@@ -510,6 +510,29 @@ const item2json = function(type){
 	}
 }
 
+const context2results = function(context, results, language){
+	var condition = ''
+
+	if(obj.condition){
+		condition = `condition : ${JSON.stringify(context.condition)}`
+	}
+
+	return `{
+		search : {
+			text : '${context.text}',
+			query : {
+				${condition}
+			},
+			results : ${JSON.stringify(results)}
+		}
+	}
+	return JSON Structure {
+		results : [find the content corresponding to {search.text} in {search.results}],
+		text : Please summarize the search results and the context in ${language}.
+	}
+	`
+}
+
 
 const semantic_prompt_system = function(language){
 	return `Converts and returns the JSON structure as natural language in ${language}. no explanation.`
@@ -1393,9 +1416,9 @@ async function Deepinfra(key, model, system, user){
 	}
 }
 
-async function Gemini(key, model, system, user, generationConfig, inlineData){
-	if(typeof generationConfig == "undefined"){
-		generationConfig = {
+async function Gemini(key, model, system, user, config, inlineData){
+	if(typeof config == "undefined"){
+		config = {
 			"response_mime_type": "application/json",
 			"temperature": 1
 		}
@@ -1418,7 +1441,7 @@ async function Gemini(key, model, system, user, generationConfig, inlineData){
 			contents: [{
 				parts: parts
 			}],
-			generationConfig: generationConfig
+			generationConfig: config
 		})
 	})
 
@@ -1426,7 +1449,7 @@ async function Gemini(key, model, system, user, generationConfig, inlineData){
 
 	var content = data.candidates[0].content.parts[0].text
 
-	if(generationConfig["response_mime_type"]){
+	if(config["response_mime_type"]){
 		try{
 			var results = JSON.parse(content)
 
@@ -1638,7 +1661,6 @@ async function Cron(event, env, ctx, models, limits){
 						team.data = {}
 					}
 
-						
 
 					var page_count = team.data ? team.data.page_count : 0
 
@@ -1777,12 +1799,13 @@ async function Cron(event, env, ctx, models, limits){
 						}
 
 
+
 						content = JSON.stringify(content)
 
 						var system = semantic_prompt_system(language)
 
 						if(models['deepinfra']){
-							talk.text = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', system, content)
+							talk.text = await Deepinfra(env.deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', system, content)
 
 							models['deepinfra'] -= 1
 
@@ -1845,6 +1868,7 @@ async function Cron(event, env, ctx, models, limits){
 						await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 
 
+
 						var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
 						if(type == "tracking"){
@@ -1866,7 +1890,6 @@ async function Cron(event, env, ctx, models, limits){
 							})), { to: 'arraybuffer' })
 
 							item.data = arr.buffer
-
 
 							statements[`${zoneRegion}_tracking`].push(
 								env[`${zoneRegion}_tracking`].prepare(`
@@ -1904,7 +1927,6 @@ async function Cron(event, env, ctx, models, limits){
 										"payment_origin" = EXCLUDED."payment_origin",
 										"payment_number" = EXCLUDED."payment_number",
 										"bundle_shipping" = EXCLUDED."bundle_shipping"
-
 								`).bind(
 									item.id,
 									item.from,
@@ -1939,8 +1961,6 @@ async function Cron(event, env, ctx, models, limits){
 								)
 							)
 						}
-
-
 
 						statements[`${zoneRegion}_items`].push(
 							env[`${zoneRegion}_items`].prepare(`
@@ -2401,7 +2421,7 @@ async function Cron(event, env, ctx, models, limits){
 										}
 
 										// if(models['deepinfra']){
-										// 	item.semantic = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', semantic_prompt_system(language), content)
+										// 	item.semantic = await Deepinfra(env.deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', semantic_prompt_system(language), content)
 
 										// 	models['deepinfra'] -= 1
 
@@ -3083,7 +3103,7 @@ async function Cron(event, env, ctx, models, limits){
 
 
 															if(models['deepinfra']){
-																var semantic = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', semantic_prompt_system(language), content)
+																var semantic = await Deepinfra(env.deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', semantic_prompt_system(language), content)
 
 																models['deepinfra'] -= 1
 
@@ -3274,17 +3294,14 @@ async function Cron(event, env, ctx, models, limits){
 						*/ 
 
 
-						var isSemantic = task.text.match(extractNumbersRegex)
-
 						var content = task.text
 
 
 						// talk.type = prompt.type
 
 						var range = {
-							goods : {
-								price : {}
-							},
+							goods : {},
+							order : {}
 						}
 
 						var base = {}
@@ -3294,8 +3311,12 @@ async function Cron(event, env, ctx, models, limits){
 						}
 
 
+
 						if(base.range){
 							if(Object.keys(base.range).length){
+								
+								base.range.price = {}
+
 								if(base.range.price.min){
 									range.price.min = `min:${base.range.price.min},`
 								}
@@ -3305,6 +3326,8 @@ async function Cron(event, env, ctx, models, limits){
 								}
 
 								
+
+								base.range.quantity = {}
 
 								if(base.range.quantity.min){
 									range.quantity.min = `min:${base.range.quantity.min},`
@@ -3316,6 +3339,8 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.width = {}
+
 								if(base.range.width.min){
 									range.width.min = `min:${base.range.width.min},`
 								}
@@ -3326,45 +3351,55 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.height = {}
+
 								if(base.range.height.min){
 									range.height.min = `min:${base.range.height.min},`
 								}
-								
+
 								if(base.range.height.max){
 									range.height.max = `max:${base.range.height.max},`
 								}
 
 
 
+								base.range.length = {}
+
 								if(base.range.length.min){
 									range.length.min = `min:${base.range.length.min},`
 								}
-								
+
 								if(base.range.length.max){
 									range.length.max = `max:${base.range.length.max},`
 								}
 
 
 
+								base.range.weight = {}
+
 								if(base.range.weight.min){
 									range.weight.min = `min:${base.range.weight.min},`
 								}
-								
+
 								if(base.range.weight.max){
 									range.weight.max = `max:${base.range.weight.max},`
 								}
 
 
 
+								base.range.shipping_fee = {}
+
 								if(base.range.shipping_fee.min){
 									range.shipping_fee.min = `min:${base.range.shipping_fee.min},`
 								}
-								
+
 								if(base.range.shipping_fee.max){
 									range.shipping_fee.max = `max:${base.range.shipping_fee.max},`
 								}
 
 
+
+								base.range.shipping_duration = {}
 
 								if(base.range.shipping_duration.min){
 									range.shipping_duration.min = `min:${base.range.shipping_duration.min},`
@@ -3376,6 +3411,8 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.sale_price = {}
+
 								if(base.range.sale_price.min){
 									range.sale_price.min = `min:${base.range.sale_price.min},`
 								}
@@ -3385,6 +3422,8 @@ async function Cron(event, env, ctx, models, limits){
 								}
 
 
+
+								base.range.cost_price = {}
 
 								if(base.range.cost_price.min){
 									range.cost_price.min = `min:${base.range.cost_price.min},`
@@ -3396,6 +3435,8 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.stock_quantity = {}
+
 								if(base.range.stock_quantity.min){
 									range.stock_quantity.min = `min:${base.range.stock_quantity.min},`
 								}
@@ -3405,6 +3446,8 @@ async function Cron(event, env, ctx, models, limits){
 								}
 
 
+
+								base.range.low_stock_threshold = {}
 
 								if(base.range.low_stock_threshold.min){
 									range.low_stock_threshold.min = `min:${base.range.low_stock_threshold.min},`
@@ -3416,6 +3459,8 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.discount = {}
+
 								if(base.range.discount.min){
 									range.discount.min = `min:${base.range.discount.min},`
 								}
@@ -3425,6 +3470,8 @@ async function Cron(event, env, ctx, models, limits){
 								}
 
 
+
+								base.range.min_order_amount = {}
 
 								if(base.range.min_order_amount.min){
 									range.min_order_amount.min = `min:${base.range.min_order_amount.min},`
@@ -3436,15 +3483,19 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.max_discount_amount = {}
+
 								if(base.range.max_discount_amount.min){
 									range.max_discount_amount.min = `min:${base.range.max_discount_amount.min},`
 								}
 								
-								if(base.range.discount.max){
+								if(base.range.max_discount_amount.max){
 									range.max_discount_amount.max = `max:${base.range.max_discount_amount.max},`
 								}
 
 
+
+								base.range.usage_limit = {}
 
 								if(base.range.usage_limit.min){
 									range.usage_limit.min = `min:${base.range.usage_limit.min},`
@@ -3456,6 +3507,8 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.usage_per = {}
+
 								if(base.range.usage_per.min){
 									range.usage_per.min = `min:${base.range.usage_per.min},`
 								}
@@ -3466,6 +3519,8 @@ async function Cron(event, env, ctx, models, limits){
 
 
 
+								base.range.started_at = {}
+
 								if(base.range.started_at.min){
 									range.started_at.min = `min:${base.range.started_at.min},`
 								}
@@ -3475,6 +3530,8 @@ async function Cron(event, env, ctx, models, limits){
 								}
 
 
+
+								base.range.expired_at = {}
 
 								if(base.range.expired_at.min){
 									range.expired_at.min = `min:${base.range.expired_at.min},`
@@ -3487,12 +3544,12 @@ async function Cron(event, env, ctx, models, limits){
 						}
 
 						if(models['deepinfra']){
-							var analyze = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', text2json(language, prompt, range, now).trim(), content)
+							var { sql } = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', text2json(language, prompt, range, now).trim(), content)
 
 							models['deepinfra'] -= 1
 
 						}else if(gemini_llm_api){
-							var analyze = await Gemini(gemini_llm_api, gemini_llm_model, text2json(language, prompt, range, now).trim(), content)
+							var { sql } = await Gemini(gemini_llm_api, gemini_llm_model, text2json(language, prompt, range, now).trim(), content)
 
 							models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -3502,181 +3559,41 @@ async function Cron(event, env, ctx, models, limits){
 							continue
 						}
 
-						analyze.filters.orderBy = "DESC"
-
-						if(prompt.find){
-							// 최근 많이 판매된 가격이 5만 원 이상인 상품만 보여줘
-
-							/*
-								
-								{
-									"context": "Show me only the products from the 'Summer Season' promotion that are in the top 20% for detail page views but have a purchase conversion rate of less than 1%. I need to analyze the reasons why.",
-									"results": [
-										{
-											"intent": "FILTER_PRODUCTS",
-											"details": {
-												"promotion": "Summer Season",
-												"criteria": [
-													{
-														"metric": "Detail Page Views",
-														"threshold": "Top 20%"
-													},
-													{
-														"metric": "Purchase Conversion Rate",
-														"condition": "less than",
-														"value": 0.01
-													}
-												],
-												"reason": "To analyze the reason"
-											}
-										}
-									]
-								}
-							*/
-
-							if(find == 'few' || find == 'little'){
-								analyze.filters.orderBy = "ASC"
-							}
-
-
-							if(!isSemantic){
-								
-
-
-							}
-
-							// {
-							// 	filters:{
-
-							// 		quantity:{
-							// 			eq,lte,gte:0,
-							// 		},
-							// 		amount:{
-							// 			currency:"",
-							// 			eq,lte,gte:0,
-							// 		},
-							// 		date:{
-							// 			eq:"${current}",lte:"${current}",gte:"${current}"
-							// 		},
-							// 		${type2json(prompt.type)}
-							// 	},
-							// 	text:translate the semantic content related to 'type' into English, excluding any mention of 'filters', excluding any mention of 'find'
-							// }
-
-						
-
-								
-							// 본인 쇼핑몰에서 가장 많이 팔린수량을 기준으로
+						if(!sql){
+							continue
 						}
 
-						if(prompt.status){
-
-						}
-
-						/*
-							prompt.type
-							prompt.find
-							prompt.status
-
-						*/
-
-
-						/*
-							가격 필터 UI로 만들어 놓기
-							task.condition
-								amount
-									eq:가격 값
-									gte:가격 이상 값
-									lte:가격 이하 값
-						*/  
-
-						var query = {
-							options:{
-								topK: task.topK,
-								returnValues: false, // true 이며 벡터 값 포함
-								returnMetadata: true,
-								filter : {}
-							}
-						}
-
-
-						var semantic = analyze.text
-
-						if(models['cloudflare']){
-							var { data: queryVector } = await env.AI.run('@cf/baai/bge-m3', {
-								text: [semantic],
-							})
-
-							models['cloudflare'] -= 1
-
-						}else if(models['deepinfra']){
-							var queryVector = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', semantic)
-
-							var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-								return {
-									id: item.id,
-									values: values,
-									metadata: metadata
-								}
-							})
-
-							models['deepinfra'] -= 1
-
-						}else{
-							clear_condition += ` AND "id" != "${task.id}"`
-
+						if(!sql.where){
 							continue
 						}
 
 
+						var generation = ''
 
-						var condition = ""
-
-						var filters = analyze.filters
-
-						if(isSemantic && filters){
-							if(Object.keys(filters).length){
-								for (const key in filters) {
-									var value = filters[key]
-
-									if (filters.hasOwnProperty(key)) {
-										query.options.filter[key] = value
-
-										if(key == "amount"){
-											if(value.currency){
-												task.currency = query.options.filter.currency = value.currency
-											}
-										}
-
-										condition += parseCondition(value, key, condition ? " AND " : "")
-									}
-								}
-							}
-						}
-
-
-						var context = ''
+						var augmented = ''
 
 						// var ensemble
 
 						// 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
 						if(task.topK > 10){
 							var { results, success, error } = await env[`${zoneRegion}_talks`].prepare(
-								`SELECT * FROM talks WHERE "bcc" = "${task.bcc}" AND "created_at" < ${created_at} AND "updated_at" = ${row.updated_at} ORDER BY created_at DESC LIMIT 5`
+								`SELECT * FROM talks WHERE "bcc" = "${task.bcc}" AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
 							).all()
 
-							var prompts = Object.assign({}, results)
+							if(results.length){
+								for(var r = 0; r < results.length; r++){
+									var retrieval = results[r]
 
-							if(prompts.length){
-								for(var p = 0; p < prompts.length; p++){
-									var prompt = prompts[p]
-
-									var { results, success, error } = await env[`${zoneRegion}_${prompt.type}`].prepare(
-										`SELECT * FROM ${prompt.type} WHERE "ref" = "${prompt.ref}" AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
+									var { results, success, error } = await env[`${zoneRegion}_${retrieval.type}`].prepare(
+										`SELECT * FROM ${retrieval.type} WHERE "ref" = "${retrieval.ref}" AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
 									).all()
 
+									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(retrieval.data))
+
+									var data = JSON.parse(decompressedJsonString)
+
 									if(results.length){
-										context += `${p}. ${prompt.msg}\n`
+										augmented += `${p}. ${data.text}\n`
 
 										for(var r = 0; r < results.length; r++){
 											var obj = Object.assign({}, results[r])
@@ -3687,7 +3604,7 @@ async function Cron(event, env, ctx, models, limits){
 											delete obj.bcc
 											delete obj.ref
 
-											context += `${JSON.stringify(obj)}\n`
+											augmented += `${JSON.stringify(obj)}\n`
 										}
 									}
 
@@ -3695,197 +3612,264 @@ async function Cron(event, env, ctx, models, limits){
 										env[`${zoneRegion}_talks`].prepare(`
 											UPDATE talks SET updated_at = ? WHERE id = ?
 										`).bind(
-											now, prompt.id
+											now, retrieval.id
 										)
 									)
 								}
 
-								if(context){
-									context = `Reference Context Start\n${context}\nReference Context End\n`
+								if(augmented){
+									augmented = `Reference Context Start\n${augmented}\nReference Context End\n`
 								}
 							}
 						}
 
+						if(sql.where.length){
+							for(var p = 0; p < sql.where.length; p++){
+								var context = sql.where[p]
 
+								context.id = hashId()
 
-						var { matches } = await env[`${vectorRegion}-${prompt.type}`].query(queryVector[0], query.options)
-
-						task.no = page_count.toString() // 채팅 나열 순서
-
-						task.amount = 0
-
-						task.quantity = 0
-
-						task.score = 0
-
-						if (matches) {
-							if(matches.length){
-								task.score = matches.reduce((sum, match) => sum + match.score, 0) / matches.length
-							}
-						}
-
-						var items = []
-
-						var temp = {}
-
-						if(matches.length){
-							for(var m = 0; m < matches.length; m++){
-								var match = matches[m]
-
-								if(temp[match.id]){
+								if(!context.type){
 									continue
 								}
 
-								temp[match.id] = true
 
-								var obj = Object.assign({},match.metadata)
+								context.orderBy = "DESC"
 
-								delete obj.from
-								delete obj.to
-								delete obj.cc
-								delete obj.bcc
-								delete obj.ref
+								if(context.find){
+									// 최근 많이 판매된 가격이 5만 원 이상인 상품만 보여줘
 
-								items.push(obj)	
-							}
-						}
-
-						var system = `Return the value of the JSON object, interpreted as "${semantic}" and translated into ${language}. no explanation`
-
-						var content = context + semantic + JSON.stringify(items)
-
-
-						if(models['deepinfra']){
-							task.title = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', system, content)
-
-							models['deepinfra'] -= 1
-
-						}else if(gemini_llm_api){
-						
-
-							task.title = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
-
-						}else{
-							clear_condition += ` AND "id" != "${task.id}"`
-
-							continue
-						}
-
-
-						// 프롬프트 결과값 vectorize 저장하기
-
-						var metadata = {
-							type: task.type,
-							from: task.from,
-							to: task.to,
-							cc: task.cc,
-							ref:task.id,
-						}
-
-						if(models['cloudflare']){
-							var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
-								text: [task.title]
-							})
-
-							var $VectorizeVector = [
-								{
-									id: hashId(task.id),
-									values: embeddings[0],
-									metadata: metadata
+									if(find == 'few' || find == 'little'){
+										context.orderBy = "ASC"
+									}
 								}
-							]
 
-							models['cloudflare'] -= 1
+								if(context.status){
 
-						}else if(models['deepinfra']){
-							var embeddings = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', task.title)
-
-							var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-								return {
-									id: item.id,
-									values: values,
-									metadata: metadata
 								}
-							})
 
-							models['deepinfra'] -= 1
+								/*
+									context.type
+									context.find
+									context.status
 
-						}else{
-							clear_condition += ` AND "id" != "${task.id}"`
-
-							continue
-						}
+								*/
 
 
-						console.log('${vectorRegion}-${prompt.type}',`${vectorRegion}-${prompt.type}`);
+								/*
+									가격 필터 UI로 만들어 놓기
+									task.condition
+										amount
+											eq:가격 값
+											gte:가격 이상 값
+											lte:가격 이하 값
+								*/  
 
-						await env[`${vectorRegion}-${prompt.type}`].upsert($VectorizeVector)
+								var query = {
+									options:{
+										topK: task.topK,
+										returnValues: false, // true 이며 벡터 값 포함
+										returnMetadata: true,
+										filter : {
+											type : context.type,
+											to : team.id
+										}
+									}
+								}
 
-						task.semantic = semantic
 
-						statements[`${zoneRegion}_items`].push(
-							env[`${zoneRegion}_items`].prepare(`
-								INSERT INTO items (
-									"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
-								) VALUES (
-									?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
-								) ON CONFLICT (id) DO UPDATE SET
-									"type" = EXCLUDED."type",
-									"from" = EXCLUDED."from",
-									"to" = EXCLUDED."to",
-									"cc" = EXCLUDED."cc",
-									"bcc" = EXCLUDED."bcc",
-									"ref" = EXCLUDED."ref",
-									"created_at" = EXCLUDED."created_at",
-									"updated_at" = EXCLUDED."updated_at"
-							`).bind(
-								hashId(task.id),
-								task.type,
-								task.from,
-								task.to,
-								task.cc,
-								task.bcc,
-								task.id,
-								now,
-								0
-							)
-						)
 
-						console.log('matches.length',matches.length);
 
-						if(matches.length){
-							var temp = {}
 
-							for(var m = 0; m < matches.length; m++){
-								var match = matches[m]
+								if(models['cloudflare']){
+									var { data: queryVector } = await env.AI.run('@cf/baai/bge-m3', {
+										text: [context.text],
+									})
 
-								var meta = match.metadata
+									models['cloudflare'] -= 1
 
-								meta.id = match.id
+								}else if(models['deepinfra']){
+									var queryVector = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', context.text)
 
-								if(temp[meta.id]){
+									var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+										return {
+											id: item.id,
+											values: values,
+											metadata: metadata
+										}
+									})
+
+									models['deepinfra'] -= 1
+
+								}else{
+									clear_condition += ` AND "id" != "${task.id}"`
+
 									continue
 								}
 
-								temp[meta.id] = true
-
-								meta.type = match.type
-
-								meta.score = match.score
-
-								meta.semantic = semantic
 
 
-								meta.bcc = task.bcc
+								var condition = `"created_at" < ${now}`
 
-								meta.ref = task.id
+								if(Object.keys(context.condition).length){
+									for (const key in context.condition) {
+										var value = context.condition[key]
 
-								statements[`${zoneRegion}_items`].push(
-									env[`${zoneRegion}_items`].prepare(`
-										INSERT INTO items (
-											"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
+										if (context.condition.hasOwnProperty(key)) {
+											if(isNaN(value)){
+												query.options.filter[key] = value
+											}
+											
+											// if(key == "amount"){
+											// 	if(value.currency){
+											// 		task.currency = query.options.filter.currency = value.currency
+											// 	}
+											// }
+
+											condition += parseCondition(value, key, " AND ")
+										}
+									}
+								}
+
+								var { matches } = await env[`${vectorRegion}-${context.type}`].query(queryVector[0], query.options)
+
+								task.no = page_count.toString() // 채팅 나열 순서
+
+								delete query.options.filter.to
+
+								var rag = {
+									search : {
+										query : context.condition,
+										sql : {},
+										rag : {}
+									}
+								}
+
+								var matches_condition = ''
+
+								if(matches.length){
+									for(var m = 0; m < matches.length; m++){
+										var match = matches[m]
+
+										delete matches[m].from
+										delete matches[m].to
+										delete matches[m].cc
+										delete matches[m].bcc
+										delete matches[m].ref
+
+										if(matches_condition.length){
+											matches_condition += ' OR '
+										}
+
+										matches_condition += `("id" = "${match.id}" AND "to" = "${team.id}" AND "created_at" < ${now})`
+									}
+								}
+
+								var { results } = await env[`${zoneRegion}_${context.type}`].prepare(`SELECT * FROM ${context.type} WHERE ${matches_condition} LIMIT 100`).all()
+
+								if(results.length){
+									for(var r = 0; r < results.length; r++){
+										var item = results[r]
+
+										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+
+										var data = JSON.parse(decompressedJsonString)
+
+										if(data){
+											if(Object.keys(data).length){
+												for (const name in data) {
+													if (data.hasOwnProperty(name)) {
+														var value = data[name]
+
+														item[name] = value
+													}
+												}
+											}
+										}
+
+										delete results[i].from
+										delete results[i].to
+										delete results[i].cc
+										delete results[i].bcc
+										delete results[i].ref
+										delete results[i].data
+									}
+
+									rag.search.vector = {
+										results : results
+									}
+									
+								}
+
+								var { results } = await env[`${zoneRegion}_${context.type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = "${team.id}" AND "created_at" < ${now} LIMIT 300`).all()
+
+								if(results.length){
+									for(var r = 0; r < results.length; r++){
+										var item = results[r]
+
+										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+
+										var data = JSON.parse(decompressedJsonString)
+
+										if(data){
+											if(Object.keys(data).length){
+												for (const name in data) {
+													if (data.hasOwnProperty(name)) {
+														var value = data[name]
+
+														item[name] = value
+													}
+												}
+											}
+										}
+
+										delete results[i].from
+										delete results[i].to
+										delete results[i].cc
+										delete results[i].bcc
+										delete results[i].ref
+										delete results[i].data
+									}
+
+									rag.search.sql = {
+										results : results
+									}
+								}
+
+
+								var system = 'Return the content related to the {search.text} value from the search results in a JSON structure.'
+
+								var content = context2results(context, [...rag.search.sql, ...rag.search.rag], language)
+
+								if(models['deepinfra']){
+									var text = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', system, content)
+
+									models['deepinfra'] -= 1
+
+								}else if(gemini_llm_api){
+									var text = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+
+									models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+								}else{
+									clear_condition += ` AND "id" != "${task.id}"`
+
+									continue
+								}
+
+								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+									text : text,
+									json : json
+								})), { to: 'arraybuffer' })
+
+								context.data = arr.buffer
+
+								statements[`${zoneRegion}_talks`].push(
+									env[`${zoneRegion}_talks`].prepare(`
+										INSERT INTO talks (
+											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 										) VALUES (
-											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
 										) ON CONFLICT (id) DO UPDATE SET
 											"type" = EXCLUDED."type",
 											"from" = EXCLUDED."from",
@@ -3893,20 +3877,78 @@ async function Cron(event, env, ctx, models, limits){
 											"cc" = EXCLUDED."cc",
 											"bcc" = EXCLUDED."bcc",
 											"ref" = EXCLUDED."ref",
+											"data" = EXCLUDED."data",
 											"created_at" = EXCLUDED."created_at",
 											"updated_at" = EXCLUDED."updated_at"
 									`).bind(
-										hashId(meta.id+task.id),
-										meta.type,
-										meta.from,
-										meta.to,
-										meta.cc,
-										meta.bcc,
-										meta.ref,
+										context.id,
+										context.type,
+										task.from,
+										task.to,
+										task.cc,
+										task.bcc,
+										task.id,
+										context.data,
 										now,
-										0
+										now
 									)
 								)
+
+
+
+
+								/*
+									context에 숫자값이 없으면 프롬프트 결과값 vectorize 저장하기
+
+									기존 벡터값이 있으면 추가하지 않기
+								*/ 
+
+
+								// var metadata = {
+								// 	type: context.type,
+								// 	from: task.from,
+								// 	to: task.to,
+								// 	cc: task.cc,
+								// 	ref:task.id,
+								// }
+
+								// if(models['cloudflare']){
+								// 	var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
+								// 		text: [semantic]
+								// 	})
+
+								// 	var $VectorizeVector = [
+								// 		{
+								// 			id: context.id,
+								// 			values: embeddings[0],
+								// 			metadata: metadata
+								// 		}
+								// 	]
+
+								// 	models['cloudflare'] -= 1
+
+								// }else if(models['deepinfra']){
+								// 	var embeddings = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', semantic)
+
+								// 	var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+								// 		return {
+								// 			id: context.id,
+								// 			values: values,
+								// 			metadata: metadata
+								// 		}
+								// 	})
+
+								// 	models['deepinfra'] -= 1
+
+								// }else{
+								// 	clear_condition += ` AND "id" != "${task.id}"`
+
+								// 	continue
+								// }
+
+								// console.log('${vectorRegion}-${context.type}',`${vectorRegion}-${context.type}`);
+
+								// await env[`${vectorRegion}-${context.type}`].upsert($VectorizeVector)
 							}
 						}
 					}
@@ -3927,7 +3969,6 @@ async function Cron(event, env, ctx, models, limits){
 
 						talk.data = arr.buffer
 					}
-
 
 					statements[`${zoneRegion}_talks`].push(
 						env[`${zoneRegion}_talks`].prepare(`
@@ -3972,7 +4013,7 @@ async function Cron(event, env, ctx, models, limits){
 
 					var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(team.data)), { to: 'arraybuffer' })
 
-					team.data = arr.buffer		
+					team.data = arr.buffer
 
 					statements[logisRegion].push(
 						env[logisRegion].prepare(`
