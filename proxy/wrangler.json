@@ -1,0 +1,162 @@
+{
+  "compatibility_date": "2025-09-01",
+  "main": "src/index.ts",
+  "name": "proxy-logis-center",
+  "upload_source_maps": true,
+  "d1_databases": [
+    {
+      "binding": "apac_logis",
+      "database_id": "f9f060db-0652-437d-a7f6-af068d65b381",
+      "database_name": "apac_logis"
+    },
+    {
+      "binding": "apac1_logis_items",
+      "database_id": "0907e34f-6533-45b2-a702-97153917cb7c",
+      "database_name": "apac1_logis_items"
+    },
+    {
+      "binding": "apac1_logis_event",
+      "database_id": "b2e7fb44-7f0b-4ada-b864-7efc1a3903ec",
+      "database_name": "apac1_logis_event"
+    },
+    {
+      "binding": "apac1_logis_sales",
+      "database_id": "e4cea13f-bdc8-43b5-829c-baab83209a08",
+      "database_name": "apac1_logis_sales"
+    },
+    {
+      "binding": "apac1_logis_talks",
+      "database_id": "7cfc2e7f-a97d-42f8-8575-a2d569ecbf31",
+      "database_name": "apac1_logis_talks"
+    },
+    {
+      "binding": "apac1_logis_tracking",
+      "database_id": "6e47fe0d-f0c6-4856-a306-fd52b4ef3199",
+      "database_name": "apac1_logis_tracking"
+    },
+    {
+      "binding": "apac2_logis_event",
+      "database_id": "53045cb9-01db-44d3-9594-0b0bf36464c0",
+      "database_name": "apac2_logis_event"
+    },
+    {
+      "binding": "apac2_logis_items",
+      "database_id": "6b37604c-28b7-4659-9a46-e3b8209c6a03",
+      "database_name": "apac2_logis_items"
+    },
+    {
+      "binding": "apac2_logis_sales",
+      "database_id": "58f33a41-7e82-4263-ba73-83d0da62cb1a",
+      "database_name": "apac2_logis_sales"
+    },
+    {
+      "binding": "apac2_logis_talks",
+      "database_id": "4718586a-b6f7-40b6-9d70-57194022cc92",
+      "database_name": "apac2_logis_talks"
+    },
+    {
+      "binding": "apac2_logis_tracking",
+      "database_id": "b755a898-ae71-422f-85bf-60af2a7d292f",
+      "database_name": "apac2_logis_tracking"
+    },
+    {
+      "binding": "apac3_logis_event",
+      "database_id": "68c73cc8-dc8f-4ce1-b37b-d0602b8644ee",
+      "database_name": "apac3_logis_event"
+    },
+    {
+      "binding": "apac3_logis_items",
+      "database_id": "2d98c9f4-4217-4ba7-b6bd-560b302eb501",
+      "database_name": "apac3_logis_items"
+    },
+    {
+      "binding": "apac3_logis_sales",
+      "database_id": "0755b56c-6bb0-4bef-9868-0a38ee121ecc",
+      "database_name": "apac3_logis_sales"
+    },
+    {
+      "binding": "apac3_logis_talks",
+      "database_id": "7de774b2-d190-4bbb-bcd3-127a16b136a9",
+      "database_name": "apac3_logis_talks"
+    },
+    {
+      "binding": "apac3_logis_tracking",
+      "database_id": "63dbd6a0-c404-46d8-b31b-ff1abc3c4a9f",
+      "database_name": "apac3_logis_tracking"
+    },
+    {
+      "binding": "center_logis",
+      "database_id": "24cedd99-28b2-4c9f-ad34-31ea252d96f4",
+      "database_name": "center_logis"
+    },
+    {
+      "binding": "DB",
+      "database_id": "54991e7a-7240-4f34-8c8a-da9923eb170c",
+      "database_name": "logis_center"
+    }
+  ],
+  "vectorize": [
+    {
+      "binding": "apac-logis",
+      "index_name": "apac-logis"
+    },
+    {
+      "binding": "apac1-logis-event",
+      "index_name": "apac1-logis-event"
+    },
+    {
+      "binding": "apac1-logis-items",
+      "index_name": "apac1-logis-items"
+    },
+    {
+      "binding": "apac1-logis-sales",
+      "index_name": "apac1-logis-sales"
+    },
+    {
+      "binding": "apac1-logis-tracking",
+      "index_name": "apac1-logis-tracking"
+    },
+    {
+      "binding": "apac2-logis-event",
+      "index_name": "apac2-logis-event"
+    },
+    {
+      "binding": "apac2-logis-items",
+      "index_name": "apac2-logis-items"
+    },
+    {
+      "binding": "apac2-logis-sales",
+      "index_name": "apac2-logis-sales"
+    },
+    {
+      "binding": "apac2-logis-tracking",
+      "index_name": "apac2-logis-tracking"
+    },
+    {
+      "binding": "apac3-logis-event",
+      "index_name": "apac3-logis-event"
+    },
+    {
+      "binding": "apac3-logis-items",
+      "index_name": "apac3-logis-items"
+    },
+    {
+      "binding": "apac3-logis-sales",
+      "index_name": "apac3-logis-sales"
+    },
+    {
+      "binding": "apac3-logis-tracking",
+      "index_name": "apac3-logis-tracking"
+    },
+    {
+      "binding": "center-logis",
+      "index_name": "center-logis"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
