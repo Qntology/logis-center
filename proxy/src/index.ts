@@ -120,26 +120,8 @@ const randomKey = function(){
 const image2json = function(type){
 	if(type == "tracking"){
 		return `convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.{
-			type:"shipping label",
-			status:"draft" or "progress" or "return" or "complete",
-			id:tracking number | string,
-			title:${type} goods title | string, 
-			senderName:senderName | string,
-			sender_address:sender_address | string,
-			sender_phone:sender_phone | string,
-			recipient_name:recipient_name | string,
-			recipient_address:recipient_address | string,
-			recipient_phone:recipient_phone | string,
-			package_width:Package width | number,
-			package_height:Package height | number,
-			package_length:Package length | number,
-			package_weight:Package weight | number,
-			carrier:carrier name translated into English | string,
-			shipping_fee:Shipping cost | number,
-			shipping_method:"standard" or "express" or "same_day" or "pick_up" or "freight",
-			shipping_duration:Estimated delivery days | number,
-			bundle_shipping:Allow combined shipping | string,
-			shipping_date:yyyy-MM-dd'T'HH:mm:ss | string,
+			no:Tracking Number(운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ) | string,
+			barcode : [barcode number | string]
 		}`
 	}
 }
@@ -274,35 +256,11 @@ const type2json = function(type){
 	}
 }
 
-const context2intents = function(language){
-	return `Return the intent from the sentence as a JSON object. {
-		language:'${language}',
-		type:['sales' or 'order' or 'goods' or 'tracking' or 'search' or 'review' or 'member' or 'coupon' or 'event' or ''],
-		find:'many' or 'few' or 'much' or 'little' or '',
-		criteria:['width' or 'height' or 'length' or 'weight' or 'shipping_fee' or 'shipping_duration' or 'sale_price' or 'cost_price' or 'stock_quantity' or 'low_stock_threshold' or 'discount' or 'min_order_amount' or 'max_discount_amount' or 'usage_limit' or 'usage_per' or 'started_at' or 'expired_at'],
-		status'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
-	}`
-}
 
-	// convert the natural language content to fit the dataset JSON structure. Return only the JSON structure result, no explanation. 
-	// {
-	// 	filters:{
-	// 		quantity:{
-	// 			eq,lte,gte:0,
-	// 		},
-	// 		amount:{
-	// 			currency:"",
-	// 			eq,lte,gte:0,
-	// 		},
-	// 		date:{
-	// 			eq:"${current}",lte:"${current}",gte:"${current}"
-	// 		},
-	// 		${type2json(prompt.type)}
-	// 	},
-	// 	text:translate the semantic content related to 'type' into English, excluding any mention of 'filters', excluding any mention of 'find'
-	// }
 
-const text2json = function(language, prompt, range, current){
+
+const text2json = function(language, prompt, threshold, current){
+
 	var width = "";
 	var height = "";
 	var length = "";
@@ -319,35 +277,35 @@ const text2json = function(language, prompt, range, current){
 	var usage_limit = "";
 	var usage_per = "";
 
-/*
+	/*
 
-convert the natural language content to fit the dataset JSON structure.
-{
-	sql : {
-		where : [
-			{
-				type:'sales' or 'order' or 'goods' or 'tracking' or 'search' or 'view' or 'review' or 'member' or 'coupon' or 'event' or '',
-				find:'many' or 'few' or 'much' or 'little' or '',
-				status'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
-				intent:intent,
-				condition : {
-					quantity:{
-						eq:0,lte:0,gte:0,
+	convert the natural language content to fit the dataset JSON structure.
+	{
+		sql : {
+			where : [
+				{
+					type:'sales' or 'order' or 'goods' or 'tracking' or 'search' or 'view' or 'review' or 'member' or 'coupon' or 'event' or '',
+					find:'many' or 'few' or 'much' or 'little' or '',
+					status'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
+					intent:intent,
+					condition : {
+						quantity:{
+							eq:0,lte:0,gte:0,
+						},
+						amount:{
+							currency:"",
+							eq:0,lte:0,gte:0,
+						},
 					},
-					amount:{
-						currency:"",
-						eq:0,lte:0,gte:0,
-					},
+					orderBy:'size' or 'weight' or 'shipping_fee' or 'shipping_duration' or 'sale_price' or 'cost_price' or 'low_stock_threshold' or 'discount' or 'min_order_amount' or 'max_discount_amount' or 'usage_limit' or 'usage_per' or '',
+					text:translate the semantic content related to 'type' into English, excluding any mention of 'condition', excluding any mention of 'find'
 				},
-				orderBy:'size' or 'weight' or 'shipping_fee' or 'shipping_duration' or 'sale_price' or 'cost_price' or 'low_stock_threshold' or 'discount' or 'min_order_amount' or 'max_discount_amount' or 'usage_limit' or 'usage_per' or '',
-				text:translate the semantic content related to 'type' into English, excluding any mention of 'condition', excluding any mention of 'find'
-			},
-		]
+			]
+		}
 	}
-}
-'여름 시즌' 기획전에 포함된 상품들 중, 상세 페이지 조회수는 상위 20%에 속하지만 구매 전환율이 1% 미만인 상품들만 따로 보여줘. 원인 분석이 시급해
+	'여름 시즌' 기획전에 포함된 상품들 중, 상세 페이지 조회수는 상위 20%에 속하지만 구매 전환율이 1% 미만인 상품들만 따로 보여줘. 원인 분석이 시급해
 
-*/
+	*/
 
 
 	return `convert the natural language content to fit the dataset JSON structure.
@@ -1373,14 +1331,34 @@ async function arrayBufferToBase64(arrayBuffer) {
 	return btoa(binary)
 }
 
-async function Deepinfra(key, model, system, user){
+async function Deepinfra(key, model, system, user, inlineData){
 	// DeepInfra API 호출
+
+	var messages = []
+
+	if(inlineData){
+		messages.push({
+			type: "image_url",   // 여기서 URL 입력
+			image_url: {
+				url: inlineData.data,
+				detail: "auto"
+			}
+		})
+	}
+
+	if(system){
+		messages.push({ "role": "system", "content": system })
+	}
+
+	if(user){
+		messages.push({ "role": "user", "content": user })
+	}
+
+	
+		
 	var body = {
 		"model" : model,
-		"messages": [
-			{ "role": "system", "content": system },
-			{ "role": "user", "content": user }
-		],
+		"messages": messages,
 		"max_tokens": 5000,
 		"temperature": 1
 	}
@@ -1466,6 +1444,11 @@ async function Gemini(key, model, system, user, config, inlineData){
 }
 
 
+/*
+	cf/google/embeddinggemma-300m
+	google/embeddinggemma-300m
+*/
+
 
 export default {
 	async fetch(
@@ -1479,8 +1462,6 @@ export default {
 
 		try{
 			const buffer = await request.arrayBuffer()
-
-			console.log('buffer.byteLength',buffer.byteLength);
 
 			if(buffer.byteLength){
 				var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(buffer))
@@ -1610,54 +1591,43 @@ export default {
 						}
 
 
-						// if(limits[task.payer]){
-						// 	limits[task.payer] -= 1
-						// }else{
-						// 	clear_condition += ` AND "id" != "${task.id}"`
+						if(limits[task.team]){
+							limits[task.team] -= 1
+						}else{
+							clear_condition += ` AND "id" != "${task.id}"`
 
-						// 	var item = {
-						// 		id : hashId(task.id),
-						// 		type : "cancel",
-						// 		from : task.from,
-						// 		to : task.to,
-						// 		cc : task.cc,
-						// 		bcc : task.bcc,
-						// 		ref : task.id,
-						// 		started_at : now,
-						// 		updated_at : now
-						// 	} 
+							statements[`${zoneRegion}_talks`].push(
+								env[`${zoneRegion}_talks`].prepare(`
+									INSERT INTO talks (
+										"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+									) VALUES (
+										?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+									) ON CONFLICT (id) DO UPDATE SET
+										"type" = EXCLUDED."type",
+										"from" = EXCLUDED."from",
+										"to" = EXCLUDED."to",
+										"cc" = EXCLUDED."cc",
+										"bcc" = EXCLUDED."bcc",
+										"ref" = EXCLUDED."ref",
+										"data" = EXCLUDED."data",
+										"created_at" = EXCLUDED."created_at",
+										"updated_at" = EXCLUDED."updated_at"
+								`).bind(
+									talk.id,
+									"prompt",
+									task.from,
+									task.to,
+									task.cc,
+									task.bcc,
+									talk.ref,
+									null,
+									now,
+									now
+								)
+							)
 
-
-						// 	statements[`${zoneRegion}_items`].push(
-						// 		env[`${zoneRegion}_items`].prepare(`
-						// 			INSERT INTO items (
-						// 				"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"" 
-						// 			) VALUES (
-						// 				?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
-						// 			) ON CONFLICT (id) DO UPDATE SET
-						// 				"type" = EXCLUDED."type",
-						// 				"from" = EXCLUDED."from",
-						// 				"to" = EXCLUDED."to",
-						// 				"cc" = EXCLUDED."cc",
-						// 				"bcc" = EXCLUDED."bcc",
-						// 				"ref" = EXCLUDED."ref",
-						// 				"created_at" = EXCLUDED."created_at",
-						// 				"updated_at" = EXCLUDED."updated_at"
-						// 		`).bind(
-						// 			item.id,
-						// 			item.type,
-						// 			item.from,
-						// 			item.to,
-						// 			item.cc,
-						// 			item.bcc,
-						// 			item.ref,
-						// 			now,
-						// 			now
-						// 		)
-						// 	)
-
-						// 	continue
-						// }
+							continue
+						}
 
 
 						// model context protocol
@@ -1675,7 +1645,34 @@ export default {
 
 							var content = task.text
 
-							var item = await Gemini(gemini_llm_api, gemini_llm_model, system, content, null, inlineData)
+
+							var item
+
+							if(models['deepinfra']){
+								item = await Deepinfra(deepinfra, 'google/gemma-3-4b-it', system, content, inlineData)
+
+								models['deepinfra'] -= 1
+
+							}
+
+							if(!item && gemini_llm_api){
+								item = await Gemini(gemini_llm_api, gemini_llm_model, system, content, null, inlineData)
+
+								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+							}else{
+								clear_condition += ` AND "id" != "${task.id}"`
+
+								continue
+							}
+
+							/*
+								item.no == item.index 먼저 조회하고 없으면
+								barcode 찾는 형식으로 해야함
+
+								둘다 없으면 type 'draft'로 전부 추가해야함
+							*/
+							
 
 							if(!item.status){
 								// 올바르지 않은 이미지 안내하기
@@ -1683,14 +1680,14 @@ export default {
 								continue
 							}
 
+							if(task.referrer){
+								item.referrer = task.referrer
+							}
+
 							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item)), { to: 'arraybuffer' })
 
 							item.data = arr.buffer
 
-
-							
-
-							item.no = item.id + ""
 
 							item.id = hashId(task.to+item.no)
 
@@ -1704,11 +1701,12 @@ export default {
 
 							item.bcc = task.bcc
 
-							item.ref = task.id
+							// item.ref = task.id
+							item.ref = task.referrer ? task.referrer : ""
 
 							item.created_at = now
 
-							item.index = crc32(task.to+item.no)
+							item.index = crc32(hashId(task.to+item.no))
 
 							var content = {}
 
@@ -1741,11 +1739,13 @@ export default {
 							var system = semantic_prompt_system(language)
 
 							if(models['deepinfra']){
-								talk.text = await Deepinfra(env.deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', system, JSON.stringify(content))
+								talk.text = await Deepinfra(deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', system, JSON.stringify(content))
 
 								models['deepinfra'] -= 1
 
-							}else if(gemini_llm_api){
+							}
+
+							if(!talk.text && gemini_llm_api){
 								talk.text = await Gemini(gemini_llm_api, gemini_llm_model, system, JSON.stringify(content))
 
 								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
@@ -1764,8 +1764,10 @@ export default {
 								to: task.to,
 								cc: task.cc,
 								bcc: task.bcc,
-								ref:task.id
+								ref:task.referrer ? task.referrer : ""
 							}
+
+							var embeddings
 
 							if(models['cloudflare']){
 								var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
@@ -1782,8 +1784,10 @@ export default {
 
 								models['cloudflare'] -= 1
 
-							}else if(models['deepinfra']){
-								var embeddings = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', talk.text)
+							}
+
+							if(!embeddings && models['deepinfra']){
+								var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', talk.text)
 
 								var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 									return {
@@ -1932,13 +1936,17 @@ export default {
 
 								var content = convertHtmlToCleanPug(task.text)
 
+								var page
+
 								if(models['deepinfra']){
-									var page = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', system, content)
+									page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 									models['deepinfra'] -= 1
 
-								}else if(gemini_llm_api){
-									var page = await Gemini(gemini_llm_api, gemini_llm_model, system, content)
+								}
+
+								if(!page && gemini_llm_api){
+									page = await Gemini(gemini_llm_api, gemini_llm_model, system, content)
 
 									models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -1979,9 +1987,9 @@ export default {
 								system = system.trim()
 
 
-								var pageId = hashId(task.cc+task.link)
+								var pageId = hashId(task.link)
 
-								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${pageId}" AND "cc" = "${task.cc}" AND "created_at" < ${created_at} LIMIT 1`).all()
+								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${pageId}" AND "created_at" < ${created_at} LIMIT 1`).all()
 
 								if(results.length){
 									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(results[0].data))
@@ -2050,9 +2058,21 @@ export default {
 								var content = convertHtmlToCleanPug(task.text)
 
 								if(!page){
-									if(gemini_llm_api){
 
-										var page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+									if(models['deepinfra']){
+										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+										page = JSON.parse(page)
+
+
+										models['deepinfra'] -= 1
+
+									}
+
+									if(!page && gemini_llm_api){
+
+										page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
 
 										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -2062,28 +2082,7 @@ export default {
 										continue
 									}
 
-									// if(models['deepinfra']){
-									// 	var page = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
-
-									// 	page = JSON.parse(page)
-
-
-									// 	models['deepinfra'] -= 1
-
-									// }else if(gemini_llm_api){
-
-									// 	var page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
-
-
-									// 	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-									// }else{
-									// 	clear_condition += ` AND "id" != "${task.id}"`
-
-									// 	continue
-									// }
-
-									page.id = hashId(task.cc+task.link)
+									page.id = hashId(task.link)
 
 									page.from = task.from
 									page.to = task.to
@@ -2143,7 +2142,7 @@ export default {
 									next : page.next || ""
 								})), { to: 'arraybuffer' })
 
-								page.ref = task.id
+								page.ref = task.referrer ? task.referrer : ""
 
 								page.data = arr.buffer
 
@@ -2238,7 +2237,7 @@ export default {
 
 										item.no = (item.id ? item.id : i).toString()
 
-										item.index = crc32(task.to+item.no)
+										item.index = crc32(hashId(task.to+item.no))
 
 										try{
 											var url = new URL(item.link)
@@ -2289,7 +2288,8 @@ export default {
 										item.cc = task.cc
 										item.bcc = task.bcc
 
-										item.ref = task.id
+										// item.ref = task.id
+										item.ref = task.referrer ? task.referrer : ""
 
 
 
@@ -2345,7 +2345,14 @@ export default {
 
 											var content = JSON.stringify(obj)
 
-											if(gemini_llm_api){
+											if(models['deepinfra']){
+												item.semantic = await Deepinfra(deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', semantic_prompt_system(language), content)
+
+												models['deepinfra'] -= 1
+
+											}
+
+											if(!item.semantic && gemini_llm_api){
 												item.semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
 
 												models[gemini_llm_api+'-'+gemini_llm_model] -= 1
@@ -2355,40 +2362,6 @@ export default {
 
 												continue
 											}
-
-											// if(models['deepinfra']){
-											// 	item.semantic = await Deepinfra(env.deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', semantic_prompt_system(language), content)
-
-											// 	models['deepinfra'] -= 1
-
-											// }else if(gemini_llm_api){
-											// 	item.semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
-
-											// 	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-											// }else{
-											// 	clear_condition += ` AND "id" != "${task.id}"`
-
-											// 	continue
-											// }
-										}
-
-
-										try{
-											await env[CenterRegion].prepare(`
-												INSERT INTO console (
-													"id", "bcc", "log", "created_at"
-												) VALUES (
-													?1, ?2, ?3, ?4
-												) ON CONFLICT (id) DO NOTHING
-											`).bind(
-												hashId(),
-												task.bcc,
-												'item.semantic'+item.semantic,
-												now  // Parameter for created_at (only insert)
-											).run()
-										}catch(err){
-
 										}
 
 
@@ -2399,8 +2372,10 @@ export default {
 												to: item.to,
 												cc: item.cc,
 												bcc: item.bcc,
-												ref:item.ref
+												ref:task.referrer ? task.referrer : ""
 											}
+
+											var embeddings
 
 											if(models['cloudflare']){
 												var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
@@ -2417,8 +2392,10 @@ export default {
 
 												models['cloudflare'] -= 1
 
-											}else if(models['deepinfra']){
-												var embeddings = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', item.semantic)
+											}
+
+											if(!embeddings && models['deepinfra']){
+												var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', item.semantic)
 
 												var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 													return {
@@ -2706,7 +2683,7 @@ export default {
 													var { results } = await env[`${zoneRegion}_${type}`].prepare(
 														`SELECT * FROM ${type} WHERE "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
 													).bind(
-														crc32(task.to+item.id), team.id, item.cc, now - 60000
+														crc32(hashId(task.to+item.id)), team.id, item.cc, now - 60000
 													).all()
 
 													if(results.length){
@@ -2770,6 +2747,8 @@ export default {
 
 										if(Object.keys(drafts).length){
 											for (const type in drafts) {
+												// for start
+
 												if (drafts.hasOwnProperty(type)) {
 													var draft = drafts[type]
 
@@ -2919,7 +2898,7 @@ export default {
 																)
 
 
-																var content = JSON.stringify({
+																var metadata = {
 																	title : data.title,
 																	size : row.size ? row.size : "",
 																	currency : row.currency ? row.currency : "",
@@ -2934,16 +2913,22 @@ export default {
 																	rental : row.rental ? true : false,
 																	refurbish : row.refurbish ? true : false,
 																	tax_included : row.tax_included ? true : false
-																})
+																}
 
+
+																var content = JSON.stringify(metadata)
+
+																var semantic
 
 																if(models['deepinfra']){
-																	var semantic = await Deepinfra(env.deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', semantic_prompt_system(language), content)
+																	semantic = await Deepinfra(deepinfra, 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo', semantic_prompt_system(language), content)
 
 																	models['deepinfra'] -= 1
 
-																}else if(gemini_llm_api){
-																	var semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
+																}
+
+																if(!semantic & gemini_llm_api){
+																	semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
 
 																	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -2953,16 +2938,37 @@ export default {
 																	continue
 																}
 
+																metadata.id = item.id
+																metadata.type = item.type
+																metadata.from = task.from
+																metadata.to = task.to
+																metadata.cc = task.cc
+																metadata.bcc = task.bcc
+																metadata.ref = task.referrer ? task.referrer : ""
+
+																var embeddings
+
+																var $VectorizeVector
 
 																if(models['cloudflare']){
-																	var { data: queryVector } = await env.AI.run('@cf/baai/bge-m3', {
+																	var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
 																		text: [semantic],
 																	})
 
+																	var $VectorizeVector = [
+																		{
+																			id: item.id,
+																			values: embeddings[0],
+																			metadata: metadata
+																		}
+																	]
+
 																	models['cloudflare'] -= 1
 
-																}else if(models['deepinfra']){
-																	var queryVector = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', semantic)
+																}
+
+																if(!embeddings && models['deepinfra']){
+																	var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', semantic)
 
 																	var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 																		return {
@@ -2979,6 +2985,9 @@ export default {
 
 																	continue
 																}
+																
+
+																await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 
 															}else{
 																// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
@@ -3001,11 +3010,41 @@ export default {
 															}
 														}
 													}
-
 												}
+
+												// for end
 											}
-													
+
+											// if end
 										}
+
+										statements[`${zoneRegion}_items`].push(
+											env[`${zoneRegion}_items`].prepare(`
+												INSERT INTO items (
+													"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
+												) VALUES (
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+												) ON CONFLICT (id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												item.id,
+												item.type,
+												item.from,
+												item.to,
+												item.cc,
+												item.bcc,
+												item.ref,
+												now,
+												0
+											)
+										)
 									}
 								}
 
@@ -3055,37 +3094,33 @@ export default {
 									task.data = null
 								}
 
-								try{
-									statements[`${zoneRegion}_items`].push(
-										env[`${zoneRegion}_items`].prepare(`
-											INSERT INTO items (
-												"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
-											) VALUES (
-												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
-											) ON CONFLICT (id) DO UPDATE SET
-												"type" = EXCLUDED."type",
-												"from" = EXCLUDED."from",
-												"to" = EXCLUDED."to",
-												"cc" = EXCLUDED."cc",
-												"bcc" = EXCLUDED."bcc",
-												"ref" = EXCLUDED."ref",
-												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
-										`).bind(
-											hashId(task.id),
-											task.type,
-											task.from,
-											task.to,
-											task.cc,
-											task.bcc,
-											task.id,
-											now,
-											0
-										)
+								statements[`${zoneRegion}_items`].push(
+									env[`${zoneRegion}_items`].prepare(`
+										INSERT INTO items (
+											"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
+										) VALUES (
+											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+										) ON CONFLICT (id) DO UPDATE SET
+											"type" = EXCLUDED."type",
+											"from" = EXCLUDED."from",
+											"to" = EXCLUDED."to",
+											"cc" = EXCLUDED."cc",
+											"bcc" = EXCLUDED."bcc",
+											"ref" = EXCLUDED."ref",
+											"created_at" = EXCLUDED."created_at",
+											"updated_at" = EXCLUDED."updated_at"
+									`).bind(
+										hashId(task.id),
+										task.type,
+										task.from,
+										task.to,
+										task.cc,
+										task.bcc,
+										task.id,
+										now,
+										0
 									)
-								}catch(err){
-									console.log('item2 push err '+err)
-								}
+								)
 
 							}catch(err){
 								console.log('inner err '+err)
@@ -3127,263 +3162,255 @@ export default {
 
 							*/ 
 
-
-							var content = task.text
-
-
-							// talk.type = prompt.type
-
-							var range = {
-								goods : {},
-								order : {}
-							}
-
-							var base = {}
+							var threshold = {}
 
 							if(team.data){
-								base = team.data.base
-							}
-
-
-
-							if(base.range){
-								if(Object.keys(base.range).length){
+								if(Object.keys(team.data.threshold).length){
 									
-									base.range.price = {}
+									team.data.threshold.price = {}
 
-									if(base.range.price.min){
-										range.price.min = `min:${base.range.price.min},`
+									if(team.data.threshold.price.min){
+										threshold.price.min = `min:${team.data.threshold.price.min},`
 									}
 
-									if(base.range.price.max){
-										range.price.max = `max:${base.range.price.max},`
+									if(team.data.threshold.price.max){
+										threshold.price.max = `max:${team.data.threshold.price.max},`
 									}
 
 									
 
-									base.range.quantity = {}
+									team.data.threshold.quantity = {}
 
-									if(base.range.quantity.min){
-										range.quantity.min = `min:${base.range.quantity.min},`
+									if(team.data.threshold.quantity.min){
+										threshold.quantity.min = `min:${team.data.threshold.quantity.min},`
 									}
 
-									if(base.range.quantity.max){
-										range.quantity.max = `max:${base.range.quantity.max},`
-									}
-
-
-
-									base.range.width = {}
-
-									if(base.range.width.min){
-										range.width.min = `min:${base.range.width.min},`
-									}
-
-									if(base.range.width.max){
-										range.width.max = `max:${base.range.width.max},`
+									if(team.data.threshold.quantity.max){
+										threshold.quantity.max = `max:${team.data.threshold.quantity.max},`
 									}
 
 
 
-									base.range.height = {}
+									team.data.threshold.width = {}
 
-									if(base.range.height.min){
-										range.height.min = `min:${base.range.height.min},`
+									if(team.data.threshold.width.min){
+										threshold.width.min = `min:${team.data.threshold.width.min},`
 									}
 
-									if(base.range.height.max){
-										range.height.max = `max:${base.range.height.max},`
-									}
-
-
-
-									base.range.length = {}
-
-									if(base.range.length.min){
-										range.length.min = `min:${base.range.length.min},`
-									}
-
-									if(base.range.length.max){
-										range.length.max = `max:${base.range.length.max},`
+									if(team.data.threshold.width.max){
+										threshold.width.max = `max:${team.data.threshold.width.max},`
 									}
 
 
 
-									base.range.weight = {}
+									team.data.threshold.height = {}
 
-									if(base.range.weight.min){
-										range.weight.min = `min:${base.range.weight.min},`
+									if(team.data.threshold.height.min){
+										threshold.height.min = `min:${team.data.threshold.height.min},`
 									}
 
-									if(base.range.weight.max){
-										range.weight.max = `max:${base.range.weight.max},`
-									}
-
-
-
-									base.range.shipping_fee = {}
-
-									if(base.range.shipping_fee.min){
-										range.shipping_fee.min = `min:${base.range.shipping_fee.min},`
-									}
-
-									if(base.range.shipping_fee.max){
-										range.shipping_fee.max = `max:${base.range.shipping_fee.max},`
+									if(team.data.threshold.height.max){
+										threshold.height.max = `max:${team.data.threshold.height.max},`
 									}
 
 
 
-									base.range.shipping_duration = {}
+									team.data.threshold.length = {}
 
-									if(base.range.shipping_duration.min){
-										range.shipping_duration.min = `min:${base.range.shipping_duration.min},`
-									}
-									
-									if(base.range.shipping_duration.max){
-										range.shipping_duration.max = `max:${base.range.shipping_duration.max},`
+									if(team.data.threshold.length.min){
+										threshold.length.min = `min:${team.data.threshold.length.min},`
 									}
 
+									if(team.data.threshold.length.max){
+										threshold.length.max = `max:${team.data.threshold.length.max},`
+									}
 
 
-									base.range.sale_price = {}
 
-									if(base.range.sale_price.min){
-										range.sale_price.min = `min:${base.range.sale_price.min},`
+									team.data.threshold.weight = {}
+
+									if(team.data.threshold.weight.min){
+										threshold.weight.min = `min:${team.data.threshold.weight.min},`
+									}
+
+									if(team.data.threshold.weight.max){
+										threshold.weight.max = `max:${team.data.threshold.weight.max},`
+									}
+
+
+
+									team.data.threshold.shipping_fee = {}
+
+									if(team.data.threshold.shipping_fee.min){
+										threshold.shipping_fee.min = `min:${team.data.threshold.shipping_fee.min},`
+									}
+
+									if(team.data.threshold.shipping_fee.max){
+										threshold.shipping_fee.max = `max:${team.data.threshold.shipping_fee.max},`
+									}
+
+
+
+									team.data.threshold.shipping_duration = {}
+
+									if(team.data.threshold.shipping_duration.min){
+										threshold.shipping_duration.min = `min:${team.data.threshold.shipping_duration.min},`
 									}
 									
-									if(base.range.sale_price.max){
-										range.sale_price.max = `max:${base.range.sale_price.max},`
+									if(team.data.threshold.shipping_duration.max){
+										threshold.shipping_duration.max = `max:${team.data.threshold.shipping_duration.max},`
 									}
 
 
 
-									base.range.cost_price = {}
+									team.data.threshold.sale_price = {}
 
-									if(base.range.cost_price.min){
-										range.cost_price.min = `min:${base.range.cost_price.min},`
-									}
-									
-									if(base.range.cost_price.max){
-										range.cost_price.max = `max:${base.range.cost_price.max},`
-									}
-
-
-
-									base.range.stock_quantity = {}
-
-									if(base.range.stock_quantity.min){
-										range.stock_quantity.min = `min:${base.range.stock_quantity.min},`
+									if(team.data.threshold.sale_price.min){
+										threshold.sale_price.min = `min:${team.data.threshold.sale_price.min},`
 									}
 									
-									if(base.range.stock_quantity.max){
-										range.stock_quantity.max = `max:${base.range.stock_quantity.max},`
+									if(team.data.threshold.sale_price.max){
+										threshold.sale_price.max = `max:${team.data.threshold.sale_price.max},`
 									}
 
 
 
-									base.range.low_stock_threshold = {}
+									team.data.threshold.cost_price = {}
 
-									if(base.range.low_stock_threshold.min){
-										range.low_stock_threshold.min = `min:${base.range.low_stock_threshold.min},`
-									}
-									
-									if(base.range.low_stock_threshold.max){
-										range.low_stock_threshold.max = `max:${base.range.low_stock_threshold.max},`
-									}
-
-
-
-									base.range.discount = {}
-
-									if(base.range.discount.min){
-										range.discount.min = `min:${base.range.discount.min},`
+									if(team.data.threshold.cost_price.min){
+										threshold.cost_price.min = `min:${team.data.threshold.cost_price.min},`
 									}
 									
-									if(base.range.discount.max){
-										range.discount.max = `max:${base.range.discount.max},`
+									if(team.data.threshold.cost_price.max){
+										threshold.cost_price.max = `max:${team.data.threshold.cost_price.max},`
 									}
 
 
 
-									base.range.min_order_amount = {}
+									team.data.threshold.stock_quantity = {}
 
-									if(base.range.min_order_amount.min){
-										range.min_order_amount.min = `min:${base.range.min_order_amount.min},`
-									}
-									
-									if(base.range.min_order_amount.max){
-										range.min_order_amount.max = `max:${base.range.min_order_amount.max},`
-									}
-
-
-
-									base.range.max_discount_amount = {}
-
-									if(base.range.max_discount_amount.min){
-										range.max_discount_amount.min = `min:${base.range.max_discount_amount.min},`
+									if(team.data.threshold.stock_quantity.min){
+										threshold.stock_quantity.min = `min:${team.data.threshold.stock_quantity.min},`
 									}
 									
-									if(base.range.max_discount_amount.max){
-										range.max_discount_amount.max = `max:${base.range.max_discount_amount.max},`
+									if(team.data.threshold.stock_quantity.max){
+										threshold.stock_quantity.max = `max:${team.data.threshold.stock_quantity.max},`
 									}
 
 
 
-									base.range.usage_limit = {}
+									team.data.threshold.low_stock_threshold = {}
 
-									if(base.range.usage_limit.min){
-										range.usage_limit.min = `min:${base.range.usage_limit.min},`
-									}
-									
-									if(base.range.usage_limit.max){
-										range.usage_limit.max = `max:${base.range.usage_limit.max},`
-									}
-
-
-
-									base.range.usage_per = {}
-
-									if(base.range.usage_per.min){
-										range.usage_per.min = `min:${base.range.usage_per.min},`
+									if(team.data.threshold.low_stock_threshold.min){
+										threshold.low_stock_threshold.min = `min:${team.data.threshold.low_stock_threshold.min},`
 									}
 									
-									if(base.range.usage_per.max){
-										range.usage_per.max = `max:${base.range.usage_per.max},`
+									if(team.data.threshold.low_stock_threshold.max){
+										threshold.low_stock_threshold.max = `max:${team.data.threshold.low_stock_threshold.max},`
 									}
 
 
 
-									base.range.started_at = {}
+									team.data.threshold.discount = {}
 
-									if(base.range.started_at.min){
-										range.started_at.min = `min:${base.range.started_at.min},`
-									}
-									
-									if(base.range.started_at.max){
-										range.started_at.max = `max:${base.range.started_at.max},`
-									}
-
-
-
-									base.range.expired_at = {}
-
-									if(base.range.expired_at.min){
-										range.expired_at.min = `min:${base.range.expired_at.min},`
+									if(team.data.threshold.discount.min){
+										threshold.discount.min = `min:${team.data.threshold.discount.min},`
 									}
 									
-									if(base.range.expired_at.max){
-										range.expired_at.max = `max:${base.range.expired_at.max},`
+									if(team.data.threshold.discount.max){
+										threshold.discount.max = `max:${team.data.threshold.discount.max},`
+									}
+
+
+
+									team.data.threshold.min_order_amount = {}
+
+									if(team.data.threshold.min_order_amount.min){
+										threshold.min_order_amount.min = `min:${team.data.threshold.min_order_amount.min},`
+									}
+									
+									if(team.data.threshold.min_order_amount.max){
+										threshold.min_order_amount.max = `max:${team.data.threshold.min_order_amount.max},`
+									}
+
+
+
+									team.data.threshold.max_discount_amount = {}
+
+									if(team.data.threshold.max_discount_amount.min){
+										threshold.max_discount_amount.min = `min:${team.data.threshold.max_discount_amount.min},`
+									}
+									
+									if(team.data.threshold.max_discount_amount.max){
+										threshold.max_discount_amount.max = `max:${team.data.threshold.max_discount_amount.max},`
+									}
+
+
+
+									team.data.threshold.usage_limit = {}
+
+									if(team.data.threshold.usage_limit.min){
+										threshold.usage_limit.min = `min:${team.data.threshold.usage_limit.min},`
+									}
+									
+									if(team.data.threshold.usage_limit.max){
+										threshold.usage_limit.max = `max:${team.data.threshold.usage_limit.max},`
+									}
+
+
+
+									team.data.threshold.usage_per = {}
+
+									if(team.data.threshold.usage_per.min){
+										threshold.usage_per.min = `min:${team.data.threshold.usage_per.min},`
+									}
+									
+									if(team.data.threshold.usage_per.max){
+										threshold.usage_per.max = `max:${team.data.threshold.usage_per.max},`
+									}
+
+
+
+									team.data.threshold.started_at = {}
+
+									if(team.data.threshold.started_at.min){
+										threshold.started_at.min = `min:${team.data.threshold.started_at.min},`
+									}
+									
+									if(team.data.threshold.started_at.max){
+										threshold.started_at.max = `max:${team.data.threshold.started_at.max},`
+									}
+
+
+
+									team.data.threshold.expired_at = {}
+
+									if(team.data.threshold.expired_at.min){
+										threshold.expired_at.min = `min:${team.data.threshold.expired_at.min},`
+									}
+									
+									if(team.data.threshold.expired_at.max){
+										threshold.expired_at.max = `max:${team.data.threshold.expired_at.max},`
 									}
 								}
 							}
 
+
+							var sql
+
 							if(models['deepinfra']){
-								var { sql } = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', text2json(language, prompt, range, now).trim(), content)
+								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', text2json(language, prompt, threshold, current).trim(), task.text)
+
+								sql = res.sql
 
 								models['deepinfra'] -= 1
 
-							}else if(gemini_llm_api){
-								var { sql } = await Gemini(gemini_llm_api, gemini_llm_model, text2json(language, prompt, range, now).trim(), content)
+							}
+
+							if(!sql && gemini_llm_api){
+								var res = await Gemini(gemini_llm_api, gemini_llm_model, text2json(language, prompt, threshold, current).trim(), task.text)
+
+								sql = res.sql
 
 								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -3406,10 +3433,8 @@ export default {
 
 							var augmented = ''
 
-							// var ensemble
-
 							// 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
-							if(task.topK > 10){
+							if(task.topK > 50){
 								var { results, success, error } = await env[`${zoneRegion}_talks`].prepare(
 									`SELECT * FROM talks WHERE "bcc" = "${task.bcc}" AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
 								).all()
@@ -3482,22 +3507,7 @@ export default {
 
 									}
 
-									/*
-										context.type
-										context.find
-										context.status
 
-									*/
-
-
-									/*
-										가격 필터 UI로 만들어 놓기
-										task.condition
-											amount
-												eq:가격 값
-												gte:가격 이상 값
-												lte:가격 이하 값
-									*/  
 
 									var query = {
 										options:{
@@ -3511,9 +3521,7 @@ export default {
 										}
 									}
 
-
-
-
+									var queryVector
 
 									if(models['cloudflare']){
 										var { data: queryVector } = await env.AI.run('@cf/baai/bge-m3', {
@@ -3522,8 +3530,10 @@ export default {
 
 										models['cloudflare'] -= 1
 
-									}else if(models['deepinfra']){
-										var queryVector = await Deepinfra(env.deepinfra, 'BAAI/bge-m3', '', context.text)
+									}
+
+									if(!queryVector && models['deepinfra']){
+										var queryVector = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', context.text)
 
 										var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 											return {
@@ -3554,11 +3564,11 @@ export default {
 													query.options.filter[key] = value
 												}
 												
-												// if(key == "amount"){
-												// 	if(value.currency){
-												// 		task.currency = query.options.filter.currency = value.currency
-												// 	}
-												// }
+												if(key == "amount"){
+													if(value.currency){
+														query.options.filter.currency = value.currency
+													}
+												}
 
 												condition += parseCondition(value, key, " AND ")
 											}
@@ -3675,13 +3685,17 @@ export default {
 
 									var content = context2results(context, [...rag.search.sql.results, ...rag.search.vector.results], language)
 
+									var text
+
 									if(models['deepinfra']){
-										var text = await Deepinfra(env.deepinfra, 'openai/gpt-oss-20b', system, content)
+										text = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 										models['deepinfra'] -= 1
 
-									}else if(gemini_llm_api){
-										var text = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+									}
+
+									if(!text && gemini_llm_api){
+										text = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
 
 										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
