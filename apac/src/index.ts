@@ -4,6 +4,8 @@ async function Sleep(ms) {
 	return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+const CenterRegion = "center_logis"
+
 async function Cron(event, env, ctx, models, limits){
 	/*
 		매월 1일에 결제한 사용자를 기준으로 
@@ -18,13 +20,13 @@ async function Cron(event, env, ctx, models, limits){
 
 		var len = results.length
 
-		console.log('tasks len',len)
-
 		var tasks = []
 
 		var clear_condition = ""
 
 		if (len) {
+			console.log('tasks len',len)
+			
 			for(var i = 0; i < len; i++){
 				var cron = results[i]
 
@@ -107,6 +109,8 @@ async function Cron(event, env, ctx, models, limits){
 						continue
 					}
 
+					console.log('task.ref',task.ref);
+
 					var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 						now : now,
 						ref : task.ref,
@@ -120,18 +124,17 @@ async function Cron(event, env, ctx, models, limits){
 					})), { to: 'arraybuffer' })
 
 
-					const response = await fetch(`https://proxy-logis-center.contact-730.workers.dev/`, {
+					const res = await fetch(`https://proxy.logis.center`, {
 						method: "POST",
 						headers: {
-							"Content-Type": "application/json"
+							'Content-Type': 'application/octet-stream',
+							'Content-Encoding': 'gzip'
 						},
 						body: arr.buffer
 					});
 
-					var success = response.clone();
-
 					try{
-						var results = await success.json();
+						var results = await res.json();
 
 						models = results.models
 						limits = results.limits
@@ -139,7 +142,7 @@ async function Cron(event, env, ctx, models, limits){
 						pageCount = results.counts
 
 					}catch(err){
-						
+						console.log('err',err);
 					}
 				}
 			}
