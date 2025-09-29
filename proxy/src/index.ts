@@ -55,7 +55,7 @@ import { ethers } from "ethers"
 				📱 재고 조회 & 재고 증감
 
 		이벤트
-			🖥️ 송장 출력	
+			🖥️ 송장 출력    
 			✨ 주문 조회
 			✨ 재고 조회
 
@@ -272,7 +272,7 @@ const list2json = function(language){
 	return `
 		type:'order' or 'goods' or 'tracking' or 'search' or 'review' or 'member' or 'coupon' or 'event' or '',
 		isDetail:is detail page | true/false,
-		list:Item parent list CSS selector excluding ads,
+		node:Item parent list CSS selector excluding ads,
 		item:Item CSS selector excluding ads,
 		more:Item detail link CSS selector,
 		next:items next button CSS selector,
@@ -303,13 +303,14 @@ const list2json = function(language){
 				expired_at:yyyy-MM-dd'T'HH:mm:ss,
 			}
 		] 
-	}`
+	`
 }
 
 
 const item2json = function(type){
 	if(type == 'tracking'){
 		return ` 
+			node:${type} detail page form element CSS selector,
 			status:"draft" or "progress" or "return" or "complete",
 			id:tracking number | string,
 			title:${type} goods title | string, 
@@ -330,9 +331,9 @@ const item2json = function(type){
 			bundle_shipping:Allow combined shipping | string,
 			shipping_date:yyyy-MM-dd'T'HH:mm:ss | string,
 		`
-	}else if(type == 'sales'){
+	}else if(type == 'goods'){
 		return `
-			form:${type} detail page form element CSS selector,
+			node:${type} detail page form element CSS selector,
 			id:Refer to the ID value from the link or an attribute | string,
 			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
 			payment_method:payment method | string,
@@ -355,6 +356,7 @@ const item2json = function(type){
 			barcode:product Barcode value | string,
 			sale_price:product sale price | number,
 			supply_price:product supply price | number,
+			currency:ISO 4217 Currency Code | string,
 			compare_at_price:product Original price for showing discounts | number,
 			quantity:product Inventory quantity | number,
 			stock_keeping_unit: Stock Keeping Unit | string,
@@ -393,16 +395,15 @@ const item2json = function(type){
 		`
 	}else if(type == 'order'){
 		return `
+			node:${type} detail page form element CSS selector,
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
-			order_goods:[{
+			goods:[{
 				title:goods title | string,
-				options:[{
-					name : goods option name | string,
-					option:goods option value | string,
-				}],
 				link:URL includes the path additional goods item link | string,
 				id:Refer to the ID value from the link or an attribute | string,
 			}],
+			bank:bank company name | string,
+			card:card company name | string,
 			payment_date:payment_date | string,
 			payment_method:'C.O.D.' or 'CARD' or 'BANK' or '',
 			payment_origin:payment origin | string,
@@ -410,6 +411,7 @@ const item2json = function(type){
 		`
 	}else if(type == 'coupon' || type == 'event'){
 		return `
+			node:${type} detail page form element CSS selector,
 			type:'percentage' or 'fixed_amount' or 'free_shipping' or '',
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or "complete",
 			title:${type} item title | string, 
@@ -438,10 +440,10 @@ const item2json = function(type){
 
 
 
-const type2json = function(type){
+const form2json = function(type){
 	if(type == 'tracking' || type == 'review' || type == 'member'){
 		return `
-			list:${type} item parent list CSS selector excluding ads,
+			node:${type} item parent list CSS selector excluding ads,
 			item:${type} item CSS selector excluding ads,
 			title:${type} item title CSS selector excluding ads, 
 			date:${type} item date value CSS selector
@@ -604,25 +606,25 @@ const isDiff = (obj1, obj2) => {
 
 
 // const getCommonAncestor = (elements) => {
-// 	if (!elements || elements.length === 0) {
-// 		return null;
-// 	}
+//  if (!elements || elements.length === 0) {
+//      return null;
+//  }
 
-// 	// Start with the first element's parent as the potential common ancestor
-// 	let ancestor = elements[0].parentNode;
+//  // Start with the first element's parent as the potential common ancestor
+//  let ancestor = elements[0].parentNode;
 
-// 	// Loop through all elements
-// 	for (let i = 1; i < elements.length; i++) {
-// 		// Check if the current ancestor contains the next element
-// 		// If not, move up the tree from the first element
-// 		if (!ancestor.contains(elements[i])) {
-// 			ancestor = ancestor.parentNode;
-// 			// Restart the loop to re-check all elements with the new ancestor
-// 			i = 0; 
-// 		}
-// 	}
+//  // Loop through all elements
+//  for (let i = 1; i < elements.length; i++) {
+//      // Check if the current ancestor contains the next element
+//      // If not, move up the tree from the first element
+//      if (!ancestor.contains(elements[i])) {
+//          ancestor = ancestor.parentNode;
+//          // Restart the loop to re-check all elements with the new ancestor
+//          i = 0; 
+//      }
+//  }
 
-// 	return ancestor;
+//  return ancestor;
 // };
 
 // // Example usage:
@@ -641,7 +643,7 @@ const isDiff = (obj1, obj2) => {
 */
 
 /*
-	reviews 정보는 title에 작성자 이름과	리뷰 내용 합쳐서 넣기
+	reviews 정보는 title에 작성자 이름과  리뷰 내용 합쳐서 넣기
 
 
 	vector 메타데이터로 저장해야할 분류
@@ -777,7 +779,8 @@ function convertHtmlToCleanPug(body) {
  * @returns {string[]} 생성된 Pug 라인 배열
  */
 function generatePugLines(nodes, indentLevel) {
-	const indent = '	'.repeat(indentLevel); // 들여쓰기 문자 (공백 2칸)
+	// 들여쓰기 문자 (공백 4칸)
+	const indent = '    '.repeat(indentLevel); 
 	let lines = [];
 
 	nodes.forEach(node => {
@@ -785,14 +788,14 @@ function generatePugLines(nodes, indentLevel) {
 		if (node.nodeType === Node.ELEMENT_NODE) {
 			const tagName = node.tagName.toLowerCase();
 
-			// --- ✨ 추가된 부분: base64 이미지를 포함하는 img 태그 제외 ---
+			// --- base64 이미지를 포함하는 img 태그 제외 ---
 			const src = node.getAttribute('src');
 			if (tagName === 'img' && src && src.includes('base64')) {
 				return; // src에 'base64'가 포함된 img 태그는 변환에서 건너뜁니다.
 			}
-			// --- 제외 로직 끝 ---
 
 			// 불필요한 태그들을 만나면 건너뛰기
+			// input, textarea는 이제 포함됩니다.
 			if (['script', 'style', 'link', 'noscript', 'iframe', 'button'].includes(tagName)) {
 				return;
 			}
@@ -811,36 +814,39 @@ function generatePugLines(nodes, indentLevel) {
 				attributesString += `.${Array.from(node.classList).join('.')}`;
 			}
 
-			// <img> 태그의 src 속성 처리
-			if (tagName === 'img' && node.hasAttribute('src')) {
-				const src = node.getAttribute('src');
-				if (src) { // src 속성값이 비어있지 않은 경우에만 추가
-					otherAttributes.push(`src="${src}"`);
-				}
-			}
-
-			// <a> 태그의 href 속성 처리
-			if (tagName === 'a' && node.hasAttribute('href')) {
-				const href = node.getAttribute('href');
-				if (href) { // href 속성값이 비어있지 않은 경우에만 추가
-					otherAttributes.push(`href="${href}"`);
-				}
-			}
-
-			// ✨ 추가된 부분: data- 속성 처리
 			// NamedNodeMap을 Array로 변환하여 모든 속성을 순회합니다.
 			Array.from(node.attributes).forEach(attr => {
-				if (attr.name.startsWith('data-')) {
-					otherAttributes.push(`${attr.name}="${attr.value}"`);
+				const attrName = attr.name;
+				const attrValue = attr.value;
+
+				// 기본적으로 포함할 속성들: input, a, img, textarea의 주요 속성 포함
+				const alwaysInclude = [
+					'src', 'href', 'type', 'name', 'value', 'placeholder', 
+					'checked', 'selected', 'disabled', 'readonly', 'rows', 'cols'
+				];
+
+				// ID와 Class는 이미 처리되었으므로 제외
+				if (attrName === 'id' || attrName === 'class') {
+					return;
+				}
+
+				if (attrName.startsWith('data-') || alwaysInclude.includes(attrName)) {
+					// Boolean 속성 처리 (ex: disabled, checked, readonly)
+					if (['checked', 'selected', 'disabled', 'readonly'].includes(attrName) && (attrValue === '' || attrValue === attrName)) {
+						otherAttributes.push(`${attrName}`); // 값 없이 속성 이름만 추가 (Pug의 Boolean 속성 표기)
+					} else if (attrValue) { // 속성값이 비어있지 않은 경우에만 추가
+						// 따옴표 안에 따옴표가 있는 경우 이스케이프 필요 (여기서는 단순하게 큰따옴표로 처리)
+						const safeValue = attrValue.replace(/"/g, "'"); 
+						otherAttributes.push(`${attrName}="${safeValue}"`);
+					}
 				}
 			});
-			// ✨ 추가된 부분 끝
+			// --- 속성 처리 끝 ---
 
-			// 괄호로 묶는 속성들 추가 (src="..." href="...")
+			// 괄호로 묶는 속성들 추가
 			if (otherAttributes.length > 0) {
 				attributesString += `(${otherAttributes.join(' ')})`;
 			}
-			// --- 속성 처리 끝 ---
 
 
 			// div 축약 로직은 그대로 유지
@@ -856,8 +862,23 @@ function generatePugLines(nodes, indentLevel) {
 			// 태그 이름과 변환된 속성 문자열을 함께 추가
 			lines.push(`${indent}${tagName}${attributesString}`);
 
-			if (currentNode.hasChildNodes()) {
-				lines = lines.concat(generatePugLines(currentNode.childNodes, indentLevel + 1));
+			// textarea의 값 처리 (node.value 사용)
+			if (tagName === 'textarea') {
+				const value = node.value;
+				if (value.trim()) {
+					// 여러 줄 텍스트 처리를 위해 각 줄을 '| '로 시작
+					value.split('\n').forEach(line => {
+						lines.push(`${indent}    | ${line}`);
+					});
+				}
+			}
+			// 자식 노드 처리
+			else if (currentNode.hasChildNodes()) {
+				// textarea는 값 처리가 완료되었으므로, 자식 노드를 추가로 처리할 필요는 없습니다.
+				// (일반적으로 textarea의 텍스트는 childNodes로도 잡히지만, value로 처리하는 것이 정확합니다.)
+				if (tagName !== 'textarea') {
+					lines = lines.concat(generatePugLines(currentNode.childNodes, indentLevel + 1));
+				}
 			}
 
 		} else if (node.nodeType === Node.TEXT_NODE) {
@@ -1063,28 +1084,28 @@ const Flow = function(query, item){
 		}
 		
 	}else if(query == "tracking" && item.type == "goods"){
-	// 	return {
-	// 		type : 'sales',
-	// 		column : 'sales',
-	// 		index : item.index,
-	// 		flow : {
-	// 			type : 'tracking',
-	// 			column : 'index',
-	// 			index : item.index
-	// 		}
-	// 	}
+	//  return {
+	//      type : 'sales',
+	//      column : 'sales',
+	//      index : item.index,
+	//      flow : {
+	//          type : 'tracking',
+	//          column : 'index',
+	//          index : item.index
+	//      }
+	//  }
 
 	}else if(query == "event" && item.type == "goods"){
-	// 	return {
-	// 		type : 'event',
-	// 		column : 'index'
-	// 	}
+	//  return {
+	//      type : 'event',
+	//      column : 'index'
+	//  }
 
 	}else if(query == "coupon" && item.type == "goods"){
-	// 	return {
-	// 		type : 'event',
-	// 		column : 'index'
-	// 	}
+	//  return {
+	//      type : 'event',
+	//      column : 'index'
+	//  }
 
 
 
@@ -1105,26 +1126,26 @@ const Flow = function(query, item){
 
 	}else if(query == "event" && item.type == "tracking"){
 		// return {
-		// 	type : 'sales',
-		// 	column : 'tracking',
-		// 	index : item.index
-		// 	flow : {
-		// 		type : 'event',
-		// 		column : 'index',
-		// 		index : 'event'
-		// 	}
+		//  type : 'sales',
+		//  column : 'tracking',
+		//  index : item.index
+		//  flow : {
+		//      type : 'event',
+		//      column : 'index',
+		//      index : 'event'
+		//  }
 		// }
 
 	}else if(query == "coupon" && item.type == "tracking"){
 		// return {
-		// 	type : 'sales',
-		// 	column : 'tracking',
-		// 	index : item.index
-		// 	flow : {
-		// 		type : 'event',
-		// 		column : 'index',
-		// 		index : 'event'
-		// 	}
+		//  type : 'sales',
+		//  column : 'tracking',
+		//  index : item.index
+		//  flow : {
+		//      type : 'event',
+		//      column : 'index',
+		//      index : 'event'
+		//  }
 		// }
 
 
@@ -1173,20 +1194,20 @@ const Flow = function(query, item){
 		}
 
 	}else if(query == "order" && item.type == "coupon"){
-	// 	return {
-	// 		type : 'sales',
-	// 		column : 'event'
-	// 	}
+	//  return {
+	//      type : 'sales',
+	//      column : 'event'
+	//  }
 
 	}else if(query == "tracking" && item.type == "coupon"){
 		// return {
-		// 	type : 'sales',
-		// 	column : 'event',
-		// 	flow : {
-		// 		type : 'tracking',
-		// 		column : 'index',
-		// 		index : 'event'
-		// 	}
+		//  type : 'sales',
+		//  column : 'event',
+		//  flow : {
+		//      type : 'tracking',
+		//      column : 'index',
+		//      index : 'event'
+		//  }
 		// }
 
 	}else if(query == "event" && item.type == "coupon"){
@@ -1208,12 +1229,12 @@ const Flow = function(query, item){
 
 /*
 	벡터맵으로 구분하자
-	wnam-logis		Western North America
-	enam-logis		Eastern North America
-	weur-logis		Western Europe
-	eeur-logis		Eastern Europe
-	apac-logis		Asia-Pacific
-	oc-logis			Oceania
+	wnam-logis      Western North America
+	enam-logis      Eastern North America
+	weur-logis      Western Europe
+	eeur-logis      Eastern Europe
+	apac-logis      Asia-Pacific
+	oc-logis            Oceania
 
 
 */ 
@@ -1319,7 +1340,7 @@ const languageCode = {
 	// Africa
 	'za': 'English', // South Africa
 	'ng': 'English', // Nigeria
-	'eg': 'Arabic',	// Egypt
+	'eg': 'Arabic', // Egypt
 
 	// Middle East
 	'sa': 'Arabic', // Saudi Arabia
@@ -1361,12 +1382,12 @@ function parseBody(body, page){
 					}else if($item.value){
 						item[s] = $item.value
 					}else if($item.textContent){
-						item[s] = $item.textContent		
+						item[s] = $item.textContent     
 					}else{
 						item[s] = null
 					}
 				}else{
-					item[s] = $item.textContent ? $item.textContent : null	
+					item[s] = $item.textContent ? $item.textContent : null  
 				}
 			}
 
@@ -1397,7 +1418,7 @@ async function Deepinfra(key, model, system, user, inlineData){
 
 	if(inlineData){
 		messages.push({
-			type: "image_url",	 // 여기서 URL 입력
+			type: "image_url",   // 여기서 URL 입력
 			image_url: {
 				url: inlineData.data,
 				detail: "auto"
@@ -1436,7 +1457,7 @@ async function Deepinfra(key, model, system, user, inlineData){
 		}
 	}
 
-	const res = await fetch(`https://api.deepinfra.com/v1/openai/${pathname}`, {
+	var res = await fetch(`https://api.deepinfra.com/v1/openai/${pathname}`, {
 		method: "POST",
 		headers: {
 			"Authorization": `Bearer ${key}`,
@@ -1445,7 +1466,7 @@ async function Deepinfra(key, model, system, user, inlineData){
 		body: JSON.stringify(body),
 	});
 
-	const json = await res.json();
+	var json = await res.json();
 
 
 
@@ -1491,7 +1512,7 @@ async function Gemini(key, model, system, user, config, inlineData){
 		parts.push({ inlineData: inlineData })
 	}
 
-	const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+	var res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
@@ -1504,7 +1525,7 @@ async function Gemini(key, model, system, user, config, inlineData){
 		})
 	})
 
-	const data = await res.json()
+	var data = await res.json()
 
 	var content = data.candidates[0].content.parts[0].text
 
@@ -1514,7 +1535,7 @@ async function Gemini(key, model, system, user, config, inlineData){
 				content = content.replace(/```json/gi, "")
 				content = content.replace(/```/gi, "")
 				content = content.replace(/\n/gi,"")
-				content = content.trim()	
+				content = content.trim()    
 			}
 
 			var results = JSON.parse(content)
@@ -1680,8 +1701,6 @@ export default {
 
 
 						// model context protocol
-
-						var page
 
 						if(task.contentType == "image/jpeg"){
 							var base64 = arrayBufferToBase64(task.buffer)
@@ -2003,33 +2022,21 @@ export default {
 
 									var selectors = JSON.parse(decompressedJsonString)
 
-									if(selectors.type){
-										var selector = ''
-										
-										if(selectors.form){
-											selector = selectors.form
-										}else if(selectors.list){
-											selector = selectors.list
-										}
-
-										if(selector){
-											try{
-												var { document } = parseHTML(`<html><body>${task.text}</body></html>`);
-												
-												if(document.querySelector(selector)){
-													task.text = document.querySelector(selector).innerHTML
-												}
-											}catch(err){
-												console.log('page err',err);
+									if(selectors.type && selectors.node){
+										try{
+											var { document } = parseHTML(`<html><body>${task.text}</body></html>`);
+											
+											if(document.querySelector(selectors.node)){
+												task.text = document.querySelector(selectors.node).innerHTML
 											}
+										}catch(err){
+											console.log('page err',err);
 										}
 									}
 								}
 
 								// page.items
 
-								// inner errTypeError: Cannot create property 'id' on string '{language:'Korean',type:'goods',list:null,item:null,more:null,next:null,text:'리스트가 없습니다.',items:[]}'
-								// 상품 상세일때
 
 
 								var system = list2json(language)
@@ -2054,72 +2061,96 @@ export default {
 
 								system = system.trim()
 
+								var page
 
+								var pageType = ''
 
 								var content = convertHtmlToCleanPug(task.text)
 
-								if(!page){
-									if(models['deepinfra']){
-										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+								if(models['deepinfra']){
+									page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
 
-										models['deepinfra'] -= 1
+									pageType = page.type
 
-									}
+									models['deepinfra'] -= 1
 
-									if(!page && gemini_llm_api){
-										page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
-
-										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-									}
-
-									if(!isDetail && page){
-										if(page.isDetail){
-											isDetail = page.isDetail
-
-											system = item2json(_page.type)
-
-											if(models['deepinfra']){
-												page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
-
-												models['deepinfra'] -= 1
-
-											}
-
-											if(!page && gemini_llm_api){
-												page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
-
-												models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-											}
-										}
-									}else{
-										fallback = 'page overflow'
-
-										continue
-									}
-
-									page.id = hashId(task.link)
-									page.from = task.from
-									page.to = task.to
-									page.cc = task.cc
-									page.bcc = task.bcc
 								}
 
+								if(!page && gemini_llm_api){
+									page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+									pageType = page.type
+
+									models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+								}
+
+								if(!isDetail && page){
+									if(page.isDetail){
+										isDetail = page.isDetail
+
+										system = item2json(pageType)
+
+										if(models['deepinfra']){
+											page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+											models['deepinfra'] -= 1
+
+										}
+
+										if(!page && gemini_llm_api){
+											page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+										}
+									}
+								}
+
+								if(!page){
+									fallback = 'page overflow'
+
+									continue
+								}
+
+								page.type = pageType
+
+								page.id = hashId(task.link)
+								page.from = task.from
+								page.to = task.to
+								page.cc = task.cc
+								page.bcc = task.bcc
+
+
+								if(isDetail){
+									await env[CenterRegion].prepare(`
+										INSERT INTO console (
+											"id", "bcc", "log", "created_at"
+										) VALUES (
+											?1, ?2, ?3, ?4
+										) ON CONFLICT (id) DO NOTHING
+									`).bind(
+										hashId(),
+										task.bcc,
+										'detail page content '+content,
+										now // Parameter for created_at (only insert)
+									).run()
+									page.items = [page]
+								}
 
 								talk.text = page.text
 
 								// await env[CenterRegion].prepare(`
-								// 	INSERT INTO console (
-								// 		"id", "bcc", "log", "created_at"
-								// 	) VALUES (
-								// 		?1, ?2, ?3, ?4
-								// 	) ON CONFLICT (id) DO NOTHING
+								//  INSERT INTO console (
+								//      "id", "bcc", "log", "created_at"
+								//  ) VALUES (
+								//      ?1, ?2, ?3, ?4
+								//  ) ON CONFLICT (id) DO NOTHING
 								// `).bind(
-								// 	hashId(),
-								// 	task.bcc,
-								// 	'talk.text'+talk.text,
-								// 	now	// Parameter for created_at (only insert)
+								//  hashId(),
+								//  task.bcc,
+								//  'talk.text'+talk.text,
+								//  now // Parameter for created_at (only insert)
 								// ).run()
 
 								await env[CenterRegion].prepare(`
@@ -2132,27 +2163,33 @@ export default {
 									hashId(),
 									task.bcc,
 									'page.type'+page.type,
-									now	// Parameter for created_at (only insert)
+									now // Parameter for created_at (only insert)
 								).run()
+
+								if(!page.type){
+									continue
+
+									fallback = 'type not found'
+								}
 
 
 								// await env[CenterRegion].prepare(`
-								// 	INSERT INTO console (
-								// 		"id", "bcc", "log", "created_at"
-								// 	) VALUES (
-								// 		?1, ?2, ?3, ?4
-								// 	) ON CONFLICT (id) DO NOTHING
+								//  INSERT INTO console (
+								//      "id", "bcc", "log", "created_at"
+								//  ) VALUES (
+								//      ?1, ?2, ?3, ?4
+								//  ) ON CONFLICT (id) DO NOTHING
 								// `).bind(
-								// 	hashId(),
-								// 	task.bcc,
-								// 	'zoneRegion'+zoneRegion,
-								// 	now	// Parameter for created_at (only insert)
+								//  hashId(),
+								//  task.bcc,
+								//  'zoneRegion'+zoneRegion,
+								//  now // Parameter for created_at (only insert)
 								// ).run()
 
 
 								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 									text : page.text || "",
-									list : page.list || "",
+									node : page.node || "",
 									item : page.item || "",
 									more : page.more || "",
 									next : page.next || ""
@@ -2209,7 +2246,7 @@ export default {
 									/*
 										주문이후의 절차는 주문번호로 매칭해야함
 
-										type : tracking					// 배송추적
+										type : tracking                 // 배송추적
 																		// "고객 주문"" or "자사 재고" 등으로 추상화 매칭
 
 										type : order
@@ -2223,10 +2260,10 @@ export default {
 											이 부분은 무조건 유료만 가능하게
 
 												벡터 쿼리로 미리 저장하고 
-													type : order, semantic : cancel		// 주문취소
-													type : order, semantic : exchange	// 교환
-													type : order, semantic : return 	// 반품
-													type : order, semantic : refund		// 환불
+													type : order, semantic : cancel     // 주문취소
+													type : order, semantic : exchange   // 교환
+													type : order, semantic : return     // 반품
+													type : order, semantic : refund     // 환불
 
 												title값 쿼리로 semantic 선택
 
@@ -2249,7 +2286,11 @@ export default {
 											continue
 										}
 
-										item.type = page.type
+										if(isDetail){
+											item.link = task.link
+										}
+
+										item.type = pageType
 
 										item.no = (item.id ? item.id : i).toString()
 
@@ -2284,9 +2325,7 @@ export default {
 										}
 
 
-										if(isDetail){
-											item.link = task.link
-										}
+										
 
 										item.id = hashId(task.to+task.cc+item.link)
 										
@@ -2935,7 +2974,7 @@ export default {
 													hashId(),
 													task.bcc,
 													'inner err'+type+err,
-													now	// Parameter for created_at (only insert)
+													now // Parameter for created_at (only insert)
 												).run()
 											}
 										}
@@ -2943,7 +2982,7 @@ export default {
 
 
 										if(Object.keys(drafts).length){
-											for (const type in drafts) {
+											for (var type in drafts) {
 												// for start
 
 												if (drafts.hasOwnProperty(type)) {
@@ -3334,7 +3373,7 @@ export default {
 									hashId(),
 									task.bcc,
 									'inner err'+err,
-									now	// Parameter for created_at (only insert)
+									now // Parameter for created_at (only insert)
 								).run()
 							}
 
@@ -3845,7 +3884,7 @@ export default {
 									}
 
 									if(Object.keys(context.condition).length){
-										for (const key in context.condition) {
+										for (var key in context.condition) {
 											var value = context.condition[key]
 
 											if (context.condition.hasOwnProperty(key)) {
@@ -3901,7 +3940,7 @@ export default {
 
 											if(data){
 												if(Object.keys(data).length){
-													for (const name in data) {
+													for (var name in data) {
 														if (data.hasOwnProperty(name)) {
 															var value = data[name]
 
@@ -3943,7 +3982,7 @@ export default {
 
 											if(data){
 												if(Object.keys(data).length){
-													for (const name in data) {
+													for (var name in data) {
 														if (data.hasOwnProperty(name)) {
 															var value = data[name]
 
@@ -4157,7 +4196,7 @@ export default {
 					}), {
 						headers: { "Content-Type": "application/json" },
 					})
-				}		
+				}       
 			}
 		}catch(err){
 			console.log('err',err);
