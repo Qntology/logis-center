@@ -2068,10 +2068,6 @@ export default {
 										}
 									}
 								}
-
-								// page.items
-
-
 								
 
 								if(task.ref){
@@ -2089,10 +2085,6 @@ export default {
 										}
 									}
 								}
-
-
-
-								
 
 
 
