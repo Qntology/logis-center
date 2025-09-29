@@ -1743,9 +1743,9 @@ export default {
 								continue
 							}
 
-							if(task.referrer){
-								item.referrer = task.referrer
-							}
+							// if(task.referrer){
+							// 	item.referrer = task.referrer
+							// }
 
 							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item)), { to: 'arraybuffer' })
 
@@ -2038,6 +2038,7 @@ export default {
 								// page.items
 
 
+								var pageType = ''
 
 								var system = list2json(language)
 
@@ -2048,13 +2049,9 @@ export default {
 										var _page = results[0]
 
 										if(_page.type){
-											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
-
-											var data = JSON.parse(decompressedJsonString)
-
-											system = item2json(_page.type)
-
 											isDetail = true
+
+											pageType = _page.type
 										}
 									}
 								}
@@ -2063,47 +2060,50 @@ export default {
 
 								var page
 
-								var pageType = ''
+								
 
 								var content = convertHtmlToCleanPug(task.text)
 
-								if(models['deepinfra']){
-									page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+								if(!isDetail){
+									if(models['deepinfra']){
+										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
 
-									pageType = page.type
+										pageType = page.type
 
-									models['deepinfra'] -= 1
-
-								}
-
-								if(!page && gemini_llm_api){
-									page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
-
-									pageType = page.type
-
-									models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-								}
-
-								if(!isDetail && page){
-									if(page.isDetail){
 										isDetail = page.isDetail
 
-										system = item2json(pageType)
+										models['deepinfra'] -= 1
 
-										if(models['deepinfra']){
-											page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+									}
 
-											models['deepinfra'] -= 1
+									if(!page && gemini_llm_api){
+										page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
 
-										}
+										pageType = page.type
 
-										if(!page && gemini_llm_api){
-											page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+										isDetail = page.isDetail
 
-											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
-										}
+									}
+								}
+							
+
+								if((!isDetail && page) || isDetail){
+									system = item2json(pageType)
+
+									if(models['deepinfra']){
+										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+										models['deepinfra'] -= 1
+
+									}
+
+									if(!page && gemini_llm_api){
+										page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
 									}
 								}
 
@@ -2112,6 +2112,8 @@ export default {
 
 									continue
 								}
+
+
 
 								page.type = pageType
 
@@ -2123,18 +2125,6 @@ export default {
 
 
 								if(isDetail){
-									await env[CenterRegion].prepare(`
-										INSERT INTO console (
-											"id", "bcc", "log", "created_at"
-										) VALUES (
-											?1, ?2, ?3, ?4
-										) ON CONFLICT (id) DO NOTHING
-									`).bind(
-										hashId(),
-										task.bcc,
-										'detail page content '+content,
-										now // Parameter for created_at (only insert)
-									).run()
 									page.items = [page]
 								}
 
@@ -2290,7 +2280,7 @@ export default {
 											item.link = task.link
 										}
 
-										item.type = pageType
+										item.type = page.type
 
 										item.no = (item.id ? item.id : i).toString()
 
@@ -2339,6 +2329,19 @@ export default {
 										item.bcc = task.bcc
 
 										item.ref = task.referrer ? task.referrer : ""
+
+										await env[CenterRegion].prepare(`
+											INSERT INTO console (
+												"id", "bcc", "log", "created_at"
+											) VALUES (
+												?1, ?2, ?3, ?4
+											) ON CONFLICT (id) DO NOTHING
+										`).bind(
+											hashId(),
+											task.bcc,
+											'item.ref '+item.ref,
+											now // Parameter for created_at (only insert)
+										).run()
 
 
 
