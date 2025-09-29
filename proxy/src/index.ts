@@ -1687,11 +1687,11 @@ export default {
 							}
 						}
 
-						if(limits[task.team]){
-							limits[task.team] -= 1
+						if(limits[team.id]){
+							limits[team.id] -= 1
 						}else{
-							if(typeof limits[task.team] == "undefined"){
-								limits[task.team] = 0
+							if(typeof limits[team.id] == "undefined"){
+								limits[team.id] = 0
 							}else{
 								fallback = 'out of gas'
 
@@ -1759,7 +1759,7 @@ export default {
 							*/
 							item.no = item.id
 
-							item.id = hashId(task.to+item.no)
+							item.id = hashId(team.id+item.no)
 
 							item.type = type
 
@@ -2317,7 +2317,8 @@ export default {
 
 										
 
-										item.id = hashId(task.to+task.cc+item.link)
+
+										item.id = hashId(team.id+task.cc+item.link)
 										
 
 
@@ -2922,7 +2923,7 @@ export default {
 													var { results } = await env[`${zoneRegion}_${type}`].prepare(
 														`SELECT * FROM ${type} WHERE "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
 													).bind(
-														crc32(hashId(task.to+item.id)), team.id, item.cc, now - 60000
+														item.index, team.id, item.cc, now - 60000
 													).all()
 
 													if(results.length){
