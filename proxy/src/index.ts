@@ -2023,13 +2023,13 @@ export default {
 										"created_at" = EXCLUDED."created_at",
 										"updated_at" = EXCLUDED."updated_at"
 								`).bind(
-									hashId(task.id),
+									task.id,
 									"prompt",
 									task.from,
 									task.to,
 									task.cc,
 									task.bcc,
-									task.id,
+									task.ref,
 									now,
 									0
 								)
@@ -2161,7 +2161,7 @@ export default {
 
 								page.type = pageType
 
-								page.id = hashId(task.link)
+								page.id = hashId(task.cc+task.link)
 								page.from = task.from
 								page.to = task.to
 								page.cc = task.cc
@@ -3405,13 +3405,13 @@ export default {
 											"created_at" = EXCLUDED."created_at",
 											"updated_at" = EXCLUDED."updated_at"
 									`).bind(
-										hashId(task.id),
+										task.id,
 										task.type,
 										task.from,
 										task.to,
 										task.cc,
 										task.bcc,
-										task.id,
+										task.ref,
 										now,
 										0
 									)
