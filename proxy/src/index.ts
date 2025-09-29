@@ -117,6 +117,60 @@ const randomKey = function(){
 	return parseInt(key.replace("0.",""))
 }
 
+/**
+ * 두 객체를 병합합니다. obj1의 값이 비어있다면(null, undefined, '') obj2의 값으로 덮어씁니다.
+ * obj2의 값이 유효하다면(null, undefined, ''이 아니라면) 덮어씁니다.
+ * @param {Object} obj1 기본 객체
+ * @param {Object} obj2 덮어쓸 값(소스)을 가진 객체
+ * @returns {Object} 병합된 새로운 객체
+ */
+function mergeItem(obj1, obj2) {
+	// 새로운 객체를 생성하여 obj1의 속성을 복사합니다.
+	const merged = { ...obj1 };
+
+	// obj2의 모든 키를 순회합니다.
+	for (const key in obj2) {
+		if (obj2.hasOwnProperty(key)) {
+			const value1 = merged[key];
+			const value2 = obj2[key];
+
+			// **값이 비어있는지 확인하는 헬퍼 함수**
+			// '비어있다'는 기준은 null, undefined, 빈 문자열('')로 정의합니다.
+			const isEmpty = (value) => value === null || value === undefined || value === '';
+
+			// 1. obj1에 해당 키가 없거나,
+			// 2. obj1의 값이 비어있는 경우 && obj2의 값이 비어있지 않은 경우
+			//    => obj2의 값으로 덮어씁니다.
+
+			// obj2의 값이 유효하다면 (비어있지 않다면)
+			if (!isEmpty(value2)) {
+				// obj1의 값이 비어있거나 (키가 아예 없거나)
+				// obj2의 값이 obj1의 값보다 더 '유효'하다고 판단되면 덮어씁니다.
+				// 이 로직은 obj1에 값이 있더라도 obj2에 유효한 값이 있다면 덮어쓰도록 구현되었습니다.
+				// 예를 들어, obj1.name = 'Alice', obj2.name = 'Bob' 이면 'Bob'이 최종 값이 됩니다.
+
+				// 만약 obj1의 값이 비어있을 때만 덮어쓰고 싶다면 아래와 같이 조건을 수정하세요:
+				// if (isEmpty(value1)) { merged[key] = value2; }
+				// 하지만 일반적으로는 obj2가 '업데이트할' 값을 담고 있으므로 무조건 덮어쓰는 것이 일반적입니다.
+
+				// 여기서는 **"하나(obj1)는 값이 비어있고 하나(obj2)는 값이 있으면 있는 값으로 덮어씌우는"** 요구사항을
+				// 좀 더 명확하게 **"obj1의 값이 비어있을 경우에만 obj2의 유효한 값으로 덮어쓴다"**로 해석하여 구현해 보겠습니다.
+
+				if (isEmpty(value1)) {
+					merged[key] = value2;
+				} else {
+					// obj1에 이미 유효한 값이 있다면 덮어쓰지 않고 obj1의 값을 유지합니다.
+					// (선택 사항: 원본 obj1의 값을 유지)
+				}
+			}
+			// obj2의 값이 비어있다면 아무 작업도 하지 않습니다. (obj1의 값이 유지됨)
+
+		}
+	}
+
+	return merged;
+}
+
 const image2json = function(type){
 	if(type == "tracking"){
 		return `convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.{
@@ -125,8 +179,6 @@ const image2json = function(type){
 		}`
 	}
 }
-
-
 
 
 /*
@@ -1743,9 +1795,6 @@ export default {
 								continue
 							}
 
-							// if(task.referrer){
-							// 	item.referrer = task.referrer
-							// }
 
 							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item)), { to: 'arraybuffer' })
 
@@ -1771,7 +1820,7 @@ export default {
 
 							item.bcc = task.bcc
 
-							item.ref = task.referrer ? task.referrer : ""
+							item.ref = task.ref
 
 							item.created_at = now
 
@@ -1838,7 +1887,7 @@ export default {
 								to: task.to,
 								cc: task.cc,
 								bcc: task.bcc,
-								ref:task.referrer ? task.referrer : ""
+								ref:task.ref
 							}
 
 							var embeddings
@@ -2042,8 +2091,8 @@ export default {
 
 								var system = list2json(language)
 
-								if(task.referrer){
-									var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${task.referrer}" AND "cc" = "${task.cc}" AND "created_at" < ${created_at} LIMIT 1`).all()
+								if(task.ref){
+									var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${task.ref}" AND "cc" = "${task.cc}" AND "created_at" < ${created_at} LIMIT 1`).all()
 
 									if(results.length){
 										var _page = results[0]
@@ -2185,7 +2234,7 @@ export default {
 									next : page.next || ""
 								})), { to: 'arraybuffer' })
 
-								page.ref = task.referrer ? task.referrer : ""
+								page.ref = task.ref
 
 								page.data = arr.buffer
 
@@ -2329,7 +2378,7 @@ export default {
 										item.cc = task.cc
 										item.bcc = task.bcc
 
-										item.ref = task.referrer ? task.referrer : ""
+										item.ref = task.ref
 
 										await env[CenterRegion].prepare(`
 											INSERT INTO console (
@@ -2420,7 +2469,7 @@ export default {
 												to: item.to,
 												cc: item.cc,
 												bcc: item.bcc,
-												ref:task.referrer ? task.referrer : ""
+												ref:task.ref
 											}
 
 											var embeddings
@@ -2495,6 +2544,15 @@ export default {
 											}
 										}
 
+										var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+
+										if(results.length){
+											var _item = results[0]
+
+											item = mergeItem(item, _item)
+										}
+										
 
 										if(itemType == "sales"){
 											statements[`${zoneRegion}_sales`].push(
@@ -3186,7 +3244,7 @@ export default {
 																metadata.to = task.to
 																metadata.cc = task.cc
 																metadata.bcc = task.bcc
-																metadata.ref = task.referrer ? task.referrer : ""
+																metadata.ref = task.ref
 
 																var embeddings
 
