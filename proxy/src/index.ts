@@ -2166,52 +2166,6 @@ export default {
 
 								talk.text = page.text
 
-								// await env[CenterRegion].prepare(`
-								//  INSERT INTO console (
-								//      "id", "bcc", "log", "created_at"
-								//  ) VALUES (
-								//      ?1, ?2, ?3, ?4
-								//  ) ON CONFLICT (id) DO NOTHING
-								// `).bind(
-								//  hashId(),
-								//  task.bcc,
-								//  'talk.text'+talk.text,
-								//  now // Parameter for created_at (only insert)
-								// ).run()
-
-								await env[CenterRegion].prepare(`
-									INSERT INTO console (
-										"id", "bcc", "log", "created_at"
-									) VALUES (
-										?1, ?2, ?3, ?4
-									) ON CONFLICT (id) DO NOTHING
-								`).bind(
-									hashId(),
-									task.bcc,
-									'page.type'+page.type+' isDetail'+isDetail,
-									now // Parameter for created_at (only insert)
-								).run()
-
-								if(!page.type){
-									continue
-
-									fallback = 'type not found'
-								}
-
-
-								// await env[CenterRegion].prepare(`
-								//  INSERT INTO console (
-								//      "id", "bcc", "log", "created_at"
-								//  ) VALUES (
-								//      ?1, ?2, ?3, ?4
-								//  ) ON CONFLICT (id) DO NOTHING
-								// `).bind(
-								//  hashId(),
-								//  task.bcc,
-								//  'zoneRegion'+zoneRegion,
-								//  now // Parameter for created_at (only insert)
-								// ).run()
-
 
 								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 									text : page.text || "",
