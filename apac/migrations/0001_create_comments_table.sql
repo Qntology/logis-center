@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS items (
     "cc" TEXT,
     "bcc" TEXT,
     "ref" TEXT,
+    "data" BLOB NULL,
     "created_at" INTEGER,
     "updated_at" INTEGER
 );
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS sales (
     "discount" REAL,
     "quantity" INTEGER,
     "tracking" INTEGER,
-    "phone" TEXT,
+    "number" TEXT,
     "carrier" TEXT,
     "shipping_fee" REAL,
     "shipping_method" TEXT,

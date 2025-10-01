@@ -109,8 +109,6 @@ async function Cron(event, env, ctx, models, limits){
 						continue
 					}
 
-					console.log('task.ref',task.ref);
-
 					var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 						now : now,
 						ref : task.ref,

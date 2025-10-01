@@ -16,19 +16,6 @@ import { ethers } from "ethers"
 */
 
 /*
-
-	*** 중요 ***
-		1 리스트 페이지는 프롬프트로 무조건 처리해야함
-
-		2 상세는 CSS selector로 발라내야함
-
-		* 상세 먼저 크롤링할 경우 "리스트 먼저 크롤링하라고" 안내 메세지 띄우기
-
-		* 스캔이라고 하지 않고 리스트 스캔이라고 하기
-
-
-
-
 	무료 oauth 토큰
 
 	유료 logis 토큰
@@ -152,10 +139,13 @@ function mergeItem(obj1, obj2) {
 	return merged;
 }
 
-const image2json = function(type){
+const image2json = function(type, address){
 	if(type == "tracking"){
 		return `convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.{
 			no:Tracking Number(운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ) | string,
+			recipient_address : ${JSON.stringify(address)},
+			recipient_match : shipping label recipient address match. Ruled the same despite different floor levels | true/false,
+			text : summarize including the shipping label contents. Filter the addresses included in the summary information to District-level and up | string,
 			barcode : [barcode number | string]
 		}`
 	}
@@ -323,7 +313,7 @@ const list2json = function(language){
 				title:title | string, 
 				sale_price:sale price | number,
 				supply_price:supply price | number,
-				link:detail link | string,
+				link:URL includes manage path additional link | string,
 				currency:ISO 4217 Currency Code | string,
 				quantity:item stock quantity | number,
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
@@ -419,11 +409,10 @@ const item2json = function(type){
 			],
 			additional_goods:[
 				{
-					link:URL includes the path additional goods link | string
+					link:URL includes manage path additional product link | string
 				}
 			],
 			title:product based title | string,
-			link:product detail link | string,
 			date:yyyy-MM-dd'T'HH:mm:ss | string,
 		`
 	}else if(type == 'order'){
@@ -432,7 +421,7 @@ const item2json = function(type){
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
 			goods:[{
 				title:goods title | string,
-				link:URL includes the path additional goods item link | string,
+				link:URL includes manage path additional goods link | string,
 				id:Refer to the ID value from the link or an attribute | string,
 			}],
 			bank:bank company name | string,
@@ -528,7 +517,7 @@ const form2json = function(type){
 				}]
 			}],
 			additional_goods:[{
-				link:URL includes the path additional goods link CSS selector
+				link:URL includes manage path additional goods link CSS selector
 			}],
 			title:goods title CSS selector,
 			date:goods date(yyyy-MM-dd'T'HH:mm:ss) CSS selector
@@ -542,7 +531,7 @@ const form2json = function(type){
 					name : product option name CSS selector,
 					option:product option value CSS selector,
 				}],
-				link:URL includes the path additional product link CSS selector
+				link:URL includes manage path additional product link CSS selector
 			}],
 			date:order date CSS selector
 		`
@@ -1742,7 +1731,13 @@ export default {
 
 							var type = talk.type = task.type
 
-							var system = image2json(type)
+							var address = []
+
+							// 주소 조회해야함
+
+							// 겸사 겸사 업체 정보 등록받자
+
+							var system = image2json(type, address)
 
 							var content = task.text
 
@@ -1750,7 +1745,7 @@ export default {
 							var item
 
 							if(models['deepinfra']){
-								item = await Deepinfra(deepinfra, 'google/gemma-3-4b-it', system, content, inlineData)
+								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, content, inlineData)
 
 								models['deepinfra'] -= 1
 
@@ -1777,12 +1772,24 @@ export default {
 							}
 
 
+							talk.text = item.text
+
+
 							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item)), { to: 'arraybuffer' })
 
 							item.data = arr.buffer
 
+
+
 							/*
+								입고, 출고 나가면 증가 및 차감하는 로직 반영해야함
+
+								업체 주소 미리 입력되어있고, 받는 사람에 LLM으로 true 시 입고, false시 출고
+
+
+
 								item.no == item.index 먼저 조회하고 없으면
+								
 								barcode 찾는 형식으로 해야함
 
 								둘다 없으면 type 'draft'로 전부 추가해야함
@@ -1810,131 +1817,194 @@ export default {
 
 
 
-							var content = {}
-
-
-							if(item.title){
-								content.title = item.title
-							}
-
-							if(item.sender_address){
-								content.sender_address = item.sender_address
-							}
-
-							if(item.recipient_address){
-								content.recipient_address = item.recipient_address
-							}
-
-							if(item.carrier){
-								content.carrier = item.carrier
-							}
-
-							if(item.shipping_method){
-								content.shipping_method = item.shipping_method
-							}
-
-							if(item.fulfillment_service){
-								content.fulfillment_service = item.fulfillment_service
-							}
-
-
-							var system = semantic_prompt_system(language)
-
-							if(models['deepinfra']){
-								talk.text = await Deepinfra(deepinfra, 'google/gemma-3-4b-it', system, JSON.stringify(content))
-
-								models['deepinfra'] -= 1
-
-							}
-
-							if(!talk.text && gemini_llm_api){
-								talk.text = await Gemini(gemini_llm_api, gemini_llm_model, system, JSON.stringify(content))
-
-								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-							}
-
-							if(!talk.text){
-								fallback = 'overflow'
-
-								continue
-							}
-
-
-							var metadata = {
-								id: item.id,
-								type: item.type,
-								from: task.from,
-								to: task.to,
-								cc: task.cc,
-								bcc: task.bcc,
-								ref:task.ref
-							}
-
-							var embeddings
-
-							if(models['cloudflare']){
-								var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
-									text: [talk.text]
-								})
-
-								var $VectorizeVector = [
-									{
-										id: item.id,
-										values: embeddings[0],
-										metadata: metadata
-									}
-								]
-
-								models['cloudflare'] -= 1
-
-							}
-
-							if(!embeddings && models['deepinfra']){
-								var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', talk.text)
-
-								var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-									return {
-										id: item.id,
-										values: values,
-										metadata: metadata
-									}
-								})
-
-								models['deepinfra'] -= 1
-
-							}
-
-							if(!embeddings){
-								fallback = 'overflow'
-
-								continue
-							}
-
-							await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
+								
 
 
 
-							var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+							var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+							var sales = results
 
 							if(type == "tracking"){
-								if(results.length){
-									var tracking = results[0]
+								var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
-									statements[`${zoneRegion}_tracking`].push(
-										env[`${zoneRegion}_tracking`].prepare(`
-											UPDATE tracking SET ref = ?, updated_at = ?, status = ? WHERE id = ?
+								if(results.length){
+									var _item = results[0]
+
+									item = mergeItem(item, _item)
+
+									if(sales.length){
+										var _item = sales[0]
+
+										statements[`${zoneRegion}_sales`].push(
+											env[`${zoneRegion}_sales`].prepare(`
+												UPDATE sales SET updated_at = ?, status = ? WHERE id = ?
+											`).bind(
+												now, _item.status, _item.id
+											)
+										)
+									}
+								}
+
+
+								// item.index
+
+								// 재고 나가는건지 들어가는건지 구분 필요 Shipping, Receiving
+
+								if(sales.length){
+									var _item = sales[0]
+
+									statements[`${zoneRegion}_items`].push(
+										env[`${zoneRegion}_items`].prepare(`
+											INSERT INTO items (
+												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+											) VALUES (
+												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+											) ON CONFLICT (id) DO UPDATE SET
+												"type" = EXCLUDED."type",
+												"from" = EXCLUDED."from",
+												"to" = EXCLUDED."to",
+												"cc" = EXCLUDED."cc",
+												"bcc" = EXCLUDED."bcc",
+												"ref" = EXCLUDED."ref",
+												"data" = EXCLUDED."data",
+												"created_at" = EXCLUDED."created_at",
+												"updated_at" = EXCLUDED."updated_at"
 										`).bind(
-											task.id, now, item.status, tracking.id
+											_item.id,
+											_item.type,
+											_item.from,
+											_item.to,
+											_item.cc,
+											_item.bcc,
+											_item.data,
+											item.id,
+											_item.created_at,
+											now
+										)
+									)
+								}else{
+									var content = {}
+
+									if(item.title){
+										content.title = item.title
+									}
+
+									if(item.sender_address){
+										content.sender_address = item.sender_address
+									}
+
+									if(item.recipient_address){
+										content.recipient_address = item.recipient_address
+									}
+
+									if(item.carrier){
+										content.carrier = item.carrier
+									}
+
+									if(item.shipping_method){
+										content.shipping_method = item.shipping_method
+									}
+
+									if(item.fulfillment_service){
+										content.fulfillment_service = item.fulfillment_service
+									}
+
+									item.type = item.recipient_match ? 'receiving' : 'shipping'
+
+									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+										type : task.type,
+										text : item.text,
+										link : null
+									})), { to: 'arraybuffer' })
+
+									item.data = arr.buffer
+
+
+									var metadata = {
+										id: item.id,
+										type: item.type,
+										from: task.from,
+										to: task.to,
+										cc: task.cc,
+										bcc: task.bcc,
+										ref:task.ref
+									}
+
+									var embeddings
+
+									if(models['cloudflare']){
+										var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
+											text: [item.text]
+										})
+
+										var $VectorizeVector = [
+											{
+												id: item.id,
+												values: embeddings[0],
+												metadata: metadata
+											}
+										]
+
+										models['cloudflare'] -= 1
+
+									}
+
+									if(!embeddings && models['deepinfra']){
+										var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', item.text)
+
+										var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+											return {
+												id: item.id,
+												values: values,
+												metadata: metadata
+											}
+										})
+
+										models['deepinfra'] -= 1
+
+									}
+
+									if(!embeddings){
+										fallback = 'overflow'
+
+										continue
+									}
+
+									await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
+
+									statements[`${zoneRegion}_items`].push(
+										env[`${zoneRegion}_items`].prepare(`
+											INSERT INTO items (
+												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+											) VALUES (
+												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+											) ON CONFLICT (id) DO UPDATE SET
+												"type" = EXCLUDED."type",
+												"from" = EXCLUDED."from",
+												"to" = EXCLUDED."to",
+												"cc" = EXCLUDED."cc",
+												"bcc" = EXCLUDED."bcc",
+												"ref" = EXCLUDED."ref",
+												"data" = EXCLUDED."data",
+												"created_at" = EXCLUDED."created_at",
+												"updated_at" = EXCLUDED."updated_at"
+										`).bind(
+											task.id,
+											task.type,
+											task.from,
+											task.to,
+											task.cc,
+											task.bcc,
+											task.ref,
+											arr.buffer,
+											now,
+											0
 										)
 									)
 								}
 
-								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-									title : item.title
-								})), { to: 'arraybuffer' })
-
-								item.data = arr.buffer
 
 								statements[`${zoneRegion}_tracking`].push(
 									env[`${zoneRegion}_tracking`].prepare(`
@@ -2006,34 +2076,7 @@ export default {
 									)
 								)
 							}
-
-							statements[`${zoneRegion}_items`].push(
-								env[`${zoneRegion}_items`].prepare(`
-									INSERT INTO items (
-										"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
-									) VALUES (
-										?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
-									) ON CONFLICT (id) DO UPDATE SET
-										"type" = EXCLUDED."type",
-										"from" = EXCLUDED."from",
-										"to" = EXCLUDED."to",
-										"cc" = EXCLUDED."cc",
-										"bcc" = EXCLUDED."bcc",
-										"ref" = EXCLUDED."ref",
-										"created_at" = EXCLUDED."created_at",
-										"updated_at" = EXCLUDED."updated_at"
-								`).bind(
-									task.id,
-									"prompt",
-									task.from,
-									task.to,
-									task.cc,
-									task.bcc,
-									task.ref,
-									now,
-									0
-								)
-							)
+								
 
 						}else if(task.scan){
 							// INSERT 백터 생성 INSERT
@@ -2047,7 +2090,9 @@ export default {
 
 								var pageLength = 0
 
-								var pageId = hashId(task.link)
+								var pathname = task.link.split("?")[0]
+
+								var pageId = hashId(task.cc+pathname)
 
 								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${pageId}" AND "created_at" < ${created_at} LIMIT 1`).all()
 
@@ -2153,7 +2198,8 @@ export default {
 
 								page.type = pageType
 
-								page.id = hashId(task.cc+task.link)
+
+								page.id = pageId // hashId(task.cc+pageId)
 								page.from = task.from
 								page.to = task.to
 								page.cc = task.cc
@@ -2499,7 +2545,7 @@ export default {
 											statements[`${zoneRegion}_sales`].push(
 												env[`${zoneRegion}_sales`].prepare(`
 													INSERT INTO sales (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "phone", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
 													) VALUES (
 														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
 													) ON CONFLICT (id) DO UPDATE SET
@@ -2528,7 +2574,7 @@ export default {
 														"discount" = EXCLUDED."discount",
 														"quantity" = EXCLUDED."quantity",
 														"tracking" = EXCLUDED."tracking",
-														"phone" = EXCLUDED."phone",
+														"number" = EXCLUDED."number",
 														"carrier" = EXCLUDED."carrier",
 														"shipping_fee" = EXCLUDED."shipping_fee",
 														"shipping_method" = EXCLUDED."shipping_method",
@@ -2569,7 +2615,7 @@ export default {
 													item.discount ? parseFloat(item.discount) : 0,
 													item.quantity ? parseFloat(item.quantity) : 0,
 													item.tracking ? parseFloat(item.tracking) : 0,
-													item.phone ? item.phone : "",
+													item.number ? item.number : "",
 													item.carrier ? item.carrier : "",
 													item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
 													item.shipping_method ? item.shipping_method : "",
@@ -2659,7 +2705,7 @@ export default {
 											statements[`${zoneRegion}_event`].push(
 												env[`${zoneRegion}_event`].prepare(`
 													INSERT INTO event (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "phone", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
 													) VALUES (
 														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
 													) ON CONFLICT (id) DO UPDATE SET
@@ -2675,7 +2721,7 @@ export default {
 														"expired_at" = EXCLUDED."expired_at",
 														"index" = EXCLUDED."index",
 														"event" = EXCLUDED."event",
-														"phone" = EXCLUDED."phone",
+														"number" = EXCLUDED."number",
 														"address" = EXCLUDED."address",
 														"status" = EXCLUDED."status",
 														"code" = EXCLUDED."code",
@@ -2703,7 +2749,7 @@ export default {
 													item.expired_at ? parseFloat(item.expired_at) : 0,
 													item.index ? parseFloat(item.index) : 0,
 													item.event ? parseFloat(item.event) : 0,
-													item.phone ? item.phone : "",
+													item.number ? item.number : "",
 													item.address ? item.address : "",
 													item.status ? item.status : "",
 													item.code ? item.code : "",
@@ -3049,7 +3095,7 @@ export default {
 																statements[`${zoneRegion}_${type}`].push(
 																	env[`${zoneRegion}_${type}`].prepare(`
 																		INSERT INTO ${type} (
-																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "phone", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
 																		) VALUES (
 																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
 																		) ON CONFLICT (id) DO UPDATE SET
@@ -3078,7 +3124,7 @@ export default {
 																			"discount" = EXCLUDED."discount",
 																			"quantity" = EXCLUDED."quantity",
 																			"tracking" = EXCLUDED."tracking",
-																			"phone" = EXCLUDED."phone",
+																			"number" = EXCLUDED."number",
 																			"carrier" = EXCLUDED."carrier",
 																			"shipping_fee" = EXCLUDED."shipping_fee",
 																			"shipping_method" = EXCLUDED."shipping_method",
@@ -3119,7 +3165,7 @@ export default {
 																		row.discount ? parseFloat(row.discount) : 0,
 																		row.quantity ? parseFloat(row.quantity) : 0,
 																		row.tracking ? parseFloat(row.tracking) : 0,
-																		item.phone ? item.phone : "",
+																		item.number ? item.number : "",
 																		row.carrier ? row.carrier : "",
 																		row.shipping_fee ? parseFloat(row.shipping_fee) : 0,
 																		row.shipping_method ? row.shipping_method : "",
@@ -3228,30 +3274,34 @@ export default {
 
 																	continue
 																}
-																
 
 																await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 
-															}else{
-																// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
-
-																statements[`${zoneRegion}_${type}`].push(
-																	env[`${zoneRegion}_${type}`].prepare(`
-																		UPDATE ${type} SET ${column} = ? WHERE id = ?
-																	`).bind(
-																		index, row.id
-																	)
-																)
-
-																statements[`${zoneRegion}_items`].push(
-																	env[`${zoneRegion}_items`].prepare(`
-																		UPDATE items SET updated_at = ? WHERE id = ?
-																	`).bind(
-																		now, row.id
-																	)
-																)
 															}
+
+															// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
+
+															statements[`${zoneRegion}_${type}`].push(
+																env[`${zoneRegion}_${type}`].prepare(`
+																	UPDATE ${type} SET ${column} = ? WHERE id = ?
+																`).bind(
+																	index, row.id
+																)
+															)
+
+															statements[`${zoneRegion}_items`].push(
+																env[`${zoneRegion}_items`].prepare(`
+																	UPDATE items SET updated_at = ? WHERE id = ?
+																`).bind(
+																	now, row.id
+																)
+															)
+
+															// for end
+
 														}
+
+														// if end
 													}
 												}
 
@@ -3261,12 +3311,19 @@ export default {
 											// if end
 										}
 
+
+										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+											type : item.type,
+											text : item.semantic,
+											link : item.link
+										})), { to: 'arraybuffer' })
+
 										statements[`${zoneRegion}_items`].push(
 											env[`${zoneRegion}_items`].prepare(`
 												INSERT INTO items (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
+													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
 												) ON CONFLICT (id) DO UPDATE SET
 													"type" = EXCLUDED."type",
 													"from" = EXCLUDED."from",
@@ -3274,6 +3331,7 @@ export default {
 													"cc" = EXCLUDED."cc",
 													"bcc" = EXCLUDED."bcc",
 													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
 													"created_at" = EXCLUDED."created_at",
 													"updated_at" = EXCLUDED."updated_at"
 											`).bind(
@@ -3284,6 +3342,7 @@ export default {
 												item.cc,
 												item.bcc,
 												item.ref,
+												arr.buffer,
 												now,
 												0
 											)
@@ -3335,12 +3394,18 @@ export default {
 									task.data = null
 								}
 
+								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+									type : page.type,
+									text : task.semantic,
+									link : task.link
+								})), { to: 'arraybuffer' })
+
 								statements[`${zoneRegion}_items`].push(
 									env[`${zoneRegion}_items`].prepare(`
 										INSERT INTO items (
-											"id", "type", "from", "to", "cc", "bcc", "ref", "created_at", "updated_at"
+											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 										) VALUES (
-											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
 										) ON CONFLICT (id) DO UPDATE SET
 											"type" = EXCLUDED."type",
 											"from" = EXCLUDED."from",
@@ -3348,6 +3413,7 @@ export default {
 											"cc" = EXCLUDED."cc",
 											"bcc" = EXCLUDED."bcc",
 											"ref" = EXCLUDED."ref",
+											"data" = EXCLUDED."data",
 											"created_at" = EXCLUDED."created_at",
 											"updated_at" = EXCLUDED."updated_at"
 									`).bind(
@@ -3358,8 +3424,9 @@ export default {
 										task.cc,
 										task.bcc,
 										task.ref,
+										arr.buffer,
 										now,
-										0
+										now
 									)
 								)
 
