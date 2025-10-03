@@ -2522,7 +2522,6 @@ export default {
 
 
 										// team base 설정
-
 										if(!team.data.base){
 											team.data.base = {
 												sales : {},
@@ -2530,6 +2529,8 @@ export default {
 												tracking : {}
 											}
 										}
+
+
 
 										var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
@@ -2541,233 +2542,7 @@ export default {
 										}
 										
 
-										if(itemType == "sales"){
-											statements[`${zoneRegion}_sales`].push(
-												env[`${zoneRegion}_sales`].prepare(`
-													INSERT INTO sales (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
-													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
-													) ON CONFLICT (id) DO UPDATE SET
-														"type" = EXCLUDED."type",
-														"from" = EXCLUDED."from",
-														"to" = EXCLUDED."to",
-														"cc" = EXCLUDED."cc",
-														"bcc" = EXCLUDED."bcc",
-														"ref" = EXCLUDED."ref",
-														"data" = EXCLUDED."data",
-														"created_at" = EXCLUDED."created_at",
-														"started_at" = EXCLUDED."started_at",
-														"expired_at" = EXCLUDED."expired_at",
-														"index" = EXCLUDED."index",
-														"event" = EXCLUDED."event",
-														"views" = EXCLUDED."views",
-														"sales" = EXCLUDED."sales",
-														"width" = EXCLUDED."width",
-														"height" = EXCLUDED."height",
-														"length" = EXCLUDED."length",
-														"weight" = EXCLUDED."weight",
-														"size" = EXCLUDED."size",
-														"currency" = EXCLUDED."currency",
-														"supply_price" = EXCLUDED."supply_price",
-														"sale_price" = EXCLUDED."sale_price",
-														"discount" = EXCLUDED."discount",
-														"quantity" = EXCLUDED."quantity",
-														"tracking" = EXCLUDED."tracking",
-														"number" = EXCLUDED."number",
-														"carrier" = EXCLUDED."carrier",
-														"shipping_fee" = EXCLUDED."shipping_fee",
-														"shipping_method" = EXCLUDED."shipping_method",
-														"shipping_duration" = EXCLUDED."shipping_duration",
-														"fulfillment_service" = EXCLUDED."fulfillment_service",
-														"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
-														"bundle_shipping" = EXCLUDED."bundle_shipping",
-														"used" = EXCLUDED."used",
-														"lease" = EXCLUDED."lease",
-														"rental" = EXCLUDED."rental",
-														"refurbish" = EXCLUDED."refurbish",
-														"tax_included" = EXCLUDED."tax_included",
-														"release_date" = EXCLUDED."release_date"
-												`).bind(
-													item.id,
-													item.type,
-													item.from,
-													item.to,
-													item.cc,
-													item.bcc,
-													item.ref,
-													item.data,
-													item.created_at,
-													item.started_at ? parseFloat(item.started_at) : 0,
-													item.expired_at ? parseFloat(item.expired_at) : 0,
-													item.index ? parseFloat(item.index) : 0,
-													item.event ? parseFloat(item.event) : 0,
-													item.views ? parseFloat(item.views) : 0,
-													item.sales ? parseFloat(item.sales) : 0,
-													item.width ? parseFloat(item.width) : 0,
-													item.height ? parseFloat(item.height) : 0,
-													item.length ? parseFloat(item.length) : 0,
-													item.weight ? parseFloat(item.weight) : 0,
-													item.size ? item.size : "",
-													item.currency,
-													item.supply_price? parseFloat(item.supply_price) : 0,
-													item.sale_price? parseFloat(item.sale_price) : 0,
-													item.discount ? parseFloat(item.discount) : 0,
-													item.quantity ? parseFloat(item.quantity) : 0,
-													item.tracking ? parseFloat(item.tracking) : 0,
-													item.number ? item.number : "",
-													item.carrier ? item.carrier : "",
-													item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
-													item.shipping_method ? item.shipping_method : "",
-													item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
-													item.fulfillment_service ? item.fulfillment_service : "",
-													item.stock_keeping_unit ? item.stock_keeping_unit : "",
-													item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0,
-													item.used ? parseFloat(item.used) : 0,
-													item.lease ? parseFloat(item.lease) : 0,
-													item.rental ? parseFloat(item.rental) : 0,
-													item.refurbish ? parseFloat(item.refurbish) : 0,
-													item.tax_included ? parseFloat(item.tax_included) : 0,
-													item.release_date ? parseFloat(item.release_date) : 0
-												)
-											)
-										}else if(itemType == "tracking"){
-											statements[`${zoneRegion}_tracking`].push(
-												env[`${zoneRegion}_tracking`].prepare(`
-													INSERT INTO tracking (
-														"id", "from", "to", "cc", "bcc", "ref", "created_at", "index", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
-													) ON CONFLICT (id) DO UPDATE SET
-														"from" = EXCLUDED."from",
-														"to" = EXCLUDED."to",
-														"cc" = EXCLUDED."cc",
-														"bcc" = EXCLUDED."bcc",
-														"ref" = EXCLUDED."ref",
-														"created_at" = EXCLUDED."created_at",
-														"index" = EXCLUDED."index",
-														"status" = EXCLUDED."status",
-														"no" = EXCLUDED."no",
-														"sender_address" = EXCLUDED."sender_address",
-														"sender_phone" = EXCLUDED."sender_phone",
-														"recipient_address" = EXCLUDED."recipient_address",
-														"recipient_phone" = EXCLUDED."recipient_phone",
-														"width" = EXCLUDED."width",
-														"height" = EXCLUDED."height",
-														"length" = EXCLUDED."length",
-														"weight" = EXCLUDED."weight",
-														"carrier" = EXCLUDED."carrier",
-														"shipping_fee" = EXCLUDED."shipping_fee",
-														"shipping_method" = EXCLUDED."shipping_method",
-														"shipping_duration" = EXCLUDED."shipping_duration",
-														"shipping_date" = EXCLUDED."shipping_date",
-														"delivery_date" = EXCLUDED."delivery_date",
-														"order_date" = EXCLUDED."order_date",
-														"payment_date" = EXCLUDED."payment_date",
-														"payment_method" = EXCLUDED."payment_method",
-														"payment_origin" = EXCLUDED."payment_origin",
-														"payment_number" = EXCLUDED."payment_number",
-														"bundle_shipping" = EXCLUDED."bundle_shipping"
-												`).bind(
-													item.id,
-													item.from,
-													item.to,
-													item.cc,
-													item.bcc,
-													item.ref,
-													item.created_at,
-													item.index,
-													item.status,
-													item.no ? item.no : "",
-													item.sender_address ? item.sender_address : "",
-													item.sender_phone ? item.sender_phone : "",
-													item.recipient_address ? item.recipient_address : "",
-													item.recipient_phone ? item.recipient_phone : "",
-													item.width ? parseFloat(item.width) : 0,
-													item.height ? parseFloat(item.height) : 0,
-													item.length ? parseFloat(item.length) : 0,
-													item.weight ? parseFloat(item.weight) : 0,
-													item.carrier ? parseFloat(item.carrier) : 0,
-													item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
-													item.shipping_method ? item.shipping_method : "",
-													item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
-													item.shipping_date ? parseFloat(item.shipping_date) : 0,
-													item.delivery_date ? parseFloat(item.delivery_date) : 0,
-													item.order_date ? parseFloat(item.order_date) : 0,
-													item.payment_date ? parseFloat(item.payment_date) : 0,
-													item.payment_method ? item.payment_method : "",
-													item.payment_origin ? item.payment_origin : "",
-													item.payment_number ? item.payment_number : "",
-													item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0
-												)
-											)
-										}else if(itemType == "event"){
-											statements[`${zoneRegion}_event`].push(
-												env[`${zoneRegion}_event`].prepare(`
-													INSERT INTO event (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
-													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
-													) ON CONFLICT (id) DO UPDATE SET
-														"type" = EXCLUDED."type",
-														"from" = EXCLUDED."from",
-														"to" = EXCLUDED."to",
-														"cc" = EXCLUDED."cc",
-														"bcc" = EXCLUDED."bcc",
-														"ref" = EXCLUDED."ref",
-														"data" = EXCLUDED."data",
-														"created_at" = EXCLUDED."created_at",
-														"started_at" = EXCLUDED."started_at",
-														"expired_at" = EXCLUDED."expired_at",
-														"index" = EXCLUDED."index",
-														"event" = EXCLUDED."event",
-														"number" = EXCLUDED."number",
-														"address" = EXCLUDED."address",
-														"status" = EXCLUDED."status",
-														"code" = EXCLUDED."code",
-														"discount" = EXCLUDED."discount",
-														"quantity" = EXCLUDED."quantity",
-														"usage_per" = EXCLUDED."usage_per",
-														"usage_limit" = EXCLUDED."usage_limit",
-														"min_order_amount" = EXCLUDED."min_order_amount",
-														"max_order_amount" = EXCLUDED."max_order_amount",
-														"max_discount_amount" = EXCLUDED."max_discount_amount",
-														"new_customer_only" = EXCLUDED."new_customer_only",
-														"first_purchase_only" = EXCLUDED."first_purchase_only",
-														"region_restrictions" = EXCLUDED."region_restrictions"
-												`).bind(
-													item.id,
-													item.type,
-													item.from,
-													item.to,
-													item.cc,
-													item.bcc,
-													item.ref,
-													item.data,
-													item.created_at,
-													item.started_at ? parseFloat(item.started_at) : 0,
-													item.expired_at ? parseFloat(item.expired_at) : 0,
-													item.index ? parseFloat(item.index) : 0,
-													item.event ? parseFloat(item.event) : 0,
-													item.number ? item.number : "",
-													item.address ? item.address : "",
-													item.status ? item.status : "",
-													item.code ? item.code : "",
-													item.discount ? parseFloat(item.discount) : 0,
-													item.quantity ? parseFloat(item.quantity) : 0,
-													item.usage_per ? parseFloat(item.usage_per) : 0,
-													item.usage_limit ? parseFloat(item.usage_limit) : 0,
-													item.min_order_amount ? parseFloat(item.min_order_amount) : 0,
-													item.max_order_amount ? parseFloat(item.max_order_amount) : 0,
-													item.max_discount_amount ? parseFloat(item.max_discount_amount) : 0,
-													item.new_customer_only ? parseFloat(item.new_customer_only) : 0,
-													item.first_purchase_only ? parseFloat(item.first_purchase_only) : 0,
-													item.region_restrictions ? parseFloat(item.region_restrictions) : 0
-												)
-											)
-										}
-									
-
+										
 
 										if(item.price <= team.data.base[itemType].price.min){
 											team.data.base[itemType].price.min = item.price
@@ -2948,13 +2723,26 @@ export default {
 										}
 
 
+										/*
+											type 별로 
 
+											updated_at 값 설정해야함
+
+											order
+
+											event
+										*/
+
+										var updated_at
+
+										var progress = {}
 
 										var drafts = {}
 
 										var related = Related(item.type)
 
 										// 관련 타입 정보 가져옴
+
 
 										for(var r = 0; r < related.length; r++){
 											var relatedType = related[r]
@@ -2970,6 +2758,9 @@ export default {
 													).bind(
 														item.index, team.id, item.cc, now - 60000
 													).all()
+
+
+													
 
 													if(results.length){
 														if(flow){
@@ -3002,7 +2793,30 @@ export default {
 														}
 
 													}else{
+														// draft 상태 맞음
 														// 없으면 추가해야함 - 일부 사용자가 직접 팝업으로 띄워야 할수 있음
+
+														/*
+															상품 스캔 하였는데
+															상품 상세페이지 스캔 안되어있으면
+														*/
+
+														/*
+															고객 주문 스캔하였는데
+															배송 시작 정보가 없을시
+														*/
+														if(item.type == "order" && type == "tracking" && column == "sales"){
+															updated_at = 0
+														}
+
+
+														/*
+															이벤트 스캔하였는데
+															상품에 이벤트 등록 안되어있으면
+														*/
+														if(item.type == "event" && type == "sales" && column == "event"){
+															updated_at = 0
+														}
 
 														drafts[type] = {
 															rows : [],
@@ -3027,6 +2841,8 @@ export default {
 												).run()
 											}
 										}
+
+
 
 
 
@@ -3318,6 +3134,7 @@ export default {
 											link : item.link
 										})), { to: 'arraybuffer' })
 
+
 										statements[`${zoneRegion}_items`].push(
 											env[`${zoneRegion}_items`].prepare(`
 												INSERT INTO items (
@@ -3344,9 +3161,235 @@ export default {
 												item.ref,
 												arr.buffer,
 												now,
-												0
+												typeof updated_at != "undefined" ? updated_at : now 
 											)
 										)
+
+										if(itemType == "sales"){
+											statements[`${zoneRegion}_sales`].push(
+												env[`${zoneRegion}_sales`].prepare(`
+													INSERT INTO sales (
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+													) VALUES (
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
+													) ON CONFLICT (id) DO UPDATE SET
+														"type" = EXCLUDED."type",
+														"from" = EXCLUDED."from",
+														"to" = EXCLUDED."to",
+														"cc" = EXCLUDED."cc",
+														"bcc" = EXCLUDED."bcc",
+														"ref" = EXCLUDED."ref",
+														"data" = EXCLUDED."data",
+														"created_at" = EXCLUDED."created_at",
+														"started_at" = EXCLUDED."started_at",
+														"expired_at" = EXCLUDED."expired_at",
+														"index" = EXCLUDED."index",
+														"event" = EXCLUDED."event",
+														"views" = EXCLUDED."views",
+														"sales" = EXCLUDED."sales",
+														"width" = EXCLUDED."width",
+														"height" = EXCLUDED."height",
+														"length" = EXCLUDED."length",
+														"weight" = EXCLUDED."weight",
+														"size" = EXCLUDED."size",
+														"currency" = EXCLUDED."currency",
+														"supply_price" = EXCLUDED."supply_price",
+														"sale_price" = EXCLUDED."sale_price",
+														"discount" = EXCLUDED."discount",
+														"quantity" = EXCLUDED."quantity",
+														"tracking" = EXCLUDED."tracking",
+														"number" = EXCLUDED."number",
+														"carrier" = EXCLUDED."carrier",
+														"shipping_fee" = EXCLUDED."shipping_fee",
+														"shipping_method" = EXCLUDED."shipping_method",
+														"shipping_duration" = EXCLUDED."shipping_duration",
+														"fulfillment_service" = EXCLUDED."fulfillment_service",
+														"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
+														"bundle_shipping" = EXCLUDED."bundle_shipping",
+														"used" = EXCLUDED."used",
+														"lease" = EXCLUDED."lease",
+														"rental" = EXCLUDED."rental",
+														"refurbish" = EXCLUDED."refurbish",
+														"tax_included" = EXCLUDED."tax_included",
+														"release_date" = EXCLUDED."release_date"
+												`).bind(
+													item.id,
+													item.type,
+													item.from,
+													item.to,
+													item.cc,
+													item.bcc,
+													item.ref,
+													item.data,
+													item.created_at,
+													item.started_at ? parseFloat(item.started_at) : 0,
+													item.expired_at ? parseFloat(item.expired_at) : 0,
+													item.index ? parseFloat(item.index) : 0,
+													item.event ? parseFloat(item.event) : 0,
+													item.views ? parseFloat(item.views) : 0,
+													item.sales ? parseFloat(item.sales) : 0,
+													item.width ? parseFloat(item.width) : 0,
+													item.height ? parseFloat(item.height) : 0,
+													item.length ? parseFloat(item.length) : 0,
+													item.weight ? parseFloat(item.weight) : 0,
+													item.size ? item.size : "",
+													item.currency,
+													item.supply_price? parseFloat(item.supply_price) : 0,
+													item.sale_price? parseFloat(item.sale_price) : 0,
+													item.discount ? parseFloat(item.discount) : 0,
+													item.quantity ? parseFloat(item.quantity) : 0,
+													item.tracking ? parseFloat(item.tracking) : 0,
+													item.number ? item.number : "",
+													item.carrier ? item.carrier : "",
+													item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
+													item.shipping_method ? item.shipping_method : "",
+													item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
+													item.fulfillment_service ? item.fulfillment_service : "",
+													item.stock_keeping_unit ? item.stock_keeping_unit : "",
+													item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0,
+													item.used ? parseFloat(item.used) : 0,
+													item.lease ? parseFloat(item.lease) : 0,
+													item.rental ? parseFloat(item.rental) : 0,
+													item.refurbish ? parseFloat(item.refurbish) : 0,
+													item.tax_included ? parseFloat(item.tax_included) : 0,
+													item.release_date ? parseFloat(item.release_date) : 0
+												)
+											)
+										}else if(itemType == "tracking"){
+											statements[`${zoneRegion}_tracking`].push(
+												env[`${zoneRegion}_tracking`].prepare(`
+													INSERT INTO tracking (
+														"id", "from", "to", "cc", "bcc", "ref", "created_at", "index", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+													) VALUES (
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+													) ON CONFLICT (id) DO UPDATE SET
+														"from" = EXCLUDED."from",
+														"to" = EXCLUDED."to",
+														"cc" = EXCLUDED."cc",
+														"bcc" = EXCLUDED."bcc",
+														"ref" = EXCLUDED."ref",
+														"created_at" = EXCLUDED."created_at",
+														"index" = EXCLUDED."index",
+														"status" = EXCLUDED."status",
+														"no" = EXCLUDED."no",
+														"sender_address" = EXCLUDED."sender_address",
+														"sender_phone" = EXCLUDED."sender_phone",
+														"recipient_address" = EXCLUDED."recipient_address",
+														"recipient_phone" = EXCLUDED."recipient_phone",
+														"width" = EXCLUDED."width",
+														"height" = EXCLUDED."height",
+														"length" = EXCLUDED."length",
+														"weight" = EXCLUDED."weight",
+														"carrier" = EXCLUDED."carrier",
+														"shipping_fee" = EXCLUDED."shipping_fee",
+														"shipping_method" = EXCLUDED."shipping_method",
+														"shipping_duration" = EXCLUDED."shipping_duration",
+														"shipping_date" = EXCLUDED."shipping_date",
+														"delivery_date" = EXCLUDED."delivery_date",
+														"order_date" = EXCLUDED."order_date",
+														"payment_date" = EXCLUDED."payment_date",
+														"payment_method" = EXCLUDED."payment_method",
+														"payment_origin" = EXCLUDED."payment_origin",
+														"payment_number" = EXCLUDED."payment_number",
+														"bundle_shipping" = EXCLUDED."bundle_shipping"
+												`).bind(
+													item.id,
+													item.from,
+													item.to,
+													item.cc,
+													item.bcc,
+													item.ref,
+													item.created_at,
+													item.index,
+													item.status,
+													item.no ? item.no : "",
+													item.sender_address ? item.sender_address : "",
+													item.sender_phone ? item.sender_phone : "",
+													item.recipient_address ? item.recipient_address : "",
+													item.recipient_phone ? item.recipient_phone : "",
+													item.width ? parseFloat(item.width) : 0,
+													item.height ? parseFloat(item.height) : 0,
+													item.length ? parseFloat(item.length) : 0,
+													item.weight ? parseFloat(item.weight) : 0,
+													item.carrier ? parseFloat(item.carrier) : 0,
+													item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
+													item.shipping_method ? item.shipping_method : "",
+													item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
+													item.shipping_date ? parseFloat(item.shipping_date) : 0,
+													item.delivery_date ? parseFloat(item.delivery_date) : 0,
+													item.order_date ? parseFloat(item.order_date) : 0,
+													item.payment_date ? parseFloat(item.payment_date) : 0,
+													item.payment_method ? item.payment_method : "",
+													item.payment_origin ? item.payment_origin : "",
+													item.payment_number ? item.payment_number : "",
+													item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0
+												)
+											)
+										}else if(itemType == "event"){
+											statements[`${zoneRegion}_event`].push(
+												env[`${zoneRegion}_event`].prepare(`
+													INSERT INTO event (
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
+													) VALUES (
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+													) ON CONFLICT (id) DO UPDATE SET
+														"type" = EXCLUDED."type",
+														"from" = EXCLUDED."from",
+														"to" = EXCLUDED."to",
+														"cc" = EXCLUDED."cc",
+														"bcc" = EXCLUDED."bcc",
+														"ref" = EXCLUDED."ref",
+														"data" = EXCLUDED."data",
+														"created_at" = EXCLUDED."created_at",
+														"started_at" = EXCLUDED."started_at",
+														"expired_at" = EXCLUDED."expired_at",
+														"index" = EXCLUDED."index",
+														"event" = EXCLUDED."event",
+														"number" = EXCLUDED."number",
+														"address" = EXCLUDED."address",
+														"status" = EXCLUDED."status",
+														"code" = EXCLUDED."code",
+														"discount" = EXCLUDED."discount",
+														"quantity" = EXCLUDED."quantity",
+														"usage_per" = EXCLUDED."usage_per",
+														"usage_limit" = EXCLUDED."usage_limit",
+														"min_order_amount" = EXCLUDED."min_order_amount",
+														"max_order_amount" = EXCLUDED."max_order_amount",
+														"max_discount_amount" = EXCLUDED."max_discount_amount",
+														"new_customer_only" = EXCLUDED."new_customer_only",
+														"first_purchase_only" = EXCLUDED."first_purchase_only",
+														"region_restrictions" = EXCLUDED."region_restrictions"
+												`).bind(
+													item.id,
+													item.type,
+													item.from,
+													item.to,
+													item.cc,
+													item.bcc,
+													item.ref,
+													item.data,
+													item.created_at,
+													item.started_at ? parseFloat(item.started_at) : 0,
+													item.expired_at ? parseFloat(item.expired_at) : 0,
+													item.index ? parseFloat(item.index) : 0,
+													item.event ? parseFloat(item.event) : 0,
+													item.number ? item.number : "",
+													item.address ? item.address : "",
+													item.status ? item.status : "",
+													item.code ? item.code : "",
+													item.discount ? parseFloat(item.discount) : 0,
+													item.quantity ? parseFloat(item.quantity) : 0,
+													item.usage_per ? parseFloat(item.usage_per) : 0,
+													item.usage_limit ? parseFloat(item.usage_limit) : 0,
+													item.min_order_amount ? parseFloat(item.min_order_amount) : 0,
+													item.max_order_amount ? parseFloat(item.max_order_amount) : 0,
+													item.max_discount_amount ? parseFloat(item.max_discount_amount) : 0,
+													item.new_customer_only ? parseFloat(item.new_customer_only) : 0,
+													item.first_purchase_only ? parseFloat(item.first_purchase_only) : 0,
+													item.region_restrictions ? parseFloat(item.region_restrictions) : 0
+												)
+											)
+										}
 									}
 								}
 
@@ -3802,7 +3845,6 @@ export default {
 							var generation = ''
 
 							var augmented = ''
-
 
 							// 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
 							if(task.topK > 50){
