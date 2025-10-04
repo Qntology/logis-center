@@ -926,7 +926,7 @@ const twoPartDomains = ["co.kr","co.uk","co.jp","com.cn","co.in","com.mx","co.id
 		- pages 
 		- tasks
 
-	사용자 5000명씩 분할
+	사용자 1000명씩 분할
 		- vectorize, d1 둘다
 
 	apac1-logis_items
@@ -1058,72 +1058,84 @@ const Related = function(type){
 
 
 
-/*
-	before 가져올것
-	after 기준값
-	item after item
-
-
-	추후 벡터 db 검색시 내용이 많아지면 토큰 소모가 커질수 있으므로 distinct 꼭 사용하기
-*/
-const Flow = function(query, item){
-	if(query == "goods" && item.type == "order"){
+const Relay = function(foreign, primary){
+	if(foreign == "goods" && primary.type == "order"){
 		return {
 			type : 'sales',
 			column : 'index',
-			index : item.sales
+			foreign : {
+				key : "sales",
+				value : primary.sales
+			}
 		}
 
-	}else if(query == "tracking" && item.type == "order"){
+	}else if(foreign == "tracking" && primary.type == "order"){
 		return {
 			type : 'tracking',
 			column : 'index',
-			index : item.tracking
+			foreign : {
+				key : "tracking"
+				value : primary.tracking
+			}
 		}
 
-	}else if(query == "coupon" && item.type == "order"){
+	}else if(foreign == "coupon" && primary.type == "order"){
 		return {
 			type : 'event',
 			column : 'index',
-			index : item.event
+			foreign : {
+				key : "event",
+				value : primary.event
+			}
 		}
 
-	}else if(query == "event" && item.type == "order"){
+	}else if(foreign == "event" && primary.type == "order"){
 		return {
 			type : 'event',
 			column : 'index',
-			index : item.event
+			foreign : {
+				key : "event",
+				value : primary.event
+			}
 		}
 
 
 
 
-	}else if(query == "order" && item.type == "goods"){
+	}else if(foreign == "order" && primary.type == "goods"){
 		return {
 			type : 'sales',
 			column : 'sales',
-			index : item.id
+			foreign : {
+				key : "event",
+				value : primary.id
+			}
 		}
+		// return {
+		// 	type : 'sales',
+		// 	column : 'sales',
+		// 	index : primary.id
+		// }
 		
-	}else if(query == "tracking" && item.type == "goods"){
+	}else if(foreign == "tracking" && primary.type == "goods"){
 	//  return {
 	//      type : 'sales',
 	//      column : 'sales',
-	//      index : item.index,
+	//      foreign : primary.index,
 	//      flow : {
 	//          type : 'tracking',
 	//          column : 'index',
-	//          index : item.index
+	//          index : primary.index
 	//      }
 	//  }
 
-	}else if(query == "event" && item.type == "goods"){
+	}else if(foreign == "event" && primary.type == "goods"){
 	//  return {
 	//      type : 'event',
 	//      column : 'index'
 	//  }
 
-	}else if(query == "coupon" && item.type == "goods"){
+	}else if(foreign == "coupon" && primary.type == "goods"){
 	//  return {
 	//      type : 'event',
 	//      column : 'index'
@@ -1132,25 +1144,34 @@ const Flow = function(query, item){
 
 
 
-	}else if(query == "goods" && item.type == "tracking"){
+	}else if(foreign == "goods" && primary.type == "tracking"){
 		return {
 			type : 'sales',
 			column : 'tracking',
-			index : item.index
+			foreign : {
+				key : "sales",
+				value : primary.index
+			}
 		}
 
-	}else if(query == "order" && item.type == "tracking"){
+	}else if(foreign == "order" && primary.type == "tracking"){
 		return {
 			type : 'sales',
 			column : 'tracking',
-			index : item.index
+			foreign : {
+				key : "sales",
+				value : primary.sales
+			}
 		}
 
-	}else if(query == "event" && item.type == "tracking"){
+	}else if(foreign == "event" && primary.type == "tracking"){
 		// return {
 		//  type : 'sales',
 		//  column : 'tracking',
-		//  index : item.index
+		//  foreign : {
+		// 	key : "event",
+		// 	value : primary.event
+		// }
 		//  flow : {
 		//      type : 'event',
 		//      column : 'index',
@@ -1158,40 +1179,46 @@ const Flow = function(query, item){
 		//  }
 		// }
 
-	}else if(query == "coupon" && item.type == "tracking"){
+	}else if(foreign == "coupon" && primary.type == "tracking"){
 		// return {
-		//  type : 'sales',
-		//  column : 'tracking',
-		//  index : item.index
-		//  flow : {
-		//      type : 'event',
-		//      column : 'index',
-		//      index : 'event'
-		//  }
+		// 	type : 'sales',
+		// 	column : 'tracking',
+		// 	foreign : {
+		// 		key : "event",
+		// 		value : primary.event
+		// 	},
+		// 	flow : {
+		// 		type : 'event',
+		// 		column : 'index',
+		// 		index : 'event'
+		// 	}
 		// }
 
 
 
 
-	}else if(query == "sales" && item.type == "event"){
+	}else if(foreign == "sales" && primary.type == "event"){
 		return {
 			type : 'sales',
 			column : 'event',
-			index : item.index
+			primary : {
+				key : 'sales',
+				value : primary.sales
+			}
 		}
 
-	}else if(query == "order" && item.type == "event"){
+	}else if(foreign == "order" && primary.type == "event"){
 		return {
 			type : 'sales',
 			column : 'event',
-			index : item.index
+			foreign : primary.index
 		}
 
-	}else if(query == "tracking" && item.type == "event"){
+	}else if(foreign == "tracking" && primary.type == "event"){
 		return {
 			type : 'sales',
 			column : 'event',
-			index : item.index,
+			foreign : primary.index,
 			flow : {
 				type : 'tracking',
 				column : 'index',
@@ -1199,44 +1226,44 @@ const Flow = function(query, item){
 			}
 		}
 
-	}else if(query == "coupon" && item.type == "event"){
+	}else if(foreign == "coupon" && primary.type == "event"){
 		return {
 			type : 'event',
 			column : 'index',
-			index : item.index
+			foreign : primary.index
 		}
 
 
 
 
-	}else if(query == "goods" && item.type == "coupon"){
+	}else if(foreign == "goods" && primary.type == "coupon"){
 		return {
 			type : 'sales',
 			column : 'event'
 		}
 
-	}else if(query == "order" && item.type == "coupon"){
+	}else if(foreign == "order" && primary.type == "coupon"){
 	//  return {
 	//      type : 'sales',
 	//      column : 'event'
 	//  }
 
-	}else if(query == "tracking" && item.type == "coupon"){
-		// return {
-		//  type : 'sales',
-		//  column : 'event',
-		//  flow : {
-		//      type : 'tracking',
-		//      column : 'index',
-		//      index : 'event'
-		//  }
-		// }
+	}else if(foreign == "tracking" && primary.type == "coupon"){
+		return	{
+			type : 'sales',
+			column : 'event',
+			primary : {
+				type : 'tracking',
+				column : 'index',
+				index : 'event'
+			}
+		}
 
-	}else if(query == "event" && item.type == "coupon"){
+	}else if(foreign == "event" && primary.type == "coupon"){
 		return {
 			type : 'event',
 			column : 'event',
-			index : item.index
+			foreign : primary.index
 		}
 
 	}
@@ -1247,6 +1274,7 @@ const Flow = function(query, item){
 		column : null
 	}
 }
+
 
 
 /*
@@ -2723,15 +2751,6 @@ export default {
 										}
 
 
-										/*
-											type 별로 
-
-											updated_at 값 설정해야함
-
-											order
-
-											event
-										*/
 
 										var updated_at
 
@@ -2739,17 +2758,60 @@ export default {
 
 										var drafts = {}
 
-										var related = Related(item.type)
+										var related = Related(item.type) // 관련 타입 정보 가져옴
 
-										// 관련 타입 정보 가져옴
+										/*
+											두가지 타입으로 
+												외부 테이블 최신화 진행
 
+												primary = 외부 데이터로 내부 데이터 수정
+													order 스캔 진행시
+														draft.type == "goods" && row.type == "order"
+														
+														order items 만 있으면 goods 상세 정보가 없기 때문에 
+														goods 정보 가져와서 order item에 업데이트 해야함
+
+														
+												foreign = 내부 데이터로 외부 데이터 수정
+													tracking 스캔 진행시
+														tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
+
+
+
+											예외 시나리오
+												goods 스캔 진행시 다음 의미 없음
+													row.type == "goods"
+													row.type == "event"
+													row.type == "tracking"
+
+												event 스캔 진행시 다음 의미 없음
+													row.type == "coupon"
+													row.type == "event"
+													row.type == "goods"
+													row.type == "order"
+
+											
+											const Relay = function(foreign, primary){
+												if(foreign == "goods" && primary.type == "order"){
+													return {
+														type : 'sales',
+														column : 'index',
+														foreign : {
+															key : "sales",
+															value : item.sales
+														}
+													}
+
+												}
+											}
+										*/ 
 
 										for(var r = 0; r < related.length; r++){
 											var relatedType = related[r]
 
-											var { flow, type, column } = Flow(relatedType, item)
+											var { type, column, foreign, primary, flow } = Relay(relatedType, item)
 
-											// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
+											// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
 
 											try{
 												if(type){
@@ -2758,9 +2820,6 @@ export default {
 													).bind(
 														item.index, team.id, item.cc, now - 60000
 													).all()
-
-
-													
 
 													if(results.length){
 														if(flow){
@@ -2776,6 +2835,8 @@ export default {
 
 															if(results.length){
 																drafts[type] = {
+																	foreign : foreign,
+																	primary : primary,
 																	rows : results,
 																	flow : flow,
 																	type : relatedType,
@@ -2785,6 +2846,8 @@ export default {
 															}
 														}else{
 															drafts[type] = {
+																foreign : foreign,
+																primary : primary,
 																rows : results,
 																type : relatedType, 
 																column : column,
@@ -2805,20 +2868,24 @@ export default {
 															고객 주문 스캔하였는데
 															배송 시작 정보가 없을시
 														*/
-														if(item.type == "order" && type == "tracking" && column == "sales"){
-															updated_at = 0
-														}
+														updated_at = 0
+														
+														// if(item.type == "order" && type == "tracking" && column == "sales"){
+														// 	updated_at = 0
+														// }
 
 
-														/*
-															이벤트 스캔하였는데
-															상품에 이벤트 등록 안되어있으면
-														*/
-														if(item.type == "event" && type == "sales" && column == "event"){
-															updated_at = 0
-														}
+														// /*
+														// 	이벤트 스캔하였는데
+														// 	상품에 이벤트 등록 안되어있으면
+														// */
+														// if(item.type == "event" && type == "sales" && column == "event"){
+														// 	updated_at = 0
+														// }
 
 														drafts[type] = {
+															foreign : foreign,
+															primary : primary,
 															rows : [],
 															type : relatedType,
 															column : column,
@@ -2851,13 +2918,13 @@ export default {
 												// for start
 
 												if (drafts.hasOwnProperty(type)) {
-													var draft = drafts[type]
+													var relate = drafts[type]
 
 													/*
 														시나리오 case
 
 														order 스캔 진행시
-															draft.type == "goods" && row.type == "order"
+															relate.type == "goods" && row.type == "order"
 
 															order items 만 있으면 goods 상세 정보가 없기 때문에 goods 정보 가져와서 order item에 업데이트 해야함
 
@@ -2877,222 +2944,229 @@ export default {
 															tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
 													*/
 
-													if(draft.rows.length){
-														// update만 진행
 
-														// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
+													var column = relate.column
 
-														var column = draft.column
+													var index = relate.index
 
-														var index = draft.index
+													var primary = relate.primary
 
-														if(draft.flow){
-															column = draft.flow.column
-															index = draft.flow.index
-														}
+													var foreign = relate.foreign
 
-														for(var d = 0; d < draft.rows.length; d++){
-															var row = draft.rows[d]
+													if(relate.flow){
+														column = relate.flow.column
+														index = relate.flow.index
+													}
 
-															var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(row.data))
+													if(relate.rows.length){
+														for(var d = 0; d < relate.rows.length; d++){
+															var row = relate.rows[d]
 
-															var data = JSON.parse(decompressedJsonString)
+															if(primary){
+																// item = mergeItem(item, row)
 
-															if(draft.type == "goods" && row.type == "order"){
-																var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-																	id : item.id,
-																	title : item.title,
-																	link : item.link,
-																	data : data
-																})), { to: 'arraybuffer' })
+																if(relate.type == "goods" && row.type == "order"){
+																	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(row.data))
 
-																row.data = arr.buffer
+																	var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+																		id : item.id,
+																		title : item.title,
+																		link : item.link,
+																		data : JSON.parse(decompressedJsonString)
+																	})), { to: 'arraybuffer' })
 
-																statements[`${zoneRegion}_${type}`].push(
-																	env[`${zoneRegion}_${type}`].prepare(`
-																		INSERT INTO ${type} (
-																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
-																		) VALUES (
-																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
-																		) ON CONFLICT (id) DO UPDATE SET
-																			"type" = EXCLUDED."type",
-																			"from" = EXCLUDED."from",
-																			"to" = EXCLUDED."to",
-																			"cc" = EXCLUDED."cc",
-																			"bcc" = EXCLUDED."bcc",
-																			"ref" = EXCLUDED."ref",
-																			"data" = EXCLUDED."data",
-																			"created_at" = EXCLUDED."created_at",
-																			"started_at" = EXCLUDED."started_at",
-																			"expired_at" = EXCLUDED."expired_at",
-																			"index" = EXCLUDED."index",
-																			"event" = EXCLUDED."event",
-																			"views" = EXCLUDED."views",
-																			"sales" = EXCLUDED."sales",
-																			"width" = EXCLUDED."width",
-																			"height" = EXCLUDED."height",
-																			"length" = EXCLUDED."length",
-																			"weight" = EXCLUDED."weight",
-																			"size" = EXCLUDED."size",
-																			"currency" = EXCLUDED."currency",
-																			"supply_price" = EXCLUDED."supply_price",
-																			"sale_price" = EXCLUDED."sale_price",
-																			"discount" = EXCLUDED."discount",
-																			"quantity" = EXCLUDED."quantity",
-																			"tracking" = EXCLUDED."tracking",
-																			"number" = EXCLUDED."number",
-																			"carrier" = EXCLUDED."carrier",
-																			"shipping_fee" = EXCLUDED."shipping_fee",
-																			"shipping_method" = EXCLUDED."shipping_method",
-																			"shipping_duration" = EXCLUDED."shipping_duration",
-																			"fulfillment_service" = EXCLUDED."fulfillment_service",
-																			"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
-																			"bundle_shipping" = EXCLUDED."bundle_shipping",
-																			"used" = EXCLUDED."used",
-																			"lease" = EXCLUDED."lease",
-																			"rental" = EXCLUDED."rental",
-																			"refurbish" = EXCLUDED."refurbish",
-																			"tax_included" = EXCLUDED."tax_included",
-																			"release_date" = EXCLUDED."release_date"
-																	`).bind(
-																		hashId(item.id+row.id),
-																		item.type,
-																		item.from,
-																		item.to,
-																		item.cc,
-																		item.bcc,
-																		item.ref,
-																		row.data,
-																		item.created_at,
-																		row.started_at ? parseFloat(row.started_at) : 0,
-																		row.expired_at ? parseFloat(row.expired_at) : 0,
-																		item.index ? parseFloat(item.index) : 0,
-																		row.event ? parseFloat(row.event) : 0,
-																		item.views,
-																		row.sales ? parseFloat(row.sales) : 0,
-																		row.width ? parseFloat(row.width) : 0,
-																		row.height ? parseFloat(row.height) : 0,
-																		row.length ? parseFloat(row.length) : 0,
-																		row.weight ? parseFloat(row.weight) : 0,
-																		row.size ? row.size : "",
-																		row.currency ? row.currency : "",
-																		row.supply_price? parseFloat(row.supply_price) : 0,
-																		row.sale_price? parseFloat(row.sale_price) : 0,
-																		row.discount ? parseFloat(row.discount) : 0,
-																		row.quantity ? parseFloat(row.quantity) : 0,
-																		row.tracking ? parseFloat(row.tracking) : 0,
-																		item.number ? item.number : "",
-																		row.carrier ? row.carrier : "",
-																		row.shipping_fee ? parseFloat(row.shipping_fee) : 0,
-																		row.shipping_method ? row.shipping_method : "",
-																		row.shipping_duration ? parseFloat(row.shipping_duration) : 0,
-																		row.fulfillment_service ? row.fulfillment_service : "",
-																		row.stock_keeping_unit ? row.stock_keeping_unit : "",
-																		row.bundle_shipping ? parseFloat(row.bundle_shipping) : 0,
-																		row.used ? parseFloat(row.used) : 0,
-																		row.lease ? parseFloat(row.lease) : 0,
-																		row.rental ? parseFloat(row.rental) : 0,
-																		row.refurbish ? parseFloat(row.refurbish) : 0,
-																		row.tax_included ? parseFloat(row.tax_included) : 0,
-																		row.release_date ? parseFloat(row.release_date) : 0
+																	row.data = arr.buffer
+
+																	statements[`${zoneRegion}_${type}`].push(
+																		env[`${zoneRegion}_${type}`].prepare(`
+																			INSERT INTO ${type} (
+																				"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+																			) VALUES (
+																				?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
+																			) ON CONFLICT (id) DO UPDATE SET
+																				"type" = EXCLUDED."type",
+																				"from" = EXCLUDED."from",
+																				"to" = EXCLUDED."to",
+																				"cc" = EXCLUDED."cc",
+																				"bcc" = EXCLUDED."bcc",
+																				"ref" = EXCLUDED."ref",
+																				"data" = EXCLUDED."data",
+																				"created_at" = EXCLUDED."created_at",
+																				"started_at" = EXCLUDED."started_at",
+																				"expired_at" = EXCLUDED."expired_at",
+																				"index" = EXCLUDED."index",
+																				"event" = EXCLUDED."event",
+																				"views" = EXCLUDED."views",
+																				"sales" = EXCLUDED."sales",
+																				"width" = EXCLUDED."width",
+																				"height" = EXCLUDED."height",
+																				"length" = EXCLUDED."length",
+																				"weight" = EXCLUDED."weight",
+																				"size" = EXCLUDED."size",
+																				"currency" = EXCLUDED."currency",
+																				"supply_price" = EXCLUDED."supply_price",
+																				"sale_price" = EXCLUDED."sale_price",
+																				"discount" = EXCLUDED."discount",
+																				"quantity" = EXCLUDED."quantity",
+																				"tracking" = EXCLUDED."tracking",
+																				"number" = EXCLUDED."number",
+																				"carrier" = EXCLUDED."carrier",
+																				"shipping_fee" = EXCLUDED."shipping_fee",
+																				"shipping_method" = EXCLUDED."shipping_method",
+																				"shipping_duration" = EXCLUDED."shipping_duration",
+																				"fulfillment_service" = EXCLUDED."fulfillment_service",
+																				"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
+																				"bundle_shipping" = EXCLUDED."bundle_shipping",
+																				"used" = EXCLUDED."used",
+																				"lease" = EXCLUDED."lease",
+																				"rental" = EXCLUDED."rental",
+																				"refurbish" = EXCLUDED."refurbish",
+																				"tax_included" = EXCLUDED."tax_included",
+																				"release_date" = EXCLUDED."release_date"
+																		`).bind(
+																			hashId(item.id+row.id),
+																			item.type,
+																			item.from,
+																			item.to,
+																			item.cc,
+																			item.bcc,
+																			item.ref,
+																			row.data,
+																			item.created_at,
+																			row.started_at ? parseFloat(row.started_at) : 0,
+																			row.expired_at ? parseFloat(row.expired_at) : 0,
+																			item.index ? parseFloat(item.index) : 0,
+																			row.event ? parseFloat(row.event) : 0,
+																			item.views,
+																			row.sales ? parseFloat(row.sales) : 0,
+																			row.width ? parseFloat(row.width) : 0,
+																			row.height ? parseFloat(row.height) : 0,
+																			row.length ? parseFloat(row.length) : 0,
+																			row.weight ? parseFloat(row.weight) : 0,
+																			row.size ? row.size : "",
+																			row.currency ? row.currency : "",
+																			row.supply_price? parseFloat(row.supply_price) : 0,
+																			row.sale_price? parseFloat(row.sale_price) : 0,
+																			row.discount ? parseFloat(row.discount) : 0,
+																			row.quantity ? parseFloat(row.quantity) : 0,
+																			row.tracking ? parseFloat(row.tracking) : 0,
+																			item.number ? item.number : "",
+																			row.carrier ? row.carrier : "",
+																			row.shipping_fee ? parseFloat(row.shipping_fee) : 0,
+																			row.shipping_method ? row.shipping_method : "",
+																			row.shipping_duration ? parseFloat(row.shipping_duration) : 0,
+																			row.fulfillment_service ? row.fulfillment_service : "",
+																			row.stock_keeping_unit ? row.stock_keeping_unit : "",
+																			row.bundle_shipping ? parseFloat(row.bundle_shipping) : 0,
+																			row.used ? parseFloat(row.used) : 0,
+																			row.lease ? parseFloat(row.lease) : 0,
+																			row.rental ? parseFloat(row.rental) : 0,
+																			row.refurbish ? parseFloat(row.refurbish) : 0,
+																			row.tax_included ? parseFloat(row.tax_included) : 0,
+																			row.release_date ? parseFloat(row.release_date) : 0
+																		)
 																	)
-																)
 
 
-																var metadata = {
-																	title : data.title,
-																	size : row.size ? row.size : "",
-																	currency : row.currency ? row.currency : "",
-																	carrier : row.carrier ? row.carrier : "",
-																	shipping_fee : row.shipping_fee ? true : false,
-																	shipping_method : row.shipping_method ? row.shipping_method : "",
-																	fulfillment_service : row.fulfillment_service ? row.fulfillment_service : "",
-																	stock_keeping_unit : row.stock_keeping_unit ? row.stock_keeping_unit : "",
-																	bundle_shipping : row.bundle_shipping ? true : false,
-																	used : row.used ? true : false,
-																	lease : row.lease ? true : false,
-																	rental : row.rental ? true : false,
-																	refurbish : row.refurbish ? true : false,
-																	tax_included : row.tax_included ? true : false
+																	var metadata = {
+																		title : data.title,
+																		size : row.size ? row.size : "",
+																		currency : row.currency ? row.currency : "",
+																		carrier : row.carrier ? row.carrier : "",
+																		shipping_fee : row.shipping_fee ? true : false,
+																		shipping_method : row.shipping_method ? row.shipping_method : "",
+																		fulfillment_service : row.fulfillment_service ? row.fulfillment_service : "",
+																		stock_keeping_unit : row.stock_keeping_unit ? row.stock_keeping_unit : "",
+																		bundle_shipping : row.bundle_shipping ? true : false,
+																		used : row.used ? true : false,
+																		lease : row.lease ? true : false,
+																		rental : row.rental ? true : false,
+																		refurbish : row.refurbish ? true : false,
+																		tax_included : row.tax_included ? true : false
+																	}
+
+
+																	var content = JSON.stringify(metadata)
+
+																	var semantic
+
+																	if(models['deepinfra']){
+																		semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', semantic_prompt_system(language), content)
+
+																		models['deepinfra'] -= 1
+
+																	}
+
+																	if(!semantic & gemini_llm_api){
+																		semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
+
+																		models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+																	}
+
+																	if(!semantic){
+																		fallback = 'semantic overflow'
+
+																		continue
+																	}
+
+																	metadata.id = item.id
+																	metadata.type = item.type
+																	metadata.from = task.from
+																	metadata.to = task.to
+																	metadata.cc = task.cc
+																	metadata.bcc = task.bcc
+																	metadata.ref = task.ref
+
+																	var embeddings
+
+																	var $VectorizeVector
+
+																	if(models['cloudflare']){
+																		var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
+																			text: [semantic],
+																		})
+
+																		var $VectorizeVector = [
+																			{
+																				id: item.id,
+																				values: embeddings[0],
+																				metadata: metadata
+																			}
+																		]
+
+																		models['cloudflare'] -= 1
+
+																	}
+
+																	if(!embeddings && models['deepinfra']){
+																		var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', semantic)
+
+																		var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+																			return {
+																				id: item.id,
+																				values: values,
+																				metadata: metadata
+																			}
+																		})
+
+																		models['deepinfra'] -= 1
+
+																	}
+
+																	if(embeddings){
+																		fallback = 'embeddings overflow'
+
+																		continue
+																	}
+
+																	await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
+
 																}
+															}
 
-
-																var content = JSON.stringify(metadata)
-
-																var semantic
-
-																if(models['deepinfra']){
-																	semantic = await Deepinfra(deepinfra, 'google/gemma-3-4b-it', semantic_prompt_system(language), content)
-
-																	models['deepinfra'] -= 1
-
-																}
-
-																if(!semantic & gemini_llm_api){
-																	semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
-
-																	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-																}
-
-																if(!semantic){
-																	fallback = 'semantic overflow'
-
-																	continue
-																}
-
-																metadata.id = item.id
-																metadata.type = item.type
-																metadata.from = task.from
-																metadata.to = task.to
-																metadata.cc = task.cc
-																metadata.bcc = task.bcc
-																metadata.ref = task.ref
-
-																var embeddings
-
-																var $VectorizeVector
-
-																if(models['cloudflare']){
-																	var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
-																		text: [semantic],
-																	})
-
-																	var $VectorizeVector = [
-																		{
-																			id: item.id,
-																			values: embeddings[0],
-																			metadata: metadata
-																		}
-																	]
-
-																	models['cloudflare'] -= 1
-
-																}
-
-																if(!embeddings && models['deepinfra']){
-																	var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', semantic)
-
-																	var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-																		return {
-																			id: item.id,
-																			values: values,
-																			metadata: metadata
-																		}
-																	})
-
-																	models['deepinfra'] -= 1
-
-																}
-
-																if(embeddings){
-																	fallback = 'embeddings overflow'
-
-																	continue
-																}
-
-																await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
-
+															if(foreign){
+																// item = mergeItem(item, row)
 															}
 
 															// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
@@ -3114,10 +3188,49 @@ export default {
 															)
 
 															// for end
-
 														}
 
 														// if end
+													}else{
+														// draft 추가해야함
+
+														var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+															id : item.id,
+															title : item.title,
+															link : item.link,
+															data : relate
+														})), { to: 'arraybuffer' })
+
+
+														// statements[`${zoneRegion}_items`].push(
+														// 	env[`${zoneRegion}_items`].prepare(`
+														// 		INSERT INTO items (
+														// 			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+														// 		) VALUES (
+														// 			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+														// 		) ON CONFLICT (id) DO UPDATE SET
+														// 			"type" = EXCLUDED."type",
+														// 			"from" = EXCLUDED."from",
+														// 			"to" = EXCLUDED."to",
+														// 			"cc" = EXCLUDED."cc",
+														// 			"bcc" = EXCLUDED."bcc",
+														// 			"ref" = EXCLUDED."ref",
+														// 			"data" = EXCLUDED."data",
+														// 			"created_at" = EXCLUDED."created_at",
+														// 			"updated_at" = EXCLUDED."updated_at"
+														// 	`).bind(
+														// 		hashId(),
+														// 		relate.type,
+														// 		item.from,
+														// 		item.to,
+														// 		item.cc,
+														// 		item.bcc,
+														// 		'',
+														// 		arr.buffer,
+														// 		now,
+														// 		0
+														// 	)
+														// )
 													}
 												}
 
