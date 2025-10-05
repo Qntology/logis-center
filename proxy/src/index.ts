@@ -1059,58 +1059,68 @@ const Related = function(type){
 
 
 const Relay = function(foreign, primary){
+	var queries = []
+
+	var migration = {}
+
+
 	if(foreign == "goods" && primary.type == "order"){
-		return {
+		queries.push({
 			type : 'sales',
-			column : 'index',
-			foreign : {
-				key : "sales",
-				value : primary.sales
-			}
+			column : 'index'
+		})
+
+		migration.import = {
+			key : "sales",
+			value : primary.sales
 		}
 
 	}else if(foreign == "tracking" && primary.type == "order"){
-		return {
+		queries.push({
 			type : 'tracking',
-			column : 'index',
-			foreign : {
-				key : "tracking"
-				value : primary.tracking
-			}
+			column : 'index'
+		})
+
+		migration.import = {
+			key : "tracking"
+			value : primary.tracking
 		}
 
 	}else if(foreign == "coupon" && primary.type == "order"){
-		return {
+		queries.push({
 			type : 'event',
-			column : 'index',
-			foreign : {
-				key : "event",
-				value : primary.event
-			}
+			column : 'index'
+		})
+
+		migration.import = {
+			key : "event",
+			value : primary.event
 		}
 
 	}else if(foreign == "event" && primary.type == "order"){
-		return {
+		queries.push({
 			type : 'event',
-			column : 'index',
-			foreign : {
-				key : "event",
-				value : primary.event
-			}
-		}
+			column : 'index'
+		})
 
+		migration.import = {
+			key : "event",
+			value : primary.event
+		}
 
 
 
 	}else if(foreign == "order" && primary.type == "goods"){
-		return {
+		queries.push({
 			type : 'sales',
 			column : 'sales',
-			foreign : {
-				key : "event",
-				value : primary.id
-			}
+		})
+
+		migration.import = {
+			key : "event",
+			value : primary.id
 		}
+
 		// return {
 		// 	type : 'sales',
 		// 	column : 'sales',
@@ -1118,162 +1128,184 @@ const Relay = function(foreign, primary){
 		// }
 		
 	}else if(foreign == "tracking" && primary.type == "goods"){
-	//  return {
-	//      type : 'sales',
-	//      column : 'sales',
-	//      foreign : primary.index,
-	//      flow : {
-	//          type : 'tracking',
-	//          column : 'index',
-	//          index : primary.index
-	//      }
-	//  }
+		// queries.push({
+		// 	type : 'sales',
+		// 	column : 'sales',
+		// })
+
+		// queries.push({
+		// 	type : 'tracking',
+		// 	column : 'index',
+		// 	index : primary.index
+		// })
+			
+		// migration.import = {
+		// 	key : "event",
+		// 	value : primary.id
+		// }
 
 	}else if(foreign == "event" && primary.type == "goods"){
-	//  return {
-	//      type : 'event',
-	//      column : 'index'
-	//  }
+		// queries.push({
+		// 	type : 'event',
+		// 	column : 'index'
+		// })
 
 	}else if(foreign == "coupon" && primary.type == "goods"){
-	//  return {
-	//      type : 'event',
-	//      column : 'index'
-	//  }
-
 
 
 
 	}else if(foreign == "goods" && primary.type == "tracking"){
-		return {
+		queries.push({
 			type : 'sales',
-			column : 'tracking',
-			foreign : {
-				key : "sales",
-				value : primary.index
-			}
+			column : 'tracking'
+		})
+
+		migration.import = {
+			key : "sales",
+			value : primary.index
 		}
 
 	}else if(foreign == "order" && primary.type == "tracking"){
-		return {
+		queries.push({
 			type : 'sales',
-			column : 'tracking',
-			foreign : {
-				key : "sales",
-				value : primary.sales
-			}
+			column : 'tracking'
+		})
+
+		migration.import = {
+			key : "sales",
+			value : primary.sales
 		}
 
 	}else if(foreign == "event" && primary.type == "tracking"){
-		// return {
-		//  type : 'sales',
-		//  column : 'tracking',
-		//  foreign : {
+		// queries.push({
+		// 	type : 'sales',
+		// 	column : 'tracking',
+		// })
+
+		// queries.push({
+		// 	type : 'event',
+		// 	column : 'index',
+		// 	index : 'event'
+		// })
+
+		// migration.import = {
 		// 	key : "event",
 		// 	value : primary.event
 		// }
-		//  flow : {
-		//      type : 'event',
-		//      column : 'index',
-		//      index : 'event'
-		//  }
-		// }
 
 	}else if(foreign == "coupon" && primary.type == "tracking"){
-		// return {
+		// queries.push({
 		// 	type : 'sales',
 		// 	column : 'tracking',
-		// 	foreign : {
-		// 		key : "event",
-		// 		value : primary.event
-		// 	},
-		// 	flow : {
-		// 		type : 'event',
-		// 		column : 'index',
-		// 		index : 'event'
-		// 	}
-		// }
+		// })
 
+		// queries.push({
+		// 	type : 'event',
+		// 	column : 'index',
+		// 	index : 'event'
+		// })
+
+		// migration.import = {
+		// 	key : "event",
+		// 	value : primary.event
+		// }
 
 
 
 	}else if(foreign == "sales" && primary.type == "event"){
-		return {
+		queries.push({
 			type : 'sales',
 			column : 'event',
-			primary : {
-				key : 'sales',
-				value : primary.sales
-			}
+		})
+
+		migration.import = {
+			key : 'sales',
+			value : primary.sales
 		}
 
 	}else if(foreign == "order" && primary.type == "event"){
-		return {
+		queries.push({
 			type : 'sales',
 			column : 'event',
-			foreign : primary.index
+		})
+
+		migration.export = {
+			key : 'event',
+			value : primary.index
 		}
 
 	}else if(foreign == "tracking" && primary.type == "event"){
-		return {
+		queries.push({
 			type : 'sales',
 			column : 'event',
-			foreign : primary.index,
-			flow : {
-				type : 'tracking',
-				column : 'index',
-				index : 'tracking'
-			}
+		})
+
+		queries.push({
+			type : 'tracking',
+			column : 'index',
+			index : 'tracking'
+		})
+
+		migration.import = {
+			key : "event",
+			value : primary.index
 		}
 
 	}else if(foreign == "coupon" && primary.type == "event"){
-		return {
+		queries.push({
 			type : 'event',
 			column : 'index',
-			foreign : primary.index
-		}
+		})
 
+		migration.export = {
+			key : 'event',
+			value : primary.index
+		}
 
 
 
 	}else if(foreign == "goods" && primary.type == "coupon"){
-		return {
+		queries.push({
 			type : 'sales',
 			column : 'event'
-		}
+		})
 
 	}else if(foreign == "order" && primary.type == "coupon"){
-	//  return {
-	//      type : 'sales',
-	//      column : 'event'
-	//  }
+		queries.push({
+			type : 'sales',
+			column : 'event'
+		})
 
 	}else if(foreign == "tracking" && primary.type == "coupon"){
-		return	{
+		queries.push({
 			type : 'sales',
 			column : 'event',
-			primary : {
-				type : 'tracking',
-				column : 'index',
-				index : 'event'
-			}
+		})
+
+		migration.export = {
+			key : 'event',
+			value : primary.index
 		}
 
 	}else if(foreign == "event" && primary.type == "coupon"){
-		return {
+		queries.push({
 			type : 'event',
 			column : 'event',
-			foreign : primary.index
+		})
+
+		migration.export = {
+			key : 'event',
+			value : primary.index
 		}
 
 	}
 
-
 	return {
-		type : null,
-		column : null
+		queries : queries,
+		migration : migration
 	}
 }
+
 
 
 
@@ -2379,8 +2411,6 @@ export default {
 										}
 
 
-										
-
 
 										item.id = hashId(team.id+task.cc+item.link)
 										
@@ -2423,7 +2453,6 @@ export default {
 										item.started_at = item.manufacture_date ? item.manufacture_date : 0
 										
 										item.expired_at = item.expiration_date ? item.expiration_date : 0
-
 
 
 
@@ -2518,7 +2547,6 @@ export default {
 												})
 
 												models['deepinfra'] -= 1
-
 											}
 
 											if(!embeddings){
@@ -2562,15 +2590,13 @@ export default {
 
 										var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
-
 										if(results.length){
 											var _item = results[0]
 
 											item = mergeItem(item, _item)
 										}
-										
 
-										
+
 
 										if(item.price <= team.data.base[itemType].price.min){
 											team.data.base[itemType].price.min = item.price
@@ -2756,7 +2782,7 @@ export default {
 
 										var progress = {}
 
-										var drafts = {}
+										var relates = {}
 
 										var related = Related(item.type) // 관련 타입 정보 가져옴
 
@@ -2764,18 +2790,16 @@ export default {
 											두가지 타입으로 
 												외부 테이블 최신화 진행
 
-												primary = 외부 데이터로 내부 데이터 수정
+												import = 외부 데이터로 내부 데이터 수정
 													order 스캔 진행시
 														draft.type == "goods" && row.type == "order"
 														
 														order items 만 있으면 goods 상세 정보가 없기 때문에 
 														goods 정보 가져와서 order item에 업데이트 해야함
 
-														
-												foreign = 내부 데이터로 외부 데이터 수정
+												export = 내부 데이터로 외부 데이터 수정
 													tracking 스캔 진행시
 														tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
-
 
 
 											예외 시나리오
@@ -2789,32 +2813,18 @@ export default {
 													row.type == "event"
 													row.type == "goods"
 													row.type == "order"
-
-											
-											const Relay = function(foreign, primary){
-												if(foreign == "goods" && primary.type == "order"){
-													return {
-														type : 'sales',
-														column : 'index',
-														foreign : {
-															key : "sales",
-															value : item.sales
-														}
-													}
-
-												}
-											}
 										*/ 
 
 										for(var r = 0; r < related.length; r++){
-											var relatedType = related[r]
-
-											var { type, column, foreign, primary, flow } = Relay(relatedType, item)
+											var { queries, migration } = Relay(related[r], item)
 
 											// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
 
 											try{
-												if(type){
+												if(queries.length){
+													var type = queries[0].type
+													var column = queries[0].column
+
 													var { results } = await env[`${zoneRegion}_${type}`].prepare(
 														`SELECT * FROM ${type} WHERE "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
 													).bind(
@@ -2822,8 +2832,10 @@ export default {
 													).all()
 
 													if(results.length){
-														if(flow){
+														if(queries[1]){
 															var row = results[0]
+
+															var flow = queries[1]
 
 															index = row[flow.index]
 
@@ -2834,24 +2846,21 @@ export default {
 															).all()
 
 															if(results.length){
-																drafts[type] = {
-																	foreign : foreign,
-																	primary : primary,
+																relates[type] = {
+																	queries : queries,
+																	import : migration.import,
+																	export : migration.export,
 																	rows : results,
-																	flow : flow,
-																	type : relatedType,
-																	column : column,
-																	index : index
+																	type : related[r]
 																}
 															}
 														}else{
-															drafts[type] = {
-																foreign : foreign,
-																primary : primary,
+															relates[type] = {
+																queries : queries,
+																import : migration.import,
+																export : migration.export,
 																rows : results,
-																type : relatedType, 
-																column : column,
-																index : index
+																type : related[r]
 															}
 														}
 
@@ -2883,13 +2892,12 @@ export default {
 														// 	updated_at = 0
 														// }
 
-														drafts[type] = {
-															foreign : foreign,
-															primary : primary,
+														relates[type] = {
+															queries : queries,
+															import : migration.import,
+															export : migration.export,
 															rows : [],
-															type : relatedType,
-															column : column,
-															item : item
+															type : related[r]
 														}
 													}
 												}
@@ -2913,59 +2921,81 @@ export default {
 
 
 
-										if(Object.keys(drafts).length){
-											for (var type in drafts) {
+										if(Object.keys(relates).length){
+											for (var type in relates) {
 												// for start
 
-												if (drafts.hasOwnProperty(type)) {
-													var relate = drafts[type]
+												// type값은 related[i]
+
+												if (relates.hasOwnProperty(type)) {
+													var relate = relates[type]
+
+													/*
+														relate.queries[0].type 	1차 쿼리 테이블 이름
+														relate.queries[0].column	1차 쿼리 column name
+														relate.queries[0].index		1차 쿼리 column value
+
+														relate.queries[1].type 	2차 쿼리 테이블 이름
+														relate.queries[1].column	2차 쿼리 column name
+														relate.queries[1].index		2차 쿼리 column value
+
+														relate.import		foreign 값을 primary에 저장하는 값
+														relate.import.key 		column name
+														relate.import.value 	column value 
+
+														relate.export		primary 값을 foreign에 저장하는 값
+														relate.export.key 		column name
+														relate.export.value 	column value 
+													*/
 
 													/*
 														시나리오 case
 
-														order 스캔 진행시
-															relate.type == "goods" && row.type == "order"
+															relate.import
+																order 스캔 진행시
+																	type == "goods" && row.type == "order"
 
-															order items 만 있으면 goods 상세 정보가 없기 때문에 goods 정보 가져와서 order item에 업데이트 해야함
+																	order items 만 있으면 goods 상세 정보가 없기 때문에 
+																	goods 정보 가져와서 order item에 업데이트 해야함
+
+															relate.export
+																tracking 스캔 진행시
+																	tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
 
 
-														goods 스캔 진행시 다음 의미 없음
-															row.type == "goods"
-															row.type == "event"
-															row.type == "tracking"
+															goods 스캔 진행시 다음 의미 없음
+																row.type == "goods"
+																row.type == "event"
+																row.type == "tracking"
 
-														event 스캔 진행시 다음 의미 없음
-															row.type == "coupon"
-															row.type == "event"
-															row.type == "goods"
-															row.type == "order"
-
-														tracking 스캔 진행시
-															tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
+															event 스캔 진행시 다음 의미 없음
+																row.type == "coupon"
+																row.type == "event"
+																row.type == "goods"
+																row.type == "order"
 													*/
 
 
-													var column = relate.column
+													var queries = relate.queries
 
-													var index = relate.index
+													var column = queries[1] ? queries[1].column : queries[0].column
+													var index = queries[1] ? queries[1].index : queries[0].index
 
-													var primary = relate.primary
-
-													var foreign = relate.foreign
-
-													if(relate.flow){
-														column = relate.flow.column
-														index = relate.flow.index
-													}
 
 													if(relate.rows.length){
 														for(var d = 0; d < relate.rows.length; d++){
 															var row = relate.rows[d]
 
-															if(primary){
-																// item = mergeItem(item, row)
+															// row.id = item.id
 
-																if(relate.type == "goods" && row.type == "order"){
+															if(relate.import){
+																var itemId = item.id
+																
+																item = mergeItem(item, row)
+
+																item.id = itemId
+
+																if(type == "goods" && row.type == "order"){
 																	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(row.data))
 
 																	var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
@@ -3165,8 +3195,10 @@ export default {
 																}
 															}
 
-															if(foreign){
-																// item = mergeItem(item, row)
+															if(relate.export){
+															
+
+																item = mergeItem(item, row)
 															}
 
 															// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
@@ -3220,7 +3252,7 @@ export default {
 														// 			"updated_at" = EXCLUDED."updated_at"
 														// 	`).bind(
 														// 		hashId(),
-														// 		relate.type,
+														// 		type,
 														// 		item.from,
 														// 		item.to,
 														// 		item.cc,
