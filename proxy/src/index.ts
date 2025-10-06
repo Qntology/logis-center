@@ -113,7 +113,7 @@ const randomKey = function(){
  * @param {Object} obj2 덮어쓸 값(소스)을 가진 객체
  * @returns {Object} 병합된 새로운 객체
  */
-function mergeItem(obj1, obj2) {
+function mergeNode(obj1, obj2) {
 	// '비어있다'는 기준은 null, undefined, 빈 문자열('')로 정의합니다.
 	const isEmpty = (value) => value === null || value === undefined || value === '';
 
@@ -358,7 +358,7 @@ const item2json = function(type){
 		return `
 			node:${type} detail page form element CSS selector,
 			id:Refer to the ID value from the link or an attribute | string,
-			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
+			status:'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
 			payment_method:payment method | string,
 			bank:bank company name | string,
 			card:card company name | string,
@@ -1061,7 +1061,7 @@ const Related = function(type){
 const Relay = function(foreign, primary){
 	var queries = []
 
-	var migration = {}
+	var etl = {}
 
 
 	if(foreign == "goods" && primary.type == "order"){
@@ -1070,9 +1070,11 @@ const Relay = function(foreign, primary){
 			column : 'index'
 		})
 
-		migration.import = {
+		etl = {
 			key : "sales",
-			value : primary.sales
+			value : primary.sales,
+			from : foreign,
+			to : primary.type
 		}
 
 	}else if(foreign == "tracking" && primary.type == "order"){
@@ -1081,9 +1083,11 @@ const Relay = function(foreign, primary){
 			column : 'index'
 		})
 
-		migration.import = {
+		etl = {
 			key : "tracking"
-			value : primary.tracking
+			value : primary.tracking,
+			from : foreign,
+			to : primary.type
 		}
 
 	}else if(foreign == "coupon" && primary.type == "order"){
@@ -1092,9 +1096,9 @@ const Relay = function(foreign, primary){
 			column : 'index'
 		})
 
-		migration.import = {
-			key : "event",
-			value : primary.event
+		etl = {
+			from : foreign,
+			to : primary.type
 		}
 
 	}else if(foreign == "event" && primary.type == "order"){
@@ -1103,112 +1107,84 @@ const Relay = function(foreign, primary){
 			column : 'index'
 		})
 
-		migration.import = {
-			key : "event",
-			value : primary.event
+		etl = {
+			from : foreign,
+			to : primary.type
 		}
 
 
 
 	}else if(foreign == "order" && primary.type == "goods"){
+		// order 에서 status = "show" 값만 수정됨
 		queries.push({
 			type : 'sales',
 			column : 'sales',
+			index : primary.type
 		})
 
-		migration.import = {
-			key : "event",
-			value : primary.id
+		etl = {
+			from : foreign,
+			to : primary.type
 		}
-
-		// return {
-		// 	type : 'sales',
-		// 	column : 'sales',
-		// 	index : primary.id
-		// }
 		
 	}else if(foreign == "tracking" && primary.type == "goods"){
-		// queries.push({
-		// 	type : 'sales',
-		// 	column : 'sales',
-		// })
-
-		// queries.push({
-		// 	type : 'tracking',
-		// 	column : 'index',
-		// 	index : primary.index
-		// })
-			
-		// migration.import = {
-		// 	key : "event",
-		// 	value : primary.id
-		// }
+		// 너무 대상이 많아져서 불가능
 
 	}else if(foreign == "event" && primary.type == "goods"){
-		// queries.push({
-		// 	type : 'event',
-		// 	column : 'index'
-		// })
+		queries.push({
+			type : 'event',
+			column : 'index',
+			index : primary.event
+		})
+
+		etl = {
+			from : foreign,
+			to : primary.type
+		}
 
 	}else if(foreign == "coupon" && primary.type == "goods"){
+		queries.push({
+			type : 'event',
+			column : 'index',
+			index : primary.event
+		})
+
+		etl = {
+			from : foreign,
+			to : primary.type
+		}
 
 
 
 	}else if(foreign == "goods" && primary.type == "tracking"){
 		queries.push({
 			type : 'sales',
-			column : 'tracking'
+			column : 'tracking',
+			value : primary.index
 		})
 
-		migration.import = {
-			key : "sales",
-			value : primary.index
+		etl = {
+			from : foreign,
+			to : primary.type
 		}
 
 	}else if(foreign == "order" && primary.type == "tracking"){
 		queries.push({
 			type : 'sales',
-			column : 'tracking'
+			column : 'tracking',
+			value : primary.index
 		})
 
-		migration.import = {
-			key : "sales",
-			value : primary.sales
+		etl = {
+			from : foreign,
+			to : primary.type
 		}
 
 	}else if(foreign == "event" && primary.type == "tracking"){
-		// queries.push({
-		// 	type : 'sales',
-		// 	column : 'tracking',
-		// })
-
-		// queries.push({
-		// 	type : 'event',
-		// 	column : 'index',
-		// 	index : 'event'
-		// })
-
-		// migration.import = {
-		// 	key : "event",
-		// 	value : primary.event
-		// }
+		// 너무 대상이 많아져서 불가능
 
 	}else if(foreign == "coupon" && primary.type == "tracking"){
-		// queries.push({
-		// 	type : 'sales',
-		// 	column : 'tracking',
-		// })
-
-		// queries.push({
-		// 	type : 'event',
-		// 	column : 'index',
-		// 	index : 'event'
-		// })
-
-		// migration.import = {
-		// 	key : "event",
-		// 	value : primary.event
-		// }
+		// 너무 대상이 많아져서 불가능
 
 
 
@@ -1216,40 +1192,32 @@ const Relay = function(foreign, primary){
 		queries.push({
 			type : 'sales',
 			column : 'event',
+			value : primary.index
 		})
 
-		migration.import = {
+		etl = {
 			key : 'sales',
-			value : primary.sales
+			value : primary.sales,
+			from : foreign,
+			to : primary.type
 		}
 
 	}else if(foreign == "order" && primary.type == "event"){
 		queries.push({
 			type : 'sales',
 			column : 'event',
+			value : primary.index
 		})
 
-		migration.export = {
+		etl = {
 			key : 'event',
-			value : primary.index
+			value : primary.index,
+			from : primary.type,
+			to : foreign
 		}
 
 	}else if(foreign == "tracking" && primary.type == "event"){
-		queries.push({
-			type : 'sales',
-			column : 'event',
-		})
-
-		queries.push({
-			type : 'tracking',
-			column : 'index',
-			index : 'tracking'
-		})
-
-		migration.import = {
-			key : "event",
-			value : primary.index
-		}
+		// 매칭이 아예 안되는 항목
 
 	}else if(foreign == "coupon" && primary.type == "event"){
 		queries.push({
@@ -1257,9 +1225,11 @@ const Relay = function(foreign, primary){
 			column : 'index',
 		})
 
-		migration.export = {
+		etl = {
 			key : 'event',
 			value : primary.index
+			from : primary.type,
+			to : foreign
 		}
 
 
@@ -1267,14 +1237,26 @@ const Relay = function(foreign, primary){
 	}else if(foreign == "goods" && primary.type == "coupon"){
 		queries.push({
 			type : 'sales',
-			column : 'event'
+			column : 'event',
+			value : primary.index
 		})
+
+		etl = {
+			from : primary.type,
+			to : foreign
+		}
 
 	}else if(foreign == "order" && primary.type == "coupon"){
 		queries.push({
 			type : 'sales',
-			column : 'event'
+			column : 'event',
+			value : primary.index
 		})
+
+		etl = {
+			from : primary.type,
+			to : foreign
+		}
 
 	}else if(foreign == "tracking" && primary.type == "coupon"){
 		queries.push({
@@ -1282,9 +1264,11 @@ const Relay = function(foreign, primary){
 			column : 'event',
 		})
 
-		migration.export = {
+		etl = {
 			key : 'event',
-			value : primary.index
+			value : primary.index,
+			from : primary.type,
+			to : foreign
 		}
 
 	}else if(foreign == "event" && primary.type == "coupon"){
@@ -1293,16 +1277,18 @@ const Relay = function(foreign, primary){
 			column : 'event',
 		})
 
-		migration.export = {
+		etl = {
 			key : 'event',
-			value : primary.index
+			value : primary.index,
+			from : primary.type,
+			to : foreign
 		}
 
 	}
 
 	return {
 		queries : queries,
-		migration : migration
+		etl : etl
 	}
 }
 
@@ -1892,7 +1878,7 @@ export default {
 								if(results.length){
 									var _item = results[0]
 
-									item = mergeItem(item, _item)
+									item = mergeNode(item, _item)
 
 									if(sales.length){
 										var _item = sales[0]
@@ -2506,57 +2492,7 @@ export default {
 										}
 
 
-										if(item.semantic){
-											var metadata = {
-												type: item.type,
-												from: item.from,
-												to: item.to,
-												cc: item.cc,
-												bcc: item.bcc,
-												ref:task.ref
-											}
-
-											var embeddings
-
-											if(models['cloudflare']){
-												var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
-													text: [item.semantic]
-												})
-
-												var $VectorizeVector = [
-													{
-														id: item.id,
-														values: embeddings[0],
-														metadata: metadata
-													}
-												]
-
-												models['cloudflare'] -= 1
-
-											}
-
-											if(!embeddings && models['deepinfra']){
-												var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', item.semantic)
-
-												var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-													return {
-														id: item.id,
-														values: values,
-														metadata: metadata
-													}
-												})
-
-												models['deepinfra'] -= 1
-											}
-
-											if(!embeddings){
-												fallback = 'embeddings overflow'
-
-												continue
-											}
-
-											await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
-										}
+										
 
 										if(item.condition){
 											if(item.condition.indexOf('used') > -1){
@@ -2593,7 +2529,7 @@ export default {
 										if(results.length){
 											var _item = results[0]
 
-											item = mergeItem(item, _item)
+											item = mergeNode(item, _item)
 										}
 
 
@@ -2790,16 +2726,26 @@ export default {
 											두가지 타입으로 
 												외부 테이블 최신화 진행
 
-												import = 외부 데이터로 내부 데이터 수정
-													order 스캔 진행시
-														draft.type == "goods" && row.type == "order"
-														
-														order items 만 있으면 goods 상세 정보가 없기 때문에 
-														goods 정보 가져와서 order item에 업데이트 해야함
+												import
+													foreign 에서 primary 
 
-												export = 내부 데이터로 외부 데이터 수정
-													tracking 스캔 진행시
-														tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
+												export
+													primary 에서 foreign 
+
+												from : foreign 
+												to : primary 
+													import = 외부 데이터로 내부 데이터 수정
+														order 스캔 진행시
+															draft.type == "goods" && row.type == "order"
+															
+															order items 만 있으면 goods 상세 정보가 없기 때문에 
+															goods 정보 가져와서 order item에 업데이트 해야함
+
+												from : primary 
+												to : foreign
+													export = 내부 데이터로 외부 데이터 수정
+														tracking 스캔 진행시
+															tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
 
 
 											예외 시나리오
@@ -2816,7 +2762,7 @@ export default {
 										*/ 
 
 										for(var r = 0; r < related.length; r++){
-											var { queries, migration } = Relay(related[r], item)
+											var { queries, etl } = Relay(related[r], item)
 
 											// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
 
@@ -2848,8 +2794,7 @@ export default {
 															if(results.length){
 																relates[type] = {
 																	queries : queries,
-																	import : migration.import,
-																	export : migration.export,
+																	etl : etl,
 																	rows : results,
 																	type : related[r]
 																}
@@ -2857,8 +2802,7 @@ export default {
 														}else{
 															relates[type] = {
 																queries : queries,
-																import : migration.import,
-																export : migration.export,
+																etl : etl,
 																rows : results,
 																type : related[r]
 															}
@@ -2894,8 +2838,7 @@ export default {
 
 														relates[type] = {
 															queries : queries,
-															import : migration.import,
-															export : migration.export,
+															etl : etl,
 															rows : [],
 															type : related[r]
 														}
@@ -2989,114 +2932,25 @@ export default {
 															// row.id = item.id
 
 															if(relate.import){
-																var itemId = item.id
+																var edgeId = item.id
 																
-																item = mergeItem(item, row)
+																var edge = mergeNode(item, row)
 
-																item.id = itemId
+																edge.id = edgeId
 
 																if(type == "goods" && row.type == "order"){
 																	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(row.data))
 
 																	var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-																		id : item.id,
-																		title : item.title,
-																		link : item.link,
+																		id : edge.id,
+																		title : edge.title,
+																		link : edge.link,
 																		data : JSON.parse(decompressedJsonString)
 																	})), { to: 'arraybuffer' })
 
-																	row.data = arr.buffer
+																	edge.vectorize = true
 
-																	statements[`${zoneRegion}_${type}`].push(
-																		env[`${zoneRegion}_${type}`].prepare(`
-																			INSERT INTO ${type} (
-																				"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
-																			) VALUES (
-																				?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
-																			) ON CONFLICT (id) DO UPDATE SET
-																				"type" = EXCLUDED."type",
-																				"from" = EXCLUDED."from",
-																				"to" = EXCLUDED."to",
-																				"cc" = EXCLUDED."cc",
-																				"bcc" = EXCLUDED."bcc",
-																				"ref" = EXCLUDED."ref",
-																				"data" = EXCLUDED."data",
-																				"created_at" = EXCLUDED."created_at",
-																				"started_at" = EXCLUDED."started_at",
-																				"expired_at" = EXCLUDED."expired_at",
-																				"index" = EXCLUDED."index",
-																				"event" = EXCLUDED."event",
-																				"views" = EXCLUDED."views",
-																				"sales" = EXCLUDED."sales",
-																				"width" = EXCLUDED."width",
-																				"height" = EXCLUDED."height",
-																				"length" = EXCLUDED."length",
-																				"weight" = EXCLUDED."weight",
-																				"size" = EXCLUDED."size",
-																				"currency" = EXCLUDED."currency",
-																				"supply_price" = EXCLUDED."supply_price",
-																				"sale_price" = EXCLUDED."sale_price",
-																				"discount" = EXCLUDED."discount",
-																				"quantity" = EXCLUDED."quantity",
-																				"tracking" = EXCLUDED."tracking",
-																				"number" = EXCLUDED."number",
-																				"carrier" = EXCLUDED."carrier",
-																				"shipping_fee" = EXCLUDED."shipping_fee",
-																				"shipping_method" = EXCLUDED."shipping_method",
-																				"shipping_duration" = EXCLUDED."shipping_duration",
-																				"fulfillment_service" = EXCLUDED."fulfillment_service",
-																				"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
-																				"bundle_shipping" = EXCLUDED."bundle_shipping",
-																				"used" = EXCLUDED."used",
-																				"lease" = EXCLUDED."lease",
-																				"rental" = EXCLUDED."rental",
-																				"refurbish" = EXCLUDED."refurbish",
-																				"tax_included" = EXCLUDED."tax_included",
-																				"release_date" = EXCLUDED."release_date"
-																		`).bind(
-																			hashId(item.id+row.id),
-																			item.type,
-																			item.from,
-																			item.to,
-																			item.cc,
-																			item.bcc,
-																			item.ref,
-																			row.data,
-																			item.created_at,
-																			row.started_at ? parseFloat(row.started_at) : 0,
-																			row.expired_at ? parseFloat(row.expired_at) : 0,
-																			item.index ? parseFloat(item.index) : 0,
-																			row.event ? parseFloat(row.event) : 0,
-																			item.views,
-																			row.sales ? parseFloat(row.sales) : 0,
-																			row.width ? parseFloat(row.width) : 0,
-																			row.height ? parseFloat(row.height) : 0,
-																			row.length ? parseFloat(row.length) : 0,
-																			row.weight ? parseFloat(row.weight) : 0,
-																			row.size ? row.size : "",
-																			row.currency ? row.currency : "",
-																			row.supply_price? parseFloat(row.supply_price) : 0,
-																			row.sale_price? parseFloat(row.sale_price) : 0,
-																			row.discount ? parseFloat(row.discount) : 0,
-																			row.quantity ? parseFloat(row.quantity) : 0,
-																			row.tracking ? parseFloat(row.tracking) : 0,
-																			item.number ? item.number : "",
-																			row.carrier ? row.carrier : "",
-																			row.shipping_fee ? parseFloat(row.shipping_fee) : 0,
-																			row.shipping_method ? row.shipping_method : "",
-																			row.shipping_duration ? parseFloat(row.shipping_duration) : 0,
-																			row.fulfillment_service ? row.fulfillment_service : "",
-																			row.stock_keeping_unit ? row.stock_keeping_unit : "",
-																			row.bundle_shipping ? parseFloat(row.bundle_shipping) : 0,
-																			row.used ? parseFloat(row.used) : 0,
-																			row.lease ? parseFloat(row.lease) : 0,
-																			row.rental ? parseFloat(row.rental) : 0,
-																			row.refurbish ? parseFloat(row.refurbish) : 0,
-																			row.tax_included ? parseFloat(row.tax_included) : 0,
-																			row.release_date ? parseFloat(row.release_date) : 0
-																		)
-																	)
-
+																	edge.data = arr.buffer
 
 																	var metadata = {
 																		title : data.title,
@@ -3140,8 +2994,8 @@ export default {
 																		continue
 																	}
 
-																	metadata.id = item.id
-																	metadata.type = item.type
+																	metadata.id = edge.id
+																	metadata.type = edge.type
 																	metadata.from = task.from
 																	metadata.to = task.to
 																	metadata.cc = task.cc
@@ -3159,7 +3013,7 @@ export default {
 
 																		var $VectorizeVector = [
 																			{
-																				id: item.id,
+																				id: edge.id,
 																				values: embeddings[0],
 																				metadata: metadata
 																			}
@@ -3174,7 +3028,7 @@ export default {
 
 																		var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 																			return {
-																				id: item.id,
+																				id: edge.id,
 																				values: values,
 																				metadata: metadata
 																			}
@@ -3196,9 +3050,9 @@ export default {
 															}
 
 															if(relate.export){
-															
+																// var edge = mergeNode(item, row)
 
-																item = mergeItem(item, row)
+
 															}
 
 															// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
@@ -3270,6 +3124,58 @@ export default {
 											}
 
 											// if end
+										}
+
+										if(item.semantic && !item.vectorize){
+											var metadata = {
+												type: item.type,
+												from: item.from,
+												to: item.to,
+												cc: item.cc,
+												bcc: item.bcc,
+												ref:task.ref
+											}
+
+											var embeddings
+
+											if(models['cloudflare']){
+												var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
+													text: [item.semantic]
+												})
+
+												var $VectorizeVector = [
+													{
+														id: item.id,
+														values: embeddings[0],
+														metadata: metadata
+													}
+												]
+
+												models['cloudflare'] -= 1
+
+											}
+
+											if(!embeddings && models['deepinfra']){
+												var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', item.semantic)
+
+												var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+													return {
+														id: item.id,
+														values: values,
+														metadata: metadata
+													}
+												})
+
+												models['deepinfra'] -= 1
+											}
+
+											if(!embeddings){
+												fallback = 'embeddings overflow'
+
+												continue
+											}
+
+											await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 										}
 
 
