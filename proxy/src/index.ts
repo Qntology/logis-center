@@ -305,10 +305,11 @@ const list2json = function(language){
 				status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 				id:Refer to the ID value from the link or an attribute | string,
 				title:author and content | string, 
+				link:URL includes manage path additional link | string,
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
 			}
 			if (type is 'order' or 'goods') {
-				status:'active' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
+				status:'active' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete,
 				id:Refer to the ID value from the link or an attribute | string,
 				title:title | string, 
 				sale_price:sale price | number,
@@ -319,7 +320,7 @@ const list2json = function(language){
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
 			}
 			if (type is 'coupon' or 'event') {
-				status : 'active' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or "complete",
+				status : 'active' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete,
 				id:Refer to the ID value from the link or an attribute | string,
 				title:type based item title, 
 				started_at:yyyy-MM-dd'T'HH:mm:ss,
@@ -334,7 +335,7 @@ const item2json = function(type){
 	if(type == 'tracking'){
 		return ` 
 			node:${type} detail page form element CSS selector,
-			status:"draft" or "progress" or "return" or "complete",
+			status:'draft' or 'progress' or 'return' or 'complete,
 			id:tracking number | string,
 			title:${type} goods title | string, 
 			senderName:senderName | string,
@@ -349,7 +350,7 @@ const item2json = function(type){
 			package_weight:Package weight | number,
 			carrier:carrier name translated into English | string,
 			shipping_fee:Shipping cost | number,
-			shipping_method:"standard" or "express" or "same_day" or "pick_up" or "freight",
+			shipping_method:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight,
 			shipping_duration:Estimated delivery days | number,
 			bundle_shipping:Allow combined shipping | string,
 			shipping_date:yyyy-MM-dd'T'HH:mm:ss | string,
@@ -358,14 +359,14 @@ const item2json = function(type){
 		return `
 			node:${type} detail page form element CSS selector,
 			id:Refer to the ID value from the link or an attribute | string,
-			status:'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
+			status:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete',
 			payment_method:payment method | string,
 			bank:bank company name | string,
 			card:card company name | string,
 			code:product constant code | string,
 			model_name:product Model name | string,
 			brand_name:product Brand name | string,
-			condition:["new" or "used" or "lease" or "rental" or "refurbish"],
+			condition:['new' or 'used' or 'lease' or 'rental' or 'refurbish'],
 			description:product Full description (HTML allowed) | string,
 			short_description:product short description | string,
 			tags:[{ tag : product keyword or tag | string }],
@@ -392,7 +393,7 @@ const item2json = function(type){
 			video_url:product Promotional video URL | string,
 			carrier:product carrier name translated into English | string,
 			shipping_fee:product Shipping cost | number,
-			shipping_method:"standard" or "express" or "same_day" or "pick_up" or "freight",
+			shipping_method:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight,
 			shipping_duration:product Estimated delivery days | number,
 			bundle_shipping:product Allow combined shipping | string,
 			product_width:Package width(cm) | number,
@@ -418,7 +419,7 @@ const item2json = function(type){
 	}else if(type == 'order'){
 		return `
 			node:${type} detail page form element CSS selector,
-			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete",
+			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete,
 			goods:[{
 				title:goods title | string,
 				link:URL includes manage path additional goods link | string,
@@ -435,7 +436,7 @@ const item2json = function(type){
 		return `
 			node:${type} detail page form element CSS selector,
 			type:'percentage' or 'fixed_amount' or 'free_shipping' or '',
-			status:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or "complete",
+			status:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete,
 			title:${type} item title | string, 
 			started_at:yyyy-MM-dd'T'HH:mm:ss | string,
 			expired_at:yyyy-MM-dd'T'HH:mm:ss | string,
@@ -451,7 +452,7 @@ const item2json = function(type){
 		`
 	}else if(type == 'review' || type == 'member'){
 		return `
-			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or "complete"
+			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete'
 			name:${type} name | string,
 			title:${type} item title | string, 
 			completed:order complete | boolean,
@@ -1058,56 +1059,65 @@ const Related = function(type){
 
 
 
-const Relay = function(foreign, primary){
-	var queries = []
+const Relay = async function(foreign, primary){
+	var query = []
 
-	var etl = {}
-
+	var merge = {}
 
 	if(foreign == "goods" && primary.type == "order"){
-		queries.push({
-			type : 'sales',
-			column : 'index'
+		query.push({
+			type : foreign,
+			table : 'sales',
+			column : 'index',
+			value : primary.goods
 		})
 
-		etl = {
+		merge = {
+			includes : ["event"],
 			key : "sales",
-			value : primary.sales,
+			value : primary.goods,
 			from : foreign,
 			to : primary.type
 		}
 
 	}else if(foreign == "tracking" && primary.type == "order"){
-		queries.push({
-			type : 'tracking',
-			column : 'index'
+		query.push({
+			type : foreign,
+			table : 'tracking',
+			column : primary.type,
+			value : primary.index
 		})
 
-		etl = {
-			key : "tracking"
-			value : primary.tracking,
+		merge = {
+			includes : ["no", "goods", "event"],
+			type : 'tracking',
+			column : 'index',
 			from : foreign,
 			to : primary.type
 		}
 
 	}else if(foreign == "coupon" && primary.type == "order"){
-		queries.push({
-			type : 'event',
-			column : 'index'
+		query.push({
+			type : foreign,
+			table : 'event',
+			column : 'index',
+			value : primary.event
 		})
 
-		etl = {
+		merge = {
 			from : foreign,
 			to : primary.type
 		}
 
 	}else if(foreign == "event" && primary.type == "order"){
-		queries.push({
-			type : 'event',
-			column : 'index'
+		query.push({
+			type : foreign,
+			table : 'event',
+			column : 'index',
+			value : primary.event
 		})
 
-		etl = {
+		merge = {
 			from : foreign,
 			to : primary.type
 		}
@@ -1116,40 +1126,55 @@ const Relay = function(foreign, primary){
 
 	}else if(foreign == "order" && primary.type == "goods"){
 		// order 에서 status = "show" 값만 수정됨
-		queries.push({
-			type : 'sales',
+		query.push({
+			type : foreign,
+			table : 'sales',
 			column : 'sales',
-			index : primary.type
+			value : primary.type
 		})
 
-		etl = {
-			from : foreign,
-			to : primary.type
+		merge = {
+			includes : ["event"],
+			from : primary.type,
+			to : foreign
 		}
 		
 	}else if(foreign == "tracking" && primary.type == "goods"){
-		// 너무 대상이 많아져서 불가능
-
-	}else if(foreign == "event" && primary.type == "goods"){
-		queries.push({
-			type : 'event',
-			column : 'index',
-			index : primary.event
+		// upsert goods 정보로 tracking 추가함
+		query.push({
+			type : primary.type,
+			table : 'tracking',
+			column : 'goods',
+			value : primary.index,
 		})
 
-		etl = {
+		merge = {
+			from : primary.type,
+			to : foreign
+		}
+
+	}else if(foreign == "event" && primary.type == "goods"){
+		query.push({
+			type : foreign,
+			table : 'event',
+			column : 'index',
+			value : primary.event
+		})
+
+		merge = {
 			from : foreign,
 			to : primary.type
 		}
 
 	}else if(foreign == "coupon" && primary.type == "goods"){
-		queries.push({
-			type : 'event',
+		query.push({
+			type : foreign,
+			table : 'event',
 			column : 'index',
-			index : primary.event
+			value : primary.event
 		})
 
-		etl = {
+		merge = {
 			from : foreign,
 			to : primary.type
 		}
@@ -1157,61 +1182,68 @@ const Relay = function(foreign, primary){
 
 
 	}else if(foreign == "goods" && primary.type == "tracking"){
-		queries.push({
-			type : 'sales',
-			column : 'tracking',
-			value : primary.index
+		// upsert goods 정보로 tracking 추가함
+		query.push({
+			type : foreign,
+			table : 'sales',
+			column : 'index',
+			value : primary.goods
 		})
 
-		etl = {
-			from : foreign,
-			to : primary.type
+		merge = {
+			from : primary.type,
+			to : foreign
 		}
 
 	}else if(foreign == "order" && primary.type == "tracking"){
-		queries.push({
-			type : 'sales',
-			column : 'tracking',
-			value : primary.index
-		})
-
-		etl = {
-			from : foreign,
-			to : primary.type
+		if(!primary.order){
+			return {
+				query : [{
+					type : foreign,
+					table : 'sales'
+					column : 'tracking',
+					value : primary.index
+				}],
+				merge : {
+					includes : ["order", "goods", "event"],
+					from : foreign,
+					to : primary.type
+				}
+			}
 		}
 
+
+
 	}else if(foreign == "event" && primary.type == "tracking"){
-		// 너무 대상이 많아져서 불가능
+		// 매칭이 아예 안되는 항목
 
 	}else if(foreign == "coupon" && primary.type == "tracking"){
-		// 너무 대상이 많아져서 불가능
+		// 매칭이 아예 안되는 항목
 
 
 
-	}else if(foreign == "sales" && primary.type == "event"){
-		queries.push({
-			type : 'sales',
+	}else if(foreign == "goods" && primary.type == "event"){
+		query.push({
+			type : foreign,
+			table : 'sales',
 			column : 'event',
 			value : primary.index
 		})
 
-		etl = {
-			key : 'sales',
-			value : primary.sales,
-			from : foreign,
-			to : primary.type
+		merge = {
+			from : primary.type,
+			to : foreign
 		}
 
 	}else if(foreign == "order" && primary.type == "event"){
-		queries.push({
-			type : 'sales',
+		query.push({
+			type : foreign,
+			table : 'sales',
 			column : 'event',
 			value : primary.index
 		})
 
-		etl = {
-			key : 'event',
-			value : primary.index,
+		merge = {
 			from : primary.type,
 			to : foreign
 		}
@@ -1220,14 +1252,14 @@ const Relay = function(foreign, primary){
 		// 매칭이 아예 안되는 항목
 
 	}else if(foreign == "coupon" && primary.type == "event"){
-		queries.push({
-			type : 'event',
-			column : 'index',
+		query.push({
+			type : foreign,
+			table : 'event',
+			column : 'event',
+			value : primary.index
 		})
 
-		etl = {
-			key : 'event',
-			value : primary.index
+		merge = {
 			from : primary.type,
 			to : foreign
 		}
@@ -1235,36 +1267,38 @@ const Relay = function(foreign, primary){
 
 
 	}else if(foreign == "goods" && primary.type == "coupon"){
-		queries.push({
-			type : 'sales',
+		query.push({
+			type : foreign,
+			table : 'sales',
 			column : 'event',
 			value : primary.index
 		})
 
-		etl = {
+		merge = {
 			from : primary.type,
 			to : foreign
 		}
 
 	}else if(foreign == "order" && primary.type == "coupon"){
-		queries.push({
-			type : 'sales',
+		query.push({
+			type : foreign,
+			table : 'sales',
 			column : 'event',
 			value : primary.index
 		})
 
-		etl = {
+		merge = {
 			from : primary.type,
 			to : foreign
 		}
 
 	}else if(foreign == "tracking" && primary.type == "coupon"){
-		queries.push({
+		query.push({
 			type : 'sales',
 			column : 'event',
 		})
 
-		etl = {
+		merge = {
 			key : 'event',
 			value : primary.index,
 			from : primary.type,
@@ -1272,23 +1306,23 @@ const Relay = function(foreign, primary){
 		}
 
 	}else if(foreign == "event" && primary.type == "coupon"){
-		queries.push({
-			type : 'event',
+		query.push({
+			type : foreign,
 			column : 'event',
+			column : 'index',
+			value : primary.event
 		})
 
-		etl = {
-			key : 'event',
-			value : primary.index,
-			from : primary.type,
-			to : foreign
+		merge = {
+			from : foreign,
+			to : primary.type
 		}
 
 	}
 
 	return {
-		queries : queries,
-		etl : etl
+		query : query,
+		merge : merge
 	}
 }
 
@@ -1858,14 +1892,7 @@ export default {
 
 							item.created_at = now
 
-							item.index = crc32(hashId(task.to+item.no))
-
-
-
-
-								
-
-
+							item.index = crc32(item.id)
 
 
 							var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
@@ -2055,17 +2082,21 @@ export default {
 								statements[`${zoneRegion}_tracking`].push(
 									env[`${zoneRegion}_tracking`].prepare(`
 										INSERT INTO tracking (
-											"id", "from", "to", "cc", "bcc", "ref", "created_at", "index", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+											"id", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 										) VALUES (
-											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
 										) ON CONFLICT (id) DO UPDATE SET
 											"from" = EXCLUDED."from",
 											"to" = EXCLUDED."to",
 											"cc" = EXCLUDED."cc",
 											"bcc" = EXCLUDED."bcc",
 											"ref" = EXCLUDED."ref",
+											"data" = EXCLUDED."data",
 											"created_at" = EXCLUDED."created_at",
 											"index" = EXCLUDED."index",
+											"event" = EXCLUDED."event", 
+											"goods" = EXCLUDED."goods", 
+											"order" = EXCLUDED."order",
 											"status" = EXCLUDED."status",
 											"no" = EXCLUDED."no",
 											"sender_address" = EXCLUDED."sender_address",
@@ -2095,8 +2126,12 @@ export default {
 										item.cc,
 										item.bcc,
 										item.ref,
+										item.data,
 										item.created_at,
 										item.index,
+										item.event ? item.event : 0,
+										item.goods ? item.goods : 0,
+										item.order ? item.order : 0,
 										item.status,
 										item.no,
 										item.sender_address ? item.sender_address : "",
@@ -2366,7 +2401,7 @@ export default {
 
 										item.no = (item.id ? item.id : i).toString()
 
-										item.index = crc32(hashId(task.to+item.no))
+										item.index = crc32(hashId(team.id+item.no))
 
 										try{
 											try{
@@ -2378,6 +2413,7 @@ export default {
 											}
 
 											item.link = url.pathname + url.search
+
 										}catch(err){
 
 										}
@@ -2398,9 +2434,7 @@ export default {
 
 
 
-										item.id = hashId(team.id+task.cc+item.link)
-										
-
+										item.id = hashId(team.id+task.cc+item.link+item.type)
 
 										item.flag = task.flag
 										
@@ -2449,6 +2483,7 @@ export default {
 										})), { to: 'arraybuffer' })
 
 										item.data = arr.buffer
+
 
 
 										if(item.type == "tracking"){
@@ -2762,51 +2797,52 @@ export default {
 										*/ 
 
 										for(var r = 0; r < related.length; r++){
-											var { queries, etl } = Relay(related[r], item)
+											var { query, merge } = Relay(related[r], item, env, zoneRegion)
 
 											// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
 
 											try{
-												if(queries.length){
-													var type = queries[0].type
-													var column = queries[0].column
+												if(query.length){
+													var table = query[0].type 
+													var type = query[0].type
+													var column = query[0].column
 
-													var { results } = await env[`${zoneRegion}_${type}`].prepare(
-														`SELECT * FROM ${type} WHERE "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
+													var { results } = await env[`${zoneRegion}_${table}`].prepare(
+														`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
 													).bind(
 														item.index, team.id, item.cc, now - 60000
 													).all()
 
 													if(results.length){
-														if(queries[1]){
-															var row = results[0]
+														// if(query[1]){
+														// 	var row = results[0]
 
-															var flow = queries[1]
+														// 	var flow = query[1]
 
-															index = row[flow.index]
+														// 	index = row[flow.index]
 
-															var { results } = await env[`${zoneRegion}_${flow.type}`].prepare(
-																`SELECT * FROM ${flow.type} WHERE "${flow.column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
-															).bind(
-																index, team.id, item.cc, now - 60000
-															).all()
+														// 	var { results } = await env[`${zoneRegion}_${flow.type}`].prepare(
+														// 		`SELECT * FROM ${flow.type} WHERE "${flow.column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
+														// 	).bind(
+														// 		index, team.id, item.cc, now - 60000
+														// 	).all()
 
-															if(results.length){
-																relates[type] = {
-																	queries : queries,
-																	etl : etl,
-																	rows : results,
-																	type : related[r]
-																}
-															}
-														}else{
-															relates[type] = {
-																queries : queries,
-																etl : etl,
-																rows : results,
-																type : related[r]
-															}
-														}
+														// 	if(results.length){
+														// 		relates[type] = {
+														// 			query : query,
+														// 			merge : merge,
+														// 			rows : results,
+														// 			type : related[r]
+														// 		}
+														// 	}
+														// }else{
+														// 	relates[type] = {
+														// 		query : query,
+														// 		merge : merge,
+														// 		rows : results,
+														// 		type : related[r]
+														// 	}
+														// }
 
 													}else{
 														// draft 상태 맞음
@@ -2836,12 +2872,19 @@ export default {
 														// 	updated_at = 0
 														// }
 
-														relates[type] = {
-															queries : queries,
-															etl : etl,
-															rows : [],
-															type : related[r]
-														}
+														// relates[type] = {
+														// 	query : query,
+														// 	merge : merge,
+														// 	rows : [],
+														// 	type : related[r]
+														// }
+													}
+
+													relates[type] = {
+														query : query,
+														merge : merge,
+														rows : results,
+														type : related[r]
 													}
 												}
 											}catch(err){
@@ -2869,83 +2912,146 @@ export default {
 												// for start
 
 												// type값은 related[i]
-
 												if (relates.hasOwnProperty(type)) {
 													var relate = relates[type]
 
 													/*
-														relate.queries[0].type 	1차 쿼리 테이블 이름
-														relate.queries[0].column	1차 쿼리 column name
-														relate.queries[0].index		1차 쿼리 column value
-
-														relate.queries[1].type 	2차 쿼리 테이블 이름
-														relate.queries[1].column	2차 쿼리 column name
-														relate.queries[1].index		2차 쿼리 column value
-
-														relate.import		foreign 값을 primary에 저장하는 값
-														relate.import.key 		column name
-														relate.import.value 	column value 
-
-														relate.export		primary 값을 foreign에 저장하는 값
-														relate.export.key 		column name
-														relate.export.value 	column value 
-													*/
-
-													/*
 														시나리오 case
 
-															relate.import
-																order 스캔 진행시
-																	type == "goods" && row.type == "order"
+														import
+															order 스캔 진행시
+																type == "goods" && row.type == "order"
 
-																	order items 만 있으면 goods 상세 정보가 없기 때문에 
-																	goods 정보 가져와서 order item에 업데이트 해야함
+																order items 만 있으면 goods 상세 정보가 없기 때문에 
+																goods 정보 가져와서 order item에 업데이트 해야함
 
-															relate.export
-																tracking 스캔 진행시
-																	tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
+														export
+															tracking 스캔 진행시
+																tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
 
-
-															goods 스캔 진행시 다음 의미 없음
-																row.type == "goods"
-																row.type == "event"
-																row.type == "tracking"
-
-															event 스캔 진행시 다음 의미 없음
-																row.type == "coupon"
-																row.type == "event"
-																row.type == "goods"
-																row.type == "order"
 													*/
 
+													if(!relate){
+														continue
+													}
 
-													var queries = relate.queries
+													if(!relate.query){
+														continue
+													}
 
-													var column = queries[1] ? queries[1].column : queries[0].column
-													var index = queries[1] ? queries[1].index : queries[0].index
+													if(!relate.merge){
+														continue
+													}
+
+
+															
+													var merge = relate.merge
+													var query = relate.query
+
+													var column = query[1] ? query[1].column : query[0].column
+													var index = query[1] ? query[1].index : query[0].index
 
 
 													if(relate.rows.length){
 														for(var d = 0; d < relate.rows.length; d++){
 															var row = relate.rows[d]
 
-															// row.id = item.id
+															var nodeData = row.data
 
-															if(relate.import){
-																var edgeId = item.id
-																
-																var edge = mergeNode(item, row)
+															var key = row.merge.key ? row.merge.key : ""
+															var value = row.merge.value ? row.merge.value : undefined
 
-																edge.id = edgeId
+															if(typeof value == 'undefined'){
+																if(typeof key != 'undefined'){
+																	value = row[key]
+																}
+															}
 
-																if(type == "goods" && row.type == "order"){
-																	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(row.data))
+
+															var from = row.type == merge.from ? item : row
+
+															var to = row.type == merge.to ? item : row
+
+
+															delete from.id
+															delete from.type
+															delete from.from
+															delete from.to
+															delete from.cc
+															delete from.bcc
+															delete from.data
+															delete from.created_at
+
+
+															if(merge.includes.indexOf('started_at') == -1){
+																delete from.started_at
+															}
+
+															if(merge.includes.indexOf('expired_at') == -1){
+																delete from.expired_at
+															}
+
+															if(merge.includes.indexOf('event') == -1){
+																delete from.event
+															}
+
+															if(merge.includes.indexOf('goods') == -1){
+																delete from.goods
+															}
+
+															if(merge.includes.indexOf('order') == -1){
+																delete from.order
+															}
+
+															if(merge.includes.indexOf('views') == -1){
+																delete from.views
+															}
+
+															if(merge.includes.indexOf('tracking') == -1){
+																delete from.tracking
+															}
+
+
+
+															if(key){
+																row[key] = value
+															}
+
+															var edgeId = to.id
+
+															var edgeType = to.type
+
+															var edge = mergeNode(to, from)
+
+															edge.id = edgeId
+
+															edge.type = edgeType
+
+
+															var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
+
+															var data = JSON.parse(decompressedJsonString)
+
+
+															if(from.type == "tracking" && typeof to.tracking != "undefined"){
+																if(from.no){
+																	to.tracking = crc32(from.no)
+																}
+															}
+
+
+															
+															if(relate.type == merge.from){
+																// import
+
+																if(from.type == "goods" && to.type == "order"){
+																	
 
 																	var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 																		id : edge.id,
 																		title : edge.title,
 																		link : edge.link,
-																		data : JSON.parse(decompressedJsonString)
+																		data : data
 																	})), { to: 'arraybuffer' })
 
 																	edge.vectorize = true
@@ -3047,13 +3153,247 @@ export default {
 																	await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 
 																}
+															}else{
+																// export
 															}
 
-															if(relate.export){
-																// var edge = mergeNode(item, row)
 
 
+															if(edgeType == "sales"){
+																statements[`${zoneRegion}_sales`].push(
+																	env[`${zoneRegion}_sales`].prepare(`
+																		INSERT INTO sales (
+																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+																		) VALUES (
+																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
+																		) ON CONFLICT (id) DO UPDATE SET
+																			"type" = EXCLUDED."type",
+																			"from" = EXCLUDED."from",
+																			"to" = EXCLUDED."to",
+																			"cc" = EXCLUDED."cc",
+																			"bcc" = EXCLUDED."bcc",
+																			"ref" = EXCLUDED."ref",
+																			"data" = EXCLUDED."data",
+																			"created_at" = EXCLUDED."created_at",
+																			"started_at" = EXCLUDED."started_at",
+																			"expired_at" = EXCLUDED."expired_at",
+																			"index" = EXCLUDED."index",
+																			"event" = EXCLUDED."event",
+																			"views" = EXCLUDED."views",
+																			"goods" = EXCLUDED."goods",
+																			"width" = EXCLUDED."width",
+																			"height" = EXCLUDED."height",
+																			"length" = EXCLUDED."length",
+																			"weight" = EXCLUDED."weight",
+																			"size" = EXCLUDED."size",
+																			"currency" = EXCLUDED."currency",
+																			"supply_price" = EXCLUDED."supply_price",
+																			"sale_price" = EXCLUDED."sale_price",
+																			"discount" = EXCLUDED."discount",
+																			"quantity" = EXCLUDED."quantity",
+																			"tracking" = EXCLUDED."tracking",
+																			"number" = EXCLUDED."number",
+																			"carrier" = EXCLUDED."carrier",
+																			"shipping_fee" = EXCLUDED."shipping_fee",
+																			"shipping_method" = EXCLUDED."shipping_method",
+																			"shipping_duration" = EXCLUDED."shipping_duration",
+																			"fulfillment_service" = EXCLUDED."fulfillment_service",
+																			"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
+																			"bundle_shipping" = EXCLUDED."bundle_shipping",
+																			"used" = EXCLUDED."used",
+																			"lease" = EXCLUDED."lease",
+																			"rental" = EXCLUDED."rental",
+																			"refurbish" = EXCLUDED."refurbish",
+																			"tax_included" = EXCLUDED."tax_included",
+																			"release_date" = EXCLUDED."release_date"
+																	`).bind(
+																		to.id,
+																		edgeType,
+																		to.from,
+																		to.to,
+																		to.cc,
+																		to.bcc,
+																		to.ref,
+																		to.data,
+																		to.created_at,
+																		edge.started_at ? parseFloat(edge.started_at) : 0,
+																		edge.expired_at ? parseFloat(edge.expired_at) : 0,
+																		edge.index ? parseFloat(edge.index) : 0,
+																		edge.event ? parseFloat(edge.event) : 0,
+																		edge.views ? parseFloat(edge.views) : 0,
+																		edge.goods ? parseFloat(edge.goods) : 0,
+																		edge.width ? parseFloat(edge.width) : 0,
+																		edge.height ? parseFloat(edge.height) : 0,
+																		edge.length ? parseFloat(edge.length) : 0,
+																		edge.weight ? parseFloat(edge.weight) : 0,
+																		edge.size ? edge.size : "",
+																		edge.currency,
+																		edge.supply_price? parseFloat(edge.supply_price) : 0,
+																		edge.sale_price? parseFloat(edge.sale_price) : 0,
+																		edge.discount ? parseFloat(edge.discount) : 0,
+																		edge.quantity ? parseFloat(edge.quantity) : 0,
+																		edge.tracking ? parseFloat(edge.tracking) : 0,
+																		edge.number ? edge.number : "",
+																		edge.carrier ? edge.carrier : "",
+																		edge.shipping_fee ? parseFloat(edge.shipping_fee) : 0,
+																		edge.shipping_method ? edge.shipping_method : "",
+																		edge.shipping_duration ? parseFloat(edge.shipping_duration) : 0,
+																		edge.fulfillment_service ? edge.fulfillment_service : "",
+																		edge.stock_keeping_unit ? edge.stock_keeping_unit : "",
+																		edge.bundle_shipping ? parseFloat(edge.bundle_shipping) : 0,
+																		edge.used ? parseFloat(edge.used) : 0,
+																		edge.lease ? parseFloat(edge.lease) : 0,
+																		edge.rental ? parseFloat(edge.rental) : 0,
+																		edge.refurbish ? parseFloat(edge.refurbish) : 0,
+																		edge.tax_included ? parseFloat(edge.tax_included) : 0,
+																		edge.release_date ? parseFloat(edge.release_date) : 0
+																	)
+																)
+															}else if(edgeType == "tracking"){
+																statements[`${zoneRegion}_tracking`].push(
+																	env[`${zoneRegion}_tracking`].prepare(`
+																		INSERT INTO tracking (
+																			"id", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+																		) VALUES (
+																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+																		) ON CONFLICT (id) DO UPDATE SET
+																			"from" = EXCLUDED."from",
+																			"to" = EXCLUDED."to",
+																			"cc" = EXCLUDED."cc",
+																			"bcc" = EXCLUDED."bcc",
+																			"ref" = EXCLUDED."ref",
+																			"data" = EXCLUDED."data",
+																			"created_at" = EXCLUDED."created_at",
+																			"index" = EXCLUDED."index",
+																			"event" = EXCLUDED."event", 
+																			"goods" = EXCLUDED."goods", 
+																			"order" = EXCLUDED."order", 
+																			"status" = EXCLUDED."status",
+																			"no" = EXCLUDED."no",
+																			"sender_address" = EXCLUDED."sender_address",
+																			"sender_phone" = EXCLUDED."sender_phone",
+																			"recipient_address" = EXCLUDED."recipient_address",
+																			"recipient_phone" = EXCLUDED."recipient_phone",
+																			"width" = EXCLUDED."width",
+																			"height" = EXCLUDED."height",
+																			"length" = EXCLUDED."length",
+																			"weight" = EXCLUDED."weight",
+																			"carrier" = EXCLUDED."carrier",
+																			"shipping_fee" = EXCLUDED."shipping_fee",
+																			"shipping_method" = EXCLUDED."shipping_method",
+																			"shipping_duration" = EXCLUDED."shipping_duration",
+																			"shipping_date" = EXCLUDED."shipping_date",
+																			"delivery_date" = EXCLUDED."delivery_date",
+																			"order_date" = EXCLUDED."order_date",
+																			"payment_date" = EXCLUDED."payment_date",
+																			"payment_method" = EXCLUDED."payment_method",
+																			"payment_origin" = EXCLUDED."payment_origin",
+																			"payment_number" = EXCLUDED."payment_number",
+																			"bundle_shipping" = EXCLUDED."bundle_shipping"
+																	`).bind(
+																		to.id,
+																		to.from,
+																		to.to,
+																		to.cc,
+																		to.bcc,
+																		to.ref,
+																		to.data,
+																		to.created_at,
+																		edge.index,
+																		edge.event ? edge.event : 0,
+																		edge.goods ? edge.goods : 0,
+																		edge.order ? edge.order : 0,
+																		edge.status,
+																		edge.no ? edge.no : "",
+																		edge.sender_address ? edge.sender_address : "",
+																		edge.sender_phone ? edge.sender_phone : "",
+																		edge.recipient_address ? edge.recipient_address : "",
+																		edge.recipient_phone ? edge.recipient_phone : "",
+																		edge.width ? parseFloat(edge.width) : 0,
+																		edge.height ? parseFloat(edge.height) : 0,
+																		edge.length ? parseFloat(edge.length) : 0,
+																		edge.weight ? parseFloat(edge.weight) : 0,
+																		edge.carrier ? parseFloat(edge.carrier) : 0,
+																		edge.shipping_fee ? parseFloat(edge.shipping_fee) : 0,
+																		edge.shipping_method ? edge.shipping_method : "",
+																		edge.shipping_duration ? parseFloat(edge.shipping_duration) : 0,
+																		edge.shipping_date ? parseFloat(edge.shipping_date) : 0,
+																		edge.delivery_date ? parseFloat(edge.delivery_date) : 0,
+																		edge.order_date ? parseFloat(edge.order_date) : 0,
+																		edge.payment_date ? parseFloat(edge.payment_date) : 0,
+																		edge.payment_method ? edge.payment_method : "",
+																		edge.payment_origin ? edge.payment_origin : "",
+																		edge.payment_number ? edge.payment_number : "",
+																		edge.bundle_shipping ? parseFloat(edge.bundle_shipping) : 0
+																	)
+																)
+															}else if(edgeType == "event"){
+																statements[`${zoneRegion}_event`].push(
+																	env[`${zoneRegion}_event`].prepare(`
+																		INSERT INTO event (
+																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
+																		) VALUES (
+																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+																		) ON CONFLICT (id) DO UPDATE SET
+																			"type" = EXCLUDED."type",
+																			"from" = EXCLUDED."from",
+																			"to" = EXCLUDED."to",
+																			"cc" = EXCLUDED."cc",
+																			"bcc" = EXCLUDED."bcc",
+																			"ref" = EXCLUDED."ref",
+																			"data" = EXCLUDED."data",
+																			"created_at" = EXCLUDED."created_at",
+																			"started_at" = EXCLUDED."started_at",
+																			"expired_at" = EXCLUDED."expired_at",
+																			"index" = EXCLUDED."index",
+																			"event" = EXCLUDED."event",
+																			"number" = EXCLUDED."number",
+																			"address" = EXCLUDED."address",
+																			"status" = EXCLUDED."status",
+																			"code" = EXCLUDED."code",
+																			"discount" = EXCLUDED."discount",
+																			"quantity" = EXCLUDED."quantity",
+																			"usage_per" = EXCLUDED."usage_per",
+																			"usage_limit" = EXCLUDED."usage_limit",
+																			"min_order_amount" = EXCLUDED."min_order_amount",
+																			"max_order_amount" = EXCLUDED."max_order_amount",
+																			"max_discount_amount" = EXCLUDED."max_discount_amount",
+																			"new_customer_only" = EXCLUDED."new_customer_only",
+																			"first_purchase_only" = EXCLUDED."first_purchase_only",
+																			"region_restrictions" = EXCLUDED."region_restrictions"
+																	`).bind(
+																		to.id,
+																		edgeType,
+																		to.from,
+																		to.to,
+																		to.cc,
+																		to.bcc,
+																		to.ref,
+																		to.data,
+																		to.created_at,
+																		edge.started_at ? parseFloat(edge.started_at) : 0,
+																		edge.expired_at ? parseFloat(edge.expired_at) : 0,
+																		edge.index ? parseFloat(edge.index) : 0,
+																		edge.event ? parseFloat(edge.event) : 0,
+																		edge.number ? edge.number : "",
+																		edge.address ? edge.address : "",
+																		edge.status ? edge.status : "",
+																		edge.code ? edge.code : "",
+																		edge.discount ? parseFloat(edge.discount) : 0,
+																		edge.quantity ? parseFloat(edge.quantity) : 0,
+																		edge.usage_per ? parseFloat(edge.usage_per) : 0,
+																		edge.usage_limit ? parseFloat(edge.usage_limit) : 0,
+																		edge.min_order_amount ? parseFloat(edge.min_order_amount) : 0,
+																		edge.max_order_amount ? parseFloat(edge.max_order_amount) : 0,
+																		edge.max_discount_amount ? parseFloat(edge.max_discount_amount) : 0,
+																		edge.new_customer_only ? parseFloat(edge.new_customer_only) : 0,
+																		edge.first_purchase_only ? parseFloat(edge.first_purchase_only) : 0,
+																		edge.region_restrictions ? parseFloat(edge.region_restrictions) : 0
+																	)
+																)
 															}
+
+
 
 															// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
 
@@ -3237,7 +3577,7 @@ export default {
 														"index" = EXCLUDED."index",
 														"event" = EXCLUDED."event",
 														"views" = EXCLUDED."views",
-														"sales" = EXCLUDED."sales",
+														"goods" = EXCLUDED."goods",
 														"width" = EXCLUDED."width",
 														"height" = EXCLUDED."height",
 														"length" = EXCLUDED."length",
@@ -3278,7 +3618,7 @@ export default {
 													item.index ? parseFloat(item.index) : 0,
 													item.event ? parseFloat(item.event) : 0,
 													item.views ? parseFloat(item.views) : 0,
-													item.sales ? parseFloat(item.sales) : 0,
+													item.goods ? parseFloat(item.goods) : 0,
 													item.width ? parseFloat(item.width) : 0,
 													item.height ? parseFloat(item.height) : 0,
 													item.length ? parseFloat(item.length) : 0,
@@ -3310,17 +3650,21 @@ export default {
 											statements[`${zoneRegion}_tracking`].push(
 												env[`${zoneRegion}_tracking`].prepare(`
 													INSERT INTO tracking (
-														"id", "from", "to", "cc", "bcc", "ref", "created_at", "index", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+														"id", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
 													) ON CONFLICT (id) DO UPDATE SET
 														"from" = EXCLUDED."from",
 														"to" = EXCLUDED."to",
 														"cc" = EXCLUDED."cc",
 														"bcc" = EXCLUDED."bcc",
 														"ref" = EXCLUDED."ref",
+														"data" = EXCLUDED."data",
 														"created_at" = EXCLUDED."created_at",
 														"index" = EXCLUDED."index",
+														"event" = EXCLUDED."event", 
+														"goods" = EXCLUDED."goods", 
+														"order" = EXCLUDED."order", 
 														"status" = EXCLUDED."status",
 														"no" = EXCLUDED."no",
 														"sender_address" = EXCLUDED."sender_address",
@@ -3350,8 +3694,12 @@ export default {
 													item.cc,
 													item.bcc,
 													item.ref,
+													item.data,
 													item.created_at,
 													item.index,
+													item.event ? item.event : 0,
+													item.goods ? item.goods : 0,
+													item.order ? item.order : 0,
 													item.status,
 													item.no ? item.no : "",
 													item.sender_address ? item.sender_address : "",
