@@ -42,7 +42,7 @@ import { ethers } from "ethers"
 				📱 재고 조회 & 재고 증감
 
 		이벤트
-			🖥️ 송장 출력    
+			🖥️ 송장 출력
 			✨ 주문 조회
 			✨ 재고 조회
 
@@ -1874,7 +1874,17 @@ export default {
 
 								둘다 없으면 type 'draft'로 전부 추가해야함
 							*/
+							
+
 							item.no = item.id
+
+							if(item.no.indexOf("-") > -1){
+								item.no = item.no.replace(/-/gi,"")
+							}
+
+							if(item.no.indexOf("_") > -1){
+								item.no = item.no.replace(/_/gi,"")
+							}
 
 							item.id = hashId(team.id+item.no)
 
@@ -1899,6 +1909,22 @@ export default {
 
 							var sales = results
 
+							if(results.length){
+								var _item = Object.assign({}, results[0])
+
+								delete _item.id
+								delete _item.type
+								delete _item.from
+								delete _item.to
+								delete _item.cc
+								delete _item.bcc
+								delete _item.data
+								delete _item.created_at
+
+								item = mergeNode(item, _item)
+							}
+
+
 							if(type == "tracking"){
 								var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
@@ -1921,9 +1947,6 @@ export default {
 								}
 
 
-								// item.index
-
-								// 재고 나가는건지 들어가는건지 구분 필요 Shipping, Receiving
 
 								if(sales.length){
 									var _item = sales[0]
@@ -1987,7 +2010,7 @@ export default {
 									item.type = item.recipient_match ? 'receiving' : 'shipping'
 
 									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-										type : task.type,
+										type : item.type,
 										text : item.text,
 										link : null
 									})), { to: 'arraybuffer' })
@@ -2082,10 +2105,11 @@ export default {
 								statements[`${zoneRegion}_tracking`].push(
 									env[`${zoneRegion}_tracking`].prepare(`
 										INSERT INTO tracking (
-											"id", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 										) VALUES (
-											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
 										) ON CONFLICT (id) DO UPDATE SET
+											"type" = EXCLUDED."type",
 											"from" = EXCLUDED."from",
 											"to" = EXCLUDED."to",
 											"cc" = EXCLUDED."cc",
@@ -2121,6 +2145,7 @@ export default {
 											"bundle_shipping" = EXCLUDED."bundle_shipping"
 									`).bind(
 										item.id,
+										item.type,
 										item.from,
 										item.to,
 										item.cc,
@@ -2401,6 +2426,14 @@ export default {
 
 										item.no = (item.id ? item.id : i).toString()
 
+										if(item.no.indexOf("-") > -1){
+											item.no = item.no.replace(/-/gi,"")
+										}
+
+										if(item.no.indexOf("_") > -1){
+											item.no = item.no.replace(/_/gi,"")
+										}
+
 										item.index = crc32(hashId(team.id+item.no))
 
 										try{
@@ -2417,6 +2450,7 @@ export default {
 										}catch(err){
 
 										}
+
 
 										var itemType = item.type
 
@@ -2445,18 +2479,6 @@ export default {
 
 										item.ref = task.ref
 
-										await env[CenterRegion].prepare(`
-											INSERT INTO console (
-												"id", "bcc", "log", "created_at"
-											) VALUES (
-												?1, ?2, ?3, ?4
-											) ON CONFLICT (id) DO NOTHING
-										`).bind(
-											hashId(),
-											task.bcc,
-											'item.ref '+item.ref,
-											now // Parameter for created_at (only insert)
-										).run()
 
 
 
@@ -2479,7 +2501,8 @@ export default {
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 											id : item.id,
 											title : item.title,
-											link : item.link
+											link : item.link,
+											origin : task.origin ? task.origin : ''
 										})), { to: 'arraybuffer' })
 
 										item.data = arr.buffer
@@ -2797,7 +2820,7 @@ export default {
 										*/ 
 
 										for(var r = 0; r < related.length; r++){
-											var { query, merge } = Relay(related[r], item, env, zoneRegion)
+											var { query, merge } = Relay(related[r], item)
 
 											// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
 
@@ -3039,6 +3062,30 @@ export default {
 																}
 															}
 
+															if(from.type == "order" && typeof to.order != "undefined"){
+																if(from.index){
+																	to.order = from.index
+																}
+															}
+
+															if(from.type == "goods" && typeof to.goods != "undefined"){
+																if(from.index){
+																	to.goods = from.index
+																}
+															}
+
+															if(from.type == "event" && typeof to.event != "undefined"){
+																if(from.index){
+																	to.event = from.index
+																}
+															}
+
+															if(from.type == "coupon" && typeof to.event != "undefined" && to.type != "event"){
+																if(from.index){
+																	to.event = from.index
+																}
+															}
+
 
 															
 															if(relate.type == merge.from){
@@ -3051,6 +3098,7 @@ export default {
 																		id : edge.id,
 																		title : edge.title,
 																		link : edge.link,
+																		origin : data.origin ? data.origin : "",
 																		data : data
 																	})), { to: 'arraybuffer' })
 
@@ -3253,10 +3301,11 @@ export default {
 																statements[`${zoneRegion}_tracking`].push(
 																	env[`${zoneRegion}_tracking`].prepare(`
 																		INSERT INTO tracking (
-																			"id", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 																		) VALUES (
-																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
 																		) ON CONFLICT (id) DO UPDATE SET
+																			"type" = EXCLUDED."type",
 																			"from" = EXCLUDED."from",
 																			"to" = EXCLUDED."to",
 																			"cc" = EXCLUDED."cc",
@@ -3292,6 +3341,7 @@ export default {
 																			"bundle_shipping" = EXCLUDED."bundle_shipping"
 																	`).bind(
 																		to.id,
+																		to.type,
 																		to.from,
 																		to.to,
 																		to.cc,
@@ -3522,7 +3572,8 @@ export default {
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 											type : item.type,
 											text : item.semantic,
-											link : item.link
+											link : item.link,
+											origin : task.origin ? task.origin : ''
 										})), { to: 'arraybuffer' })
 
 
@@ -3650,10 +3701,11 @@ export default {
 											statements[`${zoneRegion}_tracking`].push(
 												env[`${zoneRegion}_tracking`].prepare(`
 													INSERT INTO tracking (
-														"id", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
 													) ON CONFLICT (id) DO UPDATE SET
+														"type" = EXCLUDED."type",
 														"from" = EXCLUDED."from",
 														"to" = EXCLUDED."to",
 														"cc" = EXCLUDED."cc",
@@ -3689,6 +3741,7 @@ export default {
 														"bundle_shipping" = EXCLUDED."bundle_shipping"
 												`).bind(
 													item.id,
+													item.type,
 													item.from,
 													item.to,
 													item.cc,
@@ -3839,7 +3892,8 @@ export default {
 								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 									type : page.type,
 									text : task.semantic,
-									link : task.link
+									link : task.link,
+									origin : task.origin ? task.origin : ''
 								})), { to: 'arraybuffer' })
 
 								statements[`${zoneRegion}_items`].push(

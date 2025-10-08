@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS event (
 
 CREATE TABLE IF NOT EXISTS tracking (
     "id" TEXT PRIMARY KEY,
+    "type" TEXT,
     "from" TEXT,
     "to" TEXT,
     "cc" TEXT,
