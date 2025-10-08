@@ -1065,36 +1065,81 @@ const Relay = async function(foreign, primary){
 	var merge = {}
 
 	if(foreign == "goods" && primary.type == "order"){
-		query.push({
-			type : foreign,
-			table : 'sales',
-			column : 'index',
-			value : primary.goods
-		})
+		if(primary.tracking){
+			query.push({
+				type : primary.type,
+				table : 'sales',
+				column : 'tracking',
+				value : primary.tracking
+			})
 
-		merge = {
-			includes : ["event"],
-			key : "sales",
-			value : primary.goods,
-			from : foreign,
-			to : primary.type
+			merge = {
+				upsert : {
+					includes : ["index", "event", "width", "height", "length", "weight", "size", "currency", "cost_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"],
+					from : foreign,
+					to : primary.type
+				}
+			}
+
+		}else{
+			query.push({
+				type : primary.type,
+				table : 'sales',
+				column : 'index',
+				value : primary.index
+			})
+
+			merge = {
+				update : {
+					includes : ["index", "event", "width", "height", "length", "weight", "size", "currency", "cost_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"],
+					column : 'index',
+					value : primary.index,
+					from : foreign,
+					to : primary.type
+				}
+			}
 		}
 
 	}else if(foreign == "tracking" && primary.type == "order"){
-		query.push({
-			type : foreign,
-			table : 'tracking',
-			column : primary.type,
-			value : primary.index
-		})
+		// 단일 주문인경우 상품 제외하고 배송관련 내용만 업데이트함
+		// 여러 상품 아이템은 tracking 번호만 업데이트함
 
-		merge = {
-			includes : ["no", "goods", "event"],
-			type : 'tracking',
-			column : 'index',
-			from : foreign,
-			to : primary.type
-		}
+		if(primary.tracking){
+			query.push({
+				type : foreign,
+				table : 'tracking',
+				column : primary.type,
+				value : primary.index
+			})
+
+			merge = {
+				update : {
+					includes : ["index", "width", "height", "length", "weight"],
+					column : 'tracking',
+					value : primary.tracking,
+					column : 'index',
+					from : primary.type,
+					to : foreign
+				}
+			}
+		}else{
+			query.push({
+				type : foreign,
+				table : 'tracking',
+				column : primary.type,
+				value : primary.index
+			})
+
+			merge = {
+				update : {
+					includes : ["index", "no", "goods", "event"],
+					column : 'index',
+					value : primary.index,
+					from : foreign,
+					to : primary.type
+				}
+			}
+		}	
 
 	}else if(foreign == "coupon" && primary.type == "order"){
 		query.push({
@@ -1105,8 +1150,13 @@ const Relay = async function(foreign, primary){
 		})
 
 		merge = {
-			from : foreign,
-			to : primary.type
+			update : {
+				includes : ["discount"],
+				column : 'index',
+				value : primary.index,
+				from : foreign,
+				to : primary.type
+			}
 		}
 
 	}else if(foreign == "event" && primary.type == "order"){
@@ -1118,39 +1168,51 @@ const Relay = async function(foreign, primary){
 		})
 
 		merge = {
-			from : foreign,
-			to : primary.type
+			update : {
+				includes : ["discount"],
+				column : 'index',
+				value : primary.index,
+				from : foreign,
+				to : primary.type
+			}
 		}
 
 
 
 	}else if(foreign == "order" && primary.type == "goods"){
-		// order 에서 status = "show" 값만 수정됨
 		query.push({
 			type : foreign,
 			table : 'sales',
-			column : 'sales',
-			value : primary.type
+			column : 'goods',
+			value : primary.index
 		})
 
 		merge = {
-			includes : ["event"],
-			from : primary.type,
-			to : foreign
+			update : {
+				includes : ["event", "width", "height", "length", "weight", "size", "currency", "cost_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"],
+				column : "goods",
+				value : primary.index,
+				from : primary.type,
+				to : foreign
+			}
 		}
 		
 	}else if(foreign == "tracking" && primary.type == "goods"){
 		// upsert goods 정보로 tracking 추가함
 		query.push({
-			type : primary.type,
+			type : "order",
+			status : 0,
 			table : 'tracking',
 			column : 'goods',
 			value : primary.index,
 		})
 
 		merge = {
-			from : primary.type,
-			to : foreign
+			update : {
+				includes : ["width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"],
+				from : primary.type,
+				to : foreign
+			}
 		}
 
 	}else if(foreign == "event" && primary.type == "goods"){
@@ -1162,8 +1224,13 @@ const Relay = async function(foreign, primary){
 		})
 
 		merge = {
-			from : foreign,
-			to : primary.type
+			update : {
+				includes : ["discount"],
+				column : 'index',
+				value : primary.index,
+				from : foreign,
+				to : primary.type
+			}
 		}
 
 	}else if(foreign == "coupon" && primary.type == "goods"){
@@ -1175,8 +1242,13 @@ const Relay = async function(foreign, primary){
 		})
 
 		merge = {
-			from : foreign,
-			to : primary.type
+			update : {
+				includes : ["discount"],
+				column : 'index',
+				value : primary.index,
+				from : foreign,
+				to : primary.type
+			}
 		}
 
 
@@ -1184,35 +1256,59 @@ const Relay = async function(foreign, primary){
 	}else if(foreign == "goods" && primary.type == "tracking"){
 		// upsert goods 정보로 tracking 추가함
 		query.push({
-			type : foreign,
+			type : "order",
+			status : 0,
 			table : 'sales',
-			column : 'index',
+			column : "goods",
 			value : primary.goods
 		})
 
 		merge = {
-			from : primary.type,
-			to : foreign
+			update : {
+				includes : ["width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"],
+				column : 'index',
+				value : primary.index,
+				from : foreign,
+				to : primary.type
+			}
 		}
 
 	}else if(foreign == "order" && primary.type == "tracking"){
-		if(!primary.order){
-			return {
-				query : [{
-					type : foreign,
-					table : 'sales'
+		if(primary.goods){
+			query.push({
+				type : foreign,
+				table : 'sales',
+				column : 'goods',
+				value : primary.goods
+			})
+
+			merge = {
+				update : {
+					includes : ["index", "width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"],
 					column : 'tracking',
-					value : primary.index
-				}],
-				merge : {
-					includes : ["order", "goods", "event"],
+					value : primary.index,
+					from : primary.type,
+					to : foreign
+				}
+			}
+		}else{
+			query.push({
+				type : foreign,
+				table : 'tracking',
+				column : primary.type,
+				value : primary.index
+			})
+
+			merge = {
+				update : {
+					includes : ["index", "no", "order", "goods", "event"],
+					column : 'index',
+					value : primary.index,
 					from : foreign,
 					to : primary.type
 				}
 			}
 		}
-
-
 
 	}else if(foreign == "event" && primary.type == "tracking"){
 		// 매칭이 아예 안되는 항목
@@ -1231,8 +1327,13 @@ const Relay = async function(foreign, primary){
 		})
 
 		merge = {
-			from : primary.type,
-			to : foreign
+			update : {
+				includes : ["discount"],
+				column : 'event',
+				value : primary.index,
+				from : primary.type,
+				to : foreign
+			}
 		}
 
 	}else if(foreign == "order" && primary.type == "event"){
@@ -1244,8 +1345,13 @@ const Relay = async function(foreign, primary){
 		})
 
 		merge = {
-			from : primary.type,
-			to : foreign
+			update : {
+				includes : ["discount"],
+				column : 'event',
+				value : primary.index,
+				from : primary.type,
+				to : foreign
+			}
 		}
 
 	}else if(foreign == "tracking" && primary.type == "event"){
@@ -1260,8 +1366,13 @@ const Relay = async function(foreign, primary){
 		})
 
 		merge = {
-			from : primary.type,
-			to : foreign
+			update : {
+				includes : ["started_at", "expired_at", "phone", "address", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"],
+				column : 'event',
+				value : primary.index,
+				from : primary.type,
+				to : foreign
+			}
 		}
 
 
@@ -1282,42 +1393,44 @@ const Relay = async function(foreign, primary){
 	}else if(foreign == "order" && primary.type == "coupon"){
 		query.push({
 			type : foreign,
+			status : 0,
 			table : 'sales',
 			column : 'event',
 			value : primary.index
 		})
 
 		merge = {
-			from : primary.type,
-			to : foreign
+			update : {
+				includes : ["discount"],
+				column : 'event',
+				value : primary.index,
+				from : primary.type,
+				to : foreign
+			}
 		}
 
 	}else if(foreign == "tracking" && primary.type == "coupon"){
-		query.push({
-			type : 'sales',
-			column : 'event',
-		})
-
-		merge = {
-			key : 'event',
-			value : primary.index,
-			from : primary.type,
-			to : foreign
-		}
+		// 매칭이 아예 안되는 항목
 
 	}else if(foreign == "event" && primary.type == "coupon"){
-		query.push({
-			type : foreign,
-			column : 'event',
-			column : 'index',
-			value : primary.event
-		})
+		if(typeof primary.event != "undefined"){
+			query.push({
+				type : foreign,
+				table : 'event',
+				column : 'index',
+				value : primary.event
+			})
 
-		merge = {
-			from : foreign,
-			to : primary.type
+			merge = {
+				update : {
+					includes : ["started_at", "expired_at", "phone", "address", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"],
+					column : 'index',
+					value : primary.index,
+					from : foreign,
+					to : primary.type
+				}
+			}
 		}
-
 	}
 
 	return {
@@ -1811,11 +1924,10 @@ export default {
 
 							var type = talk.type = task.type
 
-							var address = []
 
 							// 주소 조회해야함
-
 							// 겸사 겸사 업체 정보 등록받자
+							var address = team.data.address ? team.data.address : []
 
 							var system = image2json(type, address)
 
@@ -2831,43 +2943,12 @@ export default {
 													var column = query[0].column
 
 													var { results } = await env[`${zoneRegion}_${table}`].prepare(
-														`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
+														`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
 													).bind(
-														item.index, team.id, item.cc, now - 60000
+														item.index, team.id, item.cc, now
 													).all()
 
-													if(results.length){
-														// if(query[1]){
-														// 	var row = results[0]
-
-														// 	var flow = query[1]
-
-														// 	index = row[flow.index]
-
-														// 	var { results } = await env[`${zoneRegion}_${flow.type}`].prepare(
-														// 		`SELECT * FROM ${flow.type} WHERE "${flow.column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" > ? LIMIT 1`
-														// 	).bind(
-														// 		index, team.id, item.cc, now - 60000
-														// 	).all()
-
-														// 	if(results.length){
-														// 		relates[type] = {
-														// 			query : query,
-														// 			merge : merge,
-														// 			rows : results,
-														// 			type : related[r]
-														// 		}
-														// 	}
-														// }else{
-														// 	relates[type] = {
-														// 		query : query,
-														// 		merge : merge,
-														// 		rows : results,
-														// 		type : related[r]
-														// 	}
-														// }
-
-													}else{
+													if(results.length == 0){
 														// draft 상태 맞음
 														// 없으면 추가해야함 - 일부 사용자가 직접 팝업으로 띄워야 할수 있음
 
@@ -2880,27 +2961,7 @@ export default {
 															고객 주문 스캔하였는데
 															배송 시작 정보가 없을시
 														*/
-														updated_at = 0
-														
-														// if(item.type == "order" && type == "tracking" && column == "sales"){
-														// 	updated_at = 0
-														// }
-
-
-														// /*
-														// 	이벤트 스캔하였는데
-														// 	상품에 이벤트 등록 안되어있으면
-														// */
-														// if(item.type == "event" && type == "sales" && column == "event"){
-														// 	updated_at = 0
-														// }
-
-														// relates[type] = {
-														// 	query : query,
-														// 	merge : merge,
-														// 	rows : [],
-														// 	type : related[r]
-														// }
+														updated_at = 0	
 													}
 
 													relates[type] = {
@@ -2966,7 +3027,6 @@ export default {
 														continue
 													}
 
-
 															
 													var merge = relate.merge
 													var query = relate.query
@@ -2984,10 +3044,12 @@ export default {
 															var key = row.merge.key ? row.merge.key : ""
 															var value = row.merge.value ? row.merge.value : undefined
 
-															if(typeof value == 'undefined'){
-																if(typeof key != 'undefined'){
-																	value = row[key]
-																}
+															if(merge.update){
+																
+															}
+
+															if(merge.upsert){
+																
 															}
 
 
@@ -2996,44 +3058,17 @@ export default {
 															var to = row.type == merge.to ? item : row
 
 
-															delete from.id
-															delete from.type
-															delete from.from
-															delete from.to
-															delete from.cc
-															delete from.bcc
-															delete from.data
-															delete from.created_at
+															var node = {}
 
+															if(merge.includes){
+																if(merge.includes.length){
+																	for(var v = 0; v < merge.includes.length; v++){
+																		var include = merge.includes[v]
 
-															if(merge.includes.indexOf('started_at') == -1){
-																delete from.started_at
+																		node[include] = from[include]
+																	}
+																}
 															}
-
-															if(merge.includes.indexOf('expired_at') == -1){
-																delete from.expired_at
-															}
-
-															if(merge.includes.indexOf('event') == -1){
-																delete from.event
-															}
-
-															if(merge.includes.indexOf('goods') == -1){
-																delete from.goods
-															}
-
-															if(merge.includes.indexOf('order') == -1){
-																delete from.order
-															}
-
-															if(merge.includes.indexOf('views') == -1){
-																delete from.views
-															}
-
-															if(merge.includes.indexOf('tracking') == -1){
-																delete from.tracking
-															}
-
 
 
 															if(key){
@@ -3044,7 +3079,7 @@ export default {
 
 															var edgeType = to.type
 
-															var edge = mergeNode(to, from)
+															var edge = mergeNode(to, node)
 
 															edge.id = edgeId
 
@@ -3211,7 +3246,7 @@ export default {
 																statements[`${zoneRegion}_sales`].push(
 																	env[`${zoneRegion}_sales`].prepare(`
 																		INSERT INTO sales (
-																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
 																		) VALUES (
 																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
 																		) ON CONFLICT (id) DO UPDATE SET
@@ -3611,7 +3646,7 @@ export default {
 											statements[`${zoneRegion}_sales`].push(
 												env[`${zoneRegion}_sales`].prepare(`
 													INSERT INTO sales (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "sales", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
 													) VALUES (
 														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40
 													) ON CONFLICT (id) DO UPDATE SET

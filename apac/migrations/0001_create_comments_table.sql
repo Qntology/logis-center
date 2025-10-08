@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS event (
     "event" INTEGER,
     "phone" TEXT,
     "address" TEXT,
-    "status" TEXT,
+    "status" INTEGER,
     "code" TEXT,
     "discount" REAL,
     "quantity" INTEGER,
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS tracking (
     "event" INTEGER,
     "goods" INTEGER,
     "order" INTEGER,
-    "status" TEXT,
+    "status" INTEGER,
     "no" TEXT,
     "sender_address" TEXT,
     "sender_phone" TEXT,
@@ -160,6 +160,19 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS pages (
+    "id" TEXT PRIMARY KEY,
+    "type" TEXT,
+    "from" TEXT,
+    "to" TEXT,
+    "cc" TEXT,
+    "bcc" TEXT,
+    "ref" TEXT,
+    "data" BLOB NULL,
+    "created_at" INTEGER,
+    "updated_at" INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS views (
     "id" TEXT PRIMARY KEY,
     "type" TEXT,
     "from" TEXT,
