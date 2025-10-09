@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS sales (
     "event" INTEGER,
     "views" INTEGER,
     "goods" INTEGER,
+    "status" INTEGER,
     "width" REAL,
     "height" REAL,
     "length" REAL,

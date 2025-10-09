@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS sales (
     "event" INTEGER,
     "views" INTEGER,
     "goods" INTEGER,
+    "status" INTEGER,
     "width" REAL,
     "height" REAL,
     "length" REAL,
@@ -160,6 +161,19 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS pages (
+    "id" TEXT PRIMARY KEY,
+    "type" TEXT,
+    "from" TEXT,
+    "to" TEXT,
+    "cc" TEXT,
+    "bcc" TEXT,
+    "ref" TEXT,
+    "data" BLOB NULL,
+    "created_at" INTEGER,
+    "updated_at" INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS views (
     "id" TEXT PRIMARY KEY,
     "type" TEXT,
     "from" TEXT,
