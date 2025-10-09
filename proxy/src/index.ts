@@ -309,18 +309,18 @@ const list2json = function(language){
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
 			}
 			if (type is 'order' or 'goods') {
-				status:'active' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+				status:'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+				link:URL includes manage path additional link | string,
 				id:Refer to the ID value from the link or an attribute | string,
 				title:title | string, 
 				sale_price:sale price | number,
 				supply_price:supply price | number,
-				link:URL includes manage path additional link | string,
 				currency:ISO 4217 Currency Code | string,
 				quantity:item stock quantity | number,
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
 			}
 			if (type is 'coupon' or 'event') {
-				status : 'active' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
+				status : 'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
 				id:Refer to the ID value from the link or an attribute | string,
 				title:type based item title, 
 				started_at:yyyy-MM-dd'T'HH:mm:ss,
@@ -2060,7 +2060,7 @@ export default {
 
 							item.created_at = now
 
-							item.index = crc32(item.id)
+							item.index = crc32(team.id+item.id)
 
 
 							var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
@@ -2531,7 +2531,6 @@ export default {
 
 								var items = page.items ? page.items : []
 
-
 								if(items.length){
 									/*
 										주문이후의 절차는 주문번호로 매칭해야함
@@ -2746,8 +2745,15 @@ export default {
 											var _item = results[0]
 
 											item = mergeNode(item, _item)
-										}
+										}else{
+											var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = "${item.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
+											if(results.length){
+												var _item = results[0]
+
+												item = mergeNode(item, _item)
+											}
+										}
 
 
 										if(item.price <= team.data.base[itemType].price.min){
@@ -2987,12 +2993,24 @@ export default {
 													var table = query[0].type 
 													var type = query[0].type
 													var column = query[0].column
+													var column_value = query[0].value
+													var status = query[0].status
 
-													var { results } = await env[`${zoneRegion}_${table}`].prepare(
-														`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-													).bind(
-														item.index, team.id, item.cc, now
-													).all()
+													if(typeof status != "undefined"){
+														var { results } = await env[`${zoneRegion}_${table}`].prepare(
+															`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+														).bind(
+															column_value, team.id, item.cc, status, now
+														).all()
+													}else{
+														var { results } = await env[`${zoneRegion}_${table}`].prepare(
+															`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+														).bind(
+															column_value, team.id, item.cc, now
+														).all()
+													}
+
+														
 
 													if(results.length == 0){
 														// draft 상태 맞음

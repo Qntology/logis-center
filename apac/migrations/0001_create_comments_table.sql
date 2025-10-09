@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS sales (
     "weight" REAL,
     "size" TEXT,
     "currency" TEXT,
-    "cost_price" REAL,
+    "supply_price" REAL,
     "sale_price" REAL,
     "discount" REAL,
     "quantity" INTEGER,
