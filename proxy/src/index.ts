@@ -317,6 +317,7 @@ const list2json = function(language){
 				supply_price:supply price | number,
 				currency:ISO 4217 Currency Code | string,
 				quantity:item stock quantity | number,
+				tracking_number:Tracking Number(운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ) | string,
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
 			}
 			if (type is 'coupon' or 'event') {
@@ -2624,8 +2625,20 @@ export default {
 										}
 
 
+										item.id = hashId(team.id+task.cc+item.link)
 
-										item.id = hashId(team.id+task.cc+item.link+item.type)
+
+										if(item.type == "tracking"){
+											var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE index" = "${item.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+											if(results.length){
+												var _item = results[0]
+
+												item = mergeNode(item, _item)
+											}
+
+											item.id = hashId(team.id+task.cc+task.link)
+										}
 
 										item.flag = task.flag
 										
@@ -2664,50 +2677,150 @@ export default {
 
 										item.data = arr.buffer
 
-
-
-										if(item.type == "tracking"){
-											var obj = {
-												type : item.type,
-												status : item.status,
-												title : item.title
-											}
-
-											if(item.sender){
-												obj.sender = item.sender
-											}
-
-											if(item.recipient){
-												obj.recipient = item.recipient
-											}
-
-											var system = semantic_prompt_system(language) + '\n- Filter to District-level and up.'
-
-											var content = JSON.stringify(obj)
-
-											if(models['deepinfra']){
-												item.semantic = await Deepinfra(deepinfra, 'google/gemma-3-4b-it', system, content)
-
-												models['deepinfra'] -= 1
-
-											}
-
-											if(!item.semantic && gemini_llm_api){
-												item.semantic = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
-
-												models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-											}
-
-											if(!item.semantic){
-												fallback = 'item overflow'
-
-												continue
-											}
+										if(isDetail){
+											
 										}
 
+										if(item.type == "order" && item.tracking_number){
+											/*
+												상세와 리스트 차이가 분명히 있음
 
-										
+												주문 
+													리스트에서는 송장번호가 없음
+													상세페이지에서는 송장번호가 있음
+
+											*/
+
+
+											var tracking = Object.assign({}, item)
+
+											tracking.no = item.tracking_number
+
+											if(item.no.indexOf("-") > -1){
+												tracking.no = tracking.no.replace(/-/gi,"")
+											}
+
+											if(tracking.no.indexOf("_") > -1){
+												tracking.no = tracking.no.replace(/_/gi,"")
+											}
+
+											tracking.id = hashId(team.id+tracking.no)
+
+											tracking.index = crc32(tracking.id) 
+
+											var data = {
+												id : item.id,
+												title : item.title,
+												link : item.link,
+												origin : task.origin ? task.origin : '',
+												sender : item.sender,
+												recipient : item.recipient
+											}
+											
+
+											var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+											if(results.length){
+												var _item = results[0]
+
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
+
+												_item.data = JSON.parse(decompressedJsonString)
+
+												data = mergeNode(data, _item.data)
+
+												delete _item.data
+
+												tracking = mergeNode(tracking, _item)
+											}
+
+											tracking.data = data
+
+
+											var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
+
+
+											statements[`${zoneRegion}_tracking`].push(
+												env[`${zoneRegion}_tracking`].prepare(`
+													INSERT INTO tracking (
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+													) VALUES (
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+													) ON CONFLICT (id) DO UPDATE SET
+														"type" = EXCLUDED."type",
+														"from" = EXCLUDED."from",
+														"to" = EXCLUDED."to",
+														"cc" = EXCLUDED."cc",
+														"bcc" = EXCLUDED."bcc",
+														"ref" = EXCLUDED."ref",
+														"data" = EXCLUDED."data",
+														"created_at" = EXCLUDED."created_at",
+														"index" = EXCLUDED."index",
+														"event" = EXCLUDED."event", 
+														"goods" = EXCLUDED."goods", 
+														"order" = EXCLUDED."order", 
+														"status" = EXCLUDED."status",
+														"no" = EXCLUDED."no",
+														"sender_address" = EXCLUDED."sender_address",
+														"sender_phone" = EXCLUDED."sender_phone",
+														"recipient_address" = EXCLUDED."recipient_address",
+														"recipient_phone" = EXCLUDED."recipient_phone",
+														"width" = EXCLUDED."width",
+														"height" = EXCLUDED."height",
+														"length" = EXCLUDED."length",
+														"weight" = EXCLUDED."weight",
+														"carrier" = EXCLUDED."carrier",
+														"shipping_fee" = EXCLUDED."shipping_fee",
+														"shipping_method" = EXCLUDED."shipping_method",
+														"shipping_duration" = EXCLUDED."shipping_duration",
+														"shipping_date" = EXCLUDED."shipping_date",
+														"delivery_date" = EXCLUDED."delivery_date",
+														"order_date" = EXCLUDED."order_date",
+														"payment_date" = EXCLUDED."payment_date",
+														"payment_method" = EXCLUDED."payment_method",
+														"payment_origin" = EXCLUDED."payment_origin",
+														"payment_number" = EXCLUDED."payment_number",
+														"bundle_shipping" = EXCLUDED."bundle_shipping"
+												`).bind(
+													tracking.id,
+													tracking.type,
+													tracking.from,
+													tracking.to,
+													tracking.cc,
+													tracking.bcc,
+													tracking.ref,
+													arr.buffer,
+													tracking.created_at,
+													tracking.index,
+													tracking.event ? tracking.event : 0,
+													tracking.goods ? tracking.goods : 0,
+													tracking.order ? tracking.order : 0,
+													parseStatus(tracking.status),
+													tracking.no ? tracking.no : "",
+													tracking.sender_address ? tracking.sender_address : "",
+													tracking.sender_phone ? tracking.sender_phone : "",
+													tracking.recipient_address ? tracking.recipient_address : "",
+													tracking.recipient_phone ? tracking.recipient_phone : "",
+													tracking.width ? parseFloat(tracking.width) : 0,
+													tracking.height ? parseFloat(tracking.height) : 0,
+													tracking.length ? parseFloat(tracking.length) : 0,
+													tracking.weight ? parseFloat(tracking.weight) : 0,
+													tracking.carrier ? parseFloat(tracking.carrier) : 0,
+													tracking.shipping_fee ? parseFloat(tracking.shipping_fee) : 0,
+													tracking.shipping_method ? tracking.shipping_method : "",
+													tracking.shipping_duration ? parseFloat(tracking.shipping_duration) : 0,
+													tracking.shipping_date ? parseFloat(tracking.shipping_date) : 0,
+													tracking.delivery_date ? parseFloat(tracking.delivery_date) : 0,
+													tracking.order_date ? parseFloat(tracking.order_date) : 0,
+													tracking.payment_date ? parseFloat(tracking.payment_date) : 0,
+													tracking.payment_method ? tracking.payment_method : "",
+													tracking.payment_origin ? tracking.payment_origin : "",
+													tracking.payment_number ? tracking.payment_number : "",
+													tracking.bundle_shipping ? parseFloat(tracking.bundle_shipping) : 0
+												)
+											)
+										}
+
 
 										if(item.condition){
 											if(item.condition.indexOf('used') > -1){
