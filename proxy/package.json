@@ -23,7 +23,7 @@
     "linkedom": "0.18.11",
     "pako": "^2.1.0",
     "typescript": "^5.8.2",
-    "wrangler": "^4.42.1"
+    "wrangler": "^4.42.2"
   },
   "scripts": {
     "check": "tsc && wrangler deploy --dry-run",

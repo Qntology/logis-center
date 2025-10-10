@@ -1867,9 +1867,11 @@ export default {
 
 				console.log('results.length',results.length);
 
-				if(results.length){
-					for(var c = 0; c < results.length; c++){
-						var cron = results[c]
+				var crons = Object.assign([], results)
+
+				if(crons.length){
+					for(var c = 0; c < crons.length; c++){
+						var cron = crons[c]
 
 						var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.task))
 
@@ -1949,17 +1951,17 @@ export default {
 							}
 						}
 
-						if(limits[team.id]){
-							limits[team.id] -= 1
-						}else{
-							if(typeof limits[team.id] == "undefined"){
-								limits[team.id] = 0
-							}else{
-								fallback = 'out of gas'
+						// if(limits[team.id]){
+						// 	limits[team.id] -= 1
+						// }else{
+						// 	if(typeof limits[team.id] == "undefined"){
+						// 		limits[team.id] = 0
+						// 	}else{
+						// 		fallback = 'out of gas'
 
-								continue
-							}
-						}
+						// 		continue
+						// 	}
+						// }
 
 
 						// model context protocol
@@ -2091,6 +2093,7 @@ export default {
 									var _item = results[0]
 
 									item = mergeNode(item, _item)
+
 
 									if(sales.length){
 										var _item = sales[0]
@@ -2355,9 +2358,9 @@ export default {
 
 								var pageLength = 0
 
-								var pathname = task.link.split("?")[0]
+								var url = new URL(task.href)
 
-								var pageId = hashId(task.cc+pathname)
+								var pageId = hashId(task.cc+url.pathname)
 
 								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${pageId}" AND "created_at" < ${created_at} LIMIT 1`).all()
 
@@ -2378,25 +2381,35 @@ export default {
 										}
 									}
 								}
-								
 
-								if(task.ref){
-									var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${task.ref}" AND "cc" = "${task.cc}" AND "created_at" < ${created_at} LIMIT 1`).all()
 
-									if(results.length){
-										var _page = results[0]
+								// 기존 값이 있으면 아래 프로세스 실행함
 
-										if(_page.type){
-											if(!_page.item){
-												isDetail = true
+								var itemId = hashId(team.id+task.cc+task.link)
 
-												pageType = _page.type
+								var { results } = await env[`${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = "${itemId}" AND "created_at" < ${created_at} LIMIT 1`).all()
+
+								if(results.length){
+									if(task.ref){
+										var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${task.ref}" AND "created_at" < ${created_at} LIMIT 1`).all()
+
+										if(results.length){
+											var _page = results[0]
+
+											if(_page.type){
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+												var _data = JSON.parse(decompressedJsonString)
+
+												if(_data.item){
+													isDetail = true
+
+													pageType = _page.type
+												}
 											}
 										}
 									}
 								}
-
-
 
 								var content = convertHtmlToCleanPug(task.text)
 
@@ -2410,7 +2423,9 @@ export default {
 
 										pageType = page.type
 
-										pageLength = page.items.length
+										if(page.items){
+											pageLength = page.items.length
+										}
 
 										isDetail = page.isDetail
 
@@ -2423,7 +2438,9 @@ export default {
 
 										pageType = page.type
 
-										pageLength = page.items.length
+										if(page.items){
+											pageLength = page.items.length
+										}
 
 										isDetail = page.isDetail
 
@@ -2453,6 +2470,10 @@ export default {
 									}
 								}
 
+								console.log('page', JSON.stringify(page));
+
+								console.log('isDetail', JSON.stringify(isDetail));
+
 								if(!page){
 									fallback = 'page overflow'
 
@@ -2464,7 +2485,7 @@ export default {
 								page.type = pageType
 
 
-								page.id = pageId // hashId(task.cc+pageId)
+								page.id = pageId
 								page.from = task.from
 								page.to = task.to
 								page.cc = task.cc
@@ -2531,6 +2552,8 @@ export default {
 								*/ 
 
 								var items = page.items ? page.items : []
+
+								console.log('items',JSON.stringify(items));
 
 								if(items.length){
 									/*
@@ -2666,6 +2689,7 @@ export default {
 										
 										item.expired_at = item.expiration_date ? item.expiration_date : 0
 
+										
 
 
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
@@ -2676,10 +2700,6 @@ export default {
 										})), { to: 'arraybuffer' })
 
 										item.data = arr.buffer
-
-										if(isDetail){
-											
-										}
 
 										if(item.type == "order" && item.tracking_number){
 											/*
@@ -2693,6 +2713,8 @@ export default {
 
 
 											var tracking = Object.assign({}, item)
+
+											tracking.type = "tracking"
 
 											tracking.no = item.tracking_number
 
@@ -3101,6 +3123,10 @@ export default {
 
 											// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
 
+											if(!query || !merge){
+												continue
+											}
+
 											try{
 												if(query.length){
 													var table = query[0].type 
@@ -3158,7 +3184,7 @@ export default {
 												`).bind(
 													hashId(),
 													task.bcc,
-													'inner err'+type+err,
+													'tracking inner err'+type+err,
 													now // Parameter for created_at (only insert)
 												).run()
 											}
@@ -3628,15 +3654,6 @@ export default {
 
 
 																	// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
-
-																	statements[`${zoneRegion}_${type}`].push(
-																		env[`${zoneRegion}_${type}`].prepare(`
-																			UPDATE ${type} SET ${column} = ? WHERE id = ?
-																		`).bind(
-																			index, row.id
-																		)
-																	)
-
 																	statements[`${zoneRegion}_items`].push(
 																		env[`${zoneRegion}_items`].prepare(`
 																			UPDATE items SET updated_at = ? WHERE id = ?
@@ -4184,270 +4201,274 @@ export default {
 							}
 
 
-							if(paragraphs.length){
-								for(var p = 0; p < paragraphs.length; p++){
-									var paragraph = paragraphs[p]
+							try{
+								if(paragraphs.length){
+									for(var p = 0; p < paragraphs.length; p++){
+										var paragraph = paragraphs[p]
 
-									paragraph.status = null
-									paragraph.orderBy = null
-									paragraph.find = null
+										paragraph.status = null
+										paragraph.orderBy = null
+										paragraph.find = null
 
-									if(!paragraph.price){
-										paragraph.price = {}
+										if(!paragraph.price){
+											paragraph.price = {}
+										}
+
+										if(team.data.base[paragraph.type]?.price.min){
+											paragraph.price.min = `min:${team.data.base[paragraph.type]?.price.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.price.max){
+											paragraph.price.max = `max:${team.data.base[paragraph.type]?.price.max},`
+										}
+
+										
+
+										if(!paragraph.quantity){
+											paragraph.quantity = {}
+										}
+
+										if(team.data.base[paragraph.type]?.quantity.min){
+											paragraph.quantity.min = `min:${team.data.base[paragraph.type]?.quantity.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.quantity.max){
+											paragraph.quantity.max = `max:${team.data.base[paragraph.type]?.quantity.max},`
+										}
+
+
+
+										if(!paragraph.width){
+											paragraph.width = {}
+										}
+
+										if(team.data.base[paragraph.type]?.width.min){
+											paragraph.width.min = `min:${team.data.base[paragraph.type]?.width.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.width.max){
+											paragraph.width.max = `max:${team.data.base[paragraph.type]?.width.max},`
+										}
+
+
+
+										if(!paragraph.height){
+											paragraph.height = {}
+										}
+
+										if(team.data.base[paragraph.type]?.height.min){
+											paragraph.height.min = `min:${team.data.base[paragraph.type]?.height.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.height.max){
+											paragraph.height.max = `max:${team.data.base[paragraph.type]?.height.max},`
+										}
+
+
+
+										if(!paragraph.length){
+											paragraph.length = {}
+										}
+
+										if(team.data.base[paragraph.type]?.length.min){
+											paragraph.length.min = `min:${team.data.base[paragraph.type]?.length.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.length.max){
+											paragraph.length.max = `max:${team.data.base[paragraph.type]?.length.max},`
+										}
+
+
+
+										if(!paragraph.weight){
+											paragraph.weight = {}
+										}
+
+										if(team.data.base[paragraph.type]?.weight.min){
+											paragraph.weight.min = `min:${team.data.base[paragraph.type]?.weight.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.weight.max){
+											paragraph.weight.max = `max:${team.data.base[paragraph.type]?.weight.max},`
+										}
+
+
+
+										if(!paragraph.shipping_fee){
+											paragraph.shipping_fee = {}
+										}
+
+										if(team.data.base[paragraph.type]?.shipping_fee.min){
+											paragraph.shipping_fee.min = `min:${team.data.base[paragraph.type]?.shipping_fee.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.shipping_fee.max){
+											paragraph.shipping_fee.max = `max:${team.data.base[paragraph.type]?.shipping_fee.max},`
+										}
+
+
+
+										if(!paragraph.shipping_duration){
+											paragraph.shipping_duration = {}
+										}
+
+										if(team.data.base[paragraph.type]?.shipping_duration.min){
+											paragraph.shipping_duration.min = `min:${team.data.base[paragraph.type]?.shipping_duration.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.shipping_duration.max){
+											paragraph.shipping_duration.max = `max:${team.data.base[paragraph.type]?.shipping_duration.max},`
+										}
+
+
+
+										if(!paragraph.price){
+											paragraph.price = {}
+										}
+
+										if(team.data.base[paragraph.type]?.sale_price.min){
+											paragraph.price.min = `min:${team.data.base[paragraph.type]?.sale_price.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.sale_price.max){
+											paragraph.price.max = `max:${team.data.base[paragraph.type]?.sale_price.max},`
+										}
+
+
+
+										if(!paragraph.supply_price){
+											paragraph.supply_price = {}
+										}
+
+										if(team.data.base[paragraph.type]?.supply_price.min){
+											paragraph.supply_price.min = `min:${team.data.base[paragraph.type]?.supply_price.min},`
+										}
+										
+										if(team.data.base[paragraph.type]?.supply_price.max){
+											paragraph.supply_price.max = `max:${team.data.base[paragraph.type]?.supply_price.max},`
+										}
+
+
+
+
+										if(!paragraph.low_stock_threshold){
+											paragraph.low_stock_threshold = {}
+										}
+
+										if(team.data.base[paragraph.type]?.low_stock_threshold.min){
+											paragraph.low_stock_threshold.min = `min:${team.data.base[paragraph.type]?.low_stock_threshold.min},`
+										}
+										
+										if(team.data.base[paragraph.type]?.low_stock_threshold.max){
+											paragraph.low_stock_threshold.max = `max:${team.data.base[paragraph.type]?.low_stock_threshold.max},`
+										}
+
+
+
+										if(!paragraph.discount){
+											paragraph.discount = {}
+										}
+
+										if(team.data.base[paragraph.type]?.discount.min){
+											paragraph.discount.min = `min:${team.data.base[paragraph.type]?.discount.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.discount.max){
+											paragraph.discount.max = `max:${team.data.base[paragraph.type]?.discount.max},`
+										}
+
+
+
+										if(!paragraph.min_order_amount){
+											paragraph.min_order_amount = {}
+										}
+
+										if(team.data.base[paragraph.type]?.min_order_amount.min){
+											paragraph.min_order_amount.min = `min:${team.data.base[paragraph.type]?.min_order_amount.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.min_order_amount.max){
+											paragraph.min_order_amount.max = `max:${team.data.base[paragraph.type]?.min_order_amount.max},`
+										}
+
+
+
+										if(!paragraph.max_discount_amount){
+											paragraph.max_discount_amount = {}
+										}
+
+										if(team.data.base[paragraph.type]?.max_discount_amount.min){
+											paragraph.max_discount_amount.min = `min:${team.data.base[paragraph.type]?.max_discount_amount.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.max_discount_amount.max){
+											paragraph.max_discount_amount.max = `max:${team.data.base[paragraph.type]?.max_discount_amount.max},`
+										}
+
+
+
+										if(!paragraph.usage_limit){
+											paragraph.usage_limit = {}
+										}
+
+										if(team.data.base[paragraph.type]?.usage_limit.min){
+											paragraph.usage_limit.min = `min:${team.data.base[paragraph.type]?.usage_limit.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.usage_limit.max){
+											paragraph.usage_limit.max = `max:${team.data.base[paragraph.type]?.usage_limit.max},`
+										}
+
+
+
+										if(!paragraph.usage_per){
+											paragraph.usage_per = {}
+										}
+
+										if(team.data.base[paragraph.type]?.usage_per.min){
+											paragraph.usage_per.min = `min:${team.data.base[paragraph.type]?.usage_per.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.usage_per.max){
+											paragraph.usage_per.max = `max:${team.data.base[paragraph.type]?.usage_per.max},`
+										}
+
+
+
+										if(!paragraph.started_at){
+											paragraph.started_at = {}
+										}
+
+										if(team.data.base[paragraph.type]?.started_at.min){
+											paragraph.started_at.min = `min:${team.data.base[paragraph.type]?.started_at.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.started_at.max){
+											paragraph.started_at.max = `max:${team.data.base[paragraph.type]?.started_at.max},`
+										}
+
+
+
+										if(!paragraph.expir){
+											paragraph.expired_at = {}
+										}
+										if(team.data.base[paragraph.type]?.expired_at.min){
+											paragraph.expired_at.min = `min:${team.data.base[paragraph.type]?.expired_at.min},`
+										}
+
+										if(team.data.base[paragraph.type]?.expired_at.max){
+											paragraph.expired_at.max = `max:${team.data.base[paragraph.type]?.expired_at.max},`
+										}
+
+										paragraphs[p] = paragraph
 									}
+								}else{
+									fallback = 'Document Not Found'
 
-									if(team.data[paragraph.type]?.price.min){
-										paragraph.price.min = `min:${team.data[paragraph.type]?.price.min},`
-									}
-
-									if(team.data[paragraph.type]?.price.max){
-										paragraph.price.max = `max:${team.data[paragraph.type]?.price.max},`
-									}
-
-									
-
-									if(!paragraph.quantity){
-										paragraph.quantity = {}
-									}
-
-									if(team.data[paragraph.type]?.quantity.min){
-										paragraph.quantity.min = `min:${team.data[paragraph.type]?.quantity.min},`
-									}
-
-									if(team.data[paragraph.type]?.quantity.max){
-										paragraph.quantity.max = `max:${team.data[paragraph.type]?.quantity.max},`
-									}
-
-
-
-									if(!paragraph.width){
-										paragraph.width = {}
-									}
-
-									if(team.data[paragraph.type]?.width.min){
-										paragraph.width.min = `min:${team.data[paragraph.type]?.width.min},`
-									}
-
-									if(team.data[paragraph.type]?.width.max){
-										paragraph.width.max = `max:${team.data[paragraph.type]?.width.max},`
-									}
-
-
-
-									if(!paragraph.height){
-										paragraph.height = {}
-									}
-
-									if(team.data[paragraph.type]?.height.min){
-										paragraph.height.min = `min:${team.data[paragraph.type]?.height.min},`
-									}
-
-									if(team.data[paragraph.type]?.height.max){
-										paragraph.height.max = `max:${team.data[paragraph.type]?.height.max},`
-									}
-
-
-
-									if(!paragraph.length){
-										paragraph.length = {}
-									}
-
-									if(team.data[paragraph.type]?.length.min){
-										paragraph.length.min = `min:${team.data[paragraph.type]?.length.min},`
-									}
-
-									if(team.data[paragraph.type]?.length.max){
-										paragraph.length.max = `max:${team.data[paragraph.type]?.length.max},`
-									}
-
-
-
-									if(!paragraph.weight){
-										paragraph.weight = {}
-									}
-
-									if(team.data[paragraph.type]?.weight.min){
-										paragraph.weight.min = `min:${team.data[paragraph.type]?.weight.min},`
-									}
-
-									if(team.data[paragraph.type]?.weight.max){
-										paragraph.weight.max = `max:${team.data[paragraph.type]?.weight.max},`
-									}
-
-
-
-									if(!paragraph.shipping_fee){
-										paragraph.shipping_fee = {}
-									}
-
-									if(team.data[paragraph.type]?.shipping_fee.min){
-										paragraph.shipping_fee.min = `min:${team.data[paragraph.type]?.shipping_fee.min},`
-									}
-
-									if(team.data[paragraph.type]?.shipping_fee.max){
-										paragraph.shipping_fee.max = `max:${team.data[paragraph.type]?.shipping_fee.max},`
-									}
-
-
-
-									if(!paragraph.shipping_duration){
-										paragraph.shipping_duration = {}
-									}
-
-									if(team.data[paragraph.type]?.shipping_duration.min){
-										paragraph.shipping_duration.min = `min:${team.data[paragraph.type]?.shipping_duration.min},`
-									}
-
-									if(team.data[paragraph.type]?.shipping_duration.max){
-										paragraph.shipping_duration.max = `max:${team.data[paragraph.type]?.shipping_duration.max},`
-									}
-
-
-
-									if(!paragraph.price){
-										paragraph.price = {}
-									}
-
-									if(team.data[paragraph.type]?.sale_price.min){
-										paragraph.price.min = `min:${team.data[paragraph.type]?.sale_price.min},`
-									}
-
-									if(team.data[paragraph.type]?.sale_price.max){
-										paragraph.price.max = `max:${team.data[paragraph.type]?.sale_price.max},`
-									}
-
-
-
-									if(!paragraph.supply_price){
-										paragraph.supply_price = {}
-									}
-
-									if(team.data[paragraph.type]?.supply_price.min){
-										paragraph.supply_price.min = `min:${team.data[paragraph.type]?.supply_price.min},`
-									}
-									
-									if(team.data[paragraph.type]?.supply_price.max){
-										paragraph.supply_price.max = `max:${team.data[paragraph.type]?.supply_price.max},`
-									}
-
-
-
-
-									if(!paragraph.low_stock_threshold){
-										paragraph.low_stock_threshold = {}
-									}
-
-									if(team.data[paragraph.type]?.low_stock_threshold.min){
-										paragraph.low_stock_threshold.min = `min:${team.data[paragraph.type]?.low_stock_threshold.min},`
-									}
-									
-									if(team.data[paragraph.type]?.low_stock_threshold.max){
-										paragraph.low_stock_threshold.max = `max:${team.data[paragraph.type]?.low_stock_threshold.max},`
-									}
-
-
-
-									if(!paragraph.discount){
-										paragraph.discount = {}
-									}
-
-									if(team.data[paragraph.type]?.discount.min){
-										paragraph.discount.min = `min:${team.data[paragraph.type]?.discount.min},`
-									}
-
-									if(team.data[paragraph.type]?.discount.max){
-										paragraph.discount.max = `max:${team.data[paragraph.type]?.discount.max},`
-									}
-
-
-
-									if(!paragraph.min_order_amount){
-										paragraph.min_order_amount = {}
-									}
-
-									if(team.data[paragraph.type]?.min_order_amount.min){
-										paragraph.min_order_amount.min = `min:${team.data[paragraph.type]?.min_order_amount.min},`
-									}
-
-									if(team.data[paragraph.type]?.min_order_amount.max){
-										paragraph.min_order_amount.max = `max:${team.data[paragraph.type]?.min_order_amount.max},`
-									}
-
-
-
-									if(!paragraph.max_discount_amount){
-										paragraph.max_discount_amount = {}
-									}
-
-									if(team.data[paragraph.type]?.max_discount_amount.min){
-										paragraph.max_discount_amount.min = `min:${team.data[paragraph.type]?.max_discount_amount.min},`
-									}
-
-									if(team.data[paragraph.type]?.max_discount_amount.max){
-										paragraph.max_discount_amount.max = `max:${team.data[paragraph.type]?.max_discount_amount.max},`
-									}
-
-
-
-									if(!paragraph.usage_limit){
-										paragraph.usage_limit = {}
-									}
-
-									if(team.data[paragraph.type]?.usage_limit.min){
-										paragraph.usage_limit.min = `min:${team.data[paragraph.type]?.usage_limit.min},`
-									}
-
-									if(team.data[paragraph.type]?.usage_limit.max){
-										paragraph.usage_limit.max = `max:${team.data[paragraph.type]?.usage_limit.max},`
-									}
-
-
-
-									if(!paragraph.usage_per){
-										paragraph.usage_per = {}
-									}
-
-									if(team.data[paragraph.type]?.usage_per.min){
-										paragraph.usage_per.min = `min:${team.data[paragraph.type]?.usage_per.min},`
-									}
-
-									if(team.data[paragraph.type]?.usage_per.max){
-										paragraph.usage_per.max = `max:${team.data[paragraph.type]?.usage_per.max},`
-									}
-
-
-
-									if(!paragraph.started_at){
-										paragraph.started_at = {}
-									}
-
-									if(team.data[paragraph.type]?.started_at.min){
-										paragraph.started_at.min = `min:${team.data[paragraph.type]?.started_at.min},`
-									}
-
-									if(team.data[paragraph.type]?.started_at.max){
-										paragraph.started_at.max = `max:${team.data[paragraph.type]?.started_at.max},`
-									}
-
-
-
-									if(!paragraph.expir){
-										paragraph.expired_at = {}
-									}
-									if(team.data[paragraph.type]?.expired_at.min){
-										paragraph.expired_at.min = `min:${team.data[paragraph.type]?.expired_at.min},`
-									}
-
-									if(team.data[paragraph.type]?.expired_at.max){
-										paragraph.expired_at.max = `max:${team.data[paragraph.type]?.expired_at.max},`
-									}
-
-									paragraphs[p] = paragraph
+									continue
 								}
-							}else{
-								fallback = 'Document Not Found'
-
-								continue
+							}catch(err){
+								console.log('paragraphs err', err);
 							}
 
 
@@ -4534,295 +4555,297 @@ export default {
 								}
 							}
 
-							if(contexts.length){
-								for(var q = 0; q < contexts.length; q++){
-									var context = contexts[q]
+							if(contexts){
+								if(contexts.length){
+									for(var q = 0; q < contexts.length; q++){
+										var context = contexts[q]
 
-									context.id = hashId()
+										context.id = hashId()
 
-									if(!context.type){
-										continue
-									}
-
-
-									var type = context.type
-
-									if(context.type == "sales"){
-										type = "sales"
-
-										context.type = "order"
-
-									}else if(context.type == "goods" || context.type == "order"){
-										type = "sales"
-
-									}else if(context.type == "event" || context.type == "coupon"){
-										type = "event"
-
-									}
-
-
-									context.by = "created_at"
-
-									if(context.substantial){
-										context.by = context.substantial
-									}
-
-
-									context.sort = "DESC"
-
-									if(context.find){
-										if(find == 'light' || find == 'few' || find == 'little'){
-											context.sort = "ASC"
+										if(!context.type){
+											continue
 										}
-									}
 
 
-									var query = {
-										options:{
-											topK: task.topK,
-											returnValues: false, // true 이며 벡터 값 포함
-											returnMetadata: true,
-											filter : {
-												type : context.type,
-												to : team.id
+										var type = context.type
+
+										if(context.type == "sales"){
+											type = "sales"
+
+											context.type = "order"
+
+										}else if(context.type == "goods" || context.type == "order"){
+											type = "sales"
+
+										}else if(context.type == "event" || context.type == "coupon"){
+											type = "event"
+
+										}
+
+
+										context.by = "created_at"
+
+										if(context.substantial){
+											context.by = context.substantial
+										}
+
+
+										context.sort = "DESC"
+
+										if(context.find){
+											if(find == 'light' || find == 'few' || find == 'little'){
+												context.sort = "ASC"
 											}
 										}
-									}
-
-									var queryVector
-
-									if(models['cloudflare']){
-										var { data: queryVector } = await env.AI.run('@cf/baai/bge-m3', {
-											text: [context.text],
-										})
-
-										models['cloudflare'] -= 1
-
-									}
-
-									if(!queryVector && models['deepinfra']){
-										var queryVector = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', context.text)
-
-										var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-											return {
-												id: item.id,
-												values: values,
-												metadata: metadata
-											}
-										})
-
-										models['deepinfra'] -= 1
-
-									}
-
-									if(!queryVector){
-										fallback = 'overflow'
-
-										continue
-									}
 
 
-									var condition = `"created_at" < ${now}`
-
-
-									if(context.status){
-										if(type == "sales"){
-											if(context.status == "used" || context.status == "lease" || context.status == "rental" || context.status == "refurbish"){
-												condition += ` AND "${context.status}" > 0 `
-											}
-										}else{
-											condition += ` AND "status" = "${context.status}" `
-										}
-									}
-
-									if(Object.keys(context.condition).length){
-										for (var key in context.condition) {
-											var value = context.condition[key]
-
-											if (context.condition.hasOwnProperty(key)) {
-												if(isNaN(value)){
-													query.options.filter[key] = value
-
-													if(key == "price"){
-														if(value.currency){
-															query.options.filter.currency = value.currency
-														}
-													}
-												}else{
-													condition += parseCondition(value, key, " AND ")
+										var query = {
+											options:{
+												topK: task.topK,
+												returnValues: false, // true 이며 벡터 값 포함
+												returnMetadata: true,
+												filter : {
+													type : context.type,
+													to : team.id
 												}
 											}
 										}
-									}
 
+										var queryVector
 
-									var { matches } = await env[`${vectorRegion}-${type}`].query(queryVector[0], query.options)
+										if(models['cloudflare']){
+											var { data: queryVector } = await env.AI.run('@cf/baai/bge-m3', {
+												text: [context.text],
+											})
 
-									var rag = {
-										search : {
-											query : context.condition,
-											sql : {},
-											vector : {}
+											models['cloudflare'] -= 1
+
 										}
-									}
 
-									var matches_condition = ''
+										if(!queryVector && models['deepinfra']){
+											var queryVector = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', context.text)
 
-									if(matches.length){
-										for(var m = 0; m < matches.length; m++){
-											var match = matches[m]
+											var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+												return {
+													id: item.id,
+													values: values,
+													metadata: metadata
+												}
+											})
 
-											if(matches_condition.length){
-												matches_condition += ' OR '
+											models['deepinfra'] -= 1
+
+										}
+
+										if(!queryVector){
+											fallback = 'overflow'
+
+											continue
+										}
+
+
+										var condition = `"created_at" < ${now}`
+
+
+										if(context.status){
+											if(type == "sales"){
+												if(context.status == "used" || context.status == "lease" || context.status == "rental" || context.status == "refurbish"){
+													condition += ` AND "${context.status}" > 0 `
+												}
+											}else{
+												condition += ` AND "status" = "${context.status}" `
 											}
-
-											matches_condition += `("id" = "${match.id}" AND "to" = "${team.id}" AND "created_at" < ${now})`
 										}
-									}
 
-									var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
+										if(Object.keys(context.condition).length){
+											for (var key in context.condition) {
+												var value = context.condition[key]
 
-									if(results.length){
-										for(var r = 0; r < results.length; r++){
-											var item = results[r]
+												if (context.condition.hasOwnProperty(key)) {
+													if(isNaN(value)){
+														query.options.filter[key] = value
 
-											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
-
-											var data = JSON.parse(decompressedJsonString)
-
-											if(data){
-												if(Object.keys(data).length){
-													for (var name in data) {
-														if (data.hasOwnProperty(name)) {
-															var value = data[name]
-
-															item[name] = value
+														if(key == "price"){
+															if(value.currency){
+																query.options.filter.currency = value.currency
+															}
 														}
+													}else{
+														condition += parseCondition(value, key, " AND ")
 													}
 												}
 											}
-
-											delete results[i].from
-											delete results[i].to
-											delete results[i].cc
-											delete results[i].bcc
-											delete results[i].ref
-											delete results[i].data
 										}
 
-										rag.search.vector = {
-											results : results
+
+										var { matches } = await env[`${vectorRegion}-${type}`].query(queryVector[0], query.options)
+
+										var rag = {
+											search : {
+												query : context.condition,
+												sql : {},
+												vector : {}
+											}
 										}
-										
-									}
 
-									var orderBy = ''
+										var matches_condition = ''
 
-									if(context.sort && context.by){
-										orderBy = `ORDER BY ${context.by} ${context.sort}`
-									}
+										if(matches.length){
+											for(var m = 0; m < matches.length; m++){
+												var match = matches[m]
 
-									var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = "${team.id}" AND "created_at" < ${now} ${orderBy} LIMIT 300`).all()
+												if(matches_condition.length){
+													matches_condition += ' OR '
+												}
 
-									if(results.length){
-										for(var r = 0; r < results.length; r++){
-											var item = results[r]
+												matches_condition += `("id" = "${match.id}" AND "to" = "${team.id}" AND "created_at" < ${now})`
+											}
+										}
 
-											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+										var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
 
-											var data = JSON.parse(decompressedJsonString)
+										if(results.length){
+											for(var r = 0; r < results.length; r++){
+												var item = results[r]
 
-											if(data){
-												if(Object.keys(data).length){
-													for (var name in data) {
-														if (data.hasOwnProperty(name)) {
-															var value = data[name]
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
 
-															item[name] = value
+												var data = JSON.parse(decompressedJsonString)
+
+												if(data){
+													if(Object.keys(data).length){
+														for (var name in data) {
+															if (data.hasOwnProperty(name)) {
+																var value = data[name]
+
+																item[name] = value
+															}
 														}
 													}
 												}
+
+												delete results[i].from
+												delete results[i].to
+												delete results[i].cc
+												delete results[i].bcc
+												delete results[i].ref
+												delete results[i].data
 											}
 
-											delete results[i].from
-											delete results[i].to
-											delete results[i].cc
-											delete results[i].bcc
-											delete results[i].ref
-											delete results[i].data
+											rag.search.vector = {
+												results : results
+											}
+											
 										}
 
-										rag.search.sql = {
-											results : results
+										var orderBy = ''
+
+										if(context.sort && context.by){
+											orderBy = `ORDER BY ${context.by} ${context.sort}`
 										}
-									}
+
+										var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = "${team.id}" AND "created_at" < ${now} ${orderBy} LIMIT 300`).all()
+
+										if(results.length){
+											for(var r = 0; r < results.length; r++){
+												var item = results[r]
+
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+
+												var data = JSON.parse(decompressedJsonString)
+
+												if(data){
+													if(Object.keys(data).length){
+														for (var name in data) {
+															if (data.hasOwnProperty(name)) {
+																var value = data[name]
+
+																item[name] = value
+															}
+														}
+													}
+												}
+
+												delete results[i].from
+												delete results[i].to
+												delete results[i].cc
+												delete results[i].bcc
+												delete results[i].ref
+												delete results[i].data
+											}
+
+											rag.search.sql = {
+												results : results
+											}
+										}
 
 
-									var system = 'Return the content related to the {search.text} value from the search results in a JSON structure.'
+										var system = 'Return the content related to the {search.text} value from the search results in a JSON structure.'
 
-									var content = context2results(context, [...rag.search.sql.results, ...rag.search.vector.results], language)
+										var content = context2results(context, [...rag.search.sql.results, ...rag.search.vector.results], language)
 
 
-									var text
+										var text
 
-									if(models['deepinfra']){
-										text = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+										if(models['deepinfra']){
+											text = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
-										models['deepinfra'] -= 1
+											models['deepinfra'] -= 1
 
-									}
+										}
 
-									if(!text && gemini_llm_api){
-										text = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+										if(!text && gemini_llm_api){
+											text = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
 
-										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
-									}
+										}
 
-									if(!text){
-										fallback = 'overflow'
+										if(!text){
+											fallback = 'overflow'
 
-										continue
-									}
+											continue
+										}
 
-									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-										text : text,
-										search : rag.search
-									})), { to: 'arraybuffer' })
+										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+											text : text,
+											search : rag.search
+										})), { to: 'arraybuffer' })
 
-									context.data = arr.buffer
+										context.data = arr.buffer
 
-									statements[`${zoneRegion}_talks`].push(
-										env[`${zoneRegion}_talks`].prepare(`
-											INSERT INTO talks (
-												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-											) VALUES (
-												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-											) ON CONFLICT (id) DO UPDATE SET
-												"type" = EXCLUDED."type",
-												"from" = EXCLUDED."from",
-												"to" = EXCLUDED."to",
-												"cc" = EXCLUDED."cc",
-												"bcc" = EXCLUDED."bcc",
-												"ref" = EXCLUDED."ref",
-												"data" = EXCLUDED."data",
-												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
-										`).bind(
-											context.id,
-											context.type,
-											task.from,
-											task.to,
-											task.cc,
-											task.bcc,
-											task.id,
-											context.data,
-											now,
-											now
+										statements[`${zoneRegion}_talks`].push(
+											env[`${zoneRegion}_talks`].prepare(`
+												INSERT INTO talks (
+													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+												) VALUES (
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												) ON CONFLICT (id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												context.id,
+												context.type,
+												task.from,
+												task.to,
+												task.cc,
+												task.bcc,
+												task.id,
+												context.data,
+												now,
+												now
+											)
 										)
-									)
+									}
 								}
-							}
+							}	
 						}
 					}
 
