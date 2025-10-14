@@ -176,6 +176,8 @@ CREATE TABLE IF NOT EXISTS pages (
 CREATE TABLE IF NOT EXISTS views (
     "id" TEXT PRIMARY KEY,
     "type" TEXT,
+    "flag" TEXT,
+    "lang" TEXT,
     "from" TEXT,
     "to" TEXT,
     "cc" TEXT,
@@ -183,7 +185,10 @@ CREATE TABLE IF NOT EXISTS views (
     "ref" TEXT,
     "data" BLOB NULL,
     "created_at" INTEGER,
-    "updated_at" INTEGER
+    "updated_at" INTEGER,
+    "goods" INTEGER,
+    "order" INTEGER,
+    "event" INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS zones (

@@ -2,7 +2,7 @@ import { Node, parseHTML } from 'linkedom'
 
 import { gzip, ungzip } from 'pako'
 
-import { ethers } from "ethers"
+import { ethers } from 'ethers'
 
 
 /*
@@ -13,6 +13,10 @@ import { ethers } from "ethers"
 		+++ 결제 플로우 만들어야함
 
 	***selector 가 같은데 계속 풀 html 문서 전송막기
+
+	사용자가 안사용하는 벡터 DB 자동 정리하는 기능 추가하기
+
+
 */
 
 /*
@@ -82,15 +86,56 @@ import { ethers } from "ethers"
 		쇼핑몰 주문 관리 페이지
 
 
-
-
 	OCR 시 
-
 		DRAFT로 등록하고, 재고 여부 확인후 병합 
 
 
 	1000회 limit 요청 차게 될수도 있으니 fetch 요청하는것으로 우회하기
 
+
+
+
+	team.data.base.graph
+		page.ref = 레퍼러
+		page.ref 간에 연결을 프로세스로 보여줌
+
+		실제 page.ref 값
+			shopping_mall.host
+				> goods
+					// tracking 테이블에서 해당 list, detail id 값 참조해서 날짜 값을 기준으로 평가함
+
+					> list 플로우
+						?type=order &created_at = ${Today} &limit = 100
+						
+						~~ 상품명	최근 24시간 주문	재고	상태
+						~~ 상품 A	23건 (+15%)	12	🔥 판매호조
+						~~ 상품 B	0건 (-100%)	150	⚠️ 판매정체
+						
+						> detail
+							~~ “최근 24시간 주문 15건”, “이번 주 82건, 지난주 대비 +12%”
+							~~ 조회 트래킹을 해보세요!
+
+				> order
+					> list 플로우
+						?type=tracking &created_at = ${Today} &limit = 100
+						
+						~~ 주문 대기 상태 상품 리스트 표시
+						~~ 작업자 상태
+						++ 작업 프로세스 플로우 메모
+						++ tracking draft 노출
+
+						> detail 플로우
+							0. event 있으면 플로우 표시
+							1. goods 표시
+							2. order 표시
+							3. tracking 표시
+
+							~~ 주문 대기 상태 상품 정보 표시
+							~~ 작업 상태 or 설정
+
+							++ 작업 프로세스 플로우 메모
+
+							++ tracking draft 노출
 
 */
 
@@ -2559,8 +2604,8 @@ export default {
 									/*
 										주문이후의 절차는 주문번호로 매칭해야함
 
-										type : tracking                 // 배송추적
-																		// "고객 주문"" or "자사 재고" 등으로 추상화 매칭
+										type : tracking 	// 배송추적
+															// "고객 주문"" or "자사 재고" 등으로 추상화 매칭
 
 										type : order
 											order 파생 정보는
@@ -2701,146 +2746,149 @@ export default {
 
 										item.data = arr.buffer
 
-										if(item.type == "order" && item.tracking_number){
-											/*
-												상세와 리스트 차이가 분명히 있음
+										try{
+											if(item.type == "order" && item.tracking_number){
+												/*
+													상세와 리스트 차이가 분명히 있음
 
-												주문 
-													리스트에서는 송장번호가 없음
-													상세페이지에서는 송장번호가 있음
-
-											*/
-
-
-											var tracking = Object.assign({}, item)
-
-											tracking.type = "tracking"
-
-											tracking.no = item.tracking_number
-
-											if(item.no.indexOf("-") > -1){
-												tracking.no = tracking.no.replace(/-/gi,"")
-											}
-
-											if(tracking.no.indexOf("_") > -1){
-												tracking.no = tracking.no.replace(/_/gi,"")
-											}
-
-											tracking.id = hashId(team.id+tracking.no)
-
-											tracking.index = crc32(tracking.id) 
-
-											var data = {
-												id : item.id,
-												title : item.title,
-												link : item.link,
-												origin : task.origin ? task.origin : '',
-												sender : item.sender,
-												recipient : item.recipient
-											}
-											
-
-											var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
-
-											if(results.length){
-												var _item = results[0]
-
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
-
-												_item.data = JSON.parse(decompressedJsonString)
-
-												data = mergeNode(data, _item.data)
-
-												delete _item.data
-
-												tracking = mergeNode(tracking, _item)
-											}
-
-											tracking.data = data
+													주문 
+														리스트에서는 송장번호가 없음
+														상세페이지에서는 송장번호가 있음
+												*/
 
 
-											var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
+												var tracking = Object.assign({}, item)
+
+												tracking.type = "tracking"
+
+												tracking.no = item.tracking_number
+
+												if(item.no.indexOf("-") > -1){
+													tracking.no = tracking.no.replace(/-/gi,"")
+												}
+
+												if(tracking.no.indexOf("_") > -1){
+													tracking.no = tracking.no.replace(/_/gi,"")
+												}
+
+												tracking.id = hashId(team.id+tracking.no)
+
+												tracking.index = crc32(tracking.id) 
+
+												var data = {
+													id : item.id,
+													title : item.title,
+													link : item.link,
+													origin : task.origin ? task.origin : '',
+													sender : item.sender,
+													recipient : item.recipient
+												}
+												
+
+												var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+												if(results.length){
+													var _item = results[0]
+
+													var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
+
+													_item.data = JSON.parse(decompressedJsonString)
+
+													data = mergeNode(data, _item.data)
+
+													delete _item.data
+
+													tracking = mergeNode(tracking, _item)
+												}
+
+												tracking.data = data
 
 
-											statements[`${zoneRegion}_tracking`].push(
-												env[`${zoneRegion}_tracking`].prepare(`
-													INSERT INTO tracking (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
-													) ON CONFLICT (id) DO UPDATE SET
-														"type" = EXCLUDED."type",
-														"from" = EXCLUDED."from",
-														"to" = EXCLUDED."to",
-														"cc" = EXCLUDED."cc",
-														"bcc" = EXCLUDED."bcc",
-														"ref" = EXCLUDED."ref",
-														"data" = EXCLUDED."data",
-														"created_at" = EXCLUDED."created_at",
-														"index" = EXCLUDED."index",
-														"event" = EXCLUDED."event", 
-														"goods" = EXCLUDED."goods", 
-														"order" = EXCLUDED."order", 
-														"status" = EXCLUDED."status",
-														"no" = EXCLUDED."no",
-														"sender_address" = EXCLUDED."sender_address",
-														"sender_phone" = EXCLUDED."sender_phone",
-														"recipient_address" = EXCLUDED."recipient_address",
-														"recipient_phone" = EXCLUDED."recipient_phone",
-														"width" = EXCLUDED."width",
-														"height" = EXCLUDED."height",
-														"length" = EXCLUDED."length",
-														"weight" = EXCLUDED."weight",
-														"carrier" = EXCLUDED."carrier",
-														"shipping_fee" = EXCLUDED."shipping_fee",
-														"shipping_method" = EXCLUDED."shipping_method",
-														"shipping_duration" = EXCLUDED."shipping_duration",
-														"shipping_date" = EXCLUDED."shipping_date",
-														"delivery_date" = EXCLUDED."delivery_date",
-														"order_date" = EXCLUDED."order_date",
-														"payment_date" = EXCLUDED."payment_date",
-														"payment_method" = EXCLUDED."payment_method",
-														"payment_origin" = EXCLUDED."payment_origin",
-														"payment_number" = EXCLUDED."payment_number",
-														"bundle_shipping" = EXCLUDED."bundle_shipping"
-												`).bind(
-													tracking.id,
-													tracking.type,
-													tracking.from,
-													tracking.to,
-													tracking.cc,
-													tracking.bcc,
-													tracking.ref,
-													arr.buffer,
-													tracking.created_at,
-													tracking.index,
-													tracking.event ? tracking.event : 0,
-													tracking.goods ? tracking.goods : 0,
-													tracking.order ? tracking.order : 0,
-													parseStatus(tracking.status),
-													tracking.no ? tracking.no : "",
-													tracking.sender_address ? tracking.sender_address : "",
-													tracking.sender_phone ? tracking.sender_phone : "",
-													tracking.recipient_address ? tracking.recipient_address : "",
-													tracking.recipient_phone ? tracking.recipient_phone : "",
-													tracking.width ? parseFloat(tracking.width) : 0,
-													tracking.height ? parseFloat(tracking.height) : 0,
-													tracking.length ? parseFloat(tracking.length) : 0,
-													tracking.weight ? parseFloat(tracking.weight) : 0,
-													tracking.carrier ? parseFloat(tracking.carrier) : 0,
-													tracking.shipping_fee ? parseFloat(tracking.shipping_fee) : 0,
-													tracking.shipping_method ? tracking.shipping_method : "",
-													tracking.shipping_duration ? parseFloat(tracking.shipping_duration) : 0,
-													tracking.shipping_date ? parseFloat(tracking.shipping_date) : 0,
-													tracking.delivery_date ? parseFloat(tracking.delivery_date) : 0,
-													tracking.order_date ? parseFloat(tracking.order_date) : 0,
-													tracking.payment_date ? parseFloat(tracking.payment_date) : 0,
-													tracking.payment_method ? tracking.payment_method : "",
-													tracking.payment_origin ? tracking.payment_origin : "",
-													tracking.payment_number ? tracking.payment_number : "",
-													tracking.bundle_shipping ? parseFloat(tracking.bundle_shipping) : 0
+												var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
+
+
+												statements[`${zoneRegion}_tracking`].push(
+													env[`${zoneRegion}_tracking`].prepare(`
+														INSERT INTO tracking (
+															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+														) VALUES (
+															?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+														) ON CONFLICT (id) DO UPDATE SET
+															"type" = EXCLUDED."type",
+															"from" = EXCLUDED."from",
+															"to" = EXCLUDED."to",
+															"cc" = EXCLUDED."cc",
+															"bcc" = EXCLUDED."bcc",
+															"ref" = EXCLUDED."ref",
+															"data" = EXCLUDED."data",
+															"created_at" = EXCLUDED."created_at",
+															"index" = EXCLUDED."index",
+															"event" = EXCLUDED."event", 
+															"goods" = EXCLUDED."goods", 
+															"order" = EXCLUDED."order", 
+															"status" = EXCLUDED."status",
+															"no" = EXCLUDED."no",
+															"sender_address" = EXCLUDED."sender_address",
+															"sender_phone" = EXCLUDED."sender_phone",
+															"recipient_address" = EXCLUDED."recipient_address",
+															"recipient_phone" = EXCLUDED."recipient_phone",
+															"width" = EXCLUDED."width",
+															"height" = EXCLUDED."height",
+															"length" = EXCLUDED."length",
+															"weight" = EXCLUDED."weight",
+															"carrier" = EXCLUDED."carrier",
+															"shipping_fee" = EXCLUDED."shipping_fee",
+															"shipping_method" = EXCLUDED."shipping_method",
+															"shipping_duration" = EXCLUDED."shipping_duration",
+															"shipping_date" = EXCLUDED."shipping_date",
+															"delivery_date" = EXCLUDED."delivery_date",
+															"order_date" = EXCLUDED."order_date",
+															"payment_date" = EXCLUDED."payment_date",
+															"payment_method" = EXCLUDED."payment_method",
+															"payment_origin" = EXCLUDED."payment_origin",
+															"payment_number" = EXCLUDED."payment_number",
+															"bundle_shipping" = EXCLUDED."bundle_shipping"
+													`).bind(
+														tracking.id,
+														tracking.type,
+														tracking.from,
+														tracking.to,
+														tracking.cc,
+														tracking.bcc,
+														tracking.ref,
+														arr.buffer,
+														tracking.created_at,
+														tracking.index,
+														tracking.event ? tracking.event : 0,
+														tracking.goods ? tracking.goods : 0,
+														tracking.order ? tracking.order : 0,
+														parseStatus(tracking.status),
+														tracking.no ? tracking.no : "",
+														tracking.sender_address ? tracking.sender_address : "",
+														tracking.sender_phone ? tracking.sender_phone : "",
+														tracking.recipient_address ? tracking.recipient_address : "",
+														tracking.recipient_phone ? tracking.recipient_phone : "",
+														tracking.width ? parseFloat(tracking.width) : 0,
+														tracking.height ? parseFloat(tracking.height) : 0,
+														tracking.length ? parseFloat(tracking.length) : 0,
+														tracking.weight ? parseFloat(tracking.weight) : 0,
+														tracking.carrier ? parseFloat(tracking.carrier) : 0,
+														tracking.shipping_fee ? parseFloat(tracking.shipping_fee) : 0,
+														tracking.shipping_method ? tracking.shipping_method : "",
+														tracking.shipping_duration ? parseFloat(tracking.shipping_duration) : 0,
+														tracking.shipping_date ? parseFloat(tracking.shipping_date) : 0,
+														tracking.delivery_date ? parseFloat(tracking.delivery_date) : 0,
+														tracking.order_date ? parseFloat(tracking.order_date) : 0,
+														tracking.payment_date ? parseFloat(tracking.payment_date) : 0,
+														tracking.payment_method ? tracking.payment_method : "",
+														tracking.payment_origin ? tracking.payment_origin : "",
+														tracking.payment_number ? tracking.payment_number : "",
+														tracking.bundle_shipping ? parseFloat(tracking.bundle_shipping) : 0
+													)
 												)
-											)
+											}
+										}catch(err){
+
 										}
 
 
@@ -3080,9 +3128,7 @@ export default {
 										var related = Related(item.type) // 관련 타입 정보 가져옴
 
 										/*
-											두가지 타입으로 
-												외부 테이블 최신화 진행
-
+											두가지 타입
 												import
 													foreign 에서 primary 
 
@@ -3103,19 +3149,6 @@ export default {
 													export = 내부 데이터로 외부 데이터 수정
 														tracking 스캔 진행시
 															tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
-
-
-											예외 시나리오
-												goods 스캔 진행시 다음 의미 없음
-													row.type == "goods"
-													row.type == "event"
-													row.type == "tracking"
-
-												event 스캔 진행시 다음 의미 없음
-													row.type == "coupon"
-													row.type == "event"
-													row.type == "goods"
-													row.type == "order"
 										*/ 
 
 										for(var r = 0; r < related.length; r++){
@@ -3137,13 +3170,13 @@ export default {
 
 													if(typeof status != "undefined"){
 														var { results } = await env[`${zoneRegion}_${table}`].prepare(
-															`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+															`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
 														).bind(
 															column_value, team.id, item.cc, status, now
 														).all()
 													}else{
 														var { results } = await env[`${zoneRegion}_${table}`].prepare(
-															`SELECT * FROM ${table} WHERE  "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+															`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
 														).bind(
 															column_value, team.id, item.cc, now
 														).all()
