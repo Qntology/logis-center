@@ -93,11 +93,22 @@ import { ethers } from 'ethers'
 	1000회 limit 요청 차게 될수도 있으니 fetch 요청하는것으로 우회하기
 
 
+		
 
 
 	team.data.base.graph
 		page.ref = 레퍼러
 		page.ref 간에 연결을 프로세스로 보여줌
+
+
+		오른쪽 
+			UI 채팅으로 노출시킬 내용은 스캔, 프롬프트 결과만
+
+		왼쪽영역
+			노출할 내용
+				- 페이지 테이블
+				- 연관 테이블
+				- 메모
 
 		실제 page.ref 값
 			shopping_mall.host
