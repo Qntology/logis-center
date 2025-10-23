@@ -418,8 +418,8 @@ const item2json = function(type){
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			status:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			payment_method:payment method | string,
-			bank:bank company name | string,
-			card:card company name | string,
+			bank:bank company name or '' | string,
+			card:card company name or '' | string,
 			code:product constant code | string,
 			model_name:product Model name | string,
 			brand_name:product Brand name | string,
@@ -493,9 +493,9 @@ const item2json = function(type){
 			bank:bank company name | string,
 			card:card company name | string,
 			order_date:order date | string,
-			payment_date:payment_date or empty | string,
-			payment_method:'C.O.D.' or 'CARD' or 'BANK' or '',
-			payment_origin:Payment Service Provider or empty | string,
+			payment_date:payment date or '' | string,
+			payment_method:'C.O.D.' or 'CARD' or 'BANK' or '' | string,
+			payment_origin:Payment Gateway Service Name or '' | string,
 			date:yyyy-MM-dd'T'HH:mm:ss | string
 		`
 	}else if(type == 'coupon' || type == 'event'){
@@ -2557,9 +2557,7 @@ export default {
 									}
 								}
 
-								console.log('page', JSON.stringify(page));
-
-								console.log('isDetail', JSON.stringify(isDetail));
+								
 
 								if(!page){
 									fallback = 'page overflow'
@@ -2572,6 +2570,10 @@ export default {
 								page.to = task.to
 								page.cc = task.cc
 								page.bcc = task.bcc
+
+								console.log('page', JSON.stringify(page));
+
+								console.log('isDetail', JSON.stringify(isDetail));
 
 								if(isDetail){
 									page.items = [safeClone(page)]
@@ -2758,16 +2760,14 @@ export default {
 										item.ref = task.ref
 
 
-										var goods = item.goods
+										var goods = item.goods ? safeClone(item.goods) : []
 
-										if(goods){
-											if(goods.length){
-												goods = safeClone(item.goods)
-												
-												delete item.goods
+										delete item.goods
 
-												goods.unshift({})
-											}
+										if(typeof goods.length != "undefined"){
+											goods.unshift({})
+										}else{
+											goods = []
 										}
 
 
@@ -2797,6 +2797,22 @@ export default {
 
 										item.data = arr.buffer
 
+										if(item.tracking_number){
+											var tracking_number = item.tracking_number
+
+											if(tracking_number.indexOf("-") > -1){
+												tracking_number = tracking_number.replace(/-/gi,"")
+											}
+
+											if(tracking_number.indexOf("_") > -1){
+												tracking_number = tracking_number.replace(/_/gi,"")
+											}
+
+											item.tracking = crc32(hashId(team.id+tracking_number))
+										}
+
+											
+
 										try{
 											console.log('item.type',item.type);
 											console.log('진입',item.tracking_number);
@@ -2810,179 +2826,223 @@ export default {
 														상세페이지에서는 송장번호가 있음
 												*/
 
-												var tracking_number = item.tracking_number
+											
 
-												if(tracking_number.indexOf("-") > -1){
-													tracking_number = tracking_number.replace(/-/gi,"")
-												}
+												console.log('before item.tracking',item.tracking);
 
-												if(tracking_number.indexOf("_") > -1){
-													tracking_number = tracking_number.replace(/_/gi,"")
-												}
+												if(goods.length){
+													for(var g = 0; g < goods.length; g++){
+														var good = safeClone(goods[g])
 
-												item.tracking = crc32(hashId(team.id+tracking_number))
+														var tracking = safeClone(item)
 
-												console.log('item.tracking',item.tracking);
+														tracking.type = "tracking"
 
-												if(goods){
-													if(goods.length){
-														for(var g = 0; g < goods.length; g++){
-															var good = safeClone(goods[g])
+														tracking.no = tracking_number
 
-															var tracking = safeClone(item)
+														tracking.index = item.tracking
 
-															tracking.type = "tracking"
+														if(good.id){
+															var no = good.id.toString()
 
-															tracking.no = tracking_number
-
-															tracking.index = item.tracking
-
-															if(good.id){
-																var no = good.id.toString()
-
-																if(no.indexOf("-") > -1){
-																	no = no.replace(/-/gi,"")
-																}
-
-																if(no.indexOf("_") > -1){
-																	no = no.replace(/_/gi,"")
-																}
-
-																good.no = no
-
-																good.index = crc32(hashId(team.id+good.no))
-
-																var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = "goods" AND "index" = "${good.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
-
-																if(results.length){
-																	tracking.event = results[0].event
-																}
-
-																tracking.goods = good.index
-
-																tracking.id = hashId(team.id+good.no)
-															}else{
-																tracking.id = hashId(team.id+tracking.no)
+															if(no.indexOf("-") > -1){
+																no = no.replace(/-/gi,"")
 															}
 
-
-
-															tracking.order = item.index
-
-															tracking.order_date = item.order_date
-															tracking.payment_date = item.payment_date
-															tracking.payment_method = item.payment_method
-															tracking.payment_origin = item.payment_origin
-
-															tracking.link = item.link
-
-															tracking.sender_address = item.sender_address
-															tracking.sender_phone = item.sender_phone
-															tracking.recipient_address = item.recipient_address
-															tracking.recipient_phone = item.recipient_phone
-
-															tracking.data = {
-																id : item.id,
-																link : item.link,
-																origin : task.origin ? task.origin : ""
+															if(no.indexOf("_") > -1){
+																no = no.replace(/_/gi,"")
 															}
 
-															var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+															good.no = no
+
+															good.index = crc32(hashId(team.id+good.no))
+
+															var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = "goods" AND "index" = "${good.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
 															if(results.length){
-																var _tracking = safeClone(results[0])
-
-																var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_tracking.data))
-
-																_tracking.data = JSON.parse(decompressedJsonString)
-
-																tracking = mergeNode(_tracking, tracking)
+																tracking.event = results[0].event
 															}
 
-															console.log('JSON.stringify(tracking)',JSON.stringify(tracking));
+															tracking.goods = good.index
 
-															var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
-
-															statements[`${zoneRegion}_tracking`].push(
-																env[`${zoneRegion}_tracking`].prepare(`
-																	INSERT INTO tracking (
-																		"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-																	) VALUES (
-																		?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
-																	) ON CONFLICT (id) DO UPDATE SET
-																		"type" = EXCLUDED."type",
-																		"from" = EXCLUDED."from",
-																		"to" = EXCLUDED."to",
-																		"cc" = EXCLUDED."cc",
-																		"bcc" = EXCLUDED."bcc",
-																		"ref" = EXCLUDED."ref",
-																		"data" = EXCLUDED."data",
-																		"created_at" = EXCLUDED."created_at",
-																		"index" = EXCLUDED."index",
-																		"event" = EXCLUDED."event", 
-																		"goods" = EXCLUDED."goods", 
-																		"order" = EXCLUDED."order", 
-																		"status" = EXCLUDED."status",
-																		"no" = EXCLUDED."no",
-																		"sender_address" = EXCLUDED."sender_address",
-																		"sender_phone" = EXCLUDED."sender_phone",
-																		"recipient_address" = EXCLUDED."recipient_address",
-																		"recipient_phone" = EXCLUDED."recipient_phone",
-																		"width" = EXCLUDED."width",
-																		"height" = EXCLUDED."height",
-																		"length" = EXCLUDED."length",
-																		"weight" = EXCLUDED."weight",
-																		"carrier" = EXCLUDED."carrier",
-																		"shipping_fee" = EXCLUDED."shipping_fee",
-																		"shipping_method" = EXCLUDED."shipping_method",
-																		"shipping_duration" = EXCLUDED."shipping_duration",
-																		"shipping_date" = EXCLUDED."shipping_date",
-																		"delivery_date" = EXCLUDED."delivery_date",
-																		"order_date" = EXCLUDED."order_date",
-																		"payment_date" = EXCLUDED."payment_date",
-																		"payment_method" = EXCLUDED."payment_method",
-																		"payment_origin" = EXCLUDED."payment_origin",
-																		"payment_number" = EXCLUDED."payment_number",
-																		"bundle_shipping" = EXCLUDED."bundle_shipping"
-																`).bind(
-																	tracking.id,
-																	tracking.type,
-																	tracking.from,
-																	tracking.to,
-																	tracking.cc,
-																	tracking.bcc,
-																	tracking.ref,
-																	arr.buffer,
-																	tracking.created_at,
-																	tracking.index,
-																	tracking.event ? tracking.event : 0,
-																	tracking.goods ? tracking.goods : 0,
-																	tracking.order ? tracking.order : 0,
-																	parseStatus(tracking.status),
-																	tracking.no ? tracking.no : "",
-																	tracking.sender_address ? tracking.sender_address : "",
-																	tracking.sender_phone ? tracking.sender_phone : "",
-																	tracking.recipient_address ? tracking.recipient_address : "",
-																	tracking.recipient_phone ? tracking.recipient_phone : "",
-																	tracking.width ? parseFloat(tracking.width) : 0,
-																	tracking.height ? parseFloat(tracking.height) : 0,
-																	tracking.length ? parseFloat(tracking.length) : 0,
-																	tracking.weight ? parseFloat(tracking.weight) : 0,
-																	tracking.carrier ? parseFloat(tracking.carrier) : 0,
-																	tracking.shipping_fee ? parseFloat(tracking.shipping_fee) : 0,
-																	tracking.shipping_method ? tracking.shipping_method : "",
-																	tracking.shipping_duration ? parseFloat(tracking.shipping_duration) : 0,
-																	tracking.shipping_date ? parseFloat(tracking.shipping_date) : 0,
-																	tracking.delivery_date ? parseFloat(tracking.delivery_date) : 0,
-																	tracking.order_date ? parseFloat(tracking.order_date) : 0,
-																	tracking.payment_date ? parseFloat(tracking.payment_date) : 0,
-																	tracking.payment_method ? tracking.payment_method : "",
-																	tracking.payment_origin ? tracking.payment_origin : "",
-																	tracking.payment_number ? tracking.payment_number : "",
-																	tracking.bundle_shipping ? parseFloat(tracking.bundle_shipping) : 0
-																)
-															)
+															tracking.id = hashId(team.id+good.no)
+														}else{
+															tracking.id = hashId(team.id+tracking.no)
 														}
+
+
+
+														tracking.order = item.index
+
+														tracking.order_date = item.order_date
+														tracking.payment_date = item.payment_date
+														tracking.payment_method = item.payment_method
+														tracking.payment_origin = item.payment_origin
+
+														tracking.link = item.link
+
+														tracking.sender_address = item.sender_address
+														tracking.sender_phone = item.sender_phone
+														tracking.recipient_address = item.recipient_address
+														tracking.recipient_phone = item.recipient_phone
+
+														tracking.data = {
+															id : item.id,
+															link : item.link,
+															origin : task.origin ? task.origin : ""
+														}
+
+
+
+														var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+														if(results.length){
+															var _tracking = safeClone(results[0])
+
+															var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_tracking.data))
+
+															_tracking.data = JSON.parse(decompressedJsonString)
+
+															tracking = mergeNode(_tracking, tracking)
+														}else{
+															// 처음 저장할때 자연어 LLM으로 전처리해서 벡터 저장해야함
+
+															// var metadata = {
+															// 	type: item.type,
+															// 	from: item.from,
+															// 	to: item.to,
+															// 	cc: item.cc,
+															// 	bcc: item.bcc,
+															// 	ref:task.ref
+															// }
+
+															// var embeddings
+
+															// if(models['cloudflare']){
+															// 	var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
+															// 		text: [item.semantic]
+															// 	})
+
+															// 	var $VectorizeVector = [
+															// 		{
+															// 			id: item.id,
+															// 			values: embeddings[0],
+															// 			metadata: metadata
+															// 		}
+															// 	]
+
+															// 	models['cloudflare'] -= 1
+
+															// }
+
+															// if(!embeddings && models['deepinfra']){
+															// 	var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', item.semantic)
+
+															// 	var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+															// 		return {
+															// 			id: item.id,
+															// 			values: values,
+															// 			metadata: metadata
+															// 		}
+															// 	})
+
+															// 	models['deepinfra'] -= 1
+															// }
+
+															// console.log('typeof embeddings',typeof embeddings);
+
+															// if(!embeddings){
+															// 	fallback = 'embeddings overflow'
+
+															// 	continue
+															// }
+
+															// await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
+														}
+
+														console.log('JSON.stringify(tracking)',JSON.stringify(tracking));
+
+														var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
+
+														statements[`${zoneRegion}_tracking`].push(
+															env[`${zoneRegion}_tracking`].prepare(`
+																INSERT INTO tracking (
+																	"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+																) VALUES (
+																	?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+																) ON CONFLICT (id) DO UPDATE SET
+																	"type" = EXCLUDED."type",
+																	"from" = EXCLUDED."from",
+																	"to" = EXCLUDED."to",
+																	"cc" = EXCLUDED."cc",
+																	"bcc" = EXCLUDED."bcc",
+																	"ref" = EXCLUDED."ref",
+																	"data" = EXCLUDED."data",
+																	"created_at" = EXCLUDED."created_at",
+																	"index" = EXCLUDED."index",
+																	"event" = EXCLUDED."event", 
+																	"goods" = EXCLUDED."goods", 
+																	"order" = EXCLUDED."order", 
+																	"status" = EXCLUDED."status",
+																	"no" = EXCLUDED."no",
+																	"sender_address" = EXCLUDED."sender_address",
+																	"sender_phone" = EXCLUDED."sender_phone",
+																	"recipient_address" = EXCLUDED."recipient_address",
+																	"recipient_phone" = EXCLUDED."recipient_phone",
+																	"width" = EXCLUDED."width",
+																	"height" = EXCLUDED."height",
+																	"length" = EXCLUDED."length",
+																	"weight" = EXCLUDED."weight",
+																	"carrier" = EXCLUDED."carrier",
+																	"shipping_fee" = EXCLUDED."shipping_fee",
+																	"shipping_method" = EXCLUDED."shipping_method",
+																	"shipping_duration" = EXCLUDED."shipping_duration",
+																	"shipping_date" = EXCLUDED."shipping_date",
+																	"delivery_date" = EXCLUDED."delivery_date",
+																	"order_date" = EXCLUDED."order_date",
+																	"payment_date" = EXCLUDED."payment_date",
+																	"payment_method" = EXCLUDED."payment_method",
+																	"payment_origin" = EXCLUDED."payment_origin",
+																	"payment_number" = EXCLUDED."payment_number",
+																	"bundle_shipping" = EXCLUDED."bundle_shipping"
+															`).bind(
+																tracking.id,
+																tracking.type,
+																tracking.from,
+																tracking.to,
+																tracking.cc,
+																tracking.bcc,
+																tracking.ref,
+																arr.buffer,
+																tracking.created_at,
+																tracking.index,
+																tracking.event ? tracking.event : 0,
+																tracking.goods ? tracking.goods : 0,
+																tracking.order ? tracking.order : 0,
+																parseStatus(tracking.status),
+																tracking.no ? tracking.no : "",
+																tracking.sender_address ? tracking.sender_address : "",
+																tracking.sender_phone ? tracking.sender_phone : "",
+																tracking.recipient_address ? tracking.recipient_address : "",
+																tracking.recipient_phone ? tracking.recipient_phone : "",
+																parseFloat(tracking.width ? tracking.width : 0),
+																parseFloat(tracking.height ? tracking.height : 0),
+																parseFloat(tracking.length ? tracking.length : 0),
+																parseFloat(tracking.weight ? tracking.weight : 0),
+																parseFloat(tracking.carrier ? tracking.carrier : 0),
+																parseFloat(tracking.shipping_fee ? tracking.shipping_fee : 0),
+																tracking.shipping_method ? tracking.shipping_method : "",
+																parseFloat(tracking.shipping_duration ? tracking.shipping_duration : 0),
+																parseFloat(tracking.shipping_date ? tracking.shipping_date : 0),
+																parseFloat(tracking.delivery_date ? tracking.delivery_date : 0),
+																parseFloat(tracking.order_date ? tracking.order_date : 0),
+																parseFloat(tracking.payment_date ? tracking.payment_date : 0),
+																tracking.payment_method ? tracking.payment_method : "",
+																tracking.payment_origin ? tracking.payment_origin : "",
+																tracking.payment_number ? tracking.payment_number : "",
+																parseFloat(tracking.bundle_shipping ? tracking.bundle_shipping : 0)
+															)
+														)
 													}
 												}
 											}
@@ -3038,184 +3098,187 @@ export default {
 										}
 
 
-										if(item.price <= team.data.base[itemType].price.min){
-											team.data.base[itemType].price.min = item.price
+										try{
+											if(item.price <= team.data.base[item.type].price.min){
+												team.data.base[item.type].price.min = item.price
+											}
+
+											if(item.price >= team.data.base[item.type].price.max){
+												team.data.base[item.type].price.max = item.price
+											}
+											
+
+
+											if(item.quantity <= team.data.base[item.type].quantity.min){
+												team.data.base[item.type].quantity.min = item.quantity
+											}
+
+											if(item.quantity >= team.data.base[item.type].quantity.max){
+												team.data.base[item.type].quantity.max = item.quantity
+											}
+
+
+
+											if(item.width <= team.data.base[item.type].width.min){
+												team.data.base[item.type].width.min = item.width
+											}
+
+											if(item.width >= team.data.base[item.type].width.max){
+												team.data.base[item.type].width.max = item.width
+											}
+
+
+
+											if(item.height <= team.data.base[item.type].height.min){
+												team.data.base[item.type].height.min = item.height
+											}
+
+											if(item.height >= team.data.base[item.type].height.max){
+												team.data.base[item.type].height.max = item.height
+											}
+
+
+
+											if(item.length <= team.data.base[item.type].length.min){
+												team.data.base[item.type].length.min = item.length
+											}
+
+											if(item.length >= team.data.base[item.type].length.max){
+												team.data.base[item.type].length.max = item.length
+											}
+
+
+
+											if(item.weight <= team.data.base[item.type].weight.min){
+												team.data.base[item.type].weight.min = item.weight
+											}
+
+											if(item.weight >= team.data.base[item.type].weight.max){
+												team.data.base[item.type].weight.max = item.weight
+											}
+
+
+
+											if(item.shipping_fee <= team.data.base[item.type].shipping_fee.min){
+												team.data.base[item.type].shipping_fee.min = item.shipping_fee
+											}
+
+											if(item.shipping_fee >= team.data.base[item.type].shipping_fee.max){
+												team.data.base[item.type].shipping_fee.max = item.shipping_fee
+											}
+
+
+
+											if(item.shipping_duration <= team.data.base[item.type].shipping_duration.min){
+												team.data.base[item.type].shipping_duration.min = item.shipping_duration
+											}
+
+											if(item.shipping_duration >= team.data.base[item.type].shipping_duration.max){
+												team.data.base[item.type].shipping_duration.max = item.shipping_duration
+											}
+
+
+
+											if(item.sale_price <= team.data.base[item.type].sale_price.min){
+												team.data.base[item.type].sale_price.min = item.sale_price
+											}
+
+											if(item.sale_price >= team.data.base[item.type].sale_price.max){
+												team.data.base[item.type].sale_price.max = item.sale_price
+											}
+
+
+
+											if(item.supply_price <= team.data.base[item.type].supply_price.min){
+												team.data.base[item.type].supply_price.min = item.supply_price
+											}
+
+											if(item.supply_price >= team.data.base[item.type].supply_price.max){
+												team.data.base[item.type].supply_price.max = item.supply_price
+											}
+											
+
+
+											if(item.low_stock_threshold <= team.data.base[item.type].low_stock_threshold.min){
+												team.data.base[item.type].low_stock_threshold.min = item.low_stock_threshold
+											}
+
+											if(item.low_stock_threshold >= team.data.base[item.type].low_stock_threshold.max){
+												team.data.base[item.type].low_stock_threshold.max = item.low_stock_threshold
+											}
+											
+
+
+											if(item.discount <= team.data.base[item.type].discount.min){
+												team.data.base[item.type].discount.min = item.discount
+											}
+
+											if(item.discount >= team.data.base[item.type].discount.max){
+												team.data.base[item.type].discount.max = item.discount
+											}
+											
+
+											
+											if(item.min_order_amount <= team.data.base[item.type].min_order_amount.min){
+												team.data.base[item.type].min_order_amount.min = item.min_order_amount
+											}
+
+											if(item.min_order_amount >= team.data.base[item.type].min_order_amount.max){
+												team.data.base[item.type].min_order_amount.max = item.min_order_amount
+											}
+
+
+
+											if(item.max_discount_amount <= team.data.base[item.type].max_discount_amount.min){
+												team.data.base[item.type].max_discount_amount.min = item.max_discount_amount
+											}
+
+											if(item.max_discount_amount >= team.data.base[item.type].max_discount_amount.max){
+												team.data.base[item.type].max_discount_amount.max = item.max_discount_amount
+											}
+
+
+
+											if(item.usage_limit <= team.data.base[item.type].usage_limit.min){
+												team.data.base[item.type].usage_limit.min = item.usage_limit
+											}
+
+											if(item.usage_limit >= team.data.base[item.type].usage_limit.max){
+												team.data.base[item.type].usage_limit.max = item.usage_limit
+											}
+
+
+
+											if(item.usage_per <= team.data.base[item.type].usage_per.min){
+												team.data.base[item.type].usage_per.min = item.usage_per
+											}
+
+											if(item.usage_per >= team.data.base[item.type].usage_per.max){
+												team.data.base[item.type].usage_per.max = item.usage_per
+											}
+
+
+
+											if(item.started_at <= team.data.base[item.type].started_at.min){
+												team.data.base[item.type].started_at.min = item.started_at
+											}
+
+											if(item.started_at >= team.data.base[item.type].started_at.max){
+												team.data.base[item.type].started_at.max = item.started_at
+											}
+
+
+
+											if(item.expired_at <= team.data.base[item.type].expired_at.min){
+												team.data.base[item.type].expired_at.min = item.expired_at
+											}
+
+											if(item.expired_at >= team.data.base[item.type].expired_at.max){
+												team.data.base[item.type].expired_at.max = item.expired_at
+											}
+										}catch(err){
+											console.log('err team.data.base',err);
 										}
-
-										if(item.price >= team.data.base[itemType].price.max){
-											team.data.base[itemType].price.max = item.price
-										}
-										
-
-
-										if(item.quantity <= team.data.base[itemType].quantity.min){
-											team.data.base[itemType].quantity.min = item.quantity
-										}
-
-										if(item.quantity >= team.data.base[itemType].quantity.max){
-											team.data.base[itemType].quantity.max = item.quantity
-										}
-
-
-
-										if(item.width <= team.data.base[itemType].width.min){
-											team.data.base[itemType].width.min = item.width
-										}
-
-										if(item.width >= team.data.base[itemType].width.max){
-											team.data.base[itemType].width.max = item.width
-										}
-
-
-
-										if(item.height <= team.data.base[itemType].height.min){
-											team.data.base[itemType].height.min = item.height
-										}
-
-										if(item.height >= team.data.base[itemType].height.max){
-											team.data.base[itemType].height.max = item.height
-										}
-
-
-
-										if(item.length <= team.data.base[itemType].length.min){
-											team.data.base[itemType].length.min = item.length
-										}
-
-										if(item.length >= team.data.base[itemType].length.max){
-											team.data.base[itemType].length.max = item.length
-										}
-
-
-
-										if(item.weight <= team.data.base[itemType].weight.min){
-											team.data.base[itemType].weight.min = item.weight
-										}
-
-										if(item.weight >= team.data.base[itemType].weight.max){
-											team.data.base[itemType].weight.max = item.weight
-										}
-
-
-
-										if(item.shipping_fee <= team.data.base[itemType].shipping_fee.min){
-											team.data.base[itemType].shipping_fee.min = item.shipping_fee
-										}
-
-										if(item.shipping_fee >= team.data.base[itemType].shipping_fee.max){
-											team.data.base[itemType].shipping_fee.max = item.shipping_fee
-										}
-
-
-
-										if(item.shipping_duration <= team.data.base[itemType].shipping_duration.min){
-											team.data.base[itemType].shipping_duration.min = item.shipping_duration
-										}
-
-										if(item.shipping_duration >= team.data.base[itemType].shipping_duration.max){
-											team.data.base[itemType].shipping_duration.max = item.shipping_duration
-										}
-
-
-
-										if(item.sale_price <= team.data.base[itemType].sale_price.min){
-											team.data.base[itemType].sale_price.min = item.sale_price
-										}
-
-										if(item.sale_price >= team.data.base[itemType].sale_price.max){
-											team.data.base[itemType].sale_price.max = item.sale_price
-										}
-
-
-
-										if(item.supply_price <= team.data.base[itemType].supply_price.min){
-											team.data.base[itemType].supply_price.min = item.supply_price
-										}
-
-										if(item.supply_price >= team.data.base[itemType].supply_price.max){
-											team.data.base[itemType].supply_price.max = item.supply_price
-										}
-										
-
-
-										if(item.low_stock_threshold <= team.data.base[itemType].low_stock_threshold.min){
-											team.data.base[itemType].low_stock_threshold.min = item.low_stock_threshold
-										}
-
-										if(item.low_stock_threshold >= team.data.base[itemType].low_stock_threshold.max){
-											team.data.base[itemType].low_stock_threshold.max = item.low_stock_threshold
-										}
-										
-
-
-										if(item.discount <= team.data.base[itemType].discount.min){
-											team.data.base[itemType].discount.min = item.discount
-										}
-
-										if(item.discount >= team.data.base[itemType].discount.max){
-											team.data.base[itemType].discount.max = item.discount
-										}
-										
-
-										
-										if(item.min_order_amount <= team.data.base[itemType].min_order_amount.min){
-											team.data.base[itemType].min_order_amount.min = item.min_order_amount
-										}
-
-										if(item.min_order_amount >= team.data.base[itemType].min_order_amount.max){
-											team.data.base[itemType].min_order_amount.max = item.min_order_amount
-										}
-
-
-
-										if(item.max_discount_amount <= team.data.base[itemType].max_discount_amount.min){
-											team.data.base[itemType].max_discount_amount.min = item.max_discount_amount
-										}
-
-										if(item.max_discount_amount >= team.data.base[itemType].max_discount_amount.max){
-											team.data.base[itemType].max_discount_amount.max = item.max_discount_amount
-										}
-
-
-
-										if(item.usage_limit <= team.data.base[itemType].usage_limit.min){
-											team.data.base[itemType].usage_limit.min = item.usage_limit
-										}
-
-										if(item.usage_limit >= team.data.base[itemType].usage_limit.max){
-											team.data.base[itemType].usage_limit.max = item.usage_limit
-										}
-
-
-
-										if(item.usage_per <= team.data.base[itemType].usage_per.min){
-											team.data.base[itemType].usage_per.min = item.usage_per
-										}
-
-										if(item.usage_per >= team.data.base[itemType].usage_per.max){
-											team.data.base[itemType].usage_per.max = item.usage_per
-										}
-
-
-
-										if(item.started_at <= team.data.base[itemType].started_at.min){
-											team.data.base[itemType].started_at.min = item.started_at
-										}
-
-										if(item.started_at >= team.data.base[itemType].started_at.max){
-											team.data.base[itemType].started_at.max = item.started_at
-										}
-
-
-
-										if(item.expired_at <= team.data.base[itemType].expired_at.min){
-											team.data.base[itemType].expired_at.min = item.expired_at
-										}
-
-										if(item.expired_at >= team.data.base[itemType].expired_at.max){
-											team.data.base[itemType].expired_at.max = item.expired_at
-										}
-
 
 
 										var updated_at
@@ -3324,7 +3387,7 @@ export default {
 
 
 
-
+										console.log('Object.keys(relates).length',Object.keys(relates).length);
 
 										if(Object.keys(relates).length){
 											for (var type in relates) {
@@ -3602,38 +3665,38 @@ export default {
 																				to.ref,
 																				to.data,
 																				to.created_at,
-																				edge.started_at ? parseFloat(edge.started_at) : 0,
-																				edge.expired_at ? parseFloat(edge.expired_at) : 0,
-																				edge.index ? parseFloat(edge.index) : 0,
-																				edge.event ? parseFloat(edge.event) : 0,
-																				edge.views ? parseFloat(edge.views) : 0,
-																				edge.goods ? parseFloat(edge.goods) : 0,
+																				parseFloat(edge.started_at ? edge.started_at : 0),
+																				parseFloat(edge.expired_at ? edge.expired_at : 0),
+																				parseFloat(edge.index ? edge.index : 0),
+																				parseFloat(edge.event ? edge.event : 0),
+																				parseFloat(edge.views ? edge.views : 0),
+																				parseFloat(edge.goods ? edge.goods : 0),
 																				parseStatus(edge.status),
-																				edge.width ? parseFloat(edge.width) : 0,
-																				edge.height ? parseFloat(edge.height) : 0,
-																				edge.length ? parseFloat(edge.length) : 0,
-																				edge.weight ? parseFloat(edge.weight) : 0,
+																				parseFloat(edge.width ? edge.width : 0),
+																				parseFloat(edge.height ? edge.height : 0),
+																				parseFloat(edge.length ? edge.length : 0),
+																				parseFloat(edge.weight ? edge.weight : 0),
 																				edge.size ? edge.size : "",
 																				edge.currency,
-																				edge.supply_price? parseFloat(edge.supply_price) : 0,
-																				edge.sale_price? parseFloat(edge.sale_price) : 0,
-																				edge.discount ? parseFloat(edge.discount) : 0,
-																				edge.quantity ? parseFloat(edge.quantity) : 0,
-																				edge.tracking ? parseFloat(edge.tracking) : 0,
+																				parseFloat(edge.supply_price? edge.supply_price : 0),
+																				parseFloat(edge.sale_price? edge.sale_price : 0),
+																				parseFloat(edge.discount ? edge.discount : 0),
+																				parseFloat(edge.quantity ? edge.quantity : 0),
+																				parseFloat(edge.tracking ? edge.tracking : 0),
 																				edge.number ? edge.number : "",
 																				edge.carrier ? edge.carrier : "",
-																				edge.shipping_fee ? parseFloat(edge.shipping_fee) : 0,
+																				parseFloat(edge.shipping_fee ? edge.shipping_fee : 0),
 																				edge.shipping_method ? edge.shipping_method : "",
-																				edge.shipping_duration ? parseFloat(edge.shipping_duration) : 0,
+																				parseFloat(edge.shipping_duration ? edge.shipping_duration : 0),
 																				edge.fulfillment_service ? edge.fulfillment_service : "",
 																				edge.stock_keeping_unit ? edge.stock_keeping_unit : "",
-																				edge.bundle_shipping ? parseFloat(edge.bundle_shipping) : 0,
-																				edge.used ? parseFloat(edge.used) : 0,
-																				edge.lease ? parseFloat(edge.lease) : 0,
-																				edge.rental ? parseFloat(edge.rental) : 0,
-																				edge.refurbish ? parseFloat(edge.refurbish) : 0,
-																				edge.tax_included ? parseFloat(edge.tax_included) : 0,
-																				edge.release_date ? parseFloat(edge.release_date) : 0
+																				parseFloat(edge.bundle_shipping ? edge.bundle_shipping : 0),
+																				parseFloat(edge.used ? edge.used : 0),
+																				parseFloat(edge.lease ? edge.lease : 0),
+																				parseFloat(edge.rental ? edge.rental : 0),
+																				parseFloat(edge.refurbish ? edge.refurbish : 0),
+																				parseFloat(edge.tax_included ? edge.tax_included : 0),
+																				parseFloat(edge.release_date ? edge.release_date : 0)
 																			)
 																		)
 																	}else if(edgeType == "tracking"){
@@ -3698,22 +3761,22 @@ export default {
 																				edge.sender_phone ? edge.sender_phone : "",
 																				edge.recipient_address ? edge.recipient_address : "",
 																				edge.recipient_phone ? edge.recipient_phone : "",
-																				edge.width ? parseFloat(edge.width) : 0,
-																				edge.height ? parseFloat(edge.height) : 0,
-																				edge.length ? parseFloat(edge.length) : 0,
-																				edge.weight ? parseFloat(edge.weight) : 0,
-																				edge.carrier ? parseFloat(edge.carrier) : 0,
-																				edge.shipping_fee ? parseFloat(edge.shipping_fee) : 0,
+																				parseFloat(edge.width ? edge.width : 0),
+																				parseFloat(edge.height ? edge.height : 0),
+																				parseFloat(edge.length ? edge.length : 0),
+																				parseFloat(edge.weight ? edge.weight : 0),
+																				parseFloat(edge.carrier ? edge.carrier : 0),
+																				parseFloat(edge.shipping_fee ? edge.shipping_fee : 0),
 																				edge.shipping_method ? edge.shipping_method : "",
-																				edge.shipping_duration ? parseFloat(edge.shipping_duration) : 0,
-																				edge.shipping_date ? parseFloat(edge.shipping_date) : 0,
-																				edge.delivery_date ? parseFloat(edge.delivery_date) : 0,
-																				edge.order_date ? parseFloat(edge.order_date) : 0,
-																				edge.payment_date ? parseFloat(edge.payment_date) : 0,
+																				parseFloat(edge.shipping_duration ? edge.shipping_duration : 0),
+																				parseFloat(edge.shipping_date ? edge.shipping_date : 0),
+																				parseFloat(edge.delivery_date ? edge.delivery_date : 0),
+																				parseFloat(edge.order_date ? edge.order_date : 0),
+																				parseFloat(edge.payment_date ? edge.payment_date : 0),
 																				edge.payment_method ? edge.payment_method : "",
 																				edge.payment_origin ? edge.payment_origin : "",
 																				edge.payment_number ? edge.payment_number : "",
-																				edge.bundle_shipping ? parseFloat(edge.bundle_shipping) : 0
+																				parseFloat(edge.bundle_shipping ? edge.bundle_shipping : 0)
 																			)
 																		)
 																	}else if(edgeType == "event"){
@@ -3760,24 +3823,24 @@ export default {
 																				to.ref,
 																				to.data,
 																				to.created_at,
-																				edge.started_at ? parseFloat(edge.started_at) : 0,
-																				edge.expired_at ? parseFloat(edge.expired_at) : 0,
-																				edge.index ? parseFloat(edge.index) : 0,
-																				edge.event ? parseFloat(edge.event) : 0,
+																				parseFloat(edge.started_at ? edge.started_at : 0),
+																				parseFloat(edge.expired_at ? edge.expired_at : 0),
+																				parseFloat(edge.index ? edge.index : 0),
+																				parseFloat(edge.event ? edge.event : 0),
 																				edge.number ? edge.number : "",
 																				edge.address ? edge.address : "",
 																				parseStatus(edge.status),
 																				edge.code ? edge.code : "",
-																				edge.discount ? parseFloat(edge.discount) : 0,
-																				edge.quantity ? parseFloat(edge.quantity) : 0,
-																				edge.usage_per ? parseFloat(edge.usage_per) : 0,
-																				edge.usage_limit ? parseFloat(edge.usage_limit) : 0,
-																				edge.min_order_amount ? parseFloat(edge.min_order_amount) : 0,
-																				edge.max_order_amount ? parseFloat(edge.max_order_amount) : 0,
-																				edge.max_discount_amount ? parseFloat(edge.max_discount_amount) : 0,
-																				edge.new_customer_only ? parseFloat(edge.new_customer_only) : 0,
-																				edge.first_purchase_only ? parseFloat(edge.first_purchase_only) : 0,
-																				edge.region_restrictions ? parseFloat(edge.region_restrictions) : 0
+																				parseFloat(edge.discount ? edge.discount : 0),
+																				parseFloat(edge.quantity ? edge.quantity : 0),
+																				parseFloat(edge.usage_per ? edge.usage_per : 0),
+																				parseFloat(edge.usage_limit ? edge.usage_limit : 0),
+																				parseFloat(edge.min_order_amount ? edge.min_order_amount : 0),
+																				parseFloat(edge.max_order_amount ? edge.max_order_amount : 0),
+																				parseFloat(edge.max_discount_amount ? edge.max_discount_amount : 0),
+																				parseFloat(edge.new_customer_only ? edge.new_customer_only : 0),
+																				parseFloat(edge.first_purchase_only ? edge.first_purchase_only : 0),
+																				parseFloat(edge.region_restrictions ? edge.region_restrictions : 0)
 																			)
 																		)
 																	}
@@ -3889,6 +3952,8 @@ export default {
 												models['deepinfra'] -= 1
 											}
 
+											console.log('typeof embeddings',typeof embeddings);
+
 											if(!embeddings){
 												fallback = 'embeddings overflow'
 
@@ -3936,8 +4001,6 @@ export default {
 												typeof updated_at != "undefined" ? updated_at : now 
 											)
 										)
-
-										console.log('JSON.stringify(item)',JSON.stringify(item))
 
 										if(itemType == "sales"){
 											statements[`${zoneRegion}_sales`].push(
@@ -3997,38 +4060,38 @@ export default {
 													item.ref,
 													item.data,
 													item.created_at,
-													item.started_at ? parseFloat(item.started_at) : 0,
-													item.expired_at ? parseFloat(item.expired_at) : 0,
-													item.index ? parseFloat(item.index) : 0,
-													item.event ? parseFloat(item.event) : 0,
-													item.views ? parseFloat(item.views) : 0,
-													item.goods ? parseFloat(item.goods) : 0,
+													parseFloat(item.started_at ? item.started_at : 0),
+													parseFloat(item.expired_at ? item.expired_at : 0),
+													parseFloat(item.index ? item.index : 0),
+													parseFloat(item.event ? item.event : 0),
+													parseFloat(item.views ? item.views : 0),
+													parseFloat(item.goods ? item.goods : 0),
 													parseStatus(item.status),
-													item.width ? parseFloat(item.width) : 0,
-													item.height ? parseFloat(item.height) : 0,
-													item.length ? parseFloat(item.length) : 0,
-													item.weight ? parseFloat(item.weight) : 0,
+													parseFloat(item.width ? item.width : 0),
+													parseFloat(item.height ? item.height : 0),
+													parseFloat(item.length ? item.length : 0),
+													parseFloat(item.weight ? item.weight : 0),
 													item.size ? item.size : "",
 													item.currency,
-													item.supply_price? parseFloat(item.supply_price) : 0,
-													item.sale_price? parseFloat(item.sale_price) : 0,
-													item.discount ? parseFloat(item.discount) : 0,
-													item.quantity ? parseFloat(item.quantity) : 0,
-													item.tracking ? parseFloat(item.tracking) : 0,
+													parseFloat(item.supply_price? item.supply_price : 0),
+													parseFloat(item.sale_price? item.sale_price : 0),
+													parseFloat(item.discount ? item.discount : 0),
+													parseFloat(item.quantity ? item.quantity : 0),
+													parseFloat(item.tracking ? item.tracking : 0),
 													item.number ? item.number : "",
 													item.carrier ? item.carrier : "",
-													item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
+													parseFloat(item.shipping_fee ? item.shipping_fee : 0),
 													item.shipping_method ? item.shipping_method : "",
-													item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
+													parseFloat(item.shipping_duration ? item.shipping_duration : 0),
 													item.fulfillment_service ? item.fulfillment_service : "",
 													item.stock_keeping_unit ? item.stock_keeping_unit : "",
-													item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0,
-													item.used ? parseFloat(item.used) : 0,
-													item.lease ? parseFloat(item.lease) : 0,
-													item.rental ? parseFloat(item.rental) : 0,
-													item.refurbish ? parseFloat(item.refurbish) : 0,
-													item.tax_included ? parseFloat(item.tax_included) : 0,
-													item.release_date ? parseFloat(item.release_date) : 0
+													parseFloat(item.bundle_shipping ? item.bundle_shipping : 0),
+													parseFloat(item.used ? item.used : 0),
+													parseFloat(item.lease ? item.lease : 0),
+													parseFloat(item.rental ? item.rental : 0),
+													parseFloat(item.refurbish ? item.refurbish : 0),
+													parseFloat(item.tax_included ? item.tax_included : 0),
+													parseFloat(item.release_date ? item.release_date : 0)
 												)
 											)
 										}else if(itemType == "tracking"){
@@ -4093,22 +4156,22 @@ export default {
 													item.sender_phone ? item.sender_phone : "",
 													item.recipient_address ? item.recipient_address : "",
 													item.recipient_phone ? item.recipient_phone : "",
-													item.width ? parseFloat(item.width) : 0,
-													item.height ? parseFloat(item.height) : 0,
-													item.length ? parseFloat(item.length) : 0,
-													item.weight ? parseFloat(item.weight) : 0,
-													item.carrier ? parseFloat(item.carrier) : 0,
-													item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
+													parseFloat(item.width ? item.width : 0),
+													parseFloat(item.height ? item.height : 0),
+													parseFloat(item.length ? item.length : 0),
+													parseFloat(item.weight ? item.weight : 0),
+													parseFloat(item.carrier ? item.carrier : 0),
+													parseFloat(item.shipping_fee ? item.shipping_fee : 0),
 													item.shipping_method ? item.shipping_method : "",
-													item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
-													item.shipping_date ? parseFloat(item.shipping_date) : 0,
-													item.delivery_date ? parseFloat(item.delivery_date) : 0,
-													item.order_date ? parseFloat(item.order_date) : 0,
-													item.payment_date ? parseFloat(item.payment_date) : 0,
+													parseFloat(item.shipping_duration ? item.shipping_duration : 0),
+													parseFloat(item.shipping_date ? item.shipping_date : 0),
+													parseFloat(item.delivery_date ? item.delivery_date : 0),
+													parseFloat(item.order_date ? item.order_date : 0),
+													parseFloat(item.payment_date ? item.payment_date : 0),
 													item.payment_method ? item.payment_method : "",
 													item.payment_origin ? item.payment_origin : "",
 													item.payment_number ? item.payment_number : "",
-													item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0
+													parseFloat(item.bundle_shipping ? item.bundle_shipping : 0)
 												)
 											)
 										}else if(itemType == "event"){
@@ -4155,24 +4218,24 @@ export default {
 													item.ref,
 													item.data,
 													item.created_at,
-													item.started_at ? parseFloat(item.started_at) : 0,
-													item.expired_at ? parseFloat(item.expired_at) : 0,
-													item.index ? parseFloat(item.index) : 0,
-													item.event ? parseFloat(item.event) : 0,
+													parseFloat(item.started_at ? item.started_at : 0),
+													parseFloat(item.expired_at ? item.expired_at : 0),
+													parseFloat(item.index ? item.index : 0),
+													parseFloat(item.event ? item.event : 0),
 													item.number ? item.number : "",
 													item.address ? item.address : "",
 													parseStatus(item.status),
 													item.code ? item.code : "",
-													item.discount ? parseFloat(item.discount) : 0,
-													item.quantity ? parseFloat(item.quantity) : 0,
-													item.usage_per ? parseFloat(item.usage_per) : 0,
-													item.usage_limit ? parseFloat(item.usage_limit) : 0,
-													item.min_order_amount ? parseFloat(item.min_order_amount) : 0,
-													item.max_order_amount ? parseFloat(item.max_order_amount) : 0,
-													item.max_discount_amount ? parseFloat(item.max_discount_amount) : 0,
-													item.new_customer_only ? parseFloat(item.new_customer_only) : 0,
-													item.first_purchase_only ? parseFloat(item.first_purchase_only) : 0,
-													item.region_restrictions ? parseFloat(item.region_restrictions) : 0
+													parseFloat(item.discount ? item.discount : 0),
+													parseFloat(item.quantity ? item.quantity : 0),
+													parseFloat(item.usage_per ? item.usage_per : 0),
+													parseFloat(item.usage_limit ? item.usage_limit : 0),
+													parseFloat(item.min_order_amount ? item.min_order_amount : 0),
+													parseFloat(item.max_order_amount ? item.max_order_amount : 0),
+													parseFloat(item.max_discount_amount ? item.max_discount_amount : 0),
+													parseFloat(item.new_customer_only ? item.new_customer_only : 0),
+													parseFloat(item.first_purchase_only ? item.first_purchase_only : 0),
+													parseFloat(item.region_restrictions ? item.region_restrictions : 0)
 												)
 											)
 										}
@@ -4343,6 +4406,22 @@ export default {
 
 										if(!paragraph.price){
 											paragraph.price = {}
+										}
+
+
+										var type = paragraph.type
+
+										if(paragraph.type == "sales"){
+											type = "sales"
+
+											paragraph.type = "order"
+
+										}else if(paragraph.type == "goods" || paragraph.type == "order"){
+											type = "sales"
+
+										}else if(paragraph.type == "event" || paragraph.type == "coupon"){
+											type = "event"
+
 										}
 
 										if(team.data.base[paragraph.type]?.price.min){
