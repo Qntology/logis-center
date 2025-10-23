@@ -391,11 +391,11 @@ const list2json = function(language){
 const item2json = function(type){
 	if(type == 'tracking'){
 		return ` 
-			node:${type} detail page form element CSS selector,
+			node:detail page element CSS selector,
 			status:'draft' or 'progress' or 'return' or 'complete' or 'error',
 			id:tracking number | string,
 			title:${type} goods title | string, 
-			senderName:senderName | string,
+			sender_name:sender_name | string,
 			sender_address:sender_address | string,
 			sender_phone:sender_phone | string,
 			recipient_name:recipient_name | string,
@@ -414,8 +414,8 @@ const item2json = function(type){
 		`
 	}else if(type == 'goods'){
 		return `
-			node:${type} detail page form element CSS selector,
-			id:Refer to the ID value from the link or an attribute | string,
+			node:detail page element CSS selector,
+			id:Refer to the ID value from the link or an attribute or input value | string,
 			status:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			payment_method:payment method | string,
 			bank:bank company name | string,
@@ -475,23 +475,33 @@ const item2json = function(type){
 		`
 	}else if(type == 'order'){
 		return `
-			node:${type} detail page form element CSS selector,
+			node:detail page element CSS selector,
+			id:Refer to the ID value from the link or an attribute or input value | string,
+			tracking_number:tracking number | string,
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			goods:[{
 				title:goods title | string,
 				link:URL includes manage path additional goods link | string,
 				id:Refer to the ID value from the link or an attribute | string,
 			}],
+			sender_name:sender_name | string,
+			sender_address:sender_address | string,
+			sender_phone:sender_phone | string,
+			recipient_name:recipient_name | string,
+			recipient_address:recipient_address | string,
+			recipient_phone:recipient_phone | string,
 			bank:bank company name | string,
 			card:card company name | string,
-			payment_date:payment_date | string,
+			order_date:order date | string,
+			payment_date:payment_date or empty | string,
 			payment_method:'C.O.D.' or 'CARD' or 'BANK' or '',
-			payment_origin:payment origin | string,
+			payment_origin:Payment Service Provider or empty | string,
 			date:yyyy-MM-dd'T'HH:mm:ss | string
 		`
 	}else if(type == 'coupon' || type == 'event'){
 		return `
-			node:${type} detail page form element CSS selector,
+			node:detail page element CSS selector,
+			id:Refer to the ID value from the link or an attribute or input value | string,
 			type:'percentage' or 'fixed_amount' or 'free_shipping' or '',
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
 			title:${type} item title | string, 
@@ -509,6 +519,8 @@ const item2json = function(type){
 		`
 	}else if(type == 'review' || type == 'member'){
 		return `
+			node:detail page element CSS selector,
+			id:Refer to the ID value from the link or an attribute or input value | string,
 			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			name:${type} name | string,
 			title:${type} item title | string, 
@@ -971,6 +983,22 @@ function generatePugLines(nodes, indentLevel) {
 
 	return lines;
 }
+
+function safeClone(obj) {
+	const seen = new WeakMap();
+	function clone(value) {
+		if (typeof value !== "object" || value === null) return value;
+		if (seen.has(value)) return null; // 순환 참조 제거
+		const copy = Array.isArray(value) ? [] : {};
+		seen.set(value, copy);
+		for (const key in value) {
+			copy[key] = clone(value[key]);
+		}
+		return copy;
+	}
+	return clone(obj);
+}
+
 
 
 const twoPartDomains = ["co.kr","co.uk","co.jp","com.cn","co.in","com.mx","co.id","com.my","com.sg","com.ph","com.vn"];
@@ -1805,7 +1833,7 @@ async function Deepinfra(key, model, system, user, inlineData){
 
 			var results = JSON.parse(content)
 
-			return results
+			return safeClone(results)
 		}catch(err){
 			return content
 		}
@@ -1859,7 +1887,7 @@ async function Gemini(key, model, system, user, config, inlineData){
 			var results = JSON.parse(content)
 
 
-			return results.length ? results[0] : results
+			return safeClone(results.length ? results[0] : results)
 		}catch(err){
 			
 		}
@@ -1923,7 +1951,7 @@ export default {
 
 				console.log('results.length',results.length);
 
-				var crons = Object.assign([], results)
+				var crons = safeClone(results)
 
 				if(crons.length){
 					for(var c = 0; c < crons.length; c++){
@@ -2006,6 +2034,9 @@ export default {
 								}
 							}
 						}
+
+
+						// 오픈 하기전에 반영해야함
 
 						// if(limits[team.id]){
 						// 	limits[team.id] -= 1
@@ -2127,7 +2158,7 @@ export default {
 							var sales = results
 
 							if(results.length){
-								var _item = Object.assign({}, results[0])
+								var _item = safeClone(results[0])
 
 								delete _item.id
 								delete _item.type
@@ -2536,21 +2567,19 @@ export default {
 									continue
 								}
 
-
-
 								page.type = pageType
-
-
-								page.id = pageId
 								page.from = task.from
 								page.to = task.to
 								page.cc = task.cc
 								page.bcc = task.bcc
 
-
 								if(isDetail){
-									page.items = [page]
+									page.items = [safeClone(page)]
 								}
+
+
+								page.id = pageId
+
 
 								talk.text = page.text
 
@@ -2651,7 +2680,7 @@ export default {
 											item.started_at = new Date(item.date).getTime()
 										}
 
-										if(!item.title){
+										if(!item.id){
 											continue
 										}
 
@@ -2729,6 +2758,17 @@ export default {
 										item.ref = task.ref
 
 
+										var goods = item.goods
+
+										if(goods){
+											if(goods.length){
+												goods = safeClone(item.goods)
+												
+												delete item.goods
+
+												goods.unshift({})
+											}
+										}
 
 
 										item.currency = item.currency ? item.currency.toUpperCase() : ""
@@ -2758,6 +2798,9 @@ export default {
 										item.data = arr.buffer
 
 										try{
+											console.log('item.type',item.type);
+											console.log('진입',item.tracking_number);
+
 											if(item.type == "order" && item.tracking_number){
 												/*
 													상세와 리스트 차이가 분명히 있음
@@ -2767,139 +2810,184 @@ export default {
 														상세페이지에서는 송장번호가 있음
 												*/
 
+												var tracking_number = item.tracking_number
 
-												var tracking = Object.assign({}, item)
-
-												tracking.type = "tracking"
-
-												tracking.no = item.tracking_number
-
-												if(item.no.indexOf("-") > -1){
-													tracking.no = tracking.no.replace(/-/gi,"")
+												if(tracking_number.indexOf("-") > -1){
+													tracking_number = tracking_number.replace(/-/gi,"")
 												}
 
-												if(tracking.no.indexOf("_") > -1){
-													tracking.no = tracking.no.replace(/_/gi,"")
+												if(tracking_number.indexOf("_") > -1){
+													tracking_number = tracking_number.replace(/_/gi,"")
 												}
 
-												tracking.id = hashId(team.id+tracking.no)
+												item.tracking = crc32(hashId(team.id+tracking_number))
 
-												tracking.index = crc32(tracking.id) 
+												console.log('item.tracking',item.tracking);
 
-												var data = {
-													id : item.id,
-													title : item.title,
-													link : item.link,
-													origin : task.origin ? task.origin : '',
-													sender : item.sender,
-													recipient : item.recipient
+												if(goods){
+													if(goods.length){
+														for(var g = 0; g < goods.length; g++){
+															var good = safeClone(goods[g])
+
+															var tracking = safeClone(item)
+
+															tracking.type = "tracking"
+
+															tracking.no = tracking_number
+
+															tracking.index = item.tracking
+
+															if(good.id){
+																var no = good.id.toString()
+
+																if(no.indexOf("-") > -1){
+																	no = no.replace(/-/gi,"")
+																}
+
+																if(no.indexOf("_") > -1){
+																	no = no.replace(/_/gi,"")
+																}
+
+																good.no = no
+
+																good.index = crc32(hashId(team.id+good.no))
+
+																var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = "goods" AND "index" = "${good.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+																if(results.length){
+																	tracking.event = results[0].event
+																}
+
+																tracking.goods = good.index
+
+																tracking.id = hashId(team.id+good.no)
+															}else{
+																tracking.id = hashId(team.id+tracking.no)
+															}
+
+
+
+															tracking.order = item.index
+
+															tracking.order_date = item.order_date
+															tracking.payment_date = item.payment_date
+															tracking.payment_method = item.payment_method
+															tracking.payment_origin = item.payment_origin
+
+															tracking.link = item.link
+
+															tracking.sender_address = item.sender_address
+															tracking.sender_phone = item.sender_phone
+															tracking.recipient_address = item.recipient_address
+															tracking.recipient_phone = item.recipient_phone
+
+															tracking.data = {
+																id : item.id,
+																link : item.link,
+																origin : task.origin ? task.origin : ""
+															}
+
+															var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+
+															if(results.length){
+																var _tracking = safeClone(results[0])
+
+																var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_tracking.data))
+
+																_tracking.data = JSON.parse(decompressedJsonString)
+
+																tracking = mergeNode(_tracking, tracking)
+															}
+
+															console.log('JSON.stringify(tracking)',JSON.stringify(tracking));
+
+															var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
+
+															statements[`${zoneRegion}_tracking`].push(
+																env[`${zoneRegion}_tracking`].prepare(`
+																	INSERT INTO tracking (
+																		"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+																	) VALUES (
+																		?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+																	) ON CONFLICT (id) DO UPDATE SET
+																		"type" = EXCLUDED."type",
+																		"from" = EXCLUDED."from",
+																		"to" = EXCLUDED."to",
+																		"cc" = EXCLUDED."cc",
+																		"bcc" = EXCLUDED."bcc",
+																		"ref" = EXCLUDED."ref",
+																		"data" = EXCLUDED."data",
+																		"created_at" = EXCLUDED."created_at",
+																		"index" = EXCLUDED."index",
+																		"event" = EXCLUDED."event", 
+																		"goods" = EXCLUDED."goods", 
+																		"order" = EXCLUDED."order", 
+																		"status" = EXCLUDED."status",
+																		"no" = EXCLUDED."no",
+																		"sender_address" = EXCLUDED."sender_address",
+																		"sender_phone" = EXCLUDED."sender_phone",
+																		"recipient_address" = EXCLUDED."recipient_address",
+																		"recipient_phone" = EXCLUDED."recipient_phone",
+																		"width" = EXCLUDED."width",
+																		"height" = EXCLUDED."height",
+																		"length" = EXCLUDED."length",
+																		"weight" = EXCLUDED."weight",
+																		"carrier" = EXCLUDED."carrier",
+																		"shipping_fee" = EXCLUDED."shipping_fee",
+																		"shipping_method" = EXCLUDED."shipping_method",
+																		"shipping_duration" = EXCLUDED."shipping_duration",
+																		"shipping_date" = EXCLUDED."shipping_date",
+																		"delivery_date" = EXCLUDED."delivery_date",
+																		"order_date" = EXCLUDED."order_date",
+																		"payment_date" = EXCLUDED."payment_date",
+																		"payment_method" = EXCLUDED."payment_method",
+																		"payment_origin" = EXCLUDED."payment_origin",
+																		"payment_number" = EXCLUDED."payment_number",
+																		"bundle_shipping" = EXCLUDED."bundle_shipping"
+																`).bind(
+																	tracking.id,
+																	tracking.type,
+																	tracking.from,
+																	tracking.to,
+																	tracking.cc,
+																	tracking.bcc,
+																	tracking.ref,
+																	arr.buffer,
+																	tracking.created_at,
+																	tracking.index,
+																	tracking.event ? tracking.event : 0,
+																	tracking.goods ? tracking.goods : 0,
+																	tracking.order ? tracking.order : 0,
+																	parseStatus(tracking.status),
+																	tracking.no ? tracking.no : "",
+																	tracking.sender_address ? tracking.sender_address : "",
+																	tracking.sender_phone ? tracking.sender_phone : "",
+																	tracking.recipient_address ? tracking.recipient_address : "",
+																	tracking.recipient_phone ? tracking.recipient_phone : "",
+																	tracking.width ? parseFloat(tracking.width) : 0,
+																	tracking.height ? parseFloat(tracking.height) : 0,
+																	tracking.length ? parseFloat(tracking.length) : 0,
+																	tracking.weight ? parseFloat(tracking.weight) : 0,
+																	tracking.carrier ? parseFloat(tracking.carrier) : 0,
+																	tracking.shipping_fee ? parseFloat(tracking.shipping_fee) : 0,
+																	tracking.shipping_method ? tracking.shipping_method : "",
+																	tracking.shipping_duration ? parseFloat(tracking.shipping_duration) : 0,
+																	tracking.shipping_date ? parseFloat(tracking.shipping_date) : 0,
+																	tracking.delivery_date ? parseFloat(tracking.delivery_date) : 0,
+																	tracking.order_date ? parseFloat(tracking.order_date) : 0,
+																	tracking.payment_date ? parseFloat(tracking.payment_date) : 0,
+																	tracking.payment_method ? tracking.payment_method : "",
+																	tracking.payment_origin ? tracking.payment_origin : "",
+																	tracking.payment_number ? tracking.payment_number : "",
+																	tracking.bundle_shipping ? parseFloat(tracking.bundle_shipping) : 0
+																)
+															)
+														}
+													}
 												}
-												
-
-												var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
-
-												if(results.length){
-													var _item = results[0]
-
-													var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
-
-													_item.data = JSON.parse(decompressedJsonString)
-
-													data = mergeNode(data, _item.data)
-
-													delete _item.data
-
-													tracking = mergeNode(tracking, _item)
-												}
-
-												tracking.data = data
-
-
-												var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
-
-
-												statements[`${zoneRegion}_tracking`].push(
-													env[`${zoneRegion}_tracking`].prepare(`
-														INSERT INTO tracking (
-															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-														) VALUES (
-															?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
-														) ON CONFLICT (id) DO UPDATE SET
-															"type" = EXCLUDED."type",
-															"from" = EXCLUDED."from",
-															"to" = EXCLUDED."to",
-															"cc" = EXCLUDED."cc",
-															"bcc" = EXCLUDED."bcc",
-															"ref" = EXCLUDED."ref",
-															"data" = EXCLUDED."data",
-															"created_at" = EXCLUDED."created_at",
-															"index" = EXCLUDED."index",
-															"event" = EXCLUDED."event", 
-															"goods" = EXCLUDED."goods", 
-															"order" = EXCLUDED."order", 
-															"status" = EXCLUDED."status",
-															"no" = EXCLUDED."no",
-															"sender_address" = EXCLUDED."sender_address",
-															"sender_phone" = EXCLUDED."sender_phone",
-															"recipient_address" = EXCLUDED."recipient_address",
-															"recipient_phone" = EXCLUDED."recipient_phone",
-															"width" = EXCLUDED."width",
-															"height" = EXCLUDED."height",
-															"length" = EXCLUDED."length",
-															"weight" = EXCLUDED."weight",
-															"carrier" = EXCLUDED."carrier",
-															"shipping_fee" = EXCLUDED."shipping_fee",
-															"shipping_method" = EXCLUDED."shipping_method",
-															"shipping_duration" = EXCLUDED."shipping_duration",
-															"shipping_date" = EXCLUDED."shipping_date",
-															"delivery_date" = EXCLUDED."delivery_date",
-															"order_date" = EXCLUDED."order_date",
-															"payment_date" = EXCLUDED."payment_date",
-															"payment_method" = EXCLUDED."payment_method",
-															"payment_origin" = EXCLUDED."payment_origin",
-															"payment_number" = EXCLUDED."payment_number",
-															"bundle_shipping" = EXCLUDED."bundle_shipping"
-													`).bind(
-														tracking.id,
-														tracking.type,
-														tracking.from,
-														tracking.to,
-														tracking.cc,
-														tracking.bcc,
-														tracking.ref,
-														arr.buffer,
-														tracking.created_at,
-														tracking.index,
-														tracking.event ? tracking.event : 0,
-														tracking.goods ? tracking.goods : 0,
-														tracking.order ? tracking.order : 0,
-														parseStatus(tracking.status),
-														tracking.no ? tracking.no : "",
-														tracking.sender_address ? tracking.sender_address : "",
-														tracking.sender_phone ? tracking.sender_phone : "",
-														tracking.recipient_address ? tracking.recipient_address : "",
-														tracking.recipient_phone ? tracking.recipient_phone : "",
-														tracking.width ? parseFloat(tracking.width) : 0,
-														tracking.height ? parseFloat(tracking.height) : 0,
-														tracking.length ? parseFloat(tracking.length) : 0,
-														tracking.weight ? parseFloat(tracking.weight) : 0,
-														tracking.carrier ? parseFloat(tracking.carrier) : 0,
-														tracking.shipping_fee ? parseFloat(tracking.shipping_fee) : 0,
-														tracking.shipping_method ? tracking.shipping_method : "",
-														tracking.shipping_duration ? parseFloat(tracking.shipping_duration) : 0,
-														tracking.shipping_date ? parseFloat(tracking.shipping_date) : 0,
-														tracking.delivery_date ? parseFloat(tracking.delivery_date) : 0,
-														tracking.order_date ? parseFloat(tracking.order_date) : 0,
-														tracking.payment_date ? parseFloat(tracking.payment_date) : 0,
-														tracking.payment_method ? tracking.payment_method : "",
-														tracking.payment_origin ? tracking.payment_origin : "",
-														tracking.payment_number ? tracking.payment_number : "",
-														tracking.bundle_shipping ? parseFloat(tracking.bundle_shipping) : 0
-													)
-												)
 											}
 										}catch(err){
-
+											console.log('err item.type == "order" && item.tracking_number', err)
 										}
 
 
@@ -3261,7 +3349,6 @@ export default {
 																tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
 
 													*/
-														
 													
 													var query = relate.query
 
@@ -3712,7 +3799,6 @@ export default {
 																// if end
 															}else{
 																// draft 추가해야함
-
 																var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 																	id : item.id,
 																	title : item.title,
@@ -3720,36 +3806,35 @@ export default {
 																	data : relate
 																})), { to: 'arraybuffer' })
 
-
-																// statements[`${zoneRegion}_items`].push(
-																// 	env[`${zoneRegion}_items`].prepare(`
-																// 		INSERT INTO items (
-																// 			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-																// 		) VALUES (
-																// 			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-																// 		) ON CONFLICT (id) DO UPDATE SET
-																// 			"type" = EXCLUDED."type",
-																// 			"from" = EXCLUDED."from",
-																// 			"to" = EXCLUDED."to",
-																// 			"cc" = EXCLUDED."cc",
-																// 			"bcc" = EXCLUDED."bcc",
-																// 			"ref" = EXCLUDED."ref",
-																// 			"data" = EXCLUDED."data",
-																// 			"created_at" = EXCLUDED."created_at",
-																// 			"updated_at" = EXCLUDED."updated_at"
-																// 	`).bind(
-																// 		hashId(),
-																// 		type,
-																// 		item.from,
-																// 		item.to,
-																// 		item.cc,
-																// 		item.bcc,
-																// 		'',
-																// 		arr.buffer,
-																// 		now,
-																// 		0
-																// 	)
-																// )
+																statements[`${zoneRegion}_items`].push(
+																	env[`${zoneRegion}_items`].prepare(`
+																		INSERT INTO items (
+																			"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+																		) VALUES (
+																			?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+																		) ON CONFLICT (id) DO UPDATE SET
+																			"type" = EXCLUDED."type",
+																			"from" = EXCLUDED."from",
+																			"to" = EXCLUDED."to",
+																			"cc" = EXCLUDED."cc",
+																			"bcc" = EXCLUDED."bcc",
+																			"ref" = EXCLUDED."ref",
+																			"data" = EXCLUDED."data",
+																			"created_at" = EXCLUDED."created_at",
+																			"updated_at" = EXCLUDED."updated_at"
+																	`).bind(
+																		hashId(),
+																		type,
+																		item.from,
+																		item.to,
+																		item.cc,
+																		item.bcc,
+																		'',
+																		arr.buffer,
+																		now,
+																		0
+																	)
+																)
 															}
 														}
 													}
@@ -3851,6 +3936,8 @@ export default {
 												typeof updated_at != "undefined" ? updated_at : now 
 											)
 										)
+
+										console.log('JSON.stringify(item)',JSON.stringify(item))
 
 										if(itemType == "sales"){
 											statements[`${zoneRegion}_sales`].push(
@@ -4572,7 +4659,7 @@ export default {
 											augmented += `${p}. ${data.text}\n`
 
 											for(var r = 0; r < results.length; r++){
-												var obj = Object.assign({}, results[r])
+												var obj = safeClone(results[r])
 
 												delete obj.from
 												delete obj.to
