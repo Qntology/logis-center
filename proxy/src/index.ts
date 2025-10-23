@@ -2906,58 +2906,99 @@ export default {
 															tracking = mergeNode(_tracking, tracking)
 														}else{
 															// 처음 저장할때 자연어 LLM으로 전처리해서 벡터 저장해야함
+															var content = JSON.stringify({
+																size : tracking.size ? tracking.size : "",
+																currency : tracking.currency ? tracking.currency : "",
+																carrier : tracking.carrier ? tracking.carrier : "",
+																shipping_fee : tracking.shipping_fee ? true : false,
+																shipping_method : tracking.shipping_method ? tracking.shipping_method : "",
+																fulfillment_service : tracking.fulfillment_service ? tracking.fulfillment_service : "",
+																stock_keeping_unit : tracking.stock_keeping_unit ? tracking.stock_keeping_unit : "",
+																bundle_shipping : tracking.bundle_shipping ? true : false,
+																used : tracking.used ? true : false,
+																lease : tracking.lease ? true : false,
+																rental : tracking.rental ? true : false,
+																refurbish : tracking.refurbish ? true : false,
+																tax_included : tracking.tax_included ? true : false,
+																sender_address : tracking.sender_address,
+																recipient_address : tracking.recipient_address,
+																payment_method : tracking.payment_method, 
+																payment_origin : tracking.payment_origin 
+															})
 
-															// var metadata = {
-															// 	type: item.type,
-															// 	from: item.from,
-															// 	to: item.to,
-															// 	cc: item.cc,
-															// 	bcc: item.bcc,
-															// 	ref:task.ref
-															// }
+															var semantic
 
-															// var embeddings
+															if(models['deepinfra']){
+																semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', semantic_prompt_system(language), content)
 
-															// if(models['cloudflare']){
-															// 	var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
-															// 		text: [item.semantic]
-															// 	})
+																models['deepinfra'] -= 1
 
-															// 	var $VectorizeVector = [
-															// 		{
-															// 			id: item.id,
-															// 			values: embeddings[0],
-															// 			metadata: metadata
-															// 		}
-															// 	]
+															}
 
-															// 	models['cloudflare'] -= 1
+															if(!semantic && gemini_llm_api){
+																semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
 
-															// }
+																models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
-															// if(!embeddings && models['deepinfra']){
-															// 	var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', item.semantic)
+															}
 
-															// 	var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-															// 		return {
-															// 			id: item.id,
-															// 			values: values,
-															// 			metadata: metadata
-															// 		}
-															// 	})
+															if(!semantic){
+																fallback = 'semantic overflow'
 
-															// 	models['deepinfra'] -= 1
-															// }
+																continue
+															}
 
-															// console.log('typeof embeddings',typeof embeddings);
+															var metadata = {
+																type: item.type,
+																from: item.from,
+																to: item.to,
+																cc: item.cc,
+																bcc: item.bcc,
+																ref:task.ref
+															}
 
-															// if(!embeddings){
-															// 	fallback = 'embeddings overflow'
+															var embeddings
 
-															// 	continue
-															// }
+															if(models['cloudflare']){
+																var { data: embeddings } = await env.AI.run('@cf/baai/bge-m3', {
+																	text: [semantic]
+																})
 
-															// await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
+																var $VectorizeVector = [
+																	{
+																		id: item.id,
+																		values: embeddings[0],
+																		metadata: metadata
+																	}
+																]
+
+																models['cloudflare'] -= 1
+
+															}
+
+															if(!embeddings && models['deepinfra']){
+																var embeddings = await Deepinfra(deepinfra, 'BAAI/bge-m3', '', semantic)
+
+																var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+																	return {
+																		id: item.id,
+																		values: values,
+																		metadata: metadata
+																	}
+																})
+
+																models['deepinfra'] -= 1
+															}
+
+															console.log('typeof embeddings',typeof embeddings);
+
+															if(!embeddings){
+																fallback = 'embeddings overflow'
+
+																continue
+															}
+
+															await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 														}
 
 														console.log('JSON.stringify(tracking)',JSON.stringify(tracking));
@@ -3535,7 +3576,7 @@ export default {
 
 																			}
 
-																			if(!semantic & gemini_llm_api){
+																			if(!semantic && gemini_llm_api){
 																				semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
 
 																				models[gemini_llm_api+'-'+gemini_llm_model] -= 1
