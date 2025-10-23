@@ -3353,6 +3353,7 @@ export default {
 														tracking 스캔 진행시
 															tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
 										*/ 
+										
 
 										for(var r = 0; r < related.length; r++){
 											var { query, merge } = Relay(related[r], item)
@@ -3548,7 +3549,7 @@ export default {
 																			edge.data = arr.buffer
 
 																			var metadata = {
-																				title : data.title,
+																				title : data.title ? data.title : "",
 																				size : row.size ? row.size : "",
 																				currency : row.currency ? row.currency : "",
 																				carrier : row.carrier ? row.carrier : "",
