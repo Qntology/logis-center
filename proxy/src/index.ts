@@ -351,10 +351,10 @@ const list2json = function(language){
 	return `
 		type:'order' or 'goods' or 'tracking' or 'search' or 'review' or 'member' or 'coupon' or 'event' or '',
 		isDetail:is detail page | true/false,
-		node:Item parent list CSS selector excluding ads,
-		item:Item CSS selector excluding ads,
-		more:Item detail link CSS selector,
-		next:items next button CSS selector,
+		item:Item CSS1 selector excluding ads,
+		edit:Item URL includes manage path additional Link CSS1 selector,
+		next:List next button CSS1 selector,
+		node:List CSS1 selector excluding ads,
 		text:Summarize the contents of the items array in ${language},
 		items: [
 			if (type is 'tracking' or 'review' or 'member') {
@@ -391,7 +391,7 @@ const list2json = function(language){
 const item2json = function(type){
 	if(type == 'tracking'){
 		return ` 
-			node:detail page element CSS selector,
+			node:${type} form container CSS1 selector,
 			status:'draft' or 'progress' or 'return' or 'complete' or 'error',
 			id:tracking number | string,
 			title:${type} goods title | string, 
@@ -414,7 +414,7 @@ const item2json = function(type){
 		`
 	}else if(type == 'goods'){
 		return `
-			node:detail page element CSS selector,
+			node:${type} form container CSS1 selector,
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			status:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			payment_method:payment method | string,
@@ -475,7 +475,7 @@ const item2json = function(type){
 		`
 	}else if(type == 'order'){
 		return `
-			node:detail page element CSS selector,
+			node:${type} form container CSS1 selector,
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			tracking_number:tracking number | string,
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
@@ -500,11 +500,11 @@ const item2json = function(type){
 		`
 	}else if(type == 'coupon' || type == 'event'){
 		return `
-			node:detail page element CSS selector,
+			node:${type} container CSS1 selector,
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			type:'percentage' or 'fixed_amount' or 'free_shipping' or '',
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
-			title:${type} item title | string, 
+			title:${type} title | string, 
 			started_at:yyyy-MM-dd'T'HH:mm:ss | string,
 			expired_at:yyyy-MM-dd'T'HH:mm:ss | string,
 			code:${type} code used at checkout | string,
@@ -519,7 +519,7 @@ const item2json = function(type){
 		`
 	}else if(type == 'review' || type == 'member'){
 		return `
-			node:detail page element CSS selector,
+			node:${type} container CSS1 selector,
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			name:${type} name | string,
@@ -535,91 +535,91 @@ const item2json = function(type){
 const form2json = function(type){
 	if(type == 'tracking' || type == 'review' || type == 'member'){
 		return `
-			node:${type} item parent list CSS selector excluding ads,
-			item:${type} item CSS selector excluding ads,
-			title:${type} item title CSS selector excluding ads, 
-			date:${type} item date value CSS selector
+			node:${type} item parent list CSS1 selector excluding ads,
+			item:${type} item CSS1 selector excluding ads,
+			title:${type} item title CSS1 selector excluding ads, 
+			date:${type} item date value CSS1 selector
 		`
 	}else if(type == 'goods'){
 		return `
-			display:product display status CSS selector,
-			code:product constant code CSS selector,
-			model_name:Model name CSS selector,
-			brand_name:Brand name CSS selector,
-			usedType:usedType CSS selector,
-			description:Full description (HTML allowed) CSS selector,
-			short_description : short description CSS selector,
-			tags:tag or keyword CSS selector,
-			origin_country:Country of origin/manufacture CSS selector,
-			manufacturer:Manufacturer name CSS selector,
-			release_date:Product release date CSS selector,
-			manufacture_date:Date of manufacture CSS selector,
-			expiration_date:Expiration or use-by date CSS selector,
-			gtin:Global Trade Item Number CSS selector,
-			mpn:Manufacturer Part Number CSS selector,
-			barcode:Barcode value CSS selector,
-			sale_price:sale price CSS selector,
-			supply_price:supply price CSS selector,
-			compare_at_price:Original price for showing discounts CSS selector,
-			quantity:Inventory quantity CSS selector,
-			stock_keeping_unit:Stock Keeping Unit CSS selector,
-			low_stock_threshold:Low stock alert threshold CSS selector,
-			unit:Selling unit CSS selector,
-			tax_included:Whether tax CSS selector,
-			tax_code:Tax code for region-specific rules CSS selector,
-			main_image_url:Main product image URL CSS selector,
-			additional_image_url:additional product image URL CSS selector,
-			video_url:Promotional video URL CSS selector,
-			carrier:carrier CSS selector,
-			shipping_fee:Shipping cost CSS selector,
-			shipping_method:Shipping method CSS selector,
-			shipping_duration:Estimated delivery days CSS selector,
-			bundle_shipping:Allow combined shipping CSS selector,
-			product_width:product width CSS selector,
-			product_height:product height CSS selector,
-			product_length:product length CSS selector,
-			product_weight:product weight CSS selector,
-			fulfillment_service:Fulfillment provider CSS selector,
+			display:product display status CSS1 selector,
+			code:product constant code CSS1 selector,
+			model_name:Model name CSS1 selector,
+			brand_name:Brand name CSS1 selector,
+			usedType:usedType CSS1 selector,
+			description:Full description (HTML allowed) CSS1 selector,
+			short_description : short description CSS1 selector,
+			tags:tag or keyword CSS1 selector,
+			origin_country:Country of origin/manufacture CSS1 selector,
+			manufacturer:Manufacturer name CSS1 selector,
+			release_date:Product release date CSS1 selector,
+			manufacture_date:Date of manufacture CSS1 selector,
+			expiration_date:Expiration or use-by date CSS1 selector,
+			gtin:Global Trade Item Number CSS1 selector,
+			mpn:Manufacturer Part Number CSS1 selector,
+			barcode:Barcode value CSS1 selector,
+			sale_price:sale price CSS1 selector,
+			supply_price:supply price CSS1 selector,
+			compare_at_price:Original price for showing discounts CSS1 selector,
+			quantity:Inventory quantity CSS1 selector,
+			stock_keeping_unit:Stock Keeping Unit CSS1 selector,
+			low_stock_threshold:Low stock alert threshold CSS1 selector,
+			unit:Selling unit CSS1 selector,
+			tax_included:Whether tax CSS1 selector,
+			tax_code:Tax code for region-specific rules CSS1 selector,
+			main_image_url:Main product image URL CSS1 selector,
+			additional_image_url:additional product image URL CSS1 selector,
+			video_url:Promotional video URL CSS1 selector,
+			carrier:carrier CSS1 selector,
+			shipping_fee:Shipping cost CSS1 selector,
+			shipping_method:Shipping method CSS1 selector,
+			shipping_duration:Estimated delivery days CSS1 selector,
+			bundle_shipping:Allow combined shipping CSS1 selector,
+			product_width:product width CSS1 selector,
+			product_height:product height CSS1 selector,
+			product_length:product length CSS1 selector,
+			product_weight:product weight CSS1 selector,
+			fulfillment_service:Fulfillment provider CSS1 selector,
 			options:[{
-				name : option name CSS selector,
+				name : option name CSS1 selector,
 				inputs:[{
-					input:option input CSS selector,
+					input:option input CSS1 selector,
 				}]
 			}],
 			additional_goods:[{
-				link:URL includes manage path additional goods link CSS selector
+				link:URL includes manage path additional goods link CSS1 selector
 			}],
-			title:goods title CSS selector,
-			date:goods date(yyyy-MM-dd'T'HH:mm:ss) CSS selector
+			title:goods title CSS1 selector,
+			date:goods date(yyyy-MM-dd'T'HH:mm:ss) CSS1 selector
 		`
 	}else if(type == 'order'){
 		return `
-			status:${type} status CSS selector,
+			status:${type} status CSS1 selector,
 			order_products:[{
-				title:product title CSS selector,
+				title:product title CSS1 selector,
 				options:[{
-					name : product option name CSS selector,
-					option:product option value CSS selector,
+					name : product option name CSS1 selector,
+					option:product option value CSS1 selector,
 				}],
-				link:URL includes manage path additional product link CSS selector
+				link:URL includes manage path additional product link CSS1 selector
 			}],
-			date:order date CSS selector
+			date:order date CSS1 selector
 		`
 	}else if(type == 'coupon' || type == 'event'){
 		return `
-			status:${type} status CSS selector,
-			title:${type} item title CSS selector, 
-			start_at:${type} item start date value(yyyy-MM-dd'T'HH:mm:ss) CSS selector,
-			end_at:${type} item end date value(yyyy-MM-dd'T'HH:mm:ss) CSS selector,
-			type:Type of discount CSS selector,
-			code:${type} code used at checkout CSS selector,
-			discount:Discount value input CSS selector,
-			new_customer_only:new customer only input CSS selector
-			min_order_amount:Minimum order amount required to apply coupon value input CSS selector,
-			max_discount_amount:Maximum discount limit allowed for the coupon value input CSS selector,
-			usage_limit:Total usage limit for the coupon value input CSS selector,
-			usage_per:Usage limit per customer value input CSS selector
-			region_restrictions:region restrictions value input CSS selector
+			status:${type} status CSS1 selector,
+			title:${type} item title CSS1 selector, 
+			start_at:${type} item start date value(yyyy-MM-dd'T'HH:mm:ss) CSS1 selector,
+			end_at:${type} item end date value(yyyy-MM-dd'T'HH:mm:ss) CSS1 selector,
+			type:Type of discount CSS1 selector,
+			code:${type} code used at checkout CSS1 selector,
+			discount:Discount value input CSS1 selector,
+			new_customer_only:new customer only input CSS1 selector
+			min_order_amount:Minimum order amount required to apply coupon value input CSS1 selector,
+			max_discount_amount:Maximum discount limit allowed for the coupon value input CSS1 selector,
+			usage_limit:Total usage limit for the coupon value input CSS1 selector,
+			usage_per:Usage limit per customer value input CSS1 selector
+			region_restrictions:region restrictions value input CSS1 selector
 		`
 	}
 }
@@ -1824,6 +1824,14 @@ async function Deepinfra(key, model, system, user, inlineData){
 		console.log('content',content);
 
 		try{
+			var results = JSON.parse(content)
+
+			return safeClone(results)
+		}catch(err){
+
+		}
+
+		try{
 			if(content.indexOf('```') > -1){
 				content = content.replace(/```json/gi, "")
 				content = content.replace(/```/gi, "")
@@ -2447,20 +2455,41 @@ export default {
 
 								var url = new URL(task.href)
 
-								var pageId = hashId(task.cc+url.pathname)
+								var pathname = url.pathname
+
+								var pageId = hashId(task.cc+pathname)
 
 								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${pageId}" AND "created_at" < ${created_at} LIMIT 1`).all()
 
 								if(results.length){
+									var _page = results[0]
+
 									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(results[0].data))
 
 									var selectors = JSON.parse(decompressedJsonString)
 
-									if(selectors.type && selectors.node){
+									if(_page.type){
+										if(task.ref == pageId){
+											pageType = _page.type
+										}
+
 										try{
 											var { document } = parseHTML(`<html><body>${task.text}</body></html>`);
-											
-											if(document.querySelector(selectors.node)){
+
+											var $items = document.querySelectorAll(selectors.item)
+
+											console.log('$items.length',$items.length);
+
+											console.log('task.ref, pageId',task.ref, pageId);
+
+											if(task.ref == pageId && $items.length == 0){
+												pathname = pathname.toUpperCase()
+
+												pageId = hashId(task.cc+pathname)
+
+												isDetail = true
+
+											}else if(document.querySelector(selectors.node)){
 												task.text = document.querySelector(selectors.node).innerHTML
 											}
 										}catch(err){
@@ -2498,7 +2527,11 @@ export default {
 									}
 								}
 
+
+
 								var content = convertHtmlToCleanPug(task.text)
+
+								console.log('content',content);
 
 								if(!isDetail){
 									var system = list2json(language)
@@ -2590,13 +2623,15 @@ export default {
 									text : page.text || "",
 									node : page.node || "",
 									item : page.item || "",
-									more : page.more || "",
+									edit : page.edit || "",
 									next : page.next || ""
 								})), { to: 'arraybuffer' })
 
 								page.ref = task.ref
 
 								page.data = arr.buffer
+
+
 
 								statements[CenterRegion].push(
 									env[CenterRegion].prepare(`
@@ -2706,14 +2741,14 @@ export default {
 
 										try{
 											try{
-												var url = new URL(item.link)
+												var _url = new URL(item.link)
 											}catch(err){
-												var url = new URL(task.origin+item.link)
+												var _url = new URL(task.origin+item.link)
 
-												item.link = url.pathname + url.search
+												item.link = _url.pathname + _url.search
 											}
 
-											item.link = url.pathname + url.search
+											item.link = _url.pathname + _url.search
 
 										}catch(err){
 
@@ -3354,78 +3389,83 @@ export default {
 															tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
 										*/ 
 										
+										if(related.length){
+											for(var r = 0; r < related.length; r++){
+												var { query, merge } = Relay(related[r], item)
 
-										for(var r = 0; r < related.length; r++){
-											var { query, merge } = Relay(related[r], item)
+												// console.log('query, merge',query, merge);
 
-											// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
+												// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
 
-											if(!query || !merge){
-												continue
-											}
-
-											try{
-												if(query.length){
-													var table = query[0].type 
-													var type = query[0].type
-													var column = query[0].column
-													var column_value = query[0].value
-													var status = query[0].status
-
-													if(typeof status != "undefined"){
-														var { results } = await env[`${zoneRegion}_${table}`].prepare(
-															`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-														).bind(
-															column_value, team.id, item.cc, status, now
-														).all()
-													}else{
-														var { results } = await env[`${zoneRegion}_${table}`].prepare(
-															`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-														).bind(
-															column_value, team.id, item.cc, now
-														).all()
-													}
-
-														
-
-													if(results.length == 0){
-														// draft 상태 맞음
-														// 없으면 추가해야함 - 일부 사용자가 직접 팝업으로 띄워야 할수 있음
-
-														/*
-															상품 스캔 하였는데
-															상품 상세페이지 스캔 안되어있으면
-														*/
-
-														/*
-															고객 주문 스캔하였는데
-															배송 시작 정보가 없을시
-														*/
-														updated_at = 0	
-													}
-
-													relates[type] = {
-														query : query,
-														merge : merge,
-														rows : results,
-														type : related[r]
-													}
+												if(!query || !merge){
+													continue
 												}
-											}catch(err){
-												await env[CenterRegion].prepare(`
-													INSERT INTO console (
-														"id", "bcc", "log", "created_at"
-													) VALUES (
-														?1, ?2, ?3, ?4
-													) ON CONFLICT (id) DO NOTHING
-												`).bind(
-													hashId(),
-													task.bcc,
-													'tracking inner err'+type+err,
-													now // Parameter for created_at (only insert)
-												).run()
+
+												try{
+													if(query.length){
+														var table = query[0].type 
+														var type = query[0].type
+														var column = query[0].column
+														var column_value = query[0].value
+														var status = query[0].status
+
+														if(typeof status != "undefined"){
+															var { results } = await env[`${zoneRegion}_${table}`].prepare(
+																`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+															).bind(
+																column_value, team.id, item.cc, status, now
+															).all()
+														}else{
+															var { results } = await env[`${zoneRegion}_${table}`].prepare(
+																`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+															).bind(
+																column_value, team.id, item.cc, now
+															).all()
+														}
+
+															
+
+														if(results.length == 0){
+															// draft 상태 맞음
+															// 없으면 추가해야함 - 일부 사용자가 직접 팝업으로 띄워야 할수 있음
+
+															/*
+																상품 스캔 하였는데
+																상품 상세페이지 스캔 안되어있으면
+															*/
+
+															/*
+																고객 주문 스캔하였는데
+																배송 시작 정보가 없을시
+															*/
+															updated_at = 0	
+														}
+
+														relates[type] = {
+															query : query,
+															merge : merge,
+															rows : results,
+															type : related[r]
+														}
+													}
+												}catch(err){
+													await env[CenterRegion].prepare(`
+														INSERT INTO console (
+															"id", "bcc", "log", "created_at"
+														) VALUES (
+															?1, ?2, ?3, ?4
+														) ON CONFLICT (id) DO NOTHING
+													`).bind(
+														hashId(),
+														task.bcc,
+														'tracking inner err'+type+err,
+														now // Parameter for created_at (only insert)
+													).run()
+												}
 											}
 										}
+
+											
 
 
 
@@ -4291,7 +4331,7 @@ export default {
 								task.semantic = page.text
 
 								if(items.length){
-									var type = page.type
+									var type = talk.type = page.type
 
 									if(page.type == "sales"){
 										type = "sales"
@@ -4303,8 +4343,6 @@ export default {
 										type = "event"
 
 									}
-
-									talk.type = type
 
 
 									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
