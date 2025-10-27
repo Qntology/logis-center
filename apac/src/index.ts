@@ -202,8 +202,6 @@ export default {
 			}
 
 			await Sleep(1000 * delay)
-
-			// await Sleep(1000)
 		}
 	}
 } satisfies ExportedHandler<Env>

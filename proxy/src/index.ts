@@ -12,90 +12,10 @@ import { ethers } from 'ethers'
 
 		+++ 결제 플로우 만들어야함
 
-	***selector 가 같은데 계속 풀 html 문서 전송막기
-
 	사용자가 안사용하는 벡터 DB 자동 정리하는 기능 추가하기
-
-
 */
 
 /*
-	무료 oauth 토큰
-
-	유료 logis 토큰
-
-	아이콘 설명
-		✨ 로지스 센터 확장프로그램 & AI
-		🖥️ 데스크탑
-		📱 휴대폰
-
-
-	어플리케이션
-		활성화 주소에서만 ✨ 버튼 자동화 (기존 쇼핑몰 관리자에서 사용 가능하게)
-
-		오른쪽 하단의 ✨ 클릭시 동기화 시작
-		
-		네비게이션
-			✨ 로그인
-			쇼핑몰 추가
-				추가완료시 쇼핑몰 파비콘과 쇼핑몰 이름 표시
-				🛍️ 쇼핑몰 주문목록 링크 추가
-				📦 쇼핑몰 재고목록 링크 추가
-				🖥️ 휴대폰 동기화 QR 버튼(보안 경고창 띄우고 QR 노출하기)
-				📱 송장 조회
-				📱 재고 조회 & 재고 증감
-
-		이벤트
-			🖥️ 송장 출력
-			✨ 주문 조회
-			✨ 재고 조회
-
-			재고 타입
-				- 자체 등록
-				- AI 등록
-
-	휴대폰
-		송장 스캔(오프라인)
-			발주, 발송 사용자가 선택
-				- 송장번호는 단한번만 추가되며 추가, 삭제만 가능
-				- 발주시 재고 추가됨
-				- 발송시 재고 차감
-				- draft 저장소에 등록
-					type draft 값으로 등록
-
-		AI 보정
-			* 보정은 처음 혹은 정상작동하지 않으면 동작합니다.
-			* 요청은 html 문서를 서버에 전송하면 json 구조로 리턴합니다.
-
-			오프라인
-				송장 스캔
-					- draft 저장소에 등록
-						type draft 값으로 등록
-
-
-
-	거의 수동
-	- 크롬 익스텐션에서
-		발주시 송장번호를 타입(상품번호, 주문번호)에 마킹
-			예시 여러 상품 조합인 경우 여러개 등록하는 형식이여야함
-
-			배송상태는 실제 송장을 스캔하면 완료로 체크
-
-
-	일차적으로 
-		쇼핑몰 주문 관리 페이지
-
-
-	OCR 시 
-		DRAFT로 등록하고, 재고 여부 확인후 병합 
-
-
-	1000회 limit 요청 차게 될수도 있으니 fetch 요청하는것으로 우회하기
-
-
-		
-
-
 	team.data.base.graph
 		page.ref = 레퍼러
 		page.ref 간에 연결을 프로세스로 보여줌
@@ -171,7 +91,7 @@ const randomKey = function(){
  */
 function mergeNode(obj1, obj2) {
 	// '비어있다'는 기준은 null, undefined, 빈 문자열('')로 정의합니다.
-	const isEmpty = (value) => value === null || value === undefined || value === '';
+	const isEmpty = (value) => value === null || value === undefined || value === '' || value === 0;
 
 	// 1. obj1의 모든 속성을 복사하여 새로운 객체를 생성합니다.
 	const merged = { ...obj1 };
@@ -388,7 +308,7 @@ const list2json = function(language){
 }
 
 
-const item2json = function(type){
+const item2json = function(type, href){
 	if(type == 'tracking'){
 		return ` 
 			node:${type} form container CSS1 selector,
@@ -415,6 +335,7 @@ const item2json = function(type){
 	}else if(type == 'goods'){
 		return `
 			node:${type} form container CSS1 selector,
+			link : '${href}',
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			status:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			payment_method:payment method | string,
@@ -476,6 +397,7 @@ const item2json = function(type){
 	}else if(type == 'order'){
 		return `
 			node:${type} form container CSS1 selector,
+			link : '${href}',
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			tracking_number:tracking number | string,
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
@@ -501,6 +423,7 @@ const item2json = function(type){
 	}else if(type == 'coupon' || type == 'event'){
 		return `
 			node:${type} container CSS1 selector,
+			link : '${href}',
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			type:'percentage' or 'fixed_amount' or 'free_shipping' or '',
 			status:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
@@ -520,6 +443,7 @@ const item2json = function(type){
 	}else if(type == 'review' || type == 'member'){
 		return `
 			node:${type} container CSS1 selector,
+			link : '${href}',
 			id:Refer to the ID value from the link or an attribute or input value | string,
 			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
 			name:${type} name | string,
@@ -2160,6 +2084,8 @@ export default {
 
 							item.index = crc32(team.id+item.id)
 
+							var statusCode = item.status = item.status ? parseStatus(item.status) : 0
+
 
 							var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
 
@@ -2176,6 +2102,13 @@ export default {
 								delete _item.bcc
 								delete _item.data
 								delete _item.created_at
+								delete _item.ref
+
+								if(item.status){
+									if(_item.status){
+										delete _item.status
+									}
+								}
 
 								item = mergeNode(item, _item)
 							}
@@ -2187,8 +2120,15 @@ export default {
 								if(results.length){
 									var _item = results[0]
 
-									item = mergeNode(item, _item)
+									delete _item.ref
 
+									if(item.status){
+										if(_item.status){
+											delete _item.status
+										}
+									}
+
+									item = mergeNode(item, _item)
 
 									if(sales.length){
 										var _item = sales[0]
@@ -2202,6 +2142,10 @@ export default {
 										)
 									}
 								}
+
+								item.ref = task.ref
+
+								item.created_at = now
 
 
 
@@ -2273,7 +2217,6 @@ export default {
 									})), { to: 'arraybuffer' })
 
 									item.data = arr.buffer
-
 
 									var metadata = {
 										id: item.id,
@@ -2414,7 +2357,7 @@ export default {
 										item.event ? item.event : 0,
 										item.goods ? item.goods : 0,
 										item.order ? item.order : 0,
-										parseStatus(item.status),
+										item.status,
 										item.no,
 										item.sender_address ? item.sender_address : "",
 										item.sender_phone ? item.sender_phone : "",
@@ -2478,10 +2421,6 @@ export default {
 
 											var $items = document.querySelectorAll(selectors.item)
 
-											console.log('$items.length',$items.length);
-
-											console.log('task.ref, pageId',task.ref, pageId);
-
 											if(task.ref == pageId && $items.length == 0){
 												pathname = pathname.toUpperCase()
 
@@ -2531,8 +2470,6 @@ export default {
 
 								var content = convertHtmlToCleanPug(task.text)
 
-								console.log('content',content);
-
 								if(!isDetail){
 									var system = list2json(language)
 
@@ -2571,12 +2508,14 @@ export default {
 
 
 								if((!isDetail && !pageLength) || isDetail){
-									var system = item2json(pageType)
+									var system = item2json(pageType, task.href)
 
 									system = system.trim()
 
 									if(models['deepinfra']){
 										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+										page.link = task.link
 
 										models['deepinfra'] -= 1
 
@@ -2584,6 +2523,8 @@ export default {
 
 									if(!page && gemini_llm_api){
 										page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+
+										page.link = task.link
 
 										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -2603,10 +2544,6 @@ export default {
 								page.to = task.to
 								page.cc = task.cc
 								page.bcc = task.bcc
-
-								console.log('page', JSON.stringify(page));
-
-								console.log('isDetail', JSON.stringify(isDetail));
 
 								if(isDetail){
 									page.items = [safeClone(page)]
@@ -2779,6 +2716,14 @@ export default {
 											if(results.length){
 												var _item = results[0]
 
+												delete _item.ref
+
+												if(item.status){
+													if(_item.status){
+														delete _item.status
+													}
+												}
+
 												item = mergeNode(item, _item)
 											}
 
@@ -2820,6 +2765,7 @@ export default {
 										
 										item.expired_at = item.expiration_date ? item.expiration_date : 0
 
+										var statusCode = item.status = item.status ? parseStatus(item.status) : 0
 										
 
 
@@ -2850,7 +2796,6 @@ export default {
 
 										try{
 											console.log('item.type',item.type);
-											console.log('진입',item.tracking_number);
 
 											if(item.type == "order" && item.tracking_number){
 												/*
@@ -2860,10 +2805,6 @@ export default {
 														리스트에서는 송장번호가 없음
 														상세페이지에서는 송장번호가 있음
 												*/
-
-											
-
-												console.log('before item.tracking',item.tracking);
 
 												if(goods.length){
 													for(var g = 0; g < goods.length; g++){
@@ -2905,7 +2846,7 @@ export default {
 															tracking.id = hashId(team.id+tracking.no)
 														}
 
-
+														tracking.status = item.status
 
 														tracking.order = item.index
 
@@ -2937,6 +2878,8 @@ export default {
 															var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_tracking.data))
 
 															_tracking.data = JSON.parse(decompressedJsonString)
+
+															delete _tracking.ref
 
 															tracking = mergeNode(_tracking, tracking)
 														}else{
@@ -3025,8 +2968,6 @@ export default {
 																models['deepinfra'] -= 1
 															}
 
-															console.log('typeof embeddings',typeof embeddings);
-
 															if(!embeddings){
 																fallback = 'embeddings overflow'
 
@@ -3035,8 +2976,6 @@ export default {
 
 															await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 														}
-
-														console.log('JSON.stringify(tracking)',JSON.stringify(tracking));
 
 														var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
 
@@ -3095,7 +3034,7 @@ export default {
 																tracking.event ? tracking.event : 0,
 																tracking.goods ? tracking.goods : 0,
 																tracking.order ? tracking.order : 0,
-																parseStatus(tracking.status),
+																tracking.status,
 																tracking.no ? tracking.no : "",
 																tracking.sender_address ? tracking.sender_address : "",
 																tracking.sender_phone ? tracking.sender_phone : "",
@@ -3162,6 +3101,14 @@ export default {
 										if(results.length){
 											var _item = results[0]
 
+											delete _item.ref
+
+											if(item.status){
+												if(_item.status){
+													delete _item.status
+												}
+											}
+
 											item = mergeNode(item, _item)
 										}else{
 											var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = "${item.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
@@ -3169,9 +3116,18 @@ export default {
 											if(results.length){
 												var _item = results[0]
 
+												delete _item.ref
+
+												if(item.status){
+													if(_item.status){
+														delete _item.status
+													}
+												}
+
 												item = mergeNode(item, _item)
 											}
 										}
+
 
 
 										try{
@@ -3991,6 +3947,8 @@ export default {
 											// if end
 										}
 
+										console.log('typeof item.vectorize',typeof item.vectorize);
+
 										if(item.semantic && !item.vectorize){
 											var metadata = {
 												type: item.type,
@@ -4044,7 +4002,6 @@ export default {
 
 											await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 										}
-
 
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 											type : item.type,
@@ -4148,7 +4105,7 @@ export default {
 													parseFloat(item.event ? item.event : 0),
 													parseFloat(item.views ? item.views : 0),
 													parseFloat(item.goods ? item.goods : 0),
-													parseStatus(item.status),
+													item.status,
 													parseFloat(item.width ? item.width : 0),
 													parseFloat(item.height ? item.height : 0),
 													parseFloat(item.length ? item.length : 0),
@@ -4232,7 +4189,7 @@ export default {
 													item.event ? item.event : 0,
 													item.goods ? item.goods : 0,
 													item.order ? item.order : 0,
-													parseStatus(item.status),
+													item.status,
 													item.no ? item.no : "",
 													item.sender_address ? item.sender_address : "",
 													item.sender_phone ? item.sender_phone : "",
@@ -4306,7 +4263,7 @@ export default {
 													parseFloat(item.event ? item.event : 0),
 													item.number ? item.number : "",
 													item.address ? item.address : "",
-													parseStatus(item.status),
+													item.status,
 													item.code ? item.code : "",
 													parseFloat(item.discount ? item.discount : 0),
 													parseFloat(item.quantity ? item.quantity : 0),
@@ -4792,58 +4749,59 @@ export default {
 							}
 
 
-							var generation = ''
+
+
 
 							var augmented = ''
 
-							// 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
-							if(task.topK > 50){
-								var { results, success, error } = await env[`${zoneRegion}_talks`].prepare(
-									`SELECT * FROM talks WHERE "bcc" = "${task.bcc}" AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
-								).all()
+							// // 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
+							// if(task.topK > 50){
+							// 	var { results, success, error } = await env[`${zoneRegion}_talks`].prepare(
+							// 		`SELECT * FROM talks WHERE "bcc" = "${task.bcc}" AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
+							// 	).all()
 
-								if(results.length){
-									for(var r = 0; r < results.length; r++){
-										var retrieval = results[r]
+							// 	if(results.length){
+							// 		for(var r = 0; r < results.length; r++){
+							// 			var retrieval = results[r]
 
-										var { results, success, error } = await env[`${zoneRegion}_${retrieval.type}`].prepare(
-											`SELECT * FROM ${retrieval.type} WHERE "ref" = "${retrieval.ref}" AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
-										).all()
+							// 			var { results, success, error } = await env[`${zoneRegion}_${retrieval.type}`].prepare(
+							// 				`SELECT * FROM ${retrieval.type} WHERE "ref" = "${retrieval.ref}" AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
+							// 			).all()
 
-										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(retrieval.data))
+							// 			var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(retrieval.data))
 
-										var data = JSON.parse(decompressedJsonString)
+							// 			var data = JSON.parse(decompressedJsonString)
 
-										if(results.length){
-											augmented += `${p}. ${data.text}\n`
+							// 			if(results.length){
+							// 				augmented += `${p}. ${data.text}\n`
 
-											for(var r = 0; r < results.length; r++){
-												var obj = safeClone(results[r])
+							// 				for(var b = 0; b < results.length; b++){
+							// 					var obj = safeClone(results[b])
 
-												delete obj.from
-												delete obj.to
-												delete obj.cc
-												delete obj.bcc
-												delete obj.ref
+							// 					delete obj.from
+							// 					delete obj.to
+							// 					delete obj.cc
+							// 					delete obj.bcc
+							// 					delete obj.ref
 
-												augmented += `${JSON.stringify(obj)}\n`
-											}
-										}
+							// 					augmented += `${JSON.stringify(obj)}\n`
+							// 				}
+							// 			}
 
-										statements[`${zoneRegion}_talks`].push(
-											env[`${zoneRegion}_talks`].prepare(`
-												UPDATE talks SET updated_at = ? WHERE id = ?
-											`).bind(
-												now, retrieval.id
-											)
-										)
-									}
+							// 			statements[`${zoneRegion}_talks`].push(
+							// 				env[`${zoneRegion}_talks`].prepare(`
+							// 					UPDATE talks SET updated_at = ? WHERE id = ?
+							// 				`).bind(
+							// 					now, retrieval.id
+							// 				)
+							// 			)
+							// 		}
 
-									if(augmented){
-										augmented = `Reference Context Start\n${augmented}\nReference Context End\n`
-									}
-								}
-							}
+							// 		if(augmented){
+							// 			augmented = `Reference Context Start\n${augmented}\nReference Context End\n`
+							// 		}
+							// 	}
+							// }
 
 							if(contexts){
 								if(contexts.length){
