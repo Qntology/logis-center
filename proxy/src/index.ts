@@ -2561,7 +2561,9 @@ export default {
 									node : page.node || "",
 									item : page.item || "",
 									edit : page.edit || "",
-									next : page.next || ""
+									next : page.next || "",
+									link : task.link,
+									origin : task.origin ? task.origin : ''
 								})), { to: 'arraybuffer' })
 
 								page.ref = task.ref
@@ -3530,8 +3532,6 @@ export default {
 																		// import
 
 																		if(from.type == "goods" && to.type == "order"){
-																			
-
 																			var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 																				id : edge.id,
 																				title : edge.title,
