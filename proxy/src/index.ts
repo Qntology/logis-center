@@ -80,6 +80,42 @@ const randomKey = function(){
 	return parseInt(key.replace("0.",""))
 }
 
+
+function normalizeNumericHomoglyphs(str) {
+	if (typeof str !== 'string') return str;
+
+	const map = {
+		// 0
+		'O': '0', 'o': '0', 'Ο': '0', '○': '0', '〇': '0', '０': '0', 'Ｏ': '0',
+		// 1
+		'I': '1', 'l': '1', '１': '1', 'Ｉ': '1', 'ｌ': '1', 'Ι': '1', '|': '1', 'ᛁ': '1',
+		// 2
+		'Z': '2', 'z': '2', '２': '2', 'Ƨ': '2', 'ᒿ': '2',
+		// 3
+		'Ɛ': '3', 'ɜ': '3', 'З': '3', 'з': '3', '３': '3',
+		// 4
+		'Ꮞ': '4', '４': '4',
+		// 5
+		'S': '5', 's': '5', '５': '5', 'ƽ': '5',
+		// 6
+		'b': '6', 'Ꮾ': '6', '６': '6',
+		// 7
+		'T': '7', '７': '7',
+		// 8
+		'Β': '8', 'ß': '8', '８': '8',
+		// 9
+		'g': '9', '９': '9', 'ǵ': '9', 'ɡ': '9'
+	};
+
+	const chars = Object.keys(map)
+		.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+		.join('|');
+
+	const regex = new RegExp(chars, 'gu');
+
+	return str.replace(regex, ch => map[ch] || ch);
+}
+
 /**
  * 두 객체를 병합하여 새로운 객체를 반환합니다.
  * obj2에 유효한 값이 있다면 obj1의 값에 관계없이 무조건 덮어씁니다.
@@ -269,15 +305,15 @@ const graph2contexts = function(current){
 
 const list2json = function(language){
 	return `
-		type:'order' or 'goods' or 'tracking' or 'search' or 'review' or 'member' or 'coupon' or 'event' or '',
+		type:'order' or 'goods' or 'tracking' or 'search' or 'review' or 'coupon' or 'event' or '',
 		isDetail:is detail page | true/false,
 		item:Item CSS1 selector excluding ads,
-		edit:Item URL includes manage path additional Link CSS1 selector,
+		more:Item URL includes manage path additional Link CSS1 selector,
 		next:List next button CSS1 selector,
 		node:List CSS1 selector excluding ads,
 		text:Summarize the contents of the items array in ${language},
 		items: [
-			if (type is 'tracking' or 'review' or 'member') {
+			if (type is 'tracking' or 'review') {
 				status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 				id:Refer to the ID value from the link or an attribute | string,
 				title:author and content | string, 
@@ -297,7 +333,7 @@ const list2json = function(language){
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
 			}
 			if (type is 'coupon' or 'event') {
-				status : 'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
+				status:'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
 				id:Refer to the ID value from the link or an attribute | string,
 				title:type based item title, 
 				started_at:yyyy-MM-dd'T'HH:mm:ss,
@@ -312,241 +348,460 @@ const item2json = function(type, href){
 	if(type == 'tracking'){
 		return ` 
 			node:${type} form container CSS1 selector,
-			status:'draft' or 'progress' or 'return' or 'complete' or 'error',
-			id:tracking number | string,
-			title:${type} goods title | string, 
-			sender_name:sender_name | string,
-			sender_address:sender_address | string,
-			sender_phone:sender_phone | string,
-			recipient_name:recipient_name | string,
-			recipient_address:recipient_address | string,
-			recipient_phone:recipient_phone | string,
-			package_width:Package width | number,
-			package_height:Package height | number,
-			package_length:Package length | number,
-			package_weight:Package weight | number,
-			carrier:carrier name translated into English | string,
-			shipping_fee:Shipping cost | number,
-			shipping_method:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight,
-			shipping_duration:Estimated delivery days | number,
-			bundle_shipping:Allow combined shipping | string,
-			shipping_date:yyyy-MM-dd'T'HH:mm:ss | string,
+			status:{
+				value:'draft' or 'progress' or 'return' or 'complete' or 'error',
+				selector:sibling value based CSS1 selector
+			},
+			id:{
+				value:tracking number | string,
+				selector:sibling value based CSS1 selector
+			},
+			title:{
+				value:${type} goods title | string,,
+				selector:sibling value based CSS1 selector
+			} 
+			sender_name:{
+				value:sender_name | string,
+				selector:sibling value based CSS1 selector
+			},
+			sender_address:{
+				value:sender_address | string,
+				selector:sibling value based CSS1 selector
+			},
+			sender_phone:{
+				value:sender_phone | string,
+				selector:sibling value based CSS1 selector
+			},
+			recipient_name:{
+				value:recipient_name | string,
+				selector:sibling value based CSS1 selector
+			},
+			recipient_address:{
+				value:recipient_address | string,
+				selector:sibling value based CSS1 selector
+			},
+			recipient_phone:{
+				value:recipient_phone | string,
+				selector:sibling value based CSS1 selector
+			},
+			package_width:{
+				value:Package width | number,
+				selector:sibling value based CSS1 selector
+			},
+			package_height:{
+				value:Package height | number,
+				selector:sibling value based CSS1 selector
+			},
+			package_length:{
+				value:Package length | number,
+				selector:sibling value based CSS1 selector
+			},
+			package_weight:{
+				value:Package weight | number,
+				selector:sibling value based CSS1 selector
+			},
+			carrier:{
+				value:carrier name translated into English | string,
+				selector:sibling value based CSS1 selector
+			},
+			shipping_fee:{
+				value:Shipping cost | number,
+				selector:sibling value based CSS1 selector
+			},
+			shipping_method:{
+				value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
+				selector:sibling value based CSS1 selector
+			},
+			shipping_duration:{
+				value:Estimated delivery days | number,
+				selector:sibling value based CSS1 selector
+			},
+			bundle_shipping:{
+				value:Allow combined shipping | string,
+				selector:sibling value based CSS1 selector
+			},
+			shipping_date:{
+				value:yyyy-MM-dd'T'HH:mm:ss | string,
+				selector:sibling value based CSS1 selector
+			},
 		`
 	}else if(type == 'goods'){
 		return `
 			node:${type} form container CSS1 selector,
-			link : '${href}',
-			id:Refer to the ID value from the link or an attribute or input value | string,
-			status:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-			payment_method:payment method | string,
-			bank:bank company name or '' | string,
-			card:card company name or '' | string,
-			code:product constant code | string,
-			model_name:product Model name | string,
-			brand_name:product Brand name | string,
-			condition:['new' or 'used' or 'lease' or 'rental' or 'refurbish'],
-			description:product Full description (HTML allowed) | string,
-			short_description:product short description | string,
-			tags:[{ tag : product keyword or tag | string }],
-			origin_country:product Country of origin/manufacture | string,
-			manufacturer:product Manufacturer name | string,
-			release_date:Product release date(yyyy-MM-dd'T'HH:mm:ss) | string,
-			manufacture_date:product Date(yyyy-MM-dd'T'HH:mm:ss) of manufacture | string,
-			expiration_date:product Expiration or use-by date(yyyy-MM-dd'T'HH:mm:ss) | string,
-			gtin:product Global Trade Item Number | string,
-			mpn:product Manufacturer Part Number | string,
-			barcode:product Barcode value | string,
-			sale_price:product sale price | number,
-			supply_price:product supply price | number,
-			currency:ISO 4217 Currency Code | string,
-			compare_at_price:product Original price for showing discounts | number,
-			quantity:product Inventory quantity | number,
-			stock_keeping_unit: Stock Keeping Unit | string,
-			low_stock_threshold:product Low stock alert threshold | number,
-			unit:product Selling unit | string,
-			tax_included:product Whether tax | number,
-			tax_code:product Tax code for region-specific rules | string,
-			main_image_url:Main product image URL | string,
-			additional_image_url:additional product image URL | string,
-			video_url:product Promotional video URL | string,
-			carrier:product carrier name translated into English | string,
-			shipping_fee:product Shipping cost | number,
-			shipping_method:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight,
-			shipping_duration:product Estimated delivery days | number,
-			bundle_shipping:product Allow combined shipping | string,
-			product_width:Package width(cm) | number,
-			product_height:Package height(cm) | number,
-			product_length:Package length(cm) | number,
-			product_weight:Package weight(kg) | number,
+			link:'${href}',
+			id:{
+				value:Refer to the ID value from the link or an attribute or input value | string,
+				selector:sibling value based CSS1 selector
+			},
+			status:{
+				value:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+				selector:sibling value based CSS1 selector
+			},
+			payment_method:{
+				value:payment method | string,
+				selector:sibling value based CSS1 selector
+			},
+			bank:{
+				value:bank company name or '' | string,
+				selector:sibling value based CSS1 selector
+			},
+			card:{
+				value:card company name or '' | string,
+				selector:sibling value based CSS1 selector
+			},
+			code:{
+				value:product constant code | string,
+				selector:sibling value based CSS1 selector
+			},
+			model_name:{
+				value:product Model name | string,
+				selector:sibling value based CSS1 selector
+			},
+			brand_name:{
+				value:product Brand name | string,
+				selector:sibling value based CSS1 selector
+			},
+			condition:{
+				value:['new' or 'used' or 'lease' or 'rental' or 'refurbish'],
+				selector:sibling value based CSS1 selector
+			},
+			description:{
+				value:product Full description (HTML allowed) | string,
+				selector:sibling value based CSS1 selector
+			},
+			short_description:{
+				value:product short description | string,
+				selector:sibling value based CSS1 selector
+			},
+			tags:{
+				value:[{ tag : product keyword or tag | string }],
+				selector:sibling value based CSS1 selector
+			},
+			origin_country:{
+				value:product Country of origin/manufacture | string,
+				selector:sibling value based CSS1 selector
+			},
+			manufacturer:{
+				value:product Manufacturer name | string,
+				selector:sibling value based CSS1 selector
+			},
+			release_date:{
+				value:Product release date(yyyy-MM-dd'T'HH:mm:ss) | string,
+				selector:sibling value based CSS1 selector
+			},
+			manufacture_date:{
+				value:product Date(yyyy-MM-dd'T'HH:mm:ss) of manufacture | string,
+				selector:sibling value based CSS1 selector
+			},
+			expiration_date:{
+				value:product Expiration or use-by date(yyyy-MM-dd'T'HH:mm:ss) | string,
+				selector:sibling value based CSS1 selector
+			},
+			gtin:{
+				value:product Global Trade Item Number | string,
+				selector:sibling value based CSS1 selector
+			},
+			mpn:{
+				value:product Manufacturer Part Number | string,
+				selector:sibling value based CSS1 selector
+			},
+			barcode:{
+				value:product Barcode value | string,
+				selector:sibling value based CSS1 selector
+			},
+			sale_price:{
+				value:product sale price | number,
+				selector:sibling value based CSS1 selector
+			},
+			supply_price:{
+				value:product supply price | number,
+				selector:sibling value based CSS1 selector
+			},
+			currency:{
+				value:ISO 4217 Currency Code | string,
+				selector:sibling value based CSS1 selector
+			},
+			compare_at_price:{
+				value:product Original price for showing discounts | number,
+				selector:sibling value based CSS1 selector
+			},
+			quantity:{
+				value:product Inventory quantity | number,
+				selector:sibling value based CSS1 selector
+			},
+			stock_keeping_unit:{
+				value:Stock Keeping Unit | string,
+				selector:sibling value based CSS1 selector
+			},
+			low_stock_threshold:{
+				value:product Low stock alert threshold | number,
+				selector:sibling value based CSS1 selector
+			},
+			unit:{
+				value:product Selling unit | string,
+				selector:sibling value based CSS1 selector
+			},
+			tax_included:{
+				value:product Whether tax | number,
+				selector:sibling value based CSS1 selector
+			},
+			tax_code:{
+				value:product Tax code for region-specific rules | string,
+				selector:sibling value based CSS1 selector
+			},
+			main_image_url:{
+				value:Main product image URL | string,
+				selector:sibling value based CSS1 selector
+			},
+			additional_image_url:{
+				value:additional product image URL | string,
+				selector:sibling value based CSS1 selector
+			},
+			video_url:{
+				value:product Promotional video URL | string,
+				selector:sibling value based CSS1 selector
+			},
+			carrier:{
+				value:product carrier name translated into English | string,
+				selector:sibling value based CSS1 selector
+			},
+			shipping_fee:{
+				value:product Shipping cost | number,
+				selector:sibling value based CSS1 selector
+			},
+			shipping_method:{
+				value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
+				selector:sibling value based CSS1 selector
+			},
+			shipping_duration:{
+				value:product Estimated delivery days | number,
+				selector:sibling value based CSS1 selector
+			},
+			bundle_shipping:{
+				value:product Allow combined shipping | string,
+				selector:sibling value based CSS1 selector
+			},
+			product_width:{
+				value:Package width(cm) | number,
+				selector:sibling value based CSS1 selector
+			},
+			product_height:{
+				value:Package height(cm) | number,
+				selector:sibling value based CSS1 selector
+			},
+			product_length:{
+				value : Package length(cm) | number,
+				selector:sibling value based CSS1 selector
+				
+			},
+			product_weight:{
+				value : Package weight(kg) | number,
+				selector:sibling value based CSS1 selector
+			},
 			options:[
 				{
-					name : option name | string,
+					value:option name | string,
+					selector:sibling value based CSS1 selector,
 					inputs:[{
-						input:option input value | string,
+						value:option input value | string,
+						selector:sibling value based CSS1 selector
 					}]
 				}
 			],
 			additional_goods:[
 				{
-					link:URL includes manage path additional product link | string
+					value:URL includes manage path additional product link | string,
+					selector:sibling value based CSS1 selector
 				}
 			],
-			title:product based title | string,
-			date:yyyy-MM-dd'T'HH:mm:ss | string,
+			title:{
+				value:product based title | string,
+				selector:sibling value based CSS1 selector
+			},
+			date:{
+				value:yyyy-MM-dd'T'HH:mm:ss | string,
+				selector:sibling value based CSS1 selector
+			},
 		`
 	}else if(type == 'order'){
 		return `
 			node:${type} form container CSS1 selector,
 			link : '${href}',
-			id:Refer to the ID value from the link or an attribute or input value | string,
-			tracking_number:tracking number | string,
-			status:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+			id:{
+				value:Refer to the ID value from the link or an attribute or input value | string,
+				selector:sibling value based CSS1 selector
+			},
+			tracking_number:{
+				value:tracking number | string,
+				selector:sibling value based CSS1 selector
+			},
+			status:{
+				value:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+				selector:sibling value based CSS1 selector
+			},
 			goods:[{
-				title:goods title | string,
-				link:URL includes manage path additional goods link | string,
-				id:Refer to the ID value from the link or an attribute | string,
+				title:{
+					value:goods title | string,
+					selector:sibling value based CSS1 selector
+				},
+				link:{
+					value:URL includes manage path additional goods link | string,
+					selector:sibling value based CSS1 selector
+				},
+				id:{
+					value:Refer to the product no value from the link or an attribute or input value | string,
+					selector:sibling value based CSS1 selector
+				}
 			}],
-			sender_name:sender_name | string,
-			sender_address:sender_address | string,
-			sender_phone:sender_phone | string,
-			recipient_name:recipient_name | string,
-			recipient_address:recipient_address | string,
-			recipient_phone:recipient_phone | string,
-			bank:bank company name | string,
-			card:card company name | string,
-			order_date:order date | string,
-			payment_date:payment date or '' | string,
-			payment_method:'C.O.D.' or 'CARD' or 'BANK' or '' | string,
-			payment_origin:Payment Gateway Service Name or '' | string,
-			date:yyyy-MM-dd'T'HH:mm:ss | string
+			sender_name:{
+				value:sender_name | string,
+				selector:sibling value based CSS1 selector
+			},
+			sender_address:{
+				value:sender_address, Filter the addresses to District-level and up | string,
+				selector:sibling value based CSS1 selector
+			},
+			sender_phone:{
+				value:sender_phone | string,
+				selector:sibling value based CSS1 selector
+			},
+			recipient_name:{
+				value:recipient_name | string,
+				selector:sibling value based CSS1 selector
+			},
+			recipient_address:{
+				value:recipient_address, Filter the addresses to District-level and up | string,
+				selector:sibling value based CSS1 selector
+			},
+			recipient_phone:{
+				value:recipient_phone | string,
+				selector:sibling value based CSS1 selector
+			},
+			bank:{
+				value:bank company name | string,
+				selector:sibling value based CSS1 selector
+			},
+			card:{
+				value:card company name | string,
+				selector:sibling value based CSS1 selector
+			},
+			order_date:{
+				value:order date | string,
+				selector:sibling value based CSS1 selector
+			},
+			payment_date:{
+				value:payment date or '' | string,
+				selector:sibling value based CSS1 selector
+			},
+			payment_method:{
+				value:'C.O.D.' or 'CARD' or 'BANK' or '' | string,
+				selector:sibling value based CSS1 selector
+			},
+			payment_origin:{
+				value:Payment Gateway Service Name or '' | string,
+				selector:sibling value based CSS1 selector
+			},
+			date:{
+				value:yyyy-MM-dd'T'HH:mm:ss | string
+				selector:sibling value based CSS1 selector
+			},
 		`
 	}else if(type == 'coupon' || type == 'event'){
 		return `
 			node:${type} container CSS1 selector,
 			link : '${href}',
-			id:Refer to the ID value from the link or an attribute or input value | string,
-			type:'percentage' or 'fixed_amount' or 'free_shipping' or '',
-			status:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
-			title:${type} title | string, 
-			started_at:yyyy-MM-dd'T'HH:mm:ss | string,
-			expired_at:yyyy-MM-dd'T'HH:mm:ss | string,
-			code:${type} code used at checkout | string,
-			discount:Discount value | number,
-			quantity:${type} quantity | number
-			usage_limit:Total usage limit for the coupon | number,
-			usage_per:Usage limit per customer | number,
-			new_customer_only:new customer only | boolean
-			min_order_amount:Minimum order amount required to apply coupon | number,
-			max_discount_amount:Maximum discount limit allowed for the coupon | number,
-			region_restrictions:region restrictions | boolean
+			id:{
+				value:Refer to the ID value from the link or an attribute or input value | string,
+				selector:sibling value based CSS1 selector
+			},
+			type:{
+				value:'percentage' or 'fixed_amount' or 'free_shipping' or '',
+				selector:sibling value based CSS1 selector
+			},
+			status:{
+				value:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
+				selector:sibling value based CSS1 selector
+			},
+			title:{
+				value:${type} title | string, 
+				selector:sibling value based CSS1 selector
+			},
+			started_at:{
+				value:yyyy-MM-dd'T'HH:mm:ss | string,
+				selector:sibling value based CSS1 selector
+			},
+			expired_at:{
+				value:yyyy-MM-dd'T'HH:mm:ss | string,
+				selector:sibling value based CSS1 selector
+			},
+			code:{
+				value:${type} code used at checkout | string,
+				selector:sibling value based CSS1 selector
+			},
+			discount:{
+				value:Discount value | number,
+				selector:sibling value based CSS1 selector
+			},
+			quantity:{
+				value:${type} quantity | number
+				selector:sibling value based CSS1 selector
+			},
+			usage_limit:{
+				value:Total usage limit for the coupon | number,
+				selector:sibling value based CSS1 selector
+			},
+			usage_per:{
+				value:Usage limit per customer | number,
+				selector:sibling value based CSS1 selector
+			},
+			new_customer_only:{
+				value:new customer only | boolean
+				selector:sibling value based CSS1 selector
+			},
+			min_order_amount:{
+				value:Minimum order amount required to apply coupon | number,
+				selector:sibling value based CSS1 selector
+			},
+			max_discount_amount:{
+				value:Maximum discount limit allowed for the coupon | number,
+				selector:sibling value based CSS1 selector
+			},
+			region_restrictions:{
+				value:region restrictions | boolean
+				selector:sibling value based CSS1 selector
+			},
 		`
-	}else if(type == 'review' || type == 'member'){
+	}else if(type == 'review'){
 		return `
 			node:${type} container CSS1 selector,
 			link : '${href}',
-			id:Refer to the ID value from the link or an attribute or input value | string,
-			status:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-			name:${type} name | string,
-			title:${type} item title | string, 
-			completed:order complete | boolean,
-			created_at:yyyy-MM-dd'T'HH:mm:ss
+			id:Refer to the ID value from the link or an attribute or input value | string,,
+			status:{
+				value:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+				selector:sibling value based CSS1 selector
+			},
+			name:{
+				value:${type} name | string,
+				selector:sibling value based CSS1 selector
+			},
+			title:{
+				value:${type} item title | string, 
+				selector:sibling value based CSS1 selector
+			},
+			completed:{
+				value:order complete | boolean,
+				selector:sibling value based CSS1 selector
+			},
+			created_at:{
+				value:yyyy-MM-dd'T'HH:mm:ss
+				selector:sibling value based CSS1 selector
+			},
 		`
 	}
 }
 
 
 
-const form2json = function(type){
-	if(type == 'tracking' || type == 'review' || type == 'member'){
-		return `
-			node:${type} item parent list CSS1 selector excluding ads,
-			item:${type} item CSS1 selector excluding ads,
-			title:${type} item title CSS1 selector excluding ads, 
-			date:${type} item date value CSS1 selector
-		`
-	}else if(type == 'goods'){
-		return `
-			display:product display status CSS1 selector,
-			code:product constant code CSS1 selector,
-			model_name:Model name CSS1 selector,
-			brand_name:Brand name CSS1 selector,
-			usedType:usedType CSS1 selector,
-			description:Full description (HTML allowed) CSS1 selector,
-			short_description : short description CSS1 selector,
-			tags:tag or keyword CSS1 selector,
-			origin_country:Country of origin/manufacture CSS1 selector,
-			manufacturer:Manufacturer name CSS1 selector,
-			release_date:Product release date CSS1 selector,
-			manufacture_date:Date of manufacture CSS1 selector,
-			expiration_date:Expiration or use-by date CSS1 selector,
-			gtin:Global Trade Item Number CSS1 selector,
-			mpn:Manufacturer Part Number CSS1 selector,
-			barcode:Barcode value CSS1 selector,
-			sale_price:sale price CSS1 selector,
-			supply_price:supply price CSS1 selector,
-			compare_at_price:Original price for showing discounts CSS1 selector,
-			quantity:Inventory quantity CSS1 selector,
-			stock_keeping_unit:Stock Keeping Unit CSS1 selector,
-			low_stock_threshold:Low stock alert threshold CSS1 selector,
-			unit:Selling unit CSS1 selector,
-			tax_included:Whether tax CSS1 selector,
-			tax_code:Tax code for region-specific rules CSS1 selector,
-			main_image_url:Main product image URL CSS1 selector,
-			additional_image_url:additional product image URL CSS1 selector,
-			video_url:Promotional video URL CSS1 selector,
-			carrier:carrier CSS1 selector,
-			shipping_fee:Shipping cost CSS1 selector,
-			shipping_method:Shipping method CSS1 selector,
-			shipping_duration:Estimated delivery days CSS1 selector,
-			bundle_shipping:Allow combined shipping CSS1 selector,
-			product_width:product width CSS1 selector,
-			product_height:product height CSS1 selector,
-			product_length:product length CSS1 selector,
-			product_weight:product weight CSS1 selector,
-			fulfillment_service:Fulfillment provider CSS1 selector,
-			options:[{
-				name : option name CSS1 selector,
-				inputs:[{
-					input:option input CSS1 selector,
-				}]
-			}],
-			additional_goods:[{
-				link:URL includes manage path additional goods link CSS1 selector
-			}],
-			title:goods title CSS1 selector,
-			date:goods date(yyyy-MM-dd'T'HH:mm:ss) CSS1 selector
-		`
-	}else if(type == 'order'){
-		return `
-			status:${type} status CSS1 selector,
-			order_products:[{
-				title:product title CSS1 selector,
-				options:[{
-					name : product option name CSS1 selector,
-					option:product option value CSS1 selector,
-				}],
-				link:URL includes manage path additional product link CSS1 selector
-			}],
-			date:order date CSS1 selector
-		`
-	}else if(type == 'coupon' || type == 'event'){
-		return `
-			status:${type} status CSS1 selector,
-			title:${type} item title CSS1 selector, 
-			start_at:${type} item start date value(yyyy-MM-dd'T'HH:mm:ss) CSS1 selector,
-			end_at:${type} item end date value(yyyy-MM-dd'T'HH:mm:ss) CSS1 selector,
-			type:Type of discount CSS1 selector,
-			code:${type} code used at checkout CSS1 selector,
-			discount:Discount value input CSS1 selector,
-			new_customer_only:new customer only input CSS1 selector
-			min_order_amount:Minimum order amount required to apply coupon value input CSS1 selector,
-			max_discount_amount:Maximum discount limit allowed for the coupon value input CSS1 selector,
-			usage_limit:Total usage limit for the coupon value input CSS1 selector,
-			usage_per:Usage limit per customer value input CSS1 selector
-			region_restrictions:region restrictions value input CSS1 selector
-		`
-	}
-}
 
 const context2results = function(context, results, language){
 	var condition = ''
@@ -565,8 +820,8 @@ const context2results = function(context, results, language){
 		}
 	}
 	return JSON Structure {
-		results : [find the content corresponding to {search.text} in {search.results}],
-		text : Please summarize the search results and the context in ${language}.
+		results : [find the content corresponding to search.text in search.results],
+		markdown : Please respond with the search.results and the context in ${language} formatted in Markdown
 	}
 	`
 }
@@ -663,7 +918,7 @@ const isDiff = (obj1, obj2) => {
 
 
 	vector 메타데이터로 저장해야할 분류
-		'review' or 'member' or 'coupon' or 'event'
+		'review' or 'coupon' or 'event'
 
 		
 		amount 0
@@ -812,7 +1067,7 @@ function generatePugLines(nodes, indentLevel) {
 
 			// 불필요한 태그들을 만나면 건너뛰기
 			// input, textarea는 이제 포함됩니다.
-			if (['script', 'style', 'link', 'noscript', 'iframe', 'button'].includes(tagName)) {
+			if (['script', 'style', 'link', 'noscript', 'iframe'].includes(tagName)) {
 				return;
 			}
 
@@ -1044,22 +1299,22 @@ const Related = function(type){
 	var list = []
 
 	if(type == "goods"){
-		list = ['order','tracking','coupon','event','member']
+		list = ['order','tracking','coupon','event']
 
 	}else if(type == "order"){
-		list = ['goods','tracking','coupon','event','member']
+		list = ['goods','tracking','coupon','event']
 
 	}else if(type == "tracking"){
-		list = ['goods','order','coupon','event','member']
+		list = ['goods','order','coupon','event']
 
 	}else if(type == "coupon"){
-		list = ['goods','event','member']
+		list = ['goods','event']
 
 	}else if(type == "event"){
-		list = ['goods','coupon','member']
+		list = ['goods','coupon']
 
 	}else if(type == "review"){
-		list = ['goods','coupon','event','member']
+		list = ['goods','coupon','event']
 
 	}
 
@@ -1681,6 +1936,29 @@ async function arrayBufferToBase64(arrayBuffer) {
 	return btoa(binary)
 }
 
+
+
+function cleanNumber(str){
+	if(str.indexOf("-") > -1){
+		str = str.replace(/-/gi,"")
+	}
+
+	if(str.indexOf("_") > -1){
+		str = str.replace(/_/gi,"")
+	}
+
+	if(str.indexOf(".") > -1){
+		str = str.replace(/./gi,"")
+	}
+
+	if(str.indexOf(",") > -1){
+		str = str.replace(/,/gi,"")
+	}
+
+	return str
+}
+
+
 async function Deepinfra(key, model, system, user, inlineData){
 	// DeepInfra API 호출
 
@@ -1690,8 +1968,7 @@ async function Deepinfra(key, model, system, user, inlineData){
 		messages.push({
 			type: "image_url",   // 여기서 URL 입력
 			image_url: {
-				url: inlineData.data,
-				detail: "auto"
+				url: inlineData.data
 			}
 		})
 	}
@@ -1879,7 +2156,7 @@ export default {
 
 				var fallback = ''
 
-				var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "ref" = "${json.ref}" AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
+				var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "ref" = '${json.ref}' AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
 
 				console.log('results.length',results.length);
 
@@ -1894,7 +2171,9 @@ export default {
 						var task = JSON.parse(decompressedJsonString)
 
 						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-							text : task.text
+							text : task.body,
+							link : task.link,
+							origin : task.origin ? task.origin : ''
 						})), { to: 'arraybuffer' })
 
 						task.data = arr.buffer
@@ -1937,7 +2216,7 @@ export default {
 						}
 
 						// 팀 계정으로 해야함
-						var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = "team" AND "id" = "${task.team}" AND "created_at" < ${now} LIMIT 1`).all()
+						var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'team' AND "id" = '${task.team}' AND "created_at" < ${now} LIMIT 1`).all()
 
 						var team = results[0]
 
@@ -1986,33 +2265,27 @@ export default {
 						// model context protocol
 
 						if(task.contentType == "image/jpeg"){
-							var base64 = arrayBufferToBase64(task.buffer)
-
-							var inlineData = { mimeType: task.contentType, data: base64 }
+							var inlineData = { mimeType: task.contentType, data: task.body }
 
 							var type = talk.type = task.type
 
-
-							// 주소 조회해야함
-							// 겸사 겸사 업체 정보 등록받자
 							var address = team.data.address ? team.data.address : []
 
 							var system = image2json(type, address)
 
-							var content = task.text
-
-
 							var item
 
 							if(models['deepinfra']){
-								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, content, inlineData)
+								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', inlineData)
 
 								models['deepinfra'] -= 1
 
 							}
 
+							console.log('deepinfra item',JSON.stringify(item))
+
 							if(!item && gemini_llm_api){
-								item = await Gemini(gemini_llm_api, gemini_llm_model, system, content, null, inlineData)
+								item = await Gemini(gemini_llm_api, gemini_llm_model, system, '', null, inlineData)
 
 								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -2055,16 +2328,14 @@ export default {
 								둘다 없으면 type 'draft'로 전부 추가해야함
 							*/
 							
+							item.tracking_number = item.id + ""
 
-							item.no = item.id
+							item.id = normalizeNumericHomoglyphs(item.id)
 
-							if(item.no.indexOf("-") > -1){
-								item.no = item.no.replace(/-/gi,"")
-							}
+							item.no = cleanNumber(item.id)
 
-							if(item.no.indexOf("_") > -1){
-								item.no = item.no.replace(/_/gi,"")
-							}
+
+
 
 							item.id = hashId(team.id+item.no)
 
@@ -2087,11 +2358,11 @@ export default {
 							var statusCode = item.status = item.status ? parseStatus(item.status) : 0
 
 
-							var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+							var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 							var sales = results
 
-							if(results.length){
+							if(sales.length){
 								var _item = safeClone(results[0])
 
 								delete _item.id
@@ -2115,7 +2386,7 @@ export default {
 
 
 							if(type == "tracking"){
-								var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+								var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 								if(results.length){
 									var _item = results[0]
@@ -2210,7 +2481,13 @@ export default {
 
 									item.type = item.recipient_match ? 'receiving' : 'shipping'
 
+
+
+									// 추후에 반품인지 아닌지 추가해야함
+
+
 									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+										no : item.no ? item.no :"",
 										type : item.type,
 										text : item.text,
 										link : null
@@ -2220,6 +2497,7 @@ export default {
 
 									var metadata = {
 										id: item.id,
+										no: item.no ? item.no : "",
 										type: item.type,
 										from: task.from,
 										to: task.to,
@@ -2387,6 +2665,40 @@ export default {
 						}else if(task.scan){
 							// INSERT 백터 생성 INSERT
 
+							const isMore = function(selectors){
+								var bool = false
+
+								var selector = ''
+										
+								if(_page.type == "goods"){
+									selector = `${selectors.title} ${selectors.sale_price}`
+								}else if(_page.type == "order"){
+									selector = `${selectors.tracking_number}, ${selectors.payment_method}, ${selectors.payment_origin}, ${selectors.bank}, ${selectors.card}`
+								}else if(_page.type == "tracking"){
+									selector = `${selectors.title}, ${selectors.id}, ${selectors.shipping_method}`
+								}else if(_page.type == "event"){
+									selector = `${selectors.title}, ${selectors.started_at}, ${selectors.expired_at}`
+								}else if(_page.type == "coupon"){
+									selector = `${selectors.title}, ${selectors.started_at}, ${selectors.expired_at}`
+								}
+
+								if(selector){
+									try{
+										var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
+
+										var $target = document.querySelectorAll(selector)
+
+										if($target.length){
+											bool = true
+										}
+									}catch(err){
+										console.log('more page err',err);
+									}
+								}
+
+								return bool
+							}
+
 							var isDetail = false
 
 							try{
@@ -2398,41 +2710,55 @@ export default {
 
 								var url = new URL(task.href)
 
-								var pathname = url.pathname
+								var pathname = url.pathname.toLowerCase()
 
 								var pageId = hashId(task.cc+pathname)
 
-								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${pageId}" AND "created_at" < ${created_at} LIMIT 1`).all()
+								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
-								if(results.length){
+								var pages = results
+
+								if(pages.length){
 									var _page = results[0]
 
-									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(results[0].data))
-
-									var selectors = JSON.parse(decompressedJsonString)
-
 									if(_page.type){
-										if(task.ref == pageId){
+										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+										var selectors = JSON.parse(decompressedJsonString)
+
+										isDetail = isMore(selectors)
+
+										if(isDetail){
 											pageType = _page.type
+
+										}else if(task.ref == pageId){
+											var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${hashId(task.cc+pathname.toUpperCase())}' AND "created_at" < ${created_at} LIMIT 1`).all()
+
+											if(results.length){
+												var _page = results[0]
+
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+												var selectors = JSON.parse(decompressedJsonString)
+
+
+												isDetail = isMore(selectors)
+
+												if(isDetail){
+													pageType = _page.type
+												}
+											}
+
 										}
 
 										try{
-											var { document } = parseHTML(`<html><body>${task.text}</body></html>`);
+											var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
 
-											var $items = document.querySelectorAll(selectors.item)
-
-											if(task.ref == pageId && $items.length == 0){
-												pathname = pathname.toUpperCase()
-
-												pageId = hashId(task.cc+pathname)
-
-												isDetail = true
-
-											}else if(document.querySelector(selectors.node)){
-												task.text = document.querySelector(selectors.node).innerHTML
+											if(document.querySelector(selectors.node)){
+												task.body = document.querySelector(selectors.node).innerHTML
 											}
 										}catch(err){
-											console.log('page err',err);
+											console.log('cahce page err',err);
 										}
 									}
 								}
@@ -2442,11 +2768,29 @@ export default {
 
 								var itemId = hashId(team.id+task.cc+task.link)
 
-								var { results } = await env[`${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = "${itemId}" AND "created_at" < ${created_at} LIMIT 1`).all()
+								var { results } = await env[`${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${itemId}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
 								if(results.length){
-									if(task.ref){
-										var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = "${task.ref}" AND "created_at" < ${created_at} LIMIT 1`).all()
+									var item = results[0]
+
+									if(item.data){
+
+									}
+									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+
+									item.data = JSON.parse(decompressedJsonString)
+
+									if(item.data){
+										if(item.data.detail){
+											isDetail = true
+										}
+									}
+									
+								}
+
+								if(!isDetail){
+									if(task.referrer){
+										var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${task.referrer}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
 										if(results.length){
 											var _page = results[0]
@@ -2454,11 +2798,11 @@ export default {
 											if(_page.type){
 												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
 
-												var _data = JSON.parse(decompressedJsonString)
+												var selectors = JSON.parse(decompressedJsonString)
 
-												if(_data.item){
-													isDetail = true
+												isDetail = isMore(selectors)
 
+												if(isDetail){
 													pageType = _page.type
 												}
 											}
@@ -2468,7 +2812,11 @@ export default {
 
 
 
-								var content = convertHtmlToCleanPug(task.text)
+								var content = convertHtmlToCleanPug(task.body)
+
+								console.log('content.length',content.length);
+
+								console.log('isDetail',JSON.stringify(isDetail));
 
 								if(!isDetail){
 									var system = list2json(language)
@@ -2545,31 +2893,119 @@ export default {
 								page.cc = task.cc
 								page.bcc = task.bcc
 
-								if(isDetail){
-									page.items = [safeClone(page)]
+								var selectors = {
+									text : page.text || '',
+									node : page.node || '',
+									item : page.item || '',
+									more : page.more || '',
+									next : page.next || '',
+									link : task.link,
+									origin : task.origin ? task.origin : ''
 								}
+
+								if(isDetail){
+									var item = safeClone(page)
+
+									for (var p in item) {
+										if (item.hasOwnProperty(p)) {
+											var prop = item[p]
+
+											if(prop){
+												if(typeof prop.selector != "undefined"){
+													selectors[p] = prop.selector;
+													item[p] = prop.value;
+
+												}else if(typeof prop.length == 'number'){
+
+													for(var i = 0; i < prop.length; i++){
+														var option = prop[i]
+
+														if(typeof option == "object" && Object.keys(option).length){
+															for(var n in option){
+																if (option.hasOwnProperty(n)) {
+																	var opt = option[n]
+																	
+																	if(n == "selector"){
+																		selectors[`${p}`] = option.selector
+
+																		item[p][i] = option.value
+
+																	}else if(typeof opt == "object" && Object.keys(opt).length){
+																		for(var o in opt){
+																			if (opt.hasOwnProperty(o)) {
+																				var obj = opt[o]
+
+																				if(o == "selector"){
+																					selectors[`${p}_${n}`] = opt.selector
+
+																					item[p][i][n] = opt.value
+																				}
+																			}
+																		}
+																	}
+																}
+															}
+														}
+													}
+												}
+											}
+										}
+									}
+
+									page.items = [item]
+
+
+								}
+
+
+
+								console.log('selectors',JSON.stringify(selectors));
+
+								var items = []
+
+								if(page.items){
+									if(page.items.length){
+										items = page.items
+									}
+								}
+
+								
 
 
 								page.id = pageId
 
 
 								talk.text = page.text
+								
 
 
-								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-									text : page.text || "",
-									node : page.node || "",
-									item : page.item || "",
-									edit : page.edit || "",
-									next : page.next || "",
-									link : task.link,
-									origin : task.origin ? task.origin : ''
-								})), { to: 'arraybuffer' })
+								
 
-								page.ref = task.ref
+								page.ref = task.referrer ? task.referrer : ''
+
+
+								console.log('JSON.stringify(page)',JSON.stringify(page))
+
+
+								page.data = selectors
+
+								if(pages){
+									if(pages.length){
+										var _page = pages[0]
+
+										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+										_page.data = JSON.parse(decompressedJsonString)
+
+										page = mergeNode(_page, page)
+									}
+								}
+
+									
+
+								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(page.data)), { to: 'arraybuffer' })
 
 								page.data = arr.buffer
-
 
 
 								statements[CenterRegion].push(
@@ -2612,11 +3048,11 @@ export default {
 										값 가져오기
 								*/ 
 
-								var items = page.items ? page.items : []
-
-								console.log('items',JSON.stringify(items));
+								console.log('진입전 items');
 
 								if(items.length){
+
+									console.log('items',JSON.stringify(items));
 									/*
 										주문이후의 절차는 주문번호로 매칭해야함
 
@@ -2666,15 +3102,8 @@ export default {
 
 										item.type = page.type
 
-										item.no = (item.id ? item.id : i).toString()
+										item.no = cleanNumber(item.id.toString())
 
-										if(item.no.indexOf("-") > -1){
-											item.no = item.no.replace(/-/gi,"")
-										}
-
-										if(item.no.indexOf("_") > -1){
-											item.no = item.no.replace(/_/gi,"")
-										}
 
 										item.index = crc32(hashId(team.id+item.no))
 
@@ -2684,11 +3113,11 @@ export default {
 											}catch(err){
 												var _url = new URL(task.origin+item.link)
 
-												item.link = _url.pathname + _url.search
+												item.link = (_url.pathname + _url.search).toLowerCase()
 											}
 
-											item.link = _url.pathname + _url.search
-
+											item.link = (_url.pathname + _url.search).toLowerCase()
+											
 										}catch(err){
 
 										}
@@ -2713,7 +3142,7 @@ export default {
 
 
 										if(item.type == "tracking"){
-											var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE index" = "${item.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+											var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE index" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 											if(results.length){
 												var _item = results[0]
@@ -2726,7 +3155,7 @@ export default {
 													}
 												}
 
-												item = mergeNode(item, _item)
+												item = mergeNode(_item, item)
 											}
 
 											item.id = hashId(team.id+task.cc+task.link)
@@ -2737,6 +3166,7 @@ export default {
 										item.from = task.from
 										item.to = task.to
 										item.cc = task.cc
+
 										item.bcc = task.bcc
 
 										item.ref = task.ref
@@ -2746,10 +3176,14 @@ export default {
 
 										delete item.goods
 
-										if(typeof goods.length != "undefined"){
-											goods.unshift({})
-										}else{
-											goods = []
+										try{
+											if(typeof goods.length != "undefined"){
+												goods.unshift({})
+											}else{
+												goods = []
+											}
+										}catch(err){
+											console.log('goods err',err);
 										}
 
 
@@ -2768,28 +3202,21 @@ export default {
 										item.expired_at = item.expiration_date ? item.expiration_date : 0
 
 										var statusCode = item.status = item.status ? parseStatus(item.status) : 0
-										
-
 
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 											id : item.id,
+											no : item.no ? item.no : "",
 											title : item.title,
 											link : item.link,
-											origin : task.origin ? task.origin : ''
+											origin : task.origin ? task.origin : '',
+											detail : true
 										})), { to: 'arraybuffer' })
 
 										item.data = arr.buffer
 
 										if(item.tracking_number){
-											var tracking_number = item.tracking_number
-
-											if(tracking_number.indexOf("-") > -1){
-												tracking_number = tracking_number.replace(/-/gi,"")
-											}
-
-											if(tracking_number.indexOf("_") > -1){
-												tracking_number = tracking_number.replace(/_/gi,"")
-											}
+											var tracking_number = normalizeNumericHomoglyphs(item.tracking_number)
+												tracking_number = cleanNumber(tracking_number)
 
 											item.tracking = crc32(hashId(team.id+tracking_number))
 										}
@@ -2799,7 +3226,7 @@ export default {
 										try{
 											console.log('item.type',item.type);
 
-											if(item.type == "order" && item.tracking_number){
+											if(item.type == "order" && goods){
 												/*
 													상세와 리스트 차이가 분명히 있음
 
@@ -2808,8 +3235,9 @@ export default {
 														상세페이지에서는 송장번호가 있음
 												*/
 
-												if(goods.length){
+												if(goods.length && item.tracking_number){
 													for(var g = 0; g < goods.length; g++){
+
 														var good = safeClone(goods[g])
 
 														var tracking = safeClone(item)
@@ -2821,21 +3249,13 @@ export default {
 														tracking.index = item.tracking
 
 														if(good.id){
-															var no = good.id.toString()
-
-															if(no.indexOf("-") > -1){
-																no = no.replace(/-/gi,"")
-															}
-
-															if(no.indexOf("_") > -1){
-																no = no.replace(/_/gi,"")
-															}
+															var no = cleanNumber(good.id.toString())
 
 															good.no = no
 
 															good.index = crc32(hashId(team.id+good.no))
 
-															var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = "goods" AND "index" = "${good.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+															var { results } = await env[`${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = 'goods' AND "index" = ${good.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 															if(results.length){
 																tracking.event = results[0].event
@@ -2848,7 +3268,8 @@ export default {
 															tracking.id = hashId(team.id+tracking.no)
 														}
 
-														tracking.status = item.status
+
+														tracking.status = parseStatus(item.status)
 
 														tracking.order = item.index
 
@@ -2872,7 +3293,7 @@ export default {
 
 
 
-														var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = "${tracking.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+														var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = ${tracking.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 														if(results.length){
 															var _tracking = safeClone(results[0])
@@ -2979,6 +3400,10 @@ export default {
 															await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 														}
 
+														var ggg = safeClone(tracking)
+														delete ggg.data
+														console.log('JSON.stringify(ggg)',JSON.stringify(ggg))
+
 														var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
 
 														statements[`${zoneRegion}_tracking`].push(
@@ -3074,15 +3499,15 @@ export default {
 											}
 
 											if(item.condition.indexOf('lease') > -1){
-												item.lease = 1
+												item.lease = 2
 											}
 
 											if(item.condition.indexOf('rental') > -1){
-												item.rental = 1
+												item.rental = 3
 											}
 
 											if(item.condition.indexOf('refurbish') > -1){
-												item.refurbish = 1
+												item.refurbish = 4
 											}
 										}
 
@@ -3098,7 +3523,7 @@ export default {
 
 
 
-										var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = "${item.id}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+										var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 										if(results.length){
 											var _item = results[0]
@@ -3111,9 +3536,9 @@ export default {
 												}
 											}
 
-											item = mergeNode(item, _item)
+											item = mergeNode(_item, item)
 										}else{
-											var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = "${item.index}" AND "to" = "${task.to}" AND "created_at" < ${now} LIMIT 1`).all()
+											var { results } = await env[`${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 											if(results.length){
 												var _item = results[0]
@@ -3126,7 +3551,7 @@ export default {
 													}
 												}
 
-												item = mergeNode(item, _item)
+												item = mergeNode(_item, item)
 											}
 										}
 
@@ -3381,7 +3806,6 @@ export default {
 															).all()
 														}
 
-															
 
 														if(results.length == 0){
 															// draft 상태 맞음
@@ -3534,6 +3958,7 @@ export default {
 																		if(from.type == "goods" && to.type == "order"){
 																			var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 																				id : edge.id,
+																				no : edge.no ? edge.no : "",
 																				title : edge.title,
 																				link : edge.link,
 																				origin : data.origin ? data.origin : "",
@@ -3592,7 +4017,7 @@ export default {
 																			metadata.to = task.to
 																			metadata.cc = task.cc
 																			metadata.bcc = task.bcc
-																			metadata.ref = task.ref
+																			metadata.ref = edge.ref
 
 																			var embeddings
 
@@ -3902,6 +4327,7 @@ export default {
 																// draft 추가해야함
 																var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 																	id : item.id,
+																	no : item.no ? item.no : "",
 																	title : item.title,
 																	link : item.link,
 																	data : relate
@@ -4404,7 +4830,7 @@ export default {
 							var paragraphs
 
 							if(models['deepinfra']){
-								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', para2graph(language).trim(), task.text)
+								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', para2graph(language).trim(), task.body)
 
 								if(res){
 									paragraphs = res.context
@@ -4415,7 +4841,7 @@ export default {
 							}
 
 							if(!paragraphs && gemini_llm_api){
-								var res = await Gemini(gemini_llm_api, gemini_llm_model, para2graph(language).trim(), task.text)
+								var res = await Gemini(gemini_llm_api, gemini_llm_model, para2graph(language).trim(), task.body)
 
 								if(res){
 									paragraphs = res.context
@@ -4719,6 +5145,7 @@ export default {
 							}
 
 
+
 							var contexts
 
 							if(models['deepinfra']){
@@ -4757,7 +5184,7 @@ export default {
 							// // 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
 							// if(task.topK > 50){
 							// 	var { results, success, error } = await env[`${zoneRegion}_talks`].prepare(
-							// 		`SELECT * FROM talks WHERE "bcc" = "${task.bcc}" AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
+							// 		`SELECT * FROM talks WHERE "bcc" = '${task.bcc}' AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
 							// 	).all()
 
 							// 	if(results.length){
@@ -4765,7 +5192,7 @@ export default {
 							// 			var retrieval = results[r]
 
 							// 			var { results, success, error } = await env[`${zoneRegion}_${retrieval.type}`].prepare(
-							// 				`SELECT * FROM ${retrieval.type} WHERE "ref" = "${retrieval.ref}" AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
+							// 				`SELECT * FROM ${retrieval.type} WHERE "ref" = '${retrieval.ref}' AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
 							// 			).all()
 
 							// 			var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(retrieval.data))
@@ -4895,13 +5322,34 @@ export default {
 										var condition = `"created_at" < ${now}`
 
 
+
 										if(context.status){
 											if(type == "sales"){
 												if(context.status == "used" || context.status == "lease" || context.status == "rental" || context.status == "refurbish"){
 													condition += ` AND "${context.status}" > 0 `
 												}
 											}else{
-												condition += ` AND "status" = "${context.status}" `
+												var status = 0
+
+												if(context.status.indexOf('used') > -1){
+													status = 1
+												}
+
+												if(context.status.indexOf('lease') > -1){
+													status = 2
+												}
+
+												if(context.status.indexOf('rental') > -1){
+													status = 3
+												}
+
+												if(context.status.indexOf('refurbish') > -1){
+													status = 4
+												}
+
+												if(status){
+													condition += ` AND "status" = ${status} `
+												}
 											}
 										}
 
@@ -4946,7 +5394,7 @@ export default {
 													matches_condition += ' OR '
 												}
 
-												matches_condition += `("id" = "${match.id}" AND "to" = "${team.id}" AND "created_at" < ${now})`
+												matches_condition += `("id" = '${match.id}' AND "to" = '${team.id}' AND "created_at" < ${now})`
 											}
 										}
 
@@ -4992,7 +5440,7 @@ export default {
 											orderBy = `ORDER BY ${context.by} ${context.sort}`
 										}
 
-										var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = "${team.id}" AND "created_at" < ${now} ${orderBy} LIMIT 300`).all()
+										var { results } = await env[`${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' AND "created_at" < ${now} ${orderBy} LIMIT 300`).all()
 
 										if(results.length){
 											for(var r = 0; r < results.length; r++){
@@ -5033,30 +5481,31 @@ export default {
 										var content = context2results(context, [...rag.search.sql.results, ...rag.search.vector.results], language)
 
 
-										var text
+										var generation
 
 										if(models['deepinfra']){
-											text = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+											generation = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 											models['deepinfra'] -= 1
 
 										}
 
-										if(!text && gemini_llm_api){
-											text = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+										if(!generation && gemini_llm_api){
+											generation = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
 
 											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
 										}
 
-										if(!text){
+										if(!generation){
 											fallback = 'overflow'
 
 											continue
 										}
 
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-											text : text,
+											markdown : generation.markdown,
+											results: generation.results,
 											search : rag.search
 										})), { to: 'arraybuffer' })
 
