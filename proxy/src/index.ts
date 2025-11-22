@@ -5278,7 +5278,7 @@ export default {
 											options:{
 												topK: task.topK,
 												returnValues: false, // true 이며 벡터 값 포함
-												returnMetadata: true,
+												returnMetadata: 'all',
 												filter : {
 													type : context.type,
 													to : team.id
