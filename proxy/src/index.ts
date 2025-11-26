@@ -308,7 +308,7 @@ const list2json = function(language){
 		type:'order' or 'goods' or 'tracking' or 'search' or 'review' or 'coupon' or 'event' or '',
 		isDetail:is detail page | true/false,
 		item:Item CSS1 selector excluding ads,
-		more:Item URL includes manage path additional Link CSS1 selector,
+		more:Item URL includes a manage path, an administrative or edit route Link CSS1 selector,
 		next:List next button CSS1 selector,
 		node:List CSS1 selector excluding ads,
 		text:Summarize the contents of the items array in ${language},
@@ -317,12 +317,12 @@ const list2json = function(language){
 				status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 				id:Refer to the ID value from the link or an attribute | string,
 				title:author and content | string, 
-				link:URL includes manage path additional link | string,
+				link:URL includes a manage path, an administrative or edit route Link | string,
 				date:yyyy-MM-dd'T'HH:mm:ss | string,
 			}
 			if (type is 'order' or 'goods') {
 				status:'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-				link:URL includes manage path additional link | string,
+				link:URL includes a manage path, an administrative or edit route Link | string,
 				id:Refer to the ID value from the link or an attribute | string,
 				title:title | string, 
 				sale_price:sale price | number,
@@ -610,7 +610,7 @@ const item2json = function(type, href){
 			],
 			additional_goods:[
 				{
-					value:URL includes manage path additional product link | string,
+					value:URL includes a manage path, an administrative or edit route product Link | string,
 					selector:sibling value based CSS1 selector
 				}
 			],
@@ -645,7 +645,7 @@ const item2json = function(type, href){
 					selector:sibling value based CSS1 selector
 				},
 				link:{
-					value:URL includes manage path additional goods link | string,
+					value:URL includes a manage path, an administrative or edit route goods Link | string,
 					selector:sibling value based CSS1 selector
 				},
 				id:{
@@ -2418,8 +2418,6 @@ export default {
 
 								item.created_at = now
 
-
-
 								if(sales.length){
 									var _item = sales[0]
 
@@ -2971,10 +2969,6 @@ export default {
 
 								
 
-
-								page.id = pageId
-
-
 								talk.text = page.text
 								
 
@@ -3001,7 +2995,8 @@ export default {
 									}
 								}
 
-									
+
+								page.id = pageId
 
 								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(page.data)), { to: 'arraybuffer' })
 
@@ -4430,10 +4425,13 @@ export default {
 										}
 
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+											node : page.node ? page.node : '',
+											item : page.item ? page.item : '',
 											type : item.type,
 											text : item.semantic,
 											link : item.link,
-											origin : task.origin ? task.origin : ''
+											origin : task.origin ? task.origin : '',
+											ref : page.ref
 										})), { to: 'arraybuffer' })
 
 
