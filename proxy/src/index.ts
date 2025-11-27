@@ -2717,7 +2717,7 @@ export default {
 								var pages = results
 
 								if(pages.length){
-									var _page = results[0]
+									var _page = pages[0]
 
 									if(_page.type){
 										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
@@ -2739,11 +2739,22 @@ export default {
 
 												var selectors = JSON.parse(decompressedJsonString)
 
-
 												isDetail = isMore(selectors)
 
 												if(isDetail){
 													pageType = _page.type
+												}
+
+												try{
+													var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
+
+													var $target = document.querySelectorAll(_page.data.node)
+
+													if($target.length){
+														task.page = _page
+													}
+												}catch(err){
+													console.log('more page err',err);
 												}
 											}
 
@@ -2755,6 +2766,7 @@ export default {
 											if(document.querySelector(selectors.node)){
 												task.body = document.querySelector(selectors.node).innerHTML
 											}
+
 										}catch(err){
 											console.log('cahce page err',err);
 										}
@@ -2902,6 +2914,8 @@ export default {
 								}
 
 								if(isDetail){
+									pageId = hashId(task.cc+pathname.toUpperCase())
+									
 									var item = safeClone(page)
 
 									for (var p in item) {
@@ -2996,7 +3010,8 @@ export default {
 								}
 
 
-								page.id = pageId
+
+								page.id = task.page ? task.page.id : pageId
 
 								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(page.data)), { to: 'arraybuffer' })
 
@@ -3105,13 +3120,13 @@ export default {
 										try{
 											try{
 												var _url = new URL(item.link)
+
+												item.link = (_url.pathname + _url.search).toLowerCase()
 											}catch(err){
 												var _url = new URL(task.origin+item.link)
 
 												item.link = (_url.pathname + _url.search).toLowerCase()
 											}
-
-											item.link = (_url.pathname + _url.search).toLowerCase()
 											
 										}catch(err){
 
@@ -3134,7 +3149,6 @@ export default {
 
 
 										item.id = hashId(team.id+task.cc+item.link)
-
 
 										if(item.type == "tracking"){
 											var { results } = await env[`${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE index" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
@@ -3394,10 +3408,6 @@ export default {
 
 															await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 														}
-
-														var ggg = safeClone(tracking)
-														delete ggg.data
-														console.log('JSON.stringify(ggg)',JSON.stringify(ggg))
 
 														var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
 
@@ -5400,9 +5410,9 @@ export default {
 
 										if(results.length){
 											for(var r = 0; r < results.length; r++){
-												var item = results[r]
+												var result = results[r]
 
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(result.data))
 
 												var data = JSON.parse(decompressedJsonString)
 
@@ -5412,7 +5422,7 @@ export default {
 															if (data.hasOwnProperty(name)) {
 																var value = data[name]
 
-																item[name] = value
+																result[name] = value
 															}
 														}
 													}
@@ -5442,9 +5452,9 @@ export default {
 
 										if(results.length){
 											for(var r = 0; r < results.length; r++){
-												var item = results[r]
+												var result = results[r]
 
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(result.data))
 
 												var data = JSON.parse(decompressedJsonString)
 
@@ -5454,7 +5464,7 @@ export default {
 															if (data.hasOwnProperty(name)) {
 																var value = data[name]
 
-																item[name] = value
+																result[name] = value
 															}
 														}
 													}
@@ -5666,7 +5676,7 @@ export default {
 					}), {
 						headers: { "Content-Type": "application/json" },
 					})
-				}       
+				}
 			}
 		}catch(err){
 			console.log('err',err);
