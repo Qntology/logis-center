@@ -4,7 +4,7 @@ async function Sleep(ms) {
 	return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-const CenterRegion = "center_logis"
+const CenterRegion = "logis_central"
 
 async function Cron(event, env, ctx, models, limits){
 	/*
