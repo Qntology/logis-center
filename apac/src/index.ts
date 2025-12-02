@@ -15,6 +15,8 @@ async function Cron(event, env, ctx, models, limits){
 	
 	var created_at = now - 10000
 
+	console.log('env.region',env.region);
+
 	try{
 		var { results } = await env[env.region].prepare(`SELECT * FROM tasks WHERE "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1000`).all()
 

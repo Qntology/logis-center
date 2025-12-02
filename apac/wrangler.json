@@ -10,61 +10,9 @@
       "database_name": "logis_apac"
     },
     {
-      "binding": "logis_apac1_items",
-      "database_id": "698a6600-a177-41c2-b891-f2b39d07c461",
-      "database_name": "logis_apac1_items"
-    },
-    {
-      "binding": "logis_apac1_event",
-      "database_id": "8cbde350-bdda-4340-9cb0-56606675d4a8",
-      "database_name": "logis_apac1_event"
-    },
-    {
-      "binding": "logis_apac1_sales",
-      "database_id": "6a25f901-a013-403c-9f63-dfe354b413e7",
-      "database_name": "logis_apac1_sales"
-    },
-    {
-      "binding": "logis_apac1_talks",
-      "database_id": "3c40b41f-1864-426a-91ba-33b8e65a50e4",
-      "database_name": "logis_apac1_talks"
-    },
-    {
-      "binding": "logis_apac1_tracking",
-      "database_id": "278f0c5e-f9a3-4368-85dc-30d6f153f862",
-      "database_name": "logis_apac1_tracking"
-    },
-    {
-      "binding": "logis_central",
-      "database_id": "c79f2b22-f275-4eba-b26d-8baeaccdd1f4",
-      "database_name": "logis_central"
-    },
-    {
       "binding": "DB",
       "database_id": "54991e7a-7240-4f34-8c8a-da9923eb170c",
       "database_name": "logis_center"
-    }
-  ],
-  "vectorize": [
-    {
-      "binding": "logis-apac1-event",
-      "index_name": "logis-apac1-event"
-    },
-    {
-      "binding": "logis-apac1-items",
-      "index_name": "logis-apac1-items"
-    },
-    {
-      "binding": "logis-apac1-sales",
-      "index_name": "logis-apac1-sales"
-    },
-    {
-      "binding": "logis-apac1-tracking",
-      "index_name": "logis-apac1-tracking"
-    },
-    {
-      "binding": "logis-central",
-      "index_name": "logis-central"
     }
   ],
   "ai": {

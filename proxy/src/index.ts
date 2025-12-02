@@ -153,10 +153,12 @@ function mergeNode(obj1, obj2) {
 
 const image2json = function(type, address){
 	if(type == "tracking"){
-		return `convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.{
-			no:Tracking Number(운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ) | string,
+		return `convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.
+		# Tracking Number : 운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ
+		{
+			no:Tracking Number | string,
 			recipient_address : ${JSON.stringify(address)},
-			recipient_match : shipping label recipient address match. Ruled the same despite different floor levels | true/false,
+			recipient_match : shipping label recipient address match. Ruled the same despite different floor levels | boolean,
 			text : summarize including the shipping label contents. Filter the addresses included in the summary information to District-level and up | string,
 			barcode : [barcode number | string]
 		}`
@@ -305,8 +307,8 @@ const graph2contexts = function(current){
 
 const list2json = function(language){
 	return `
-		type:'order' or 'goods' or 'tracking' or 'search' or 'review' or 'coupon' or 'event' or '',
-		isDetail:is detail page | true/false,
+		type:'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
+		isDetail:is detail page | boolean,
 		item:Item CSS1 selector excluding ads,
 		more:Item URL includes a manage path, an administrative or edit route Link CSS1 selector,
 		next:List next button CSS1 selector,
@@ -1986,7 +1988,6 @@ async function Deepinfra(key, model, system, user, inlineData){
 	var body = {
 		"model" : model,
 		"messages": messages,
-		"max_tokens": 5000,
 		"temperature": 1
 	}
 
@@ -2027,7 +2028,7 @@ async function Deepinfra(key, model, system, user, inlineData){
 		try{
 			var results = JSON.parse(content)
 
-			return safeClone(results)
+			return results
 		}catch(err){
 
 		}
@@ -2042,10 +2043,12 @@ async function Deepinfra(key, model, system, user, inlineData){
 
 			var results = JSON.parse(content)
 
-			return safeClone(results)
+			return results
 		}catch(err){
-			return content
+			
 		}
+
+		return content
 	}
 }
 
@@ -2095,8 +2098,7 @@ async function Gemini(key, model, system, user, config, inlineData){
 
 			var results = JSON.parse(content)
 
-
-			return safeClone(results.length ? results[0] : results)
+			return results.length ? results[0] : results
 		}catch(err){
 			
 		}
@@ -2190,7 +2192,7 @@ export default {
 
 						var zoneRegion = task.zone
 
-						var vectorRegion = zoneRegion.replace(/_/gi,"-")
+						var vectorRegion = 'logis-'+zoneRegion.replace(/_/gi,"-")
 
 						var language = languageCode[task.flag]
 
@@ -2271,7 +2273,7 @@ export default {
 							var item
 
 							if(models['deepinfra']){
-								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', inlineData)
+								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', '', system, inlineData)
 
 								models['deepinfra'] -= 1
 
@@ -2280,7 +2282,7 @@ export default {
 							console.log('deepinfra item',JSON.stringify(item))
 
 							if(!item && gemini_llm_api){
-								item = await Gemini(gemini_llm_api, gemini_llm_model, system, '', null, inlineData)
+								item = await Gemini(gemini_llm_api, gemini_llm_model, '', system, null, inlineData)
 
 								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -2829,10 +2831,12 @@ export default {
 								if(!isDetail){
 									var system = list2json(language)
 
-									system = system.trim()
-
 									if(models['deepinfra']){
-										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', `
+											Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+											{language:'${language}',${system}}
+											${content}
+										`)
 
 										pageType = page.type
 
@@ -2847,7 +2851,11 @@ export default {
 									}
 
 									if(!page && gemini_llm_api){
-										page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+										page = await Gemini(gemini_llm_api, gemini_llm_model, '', `
+											Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+											{language:'${language}',${system}}
+											${content}
+										`)
 
 										pageType = page.type
 
@@ -2863,24 +2871,39 @@ export default {
 								}
 
 
-								if((!isDetail && !pageLength) || isDetail){
+								if((!isDetail && !pageLength && pageType) || isDetail){
 									var system = item2json(pageType, task.href)
 
-									system = system.trim()
-
 									if(models['deepinfra']){
-										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}${content}`)
 
-										page.link = task.link
+
+										if(page.node){
+											page.type = pageType
+
+											page.link = task.link
+
+											isDetail = true
+										}else{
+											page = null
+										}
 
 										models['deepinfra'] -= 1
 
 									}
 
 									if(!page && gemini_llm_api){
-										page = await Gemini(gemini_llm_api, gemini_llm_model, `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}`, content)
+										page = await Gemini(gemini_llm_api, gemini_llm_model, '', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}${content}`)
 
-										page.link = task.link
+										if(page.node){
+											page.type = pageType
+
+											page.link = task.link
+
+											isDetail = true
+										}else{
+											page = null
+										}
 
 										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -2894,6 +2917,7 @@ export default {
 
 									continue
 								}
+
 
 								page.type = pageType
 								page.from = task.from
@@ -2912,7 +2936,11 @@ export default {
 								}
 
 								if(isDetail){
-									pageId = hashId(task.cc+pathname.toUpperCase())
+									task.ref = talk.ref = pageId = hashId(task.cc+pathname.toUpperCase())
+
+									var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
+
+									pages = results
 									
 									var item = safeClone(page)
 
@@ -2964,12 +2992,8 @@ export default {
 
 									page.items = [item]
 
-
 								}
 
-
-
-								console.log('selectors',JSON.stringify(selectors));
 
 								var items = []
 
@@ -2979,37 +3003,73 @@ export default {
 									}
 								}
 
-								
 
 								talk.text = page.text
 								
 
-
-								
-
 								page.ref = task.referrer ? task.referrer : ''
-
-
-								console.log('JSON.stringify(page)',JSON.stringify(page))
 
 
 								page.data = selectors
 
 								if(pages){
 									if(pages.length){
-										var _page = pages[0]
+										for(var p = 0; p < pages.length; p++){
+											var _page = pages[p]
 
-										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
 
-										_page.data = JSON.parse(decompressedJsonString)
+											var before = JSON.parse(decompressedJsonString)
+											var after = selectors
 
-										page = mergeNode(_page, page)
+											try{
+												var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
+
+												if(Object.keys(before).length){
+													for (var selector in before) {
+														if (before.hasOwnProperty(selector)) {
+															if(typeof selector == "string"){
+																try{
+																	var $before = document.querySelector(`${before[selector]}`)
+																	var $after = document.querySelector(`${after[selector]}`)
+
+																	if($before && !$after){
+																		_page.data[selector] = page.data[selector] = before[selector] + ''
+
+																	}else if(!$before && $after){
+																		_page.data[selector] = page.data[selector] = after[selector] + ''
+
+																	}else if($before && $after){
+																		_page.data[selector] = page.data[selector] = before[selector] + ''
+
+																	}
+
+																}catch(err){
+																	console.log('selector err',err);
+																}
+															}
+														}
+													}
+												}
+											}catch(err){
+												// console.log('_page.data err',err);
+											}
+
+											_page.data = before
+
+											page = mergeNode(_page, page)
+
+											selectors = page.data
+										}
+
 									}
 								}
 
 
 
 								page.id = task.page ? task.page.id : pageId
+
+								console.log('page.id',page.id);
 
 								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(page.data)), { to: 'arraybuffer' })
 
@@ -3337,14 +3397,14 @@ export default {
 															var semantic
 
 															if(models['deepinfra']){
-																semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', semantic_prompt_system(language), content)
+																semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', semantic_prompt_system(language)+content)
 
 																models['deepinfra'] -= 1
 
 															}
 
 															if(!semantic && gemini_llm_api){
-																semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
+																semantic = await Gemini(gemini_llm_api, gemini_llm_model, '', semantic_prompt_system(language)+content, {"temperature": 1})
 
 																models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -3588,7 +3648,7 @@ export default {
 												item = mergeNode(_item, item)
 											}
 
-											team.data.base[itemType].count++
+											team.data.base[item.type].count++
 										}
 
 
@@ -4028,14 +4088,14 @@ export default {
 																			var semantic
 
 																			if(models['deepinfra']){
-																				semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', semantic_prompt_system(language), content)
+																				semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', semantic_prompt_system(language)+content)
 
 																				models['deepinfra'] -= 1
 
 																			}
 
 																			if(!semantic && gemini_llm_api){
-																				semantic = await Gemini(gemini_llm_api, gemini_llm_model, semantic_prompt_system(language), content, {"temperature": 1})
+																				semantic = await Gemini(gemini_llm_api, gemini_llm_model, '', semantic_prompt_system(language)+content, {"temperature": 1})
 
 																				models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -4887,7 +4947,7 @@ export default {
 							var paragraphs
 
 							if(models['deepinfra']){
-								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', para2graph(language).trim(), task.body)
+								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', para2graph(language)+task.body)
 
 								if(res){
 									paragraphs = res.context
@@ -4898,7 +4958,7 @@ export default {
 							}
 
 							if(!paragraphs && gemini_llm_api){
-								var res = await Gemini(gemini_llm_api, gemini_llm_model, para2graph(language).trim(), task.body)
+								var res = await Gemini(gemini_llm_api, gemini_llm_model, '', para2graph(language)+task.body)
 
 								if(res){
 									paragraphs = res.context
@@ -5206,7 +5266,7 @@ export default {
 							var contexts
 
 							if(models['deepinfra']){
-								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', graph2contexts(current).trim(), JSON.stringify(paragraphs))
+								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', graph2contexts(current)+JSON.stringify(paragraphs))
 
 								if(res){
 									contexts = res.context
@@ -5216,7 +5276,7 @@ export default {
 							}
 
 							if(!contexts && gemini_llm_api){
-								var res = await Gemini(gemini_llm_api, gemini_llm_model, graph2contexts(current).trim(), JSON.stringify(paragraphs))
+								var res = await Gemini(gemini_llm_api, gemini_llm_model, '', graph2contexts(current)+JSON.stringify(paragraphs))
 
 								if(res){
 									contexts = res.context
@@ -5541,14 +5601,14 @@ export default {
 										var generation
 
 										if(models['deepinfra']){
-											generation = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+											generation = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', system+content)
 
 											models['deepinfra'] -= 1
 
 										}
 
 										if(!generation && gemini_llm_api){
-											generation = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+											generation = await Gemini(gemini_llm_api, gemini_llm_model, '', system+content, {"temperature": 1})
 
 											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
