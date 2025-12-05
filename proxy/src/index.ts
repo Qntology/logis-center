@@ -308,12 +308,12 @@ const graph2contexts = function(current){
 const list2json = function(language){
 	return `
 		type:'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
-		isDetail:is detail page | boolean,
-		item:Item CSS1 selector excluding ads,
-		more:Item URL includes a manage path, an administrative or edit route Link CSS1 selector,
-		next:List next button CSS1 selector,
-		node:List CSS1 selector excluding ads,
-		text:Summarize the contents of the items array in ${language},
+		item:type based item CSS1 selector excluding ads,
+		more:item URL includes a manage path, an administrative or edit route Link CSS1 selector,
+		next:list next button CSS1 selector,
+		node:list CSS1 selector excluding ads,
+		text:summarize the contents of the items array in ${language},
+		detail:is detail page | boolean,
 		items: [
 			if (type is 'tracking' or 'review') {
 				status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
@@ -352,79 +352,79 @@ const item2json = function(type, href){
 			node:${type} form container CSS1 selector,
 			status:{
 				value:'draft' or 'progress' or 'return' or 'complete' or 'error',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			id:{
 				value:tracking number | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			title:{
 				value:${type} goods title | string,,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			} 
 			sender_name:{
 				value:sender_name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			sender_address:{
 				value:sender_address | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			sender_phone:{
 				value:sender_phone | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			recipient_name:{
 				value:recipient_name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			recipient_address:{
 				value:recipient_address | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			recipient_phone:{
 				value:recipient_phone | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			package_width:{
 				value:Package width | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			package_height:{
 				value:Package height | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			package_length:{
 				value:Package length | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			package_weight:{
 				value:Package weight | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			carrier:{
 				value:carrier name translated into English | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			shipping_fee:{
 				value:Shipping cost | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			shipping_method:{
 				value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			shipping_duration:{
 				value:Estimated delivery days | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			bundle_shipping:{
 				value:Allow combined shipping | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			shipping_date:{
 				value:yyyy-MM-dd'T'HH:mm:ss | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 		`
 	}else if(type == 'goods'){
@@ -433,196 +433,196 @@ const item2json = function(type, href){
 			link:'${href}',
 			id:{
 				value:Refer to the ID value from the link or an attribute or input value | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			status:{
 				value:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			payment_method:{
 				value:payment method | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			bank:{
 				value:bank company name or '' | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			card:{
 				value:card company name or '' | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			code:{
 				value:product constant code | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			model_name:{
 				value:product Model name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			brand_name:{
 				value:product Brand name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			condition:{
 				value:['new' or 'used' or 'lease' or 'rental' or 'refurbish'],
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			description:{
 				value:product Full description (HTML allowed) | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			short_description:{
 				value:product short description | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			tags:{
 				value:[{ tag : product keyword or tag | string }],
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			origin_country:{
 				value:product Country of origin/manufacture | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			manufacturer:{
 				value:product Manufacturer name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			release_date:{
 				value:Product release date(yyyy-MM-dd'T'HH:mm:ss) | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			manufacture_date:{
 				value:product Date(yyyy-MM-dd'T'HH:mm:ss) of manufacture | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			expiration_date:{
 				value:product Expiration or use-by date(yyyy-MM-dd'T'HH:mm:ss) | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			gtin:{
 				value:product Global Trade Item Number | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			mpn:{
 				value:product Manufacturer Part Number | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			barcode:{
 				value:product Barcode value | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			sale_price:{
 				value:product sale price | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			supply_price:{
 				value:product supply price | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			currency:{
 				value:ISO 4217 Currency Code | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			compare_at_price:{
 				value:product Original price for showing discounts | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			quantity:{
 				value:product Inventory quantity | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			stock_keeping_unit:{
 				value:Stock Keeping Unit | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			low_stock_threshold:{
 				value:product Low stock alert threshold | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			unit:{
 				value:product Selling unit | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			tax_included:{
 				value:product Whether tax | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			tax_code:{
 				value:product Tax code for region-specific rules | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			main_image_url:{
 				value:Main product image URL | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			additional_image_url:{
 				value:additional product image URL | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			video_url:{
 				value:product Promotional video URL | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			carrier:{
 				value:product carrier name translated into English | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			shipping_fee:{
 				value:product Shipping cost | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			shipping_method:{
 				value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			shipping_duration:{
 				value:product Estimated delivery days | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			bundle_shipping:{
 				value:product Allow combined shipping | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			product_width:{
 				value:Package width(cm) | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			product_height:{
 				value:Package height(cm) | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			product_length:{
 				value : Package length(cm) | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 				
 			},
 			product_weight:{
 				value : Package weight(kg) | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			options:[
 				{
 					value:option name | string,
-					selector:sibling value based CSS1 selector,
+					selector:selector,
 					inputs:[{
 						value:option input value | string,
-						selector:sibling value based CSS1 selector
+						selector:selector
 					}]
 				}
 			],
 			additional_goods:[
 				{
 					value:URL includes a manage path, an administrative or edit route product Link | string,
-					selector:sibling value based CSS1 selector
+					selector:selector
 				}
 			],
 			title:{
 				value:product based title | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			date:{
 				value:yyyy-MM-dd'T'HH:mm:ss | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 		`
 	}else if(type == 'order'){
@@ -631,81 +631,81 @@ const item2json = function(type, href){
 			link : '${href}',
 			id:{
 				value:Refer to the ID value from the link or an attribute or input value | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			tracking_number:{
 				value:tracking number | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			status:{
 				value:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			goods:[{
 				title:{
 					value:goods title | string,
-					selector:sibling value based CSS1 selector
+					selector:selector
 				},
 				link:{
 					value:URL includes a manage path, an administrative or edit route goods Link | string,
-					selector:sibling value based CSS1 selector
+					selector:selector
 				},
 				id:{
 					value:Refer to the product no value from the link or an attribute or input value | string,
-					selector:sibling value based CSS1 selector
+					selector:selector
 				}
 			}],
 			sender_name:{
 				value:sender_name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			sender_address:{
 				value:sender_address, Filter the addresses to District-level and up | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			sender_phone:{
 				value:sender_phone | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			recipient_name:{
 				value:recipient_name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			recipient_address:{
 				value:recipient_address, Filter the addresses to District-level and up | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			recipient_phone:{
 				value:recipient_phone | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			bank:{
 				value:bank company name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			card:{
 				value:card company name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			order_date:{
 				value:order date | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			payment_date:{
 				value:payment date or '' | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			payment_method:{
 				value:'C.O.D.' or 'CARD' or 'BANK' or '' | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			payment_origin:{
 				value:Payment Gateway Service Name or '' | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			date:{
 				value:yyyy-MM-dd'T'HH:mm:ss | string
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 		`
 	}else if(type == 'coupon' || type == 'event'){
@@ -714,63 +714,63 @@ const item2json = function(type, href){
 			link : '${href}',
 			id:{
 				value:Refer to the ID value from the link or an attribute or input value | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			type:{
 				value:'percentage' or 'fixed_amount' or 'free_shipping' or '',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			status:{
 				value:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			title:{
 				value:${type} title | string, 
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			started_at:{
 				value:yyyy-MM-dd'T'HH:mm:ss | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			expired_at:{
 				value:yyyy-MM-dd'T'HH:mm:ss | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			code:{
 				value:${type} code used at checkout | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			discount:{
 				value:Discount value | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			quantity:{
 				value:${type} quantity | number
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			usage_limit:{
 				value:Total usage limit for the coupon | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			usage_per:{
 				value:Usage limit per customer | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			new_customer_only:{
 				value:new customer only | boolean
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			min_order_amount:{
 				value:Minimum order amount required to apply coupon | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			max_discount_amount:{
 				value:Maximum discount limit allowed for the coupon | number,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			region_restrictions:{
 				value:region restrictions | boolean
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 		`
 	}else if(type == 'review'){
@@ -780,23 +780,23 @@ const item2json = function(type, href){
 			id:Refer to the ID value from the link or an attribute or input value | string,,
 			status:{
 				value:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			name:{
 				value:${type} name | string,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			title:{
 				value:${type} item title | string, 
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			completed:{
 				value:order complete | boolean,
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 			created_at:{
 				value:yyyy-MM-dd'T'HH:mm:ss
-				selector:sibling value based CSS1 selector
+				selector:selector
 			},
 		`
 	}
@@ -1988,6 +1988,7 @@ async function Deepinfra(key, model, system, user, inlineData){
 	var body = {
 		"model" : model,
 		"messages": messages,
+		"max_tokens": 15000,
 		"temperature": 1
 	}
 
@@ -2225,6 +2226,15 @@ export default {
 							team.data = {}
 						}
 
+						var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'user' AND "bcc" = '${team.bcc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+						var owner = results[0]
+
+						var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(owner.data))
+
+						owner.data = JSON.parse(decompressedJsonString)	
+						
+
 
 						var statements = {}
 							statements[CenterRegion] = []
@@ -2266,7 +2276,24 @@ export default {
 
 							var type = talk.type = task.type
 
-							var address = team.data.address ? team.data.address : []
+							var address = []
+
+							if(owner.data){
+								if(owner.data.sender){
+									address.push(owner.data.sender);
+								}
+							}
+
+							if(team.data){
+								if(team.data.address){
+									for(var a = 0; a < team.data.address.length; a++){
+										var addr = team.data.address[a]
+
+										address.push(addr)
+									}
+								}
+							}
+							
 
 							var system = image2json(type, address)
 
@@ -2362,6 +2389,8 @@ export default {
 							if(sales.length){
 								var _item = safeClone(results[0])
 
+								item.ref = task.ref = _item.ref
+
 								delete _item.id
 								delete _item.type
 								delete _item.from
@@ -2384,6 +2413,25 @@ export default {
 
 							if(type == "tracking"){
 								var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+
+
+								if(!team.data.base.pages[task.cc]){
+									team.data.base.pages[task.cc] = {}
+								}
+
+								if(!team.data.base.pages[task.cc][type]){
+									team.data.base.pages[task.cc][type] = {
+										draft : 0,
+										count : 0
+									}
+								}
+
+								if(!team.data.base[type]){
+									team.data.base[type] = {
+										draft : 0,
+										count : 0
+									}
+								}
 
 								if(results.length){
 									var _item = results[0]
@@ -2408,49 +2456,67 @@ export default {
 												now, _item.status, _item.id
 											)
 										)
+
+										team.data.base.pages[task.cc].order.draft--
+										team.data.base.pages[task.cc].order.count++
+
+										team.data.base.pages[task.cc][type].draft--
+										team.data.base.pages[task.cc][type].count++
 									}
 								}else{
-									team.data.base[type].count++
+									if(sales.length){
+										team.data.base.pages[task.cc][type].draft--
+										team.data.base.pages[task.cc][type].count++
+									}else{
+										team.data.base.pages[task.cc][type].draft++
+										team.data.base[type].count++
+
+										team.data.base.pages[task.cc].order.draft++
+										team.data.base.order.count++
+
+										// items 추가 해야함
+									}
 								}
+
+
+
+								var _item = sales[0]
+
+								statements[`logis_${zoneRegion}_items`].push(
+									env[`logis_${zoneRegion}_items`].prepare(`
+										INSERT INTO items (
+											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+										) VALUES (
+											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+										) ON CONFLICT (id) DO UPDATE SET
+											"type" = EXCLUDED."type",
+											"from" = EXCLUDED."from",
+											"to" = EXCLUDED."to",
+											"cc" = EXCLUDED."cc",
+											"bcc" = EXCLUDED."bcc",
+											"ref" = EXCLUDED."ref",
+											"data" = EXCLUDED."data",
+											"created_at" = EXCLUDED."created_at",
+											"updated_at" = EXCLUDED."updated_at"
+									`).bind(
+										_item.id,
+										_item.type,
+										_item.from,
+										_item.to,
+										_item.cc,
+										_item.bcc,
+										_item.data,
+										item.id,
+										_item.created_at,
+										sales.length ? now : 0
+									)
+								)
 
 								item.ref = task.ref
 
 								item.created_at = now
 
-								if(sales.length){
-									var _item = sales[0]
-
-									statements[`logis_${zoneRegion}_items`].push(
-										env[`logis_${zoneRegion}_items`].prepare(`
-											INSERT INTO items (
-												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-											) VALUES (
-												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-											) ON CONFLICT (id) DO UPDATE SET
-												"type" = EXCLUDED."type",
-												"from" = EXCLUDED."from",
-												"to" = EXCLUDED."to",
-												"cc" = EXCLUDED."cc",
-												"bcc" = EXCLUDED."bcc",
-												"ref" = EXCLUDED."ref",
-												"data" = EXCLUDED."data",
-												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
-										`).bind(
-											_item.id,
-											_item.type,
-											_item.from,
-											_item.to,
-											_item.cc,
-											_item.bcc,
-											_item.data,
-											item.id,
-											_item.created_at,
-											now
-										)
-									)
-								}else{
-
+								if(sales.length == 0){
 									var content = {}
 
 									if(item.title){
@@ -2501,7 +2567,7 @@ export default {
 										to: task.to,
 										cc: task.cc,
 										bcc: task.bcc,
-										ref:task.ref
+										ref:pageid
 									}
 
 									var embeddings
@@ -2697,7 +2763,9 @@ export default {
 								return bool
 							}
 
-							var isDetail = false
+							var isDetail = task.detail
+
+							console.log('isDetail000',JSON.stringify(isDetail));
 
 							try{
 								var page
@@ -2706,11 +2774,15 @@ export default {
 
 								var pageLength = 0
 
+								console.log('task.href',task.href);
+
 								var url = new URL(task.href)
 
-								var pathname = url.pathname.toLowerCase()
+								var pathname = task.detail ? url.pathname.toUpperCase() : url.pathname.toLowerCase()
 
 								var pageId = hashId(task.cc+pathname)
+
+								console.log('pageId',pageId);
 
 								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
@@ -2726,6 +2798,8 @@ export default {
 
 										isDetail = isMore(_page, selectors)
 
+										console.log('_page isDetail',JSON.stringify(isDetail));
+
 										if(isDetail){
 											pageType = _page.type
 
@@ -2737,9 +2811,9 @@ export default {
 
 												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
 
-												var selectors = JSON.parse(decompressedJsonString)
+												var _selectors = JSON.parse(decompressedJsonString)
 
-												isDetail = isMore(_page, selectors)
+												isDetail = isMore(_page, _selectors)
 
 												if(isDetail){
 													pageType = _page.type
@@ -2768,7 +2842,7 @@ export default {
 											}
 
 										}catch(err){
-											console.log('cahce page err',err);
+											console.log('cache page err',err);
 										}
 									}
 								}
@@ -2776,27 +2850,26 @@ export default {
 
 								// 기존 값이 있으면 아래 프로세스 실행함
 
-								var itemId = hashId(team.id+task.cc+task.link)
+								// var itemId = hashId(team.id+task.cc+task.link)
 
-								var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${itemId}' AND "created_at" < ${created_at} LIMIT 1`).all()
+								// var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${itemId}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
-								if(results.length){
-									var item = results[0]
+								// if(results.length){
+								// 	var item = results[0]
 
-									if(item.data){
+								// 	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
 
-									}
-									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
+								// 	item.data = JSON.parse(decompressedJsonString)
 
-									item.data = JSON.parse(decompressedJsonString)
-
-									if(item.data){
-										if(item.data.detail){
-											isDetail = true
-										}
-									}
+								// 	if(item.data){
+								// 		if(item.data.node){
+								// 			if(!item.data.item){
+								// 				isDetail = true
+								// 			}
+								// 		}
+								// 	}
 									
-								}
+								// }
 
 								if(!isDetail){
 									if(task.referrer){
@@ -2810,10 +2883,12 @@ export default {
 
 												var selectors = JSON.parse(decompressedJsonString)
 
-												isDetail = isMore(_page, selectors)
+												if(selectors.node){
+													isDetail = isMore(_page, selectors)
 
-												if(isDetail){
-													pageType = _page.type
+													if(isDetail){
+														pageType = _page.type
+													}
 												}
 											}
 										}
@@ -2826,17 +2901,16 @@ export default {
 
 								console.log('content.length',content.length);
 
-								console.log('isDetail',JSON.stringify(isDetail));
+								console.log('isDetail1',JSON.stringify(isDetail));
 
 								if(!isDetail){
-									var system = list2json(language)
+									var system = `
+										Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+										{language:'${language}',${list2json(language)}}
+									`.trim()
 
 									if(models['deepinfra']){
-										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', `
-											Analyze the provided Pug template and return it in the following JSON format, no explanation. 
-											{language:'${language}',${system}}
-											${content}
-										`)
+										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 										pageType = page.type
 
@@ -2844,7 +2918,7 @@ export default {
 											pageLength = page.items.length
 										}
 
-										isDetail = page.isDetail
+										isDetail = page.detail
 
 										models['deepinfra'] -= 1
 
@@ -2863,7 +2937,7 @@ export default {
 											pageLength = page.items.length
 										}
 
-										isDetail = page.isDetail
+										isDetail = page.detail
 
 										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -2872,11 +2946,14 @@ export default {
 
 
 								if((!isDetail && !pageLength && pageType) || isDetail){
-									var system = item2json(pageType, task.href)
+									var system = `
+										Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+										# selector : sibling value based CSS1 selector
+										{language:'${language}',${item2json(pageType, task.href)}}
+									`.trim()
 
 									if(models['deepinfra']){
-										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}${content}`)
-
+										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 										if(page.node){
 											page.type = pageType
@@ -2893,7 +2970,7 @@ export default {
 									}
 
 									if(!page && gemini_llm_api){
-										page = await Gemini(gemini_llm_api, gemini_llm_model, '', `Analyze the provided Pug template and return it in the following JSON format, no explanation. {language:'${language}',${system}}${content}`)
+										page = await Gemini(gemini_llm_api, gemini_llm_model, system, content)
 
 										if(page.node){
 											page.type = pageType
@@ -2925,9 +3002,30 @@ export default {
 								page.cc = task.cc
 								page.bcc = task.bcc
 
+								if(!team.data.base.pages[task.cc]){
+									team.data.base.pages[task.cc] = {}
+								}
+
+								if(!team.data.base.pages[task.cc][page.type]){
+									team.data.base.pages[task.cc][page.type] = {
+										draft : 0,
+										count : 0
+									}
+								}
+
+								if(!team.data.base[page.type]){
+									team.data.base[page.type] = {
+										draft : 0,
+										count : 0
+									}
+								}
+
+
 								var selectors = {
+									type : page.type,
 									text : page.text || '',
 									node : page.node || '',
+									list : page.list || '',
 									item : page.item || '',
 									more : page.more || '',
 									next : page.next || '',
@@ -2935,12 +3033,47 @@ export default {
 									origin : task.origin ? task.origin : ''
 								}
 
+								
+
+								var detail = {
+									id : hashId(task.cc+pathname.toUpperCase()),
+									type : pageType,
+									from : task.from,
+									to : task.to,
+									cc : task.cc,
+									bcc: task.bcc,
+									ref: task.ref,
+									data:null,
+									created_at:now,
+									updated_at:now
+								}
+
+								console.log('isDetail2',JSON.stringify(isDetail));
+
+								var before
+
 								if(isDetail){
-									task.ref = talk.ref = pageId = hashId(task.cc+pathname.toUpperCase())
+									selectors.detail = true
+
+									talk.ref = pageId = detail.id
+
+									detail = null
+
+									console.log('pageId',pageId)
 
 									var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
-									pages = results
+									var _page
+
+									if(results.length){
+										_page = results[0]
+
+										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+										_page.data = JSON.parse(decompressedJsonString)
+
+										before = _page.data
+									}
 									
 									var item = safeClone(page)
 
@@ -2990,10 +3123,30 @@ export default {
 										}
 									}
 
+
+									if(_page){
+										if(!_page.data.item){
+											item.ref = _page.ref
+										}
+									}
+										
+
+									
 									page.items = [item]
 
+								}else{
+									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+										type : page.type,
+										origin : task.origin,
+										detail : true,
+										node : true,
+										item : ''
+									})), { to: 'arraybuffer' })
+
+									detail.data = arr.buffer
 								}
 
+								console.log('pageId',pageId);
 
 								var items = []
 
@@ -3012,59 +3165,58 @@ export default {
 
 								page.data = selectors
 
-								if(pages){
-									if(pages.length){
-										for(var p = 0; p < pages.length; p++){
-											var _page = pages[p]
+								if(before){
+									var _page = pages[0]
 
-											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+									var after = selectors
 
-											var before = JSON.parse(decompressedJsonString)
-											var after = selectors
+									try{
+										var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
 
-											try{
-												var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
+										if(Object.keys(before).length){
+											for (var selector in before) {
+												if (before.hasOwnProperty(selector)) {
+													if(typeof selector == "string"){
+														try{
+															var $before = document.querySelectorAll(`${before[selector]}`)
+															var $after = document.querySelectorAll(`${after[selector]}`)
 
-												if(Object.keys(before).length){
-													for (var selector in before) {
-														if (before.hasOwnProperty(selector)) {
-															if(typeof selector == "string"){
-																try{
-																	var $before = document.querySelector(`${before[selector]}`)
-																	var $after = document.querySelector(`${after[selector]}`)
+															if($before.length && !$after.length){
+																_page.data[selector] = page.data[selector] = before[selector] + ''
 
-																	if($before && !$after){
-																		_page.data[selector] = page.data[selector] = before[selector] + ''
+															}else if(!$before.length && $after.length){
+																_page.data[selector] = page.data[selector] = after[selector] + ''
 
-																	}else if(!$before && $after){
-																		_page.data[selector] = page.data[selector] = after[selector] + ''
-
-																	}else if($before && $after){
-																		_page.data[selector] = page.data[selector] = before[selector] + ''
-
-																	}
-
-																}catch(err){
-																	console.log('selector err',err);
+															}else if($before.length && $after.length){
+																if($before.length < $after.length){
+																	_page.data[selector] = page.data[selector] = before[selector] + ''
+																}else{
+																	_page.data[selector] = page.data[selector] = after[selector] + ''
 																}
+																
+
 															}
+
+														}catch(err){
+															console.log('selector err',err);
 														}
 													}
 												}
-											}catch(err){
-												// console.log('_page.data err',err);
 											}
-
-											_page.data = before
-
-											page = mergeNode(_page, page)
-
-											selectors = page.data
 										}
-
+									}catch(err){
+										// console.log('_page.data err',err);
 									}
+
+									// _page.data = before
+
+									page = mergeNode(_page, page)
+
+									selectors = page.data
+
 								}
 
+								console.log('page.data',JSON.stringify(page.data));
 
 
 								page.id = task.page ? task.page.id : pageId
@@ -3093,6 +3245,36 @@ export default {
 									`).bind(
 										page.id,
 										page.type,
+										page.from,
+										page.to,
+										page.cc,
+										page.bcc,
+										page.ref,
+										page.data,
+										now,
+										now
+									)
+								)
+
+								statements[`logis_${zoneRegion}_items`].push(
+									env[`logis_${zoneRegion}_items`].prepare(`
+										INSERT INTO items (
+											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+										) VALUES (
+											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+										) ON CONFLICT (id) DO UPDATE SET
+											"type" = EXCLUDED."type",
+											"from" = EXCLUDED."from",
+											"to" = EXCLUDED."to",
+											"cc" = EXCLUDED."cc",
+											"bcc" = EXCLUDED."bcc",
+											"ref" = EXCLUDED."ref",
+											"data" = EXCLUDED."data",
+											"created_at" = EXCLUDED."created_at",
+											"updated_at" = EXCLUDED."updated_at"
+									`).bind(
+										page.id,
+										'pages',
 										page.from,
 										page.to,
 										page.cc,
@@ -3185,17 +3367,23 @@ export default {
 
 												item.link = (_url.pathname + _url.search).toLowerCase()
 											}
-											
+
+
+											if(detail){
+												if(!detail.page){
+													detail.page = detail.id = hashId(task.cc+_url.pathname.toUpperCase())
+												}
+											}
+
 										}catch(err){
 
 										}
 
 
-										var itemType = item.type
+										var itemType = ""
 
-										if(item.type == "sales"){
-											itemType = "sales"
-											item.type = "order"
+										if(item.type == "tracking"){
+											itemType = "tracking"
 
 										}else if(item.type == "goods" || item.type == "order"){
 											itemType = "sales"
@@ -3205,28 +3393,73 @@ export default {
 
 										}
 
+										item.created_at = now
+
+										item.updated_at = selectors.item ? 0 : now
+
+
 
 										item.id = hashId(team.id+task.cc+item.link)
+										
 
-										if(item.type == "tracking"){
-											var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE index" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+										item.data = {
+											id : item.id,
+											no : item.no ? item.no : "",
+											title : item.title ? item.title : '',
+											link : item.link,
+											origin : task.origin ? task.origin : ''
+										}
 
-											if(results.length){
-												var _item = results[0]
+										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
-												delete _item.ref
+										console.log('add results.length',item.type,results.length);
 
-												if(item.status){
-													if(_item.status){
-														delete _item.status
-													}
-												}
+										console.log('item.updated_at',item.updated_at ? 'true' : 'false');
 
-												item = mergeNode(_item, item)
+										if(results.length){
+											var _item = results[0]
+
+											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
+
+											_item.data = JSON.parse(decompressedJsonString)
+
+											if(item.data.item && !_item.data.item){
+												item.data.item = _item.data.item
+												item.data.node = _item.data.node
+												item.ref = _item.data.ref
 											}
 
-											item.id = hashId(team.id+task.cc+task.link)
+
+											if(!_item.updated_at){
+												if(item.updated_at){
+													team.data.base.pages[task.cc][item.type].draft--
+													team.data.base.pages[task.cc][item.type].count++
+												}
+											}
+
+											item.updated_at = now
+
+											if(item.status){
+												if(_item.status){
+													delete _item.status
+												}
+											}
+
+											item = mergeNode(_item, item)
+
+										}else{
+											console.log(`team.data.base.pages[task.cc][item.type]`, team.data.base.pages[task.cc][item.type])
+											if(item.updated_at){
+												team.data.base.pages[task.cc][item.type].count++
+											}else{
+												team.data.base.pages[task.cc][item.type].draft++
+												team.data.base[item.type].count++
+												
+											}
 										}
+
+										// item.id = hashId(team.id+task.cc+task.link)
+
 
 										item.flag = task.flag
 										
@@ -3236,7 +3469,7 @@ export default {
 
 										item.bcc = task.bcc
 
-										item.ref = task.ref
+										item.ref = pageId
 
 
 										var goods = item.goods ? safeClone(item.goods) : []
@@ -3258,9 +3491,7 @@ export default {
 
 										item.quantity = item.quantity ? parseInt(item.quantity) : 0
 
-										item.created_at = now
-
-										item.updated_at = now
+										
 
 										item.semantic = item.title
 
@@ -3270,16 +3501,8 @@ export default {
 
 										var statusCode = item.status = item.status ? parseStatus(item.status) : 0
 
-										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-											id : item.id,
-											no : item.no ? item.no : "",
-											title : item.title,
-											link : item.link,
-											origin : task.origin ? task.origin : '',
-											detail : true
-										})), { to: 'arraybuffer' })
+										
 
-										item.data = arr.buffer
 
 										if(item.tracking_number){
 											var tracking_number = normalizeNumericHomoglyphs(item.tracking_number)
@@ -3396,15 +3619,18 @@ export default {
 
 															var semantic
 
+
+															var system = semantic_prompt_system(language).trim()
+
 															if(models['deepinfra']){
-																semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', semantic_prompt_system(language)+content)
+																semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 																models['deepinfra'] -= 1
 
 															}
 
 															if(!semantic && gemini_llm_api){
-																semantic = await Gemini(gemini_llm_api, gemini_llm_model, '', semantic_prompt_system(language)+content, {"temperature": 1})
+																semantic = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
 
 																models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -3422,7 +3648,7 @@ export default {
 																to: item.to,
 																cc: item.cc,
 																bcc: item.bcc,
-																ref:task.ref
+																ref:pageId
 															}
 
 															var embeddings
@@ -3445,7 +3671,7 @@ export default {
 															}
 
 															if(!embeddings && models['deepinfra']){
-																var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic)
+																var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
 
 																var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 																	return {
@@ -3463,6 +3689,10 @@ export default {
 
 																continue
 															}
+
+
+															team.data.base.pages[task.cc][tracking.type].draft++
+															// team.data.base.pages[task.cc][tracking.type].count--
 
 															await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 														}
@@ -3648,7 +3878,6 @@ export default {
 												item = mergeNode(_item, item)
 											}
 
-											team.data.base[item.type].count++
 										}
 
 
@@ -4087,15 +4316,17 @@ export default {
 
 																			var semantic
 
+																			var system = semantic_prompt_system(language).trim()
+
 																			if(models['deepinfra']){
-																				semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', semantic_prompt_system(language)+content)
+																				semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 																				models['deepinfra'] -= 1
 
 																			}
 
 																			if(!semantic && gemini_llm_api){
-																				semantic = await Gemini(gemini_llm_api, gemini_llm_model, '', semantic_prompt_system(language)+content, {"temperature": 1})
+																				semantic = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
 
 																				models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
@@ -4137,7 +4368,7 @@ export default {
 																			}
 
 																			if(!embeddings && models['deepinfra']){
-																				var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic)
+																				var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
 
 																				var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 																					return {
@@ -4406,14 +4637,24 @@ export default {
 
 
 
-																	// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
-																	statements[`logis_${zoneRegion}_items`].push(
-																		env[`logis_${zoneRegion}_items`].prepare(`
-																			UPDATE items SET updated_at = ? WHERE id = ?
-																		`).bind(
-																			now, row.id
+																	var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${row.id}' AND "created_at" < ${now} AND "updated_at" = 0 LIMIT 1`).all()
+
+																	if(results.length){
+																		// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
+																		team.data.base.pages[row.cc][row.type].draft--
+																		team.data.base.pages[row.cc][row.type].count--
+
+																		statements[`logis_${zoneRegion}_items`].push(
+																			env[`logis_${zoneRegion}_items`].prepare(`
+																				UPDATE items SET updated_at = ? WHERE id = ?
+																			`).bind(
+																				now, row.id
+																			)
 																		)
-																	)
+																	}
+
+
+																		
 
 																	// for end
 																}
@@ -4423,8 +4664,7 @@ export default {
 																
 																var draftId = hashId(item.id)
 
-																team.data.base[item.type].draft++
-
+																team.data.base.pages[item.cc][item.type].draft++
 
 																var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${draftId}' AND "created_at" < ${now} LIMIT 1`).all()
 
@@ -4494,7 +4734,7 @@ export default {
 												to: item.to,
 												cc: item.cc,
 												bcc: item.bcc,
-												ref:task.ref
+												ref:pageId
 											}
 
 											var embeddings
@@ -4517,7 +4757,7 @@ export default {
 											}
 
 											if(!embeddings && models['deepinfra']){
-												var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.semantic)
+												var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.semantic.tirm())
 
 												var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 													return {
@@ -4541,15 +4781,12 @@ export default {
 											await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 										}
 
-										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-											node : page.node ? page.node : '',
-											item : page.item ? page.item : '',
-											type : item.type,
-											text : item.semantic,
-											link : item.link,
-											origin : task.origin ? task.origin : '',
-											ref : page.ref
-										})), { to: 'arraybuffer' })
+										item.data.text = item.semantic
+										item.data.ref = page.ref
+
+										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item.data)), { to: 'arraybuffer' })
+
+										item.data = arr.buffer
 
 
 										statements[`logis_${zoneRegion}_items`].push(
@@ -4576,7 +4813,7 @@ export default {
 												item.cc,
 												item.bcc,
 												item.ref,
-												arr.buffer,
+												item.data,
 												now,
 												typeof updated_at != "undefined" ? updated_at : now 
 											)
@@ -4822,7 +5059,65 @@ export default {
 									}
 								}
 
+								if(detail){									
+									statements[CenterRegion].push(
+										env[CenterRegion].prepare(`
+											INSERT INTO pages ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
+											VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+											ON CONFLICT(id) DO UPDATE SET
+												"type" = EXCLUDED."type",
+												"from" = EXCLUDED."from",
+												"to" = EXCLUDED."to",
+												"cc" = EXCLUDED."cc",
+												"bcc" = EXCLUDED."bcc",
+												"ref" = EXCLUDED."ref",
+												"data" = EXCLUDED."data",
+												"created_at" = EXCLUDED."created_at",
+												"updated_at" = EXCLUDED."updated_at"
+										`).bind(
+											detail.id,
+											detail.type,
+											detail.from,
+											detail.to,
+											detail.cc,
+											detail.bcc,
+											detail.ref,
+											detail.data,
+											now,
+											now
+										)
+									)
 
+									statements[`logis_${zoneRegion}_items`].push(
+										env[`logis_${zoneRegion}_items`].prepare(`
+											INSERT INTO items (
+												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+											) VALUES (
+												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+											) ON CONFLICT (id) DO UPDATE SET
+												"type" = EXCLUDED."type",
+												"from" = EXCLUDED."from",
+												"to" = EXCLUDED."to",
+												"cc" = EXCLUDED."cc",
+												"bcc" = EXCLUDED."bcc",
+												"ref" = EXCLUDED."ref",
+												"data" = EXCLUDED."data",
+												"created_at" = EXCLUDED."created_at",
+												"updated_at" = EXCLUDED."updated_at"
+										`).bind(
+											detail.id,
+											'pages',
+											detail.from,
+											detail.to,
+											detail.cc,
+											detail.bcc,
+											detail.ref,
+											detail.data,
+											now,
+											now
+										)
+									)
+								}
 
 								task.title = page.text // Analyze the provided Pug template and return it in the following JSON format
 
@@ -4946,8 +5241,10 @@ export default {
 							
 							var paragraphs
 
+							var system = para2graph(language)
+
 							if(models['deepinfra']){
-								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', para2graph(language)+task.body)
+								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, task.body)
 
 								if(res){
 									paragraphs = res.context
@@ -4958,7 +5255,7 @@ export default {
 							}
 
 							if(!paragraphs && gemini_llm_api){
-								var res = await Gemini(gemini_llm_api, gemini_llm_model, '', para2graph(language)+task.body)
+								var res = await Gemini(gemini_llm_api, gemini_llm_model, system, task.body)
 
 								if(res){
 									paragraphs = res.context
@@ -5265,8 +5562,10 @@ export default {
 
 							var contexts
 
+							var system = graph2contexts(current)
+
 							if(models['deepinfra']){
-								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', graph2contexts(current)+JSON.stringify(paragraphs))
+								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, JSON.stringify(paragraphs))
 
 								if(res){
 									contexts = res.context
@@ -5276,7 +5575,7 @@ export default {
 							}
 
 							if(!contexts && gemini_llm_api){
-								var res = await Gemini(gemini_llm_api, gemini_llm_model, '', graph2contexts(current)+JSON.stringify(paragraphs))
+								var res = await Gemini(gemini_llm_api, gemini_llm_model, system, JSON.stringify(paragraphs))
 
 								if(res){
 									contexts = res.context
@@ -5415,7 +5714,7 @@ export default {
 										}
 
 										if(!queryVector && models['deepinfra']){
-											var queryVector = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', context.text)
+											var queryVector = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', context.text.tirm())
 
 											var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
 												return {
@@ -5601,14 +5900,14 @@ export default {
 										var generation
 
 										if(models['deepinfra']){
-											generation = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', '', system+content)
+											generation = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
 
 											models['deepinfra'] -= 1
 
 										}
 
 										if(!generation && gemini_llm_api){
-											generation = await Gemini(gemini_llm_api, gemini_llm_model, '', system+content, {"temperature": 1})
+											generation = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
 
 											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 

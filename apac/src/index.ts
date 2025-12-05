@@ -66,13 +66,13 @@ async function Cron(event, env, ctx, models, limits){
 					var geminiModel = function(){
 						if(Math.floor(Math.random() * 2)){
 							return {
-								first :'gemini-2.0-flash-lite',
-								second:'gemini-2.5-flash-lite'
+								first :'gemini-flash-lite-latest',
+								second:'gemini-flash-latest'
 							}
 						}else{
 							return {
-								first :'gemini-2.5-flash-lite',
-								second:'gemini-2.0-flash-lite'
+								first :'gemini-flash-latest',
+								second:'gemini-flash-lite-latest'
 							}
 						}
 					}
@@ -182,7 +182,7 @@ export default {
 
 		var expired_at = started_at + 60000
 
-		var delay = 1
+		var delay = 0.3
 
 		while(true){
 			var current_at = performance.now()
@@ -198,12 +198,12 @@ export default {
 			models = results.models
 
 			if(results.length){
-				delay = 1
+				delay = 0.3
 			}else{
-				delay += 1
+				delay += 0.3
 			}
 
-			await Sleep(1000 * delay)
+			await Sleep(300 * delay)
 		}
 	}
 } satisfies ExportedHandler<Env>
