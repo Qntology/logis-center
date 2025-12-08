@@ -67,11 +67,11 @@ async function Cron(event, env, ctx, models, limits){
 						if(Math.floor(Math.random() * 2)){
 							return {
 								first :'gemini-flash-lite-latest',
-								second:'gemini-flash-latest'
+								second:'gemini-flash-lite-latest'
 							}
 						}else{
 							return {
-								first :'gemini-flash-latest',
+								first :'gemini-flash-lite-latest',
 								second:'gemini-flash-lite-latest'
 							}
 						}
