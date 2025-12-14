@@ -73,6 +73,23 @@ import { ethers } from 'ethers'
 
 function crc32(s) { var polynomial = arguments.length < 2 ? 0x04C11DB7 : arguments[1], initialValue = arguments.length < 3 ? 0xFFFFFFFF : arguments[2], finalXORValue = arguments.length < 4 ? 0xFFFFFFFF : arguments[3], crc = initialValue, table = [], i, j, c; function reverse(x, n) { var b = 0; while (n) { b = b * 2 + x % 2; x /= 2; x -= x % 1; n--; } return b; } for (i = 256; i >= 0; i--) { c = reverse(i, 32); for (j = 0; j < 8; j++) { c = ((c * 2) ^ (((c >>> 31) % 2) * polynomial)) >>> 0; } table[i] = reverse(c, 32); } for (i = 0; i < s.length; i++) { c = s.charCodeAt(i); if (c > 255) { throw new RangeError(); } j = (crc % 256) ^ c; crc = ((crc / 256) ^ table[j]) >>> 0; } return (crc ^ finalXORValue) >>> 0; }
 
+var rowsTrim = function(rows, key, value){
+	if(typeof key != "undefined" && typeof value != "undefined"){
+		for(var r = 0; r < rows.length; r++){
+			if(rows[r]){
+				if(rows[r][key]){
+					if(rows[r][key] == value){
+						rows[r] = undefined
+					}
+				}
+			}
+		}
+	}
+
+	return rows.filter(function( row ) {
+		return row !== undefined;
+	})
+}
 
 const randomKey = function(){
 	var key = Math.random().toString()
@@ -154,13 +171,14 @@ function mergeNode(obj1, obj2) {
 const image2json = function(region, language, type, address){
 	if(type == "tracking"){
 		return `convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.
-		#tracking_number : 운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ
+		#region : ${region}
 		#recipient_address : ${JSON.stringify(address)}
+		#tracking_number is selected from the number that matches the barcode or QR code, among others, based on the #region, excluding the format of a national telephone or mobile phone number, or an order number.
 		{
-			no:#tracking_number | string,
+			tracking_number:tracking number or 운송장 번호 or 송장 번호 or 송장번호 or 등기 번호 or 등기번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
 			recipient_match : shipping label #recipient_address match. Ruled the same despite different floor levels | boolean,
-			text : summarize the shipping label contents in ${language}. Masking the address in the summary to District-level and up. Do not mention that information is masked or partially hidden | string
-			barcode : [barcode number | string]
+			barcodes : [barcode number | string] | array,
+			text : summarize the shipping label contents in ${language}. Masking the address in the summary to District-level and up. Do not mention that information is masked or partially hidden | string,
 		}`
 	}
 }
@@ -213,7 +231,7 @@ convert the natural language content to fit the dataset JSON structure. no expla
 			"find":null,
 			"condition" : {
 				"date":{
-					"eq":yyyy-MM-dd'T'HH:mm:ss,"lte":yyyy-MM-dd'T'HH:mm:ss,"gte":yyyy-MM-dd'T'HH:mm:ss
+					"eq":yyyy-MM-ddThh:mm:ss,"lte":yyyy-MM-ddThh:mm:ss,"gte":yyyy-MM-ddThh:mm:ss
 				},
 				"quantity":{
 					"eq":0,"lte":0,"gte":0
@@ -234,7 +252,7 @@ convert the natural language content to fit the dataset JSON structure. no expla
 			"find":null,
 			"condition" : {
 				"date":{
-					"eq":yyyy-MM-dd'T'HH:mm:ss,"lte":yyyy-MM-dd'T'HH:mm:ss,"gte":yyyy-MM-dd'T'HH:mm:ss
+					"eq":yyyy-MM-ddThh:mm:ss,"lte":yyyy-MM-ddThh:mm:ss,"gte":yyyy-MM-ddThh:mm:ss
 				},
 				"quantity":{
 					"eq":0,"lte":0,"gte":0
@@ -255,7 +273,7 @@ convert the natural language content to fit the dataset JSON structure. no expla
 			"find":null,
 			"condition" : {
 				"date":{
-					"eq":yyyy-MM-dd'T'HH:mm:ss,"lte":yyyy-MM-dd'T'HH:mm:ss,"gte":yyyy-MM-dd'T'HH:mm:ss
+					"eq":yyyy-MM-ddThh:mm:ss,"lte":yyyy-MM-ddThh:mm:ss,"gte":yyyy-MM-ddThh:mm:ss
 				},
 				"quantity":{
 					"eq":0,"lte":0,"gte":0
@@ -276,7 +294,7 @@ convert the natural language content to fit the dataset JSON structure. no expla
 			"find":null,
 			"condition" : {
 				"date":{
-					"eq":yyyy-MM-dd'T'HH:mm:ss,"lte":yyyy-MM-dd'T'HH:mm:ss,"gte":yyyy-MM-dd'T'HH:mm:ss
+					"eq":yyyy-MM-ddThh:mm:ss,"lte":yyyy-MM-ddThh:mm:ss,"gte":yyyy-MM-ddThh:mm:ss
 				},
 				"quantity":{
 					"eq":0,"lte":0,"gte":0
@@ -298,10 +316,10 @@ convert the natural language content to fit the dataset JSON structure. no expla
 
 const graph2contexts = function(current){
 	return `convert the natural language content to fit the dataset JSON structure. no explanation.
-	# date : The date value is set by referencing both the natural language's implied time period and the region value against the current time (${current}); it will be marked as null if a value is absent
-	# status : 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
-	# substantial : 'size' or 'weight' or 'shipping_fee' or 'shipping_duration' or 'sale_price' or 'supply_price' or 'low_stock_threshold' or 'discount' or 'min_order_amount' or 'max_discount_amount' or 'usage_limit' or 'usage_per' or ''
-	# find : 'many' or 'few' or 'much' or 'little' or 'heavy' or 'light' or ''`
+	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time (${current}); it will be marked as null if a value is absent
+	# #status : 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
+	# #substantial : 'size' or 'weight' or 'shipping_fee' or 'shipping_duration' or 'sale_price' or 'supply_price' or 'low_stock_threshold' or 'discount' or 'min_order_amount' or 'max_discount_amount' or 'usage_limit' or 'usage_per' or ''
+	# #find : 'many' or 'few' or 'much' or 'little' or 'heavy' or 'light' or ''`
 }
 
 
@@ -310,8 +328,8 @@ const list2json = function(language){
 		type:'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
 		item:type based item CSS1 selector excluding ads,
 		more:item URL includes a manage path, an administrative or edit route Link CSS1 selector,
+		node:item parent list CSS1 selector excluding ads,
 		next:list next button CSS1 selector,
-		node:list CSS1 selector excluding ads,
 		text:summarize the contents of the items array in ${language},
 		detail:is detail page | boolean,
 		items: [
@@ -320,7 +338,7 @@ const list2json = function(language){
 				id:Refer to the ID value from the link or an attribute | string,
 				title:author and content | string, 
 				link:URL includes a manage path, an administrative or edit route Link | string,
-				date:yyyy-MM-dd'T'HH:mm:ss | string,
+				registration_date:yyyy-MM-ddThh:mm:ss | string,
 			}
 			if (type is 'order' or 'goods') {
 				status:'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
@@ -331,15 +349,16 @@ const list2json = function(language){
 				supply_price:supply price | number,
 				currency:ISO 4217 Currency Code | string,
 				quantity:item stock quantity | number,
-				tracking_number:Tracking Number(운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ) | string,
-				date:yyyy-MM-dd'T'HH:mm:ss | string,
+				tracking_number:Tracking Number or 운송장 번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
+				registration_date:yyyy-MM-ddThh:mm:ss | string,
 			}
 			if (type is 'coupon' or 'event') {
 				status:'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
 				id:Refer to the ID value from the link or an attribute | string,
 				title:type based item title, 
-				started_at:yyyy-MM-dd'T'HH:mm:ss,
-				expired_at:yyyy-MM-dd'T'HH:mm:ss,
+				started_at:yyyy-MM-ddThh:mm:ss,
+				expired_at:yyyy-MM-ddThh:mm:ss,
+				registration_date:yyyy-MM-ddThh:mm:ss | string,
 			}
 		] 
 	`
@@ -423,7 +442,11 @@ const item2json = function(type, href){
 				selector:selector
 			},
 			shipping_date:{
-				value:yyyy-MM-dd'T'HH:mm:ss | string,
+				value:yyyy-MM-ddThh:mm:ss | string,
+				selector:selector
+			},
+			registration_date:{
+				value:yyyy-MM-ddThh:mm:ss | string,
 				selector:selector
 			},
 		`
@@ -488,15 +511,15 @@ const item2json = function(type, href){
 				selector:selector
 			},
 			release_date:{
-				value:Product release date(yyyy-MM-dd'T'HH:mm:ss) | string,
+				value:Product release date(yyyy-MM-ddThh:mm:ss) | string,
 				selector:selector
 			},
 			manufacture_date:{
-				value:product Date(yyyy-MM-dd'T'HH:mm:ss) of manufacture | string,
+				value:product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string,
 				selector:selector
 			},
 			expiration_date:{
-				value:product Expiration or use-by date(yyyy-MM-dd'T'HH:mm:ss) | string,
+				value:product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string,
 				selector:selector
 			},
 			gtin:{
@@ -620,8 +643,8 @@ const item2json = function(type, href){
 				value:product based title | string,
 				selector:selector
 			},
-			date:{
-				value:yyyy-MM-dd'T'HH:mm:ss | string,
+			registration_date:{
+				value:yyyy-MM-ddThh:mm:ss | string,
 				selector:selector
 			},
 		`
@@ -703,8 +726,8 @@ const item2json = function(type, href){
 				value:Payment Gateway Service Name or '' | string,
 				selector:selector
 			},
-			date:{
-				value:yyyy-MM-dd'T'HH:mm:ss | string
+			registration_date:{
+				value:yyyy-MM-ddThh:mm:ss | string,
 				selector:selector
 			},
 		`
@@ -729,11 +752,11 @@ const item2json = function(type, href){
 				selector:selector
 			},
 			started_at:{
-				value:yyyy-MM-dd'T'HH:mm:ss | string,
+				value:yyyy-MM-ddThh:mm:ss | string,
 				selector:selector
 			},
 			expired_at:{
-				value:yyyy-MM-dd'T'HH:mm:ss | string,
+				value:yyyy-MM-ddThh:mm:ss | string,
 				selector:selector
 			},
 			code:{
@@ -769,7 +792,11 @@ const item2json = function(type, href){
 				selector:selector
 			},
 			region_restrictions:{
-				value:region restrictions | boolean
+				value:region restrictions | boolean,
+				selector:selector
+			},
+			registration_date:{
+				value:yyyy-MM-ddThh:mm:ss | string,
 				selector:selector
 			},
 		`
@@ -794,8 +821,8 @@ const item2json = function(type, href){
 				value:order complete | boolean,
 				selector:selector
 			},
-			created_at:{
-				value:yyyy-MM-dd'T'HH:mm:ss
+			registration_date:{
+				value:yyyy-MM-ddThh:mm:ss | string,
 				selector:selector
 			},
 		`
@@ -808,7 +835,7 @@ const item2json = function(type, href){
 const context2results = function(context, results, language){
 	var condition = ''
 
-	if(obj.condition){
+	if(context.condition){
 		condition = `condition : ${JSON.stringify(context.condition)}`
 	}
 
@@ -988,14 +1015,24 @@ function parseCondition(obj, col, condition){
 		}
 	}
 
-	if(obj.gte && obj.lte){
-		condition += ` "${col}" >= ${val(col,obj.gte)} AND ${col} <= ${val(col,obj.lte)}`
-	}else if(obj.gte){
-		condition += `"${col}" >= ${val(col,obj.gte)}`
-	}else if(obj.lte){
-		condition += `"${col}" <= ${val(col,obj.lte)}`
-	}else if(obj.eq){
-		condition += `"${col}" = ${val(col,obj.eq)}`
+	var gte = val(col,obj.gte)
+	var lte = val(col,obj.lte)
+	var eq = val(col,obj.eq)
+
+	var column = col == 'date' ? 'created_at' : col
+
+	if(!isNaN(gte) || !isNaN(lte) || !isNaN(eq)){
+		if(obj.gte && obj.lte){
+			condition += ` "${column}" >= ${val(col,obj.gte)} AND "${column}" <= ${val(col,obj.lte)}`
+		}else if(obj.gte){
+			condition += `"${column}" >= ${val(col,obj.gte)}`
+		}else if(obj.lte){
+			condition += `"${column}" <= ${val(col,obj.lte)}`
+		}else if(obj.eq){
+			condition += `"${column}" = ${val(col,obj.eq)}`
+		}
+	}else{
+		condition = ''
 	}
 
 	return condition;
@@ -1751,17 +1788,32 @@ const Relay = async function(foreign, primary){
 	}
 }
 
+function operators(property, current){
+	if(property == "date"){
+		return {
+			eq : "yyyy-MM-ddThh:mm:ss",
+			lte : "yyyy-MM-ddThh:mm:ss",
+			gte : "yyyy-MM-ddThh:mm:ss"
+		}
+	}else{
+		return {
+			eq : 0,
+			lte : 0,
+			gte : 0
+		}
+	}
+}
 
-const paragraph2propertys = async function(task, team, paragraph){
+const paragraph2propertys = function(task, team, paragraph, current){
 	paragraph.region = task.flag // flag
-	paragraph.status = ''
-	paragraph.orderBy = ''
-	paragraph.find = ''
-	paragraph.substantial = ''
+	paragraph.status = '#status'
+	paragraph.orderBy = '#orderBy'
+	paragraph.find = '#find'
+	paragraph.substantial = '#substantial'
 
 	paragraph.condition = {}
 
-	var type = paragraph.type
+	var type = ''
 
 	if(paragraph.type == "tracking"){
 		type = "tracking"
@@ -1785,64 +1837,55 @@ const paragraph2propertys = async function(task, team, paragraph){
 	}*/
 
 
-	var operators = function(property, current){
-		if(property == "date"){
-			return {
-				eq : current,
-				lte : current,
-				gte : current
-			}
-		}else{
-			return {
-				eq : 0,
-				lte : 0,
-				gte : 0
-			}
-		}
-	}
+
 
 			
 
-
-	var propertys = ['price', 'quantity', 'width', 'height', 'length', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', 'date']
-
-	for(var p = 0; p < propertys.length; p++){
-		var property = propertys[p]
-
-		if(!paragraph.condition[property]){
-			paragraph.condition[property] = {}
-		}
-
-		if(property == "date"){
-			if(team.data.base[paragraph.type].started_at.min){
-				paragraph.condition[property].min = team.data.base[paragraph.type].started_at.min
+	try{
+		if(type){
+			if(paragraph.condition.date){
+				paragraph.condition.date = mergeNode(paragraph.condition.date, operators('date', current))
+			}else{
+				paragraph.condition.date = operators('date', current)
 			}
 
-			if(team.data.base[paragraph.type].expired_at.max){
-				paragraph.condition[property].max = team.data.base[paragraph.type].expired_at.max
+
+			var propertys = ['price', 'quantity', 'width', 'height', 'length', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', 'started_at', "expired_at"]
+
+			for(var p = 0; p < propertys.length; p++){
+				var property = propertys[p]
+
+				if(!paragraph.condition[property]){
+					paragraph.condition[property] = {}
+				}
+
+				if(team.data.base[paragraph.type][property].min){
+					paragraph.condition[property].min = team.data.base[paragraph.type][property].min
+				}
+
+				if(team.data.base[paragraph.type][property].max){
+					paragraph.condition[property].max = team.data.base[paragraph.type][property].max
+				}
+
+				if(Object.keys(paragraph.condition[property]).length){
+					paragraph.condition[property] = mergeNode(paragraph.condition[property], operators(property, current))
+
+					if(property == "price"){
+						paragraph.condition[property].currency = '' //
+					}
+				}else{
+					delete paragraph.condition[property]
+				}
 			}
 		}else{
-			if(team.data.base[paragraph.type][property].min){
-				paragraph.condition[property].min = team.data.base[paragraph.type][property].min
-			}
-
-			if(team.data.base[paragraph.type][property].max){
-				paragraph.condition[property].max = team.data.base[paragraph.type][property].max
-			}
+			paragraph = undefined
 		}
-
-			
-
-		if(Object.keys(paragraph.condition[property]).length){
-			paragraph.condition[property] = mergeNode(paragraph.condition[property], operators(property, current))
-
-			if(property == "price"){
-				paragraph.condition[property].currency = '' //
-			}
-		}else{
-			delete paragraph.condition[property]
-		}
+	}catch(err){
+		console.log('err',err);
 	}
+		
+
+	return paragraph
 }
 
 /*
@@ -2091,7 +2134,8 @@ async function Deepinfra(key, model, system, user, inlineData){
 		"model" : model,
 		"messages": messages,
 		"max_tokens": 15000,
-		"temperature": 1
+		"temperature": 1,
+		"top_p": 1
 	}
 
 	var pathname = 'chat/completions'
@@ -2223,8 +2267,6 @@ export default {
 		try{
 			const buffer = await request.arrayBuffer()
 
-			console.log('buffer.byteLength',buffer.byteLength);
-
 			if(buffer.byteLength){
 				var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(buffer))
 
@@ -2242,8 +2284,6 @@ export default {
 
 				var created_at = now - 10000
 
-				var pageCount = json.counts
-
 				var limits = json.limits
 
 				var models = json.models
@@ -2256,7 +2296,7 @@ export default {
 
 				var fallback = ''
 
-				var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "ref" = '${json.ref}' AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
+				var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "id" = '${json.id}' AND "ref" = '${json.ref}' AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
 
 				console.log('results.length',results.length);
 
@@ -2269,14 +2309,6 @@ export default {
 						var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.task))
 
 						var task = JSON.parse(decompressedJsonString)
-
-						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-							text : task.body,
-							link : task.link,
-							origin : task.origin ? task.origin : ''
-						})), { to: 'arraybuffer' })
-
-						task.data = arr.buffer
 
 						var talk = {
 							id : task.id,
@@ -2327,6 +2359,9 @@ export default {
 						}else{
 							team.data = {}
 						}
+
+						console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
+
 
 						var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'user' AND "bcc" = '${team.bcc}' AND "created_at" < ${now} LIMIT 1`).all()
 
@@ -2388,6 +2423,7 @@ export default {
 								}
 							}
 
+							// 추후 꼭 반영해야함 프론트 백엔드 미개발되어있음
 							if(team.data){
 								if(team.data.address){
 									for(var a = 0; a < team.data.address.length; a++){
@@ -2405,7 +2441,7 @@ export default {
 							var item
 
 							if(models['deepinfra']){
-								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', '', system, inlineData)
+								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', inlineData)
 
 								models['deepinfra'] -= 1
 
@@ -2424,7 +2460,7 @@ export default {
 								continue
 							}
 
-							if(!item.no){
+							if(!item.tracking_number){
 								fallback = 'ShippingLabel Not Found'
 								// 올바르지 않은 이미지 안내하기
 
@@ -2455,9 +2491,8 @@ export default {
 								둘다 없으면 type 'draft'로 전부 추가해야함
 							*/
 							
-							item.tracking_number = item.no + ""
 
-							item.no = normalizeNumericHomoglyphs(item.no)
+							item.no = normalizeNumericHomoglyphs(item.tracking_number)
 
 							item.no = cleanNumber(item.no)
 
@@ -2471,15 +2506,15 @@ export default {
 
 							item.to = task.to
 
-							item.cc = hashId('logis.center') // logis.center로 잡혀져 있음 
+							item.cc = task.cc // logis.center로 잡혀져 있음 
 
 							item.bcc = task.bcc
 
-							item.ref = '' // task.ref
+							item.ref = task.ref
 
 							item.created_at = now
 
-							item.index = crc32(team.id+item.id)
+							item.index = crc32(hashId(item.type+team.id+item.id))
 
 							var statusCode = item.status = item.status ? parseStatus(item.status) : 0
 
@@ -2537,86 +2572,95 @@ export default {
 								}
 
 								if(results.length){
-									var _item = results[0]
+									var _tracking = results[0]
 
-									delete _item.ref
+									delete _tracking.ref
 
 									if(item.status){
-										if(_item.status){
-											delete _item.status
+										if(_tracking.status){
+											delete _tracking.status
 										}
 									}
 
-									item = mergeNode(item, _item)
+									item = mergeNode(item, _tracking)
 
 									if(sales.length){
-										var _item = sales[0]
+										var _order = sales[0]
+
+										item.order = _order.index
 
 										statements[`logis_${zoneRegion}_sales`].push(
 											env[`logis_${zoneRegion}_sales`].prepare(`
-												UPDATE sales SET updated_at = ?, status = ? WHERE id = ?
+												UPDATE sales SET updated_at = ?, status = ?, tracking = ? WHERE id = ?
 											`).bind(
-												now, _item.status, _item.id
+												now, item.status, item.index, _order.id
 											)
 										)
 
 										team.data.base.pages[task.cc].order.draft--
 										team.data.base.pages[task.cc].order.count++
 
-										team.data.base.pages[task.cc][type].draft--
-										team.data.base.pages[task.cc][type].count++
+										team.data.base.pages[task.cc].tracking.draft--
+										team.data.base.pages[task.cc].tracking.count++
 									}
 								}else{
 									if(sales.length){
-										team.data.base.pages[task.cc][type].draft--
-										team.data.base.pages[task.cc][type].count++
+										team.data.base.pages[task.cc].tracking.draft--
+										team.data.base.pages[task.cc].tracking.count++
 									}else{
-										team.data.base.pages[task.cc][type].draft++
+										team.data.base.pages[task.cc].tracking.draft++
 										team.data.base[type].count++
 
 										// items 추가 해야함
 									}
 								}
-
-
-
-								var _item = sales[0]
-
-								statements[`logis_${zoneRegion}_items`].push(
-									env[`logis_${zoneRegion}_items`].prepare(`
-										INSERT INTO items (
-											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-										) VALUES (
-											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-										) ON CONFLICT (id) DO UPDATE SET
-											"type" = EXCLUDED."type",
-											"from" = EXCLUDED."from",
-											"to" = EXCLUDED."to",
-											"cc" = EXCLUDED."cc",
-											"bcc" = EXCLUDED."bcc",
-											"ref" = EXCLUDED."ref",
-											"data" = EXCLUDED."data",
-											"created_at" = EXCLUDED."created_at",
-											"updated_at" = EXCLUDED."updated_at"
-									`).bind(
-										_item.id,
-										_item.type,
-										_item.from,
-										_item.to,
-										_item.cc,
-										_item.bcc,
-										_item.data,
-										item.id,
-										_item.created_at,
-										sales.length ? now : 0
-									)
-								)
+									
 
 								item.ref = task.ref
 
 								item.created_at = now
 
-								if(sales.length == 0){
+								if(sales.length){
+									var _item = sales[0]
+
+									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
+
+									var _data = JSON.parse(decompressedJsonString)
+
+									item.order = _item.index
+
+									statements[`logis_${zoneRegion}_items`].push(
+										env[`logis_${zoneRegion}_items`].prepare(`
+											INSERT INTO items (
+												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+											) VALUES (
+												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+											) ON CONFLICT (id) DO UPDATE SET
+												"type" = EXCLUDED."type",
+												"from" = EXCLUDED."from",
+												"to" = EXCLUDED."to",
+												"cc" = EXCLUDED."cc",
+												"bcc" = EXCLUDED."bcc",
+												"ref" = EXCLUDED."ref",
+												"data" = EXCLUDED."data",
+												"created_at" = EXCLUDED."created_at",
+												"updated_at" = EXCLUDED."updated_at"
+										`).bind(
+											_item.id,
+											_item.type,
+											_item.from,
+											_item.to,
+											_item.cc,
+											_item.bcc,
+											_item.data,
+											item.id,
+											_data.time,
+											now
+										)
+									)
+
+
+								}else{
 									var content = {}
 
 									if(item.title){
@@ -2646,7 +2690,6 @@ export default {
 									item.type = item.recipient_match ? 'receiving' : 'shipping'
 
 
-
 									// 추후에 반품인지 아닌지 추가해야함
 
 
@@ -2654,7 +2697,8 @@ export default {
 										no : item.no ? item.no :"",
 										type : item.type,
 										text : item.text,
-										link : null
+										link : null,
+										time : now
 									})), { to: 'arraybuffer' })
 
 									item.data = arr.buffer
@@ -2667,8 +2711,9 @@ export default {
 										to: task.to,
 										cc: task.cc,
 										bcc: task.bcc,
-										ref:pageid
+										ref:pageId
 									}
+
 
 									var embeddings
 
@@ -2938,7 +2983,8 @@ export default {
 											var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
 
 											if(document.querySelector(selectors.node)){
-												task.body = document.querySelector(selectors.node).innerHTML
+												console.log('selectors.node',selectors.node);
+												// task.body = document.querySelector(selectors.node).innerHTML
 											}
 
 										}catch(err){
@@ -3106,19 +3152,23 @@ export default {
 									team.data.base.pages[task.cc] = {}
 								}
 
-								if(!team.data.base.pages[task.cc][page.type]){
-									team.data.base.pages[task.cc][page.type] = {
-										draft : 0,
-										count : 0
+								if(page.type){
+									if(!team.data.base.pages[task.cc][page.type]){
+										team.data.base.pages[task.cc][page.type] = {
+											draft : 0,
+											count : 0
+										}
+									}
+
+									if(!team.data.base[page.type]){
+										team.data.base[page.type] = {
+											draft : 0,
+											count : 0
+										}
 									}
 								}
 
-								if(!team.data.base[page.type]){
-									team.data.base[page.type] = {
-										draft : 0,
-										count : 0
-									}
-								}
+									
 
 
 								var selectors = {
@@ -3130,6 +3180,7 @@ export default {
 									more : page.more || '',
 									next : page.next || '',
 									link : task.link,
+									time : now,
 									origin : task.origin ? task.origin : ''
 								}
 
@@ -3237,6 +3288,7 @@ export default {
 								}else{
 									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 										type : page.type,
+										link : task.link,
 										origin : task.origin,
 										detail : true,
 										node : true,
@@ -3298,7 +3350,7 @@ export default {
 															}
 
 														}catch(err){
-															console.log('selector err',err);
+															// console.log('selector err',err);
 														}
 													}
 												}
@@ -3308,7 +3360,7 @@ export default {
 										// console.log('_page.data err',err);
 									}
 
-									// _page.data = before
+									_page.data = before
 
 									page = mergeNode(_page, page)
 
@@ -3322,6 +3374,8 @@ export default {
 								page.id = task.page ? task.page.id : pageId
 
 								console.log('page.id',page.id);
+
+								console.log('page',JSON.stringify(page));
 
 								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(page.data)), { to: 'arraybuffer' })
 
@@ -3444,9 +3498,6 @@ export default {
 									for(var i = 0; i < items.length; i++){
 										var item = items[i]
 
-										if(item.date){
-											item.started_at = new Date(item.date).getTime()
-										}
 
 										if(!item.id){
 											continue
@@ -3465,7 +3516,7 @@ export default {
 										item.no = cleanNumber(item.id.toString())
 
 
-										item.index = crc32(hashId(team.id+item.no))
+										item.index = crc32(hashId(item.type+team.id+item.no))
 
 										try{
 											try{
@@ -3503,9 +3554,20 @@ export default {
 
 										}
 
-										item.created_at = now
+										if(item.registration_date){
+											console.log('item.registration_date',item.registration_date);
+											item.created_at = new Date(item.registration_date).getTime()
+										}else{
+											item.created_at = now
+										}
 
-										item.updated_at = selectors.item ? 0 : now
+
+										var updated_at = item.updated_at = 0
+
+										if(isDetail){
+											item.updated_at = updated_at = now
+										}
+
 
 
 
@@ -3517,14 +3579,17 @@ export default {
 											no : item.no ? item.no : "",
 											title : item.title ? item.title : '',
 											link : item.link,
+											time : now,
 											origin : task.origin ? task.origin : ''
 										}
 
-										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "type" = '${item.type}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 										console.log('add results.length',item.type,results.length);
 
 										console.log('item.updated_at',item.updated_at ? 'true' : 'false');
+
+										console.log('team.data.base.pages[task.cc][item.type]',JSON.stringify(team.data.base.pages[task.cc]));
 
 										if(results.length){
 											var _item = results[0]
@@ -3539,33 +3604,40 @@ export default {
 												item.ref = _item.data.ref
 											}
 
-
-											if(!_item.updated_at){
-												if(item.updated_at){
-													team.data.base.pages[task.cc][item.type].draft--
-													team.data.base.pages[task.cc][item.type].count++
-												}
-											}
-
-											item.updated_at = now
-
 											if(item.status){
 												if(_item.status){
 													delete _item.status
 												}
 											}
 
+
 											item = mergeNode(_item, item)
 
+											var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_item.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+											if(results.length){
+												var _item = results[0]
+
+												console.log('_item.updated_at',_item.updated_at);
+												console.log('item.updated_at',updated_at);
+												if(!_item.updated_at){
+													if(updated_at){
+														team.data.base.pages[task.cc][item.type].draft--
+														team.data.base.pages[task.cc][item.type].count++
+													}
+												}
+
+												// item.updated_at = now
+											}
+
 										}else{
-											console.log(`team.data.base.pages[task.cc][item.type]`, team.data.base.pages[task.cc][item.type])
-											if(item.updated_at){
+											if(updated_at){
 												team.data.base.pages[task.cc][item.type].count++
 											}else{
 												team.data.base.pages[task.cc][item.type].draft++
-												team.data.base[item.type].count++
-												
 											}
+
+											team.data.base[item.type].count++
 										}
 
 										// item.id = hashId(team.id+task.cc+task.link)
@@ -3618,7 +3690,7 @@ export default {
 											var tracking_number = normalizeNumericHomoglyphs(item.tracking_number)
 												tracking_number = cleanNumber(tracking_number)
 
-											item.tracking = crc32(hashId(team.id+tracking_number))
+											item.tracking = crc32(hashId('tracking'+team.id+tracking_number))
 										}
 
 											
@@ -3653,7 +3725,7 @@ export default {
 
 															good.no = no
 
-															good.index = crc32(hashId(team.id+good.no))
+															good.index = crc32(hashId('goods'+team.id+good.no))
 
 															var { results } = await env[`logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = 'goods' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
@@ -3663,13 +3735,15 @@ export default {
 
 															tracking.goods = good.index
 
-															tracking.id = hashId(team.id+good.no)
+															tracking.id = hashId(team.id+tracking.no+good.no)
+
 														}else{
 															tracking.id = hashId(team.id+tracking.no)
+
 														}
 
 
-														tracking.status = parseStatus(item.status)
+														tracking.status = item.status
 
 														tracking.order = item.index
 
@@ -3688,7 +3762,19 @@ export default {
 														tracking.data = {
 															id : item.id,
 															link : item.link,
+															time : now,
 															origin : task.origin ? task.origin : ""
+														}
+
+														if(!team.data.base.pages[task.cc]){
+															team.data.base.pages[task.cc] = {}
+														}
+
+														if(!team.data.base.pages[task.cc][tracking.type]){
+															team.data.base.pages[task.cc][tracking.type] = {
+																draft : 0,
+																count : 0
+															}
 														}
 
 
@@ -3705,6 +3791,30 @@ export default {
 															delete _tracking.ref
 
 															tracking = mergeNode(_tracking, tracking)
+
+
+
+
+															var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_tracking.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+															if(results.length){
+																var _item = results[0]
+
+																if(!_item.updated_at){
+																	if(updated_at){
+																		team.data.base.pages[task.cc].tracking.draft--
+																		team.data.base.pages[task.cc].tracking.count++
+
+																		statements[`logis_${zoneRegion}_items`].push(
+																			env[`logis_${zoneRegion}_items`].prepare(`
+																				UPDATE items SET updated_at = ? WHERE id = ?
+																			`).bind(
+																				now, _item.id
+																			)
+																		)
+																	}
+																}
+															}
 														}else{
 															// 처음 저장할때 자연어 LLM으로 전처리해서 벡터 저장해야함
 															var content = JSON.stringify({
@@ -3803,11 +3913,14 @@ export default {
 
 															team.data.base.pages[task.cc][tracking.type].draft++
 															// team.data.base.pages[task.cc][tracking.type].count--
+															team.data.base[item.type].count++
 
 															await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
 														}
 
 														var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
+
+														console.log('tracking',JSON.stringify(tracking))
 
 														statements[`logis_${zoneRegion}_tracking`].push(
 															env[`logis_${zoneRegion}_tracking`].prepare(`
@@ -3915,46 +4028,6 @@ export default {
 										}
 
 
-										// team base 설정
-										if(!team.data.base){
-											team.data.base = {
-												goods : {
-													draft : 0,
-													count : 0
-												},
-												order : {
-													draft : 0,
-													count : 0
-												},
-												event : {
-													draft : 0,
-													count : 0
-												},
-												coupon : {
-													draft : 0,
-													count : 0
-												},
-												tracking : {
-													draft : 0,
-													count : 0
-												},
-												search : {
-													draft : 0,
-													count : 0
-												},
-												review : {
-													draft : 0,
-													count : 0
-												},
-												member : {
-													draft : 0,
-													count : 0
-												}
-											}
-										}
-
-
-
 										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 										if(results.length){
@@ -3972,7 +4045,7 @@ export default {
 
 
 										}else{
-											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "type" = '${item.type}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 											if(results.length){
 												var _item = results[0]
@@ -4175,7 +4248,6 @@ export default {
 										}
 
 
-										var updated_at
 
 										var progress = {}
 
@@ -4221,25 +4293,31 @@ export default {
 
 												try{
 													if(query.length){
-														var table = query[0].type 
+														var table = query[0].table
 														var type = query[0].type
 														var column = query[0].column
 														var column_value = query[0].value
 														var status = query[0].status
 
-														if(typeof status != "undefined"){
-															var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
-																`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-															).bind(
-																column_value, team.id, item.cc, status, now
-															).all()
-														}else{
-															var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
-																`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-															).bind(
-																column_value, team.id, item.cc, now
-															).all()
-														}
+														// if(typeof status != "undefined"){
+														// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+														// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+														// 	).bind(
+														// 		column_value, team.id, item.cc, status, now
+														// 	).all()
+														// }else{
+														// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+														// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+														// 	).bind(
+														// 		column_value, team.id, item.cc, now
+														// 	).all()
+														// }
+
+														var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+															`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+														).bind(
+															column_value, team.id, item.cc, now
+														).all()
 
 
 														if(results.length == 0){
@@ -4329,11 +4407,11 @@ export default {
 																	var merge
 
 																	if(relate.merge.update){
-																		merge = merge.update
+																		merge = relate.merge.update
 																	}
 
 																	if(relate.merge.upsert){
-																		merge = merge.upsert
+																		merge = relate.merge.upsert
 																	}
 
 																	if(!merge){
@@ -4347,6 +4425,10 @@ export default {
 																	var from = row.type == merge.from ? item : row
 
 																	var to = row.type == merge.to ? item : row
+
+																	if(row.type == merge.to){
+																		to.updated_at = updated_at
+																	}
 																	
 																	if(merge.includes){
 																		if(merge.includes.length){
@@ -4386,6 +4468,9 @@ export default {
 
 																	edge.type = edgeType
 
+
+																	
+
 																	
 																	if(relate.type == merge.from){
 																		// import
@@ -4396,13 +4481,14 @@ export default {
 																				no : edge.no ? edge.no : "",
 																				title : edge.title,
 																				link : edge.link,
+																				time : now,
 																				origin : data.origin ? data.origin : "",
 																				data : data
 																			})), { to: 'arraybuffer' })
 
-																			edge.vectorize = true
+																			// edge.vectorize = true
 
-																			edge.data = arr.buffer
+																			// edge.data = arr.buffer
 
 																			var metadata = {
 																				title : data.title ? data.title : "",
@@ -4504,6 +4590,14 @@ export default {
 																	}else{
 																		// export
 																	}
+
+
+																	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(edge.data))
+
+																	edge.data = JSON.parse(decompressedJsonString)
+
+
+																	edge.updated_at = edge.data.item ? 0 : now
 
 
 
@@ -4747,20 +4841,26 @@ export default {
 
 
 
-																	var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${row.id}' AND "created_at" < ${now} AND "updated_at" = 0 LIMIT 1`).all()
+																	var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${edge.id}' AND "created_at" < ${now} AND "updated_at" = 0 LIMIT 1`).all()
 
 																	if(results.length){
-																		// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
-																		team.data.base.pages[row.cc][row.type].draft--
-																		team.data.base.pages[row.cc][row.type].count--
+																		var _item = results[0]
 
-																		statements[`logis_${zoneRegion}_items`].push(
-																			env[`logis_${zoneRegion}_items`].prepare(`
-																				UPDATE items SET updated_at = ? WHERE id = ?
-																			`).bind(
-																				now, row.id
-																			)
-																		)
+																		if(!_item.updated_at){
+																			if(edge.updated_at){
+																				// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
+																				team.data.base.pages[row.cc][row.type].draft--
+																				team.data.base.pages[row.cc][row.type].count++
+
+																				statements[`logis_${zoneRegion}_items`].push(
+																					env[`logis_${zoneRegion}_items`].prepare(`
+																						UPDATE items SET updated_at = ? WHERE id = ?
+																					`).bind(
+																						now, row.id
+																					)
+																				)
+																			}
+																		}
 																	}
 
 
@@ -4775,17 +4875,31 @@ export default {
 																var draftId = hashId(item.id)
 
 																team.data.base.pages[item.cc][item.type].draft++
+																team.data.base[item.type].count++
 
 																var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${draftId}' AND "created_at" < ${now} LIMIT 1`).all()
 
 																if(results.length){
+																	var _item = results[0]
 
+																	if(!_item.updated_at){
+																		if(updated_at){
+																			statements[`logis_${zoneRegion}_items`].push(
+																				env[`logis_${zoneRegion}_items`].prepare(`
+																					UPDATE items SET updated_at = ? WHERE id = ?
+																				`).bind(
+																					now, item.id
+																				)
+																			)
+																		}
+																	}
 																}else{
 																	var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 																		id : item.id,
 																		no : item.no ? item.no : "",
 																		title : item.title,
 																		link : item.link,
+																		time : now,
 																		data : relate
 																	})), { to: 'arraybuffer' })
 
@@ -4894,10 +5008,11 @@ export default {
 										item.data.text = item.semantic
 										item.data.ref = page.ref
 
+										console.log('item',JSON.stringify(item))
+
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item.data)), { to: 'arraybuffer' })
 
 										item.data = arr.buffer
-
 
 										statements[`logis_${zoneRegion}_items`].push(
 											env[`logis_${zoneRegion}_items`].prepare(`
@@ -4925,10 +5040,10 @@ export default {
 												item.ref,
 												item.data,
 												now,
-												typeof updated_at != "undefined" ? updated_at : now 
+												updated_at
 											)
 										)
-
+											
 										if(itemType == "sales"){
 											statements[`logis_${zoneRegion}_sales`].push(
 												env[`logis_${zoneRegion}_sales`].prepare(`
@@ -4999,7 +5114,7 @@ export default {
 													parseFloat(item.length ? item.length : 0),
 													parseFloat(item.weight ? item.weight : 0),
 													item.size ? item.size : "",
-													item.currency,
+													item.currency ? item.currency : "",
 													parseFloat(item.supply_price? item.supply_price : 0),
 													parseFloat(item.sale_price? item.sale_price : 0),
 													parseFloat(item.discount ? item.discount : 0),
@@ -5166,6 +5281,7 @@ export default {
 												)
 											)
 										}
+											
 									}
 								}
 
@@ -5273,6 +5389,7 @@ export default {
 									type : page.type,
 									text : task.semantic,
 									link : task.link,
+									time : now,
 									origin : task.origin ? task.origin : ''
 								})), { to: 'arraybuffer' })
 
@@ -5305,6 +5422,8 @@ export default {
 										now
 									)
 								)
+
+									
 
 							}catch(err){
 								console.log('inner err '+err)
@@ -5346,7 +5465,7 @@ export default {
 
 							*/ 
 
-							team.data.base['prompt'].count++
+							// team.data.base['prompt'].count++
 
 							var paragraphs
 
@@ -5380,16 +5499,19 @@ export default {
 								continue
 							}
 
+							console.log('before paragraphs',JSON.stringify(paragraphs))
+
 
 							try{
 								if(paragraphs.length){
 									for(var p = 0; p < paragraphs.length; p++){
 										var paragraph = paragraphs[p]
 
-										paragraphs[p] = paragraph2propertys(task, team, paragraph)
+										paragraphs[p] = paragraph2propertys(task, team, paragraph, current)
 									}
 								}else{
 									fallback = 'paragraph2propertys'
+									// 올바르지 않은 대화요청입니다 리턴해야함
 
 									continue
 								}
@@ -5398,31 +5520,59 @@ export default {
 							}
 
 
+							if(paragraphs.length){
+								paragraphs = rowsTrim(paragraphs)
+							}
+
+							console.log('after paragraphs',JSON.stringify(paragraphs))
+
+							if(paragraphs.length == 0){
+								continue
+							}
+
 
 							var contexts
 
 							var system = graph2contexts(current)
 
 							if(models['deepinfra']){
-								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, JSON.stringify(paragraphs))
+								var results = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, `{contexts : ${JSON.stringify(paragraphs)}}`)
 
-								if(res){
-									contexts = res.context
+								console.log('contexts res',JSON.stringify(results))
+
+								if(results){
+									if(results.contexts){
+										contexts = results.contexts
+									}else if(Object.keys(results).length){
+										if(!results.text){
+											results.text = task.body
+										}
+
+										if(!results.type && paragraphs.length == 1){
+											results.type = paragraphs[0].type
+										}
+
+
+										contexts = [results]
+									}
 								}
 
 								models['deepinfra'] -= 1
 							}
 
-							if(!contexts && gemini_llm_api){
-								var res = await Gemini(gemini_llm_api, gemini_llm_model, system, JSON.stringify(paragraphs))
+							// if(!contexts && gemini_llm_api){
+							// 	var res = await Gemini(gemini_llm_api, gemini_llm_model, system, `{contexts : ${JSON.stringify(paragraphs)}}`)
 
-								if(res){
-									contexts = res.context
-								}
+							// 	if(res){
+							// 		if(res.contexts){
+							// 			contexts = res.contexts
+							// 		}
+							// 	}
 
-								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+							// 	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
-							}
+							// }
+
 
 							if(!contexts){
 								fallback = 'graph2contexts overflow'
@@ -5430,6 +5580,8 @@ export default {
 								continue
 							}
 
+
+							console.log('contexts',JSON.stringify(contexts))
 
 
 
@@ -5496,6 +5648,25 @@ export default {
 											continue
 										}
 
+										if(context.date == '#date'){
+											context.date = ''
+										}
+
+										if(context.status == '#status'){
+											context.status = ''
+										}
+
+										if(context.substantial == '#substantial'){
+											context.substantial = ''
+										}
+
+										if(context.find == '#find'){
+											context.find = ''
+										}
+
+
+
+
 
 										var type = context.type
 
@@ -5523,7 +5694,7 @@ export default {
 										context.sort = "DESC"
 
 										if(context.find){
-											if(find == 'light' || find == 'few' || find == 'little'){
+											if(context.find == 'light' || context.find == 'few' || context.find == 'little'){
 												context.sort = "ASC"
 											}
 										}
@@ -5532,7 +5703,7 @@ export default {
 										var query = {
 											options:{
 												topK: task.topK,
-												returnValues: false, // true 이며 벡터 값 포함
+												returnValues: true, // true 이며 벡터 값 포함
 												returnMetadata: 'all',
 												filter : {
 													type : context.type,
@@ -5543,25 +5714,24 @@ export default {
 
 										var queryVector
 
+										console.log('context.text',context.text);
+
 										if(models['cloudflare']){
-											var { data: queryVector } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+											var embeddings = await env.AI.run('@cf/google/embeddinggemma-300m', {
 												text: [context.text],
 											})
+
+											queryVector = embeddings.data[0];
 
 											models['cloudflare'] -= 1
 
 										}
 
-										if(!queryVector && models['deepinfra']){
-											var queryVector = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', context.text.tirm())
 
-											var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-												return {
-													id: item.id,
-													values: values,
-													metadata: metadata
-												}
-											})
+										if(!queryVector && models['deepinfra']){
+											var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', context.text)
+
+											queryVector = embeddings
 
 											models['deepinfra'] -= 1
 
@@ -5576,71 +5746,101 @@ export default {
 
 
 
-
-										var condition = `"created_at" < ${now}`
+										var condition = ``
 
 										if(context.status){
 											if(type == "sales"){
 												if(context.status == "used" || context.status == "lease" || context.status == "rental" || context.status == "refurbish"){
-													condition += ` AND "${context.status}" > 0 `
+													condition += ` "${context.status}" > 0 `
 												}
 											}else{
-												var status = 0
-
-												if(context.status.indexOf('used') > -1){
-													status = 1
-												}
-
-												if(context.status.indexOf('lease') > -1){
-													status = 2
-												}
-
-												if(context.status.indexOf('rental') > -1){
-													status = 3
-												}
-
-												if(context.status.indexOf('refurbish') > -1){
-													status = 4
-												}
+												var status = parseStatus(context.status)
 
 												if(status){
-													condition += ` AND "status" = ${status} `
+													condition += ` "status" = ${status} `
 												}
 											}
 										}
 
+										var temp = {}
+
+/*
+	{
+		"date":{"gte":"2025-06-01T00:00:00","lte":"2025-08-31T23:59:59"},
+		"quantity":{"max":1},
+		"sale_price":{"max":615600}
+	}
+*/										
+
 										if(Object.keys(context.condition).length){
-											for (var key in context.condition) {
-												var value = context.condition[key]
+											for (var key1 in context.condition) {
+												var obj = context.condition[key1]
 
-												if (context.condition.hasOwnProperty(key)) {
-													if(isNaN(value)){
-														query.options.filter[key] = value
+												if (context.condition.hasOwnProperty(key1)) {
+													for (var key2 in obj) {
+														var value = obj[key2]
 
-														if(key == "price"){
-															if(value.currency){
-																query.options.filter.currency = value.currency
+														if(value){
+															if(key2 == "min" || key2 == "max"){
+
+															}else{
+																if(!temp[key1]){
+																	temp[key1] = true
+
+																	if(isNaN(value)){
+																		if(key1 != "date"){
+																			query.options.filter[key1] = value
+																		}
+
+																		condition += parseCondition(obj, key1, " AND ")
+
+																		if(key1 == "price"){
+																			if(context.condition.currency){
+																				query.options.filter.currency = context.condition.currency
+																			}
+																		}
+
+																	}else{
+																		condition += parseCondition(value, key1, " AND ")
+																	}
+																}
 															}
 														}
-													}else{
-														condition += parseCondition(value, key, " AND ")
+															
 													}
 												}
 											}
 										}
 
+										console.log('before condition',condition);
 
+										if(condition){
+											condition = condition.replace(' AND ', '')
+											condition = condition.trim()
+										}
 
-										var { matches } = await env[`${vectorRegion}-${type}`].query(queryVector[0], query.options)
+										console.log('context.condition',JSON.stringify(context.condition));
+
+										console.log('query.options',JSON.stringify(query.options))
+										console.log(`vectorRegion type ${vectorRegion}-${type}`);
+
+										var { matches } = await env[`${vectorRegion}-${type}`].query(queryVector, query.options)
 
 										var rag = {
 											search : {
 												query : context.condition,
-												sql : {},
-												vector : {}
+												sql : {
+													results : []
+												},
+												vector : {
+													results : []
+												}
 											}
 										}
 
+										rag.search.sql
+
+										console.log('matches.length',matches.length.toString());
 
 										var matches_condition = ''
 
@@ -5654,40 +5854,49 @@ export default {
 
 												matches_condition += `("id" = '${match.id}' AND "to" = '${team.id}' AND "created_at" < ${now})`
 											}
-										}
 
-										var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
+											console.log('matches_condition',matches_condition);
 
-										if(results.length){
-											for(var r = 0; r < results.length; r++){
-												var result = results[r]
+											console.log('type',type);
 
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(result.data))
+											try{
+												var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
 
-												var data = JSON.parse(decompressedJsonString)
+												if(results.length){
+													for(var r = 0; r < results.length; r++){
+														var result = results[r]
 
-												if(data){
-													if(Object.keys(data).length){
-														for (var name in data) {
-															if (data.hasOwnProperty(name)) {
-																var value = data[name]
+														var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(result.data))
 
-																result[name] = value
+														var data = JSON.parse(decompressedJsonString)
+
+														if(data){
+															if(Object.keys(data).length){
+																for (var name in data) {
+																	if (data.hasOwnProperty(name)) {
+																		var value = data[name]
+
+																		result[name] = value
+																	}
+																}
 															}
 														}
+
+														delete results[i].from
+														delete results[i].to
+														delete results[i].cc
+														delete results[i].bcc
+														delete results[i].ref
+														delete results[i].data
 													}
+
+													rag.search.vector = {
+														results : results
+													}
+													
 												}
-
-												delete results[i].from
-												delete results[i].to
-												delete results[i].cc
-												delete results[i].bcc
-												delete results[i].ref
-												delete results[i].data
-											}
-
-											rag.search.vector = {
-												results : results
+											}catch(err){
+												console.log('matches_condition',err);
 											}
 											
 										}
@@ -5698,40 +5907,69 @@ export default {
 											orderBy = `ORDER BY ${context.by} ${context.sort}`
 										}
 
-										var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' AND "created_at" < ${now} ${orderBy} LIMIT 300`).all()
+										console.log('type',type);
 
-										if(results.length){
-											for(var r = 0; r < results.length; r++){
-												var result = results[r]
+										console.log('after condition',condition);
 
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(result.data))
-
-												var data = JSON.parse(decompressedJsonString)
-
-												if(data){
-													if(Object.keys(data).length){
-														for (var name in data) {
-															if (data.hasOwnProperty(name)) {
-																var value = data[name]
-
-																result[name] = value
-															}
-														}
-													}
+										if(condition){
+											try{
+												if(condition.indexOf(created_at) > -1){
+													condition += ` AND "created_at" < ${now}`
 												}
 
-												delete results[i].from
-												delete results[i].to
-												delete results[i].cc
-												delete results[i].bcc
-												delete results[i].ref
-												delete results[i].data
+												console.log(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`);
+												 
+												var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`).all()
+
+												console.log('results.length',results.length);
+
+												if(results.length){
+													for(var r = 0; r < results.length; r++){
+														var result = results[r]
+
+														var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(safeClone(result.data)))
+
+														var data = JSON.parse(decompressedJsonString)
+
+														if(data){
+															result.data = {}
+
+															if(Object.keys(data).length){
+																for (var name in data) {
+																	if (data.hasOwnProperty(name)) {
+																		var value = data[name]
+
+																		if(name == "type" || name == "item" || name == "node" || name == "link" || name == "origin" || name == "detail"){
+
+																		}else{
+																			result.data[name] = value
+																		}
+																	}
+																}
+															}
+														}
+
+														results[r].data = result.data
+
+														delete results[r].from
+														delete results[r].to
+														delete results[r].cc
+														delete results[r].bcc
+														delete results[r].ref
+													}
+
+													rag.search.sql = {
+														results : results
+													}
+												}
+											}catch(err){
+												console.log('text2sql err',err);
 											}
 
-											rag.search.sql = {
-												results : results
-											}
 										}
+
+											
+											
 
 
 										var system = 'Return the content related to the {search.text} value from the search results in a JSON structure.'
@@ -5761,6 +5999,9 @@ export default {
 											continue
 										}
 
+
+										console.log('generation', JSON.stringify(generation));
+
 										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 											markdown : generation.markdown,
 											results: generation.results,
@@ -5788,8 +6029,38 @@ export default {
 											`).bind(
 												context.id,
 												context.type,
-												task.from,
-												task.to,
+												team.id,
+												task.bcc,
+												task.cc,
+												task.bcc,
+												task.id,
+												context.data,
+												now-100,
+												now-100
+											)
+										)
+
+										statements[`logis_${zoneRegion}_talks`].push(
+											env[`logis_${zoneRegion}_talks`].prepare(`
+												INSERT INTO talks (
+													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+												) VALUES (
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												) ON CONFLICT (id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												context.id,
+												context.type,
+												team.id,
+												task.bcc,
 												task.cc,
 												task.bcc,
 												task.id,
@@ -5802,14 +6073,12 @@ export default {
 								}
 							}	
 						}
+
+						// for loop end
 					}
 
-
-					statements[region].push(
-						env[region].prepare(`
-							DELETE FROM tasks WHERE id = "${task.id}"
-						`)
-					)
+					
+						
 
 
 					if(fallback){
@@ -5894,11 +6163,18 @@ export default {
 						)
 					)
 
+					
+					statements[region].push(
+						env[region].prepare(`
+							DELETE FROM tasks WHERE "id" = '${task.id}'
+						`)
+					)
+
+					console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
 
 					var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(team.data)), { to: 'arraybuffer' })
 
 					team.data = arr.buffer
-
 
 					statements[logisRegion].push(
 						env[logisRegion].prepare(`
@@ -5907,6 +6183,7 @@ export default {
 							team.data, now, team.id
 						)
 					)
+
 
 
 					for (const region in statements) {
@@ -5920,10 +6197,11 @@ export default {
 						}
 					}
 
+					limits[task.id] = true
+
 					return new Response(JSON.stringify({
 						models : models,
-						limits : limits,
-						counts : pageCount
+						limits : limits
 					}), {
 						headers: { "Content-Type": "application/json" },
 					})

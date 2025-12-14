@@ -6,16 +6,14 @@ async function Sleep(ms) {
 
 const CenterRegion = "logis_central"
 
-async function Cron(event, env, ctx, models, limits){
+async function Cron(event, env, ctx, models, limits, delay){
 	/*
 		매월 1일에 결제한 사용자를 기준으로 
 		사용 가능한 balance 지급하는 프로세스 추가해야함
 	*/
 	var now = Date.now()
 	
-	var created_at = now - 10000
-
-	console.log('env.region',env.region);
+	var created_at = now
 
 	try{
 		var { results } = await env[env.region].prepare(`SELECT * FROM tasks WHERE "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1000`).all()
@@ -27,14 +25,20 @@ async function Cron(event, env, ctx, models, limits){
 		var clear_condition = ""
 
 		if (len) {
+			console.log('limits',JSON.stringify(limits));
 			console.log('tasks len',len)
 			
-			for(var i = 0; i < len; i++){
+			for(var i = 0; i < results.length; i++){
 				var cron = results[i]
 
 				var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.task))
 
 				var task = JSON.parse(decompressedJsonString)
+
+				if(limits[task.id]){
+					len--
+					continue
+				}
 
 				if(task.method){
 					delete task.method
@@ -43,11 +47,14 @@ async function Cron(event, env, ctx, models, limits){
 				tasks.push(task)
 			}
 
-			var pageCount = {}
 
 			if(tasks.length){
 				for(var t = 0; t < tasks.length; t++){
 					var task = tasks[t]
+
+					if(limits[task.id]){
+						continue
+					}
 
 					var geminiKey = function(gemini1, gemini2){
 						if(Math.floor(Math.random() * 2)){
@@ -108,16 +115,24 @@ async function Cron(event, env, ctx, models, limits){
 					}else if(!models['deepinfra']){
 						clear_condition += ` AND "id" != "${task.id}"`
 
+						limits[task.id] = true
+
+						await env[region].prepare(`
+							DELETE FROM tasks WHERE id = "${task.id}"
+						`).run()
+
 						continue
 					}
 
+					
+
 					var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
 						now : now,
+						id : task.id,
 						ref : task.ref,
 						region : env.region,
 						models : models,
 						limits : limits,
-						counts : pageCount,
 						gemini_llm_api : gemini_llm_api,
 						gemini_llm_model : gemini_llm_model,
 						deepinfra : env.deepinfra
@@ -134,16 +149,16 @@ async function Cron(event, env, ctx, models, limits){
 					});
 
 					try{
-						var results = await res.json();
+						var _results = await res.json();
 
-						models = results.models
-						limits = results.limits
-
-						pageCount = results.counts
+						models = _results.models
+						limits = _results.limits
 
 					}catch(err){
 						console.log('err',err);
 					}
+
+					await Sleep(300 * delay)
 				}
 			}
 
@@ -178,30 +193,38 @@ export default {
 		models[`${env.gemini2}-gemini-2.0-flash-lite`] = 4000
 
 
-		var started_at = performance.now()
-
-		var expired_at = started_at + 60000
+		var startTime = Date.now();
+	    
+	    // 2. 최대 실행 시간 설정 (55초)
+	    // 1분(60초) 스케줄러가 다시 실행되기 전에 종료하여 중복을 피합니다.
+	    var MAX_RUN_TIME_MS = 55 * 1000; // 55,000 밀리초
 
 		var delay = 0.3
 
-		while(true){
-			var current_at = performance.now()
 
-			if(expired_at < current_at){
-				break
+		while(true){
+			var elapsedTime = Date.now() - startTime;
+			var timeLeft = MAX_RUN_TIME_MS - elapsedTime;
+
+			if (timeLeft <= 500) { // 남은 시간이 0.5초(500ms) 이하이면 종료
+				break; 
 			}
 
-			var results = await Cron(event, env, ctx, models, limits)
+			var results = await Cron(event, env, ctx, models, limits, delay)
 
 			limits = results.limits
+
+
 
 			models = results.models
 
 			if(results.length){
+				MAX_RUN_TIME_MS = MAX_RUN_TIME_MS - (results.length * 2000)
 				delay = 0.3
 			}else{
 				delay += 0.3
 			}
+
 
 			await Sleep(300 * delay)
 		}
