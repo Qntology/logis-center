@@ -2094,6 +2094,64 @@ function cleanNumber(str){
 	return str
 }
 
+function parseDirtyJson(dirtyString) {
+if (!dirtyString) return null;
+
+	// 1단계: 숨겨진 특수 공백(NBSP 등)을 일반 공백으로 치환 (가장 흔한 에러 원인)
+	let s = dirtyString.replace(/[\u00A0\u200B\u202F\uFEFF]/g, " ");
+
+	// 2단계: 기존의 '깨진 JSON' 수리 로직 적용
+	// 2-1. 홑따옴표 값 -> 쌍따옴표로 변환 및 내부 따옴표 이스케이프
+	s = s.replace(/'([^']*)'/g, (match, inner) => {
+		return `"${inner.replace(/"/g, '\\"')}"`;
+	});
+
+	// 2-2. 따옴표 없는 키(Key)에 쌍따옴표 입히기
+	s = s.replace(/(\{|\,)\s*([a-zA-Z0-9_]+)\s*:/g, '$1 "$2":');
+
+	// 3단계: [이번 에러의 핵심] CSS 선택자 등에서 발생하는 내부 따옴표 문제 해결
+	// 예: "selector":"form[name="fregform"]"  ->  "selector":"form[name=\"fregform\"]"
+	// 설명: 값의 시작(":) 뒤에 나오는데, 쉼표(,)나 닫는 중괄호(})가 아닌 곳에 있는 따옴표를 이스케이프 처리
+	
+	// 단순 무식하지만 강력한 방법: name=" 패턴을 name=\" 로 변경
+	s = s.replace(/name="/g, 'name=\\"');
+	// CSS 선택자 끝부분 "] 패턴을 \"] 로 변경 (배열 끝과 구분하기 위해 주의 필요하지만, 보통 CSS 선택자는 문자열 내부임)
+	// 안전을 위해 [name=\\"...\\"] 패턴이 완성되도록 유도
+	s = s.replace(/"]"/g, '\\"]"'); 
+
+	// 4단계: URL 역슬래시 보정 (http://)
+	s = s.replace(/\\"http\\":\/\//g, "http://");
+	s = s.replace(/\\"https\\":\/\//g, "https://");
+
+	// 5단계: 후행 쉼표 제거
+	s = s.replace(/,\s*([\]}])/g, '$1');
+
+	console.log("--- 클린징 된 문자열 ---");
+	// console.log(s); // 디버깅 필요시 주석 해제
+
+	try {
+		return JSON.parse(s);
+	} catch (e) {
+		console.error("1차 파싱 실패, 정밀 복구 시도...");
+		
+		// 최후의 수단: 문자열 값 안에 있는 " 를 \" 로 강제 치환하는 정밀 정규식
+		// ( : 뒤에 오는 " 로 시작해서, ", 나 "} 로 끝나기 전까지의 내용 중 " 를 찾음)
+		// 이 부분은 매우 복잡하므로, 위 단계에서 해결 안 될 경우에만 작동
+		try {
+			 // CSS 선택자 같은 내부 따옴표를 잡기 위한 보완 규칙
+			 s = s.replace(/([a-zA-Z0-9_]+="\w+")/g, (match) => {
+				 return match.replace(/"/g, '\\"');
+			 });
+			 return JSON.parse(s);
+		} catch (e2) {
+			console.error("최종 파싱 실패:", e2.message);
+			console.log("실패한 문자열:\n", s);
+			return null;
+		}
+	}
+}
+
+
 
 async function Deepinfra(key, model, system, user, inlineData){
 	// DeepInfra API 호출
@@ -2195,6 +2253,20 @@ async function Deepinfra(key, model, system, user, inlineData){
 			
 		}
 
+		try{
+			content = content.replace(/```json/gi, "")
+			content = content.replace(/```/gi, "")
+			content = content.replace(/\n/gi,"")
+			content = content.trim()
+			content = parseDirtyJson(content)
+
+			var results = JSON.parse(content)
+
+			return results
+		}catch(err){
+
+		}
+
 		return content
 	}
 }
@@ -2236,18 +2308,40 @@ async function Gemini(key, model, system, user, config, inlineData){
 
 	if(config["response_mime_type"]){
 		try{
+			var results = JSON.parse(content)
+
+			return results
+		}catch(err){
+
+		}
+
+		try{
 			if(content.indexOf('```') > -1){
 				content = content.replace(/```json/gi, "")
 				content = content.replace(/```/gi, "")
 				content = content.replace(/\n/gi,"")
-				content = content.trim()    
+				content = content.trim()
 			}
 
 			var results = JSON.parse(content)
 
-			return results.length ? results[0] : results
+			return results
 		}catch(err){
 			
+		}
+
+		try{
+			content = content.replace(/```json/gi, "")
+			content = content.replace(/```/gi, "")
+			content = content.replace(/\n/gi,"")
+			content = content.trim()
+			content = parseDirtyJson(content)
+
+			var results = JSON.parse(content)
+
+			return results
+		}catch(err){
+
 		}
 	}
 
@@ -2358,6 +2452,14 @@ export default {
 							team.data = JSON.parse(decompressedJsonString)
 						}else{
 							team.data = {}
+						}
+
+						if(limits.team){
+							if(limits.team.id == team.id && isDiff(team.data, limits.team.data)){
+								statements = {}
+
+								continue
+							}
 						}
 
 						console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
@@ -3317,7 +3419,7 @@ export default {
 
 								page.data = selectors
 
-								if(before){
+								if(before && pages.length){
 									var _page = pages[0]
 
 									var after = selectors
@@ -3360,7 +3462,7 @@ export default {
 										// console.log('_page.data err',err);
 									}
 
-									_page.data = before
+									// _page.data = before
 
 									page = mergeNode(_page, page)
 
@@ -3583,7 +3685,7 @@ export default {
 											origin : task.origin ? task.origin : ''
 										}
 
-										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 										console.log('add results.length',item.type,results.length);
 
@@ -6079,10 +6181,50 @@ export default {
 
 					
 						
+					if(Object.keys(statements).length){
+						if(fallback){
+							console.log('fallback',fallback);
 
+							statements[`logis_${zoneRegion}_talks`].push(
+								env[`logis_${zoneRegion}_talks`].prepare(`
+									INSERT INTO talks (
+										"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+									) VALUES (
+										?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+									) ON CONFLICT (id) DO UPDATE SET
+										"type" = EXCLUDED."type",
+										"from" = EXCLUDED."from",
+										"to" = EXCLUDED."to",
+										"cc" = EXCLUDED."cc",
+										"bcc" = EXCLUDED."bcc",
+										"ref" = EXCLUDED."ref",
+										"data" = EXCLUDED."data",
+										"created_at" = EXCLUDED."created_at",
+										"updated_at" = EXCLUDED."updated_at"
+								`).bind(
+									talk.id,
+									"prompt",
+									task.from,
+									task.to,
+									task.cc,
+									task.bcc,
+									talk.ref,
+									null,
+									now,
+									now
+								)
+							)
+						}
 
-					if(fallback){
-						console.log('fallback',fallback);
+						talk.data = null
+
+						if(talk.text){
+							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+								text : talk.text
+							})), { to: 'arraybuffer' })
+
+							talk.data = arr.buffer
+						}
 
 						statements[`logis_${zoneRegion}_talks`].push(
 							env[`logis_${zoneRegion}_talks`].prepare(`
@@ -6102,102 +6244,69 @@ export default {
 									"updated_at" = EXCLUDED."updated_at"
 							`).bind(
 								talk.id,
-								"prompt",
-								task.from,
-								task.to,
-								task.cc,
-								task.bcc,
+								talk.type,
+								talk.from,
+								talk.to,
+								talk.cc,
+								talk.bcc,
 								talk.ref,
-								null,
+								talk.data,
 								now,
 								now
 							)
 						)
-					}
 
-					talk.data = null
+						// statements[`logis_${zoneRegion}_talks`].push(
+						// 	env[`logis_${zoneRegion}_talks`].prepare(`
+						// 		UPDATE talks SET updated_at = ? WHERE id = ?
+						// 	`).bind(
+						// 		now, task.id
+						// 	)
+						// )
 
-					if(talk.text){
-						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-							text : talk.text
-						})), { to: 'arraybuffer' })
 
-						talk.data = arr.buffer
-					}
+						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({id : team.id, flag : task.flag, team : team, created_at : cron.created_at })), { to: 'arraybuffer' })
 
-					statements[`logis_${zoneRegion}_talks`].push(
-						env[`logis_${zoneRegion}_talks`].prepare(`
-							INSERT INTO talks (
-								"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-							) VALUES (
-								?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-							) ON CONFLICT (id) DO UPDATE SET
-								"type" = EXCLUDED."type",
-								"from" = EXCLUDED."from",
-								"to" = EXCLUDED."to",
-								"cc" = EXCLUDED."cc",
-								"bcc" = EXCLUDED."bcc",
-								"ref" = EXCLUDED."ref",
-								"data" = EXCLUDED."data",
-								"created_at" = EXCLUDED."created_at",
-								"updated_at" = EXCLUDED."updated_at"
-						`).bind(
-							talk.id,
-							talk.type,
-							talk.from,
-							talk.to,
-							talk.cc,
-							talk.bcc,
-							talk.ref,
-							talk.data,
-							now,
-							now
+						statements[region].push(
+							env[region].prepare(`
+								UPDATE tasks SET task = ?, updated_at = ? WHERE id = ?
+							`).bind(
+								arr.buffer, now, task.id
+							)
 						)
-					)
 
-					statements[`logis_${zoneRegion}_talks`].push(
-						env[`logis_${zoneRegion}_talks`].prepare(`
-							UPDATE talks SET updated_at = ? WHERE id = ?
-						`).bind(
-							now, task.id
+						console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
+
+						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(team.data)), { to: 'arraybuffer' })
+
+						statements[logisRegion].push(
+							env[logisRegion].prepare(`
+								UPDATE users SET data = ?, updated_at = ? WHERE id = ?
+							`).bind(
+								arr.buffer, now, team.id
+							)
 						)
-					)
-
-					
-					statements[region].push(
-						env[region].prepare(`
-							DELETE FROM tasks WHERE "id" = '${task.id}'
-						`)
-					)
-
-					console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
-
-					var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(team.data)), { to: 'arraybuffer' })
-
-					team.data = arr.buffer
-
-					statements[logisRegion].push(
-						env[logisRegion].prepare(`
-							UPDATE users SET data = ?, updated_at = ? WHERE id = ?
-						`).bind(
-							team.data, now, team.id
-						)
-					)
 
 
 
-					for (const region in statements) {
-						if (statements.hasOwnProperty(region)) {
-							var batch = statements[region]
+						for (const region in statements) {
+							if (statements.hasOwnProperty(region)) {
+								var batch = statements[region]
 
-							if(batch.length){
-								console.log('region',region);
-								var { results, success, error } = await env[region].batch(batch)
+								if(batch.length){
+									var { results, success, error } = await env[region].batch(batch)
+								}
 							}
 						}
+
+
+						limits[task.id.toUpperCase()] = true
 					}
 
-					limits[task.id] = true
+
+
+						
+
 
 					return new Response(JSON.stringify({
 						models : models,
