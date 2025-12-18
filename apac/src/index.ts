@@ -159,6 +159,12 @@ async function Cron(event, env, ctx, models, limits, timeout){
 
 				var task = JSON.parse(decompressedJsonString)
 
+				if(cron.id == 'lock'){
+					tasks = []
+
+					break;
+				}
+
 				if(task.method){
 					delete task.method
 				}
@@ -307,12 +313,42 @@ async function Cron(event, env, ctx, models, limits, timeout){
 						gemini_llm_model = gemini_model.second
 
 					}else if(!models['deepinfra']){
-						await env[region].prepare(`
+						await env[env.region].prepare(`
 							DELETE FROM tasks WHERE id = "${task.id}"
 						`).run()
 
 						continue
 					}
+
+
+					// lock
+					var { results, success, error } =  await env[env.region].prepare(`
+						INSERT INTO tasks (
+							"id", "type", "from", "to", "cc", "bcc", "ref", "task", "created_at", "updated_at"
+						) VALUES (
+							?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 
+						) ON CONFLICT (id) DO UPDATE SET
+							"type" = EXCLUDED."type",
+							"from" = EXCLUDED."from",
+							"to" = EXCLUDED."to",
+							"cc" = EXCLUDED."cc",
+							"bcc" = EXCLUDED."bcc",
+							"ref" = EXCLUDED."ref",
+							"task" = EXCLUDED."task",
+							"created_at" = EXCLUDED."created_at",
+							"updated_at" = EXCLUDED."updated_at"
+					`).bind(
+						'lock',
+						'',
+						'',
+						'',
+						'',
+						'',
+						'',
+						null,
+						1,
+						0
+					).run()
 
 					
 
@@ -344,6 +380,9 @@ async function Cron(event, env, ctx, models, limits, timeout){
 						limits = _results.limits
 
 					}catch(err){
+						await env[env.region].prepare(`
+							DELETE FROM tasks WHERE "id" = 'lock'
+						`).run()
 						console.log('err',err);
 					}
 				}
@@ -385,7 +424,7 @@ export default {
 			value : 1000,
 			delay : 0.5,
 			start : Date.now(),
-			max : 50 * 1000
+			max : 55 * 1000
 		}
 
 		while(true){

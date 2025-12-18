@@ -2390,353 +2390,516 @@ export default {
 
 				var fallback = ''
 
-				var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "id" = '${json.id}' AND "ref" = '${json.ref}' AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
+				try{
+					var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "id" = '${json.id}' AND "ref" = '${json.ref}' AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
 
-				console.log('results.length',results.length);
+					console.log('results.length',results.length);
 
-				var crons = safeClone(results)
+					var crons = safeClone(results)
 
-				if(crons.length){
-					for(var c = 0; c < crons.length; c++){
-						var cron = crons[c]
+					if(crons.length){
+						for(var c = 0; c < crons.length; c++){
+							var cron = crons[c]
 
-						var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.task))
+							var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.task))
 
-						var task = JSON.parse(decompressedJsonString)
+							var task = JSON.parse(decompressedJsonString)
 
-						var talk = {
-							id : task.id,
-							type : task.type,
-							from : task.from,
-							to : task.to,
-							cc : task.cc,
-							bcc : task.bcc,
-							ref : task.ref,
-							data : task.data,
-							created_at : now,
-							updated_at : now
-						}
-
-						var logisRegion = LogisRegion[task.flag]
-
-						var zoneRegion = task.zone
-
-						var vectorRegion = 'logis-'+zoneRegion.replace(/_/gi,"-")
-
-						var language = languageCode[task.flag]
-
-						if(!models[task.cc]){
-							models[task.cc] = task.rpm
-						}
-
-						if(models[task.cc]){
-							models[task.cc] -= 1
-						}else{
-							fallback = 'models'
-
-							continue;
-						}
-
-						if(!limits[task.from]){
-							limits[task.from] = task.rpm
-						}
-
-						// 팀 계정으로 해야함
-						var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'team' AND "id" = '${task.team}' AND "created_at" < ${now} LIMIT 1`).all()
-
-						var team = results[0]
-
-						if(team.data){
-							var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(team.data))
-
-							team.data = JSON.parse(decompressedJsonString)
-						}else{
-							team.data = {}
-						}
-
-						if(limits.team){
-							if(limits.team.id == team.id && isDiff(team.data, limits.team.data)){
-								statements = {}
-
-								continue
-							}
-						}
-
-						console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
-
-
-						var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'user' AND "bcc" = '${team.bcc}' AND "created_at" < ${now} LIMIT 1`).all()
-
-						var owner = results[0]
-
-						var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(owner.data))
-
-						owner.data = JSON.parse(decompressedJsonString)	
-						
-
-
-						var statements = {}
-							statements[CenterRegion] = []
-
-						if(!statements[logisRegion]){
-							statements[logisRegion] = []
-						}
-
-						if(!statements[`logis_${zoneRegion}-${tables[0]}`]){
-							for(var t = 0; t < tables.length; t++){
-								var table = tables[t]
-
-								if(!statements[`logis_${zoneRegion}_${table}`]){
-									statements[`logis_${zoneRegion}_${table}`] = []
-								}
-							}
-						}
-
-
-						// 오픈 하기전에 반영해야함
-
-						// if(limits[team.id]){
-						// 	limits[team.id] -= 1
-						// }else{
-						// 	if(typeof limits[team.id] == "undefined"){
-						// 		limits[team.id] = 0
-						// 	}else{
-						// 		fallback = 'out of gas'
-
-						// 		continue
-						// 	}
-						// }
-
-
-						// model context protocol
-
-						console.log('task.contentType',task.contentType);
-
-						if(task.contentType.indexOf("image/") > -1){
-							var inlineData = { mimeType: task.contentType, data: task.body }
-
-							var type = talk.type = task.type
-
-							var address = []
-
-							if(owner.data){
-								if(owner.data.sender){
-									address.push(owner.data.sender);
-								}
+							var talk = {
+								id : task.id,
+								type : task.type,
+								from : task.from,
+								to : task.to,
+								cc : task.cc,
+								bcc : task.bcc,
+								ref : task.ref,
+								data : task.data,
+								created_at : now,
+								updated_at : now
 							}
 
-							// 추후 꼭 반영해야함 프론트 백엔드 미개발되어있음
+							var logisRegion = LogisRegion[task.flag]
+
+							var zoneRegion = task.zone
+
+							var vectorRegion = 'logis-'+zoneRegion.replace(/_/gi,"-")
+
+							var language = languageCode[task.flag]
+
+							if(!models[task.cc]){
+								models[task.cc] = task.rpm
+							}
+
+							if(models[task.cc]){
+								models[task.cc] -= 1
+							}else{
+								fallback = 'models'
+
+								continue;
+							}
+
+							if(!limits[task.from]){
+								limits[task.from] = task.rpm
+							}
+
+							// 팀 계정으로 해야함
+							var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'team' AND "id" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+
+							var team = results[0]
+
 							if(team.data){
-								if(team.data.address){
-									for(var a = 0; a < team.data.address.length; a++){
-										var addr = team.data.address[a]
+								var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(team.data))
 
-										address.push(addr)
-									}
+								team.data = JSON.parse(decompressedJsonString)
+							}else{
+								team.data = {}
+							}
+
+							if(limits.team){
+								if(limits.team.id == team.id && isDiff(team.data, limits.team.data)){
+									statements = {}
+
+									continue
 								}
 							}
 
-							console.log('address',JSON.stringify(address));
-
-							var system = image2json(task.flag, language, type, address)
-
-							var item
-
-							if(models['deepinfra']){
-								item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', inlineData)
-
-								models['deepinfra'] -= 1
-
-							}
-
-							if(!item && gemini_llm_api){
-								item = await Gemini(gemini_llm_api, gemini_llm_model, '', system, null, inlineData)
-
-								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-							}
-
-							if(!item){
-								fallback = 'overflow'
-
-								continue
-							}
-
-							if(!item.tracking_number){
-								fallback = 'ShippingLabel Not Found'
-								// 올바르지 않은 이미지 안내하기
-
-								continue
-							}
+							console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
 
 
-							talk.text = item.text
+							var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'user' AND "id" = '${team.from}' AND "created_at" < ${now} LIMIT 1`).all()
 
+							var owner = results[0]
 
-							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item)), { to: 'arraybuffer' })
+							var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(owner.data))
 
-							item.data = arr.buffer
-
-
-
-							/*
-								입고, 출고 나가면 증가 및 차감하는 로직 반영해야함
-
-								업체 주소 미리 입력되어있고, 받는 사람에 LLM으로 true 시 입고, false시 출고
-
-
-
-								item.no == item.index 먼저 조회하고 없으면
-								
-								barcode 찾는 형식으로 해야함
-
-								둘다 없으면 type 'draft'로 전부 추가해야함
-							*/
+							owner.data = JSON.parse(decompressedJsonString)	
 							
 
-							item.no = normalizeNumericHomoglyphs(item.tracking_number)
 
-							item.no = cleanNumber(item.no)
+							var statements = {}
+								statements[CenterRegion] = []
 
+							if(!statements[logisRegion]){
+								statements[logisRegion] = []
+							}
 
+							if(!statements[`logis_${zoneRegion}-${tables[0]}`]){
+								for(var t = 0; t < tables.length; t++){
+									var table = tables[t]
 
-							item.id = hashId(team.id+item.no)
-
-							item.type = type
-
-							item.from = task.from
-
-							item.to = task.to
-
-							item.cc = task.cc // logis.center로 잡혀져 있음 
-
-							item.bcc = task.bcc
-
-							item.ref = task.ref
-
-							item.created_at = now
-
-							item.index = crc32(hashId(item.type+team.id+item.id))
-
-							var statusCode = item.status = item.status ? parseStatus(item.status) : 0
-
-
-							var { results } = await env[`logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
-
-							var sales = results
-
-							if(sales.length){
-								var _item = safeClone(results[0])
-
-								item.cc = task.cc = _item.cc
-
-								item.ref = task.ref = _item.ref
-
-								delete _item.id
-								delete _item.type
-								delete _item.from
-								delete _item.to
-								delete _item.cc
-								delete _item.bcc
-								delete _item.data
-								delete _item.created_at
-								delete _item.ref
-
-								if(item.status){
-									if(_item.status){
-										delete _item.status
+									if(!statements[`logis_${zoneRegion}_${table}`]){
+										statements[`logis_${zoneRegion}_${table}`] = []
 									}
 								}
-
-								item = mergeNode(item, _item)
 							}
 
 
-							if(type == "tracking"){
-								var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+							// 오픈 하기전에 반영해야함
 
-								if(!team.data.base.pages[task.cc]){
-									team.data.base.pages[task.cc] = {}
-								}
+							// if(limits[team.id]){
+							// 	limits[team.id] -= 1
+							// }else{
+							// 	if(typeof limits[team.id] == "undefined"){
+							// 		limits[team.id] = 0
+							// 	}else{
+							// 		fallback = 'out of gas'
 
-								if(!team.data.base.pages[task.cc][type]){
-									team.data.base.pages[task.cc][type] = {
-										draft : 0,
-										count : 0
+							// 		continue
+							// 	}
+							// }
+
+
+							// model context protocol
+
+							console.log('task.contentType',task.contentType);
+
+							if(task.contentType.indexOf("image/") > -1){
+								var inlineData = { mimeType: task.contentType, data: task.body }
+
+								var type = talk.type = task.type
+
+								var address = []
+
+								if(owner.data){
+									if(owner.data.sender){
+										address.push(owner.data.sender);
 									}
 								}
 
-								if(!team.data.base[type]){
-									team.data.base[type] = {
-										draft : 0,
-										count : 0
-									}
-								}
+								// 추후 꼭 반영해야함 프론트 백엔드 미개발되어있음
+								if(team.data){
+									if(team.data.address){
+										for(var a = 0; a < team.data.address.length; a++){
+											var addr = team.data.address[a]
 
-								if(results.length){
-									var _tracking = results[0]
-
-									delete _tracking.ref
-
-									if(item.status){
-										if(_tracking.status){
-											delete _tracking.status
+											address.push(addr)
 										}
 									}
-
-									item = mergeNode(item, _tracking)
-
-									if(sales.length){
-										var _order = sales[0]
-
-										item.order = _order.index
-
-										statements[`logis_${zoneRegion}_sales`].push(
-											env[`logis_${zoneRegion}_sales`].prepare(`
-												UPDATE sales SET updated_at = ?, status = ?, tracking = ? WHERE id = ?
-											`).bind(
-												now, item.status, item.index, _order.id
-											)
-										)
-
-										team.data.base.pages[task.cc].order.draft--
-										team.data.base.pages[task.cc].order.count++
-
-										team.data.base.pages[task.cc].tracking.draft--
-										team.data.base.pages[task.cc].tracking.count++
-									}
-								}else{
-									if(sales.length){
-										team.data.base.pages[task.cc].tracking.draft--
-										team.data.base.pages[task.cc].tracking.count++
-									}else{
-										team.data.base.pages[task.cc].tracking.draft++
-										team.data.base[type].count++
-
-										// items 추가 해야함
-									}
 								}
+
+								console.log('address',JSON.stringify(address));
+
+								var system = image2json(task.flag, language, type, address)
+
+								var item
+
+								if(models['deepinfra']){
+									item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', inlineData)
+
+									models['deepinfra'] -= 1
+
+								}
+
+								if(!item && gemini_llm_api){
+									item = await Gemini(gemini_llm_api, gemini_llm_model, '', system, null, inlineData)
+
+									models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+								}
+
+								if(!item){
+									fallback = 'overflow'
+
+									continue
+								}
+
+								if(!item.tracking_number){
+									fallback = 'ShippingLabel Not Found'
+									// 올바르지 않은 이미지 안내하기
+
+									continue
+								}
+
+
+								talk.text = item.text
+
+
+								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item)), { to: 'arraybuffer' })
+
+								item.data = arr.buffer
+
+
+
+								/*
+									입고, 출고 나가면 증가 및 차감하는 로직 반영해야함
+
+									업체 주소 미리 입력되어있고, 받는 사람에 LLM으로 true 시 입고, false시 출고
+
+
+
+									item.no == item.index 먼저 조회하고 없으면
 									
+									barcode 찾는 형식으로 해야함
+
+									둘다 없으면 type 'draft'로 전부 추가해야함
+								*/
+
+								item.type = type
+								
+
+								item.no = normalizeNumericHomoglyphs(item.tracking_number)
+
+								item.no = cleanNumber(item.no)
+
+								item.index = crc32(hashId(item.type+team.id+item.no))
+
+								item.id = hashId(team.id+item.index)
+
+
+								item.from = task.from
+
+								item.to = task.to
+
+								item.cc = task.cc // logis.center로 잡혀져 있음 
+
+								item.bcc = task.bcc
 
 								item.ref = task.ref
 
 								item.created_at = now
 
+								
+
+								var statusCode = item.status = item.status ? parseStatus(item.status) : 0
+
+
+								var { results } = await env[`logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+
+								var sales = results
+
 								if(sales.length){
-									var _item = sales[0]
+									var _item = safeClone(results[0])
 
-									var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
+									item.cc = task.cc = _item.cc
 
-									var _data = JSON.parse(decompressedJsonString)
+									item.ref = task.ref = _item.ref
 
-									item.order = _item.index
+									delete _item.id
+									delete _item.type
+									delete _item.from
+									delete _item.to
+									delete _item.cc
+									delete _item.bcc
+									delete _item.data
+									delete _item.created_at
+									delete _item.ref
 
-									statements[`logis_${zoneRegion}_items`].push(
-										env[`logis_${zoneRegion}_items`].prepare(`
-											INSERT INTO items (
-												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+									if(item.status){
+										if(_item.status){
+											delete _item.status
+										}
+									}
+
+									item = mergeNode(item, _item)
+								}
+
+
+								if(type == "tracking"){
+									var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+
+									if(!team.data.base.pages[task.cc]){
+										team.data.base.pages[task.cc] = {}
+									}
+
+									if(!team.data.base.pages[task.cc][type]){
+										team.data.base.pages[task.cc][type] = {
+											draft : 0,
+											count : 0
+										}
+									}
+
+									if(!team.data.base[type]){
+										team.data.base[type] = {
+											draft : 0,
+											count : 0
+										}
+									}
+
+									if(results.length){
+										var _tracking = results[0]
+
+										delete _tracking.ref
+
+										if(item.status){
+											if(_tracking.status){
+												delete _tracking.status
+											}
+										}
+
+										item = mergeNode(item, _tracking)
+
+
+										if(sales.length){
+											var _order = sales[0]
+
+											item.order = _order.index
+
+											statements[`logis_${zoneRegion}_sales`].push(
+												env[`logis_${zoneRegion}_sales`].prepare(`
+													UPDATE sales SET updated_at = ?, status = ?, tracking = ? WHERE id = ?
+												`).bind(
+													now, item.status, item.index, _order.id
+												)
+											)
+
+											team.data.base.pages[task.cc].order.draft--
+											team.data.base.pages[task.cc].order.count++
+
+											team.data.base.pages[task.cc].tracking.draft--
+											team.data.base.pages[task.cc].tracking.count++
+										}
+									}else{
+										if(sales.length){
+											team.data.base.pages[task.cc].tracking.draft--
+											team.data.base.pages[task.cc].tracking.count++
+										}else{
+											team.data.base.pages[task.cc].tracking.draft++
+											team.data.base[type].count++
+
+											// items 추가 해야함
+										}
+									}
+										
+
+									item.ref = task.ref
+
+									item.created_at = now
+
+									if(sales.length){
+										var _item = sales[0]
+
+										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
+
+										var _data = JSON.parse(decompressedJsonString)
+
+										item.order = _item.index
+
+										statements[`logis_${zoneRegion}_items`].push(
+											env[`logis_${zoneRegion}_items`].prepare(`
+												INSERT INTO items (
+													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+												) VALUES (
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												) ON CONFLICT (id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												_item.id,
+												_item.type,
+												_item.from,
+												_item.to,
+												_item.cc,
+												_item.bcc,
+												_item.data,
+												item.id,
+												_data.time,
+												now
+											)
+										)
+
+
+									}else{
+										var content = {}
+
+										if(item.title){
+											content.title = item.title
+										}
+
+										if(item.sender_address){
+											content.sender_address = item.sender_address
+										}
+
+										if(item.recipient_address){
+											content.recipient_address = item.recipient_address
+										}
+
+										if(item.carrier){
+											content.carrier = item.carrier
+										}
+
+										if(item.shipping_method){
+											content.shipping_method = item.shipping_method
+										}
+
+										if(item.fulfillment_service){
+											content.fulfillment_service = item.fulfillment_service
+										}
+
+										item.type = item.recipient_match ? 'receiving' : 'shipping'
+
+
+										// 추후에 반품인지 아닌지 추가해야함
+
+
+										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+											no : item.no ? item.no :"",
+											type : item.type,
+											text : item.text,
+											link : null,
+											time : now
+										})), { to: 'arraybuffer' })
+
+										item.data = arr.buffer
+
+										var metadata = {
+											id: item.id,
+											no: item.no ? item.no : "",
+											type: item.type,
+											from: task.from,
+											to: task.to,
+											cc: task.cc,
+											bcc: task.bcc,
+											ref:pageId
+										}
+
+
+										var embeddings
+
+										if(models['cloudflare']){
+											var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+												text: [item.text]
+											})
+
+											var $VectorizeVector = [
+												{
+													id: item.id,
+													values: embeddings[0],
+													metadata: metadata
+												}
+											]
+
+											models['cloudflare'] -= 1
+
+										}
+
+										if(!embeddings && models['deepinfra']){
+											var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.text)
+
+											var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+												return {
+													id: item.id,
+													values: values,
+													metadata: metadata
+												}
+											})
+
+											models['deepinfra'] -= 1
+
+										}
+
+										if(!embeddings){
+											fallback = 'overflow'
+
+											continue
+										}
+
+										await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
+
+										statements[`logis_${zoneRegion}_items`].push(
+											env[`logis_${zoneRegion}_items`].prepare(`
+												INSERT INTO items (
+													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+												) VALUES (
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												) ON CONFLICT (id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												task.id,
+												task.type,
+												task.from,
+												task.to,
+												task.cc,
+												task.bcc,
+												task.ref,
+												arr.buffer,
+												now,
+												0
+											)
+										)
+									}
+
+
+									statements[`logis_${zoneRegion}_tracking`].push(
+										env[`logis_${zoneRegion}_tracking`].prepare(`
+											INSERT INTO tracking (
+												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 											) VALUES (
-												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
 											) ON CONFLICT (id) DO UPDATE SET
 												"type" = EXCLUDED."type",
 												"from" = EXCLUDED."from",
@@ -2746,118 +2909,2577 @@ export default {
 												"ref" = EXCLUDED."ref",
 												"data" = EXCLUDED."data",
 												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
+												"index" = EXCLUDED."index",
+												"event" = EXCLUDED."event", 
+												"goods" = EXCLUDED."goods", 
+												"order" = EXCLUDED."order",
+												"status" = EXCLUDED."status",
+												"no" = EXCLUDED."no",
+												"sender_address" = EXCLUDED."sender_address",
+												"sender_phone" = EXCLUDED."sender_phone",
+												"recipient_address" = EXCLUDED."recipient_address",
+												"recipient_phone" = EXCLUDED."recipient_phone",
+												"width" = EXCLUDED."width",
+												"height" = EXCLUDED."height",
+												"length" = EXCLUDED."length",
+												"weight" = EXCLUDED."weight",
+												"carrier" = EXCLUDED."carrier",
+												"shipping_fee" = EXCLUDED."shipping_fee",
+												"shipping_method" = EXCLUDED."shipping_method",
+												"shipping_duration" = EXCLUDED."shipping_duration",
+												"shipping_date" = EXCLUDED."shipping_date",
+												"delivery_date" = EXCLUDED."delivery_date",
+												"order_date" = EXCLUDED."order_date",
+												"payment_date" = EXCLUDED."payment_date",
+												"payment_method" = EXCLUDED."payment_method",
+												"payment_origin" = EXCLUDED."payment_origin",
+												"payment_number" = EXCLUDED."payment_number",
+												"bundle_shipping" = EXCLUDED."bundle_shipping"
 										`).bind(
-											_item.id,
-											_item.type,
-											_item.from,
-											_item.to,
-											_item.cc,
-											_item.bcc,
-											_item.data,
 											item.id,
-											_data.time,
-											now
+											item.type,
+											item.from,
+											item.to,
+											item.cc,
+											item.bcc,
+											item.ref,
+											item.data,
+											item.created_at,
+											item.index,
+											item.event ? item.event : 0,
+											item.goods ? item.goods : 0,
+											item.order ? item.order : 0,
+											item.status,
+											item.no,
+											item.sender_address ? item.sender_address : "",
+											item.sender_phone ? item.sender_phone : "",
+											item.recipient_address ? item.recipient_address : "",
+											item.recipient_phone ? item.recipient_phone : "",
+											item.width ? parseFloat(item.width) : 0,
+											item.height ? parseFloat(item.height) : 0,
+											item.length ? parseFloat(item.length) : 0,
+											item.weight ? parseFloat(item.weight) : 0,
+											item.carrier ? parseFloat(item.carrier) : 0,
+											item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
+											item.shipping_method ? item.shipping_method : "",
+											item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
+											item.shipping_date ? parseFloat(item.shipping_date) : 0,
+											item.delivery_date ? parseFloat(item.delivery_date) : 0,
+											item.order_date ? parseFloat(item.order_date) : 0,
+											item.payment_date ? parseFloat(item.payment_date) : 0,
+											item.payment_method ? item.payment_method : "",
+											item.payment_origin ? item.payment_origin : "",
+											item.payment_number ? item.payment_number : "",
+											item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0
 										)
 									)
+								}
+									
 
+							}else if(task.scan){
+								// INSERT 백터 생성 INSERT
 
-								}else{
-									var content = {}
+								const isMore = function(_page, selectors){
+									var bool = false
 
-									if(item.title){
-										content.title = item.title
+									var selector = ''
+											
+									if(_page.type == "goods"){
+										selector = `${selectors.title} ${selectors.sale_price}`
+									}else if(_page.type == "order"){
+										selector = `${selectors.tracking_number}, ${selectors.payment_method}, ${selectors.payment_origin}, ${selectors.bank}, ${selectors.card}`
+									}else if(_page.type == "tracking"){
+										selector = `${selectors.title}, ${selectors.id}, ${selectors.shipping_method}`
+									}else if(_page.type == "event"){
+										selector = `${selectors.title}, ${selectors.started_at}, ${selectors.expired_at}`
+									}else if(_page.type == "coupon"){
+										selector = `${selectors.title}, ${selectors.started_at}, ${selectors.expired_at}`
 									}
 
-									if(item.sender_address){
-										content.sender_address = item.sender_address
-									}
+									if(selector){
+										try{
+											var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
 
-									if(item.recipient_address){
-										content.recipient_address = item.recipient_address
-									}
+											var $target = document.querySelectorAll(selector)
 
-									if(item.carrier){
-										content.carrier = item.carrier
-									}
-
-									if(item.shipping_method){
-										content.shipping_method = item.shipping_method
-									}
-
-									if(item.fulfillment_service){
-										content.fulfillment_service = item.fulfillment_service
-									}
-
-									item.type = item.recipient_match ? 'receiving' : 'shipping'
-
-
-									// 추후에 반품인지 아닌지 추가해야함
-
-
-									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-										no : item.no ? item.no :"",
-										type : item.type,
-										text : item.text,
-										link : null,
-										time : now
-									})), { to: 'arraybuffer' })
-
-									item.data = arr.buffer
-
-									var metadata = {
-										id: item.id,
-										no: item.no ? item.no : "",
-										type: item.type,
-										from: task.from,
-										to: task.to,
-										cc: task.cc,
-										bcc: task.bcc,
-										ref:pageId
-									}
-
-
-									var embeddings
-
-									if(models['cloudflare']){
-										var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-											text: [item.text]
-										})
-
-										var $VectorizeVector = [
-											{
-												id: item.id,
-												values: embeddings[0],
-												metadata: metadata
+											if($target.length){
+												bool = true
 											}
-										]
-
-										models['cloudflare'] -= 1
-
+										}catch(err){
+											console.log('more page err',err);
+										}
 									}
 
-									if(!embeddings && models['deepinfra']){
-										var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.text)
+									return bool
+								}
 
-										var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-											return {
-												id: item.id,
-												values: values,
-												metadata: metadata
+								var isDetail = task.detail
+
+								console.log('isDetail000',JSON.stringify(isDetail));
+
+								try{
+									var page
+
+									var pageType = ''
+
+									var pageLength = 0
+
+									console.log('task.href',task.href);
+
+									var url = new URL(task.href)
+
+									var pageId = hashId((task.detail ? task.cc.toUpperCase() : task.cc.toLowerCase())+url.pathname)
+
+									console.log('pageId',pageId);
+
+									var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
+
+									var pages = results
+
+									if(pages.length){
+										var _page = pages[0]
+
+										if(_page.type){
+											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+											var selectors = JSON.parse(decompressedJsonString)
+
+											isDetail = isMore(_page, selectors)
+
+											console.log('_page isDetail',JSON.stringify(isDetail));
+
+											if(isDetail){
+												pageType = _page.type
+
+											}else if(task.ref == pageId){
+												var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${hashId(task.cc+pathname.toUpperCase())}' AND "created_at" < ${created_at} LIMIT 1`).all()
+
+												if(results.length){
+													var _page = results[0]
+
+													var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+													var _selectors = JSON.parse(decompressedJsonString)
+
+													isDetail = isMore(_page, _selectors)
+
+													if(isDetail){
+														pageType = _page.type
+													}
+
+													try{
+														var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
+
+														var $target = document.querySelectorAll(_page.data.node)
+
+														if($target.length){
+															task.page = _page
+														}
+													}catch(err){
+														console.log('more page err',err);
+													}
+												}
+
 											}
-										})
 
-										models['deepinfra'] -= 1
+											try{
+												var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
 
+												if(document.querySelector(selectors.node)){
+													console.log('selectors.node',selectors.node);
+													// task.body = document.querySelector(selectors.node).innerHTML
+												}
+
+											}catch(err){
+												console.log('cache page err',err);
+											}
+										}
 									}
 
-									if(!embeddings){
-										fallback = 'overflow'
+									if(!isDetail){
+										if(task.referrer){
+											var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${task.referrer}' AND "created_at" < ${created_at} LIMIT 1`).all()
+
+											if(results.length){
+												var _page = results[0]
+
+												if(_page.type){
+													var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+													var selectors = JSON.parse(decompressedJsonString)
+
+													if(selectors.node){
+														isDetail = isMore(_page, selectors)
+
+														if(isDetail){
+															pageType = _page.type
+														}
+													}
+												}
+											}
+										}
+									}
+
+
+
+									var content = convertHtmlToCleanPug(task.body)
+
+									console.log('content.length',content.length);
+
+									console.log('isDetail1',JSON.stringify(isDetail));
+
+									if(!isDetail){
+										var system = `
+											Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+											{language:'${language}',${list2json(language)}}
+										`.trim()
+
+										if(models['deepinfra']){
+											page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+
+											pageType = page.type
+
+											if(page.items){
+												pageLength = page.items.length
+											}
+
+											isDetail = page.detail
+
+											models['deepinfra'] -= 1
+
+										}
+
+										if(!page && gemini_llm_api){
+											page = await Gemini(gemini_llm_api, gemini_llm_model, '', `
+												Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+												{language:'${language}',${system}}
+												${content}
+											`)
+
+											pageType = page.type
+
+											if(page.items){
+												pageLength = page.items.length
+											}
+
+											isDetail = page.detail
+
+											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+										}
+									}
+
+
+									if((!isDetail && !pageLength && pageType) || isDetail){
+										var system = `
+											Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+											# selector : sibling value based CSS1 selector
+											{language:'${language}',${item2json(pageType, task.href)}}
+										`.trim()
+
+										if(models['deepinfra']){
+											page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+
+											if(page.node){
+												page.type = pageType
+
+												page.link = task.link
+
+												isDetail = true
+											}else{
+												page = null
+											}
+
+											models['deepinfra'] -= 1
+
+										}
+
+										if(!page && gemini_llm_api){
+											page = await Gemini(gemini_llm_api, gemini_llm_model, system, content)
+
+											if(page.node){
+												page.type = pageType
+
+												page.link = task.link
+
+												isDetail = true
+											}else{
+												page = null
+											}
+
+											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+										}
+									}
+
+									
+
+									if(!page){
+										fallback = 'page overflow'
 
 										continue
 									}
 
-									await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
+
+									page.type = pageType
+									page.from = task.from
+									page.to = task.to
+									page.cc = task.cc
+									page.bcc = hashId(page.type+(isDetail ? task.cc.toUpperCase() : task.cc))
+
+
+									if(!team.data.base.pages[task.cc]){
+										team.data.base.pages[task.cc] = {}
+									}
+
+									if(page.type){
+										if(!team.data.base.pages[task.cc][page.type]){
+											team.data.base.pages[task.cc][page.type] = {
+												draft : 0,
+												count : 0
+											}
+										}
+
+										if(!team.data.base[page.type]){
+											team.data.base[page.type] = {
+												draft : 0,
+												count : 0
+											}
+										}
+									}
+
+										
+
+
+									var selectors = {
+										type : page.type,
+										text : page.text || '',
+										node : page.node || '',
+										list : page.list || '',
+										item : page.item || '',
+										more : page.more || '',
+										next : page.next || '',
+										link : task.link,
+										time : now,
+										origin : task.origin ? task.origin : ''
+									}
+
+									
+
+									var detail = {
+										id : hashId(pageType+task.cc.toUpperCase()+pathname),
+										type : pageType,
+										from : task.from,
+										to : task.to,
+										cc : task.cc,
+										bcc: task.bcc,
+										ref: task.ref,
+										data:null,
+										created_at:now,
+										updated_at:now
+									}
+
+									console.log('isDetail2',JSON.stringify(isDetail));
+
+									var before
+
+									if(isDetail){
+										selectors.detail = true
+
+										talk.ref = pageId = detail.id
+
+										detail = null
+
+										console.log('pageId',pageId)
+
+										var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
+
+										var _page
+
+										if(results.length){
+											_page = results[0]
+
+											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+
+											_page.data = JSON.parse(decompressedJsonString)
+
+											before = _page.data
+										}
+										
+										var item = safeClone(page)
+
+										for (var p in item) {
+											if (item.hasOwnProperty(p)) {
+												var prop = item[p]
+
+												if(prop){
+													if(typeof prop.selector != "undefined"){
+														selectors[p] = prop.selector;
+														item[p] = prop.value;
+
+													}else if(typeof prop.length == 'number'){
+
+														for(var i = 0; i < prop.length; i++){
+															var option = prop[i]
+
+															if(typeof option == "object" && Object.keys(option).length){
+																for(var n in option){
+																	if (option.hasOwnProperty(n)) {
+																		var opt = option[n]
+																		
+																		if(n == "selector"){
+																			selectors[`${p}`] = option.selector
+
+																			item[p][i] = option.value
+
+																		}else if(typeof opt == "object" && Object.keys(opt).length){
+																			for(var o in opt){
+																				if (opt.hasOwnProperty(o)) {
+																					var obj = opt[o]
+
+																					if(o == "selector"){
+																						selectors[`${p}_${n}`] = opt.selector
+
+																						item[p][i][n] = opt.value
+																					}
+																				}
+																			}
+																		}
+																	}
+																}
+															}
+														}
+													}
+												}
+											}
+										}
+
+
+										if(_page){
+											if(!_page.data.item){
+												item.ref = _page.ref
+											}
+										}
+											
+
+										
+										page.items = [item]
+
+									}else{
+										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+											type : page.type,
+											link : task.link,
+											origin : task.origin,
+											detail : true,
+											node : true,
+											item : ''
+										})), { to: 'arraybuffer' })
+
+										detail.data = arr.buffer
+									}
+
+									console.log('pageId',pageId);
+
+									var items = []
+
+									if(page.items){
+										if(page.items.length){
+											items = page.items
+										}
+									}
+
+
+									talk.text = page.text
+									
+
+									// page.ref = task.referrer ? task.referrer : ''
+									page.ref = hashId(team.id+task.cc+page.link)
+
+									page.data = selectors
+
+									if(before && pages.length){
+										var _page = pages[0]
+
+										var after = selectors
+
+										try{
+											var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
+
+											if(Object.keys(before).length){
+												for (var selector in before) {
+													if (before.hasOwnProperty(selector)) {
+														if(typeof selector == "string"){
+															try{
+																var $before = document.querySelectorAll(`${before[selector]}`)
+																var $after = document.querySelectorAll(`${after[selector]}`)
+
+																if($before.length && !$after.length){
+																	_page.data[selector] = page.data[selector] = before[selector] + ''
+
+																}else if(!$before.length && $after.length){
+																	_page.data[selector] = page.data[selector] = after[selector] + ''
+
+																}else if($before.length && $after.length){
+																	if($before.length < $after.length){
+																		_page.data[selector] = page.data[selector] = before[selector] + ''
+																	}else{
+																		_page.data[selector] = page.data[selector] = after[selector] + ''
+																	}
+																	
+
+																}
+
+															}catch(err){
+																// console.log('selector err',err);
+															}
+														}
+													}
+												}
+											}
+										}catch(err){
+											// console.log('_page.data err',err);
+										}
+
+										// _page.data = before
+
+										page = mergeNode(_page, page)
+
+										selectors = page.data
+
+									}
+
+									console.log('page.data',JSON.stringify(page.data));
+
+
+									page.id = task.page ? task.page.id : pageId
+
+									console.log('page.id',page.id);
+
+									console.log('page',JSON.stringify(page));
+
+									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(page.data)), { to: 'arraybuffer' })
+
+									page.data = arr.buffer
+
+
+										
+
+									if(page.type){
+										statements[CenterRegion].push(
+											env[CenterRegion].prepare(`
+												INSERT INTO pages ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
+												VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+												ON CONFLICT(id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												page.id,
+												page.type,
+												page.from,
+												page.to,
+												page.cc,
+												page.bcc,
+												page.ref,
+												page.data,
+												now,
+												now
+											)
+										)
+										
+										statements[`logis_${zoneRegion}_items`].push(
+											env[`logis_${zoneRegion}_items`].prepare(`
+												INSERT INTO items (
+													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+												) VALUES (
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												) ON CONFLICT (id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												page.id,
+												'pages',
+												page.from,
+												page.to,
+												page.cc,
+												page.bcc,
+												page.ref,
+												page.data,
+												now,
+												now
+											)
+										)
+									}
+
+										
+
+
+									talk.type = page.type
+
+									/*
+										items에서 
+											시작 시간
+											최저가 최대가격
+											최저 수량 최대 수량
+
+											값 가져오기
+									*/ 
+
+									console.log('진입전 items');
+
+									if(items.length){
+
+										console.log('items',JSON.stringify(items));
+										/*
+											주문이후의 절차는 주문번호로 매칭해야함
+
+											type : tracking 	// 배송추적
+																// "고객 주문"" or "자사 재고" 등으로 추상화 매칭
+
+											type : order
+												order 파생 정보는
+												전체 주문 목록 스캔하여
+												주문 아이템 링크 클릭시
+												레퍼러 참조 이벤트 추적하여 기록
+												이 부분 크롬 익스텐션에서 해야함
+
+
+												이 부분은 무조건 유료만 가능하게
+
+													벡터 쿼리로 미리 저장하고 
+														type : order, semantic : cancel     // 주문취소
+														type : order, semantic : exchange   // 교환
+														type : order, semantic : return     // 반품
+														type : order, semantic : refund     // 환불
+
+													title값 쿼리로 semantic 선택
+
+													var { data: queryVector } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+														text: [semantic],
+													})
+
+													var { matches } = await env.SEMANTIC.query(queryVector[0], query.options)
+
+										*/
+
+										for(var i = 0; i < items.length; i++){
+											var item = items[i]
+
+
+											if(!item.id){
+												continue
+											}
+
+											if(!page.type){
+												continue
+											}
+
+											if(isDetail){
+												item.link = task.link
+											}
+
+											item.type = page.type
+
+											item.no = cleanNumber(item.id.toString())
+
+
+											item.index = crc32(hashId(item.type+team.id+item.no))
+
+											try{
+												try{
+													var _url = new URL(item.link)
+
+													item.link = (_url.pathname + _url.search).toLowerCase()
+												}catch(err){
+													var _url = new URL(task.origin+item.link)
+
+													item.link = (_url.pathname + _url.search).toLowerCase()
+												}
+
+
+												if(isDetail){
+													if(!detail.page){
+														detail.page = detail.id = hashId(item.type+task.cc.toUpperCase()+_url.pathname)
+													}
+												}
+
+											}catch(err){
+
+											}
+
+
+											var itemType = ""
+
+											if(item.type == "tracking"){
+												itemType = "tracking"
+
+											}else if(item.type == "goods" || item.type == "order"){
+												itemType = "sales"
+
+											}else if(item.type == "event" || item.type == "coupon"){
+												itemType = "event"
+
+											}
+
+											if(item.registration_date){
+												console.log('item.registration_date',item.registration_date);
+												item.created_at = new Date(item.registration_date).getTime()
+											}else{
+												item.created_at = now
+											}
+
+
+											var updated_at = item.updated_at = 0
+
+											if(isDetail){
+												item.updated_at = updated_at = now
+											}
+
+
+
+
+											item.id = hashId(team.id+item.index)
+
+											item.data = {
+												id : item.id,
+												no : item.no ? item.no : "",
+												title : item.title ? item.title : '',
+												link : item.link,
+												time : now,
+												origin : task.origin ? task.origin : ''
+											}
+
+											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+											console.log('add results.length',item.type,results.length);
+
+											console.log('item.updated_at',item.updated_at ? 'true' : 'false');
+
+											console.log('team.data.base.pages[task.cc][item.type]',JSON.stringify(team.data.base.pages[task.cc]));
+
+											if(results.length){
+												var _item = results[0]
+
+												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
+
+												_item.data = JSON.parse(decompressedJsonString)
+
+												if(item.data.item && !_item.data.item){
+													item.data.item = _item.data.item
+													item.data.node = _item.data.node
+													item.ref = _item.data.ref
+												}
+
+												if(item.status){
+													if(_item.status){
+														delete _item.status
+													}
+												}
+
+
+												item = mergeNode(_item, item)
+
+												var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_item.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+												if(results.length){
+													var _item = results[0]
+
+													console.log('_item.updated_at',_item.updated_at);
+													console.log('item.updated_at',updated_at);
+													if(!_item.updated_at){
+														if(updated_at){
+															team.data.base.pages[task.cc][item.type].draft--
+															team.data.base.pages[task.cc][item.type].count++
+														}
+													}
+
+													// item.updated_at = now
+												}
+
+											}else{
+												if(updated_at){
+													team.data.base.pages[task.cc][item.type].count++
+												}else{
+													team.data.base.pages[task.cc][item.type].draft++
+												}
+
+												team.data.base[item.type].count++
+											}
+
+											item.flag = task.flag
+											
+											item.from = task.from
+											item.to = task.to
+											item.cc = task.cc
+
+											item.bcc = hashId(item.type+(isDetail ? task.cc.toUpperCase() : task.cc))
+
+											item.ref = hashId(team.id+task.cc+item.link)
+
+
+											var goods = item.goods ? safeClone(item.goods) : []
+
+											delete item.goods
+
+											try{
+												if(typeof goods.length != "undefined"){
+													goods.unshift({})
+												}else{
+													goods = []
+												}
+											}catch(err){
+												console.log('goods err',err);
+											}
+
+
+											item.currency = item.currency ? item.currency.toUpperCase() : ""
+
+											item.quantity = item.quantity ? parseInt(item.quantity) : 0
+
+											
+
+											item.semantic = item.title
+
+											item.started_at = item.manufacture_date ? item.manufacture_date : 0
+											
+											item.expired_at = item.expiration_date ? item.expiration_date : 0
+
+											var statusCode = item.status = item.status ? parseStatus(item.status) : 0
+
+											
+
+
+											if(item.tracking_number){
+												var tracking_number = normalizeNumericHomoglyphs(item.tracking_number)
+													tracking_number = cleanNumber(tracking_number)
+
+												item.tracking = crc32(hashId('tracking'+team.id+tracking_number))
+											}
+
+												
+
+											try{
+												console.log('item.type',item.type);
+
+												if(item.type == "order" && goods){
+													/*
+														상세와 리스트 차이가 분명히 있음
+
+														주문 
+															리스트에서는 송장번호가 없음
+															상세페이지에서는 송장번호가 있음
+													*/
+
+													if(goods.length && item.tracking_number){
+														for(var g = 0; g < goods.length; g++){
+
+															var good = safeClone(goods[g])
+
+															var tracking = safeClone(item)
+
+															tracking.type = "tracking"
+
+															tracking.no = tracking_number
+
+															tracking.index = item.tracking
+
+															if(good.id){
+																var no = cleanNumber(good.id.toString())
+
+																good.no = no
+
+																good.index = crc32(hashId('goods'+team.id+good.no))
+
+																var { results } = await env[`logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = 'goods' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+																if(results.length){
+																	tracking.event = results[0].event
+																}
+
+																tracking.goods = good.index
+
+																tracking.id = hashId(team.id+tracking.no+good.no)
+
+															}else{
+																tracking.id = hashId(team.id+tracking.no)
+
+															}
+
+
+															tracking.status = item.status
+
+															tracking.order = item.index
+
+															tracking.order_date = item.order_date
+															tracking.payment_date = item.payment_date
+															tracking.payment_method = item.payment_method
+															tracking.payment_origin = item.payment_origin
+
+															tracking.link = item.link
+
+															tracking.sender_address = item.sender_address
+															tracking.sender_phone = item.sender_phone
+															tracking.recipient_address = item.recipient_address
+															tracking.recipient_phone = item.recipient_phone
+
+															tracking.data = {
+																id : item.id,
+																link : item.link,
+																time : now,
+																origin : task.origin ? task.origin : ""
+															}
+
+															if(!team.data.base.pages[task.cc]){
+																team.data.base.pages[task.cc] = {}
+															}
+
+															if(!team.data.base.pages[task.cc][tracking.type]){
+																team.data.base.pages[task.cc][tracking.type] = {
+																	draft : 0,
+																	count : 0
+																}
+															}
+
+
+
+															var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = ${tracking.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+
+															if(results.length){
+																var _tracking = safeClone(results[0])
+
+																var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_tracking.data))
+
+																_tracking.data = JSON.parse(decompressedJsonString)
+
+																delete _tracking.ref
+
+																tracking = mergeNode(_tracking, tracking)
+
+
+
+
+																var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_tracking.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+																if(results.length){
+																	var _item = results[0]
+
+																	if(!_item.updated_at){
+																		if(updated_at){
+																			team.data.base.pages[task.cc].tracking.draft--
+																			team.data.base.pages[task.cc].tracking.count++
+
+																			statements[`logis_${zoneRegion}_items`].push(
+																				env[`logis_${zoneRegion}_items`].prepare(`
+																					UPDATE items SET updated_at = ? WHERE id = ?
+																				`).bind(
+																					now, _item.id
+																				)
+																			)
+																		}
+																	}
+																}
+															}else{
+																// 처음 저장할때 자연어 LLM으로 전처리해서 벡터 저장해야함
+																var content = JSON.stringify({
+																	size : tracking.size ? tracking.size : "",
+																	currency : tracking.currency ? tracking.currency : "",
+																	carrier : tracking.carrier ? tracking.carrier : "",
+																	shipping_fee : tracking.shipping_fee ? true : false,
+																	shipping_method : tracking.shipping_method ? tracking.shipping_method : "",
+																	fulfillment_service : tracking.fulfillment_service ? tracking.fulfillment_service : "",
+																	stock_keeping_unit : tracking.stock_keeping_unit ? tracking.stock_keeping_unit : "",
+																	bundle_shipping : tracking.bundle_shipping ? true : false,
+																	used : tracking.used ? true : false,
+																	lease : tracking.lease ? true : false,
+																	rental : tracking.rental ? true : false,
+																	refurbish : tracking.refurbish ? true : false,
+																	tax_included : tracking.tax_included ? true : false,
+																	sender_address : tracking.sender_address,
+																	recipient_address : tracking.recipient_address,
+																	payment_method : tracking.payment_method, 
+																	payment_origin : tracking.payment_origin 
+																})
+
+																var semantic
+
+
+																var system = semantic_prompt_system(language).trim()
+
+																if(models['deepinfra']){
+																	semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+
+																	models['deepinfra'] -= 1
+
+																}
+
+																if(!semantic && gemini_llm_api){
+																	semantic = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+
+																	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+																}
+
+																if(!semantic){
+																	fallback = 'semantic overflow'
+
+																	continue
+																}
+
+																var metadata = {
+																	type: item.type,
+																	from: item.from,
+																	to: item.to,
+																	cc: item.cc,
+																	bcc: item.bcc,
+																	ref:pageId
+																}
+
+																var embeddings
+
+																if(models['cloudflare']){
+																	var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+																		text: [semantic]
+																	})
+
+																	var $VectorizeVector = [
+																		{
+																			id: item.id,
+																			values: embeddings[0],
+																			metadata: metadata
+																		}
+																	]
+
+																	models['cloudflare'] -= 1
+
+																}
+
+																if(!embeddings && models['deepinfra']){
+																	var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
+
+																	var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+																		return {
+																			id: item.id,
+																			values: values,
+																			metadata: metadata
+																		}
+																	})
+
+																	models['deepinfra'] -= 1
+																}
+
+																if(!embeddings){
+																	fallback = 'embeddings overflow'
+
+																	continue
+																}
+
+
+																team.data.base.pages[task.cc][tracking.type].draft++
+																// team.data.base.pages[task.cc][tracking.type].count--
+																team.data.base[item.type].count++
+
+																await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
+															}
+
+															var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
+
+															console.log('tracking',JSON.stringify(tracking))
+
+															statements[`logis_${zoneRegion}_tracking`].push(
+																env[`logis_${zoneRegion}_tracking`].prepare(`
+																	INSERT INTO tracking (
+																		"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+																	) VALUES (
+																		?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+																	) ON CONFLICT (id) DO UPDATE SET
+																		"type" = EXCLUDED."type",
+																		"from" = EXCLUDED."from",
+																		"to" = EXCLUDED."to",
+																		"cc" = EXCLUDED."cc",
+																		"bcc" = EXCLUDED."bcc",
+																		"ref" = EXCLUDED."ref",
+																		"data" = EXCLUDED."data",
+																		"created_at" = EXCLUDED."created_at",
+																		"index" = EXCLUDED."index",
+																		"event" = EXCLUDED."event", 
+																		"goods" = EXCLUDED."goods", 
+																		"order" = EXCLUDED."order", 
+																		"status" = EXCLUDED."status",
+																		"no" = EXCLUDED."no",
+																		"sender_address" = EXCLUDED."sender_address",
+																		"sender_phone" = EXCLUDED."sender_phone",
+																		"recipient_address" = EXCLUDED."recipient_address",
+																		"recipient_phone" = EXCLUDED."recipient_phone",
+																		"width" = EXCLUDED."width",
+																		"height" = EXCLUDED."height",
+																		"length" = EXCLUDED."length",
+																		"weight" = EXCLUDED."weight",
+																		"carrier" = EXCLUDED."carrier",
+																		"shipping_fee" = EXCLUDED."shipping_fee",
+																		"shipping_method" = EXCLUDED."shipping_method",
+																		"shipping_duration" = EXCLUDED."shipping_duration",
+																		"shipping_date" = EXCLUDED."shipping_date",
+																		"delivery_date" = EXCLUDED."delivery_date",
+																		"order_date" = EXCLUDED."order_date",
+																		"payment_date" = EXCLUDED."payment_date",
+																		"payment_method" = EXCLUDED."payment_method",
+																		"payment_origin" = EXCLUDED."payment_origin",
+																		"payment_number" = EXCLUDED."payment_number",
+																		"bundle_shipping" = EXCLUDED."bundle_shipping"
+																`).bind(
+																	tracking.id,
+																	tracking.type,
+																	tracking.from,
+																	tracking.to,
+																	tracking.cc,
+																	tracking.bcc,
+																	tracking.ref,
+																	arr.buffer,
+																	tracking.created_at,
+																	tracking.index,
+																	tracking.event ? tracking.event : 0,
+																	tracking.goods ? tracking.goods : 0,
+																	tracking.order ? tracking.order : 0,
+																	tracking.status,
+																	tracking.no ? tracking.no : "",
+																	tracking.sender_address ? tracking.sender_address : "",
+																	tracking.sender_phone ? tracking.sender_phone : "",
+																	tracking.recipient_address ? tracking.recipient_address : "",
+																	tracking.recipient_phone ? tracking.recipient_phone : "",
+																	parseFloat(tracking.width ? tracking.width : 0),
+																	parseFloat(tracking.height ? tracking.height : 0),
+																	parseFloat(tracking.length ? tracking.length : 0),
+																	parseFloat(tracking.weight ? tracking.weight : 0),
+																	parseFloat(tracking.carrier ? tracking.carrier : 0),
+																	parseFloat(tracking.shipping_fee ? tracking.shipping_fee : 0),
+																	tracking.shipping_method ? tracking.shipping_method : "",
+																	parseFloat(tracking.shipping_duration ? tracking.shipping_duration : 0),
+																	parseFloat(tracking.shipping_date ? tracking.shipping_date : 0),
+																	parseFloat(tracking.delivery_date ? tracking.delivery_date : 0),
+																	parseFloat(tracking.order_date ? tracking.order_date : 0),
+																	parseFloat(tracking.payment_date ? tracking.payment_date : 0),
+																	tracking.payment_method ? tracking.payment_method : "",
+																	tracking.payment_origin ? tracking.payment_origin : "",
+																	tracking.payment_number ? tracking.payment_number : "",
+																	parseFloat(tracking.bundle_shipping ? tracking.bundle_shipping : 0)
+																)
+															)
+														}
+													}
+												}
+											}catch(err){
+												console.log('err item.type == "order" && item.tracking_number', err)
+											}
+
+
+											if(item.condition){
+												if(item.condition.indexOf('used') > -1){
+													item.used = 1
+												}
+
+												if(item.condition.indexOf('lease') > -1){
+													item.lease = 2
+												}
+
+												if(item.condition.indexOf('rental') > -1){
+													item.rental = 3
+												}
+
+												if(item.condition.indexOf('refurbish') > -1){
+													item.refurbish = 4
+												}
+											}
+
+
+											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+
+											if(results.length){
+												var _item = results[0]
+
+												delete _item.ref
+
+												if(item.status){
+													if(_item.status){
+														delete _item.status
+													}
+												}
+
+												item = mergeNode(_item, item)
+
+
+											}else{
+												var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+												if(results.length){
+													var _item = results[0]
+
+													delete _item.ref
+
+													if(item.status){
+														if(_item.status){
+															delete _item.status
+														}
+													}
+
+													item = mergeNode(_item, item)
+												}
+
+											}
+
+
+
+											try{
+												if(item.price <= team.data.base[item.type].price.min){
+													team.data.base[item.type].price.min = item.price
+												}
+
+												if(item.price >= team.data.base[item.type].price.max){
+													team.data.base[item.type].price.max = item.price
+												}
+												
+
+
+												if(item.quantity <= team.data.base[item.type].quantity.min){
+													team.data.base[item.type].quantity.min = item.quantity
+												}
+
+												if(item.quantity >= team.data.base[item.type].quantity.max){
+													team.data.base[item.type].quantity.max = item.quantity
+												}
+
+
+
+												if(item.width <= team.data.base[item.type].width.min){
+													team.data.base[item.type].width.min = item.width
+												}
+
+												if(item.width >= team.data.base[item.type].width.max){
+													team.data.base[item.type].width.max = item.width
+												}
+
+
+
+												if(item.height <= team.data.base[item.type].height.min){
+													team.data.base[item.type].height.min = item.height
+												}
+
+												if(item.height >= team.data.base[item.type].height.max){
+													team.data.base[item.type].height.max = item.height
+												}
+
+
+
+												if(item.length <= team.data.base[item.type].length.min){
+													team.data.base[item.type].length.min = item.length
+												}
+
+												if(item.length >= team.data.base[item.type].length.max){
+													team.data.base[item.type].length.max = item.length
+												}
+
+
+
+												if(item.weight <= team.data.base[item.type].weight.min){
+													team.data.base[item.type].weight.min = item.weight
+												}
+
+												if(item.weight >= team.data.base[item.type].weight.max){
+													team.data.base[item.type].weight.max = item.weight
+												}
+
+
+
+												if(item.shipping_fee <= team.data.base[item.type].shipping_fee.min){
+													team.data.base[item.type].shipping_fee.min = item.shipping_fee
+												}
+
+												if(item.shipping_fee >= team.data.base[item.type].shipping_fee.max){
+													team.data.base[item.type].shipping_fee.max = item.shipping_fee
+												}
+
+
+
+												if(item.shipping_duration <= team.data.base[item.type].shipping_duration.min){
+													team.data.base[item.type].shipping_duration.min = item.shipping_duration
+												}
+
+												if(item.shipping_duration >= team.data.base[item.type].shipping_duration.max){
+													team.data.base[item.type].shipping_duration.max = item.shipping_duration
+												}
+
+
+
+												if(item.sale_price <= team.data.base[item.type].sale_price.min){
+													team.data.base[item.type].sale_price.min = item.sale_price
+												}
+
+												if(item.sale_price >= team.data.base[item.type].sale_price.max){
+													team.data.base[item.type].sale_price.max = item.sale_price
+												}
+
+
+
+												if(item.supply_price <= team.data.base[item.type].supply_price.min){
+													team.data.base[item.type].supply_price.min = item.supply_price
+												}
+
+												if(item.supply_price >= team.data.base[item.type].supply_price.max){
+													team.data.base[item.type].supply_price.max = item.supply_price
+												}
+												
+
+
+												if(item.low_stock_threshold <= team.data.base[item.type].low_stock_threshold.min){
+													team.data.base[item.type].low_stock_threshold.min = item.low_stock_threshold
+												}
+
+												if(item.low_stock_threshold >= team.data.base[item.type].low_stock_threshold.max){
+													team.data.base[item.type].low_stock_threshold.max = item.low_stock_threshold
+												}
+												
+
+
+												if(item.discount <= team.data.base[item.type].discount.min){
+													team.data.base[item.type].discount.min = item.discount
+												}
+
+												if(item.discount >= team.data.base[item.type].discount.max){
+													team.data.base[item.type].discount.max = item.discount
+												}
+												
+
+												
+												if(item.min_order_amount <= team.data.base[item.type].min_order_amount.min){
+													team.data.base[item.type].min_order_amount.min = item.min_order_amount
+												}
+
+												if(item.min_order_amount >= team.data.base[item.type].min_order_amount.max){
+													team.data.base[item.type].min_order_amount.max = item.min_order_amount
+												}
+
+
+
+												if(item.max_discount_amount <= team.data.base[item.type].max_discount_amount.min){
+													team.data.base[item.type].max_discount_amount.min = item.max_discount_amount
+												}
+
+												if(item.max_discount_amount >= team.data.base[item.type].max_discount_amount.max){
+													team.data.base[item.type].max_discount_amount.max = item.max_discount_amount
+												}
+
+
+
+												if(item.usage_limit <= team.data.base[item.type].usage_limit.min){
+													team.data.base[item.type].usage_limit.min = item.usage_limit
+												}
+
+												if(item.usage_limit >= team.data.base[item.type].usage_limit.max){
+													team.data.base[item.type].usage_limit.max = item.usage_limit
+												}
+
+
+
+												if(item.usage_per <= team.data.base[item.type].usage_per.min){
+													team.data.base[item.type].usage_per.min = item.usage_per
+												}
+
+												if(item.usage_per >= team.data.base[item.type].usage_per.max){
+													team.data.base[item.type].usage_per.max = item.usage_per
+												}
+
+
+
+												if(item.started_at <= team.data.base[item.type].started_at.min){
+													team.data.base[item.type].started_at.min = item.started_at
+												}
+
+												if(item.started_at >= team.data.base[item.type].started_at.max){
+													team.data.base[item.type].started_at.max = item.started_at
+												}
+
+
+
+												if(item.expired_at <= team.data.base[item.type].expired_at.min){
+													team.data.base[item.type].expired_at.min = item.expired_at
+												}
+
+												if(item.expired_at >= team.data.base[item.type].expired_at.max){
+													team.data.base[item.type].expired_at.max = item.expired_at
+												}
+											}catch(err){
+												console.log('err team.data.base',err);
+											}
+
+
+
+											var progress = {}
+
+											var relates = {}
+
+											var related = Related(item.type) // 관련 타입 정보 가져옴
+
+											/*
+												두가지 타입
+													import
+														foreign 에서 primary 
+
+													export
+														primary 에서 foreign 
+
+													from : foreign 
+													to : primary 
+														import = 외부 데이터로 내부 데이터 수정
+															order 스캔 진행시
+																draft.type == "goods" && row.type == "order"
+																
+																order items 만 있으면 goods 상세 정보가 없기 때문에 
+																goods 정보 가져와서 order item에 업데이트 해야함
+
+													from : primary 
+													to : foreign
+														export = 내부 데이터로 외부 데이터 수정
+															tracking 스캔 진행시
+																tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
+											*/ 
+											
+											if(related.length){
+												for(var r = 0; r < related.length; r++){
+													var { query, merge } = Relay(related[r], item)
+
+													// console.log('query, merge',query, merge);
+
+													// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
+
+													if(!query || !merge){
+														continue
+													}
+
+													try{
+														if(query.length){
+															var table = query[0].table
+															var type = query[0].type
+															var column = query[0].column
+															var column_value = query[0].value
+															var status = query[0].status
+
+															// if(typeof status != "undefined"){
+															// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+															// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+															// 	).bind(
+															// 		column_value, team.id, item.cc, status, now
+															// 	).all()
+															// }else{
+															// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+															// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+															// 	).bind(
+															// 		column_value, team.id, item.cc, now
+															// 	).all()
+															// }
+
+															var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+																`SELECT * FROM ${table} WHERE "type" = ? AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
+															).bind(
+																type, column_value, team.id, item.cc, now
+															).all()
+
+
+															if(results.length == 0){
+																// draft 상태 맞음
+																// 없으면 추가해야함 - 일부 사용자가 직접 팝업으로 띄워야 할수 있음
+
+																/*
+																	상품 스캔 하였는데
+																	상품 상세페이지 스캔 안되어있으면
+																*/
+
+																/*
+																	고객 주문 스캔하였는데
+																	배송 시작 정보가 없을시
+																*/
+																updated_at = 0	
+															}
+
+															relates[type] = {
+																query : query,
+																merge : merge,
+																rows : results,
+																type : related[r]
+															}
+														}
+													}catch(err){
+														await env[CenterRegion].prepare(`
+															INSERT INTO console (
+																"id", "bcc", "log", "created_at"
+															) VALUES (
+																?1, ?2, ?3, ?4
+															) ON CONFLICT (id) DO NOTHING
+														`).bind(
+															hashId(),
+															task.bcc,
+															'tracking inner err'+type+err,
+															now // Parameter for created_at (only insert)
+														).run()
+													}
+												}
+											}
+
+												
+
+
+
+											console.log('Object.keys(relates).length',Object.keys(relates).length);
+
+											if(Object.keys(relates).length){
+												for (var type in relates) {
+													// for start
+
+													// type값은 related[i]
+													if (relates.hasOwnProperty(type)) {
+														var relate = relates[type]
+
+														/*
+															시나리오 case
+
+															import
+																order 스캔 진행시
+																	type == "goods" && row.type == "order"
+
+																	order items 만 있으면 goods 상세 정보가 없기 때문에 
+																	goods 정보 가져와서 order item에 업데이트 해야함
+
+															export
+																tracking 스캔 진행시
+																	tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
+
+														*/
+														
+														var query = relate.query
+
+														if(relate){
+															if(typeof relate.rows != "undefined"){
+																var column = query[1] ? query[1].column : query[0].column
+																var index = query[1] ? query[1].index : query[0].index
+
+
+																if(relate.rows.length){
+																	for(var d = 0; d < relate.rows.length; d++){
+																		var row = relate.rows[d]
+
+																		var nodeData = row.data
+
+																		var merge
+
+																		if(relate.merge.update){
+																			merge = relate.merge.update
+																		}
+
+																		if(relate.merge.upsert){
+																			merge = relate.merge.upsert
+																		}
+
+																		if(!merge){
+																			continue
+																		}
+
+																		var foreign = merge.foreign
+
+																		var node = {}
+
+																		var from = row.type == merge.from ? item : row
+
+																		var to = row.type == merge.to ? item : row
+
+																		if(row.type == merge.to){
+																			to.updated_at = updated_at
+																		}
+																		
+																		if(merge.includes){
+																			if(merge.includes.length){
+																				for(var v = 0; v < merge.includes.length; v++){
+																					var include = merge.includes[v]
+
+																					node[include] = from[include]
+																				}
+																			}
+																		}
+
+																		
+
+
+																		var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
+
+																		var data = JSON.parse(decompressedJsonString)
+
+																		
+
+																		if(foreign){
+																			if(foreign.from && foreign.to){
+																				if(from[foreign.to]){
+																					to[foreign.from] = from[foreign.to]
+																				}
+																			}
+																		}
+
+
+																		var edgeId = to.id
+
+																		var edgeType = to.type
+
+																		var edge = mergeNode(to, node)
+
+																		edge.id = edgeId
+
+																		edge.type = edgeType
+
+
+																		
+
+																		
+																		if(relate.type == merge.from){
+																			// import
+
+																			if(from.type == "goods" && to.type == "order"){
+																				var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+																					id : edge.id,
+																					no : edge.no ? edge.no : "",
+																					title : edge.title,
+																					link : edge.link,
+																					time : now,
+																					origin : data.origin ? data.origin : "",
+																					data : data
+																				})), { to: 'arraybuffer' })
+
+																				// edge.vectorize = true
+
+																				// edge.data = arr.buffer
+
+																				var metadata = {
+																					title : data.title ? data.title : "",
+																					size : row.size ? row.size : "",
+																					currency : row.currency ? row.currency : "",
+																					carrier : row.carrier ? row.carrier : "",
+																					shipping_fee : row.shipping_fee ? true : false,
+																					shipping_method : row.shipping_method ? row.shipping_method : "",
+																					fulfillment_service : row.fulfillment_service ? row.fulfillment_service : "",
+																					stock_keeping_unit : row.stock_keeping_unit ? row.stock_keeping_unit : "",
+																					bundle_shipping : row.bundle_shipping ? true : false,
+																					used : row.used ? true : false,
+																					lease : row.lease ? true : false,
+																					rental : row.rental ? true : false,
+																					refurbish : row.refurbish ? true : false,
+																					tax_included : row.tax_included ? true : false
+																				}
+
+
+																				var content = JSON.stringify(metadata)
+
+																				var semantic
+
+																				var system = semantic_prompt_system(language).trim()
+
+																				if(models['deepinfra']){
+																					semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+
+																					models['deepinfra'] -= 1
+
+																				}
+
+																				if(!semantic && gemini_llm_api){
+																					semantic = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+
+																					models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+																				}
+
+																				if(!semantic){
+																					fallback = 'semantic overflow'
+
+																					continue
+																				}
+
+																				metadata.id = edge.id
+																				metadata.type = edge.type
+																				metadata.from = task.from
+																				metadata.to = task.to
+																				metadata.cc = task.cc
+																				metadata.bcc = edge.bcc
+																				metadata.ref = edge.ref
+
+																				var embeddings
+
+																				var $VectorizeVector
+
+																				if(models['cloudflare']){
+																					var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+																						text: [semantic],
+																					})
+
+																					var $VectorizeVector = [
+																						{
+																							id: edge.id,
+																							values: embeddings[0],
+																							metadata: metadata
+																						}
+																					]
+
+																					models['cloudflare'] -= 1
+
+																				}
+
+																				if(!embeddings && models['deepinfra']){
+																					var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
+
+																					var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+																						return {
+																							id: edge.id,
+																							values: values,
+																							metadata: metadata
+																						}
+																					})
+
+																					models['deepinfra'] -= 1
+
+																				}
+
+																				if(embeddings){
+																					fallback = 'embeddings overflow'
+
+																					continue
+																				}
+
+																				await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
+
+																			}
+																		}else{
+																			// export
+																		}
+
+
+																		var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(edge.data))
+
+																		edge.data = JSON.parse(decompressedJsonString)
+
+
+																		edge.updated_at = edge.data.item ? 0 : now
+
+
+
+																		if(edgeType == "sales"){
+																			statements[`logis_${zoneRegion}_sales`].push(
+																				env[`logis_${zoneRegion}_sales`].prepare(`
+																					INSERT INTO sales (
+																						"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "status", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+																					) VALUES (
+																						?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41
+																					) ON CONFLICT (id) DO UPDATE SET
+																						"type" = EXCLUDED."type",
+																						"from" = EXCLUDED."from",
+																						"to" = EXCLUDED."to",
+																						"cc" = EXCLUDED."cc",
+																						"bcc" = EXCLUDED."bcc",
+																						"ref" = EXCLUDED."ref",
+																						"data" = EXCLUDED."data",
+																						"created_at" = EXCLUDED."created_at",
+																						"started_at" = EXCLUDED."started_at",
+																						"expired_at" = EXCLUDED."expired_at",
+																						"index" = EXCLUDED."index",
+																						"event" = EXCLUDED."event",
+																						"views" = EXCLUDED."views",
+																						"goods" = EXCLUDED."goods",
+																						"status" = EXCLUDED."status",
+																						"width" = EXCLUDED."width",
+																						"height" = EXCLUDED."height",
+																						"length" = EXCLUDED."length",
+																						"weight" = EXCLUDED."weight",
+																						"size" = EXCLUDED."size",
+																						"currency" = EXCLUDED."currency",
+																						"supply_price" = EXCLUDED."supply_price",
+																						"sale_price" = EXCLUDED."sale_price",
+																						"discount" = EXCLUDED."discount",
+																						"quantity" = EXCLUDED."quantity",
+																						"tracking" = EXCLUDED."tracking",
+																						"number" = EXCLUDED."number",
+																						"carrier" = EXCLUDED."carrier",
+																						"shipping_fee" = EXCLUDED."shipping_fee",
+																						"shipping_method" = EXCLUDED."shipping_method",
+																						"shipping_duration" = EXCLUDED."shipping_duration",
+																						"fulfillment_service" = EXCLUDED."fulfillment_service",
+																						"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
+																						"bundle_shipping" = EXCLUDED."bundle_shipping",
+																						"used" = EXCLUDED."used",
+																						"lease" = EXCLUDED."lease",
+																						"rental" = EXCLUDED."rental",
+																						"refurbish" = EXCLUDED."refurbish",
+																						"tax_included" = EXCLUDED."tax_included",
+																						"release_date" = EXCLUDED."release_date"
+																				`).bind(
+																					to.id,
+																					edgeType,
+																					to.from,
+																					to.to,
+																					to.cc,
+																					to.bcc,
+																					to.ref,
+																					to.data,
+																					to.created_at,
+																					parseFloat(edge.started_at ? edge.started_at : 0),
+																					parseFloat(edge.expired_at ? edge.expired_at : 0),
+																					parseFloat(edge.index ? edge.index : 0),
+																					parseFloat(edge.event ? edge.event : 0),
+																					parseFloat(edge.views ? edge.views : 0),
+																					parseFloat(edge.goods ? edge.goods : 0),
+																					parseStatus(edge.status),
+																					parseFloat(edge.width ? edge.width : 0),
+																					parseFloat(edge.height ? edge.height : 0),
+																					parseFloat(edge.length ? edge.length : 0),
+																					parseFloat(edge.weight ? edge.weight : 0),
+																					edge.size ? edge.size : "",
+																					edge.currency,
+																					parseFloat(edge.supply_price? edge.supply_price : 0),
+																					parseFloat(edge.sale_price? edge.sale_price : 0),
+																					parseFloat(edge.discount ? edge.discount : 0),
+																					parseFloat(edge.quantity ? edge.quantity : 0),
+																					parseFloat(edge.tracking ? edge.tracking : 0),
+																					edge.number ? edge.number : "",
+																					edge.carrier ? edge.carrier : "",
+																					parseFloat(edge.shipping_fee ? edge.shipping_fee : 0),
+																					edge.shipping_method ? edge.shipping_method : "",
+																					parseFloat(edge.shipping_duration ? edge.shipping_duration : 0),
+																					edge.fulfillment_service ? edge.fulfillment_service : "",
+																					edge.stock_keeping_unit ? edge.stock_keeping_unit : "",
+																					parseFloat(edge.bundle_shipping ? edge.bundle_shipping : 0),
+																					parseFloat(edge.used ? edge.used : 0),
+																					parseFloat(edge.lease ? edge.lease : 0),
+																					parseFloat(edge.rental ? edge.rental : 0),
+																					parseFloat(edge.refurbish ? edge.refurbish : 0),
+																					parseFloat(edge.tax_included ? edge.tax_included : 0),
+																					parseFloat(edge.release_date ? edge.release_date : 0)
+																				)
+																			)
+																		}else if(edgeType == "tracking"){
+																			statements[`logis_${zoneRegion}_tracking`].push(
+																				env[`logis_${zoneRegion}_tracking`].prepare(`
+																					INSERT INTO tracking (
+																						"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+																					) VALUES (
+																						?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+																					) ON CONFLICT (id) DO UPDATE SET
+																						"type" = EXCLUDED."type",
+																						"from" = EXCLUDED."from",
+																						"to" = EXCLUDED."to",
+																						"cc" = EXCLUDED."cc",
+																						"bcc" = EXCLUDED."bcc",
+																						"ref" = EXCLUDED."ref",
+																						"data" = EXCLUDED."data",
+																						"created_at" = EXCLUDED."created_at",
+																						"index" = EXCLUDED."index",
+																						"event" = EXCLUDED."event", 
+																						"goods" = EXCLUDED."goods", 
+																						"order" = EXCLUDED."order", 
+																						"status" = EXCLUDED."status",
+																						"no" = EXCLUDED."no",
+																						"sender_address" = EXCLUDED."sender_address",
+																						"sender_phone" = EXCLUDED."sender_phone",
+																						"recipient_address" = EXCLUDED."recipient_address",
+																						"recipient_phone" = EXCLUDED."recipient_phone",
+																						"width" = EXCLUDED."width",
+																						"height" = EXCLUDED."height",
+																						"length" = EXCLUDED."length",
+																						"weight" = EXCLUDED."weight",
+																						"carrier" = EXCLUDED."carrier",
+																						"shipping_fee" = EXCLUDED."shipping_fee",
+																						"shipping_method" = EXCLUDED."shipping_method",
+																						"shipping_duration" = EXCLUDED."shipping_duration",
+																						"shipping_date" = EXCLUDED."shipping_date",
+																						"delivery_date" = EXCLUDED."delivery_date",
+																						"order_date" = EXCLUDED."order_date",
+																						"payment_date" = EXCLUDED."payment_date",
+																						"payment_method" = EXCLUDED."payment_method",
+																						"payment_origin" = EXCLUDED."payment_origin",
+																						"payment_number" = EXCLUDED."payment_number",
+																						"bundle_shipping" = EXCLUDED."bundle_shipping"
+																				`).bind(
+																					to.id,
+																					to.type,
+																					to.from,
+																					to.to,
+																					to.cc,
+																					to.bcc,
+																					to.ref,
+																					to.data,
+																					to.created_at,
+																					edge.index,
+																					edge.event ? edge.event : 0,
+																					edge.goods ? edge.goods : 0,
+																					edge.order ? edge.order : 0,
+																					parseStatus(edge.status),
+																					edge.no ? edge.no : "",
+																					edge.sender_address ? edge.sender_address : "",
+																					edge.sender_phone ? edge.sender_phone : "",
+																					edge.recipient_address ? edge.recipient_address : "",
+																					edge.recipient_phone ? edge.recipient_phone : "",
+																					parseFloat(edge.width ? edge.width : 0),
+																					parseFloat(edge.height ? edge.height : 0),
+																					parseFloat(edge.length ? edge.length : 0),
+																					parseFloat(edge.weight ? edge.weight : 0),
+																					parseFloat(edge.carrier ? edge.carrier : 0),
+																					parseFloat(edge.shipping_fee ? edge.shipping_fee : 0),
+																					edge.shipping_method ? edge.shipping_method : "",
+																					parseFloat(edge.shipping_duration ? edge.shipping_duration : 0),
+																					parseFloat(edge.shipping_date ? edge.shipping_date : 0),
+																					parseFloat(edge.delivery_date ? edge.delivery_date : 0),
+																					parseFloat(edge.order_date ? edge.order_date : 0),
+																					parseFloat(edge.payment_date ? edge.payment_date : 0),
+																					edge.payment_method ? edge.payment_method : "",
+																					edge.payment_origin ? edge.payment_origin : "",
+																					edge.payment_number ? edge.payment_number : "",
+																					parseFloat(edge.bundle_shipping ? edge.bundle_shipping : 0)
+																				)
+																			)
+																		}else if(edgeType == "event"){
+																			statements[`logis_${zoneRegion}_event`].push(
+																				env[`logis_${zoneRegion}_event`].prepare(`
+																					INSERT INTO event (
+																						"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
+																					) VALUES (
+																						?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+																					) ON CONFLICT (id) DO UPDATE SET
+																						"type" = EXCLUDED."type",
+																						"from" = EXCLUDED."from",
+																						"to" = EXCLUDED."to",
+																						"cc" = EXCLUDED."cc",
+																						"bcc" = EXCLUDED."bcc",
+																						"ref" = EXCLUDED."ref",
+																						"data" = EXCLUDED."data",
+																						"created_at" = EXCLUDED."created_at",
+																						"started_at" = EXCLUDED."started_at",
+																						"expired_at" = EXCLUDED."expired_at",
+																						"index" = EXCLUDED."index",
+																						"event" = EXCLUDED."event",
+																						"number" = EXCLUDED."number",
+																						"address" = EXCLUDED."address",
+																						"status" = EXCLUDED."status",
+																						"code" = EXCLUDED."code",
+																						"discount" = EXCLUDED."discount",
+																						"quantity" = EXCLUDED."quantity",
+																						"usage_per" = EXCLUDED."usage_per",
+																						"usage_limit" = EXCLUDED."usage_limit",
+																						"min_order_amount" = EXCLUDED."min_order_amount",
+																						"max_order_amount" = EXCLUDED."max_order_amount",
+																						"max_discount_amount" = EXCLUDED."max_discount_amount",
+																						"new_customer_only" = EXCLUDED."new_customer_only",
+																						"first_purchase_only" = EXCLUDED."first_purchase_only",
+																						"region_restrictions" = EXCLUDED."region_restrictions"
+																				`).bind(
+																					to.id,
+																					edgeType,
+																					to.from,
+																					to.to,
+																					to.cc,
+																					to.bcc,
+																					to.ref,
+																					to.data,
+																					to.created_at,
+																					parseFloat(edge.started_at ? edge.started_at : 0),
+																					parseFloat(edge.expired_at ? edge.expired_at : 0),
+																					parseFloat(edge.index ? edge.index : 0),
+																					parseFloat(edge.event ? edge.event : 0),
+																					edge.number ? edge.number : "",
+																					edge.address ? edge.address : "",
+																					parseStatus(edge.status),
+																					edge.code ? edge.code : "",
+																					parseFloat(edge.discount ? edge.discount : 0),
+																					parseFloat(edge.quantity ? edge.quantity : 0),
+																					parseFloat(edge.usage_per ? edge.usage_per : 0),
+																					parseFloat(edge.usage_limit ? edge.usage_limit : 0),
+																					parseFloat(edge.min_order_amount ? edge.min_order_amount : 0),
+																					parseFloat(edge.max_order_amount ? edge.max_order_amount : 0),
+																					parseFloat(edge.max_discount_amount ? edge.max_discount_amount : 0),
+																					parseFloat(edge.new_customer_only ? edge.new_customer_only : 0),
+																					parseFloat(edge.first_purchase_only ? edge.first_purchase_only : 0),
+																					parseFloat(edge.region_restrictions ? edge.region_restrictions : 0)
+																				)
+																			)
+																		}
+
+
+
+																		var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${edge.id}' AND "created_at" < ${now} AND "updated_at" = 0 LIMIT 1`).all()
+
+																		if(results.length){
+																			var _item = results[0]
+
+																			if(!_item.updated_at){
+																				if(edge.updated_at){
+																					// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
+																					team.data.base.pages[edge.cc][edge.type].draft--
+																					team.data.base.pages[edge.cc][edge.type].count++
+
+																					statements[`logis_${zoneRegion}_items`].push(
+																						env[`logis_${zoneRegion}_items`].prepare(`
+																							UPDATE items SET updated_at = ? WHERE id = ?
+																						`).bind(
+																							now, row.id
+																						)
+																					)
+																				}
+																			}
+																		}else{
+																			team.data.base.pages[edge.cc][edge.type].draft++
+																			team.data.base[edge.type].count++
+																		}
+
+
+																			
+
+																		// for end
+																	}
+
+																	// if end
+																}else{
+
+																	/*
+																		items로 하지 말고
+																			type 테이블에서 index로 있는지 여부 찾기
+																	*/
+																	// var draftId = hashId(item.id)
+
+
+																	var { results } = await env[`logis_${zoneRegion}_${edgeType}`].prepare(`SELECT * FROM ${edgeType} WHERE "index" = '${edge.index}' AND "type" = '${edge.type}' AND "created_at" < ${now} LIMIT 1`).all()
+
+																	if(results.length){
+																		var _item = results[0]
+
+																		if(!_item.updated_at){
+																			if(updated_at){
+																				team.data.base.pages[edge.cc][edge.type].draft--
+																				team.data.base.pages[edge.cc][edge.type].count++
+																				team.data.base[edge.type].count++
+
+																				statements[`logis_${zoneRegion}_items`].push(
+																					env[`logis_${zoneRegion}_items`].prepare(`
+																						UPDATE items SET updated_at = ? WHERE id = ?
+																					`).bind(
+																						now, item.id
+																					)
+																				)
+																			}
+																		}
+																	}else{
+																		team.data.base.pages[edge.cc][edge.type].draft++
+																		team.data.base[edge.type].count++
+
+																		var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+																			id : edge.id,
+																			no : item.no ? item.no : "",
+																			title : item.title,
+																			link : item.link,
+																			time : now,
+																			data : relate
+																		})), { to: 'arraybuffer' })
+
+																		statements[`logis_${zoneRegion}_items`].push(
+																			env[`logis_${zoneRegion}_items`].prepare(`
+																				INSERT INTO items (
+																					"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+																				) VALUES (
+																					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+																				) ON CONFLICT (id) DO UPDATE SET
+																					"type" = EXCLUDED."type",
+																					"from" = EXCLUDED."from",
+																					"to" = EXCLUDED."to",
+																					"cc" = EXCLUDED."cc",
+																					"bcc" = EXCLUDED."bcc",
+																					"ref" = EXCLUDED."ref",
+																					"data" = EXCLUDED."data",
+																					"created_at" = EXCLUDED."created_at",
+																					"updated_at" = EXCLUDED."updated_at"
+																			`).bind(
+																				edge.id,
+																				type,
+																				item.from,
+																				item.to,
+																				item.cc,
+																				item.bcc,
+																				'',
+																				arr.buffer,
+																				now,
+																				0
+																			)
+																		)
+																	}
+
+
+
+
+
+																}
+															}
+														}
+													}
+
+													// for end
+												}
+
+												// if end
+											}
+
+											console.log('typeof item.vectorize',typeof item.vectorize);
+
+											if(item.semantic && !item.vectorize){
+												var metadata = {
+													type: item.type,
+													from: item.from,
+													to: item.to,
+													cc: item.cc,
+													bcc: item.bcc,
+													ref:pageId
+												}
+
+												var embeddings
+
+												if(models['cloudflare']){
+													var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
+														text: [item.semantic]
+													})
+
+													var $VectorizeVector = [
+														{
+															id: item.id,
+															values: embeddings[0],
+															metadata: metadata
+														}
+													]
+
+													models['cloudflare'] -= 1
+
+												}
+
+												if(!embeddings && models['deepinfra']){
+													var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.semantic.tirm())
+
+													var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
+														return {
+															id: item.id,
+															values: values,
+															metadata: metadata
+														}
+													})
+
+													models['deepinfra'] -= 1
+												}
+
+												console.log('typeof embeddings',typeof embeddings);
+
+												if(!embeddings){
+													fallback = 'embeddings overflow'
+
+													continue
+												}
+
+												await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
+											}
+
+											item.data.text = item.semantic
+											item.data.ref = page.ref
+
+											console.log('item',JSON.stringify(item))
+
+											var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item.data)), { to: 'arraybuffer' })
+
+											item.data = arr.buffer
+
+											statements[`logis_${zoneRegion}_items`].push(
+												env[`logis_${zoneRegion}_items`].prepare(`
+													INSERT INTO items (
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+													) VALUES (
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+													) ON CONFLICT (id) DO UPDATE SET
+														"type" = EXCLUDED."type",
+														"from" = EXCLUDED."from",
+														"to" = EXCLUDED."to",
+														"cc" = EXCLUDED."cc",
+														"bcc" = EXCLUDED."bcc",
+														"ref" = EXCLUDED."ref",
+														"data" = EXCLUDED."data",
+														"created_at" = EXCLUDED."created_at",
+														"updated_at" = EXCLUDED."updated_at"
+												`).bind(
+													item.id,
+													item.type,
+													item.from,
+													item.to,
+													item.cc,
+													item.bcc,
+													item.ref,
+													item.data,
+													now,
+													updated_at
+												)
+											)
+												
+											if(itemType == "sales"){
+												statements[`logis_${zoneRegion}_sales`].push(
+													env[`logis_${zoneRegion}_sales`].prepare(`
+														INSERT INTO sales (
+															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "status", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
+														) VALUES (
+															?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41
+														) ON CONFLICT (id) DO UPDATE SET
+															"type" = EXCLUDED."type",
+															"from" = EXCLUDED."from",
+															"to" = EXCLUDED."to",
+															"cc" = EXCLUDED."cc",
+															"bcc" = EXCLUDED."bcc",
+															"ref" = EXCLUDED."ref",
+															"data" = EXCLUDED."data",
+															"created_at" = EXCLUDED."created_at",
+															"started_at" = EXCLUDED."started_at",
+															"expired_at" = EXCLUDED."expired_at",
+															"index" = EXCLUDED."index",
+															"event" = EXCLUDED."event",
+															"views" = EXCLUDED."views",
+															"goods" = EXCLUDED."goods",
+															"status" = EXCLUDED."status",
+															"width" = EXCLUDED."width",
+															"height" = EXCLUDED."height",
+															"length" = EXCLUDED."length",
+															"weight" = EXCLUDED."weight",
+															"size" = EXCLUDED."size",
+															"currency" = EXCLUDED."currency",
+															"supply_price" = EXCLUDED."supply_price",
+															"sale_price" = EXCLUDED."sale_price",
+															"discount" = EXCLUDED."discount",
+															"quantity" = EXCLUDED."quantity",
+															"tracking" = EXCLUDED."tracking",
+															"number" = EXCLUDED."number",
+															"carrier" = EXCLUDED."carrier",
+															"shipping_fee" = EXCLUDED."shipping_fee",
+															"shipping_method" = EXCLUDED."shipping_method",
+															"shipping_duration" = EXCLUDED."shipping_duration",
+															"fulfillment_service" = EXCLUDED."fulfillment_service",
+															"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
+															"bundle_shipping" = EXCLUDED."bundle_shipping",
+															"used" = EXCLUDED."used",
+															"lease" = EXCLUDED."lease",
+															"rental" = EXCLUDED."rental",
+															"refurbish" = EXCLUDED."refurbish",
+															"tax_included" = EXCLUDED."tax_included",
+															"release_date" = EXCLUDED."release_date"
+													`).bind(
+														item.id,
+														item.type,
+														item.from,
+														item.to,
+														item.cc,
+														item.bcc,
+														item.ref,
+														item.data,
+														item.created_at,
+														parseFloat(item.started_at ? item.started_at : 0),
+														parseFloat(item.expired_at ? item.expired_at : 0),
+														parseFloat(item.index ? item.index : 0),
+														parseFloat(item.event ? item.event : 0),
+														parseFloat(item.views ? item.views : 0),
+														parseFloat(item.goods ? item.goods : 0),
+														item.status,
+														parseFloat(item.width ? item.width : 0),
+														parseFloat(item.height ? item.height : 0),
+														parseFloat(item.length ? item.length : 0),
+														parseFloat(item.weight ? item.weight : 0),
+														item.size ? item.size : "",
+														item.currency ? item.currency : "",
+														parseFloat(item.supply_price? item.supply_price : 0),
+														parseFloat(item.sale_price? item.sale_price : 0),
+														parseFloat(item.discount ? item.discount : 0),
+														parseFloat(item.quantity ? item.quantity : 0),
+														parseFloat(item.tracking ? item.tracking : 0),
+														item.number ? item.number : "",
+														item.carrier ? item.carrier : "",
+														parseFloat(item.shipping_fee ? item.shipping_fee : 0),
+														item.shipping_method ? item.shipping_method : "",
+														parseFloat(item.shipping_duration ? item.shipping_duration : 0),
+														item.fulfillment_service ? item.fulfillment_service : "",
+														item.stock_keeping_unit ? item.stock_keeping_unit : "",
+														parseFloat(item.bundle_shipping ? item.bundle_shipping : 0),
+														parseFloat(item.used ? item.used : 0),
+														parseFloat(item.lease ? item.lease : 0),
+														parseFloat(item.rental ? item.rental : 0),
+														parseFloat(item.refurbish ? item.refurbish : 0),
+														parseFloat(item.tax_included ? item.tax_included : 0),
+														parseFloat(item.release_date ? item.release_date : 0)
+													)
+												)
+											}else if(itemType == "tracking"){
+												statements[`logis_${zoneRegion}_tracking`].push(
+													env[`logis_${zoneRegion}_tracking`].prepare(`
+														INSERT INTO tracking (
+															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
+														) VALUES (
+															?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
+														) ON CONFLICT (id) DO UPDATE SET
+															"type" = EXCLUDED."type",
+															"from" = EXCLUDED."from",
+															"to" = EXCLUDED."to",
+															"cc" = EXCLUDED."cc",
+															"bcc" = EXCLUDED."bcc",
+															"ref" = EXCLUDED."ref",
+															"data" = EXCLUDED."data",
+															"created_at" = EXCLUDED."created_at",
+															"index" = EXCLUDED."index",
+															"event" = EXCLUDED."event", 
+															"goods" = EXCLUDED."goods", 
+															"order" = EXCLUDED."order", 
+															"status" = EXCLUDED."status",
+															"no" = EXCLUDED."no",
+															"sender_address" = EXCLUDED."sender_address",
+															"sender_phone" = EXCLUDED."sender_phone",
+															"recipient_address" = EXCLUDED."recipient_address",
+															"recipient_phone" = EXCLUDED."recipient_phone",
+															"width" = EXCLUDED."width",
+															"height" = EXCLUDED."height",
+															"length" = EXCLUDED."length",
+															"weight" = EXCLUDED."weight",
+															"carrier" = EXCLUDED."carrier",
+															"shipping_fee" = EXCLUDED."shipping_fee",
+															"shipping_method" = EXCLUDED."shipping_method",
+															"shipping_duration" = EXCLUDED."shipping_duration",
+															"shipping_date" = EXCLUDED."shipping_date",
+															"delivery_date" = EXCLUDED."delivery_date",
+															"order_date" = EXCLUDED."order_date",
+															"payment_date" = EXCLUDED."payment_date",
+															"payment_method" = EXCLUDED."payment_method",
+															"payment_origin" = EXCLUDED."payment_origin",
+															"payment_number" = EXCLUDED."payment_number",
+															"bundle_shipping" = EXCLUDED."bundle_shipping"
+													`).bind(
+														item.id,
+														item.type,
+														item.from,
+														item.to,
+														item.cc,
+														item.bcc,
+														item.ref,
+														item.data,
+														item.created_at,
+														item.index,
+														item.event ? item.event : 0,
+														item.goods ? item.goods : 0,
+														item.order ? item.order : 0,
+														item.status,
+														item.no ? item.no : "",
+														item.sender_address ? item.sender_address : "",
+														item.sender_phone ? item.sender_phone : "",
+														item.recipient_address ? item.recipient_address : "",
+														item.recipient_phone ? item.recipient_phone : "",
+														parseFloat(item.width ? item.width : 0),
+														parseFloat(item.height ? item.height : 0),
+														parseFloat(item.length ? item.length : 0),
+														parseFloat(item.weight ? item.weight : 0),
+														parseFloat(item.carrier ? item.carrier : 0),
+														parseFloat(item.shipping_fee ? item.shipping_fee : 0),
+														item.shipping_method ? item.shipping_method : "",
+														parseFloat(item.shipping_duration ? item.shipping_duration : 0),
+														parseFloat(item.shipping_date ? item.shipping_date : 0),
+														parseFloat(item.delivery_date ? item.delivery_date : 0),
+														parseFloat(item.order_date ? item.order_date : 0),
+														parseFloat(item.payment_date ? item.payment_date : 0),
+														item.payment_method ? item.payment_method : "",
+														item.payment_origin ? item.payment_origin : "",
+														item.payment_number ? item.payment_number : "",
+														parseFloat(item.bundle_shipping ? item.bundle_shipping : 0)
+													)
+												)
+											}else if(itemType == "event"){
+												statements[`logis_${zoneRegion}_event`].push(
+													env[`logis_${zoneRegion}_event`].prepare(`
+														INSERT INTO event (
+															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
+														) VALUES (
+															?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+														) ON CONFLICT (id) DO UPDATE SET
+															"type" = EXCLUDED."type",
+															"from" = EXCLUDED."from",
+															"to" = EXCLUDED."to",
+															"cc" = EXCLUDED."cc",
+															"bcc" = EXCLUDED."bcc",
+															"ref" = EXCLUDED."ref",
+															"data" = EXCLUDED."data",
+															"created_at" = EXCLUDED."created_at",
+															"started_at" = EXCLUDED."started_at",
+															"expired_at" = EXCLUDED."expired_at",
+															"index" = EXCLUDED."index",
+															"event" = EXCLUDED."event",
+															"number" = EXCLUDED."number",
+															"address" = EXCLUDED."address",
+															"status" = EXCLUDED."status",
+															"code" = EXCLUDED."code",
+															"discount" = EXCLUDED."discount",
+															"quantity" = EXCLUDED."quantity",
+															"usage_per" = EXCLUDED."usage_per",
+															"usage_limit" = EXCLUDED."usage_limit",
+															"min_order_amount" = EXCLUDED."min_order_amount",
+															"max_order_amount" = EXCLUDED."max_order_amount",
+															"max_discount_amount" = EXCLUDED."max_discount_amount",
+															"new_customer_only" = EXCLUDED."new_customer_only",
+															"first_purchase_only" = EXCLUDED."first_purchase_only",
+															"region_restrictions" = EXCLUDED."region_restrictions"
+													`).bind(
+														item.id,
+														item.type,
+														item.from,
+														item.to,
+														item.cc,
+														item.bcc,
+														item.ref,
+														item.data,
+														item.created_at,
+														parseFloat(item.started_at ? item.started_at : 0),
+														parseFloat(item.expired_at ? item.expired_at : 0),
+														parseFloat(item.index ? item.index : 0),
+														parseFloat(item.event ? item.event : 0),
+														item.number ? item.number : "",
+														item.address ? item.address : "",
+														item.status,
+														item.code ? item.code : "",
+														parseFloat(item.discount ? item.discount : 0),
+														parseFloat(item.quantity ? item.quantity : 0),
+														parseFloat(item.usage_per ? item.usage_per : 0),
+														parseFloat(item.usage_limit ? item.usage_limit : 0),
+														parseFloat(item.min_order_amount ? item.min_order_amount : 0),
+														parseFloat(item.max_order_amount ? item.max_order_amount : 0),
+														parseFloat(item.max_discount_amount ? item.max_discount_amount : 0),
+														parseFloat(item.new_customer_only ? item.new_customer_only : 0),
+														parseFloat(item.first_purchase_only ? item.first_purchase_only : 0),
+														parseFloat(item.region_restrictions ? item.region_restrictions : 0)
+													)
+												)
+											}
+												
+										}
+									}
+
+									if(detail && page.type){
+										statements[CenterRegion].push(
+											env[CenterRegion].prepare(`
+												INSERT INTO pages ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
+												VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+												ON CONFLICT(id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												detail.id,
+												detail.type,
+												detail.from,
+												detail.to,
+												detail.cc,
+												detail.bcc,
+												detail.ref,
+												detail.data,
+												now,
+												now
+											)
+										)
+
+										statements[`logis_${zoneRegion}_items`].push(
+											env[`logis_${zoneRegion}_items`].prepare(`
+												INSERT INTO items (
+													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+												) VALUES (
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												) ON CONFLICT (id) DO UPDATE SET
+													"type" = EXCLUDED."type",
+													"from" = EXCLUDED."from",
+													"to" = EXCLUDED."to",
+													"cc" = EXCLUDED."cc",
+													"bcc" = EXCLUDED."bcc",
+													"ref" = EXCLUDED."ref",
+													"data" = EXCLUDED."data",
+													"created_at" = EXCLUDED."created_at",
+													"updated_at" = EXCLUDED."updated_at"
+											`).bind(
+												detail.id,
+												'pages',
+												detail.from,
+												detail.to,
+												detail.cc,
+												detail.bcc,
+												detail.ref,
+												detail.data,
+												now,
+												now
+											)
+										)
+									}
+
+									task.title = page.text // Analyze the provided Pug template and return it in the following JSON format
+
+									task.semantic = page.text
+
+									if(items.length){
+										var type = talk.type = page.type
+
+										if(page.type == "sales"){
+											type = "sales"
+
+										}else if(page.type == "goods" || page.type == "order"){
+											type = "sales"
+
+										}else if(page.type == "event" || page.type == "coupon"){
+											type = "event"
+
+										}
+
+
+										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+											no : task.no,
+											title : page.text,
+											semantic : task.semantic
+										})), { to: 'arraybuffer' })
+
+										task.data = arr.buffer
+									}else{
+										/*
+											정보가 없으면
+
+											클라이언트에서 정보를 찾지 못하였다고 안내하기
+
+											가능한 카테고리 안내 메세지 노출해야함
+										*/ 
+
+										talk.type = "empty"
+
+										task.data = null
+									}
+
+									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+										type : page.type,
+										text : task.semantic,
+										link : task.link,
+										time : now,
+										origin : task.origin ? task.origin : ''
+									})), { to: 'arraybuffer' })
 
 									statements[`logis_${zoneRegion}_items`].push(
 										env[`logis_${zoneRegion}_items`].prepare(`
@@ -2885,2619 +5507,674 @@ export default {
 											task.ref,
 											arr.buffer,
 											now,
-											0
+											now
 										)
 									)
-								}
 
-
-								statements[`logis_${zoneRegion}_tracking`].push(
-									env[`logis_${zoneRegion}_tracking`].prepare(`
-										INSERT INTO tracking (
-											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-										) VALUES (
-											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
-										) ON CONFLICT (id) DO UPDATE SET
-											"type" = EXCLUDED."type",
-											"from" = EXCLUDED."from",
-											"to" = EXCLUDED."to",
-											"cc" = EXCLUDED."cc",
-											"bcc" = EXCLUDED."bcc",
-											"ref" = EXCLUDED."ref",
-											"data" = EXCLUDED."data",
-											"created_at" = EXCLUDED."created_at",
-											"index" = EXCLUDED."index",
-											"event" = EXCLUDED."event", 
-											"goods" = EXCLUDED."goods", 
-											"order" = EXCLUDED."order",
-											"status" = EXCLUDED."status",
-											"no" = EXCLUDED."no",
-											"sender_address" = EXCLUDED."sender_address",
-											"sender_phone" = EXCLUDED."sender_phone",
-											"recipient_address" = EXCLUDED."recipient_address",
-											"recipient_phone" = EXCLUDED."recipient_phone",
-											"width" = EXCLUDED."width",
-											"height" = EXCLUDED."height",
-											"length" = EXCLUDED."length",
-											"weight" = EXCLUDED."weight",
-											"carrier" = EXCLUDED."carrier",
-											"shipping_fee" = EXCLUDED."shipping_fee",
-											"shipping_method" = EXCLUDED."shipping_method",
-											"shipping_duration" = EXCLUDED."shipping_duration",
-											"shipping_date" = EXCLUDED."shipping_date",
-											"delivery_date" = EXCLUDED."delivery_date",
-											"order_date" = EXCLUDED."order_date",
-											"payment_date" = EXCLUDED."payment_date",
-											"payment_method" = EXCLUDED."payment_method",
-											"payment_origin" = EXCLUDED."payment_origin",
-											"payment_number" = EXCLUDED."payment_number",
-											"bundle_shipping" = EXCLUDED."bundle_shipping"
-									`).bind(
-										item.id,
-										item.type,
-										item.from,
-										item.to,
-										item.cc,
-										item.bcc,
-										item.ref,
-										item.data,
-										item.created_at,
-										item.index,
-										item.event ? item.event : 0,
-										item.goods ? item.goods : 0,
-										item.order ? item.order : 0,
-										item.status,
-										item.no,
-										item.sender_address ? item.sender_address : "",
-										item.sender_phone ? item.sender_phone : "",
-										item.recipient_address ? item.recipient_address : "",
-										item.recipient_phone ? item.recipient_phone : "",
-										item.width ? parseFloat(item.width) : 0,
-										item.height ? parseFloat(item.height) : 0,
-										item.length ? parseFloat(item.length) : 0,
-										item.weight ? parseFloat(item.weight) : 0,
-										item.carrier ? parseFloat(item.carrier) : 0,
-										item.shipping_fee ? parseFloat(item.shipping_fee) : 0,
-										item.shipping_method ? item.shipping_method : "",
-										item.shipping_duration ? parseFloat(item.shipping_duration) : 0,
-										item.shipping_date ? parseFloat(item.shipping_date) : 0,
-										item.delivery_date ? parseFloat(item.delivery_date) : 0,
-										item.order_date ? parseFloat(item.order_date) : 0,
-										item.payment_date ? parseFloat(item.payment_date) : 0,
-										item.payment_method ? item.payment_method : "",
-										item.payment_origin ? item.payment_origin : "",
-										item.payment_number ? item.payment_number : "",
-										item.bundle_shipping ? parseFloat(item.bundle_shipping) : 0
-									)
-								)
-							}
-								
-
-						}else if(task.scan){
-							// INSERT 백터 생성 INSERT
-
-							const isMore = function(_page, selectors){
-								var bool = false
-
-								var selector = ''
 										
-								if(_page.type == "goods"){
-									selector = `${selectors.title} ${selectors.sale_price}`
-								}else if(_page.type == "order"){
-									selector = `${selectors.tracking_number}, ${selectors.payment_method}, ${selectors.payment_origin}, ${selectors.bank}, ${selectors.card}`
-								}else if(_page.type == "tracking"){
-									selector = `${selectors.title}, ${selectors.id}, ${selectors.shipping_method}`
-								}else if(_page.type == "event"){
-									selector = `${selectors.title}, ${selectors.started_at}, ${selectors.expired_at}`
-								}else if(_page.type == "coupon"){
-									selector = `${selectors.title}, ${selectors.started_at}, ${selectors.expired_at}`
+
+								}catch(err){
+									console.log('inner err '+err)
+
+									await env[CenterRegion].prepare(`
+										INSERT INTO console (
+											"id", "bcc", "log", "created_at"
+										) VALUES (
+											?1, ?2, ?3, ?4
+										) ON CONFLICT (id) DO NOTHING
+									`).bind(
+										hashId(),
+										task.bcc,
+										'inner err'+err,
+										now // Parameter for created_at (only insert)
+									).run()
 								}
 
-								if(selector){
-									try{
-										var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
+							}else{
+								// SELECT 백터 쿼리
 
-										var $target = document.querySelectorAll(selector)
+								// 2022년 이후 2023년에 A 쇼핑몰에서 가장 많이 팔린 제품은 뭐야?
 
-										if($target.length){
-											bool = true
-										}
-									}catch(err){
-										console.log('more page err',err);
+								/*
+									추후 few shot 추가하기
+									
+									1. 이전 대화 참조
+										id 뎁스 여러번 hashId 거친것 select해서 있으면 이전 대화 참조하기
+
+									2. 프리미엄 사용자
+										vectorize에 프롬프트 semantic 결과값 추가하고 연관된 애들 불러와서 결과 만들기
+
+										아직 개발 안됨
+
+
+									프롬프트 답변값 벡터 데이터 저장 되어있음
+
+									env[CenterRegion]에 저장 되어있어서 그쪽에서 쿼리해야함
+
+								*/ 
+
+								// team.data.base['prompt'].count++
+
+								var paragraphs
+
+								var system = para2graph(language)
+
+								if(models['deepinfra']){
+									var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, task.body)
+
+									if(res){
+										paragraphs = res.context
 									}
+
+									models['deepinfra'] -= 1
+
 								}
 
-								return bool
-							}
+								if(!paragraphs && gemini_llm_api){
+									var res = await Gemini(gemini_llm_api, gemini_llm_model, system, task.body)
 
-							var isDetail = task.detail
+									if(res){
+										paragraphs = res.context
+									}
 
-							console.log('isDetail000',JSON.stringify(isDetail));
+									models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
-							try{
-								var page
+								}
 
-								var pageType = ''
+								if(!paragraphs){
+									fallback = 'para2graph overflow'
 
-								var pageLength = 0
+									continue
+								}
 
-								console.log('task.href',task.href);
+								console.log('before paragraphs',JSON.stringify(paragraphs))
 
-								var url = new URL(task.href)
 
-								var pathname = task.detail ? url.pathname.toUpperCase() : url.pathname.toLowerCase()
+								try{
+									if(paragraphs.length){
+										for(var p = 0; p < paragraphs.length; p++){
+											var paragraph = paragraphs[p]
 
-								var pageId = hashId(task.cc+pathname)
+											paragraphs[p] = paragraph2propertys(task, team, paragraph, current)
+										}
+									}else{
+										fallback = 'paragraph2propertys'
+										// 올바르지 않은 대화요청입니다 리턴해야함
 
-								console.log('pageId',pageId);
+										continue
+									}
+								}catch(err){
+									console.log('paragraphs err', err);
+								}
 
-								var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
-								var pages = results
+								if(paragraphs.length){
+									paragraphs = rowsTrim(paragraphs)
+								}
 
-								if(pages.length){
-									var _page = pages[0]
+								console.log('after paragraphs',JSON.stringify(paragraphs))
 
-									if(_page.type){
-										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+								if(paragraphs.length == 0){
+									continue
+								}
 
-										var selectors = JSON.parse(decompressedJsonString)
 
-										isDetail = isMore(_page, selectors)
+								var contexts
 
-										console.log('_page isDetail',JSON.stringify(isDetail));
+								var system = graph2contexts(current)
 
-										if(isDetail){
-											pageType = _page.type
+								if(models['deepinfra']){
+									var results = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, `{contexts : ${JSON.stringify(paragraphs)}}`)
 
-										}else if(task.ref == pageId){
-											var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${hashId(task.cc+pathname.toUpperCase())}' AND "created_at" < ${created_at} LIMIT 1`).all()
+									console.log('contexts res',JSON.stringify(results))
 
-											if(results.length){
-												var _page = results[0]
-
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
-
-												var _selectors = JSON.parse(decompressedJsonString)
-
-												isDetail = isMore(_page, _selectors)
-
-												if(isDetail){
-													pageType = _page.type
-												}
-
-												try{
-													var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
-
-													var $target = document.querySelectorAll(_page.data.node)
-
-													if($target.length){
-														task.page = _page
-													}
-												}catch(err){
-													console.log('more page err',err);
-												}
+									if(results){
+										if(results.contexts){
+											contexts = results.contexts
+										}else if(Object.keys(results).length){
+											if(!results.text){
+												results.text = task.body
 											}
 
-										}
-
-										try{
-											var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
-
-											if(document.querySelector(selectors.node)){
-												console.log('selectors.node',selectors.node);
-												// task.body = document.querySelector(selectors.node).innerHTML
+											if(!results.type && paragraphs.length == 1){
+												results.type = paragraphs[0].type
 											}
 
-										}catch(err){
-											console.log('cache page err',err);
+
+											contexts = [results]
 										}
 									}
+
+									models['deepinfra'] -= 1
 								}
 
+								// if(!contexts && gemini_llm_api){
+								// 	var res = await Gemini(gemini_llm_api, gemini_llm_model, system, `{contexts : ${JSON.stringify(paragraphs)}}`)
 
-								// 기존 값이 있으면 아래 프로세스 실행함
-
-								// var itemId = hashId(team.id+task.cc+task.link)
-
-								// var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${itemId}' AND "created_at" < ${created_at} LIMIT 1`).all()
-
-								// if(results.length){
-								// 	var item = results[0]
-
-								// 	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(item.data))
-
-								// 	item.data = JSON.parse(decompressedJsonString)
-
-								// 	if(item.data){
-								// 		if(item.data.node){
-								// 			if(!item.data.item){
-								// 				isDetail = true
-								// 			}
+								// 	if(res){
+								// 		if(res.contexts){
+								// 			contexts = res.contexts
 								// 		}
 								// 	}
-									
+
+								// 	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
 								// }
 
-								if(!isDetail){
-									if(task.referrer){
-										var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${task.referrer}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
-										if(results.length){
-											var _page = results[0]
-
-											if(_page.type){
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
-
-												var selectors = JSON.parse(decompressedJsonString)
-
-												if(selectors.node){
-													isDetail = isMore(_page, selectors)
-
-													if(isDetail){
-														pageType = _page.type
-													}
-												}
-											}
-										}
-									}
-								}
-
-
-
-								var content = convertHtmlToCleanPug(task.body)
-
-								console.log('content.length',content.length);
-
-								console.log('isDetail1',JSON.stringify(isDetail));
-
-								if(!isDetail){
-									var system = `
-										Analyze the provided Pug template and return it in the following JSON format, no explanation. 
-										{language:'${language}',${list2json(language)}}
-									`.trim()
-
-									if(models['deepinfra']){
-										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
-
-										pageType = page.type
-
-										if(page.items){
-											pageLength = page.items.length
-										}
-
-										isDetail = page.detail
-
-										models['deepinfra'] -= 1
-
-									}
-
-									if(!page && gemini_llm_api){
-										page = await Gemini(gemini_llm_api, gemini_llm_model, '', `
-											Analyze the provided Pug template and return it in the following JSON format, no explanation. 
-											{language:'${language}',${system}}
-											${content}
-										`)
-
-										pageType = page.type
-
-										if(page.items){
-											pageLength = page.items.length
-										}
-
-										isDetail = page.detail
-
-										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-									}
-								}
-
-
-								if((!isDetail && !pageLength && pageType) || isDetail){
-									var system = `
-										Analyze the provided Pug template and return it in the following JSON format, no explanation. 
-										# selector : sibling value based CSS1 selector
-										{language:'${language}',${item2json(pageType, task.href)}}
-									`.trim()
-
-									if(models['deepinfra']){
-										page = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
-
-										if(page.node){
-											page.type = pageType
-
-											page.link = task.link
-
-											isDetail = true
-										}else{
-											page = null
-										}
-
-										models['deepinfra'] -= 1
-
-									}
-
-									if(!page && gemini_llm_api){
-										page = await Gemini(gemini_llm_api, gemini_llm_model, system, content)
-
-										if(page.node){
-											page.type = pageType
-
-											page.link = task.link
-
-											isDetail = true
-										}else{
-											page = null
-										}
-
-										models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-									}
-								}
-
-								
-
-								if(!page){
-									fallback = 'page overflow'
+								if(!contexts){
+									fallback = 'graph2contexts overflow'
 
 									continue
 								}
 
 
-								page.type = pageType
-								page.from = task.from
-								page.to = task.to
-								page.cc = task.cc
-								page.bcc = task.bcc
-
-								if(!team.data.base.pages[task.cc]){
-									team.data.base.pages[task.cc] = {}
-								}
-
-								if(page.type){
-									if(!team.data.base.pages[task.cc][page.type]){
-										team.data.base.pages[task.cc][page.type] = {
-											draft : 0,
-											count : 0
-										}
-									}
-
-									if(!team.data.base[page.type]){
-										team.data.base[page.type] = {
-											draft : 0,
-											count : 0
-										}
-									}
-								}
-
-									
+								console.log('contexts',JSON.stringify(contexts))
 
 
-								var selectors = {
-									type : page.type,
-									text : page.text || '',
-									node : page.node || '',
-									list : page.list || '',
-									item : page.item || '',
-									more : page.more || '',
-									next : page.next || '',
-									link : task.link,
-									time : now,
-									origin : task.origin ? task.origin : ''
-								}
 
-								
 
-								var detail = {
-									id : hashId(task.cc+pathname.toUpperCase()),
-									type : pageType,
-									from : task.from,
-									to : task.to,
-									cc : task.cc,
-									bcc: task.bcc,
-									ref: task.ref,
-									data:null,
-									created_at:now,
-									updated_at:now
-								}
+								var augmented = ''
 
-								console.log('isDetail2',JSON.stringify(isDetail));
+								// // 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
+								// if(task.topK > 50){
+								// 	var { results, success, error } = await env[`logis_${zoneRegion}_talks`].prepare(
+								// 		`SELECT * FROM talks WHERE "bcc" = '${task.bcc}' AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
+								// 	).all()
 
-								var before
+								// 	if(results.length){
+								// 		for(var r = 0; r < results.length; r++){
+								// 			var retrieval = results[r]
 
-								if(isDetail){
-									selectors.detail = true
+								// 			var { results, success, error } = await env[`logis_${zoneRegion}_${retrieval.type}`].prepare(
+								// 				`SELECT * FROM ${retrieval.type} WHERE "ref" = '${retrieval.ref}' AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
+								// 			).all()
 
-									talk.ref = pageId = detail.id
+								// 			var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(retrieval.data))
 
-									detail = null
+								// 			var data = JSON.parse(decompressedJsonString)
 
-									console.log('pageId',pageId)
+								// 			if(results.length){
+								// 				augmented += `${p}. ${data.text}\n`
 
-									var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${pageId}' AND "created_at" < ${created_at} LIMIT 1`).all()
+								// 				for(var b = 0; b < results.length; b++){
+								// 					var obj = safeClone(results[b])
 
-									var _page
+								// 					delete obj.from
+								// 					delete obj.to
+								// 					delete obj.cc
+								// 					delete obj.bcc
+								// 					delete obj.ref
 
-									if(results.length){
-										_page = results[0]
+								// 					augmented += `${JSON.stringify(obj)}\n`
+								// 				}
+								// 			}
 
-										var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_page.data))
+								// 			statements[`logis_${zoneRegion}_talks`].push(
+								// 				env[`logis_${zoneRegion}_talks`].prepare(`
+								// 					UPDATE talks SET updated_at = ? WHERE id = ?
+								// 				`).bind(
+								// 					now, retrieval.id
+								// 				)
+								// 			)
+								// 		}
 
-										_page.data = JSON.parse(decompressedJsonString)
+								// 		if(augmented){
+								// 			augmented = `Reference Context Start\n${augmented}\nReference Context End\n`
+								// 		}
+								// 	}
+								// }
 
-										before = _page.data
-									}
-									
-									var item = safeClone(page)
+								if(contexts){
+									if(contexts.length){
+										for(var q = 0; q < contexts.length; q++){
+											var context = contexts[q]
 
-									for (var p in item) {
-										if (item.hasOwnProperty(p)) {
-											var prop = item[p]
+											context.id = hashId()
 
-											if(prop){
-												if(typeof prop.selector != "undefined"){
-													selectors[p] = prop.selector;
-													item[p] = prop.value;
+											if(!context.type){
+												continue
+											}
 
-												}else if(typeof prop.length == 'number'){
+											if(context.date == '#date'){
+												context.date = ''
+											}
 
-													for(var i = 0; i < prop.length; i++){
-														var option = prop[i]
+											if(context.status == '#status'){
+												context.status = ''
+											}
 
-														if(typeof option == "object" && Object.keys(option).length){
-															for(var n in option){
-																if (option.hasOwnProperty(n)) {
-																	var opt = option[n]
-																	
-																	if(n == "selector"){
-																		selectors[`${p}`] = option.selector
+											if(context.substantial == '#substantial'){
+												context.substantial = ''
+											}
 
-																		item[p][i] = option.value
+											if(context.find == '#find'){
+												context.find = ''
+											}
 
-																	}else if(typeof opt == "object" && Object.keys(opt).length){
-																		for(var o in opt){
-																			if (opt.hasOwnProperty(o)) {
-																				var obj = opt[o]
 
-																				if(o == "selector"){
-																					selectors[`${p}_${n}`] = opt.selector
 
-																					item[p][i][n] = opt.value
-																				}
-																			}
-																		}
-																	}
-																}
-															}
-														}
+
+
+											var type = context.type
+
+											if(context.type == "sales"){
+												type = "sales"
+
+												context.type = "order"
+
+											}else if(context.type == "goods" || context.type == "order"){
+												type = "sales"
+
+											}else if(context.type == "event" || context.type == "coupon"){
+												type = "event"
+
+											}
+
+
+											context.by = "created_at"
+
+											if(context.substantial){
+												context.by = context.substantial
+											}
+
+
+											context.sort = "DESC"
+
+											if(context.find){
+												if(context.find == 'light' || context.find == 'few' || context.find == 'little'){
+													context.sort = "ASC"
+												}
+											}
+
+
+											var query = {
+												options:{
+													topK: task.topK,
+													returnValues: true, // true 이며 벡터 값 포함
+													returnMetadata: 'all',
+													filter : {
+														type : context.type,
+														to : team.id
 													}
 												}
 											}
-										}
-									}
 
+											var queryVector
 
-									if(_page){
-										if(!_page.data.item){
-											item.ref = _page.ref
-										}
-									}
-										
-
-									
-									page.items = [item]
-
-								}else{
-									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-										type : page.type,
-										link : task.link,
-										origin : task.origin,
-										detail : true,
-										node : true,
-										item : ''
-									})), { to: 'arraybuffer' })
-
-									detail.data = arr.buffer
-								}
-
-								console.log('pageId',pageId);
-
-								var items = []
-
-								if(page.items){
-									if(page.items.length){
-										items = page.items
-									}
-								}
-
-
-								talk.text = page.text
-								
-
-								page.ref = task.referrer ? task.referrer : ''
-
-
-								page.data = selectors
-
-								if(before && pages.length){
-									var _page = pages[0]
-
-									var after = selectors
-
-									try{
-										var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
-
-										if(Object.keys(before).length){
-											for (var selector in before) {
-												if (before.hasOwnProperty(selector)) {
-													if(typeof selector == "string"){
-														try{
-															var $before = document.querySelectorAll(`${before[selector]}`)
-															var $after = document.querySelectorAll(`${after[selector]}`)
-
-															if($before.length && !$after.length){
-																_page.data[selector] = page.data[selector] = before[selector] + ''
-
-															}else if(!$before.length && $after.length){
-																_page.data[selector] = page.data[selector] = after[selector] + ''
-
-															}else if($before.length && $after.length){
-																if($before.length < $after.length){
-																	_page.data[selector] = page.data[selector] = before[selector] + ''
-																}else{
-																	_page.data[selector] = page.data[selector] = after[selector] + ''
-																}
-																
-
-															}
-
-														}catch(err){
-															// console.log('selector err',err);
-														}
-													}
-												}
-											}
-										}
-									}catch(err){
-										// console.log('_page.data err',err);
-									}
-
-									// _page.data = before
-
-									page = mergeNode(_page, page)
-
-									selectors = page.data
-
-								}
-
-								console.log('page.data',JSON.stringify(page.data));
-
-
-								page.id = task.page ? task.page.id : pageId
-
-								console.log('page.id',page.id);
-
-								console.log('page',JSON.stringify(page));
-
-								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(page.data)), { to: 'arraybuffer' })
-
-								page.data = arr.buffer
-
-
-									
-
-								if(page.type){
-									statements[CenterRegion].push(
-										env[CenterRegion].prepare(`
-											INSERT INTO pages ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
-											VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-											ON CONFLICT(id) DO UPDATE SET
-												"type" = EXCLUDED."type",
-												"from" = EXCLUDED."from",
-												"to" = EXCLUDED."to",
-												"cc" = EXCLUDED."cc",
-												"bcc" = EXCLUDED."bcc",
-												"ref" = EXCLUDED."ref",
-												"data" = EXCLUDED."data",
-												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
-										`).bind(
-											page.id,
-											page.type,
-											page.from,
-											page.to,
-											page.cc,
-											page.bcc,
-											page.ref,
-											page.data,
-											now,
-											now
-										)
-									)
-									
-									statements[`logis_${zoneRegion}_items`].push(
-										env[`logis_${zoneRegion}_items`].prepare(`
-											INSERT INTO items (
-												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-											) VALUES (
-												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-											) ON CONFLICT (id) DO UPDATE SET
-												"type" = EXCLUDED."type",
-												"from" = EXCLUDED."from",
-												"to" = EXCLUDED."to",
-												"cc" = EXCLUDED."cc",
-												"bcc" = EXCLUDED."bcc",
-												"ref" = EXCLUDED."ref",
-												"data" = EXCLUDED."data",
-												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
-										`).bind(
-											page.id,
-											'pages',
-											page.from,
-											page.to,
-											page.cc,
-											page.bcc,
-											page.ref,
-											page.data,
-											now,
-											now
-										)
-									)
-								}
-
-									
-
-
-								talk.type = page.type
-
-								/*
-									items에서 
-										시작 시간
-										최저가 최대가격
-										최저 수량 최대 수량
-
-										값 가져오기
-								*/ 
-
-								console.log('진입전 items');
-
-								if(items.length){
-
-									console.log('items',JSON.stringify(items));
-									/*
-										주문이후의 절차는 주문번호로 매칭해야함
-
-										type : tracking 	// 배송추적
-															// "고객 주문"" or "자사 재고" 등으로 추상화 매칭
-
-										type : order
-											order 파생 정보는
-											전체 주문 목록 스캔하여
-											주문 아이템 링크 클릭시
-											레퍼러 참조 이벤트 추적하여 기록
-											이 부분 크롬 익스텐션에서 해야함
-
-
-											이 부분은 무조건 유료만 가능하게
-
-												벡터 쿼리로 미리 저장하고 
-													type : order, semantic : cancel     // 주문취소
-													type : order, semantic : exchange   // 교환
-													type : order, semantic : return     // 반품
-													type : order, semantic : refund     // 환불
-
-												title값 쿼리로 semantic 선택
-
-												var { data: queryVector } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-													text: [semantic],
-												})
-
-												var { matches } = await env.SEMANTIC.query(queryVector[0], query.options)
-
-									*/
-
-									for(var i = 0; i < items.length; i++){
-										var item = items[i]
-
-
-										if(!item.id){
-											continue
-										}
-
-										if(!page.type){
-											continue
-										}
-
-										if(isDetail){
-											item.link = task.link
-										}
-
-										item.type = page.type
-
-										item.no = cleanNumber(item.id.toString())
-
-
-										item.index = crc32(hashId(item.type+team.id+item.no))
-
-										try{
-											try{
-												var _url = new URL(item.link)
-
-												item.link = (_url.pathname + _url.search).toLowerCase()
-											}catch(err){
-												var _url = new URL(task.origin+item.link)
-
-												item.link = (_url.pathname + _url.search).toLowerCase()
-											}
-
-
-											if(isDetail){
-												if(!detail.page){
-													detail.page = detail.id = hashId(task.cc+_url.pathname.toUpperCase())
-												}
-											}
-
-										}catch(err){
-
-										}
-
-
-										var itemType = ""
-
-										if(item.type == "tracking"){
-											itemType = "tracking"
-
-										}else if(item.type == "goods" || item.type == "order"){
-											itemType = "sales"
-
-										}else if(item.type == "event" || item.type == "coupon"){
-											itemType = "event"
-
-										}
-
-										if(item.registration_date){
-											console.log('item.registration_date',item.registration_date);
-											item.created_at = new Date(item.registration_date).getTime()
-										}else{
-											item.created_at = now
-										}
-
-
-										var updated_at = item.updated_at = 0
-
-										if(isDetail){
-											item.updated_at = updated_at = now
-										}
-
-
-
-
-										item.id = hashId(team.id+task.cc+item.link)
-										
-
-										item.data = {
-											id : item.id,
-											no : item.no ? item.no : "",
-											title : item.title ? item.title : '',
-											link : item.link,
-											time : now,
-											origin : task.origin ? task.origin : ''
-										}
-
-										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
-
-										console.log('add results.length',item.type,results.length);
-
-										console.log('item.updated_at',item.updated_at ? 'true' : 'false');
-
-										console.log('team.data.base.pages[task.cc][item.type]',JSON.stringify(team.data.base.pages[task.cc]));
-
-										if(results.length){
-											var _item = results[0]
-
-											var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
-
-											_item.data = JSON.parse(decompressedJsonString)
-
-											if(item.data.item && !_item.data.item){
-												item.data.item = _item.data.item
-												item.data.node = _item.data.node
-												item.ref = _item.data.ref
-											}
-
-											if(item.status){
-												if(_item.status){
-													delete _item.status
-												}
-											}
-
-
-											item = mergeNode(_item, item)
-
-											var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_item.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
-
-											if(results.length){
-												var _item = results[0]
-
-												console.log('_item.updated_at',_item.updated_at);
-												console.log('item.updated_at',updated_at);
-												if(!_item.updated_at){
-													if(updated_at){
-														team.data.base.pages[task.cc][item.type].draft--
-														team.data.base.pages[task.cc][item.type].count++
-													}
-												}
-
-												// item.updated_at = now
-											}
-
-										}else{
-											if(updated_at){
-												team.data.base.pages[task.cc][item.type].count++
-											}else{
-												team.data.base.pages[task.cc][item.type].draft++
-											}
-
-											team.data.base[item.type].count++
-										}
-
-										// item.id = hashId(team.id+task.cc+task.link)
-
-
-										item.flag = task.flag
-										
-										item.from = task.from
-										item.to = task.to
-										item.cc = task.cc
-
-										item.bcc = task.bcc
-
-										item.ref = pageId
-
-
-										var goods = item.goods ? safeClone(item.goods) : []
-
-										delete item.goods
-
-										try{
-											if(typeof goods.length != "undefined"){
-												goods.unshift({})
-											}else{
-												goods = []
-											}
-										}catch(err){
-											console.log('goods err',err);
-										}
-
-
-										item.currency = item.currency ? item.currency.toUpperCase() : ""
-
-										item.quantity = item.quantity ? parseInt(item.quantity) : 0
-
-										
-
-										item.semantic = item.title
-
-										item.started_at = item.manufacture_date ? item.manufacture_date : 0
-										
-										item.expired_at = item.expiration_date ? item.expiration_date : 0
-
-										var statusCode = item.status = item.status ? parseStatus(item.status) : 0
-
-										
-
-
-										if(item.tracking_number){
-											var tracking_number = normalizeNumericHomoglyphs(item.tracking_number)
-												tracking_number = cleanNumber(tracking_number)
-
-											item.tracking = crc32(hashId('tracking'+team.id+tracking_number))
-										}
-
-											
-
-										try{
-											console.log('item.type',item.type);
-
-											if(item.type == "order" && goods){
-												/*
-													상세와 리스트 차이가 분명히 있음
-
-													주문 
-														리스트에서는 송장번호가 없음
-														상세페이지에서는 송장번호가 있음
-												*/
-
-												if(goods.length && item.tracking_number){
-													for(var g = 0; g < goods.length; g++){
-
-														var good = safeClone(goods[g])
-
-														var tracking = safeClone(item)
-
-														tracking.type = "tracking"
-
-														tracking.no = tracking_number
-
-														tracking.index = item.tracking
-
-														if(good.id){
-															var no = cleanNumber(good.id.toString())
-
-															good.no = no
-
-															good.index = crc32(hashId('goods'+team.id+good.no))
-
-															var { results } = await env[`logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = 'goods' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
-
-															if(results.length){
-																tracking.event = results[0].event
-															}
-
-															tracking.goods = good.index
-
-															tracking.id = hashId(team.id+tracking.no+good.no)
-
-														}else{
-															tracking.id = hashId(team.id+tracking.no)
-
-														}
-
-
-														tracking.status = item.status
-
-														tracking.order = item.index
-
-														tracking.order_date = item.order_date
-														tracking.payment_date = item.payment_date
-														tracking.payment_method = item.payment_method
-														tracking.payment_origin = item.payment_origin
-
-														tracking.link = item.link
-
-														tracking.sender_address = item.sender_address
-														tracking.sender_phone = item.sender_phone
-														tracking.recipient_address = item.recipient_address
-														tracking.recipient_phone = item.recipient_phone
-
-														tracking.data = {
-															id : item.id,
-															link : item.link,
-															time : now,
-															origin : task.origin ? task.origin : ""
-														}
-
-														if(!team.data.base.pages[task.cc]){
-															team.data.base.pages[task.cc] = {}
-														}
-
-														if(!team.data.base.pages[task.cc][tracking.type]){
-															team.data.base.pages[task.cc][tracking.type] = {
-																draft : 0,
-																count : 0
-															}
-														}
-
-
-
-														var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = ${tracking.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
-
-														if(results.length){
-															var _tracking = safeClone(results[0])
-
-															var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_tracking.data))
-
-															_tracking.data = JSON.parse(decompressedJsonString)
-
-															delete _tracking.ref
-
-															tracking = mergeNode(_tracking, tracking)
-
-
-
-
-															var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_tracking.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
-
-															if(results.length){
-																var _item = results[0]
-
-																if(!_item.updated_at){
-																	if(updated_at){
-																		team.data.base.pages[task.cc].tracking.draft--
-																		team.data.base.pages[task.cc].tracking.count++
-
-																		statements[`logis_${zoneRegion}_items`].push(
-																			env[`logis_${zoneRegion}_items`].prepare(`
-																				UPDATE items SET updated_at = ? WHERE id = ?
-																			`).bind(
-																				now, _item.id
-																			)
-																		)
-																	}
-																}
-															}
-														}else{
-															// 처음 저장할때 자연어 LLM으로 전처리해서 벡터 저장해야함
-															var content = JSON.stringify({
-																size : tracking.size ? tracking.size : "",
-																currency : tracking.currency ? tracking.currency : "",
-																carrier : tracking.carrier ? tracking.carrier : "",
-																shipping_fee : tracking.shipping_fee ? true : false,
-																shipping_method : tracking.shipping_method ? tracking.shipping_method : "",
-																fulfillment_service : tracking.fulfillment_service ? tracking.fulfillment_service : "",
-																stock_keeping_unit : tracking.stock_keeping_unit ? tracking.stock_keeping_unit : "",
-																bundle_shipping : tracking.bundle_shipping ? true : false,
-																used : tracking.used ? true : false,
-																lease : tracking.lease ? true : false,
-																rental : tracking.rental ? true : false,
-																refurbish : tracking.refurbish ? true : false,
-																tax_included : tracking.tax_included ? true : false,
-																sender_address : tracking.sender_address,
-																recipient_address : tracking.recipient_address,
-																payment_method : tracking.payment_method, 
-																payment_origin : tracking.payment_origin 
-															})
-
-															var semantic
-
-
-															var system = semantic_prompt_system(language).trim()
-
-															if(models['deepinfra']){
-																semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
-
-																models['deepinfra'] -= 1
-
-															}
-
-															if(!semantic && gemini_llm_api){
-																semantic = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
-
-																models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-															}
-
-															if(!semantic){
-																fallback = 'semantic overflow'
-
-																continue
-															}
-
-															var metadata = {
-																type: item.type,
-																from: item.from,
-																to: item.to,
-																cc: item.cc,
-																bcc: item.bcc,
-																ref:pageId
-															}
-
-															var embeddings
-
-															if(models['cloudflare']){
-																var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-																	text: [semantic]
-																})
-
-																var $VectorizeVector = [
-																	{
-																		id: item.id,
-																		values: embeddings[0],
-																		metadata: metadata
-																	}
-																]
-
-																models['cloudflare'] -= 1
-
-															}
-
-															if(!embeddings && models['deepinfra']){
-																var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
-
-																var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-																	return {
-																		id: item.id,
-																		values: values,
-																		metadata: metadata
-																	}
-																})
-
-																models['deepinfra'] -= 1
-															}
-
-															if(!embeddings){
-																fallback = 'embeddings overflow'
-
-																continue
-															}
-
-
-															team.data.base.pages[task.cc][tracking.type].draft++
-															// team.data.base.pages[task.cc][tracking.type].count--
-															team.data.base[item.type].count++
-
-															await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
-														}
-
-														var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(tracking.data)), { to: 'arraybuffer' })
-
-														console.log('tracking',JSON.stringify(tracking))
-
-														statements[`logis_${zoneRegion}_tracking`].push(
-															env[`logis_${zoneRegion}_tracking`].prepare(`
-																INSERT INTO tracking (
-																	"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-																) VALUES (
-																	?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
-																) ON CONFLICT (id) DO UPDATE SET
-																	"type" = EXCLUDED."type",
-																	"from" = EXCLUDED."from",
-																	"to" = EXCLUDED."to",
-																	"cc" = EXCLUDED."cc",
-																	"bcc" = EXCLUDED."bcc",
-																	"ref" = EXCLUDED."ref",
-																	"data" = EXCLUDED."data",
-																	"created_at" = EXCLUDED."created_at",
-																	"index" = EXCLUDED."index",
-																	"event" = EXCLUDED."event", 
-																	"goods" = EXCLUDED."goods", 
-																	"order" = EXCLUDED."order", 
-																	"status" = EXCLUDED."status",
-																	"no" = EXCLUDED."no",
-																	"sender_address" = EXCLUDED."sender_address",
-																	"sender_phone" = EXCLUDED."sender_phone",
-																	"recipient_address" = EXCLUDED."recipient_address",
-																	"recipient_phone" = EXCLUDED."recipient_phone",
-																	"width" = EXCLUDED."width",
-																	"height" = EXCLUDED."height",
-																	"length" = EXCLUDED."length",
-																	"weight" = EXCLUDED."weight",
-																	"carrier" = EXCLUDED."carrier",
-																	"shipping_fee" = EXCLUDED."shipping_fee",
-																	"shipping_method" = EXCLUDED."shipping_method",
-																	"shipping_duration" = EXCLUDED."shipping_duration",
-																	"shipping_date" = EXCLUDED."shipping_date",
-																	"delivery_date" = EXCLUDED."delivery_date",
-																	"order_date" = EXCLUDED."order_date",
-																	"payment_date" = EXCLUDED."payment_date",
-																	"payment_method" = EXCLUDED."payment_method",
-																	"payment_origin" = EXCLUDED."payment_origin",
-																	"payment_number" = EXCLUDED."payment_number",
-																	"bundle_shipping" = EXCLUDED."bundle_shipping"
-															`).bind(
-																tracking.id,
-																tracking.type,
-																tracking.from,
-																tracking.to,
-																tracking.cc,
-																tracking.bcc,
-																tracking.ref,
-																arr.buffer,
-																tracking.created_at,
-																tracking.index,
-																tracking.event ? tracking.event : 0,
-																tracking.goods ? tracking.goods : 0,
-																tracking.order ? tracking.order : 0,
-																tracking.status,
-																tracking.no ? tracking.no : "",
-																tracking.sender_address ? tracking.sender_address : "",
-																tracking.sender_phone ? tracking.sender_phone : "",
-																tracking.recipient_address ? tracking.recipient_address : "",
-																tracking.recipient_phone ? tracking.recipient_phone : "",
-																parseFloat(tracking.width ? tracking.width : 0),
-																parseFloat(tracking.height ? tracking.height : 0),
-																parseFloat(tracking.length ? tracking.length : 0),
-																parseFloat(tracking.weight ? tracking.weight : 0),
-																parseFloat(tracking.carrier ? tracking.carrier : 0),
-																parseFloat(tracking.shipping_fee ? tracking.shipping_fee : 0),
-																tracking.shipping_method ? tracking.shipping_method : "",
-																parseFloat(tracking.shipping_duration ? tracking.shipping_duration : 0),
-																parseFloat(tracking.shipping_date ? tracking.shipping_date : 0),
-																parseFloat(tracking.delivery_date ? tracking.delivery_date : 0),
-																parseFloat(tracking.order_date ? tracking.order_date : 0),
-																parseFloat(tracking.payment_date ? tracking.payment_date : 0),
-																tracking.payment_method ? tracking.payment_method : "",
-																tracking.payment_origin ? tracking.payment_origin : "",
-																tracking.payment_number ? tracking.payment_number : "",
-																parseFloat(tracking.bundle_shipping ? tracking.bundle_shipping : 0)
-															)
-														)
-													}
-												}
-											}
-										}catch(err){
-											console.log('err item.type == "order" && item.tracking_number', err)
-										}
-
-
-										if(item.condition){
-											if(item.condition.indexOf('used') > -1){
-												item.used = 1
-											}
-
-											if(item.condition.indexOf('lease') > -1){
-												item.lease = 2
-											}
-
-											if(item.condition.indexOf('rental') > -1){
-												item.rental = 3
-											}
-
-											if(item.condition.indexOf('refurbish') > -1){
-												item.refurbish = 4
-											}
-										}
-
-
-										var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
-
-										if(results.length){
-											var _item = results[0]
-
-											delete _item.ref
-
-											if(item.status){
-												if(_item.status){
-													delete _item.status
-												}
-											}
-
-											item = mergeNode(_item, item)
-
-
-										}else{
-											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
-
-											if(results.length){
-												var _item = results[0]
-
-												delete _item.ref
-
-												if(item.status){
-													if(_item.status){
-														delete _item.status
-													}
-												}
-
-												item = mergeNode(_item, item)
-											}
-
-										}
-
-
-
-										try{
-											if(item.price <= team.data.base[item.type].price.min){
-												team.data.base[item.type].price.min = item.price
-											}
-
-											if(item.price >= team.data.base[item.type].price.max){
-												team.data.base[item.type].price.max = item.price
-											}
-											
-
-
-											if(item.quantity <= team.data.base[item.type].quantity.min){
-												team.data.base[item.type].quantity.min = item.quantity
-											}
-
-											if(item.quantity >= team.data.base[item.type].quantity.max){
-												team.data.base[item.type].quantity.max = item.quantity
-											}
-
-
-
-											if(item.width <= team.data.base[item.type].width.min){
-												team.data.base[item.type].width.min = item.width
-											}
-
-											if(item.width >= team.data.base[item.type].width.max){
-												team.data.base[item.type].width.max = item.width
-											}
-
-
-
-											if(item.height <= team.data.base[item.type].height.min){
-												team.data.base[item.type].height.min = item.height
-											}
-
-											if(item.height >= team.data.base[item.type].height.max){
-												team.data.base[item.type].height.max = item.height
-											}
-
-
-
-											if(item.length <= team.data.base[item.type].length.min){
-												team.data.base[item.type].length.min = item.length
-											}
-
-											if(item.length >= team.data.base[item.type].length.max){
-												team.data.base[item.type].length.max = item.length
-											}
-
-
-
-											if(item.weight <= team.data.base[item.type].weight.min){
-												team.data.base[item.type].weight.min = item.weight
-											}
-
-											if(item.weight >= team.data.base[item.type].weight.max){
-												team.data.base[item.type].weight.max = item.weight
-											}
-
-
-
-											if(item.shipping_fee <= team.data.base[item.type].shipping_fee.min){
-												team.data.base[item.type].shipping_fee.min = item.shipping_fee
-											}
-
-											if(item.shipping_fee >= team.data.base[item.type].shipping_fee.max){
-												team.data.base[item.type].shipping_fee.max = item.shipping_fee
-											}
-
-
-
-											if(item.shipping_duration <= team.data.base[item.type].shipping_duration.min){
-												team.data.base[item.type].shipping_duration.min = item.shipping_duration
-											}
-
-											if(item.shipping_duration >= team.data.base[item.type].shipping_duration.max){
-												team.data.base[item.type].shipping_duration.max = item.shipping_duration
-											}
-
-
-
-											if(item.sale_price <= team.data.base[item.type].sale_price.min){
-												team.data.base[item.type].sale_price.min = item.sale_price
-											}
-
-											if(item.sale_price >= team.data.base[item.type].sale_price.max){
-												team.data.base[item.type].sale_price.max = item.sale_price
-											}
-
-
-
-											if(item.supply_price <= team.data.base[item.type].supply_price.min){
-												team.data.base[item.type].supply_price.min = item.supply_price
-											}
-
-											if(item.supply_price >= team.data.base[item.type].supply_price.max){
-												team.data.base[item.type].supply_price.max = item.supply_price
-											}
-											
-
-
-											if(item.low_stock_threshold <= team.data.base[item.type].low_stock_threshold.min){
-												team.data.base[item.type].low_stock_threshold.min = item.low_stock_threshold
-											}
-
-											if(item.low_stock_threshold >= team.data.base[item.type].low_stock_threshold.max){
-												team.data.base[item.type].low_stock_threshold.max = item.low_stock_threshold
-											}
-											
-
-
-											if(item.discount <= team.data.base[item.type].discount.min){
-												team.data.base[item.type].discount.min = item.discount
-											}
-
-											if(item.discount >= team.data.base[item.type].discount.max){
-												team.data.base[item.type].discount.max = item.discount
-											}
-											
-
-											
-											if(item.min_order_amount <= team.data.base[item.type].min_order_amount.min){
-												team.data.base[item.type].min_order_amount.min = item.min_order_amount
-											}
-
-											if(item.min_order_amount >= team.data.base[item.type].min_order_amount.max){
-												team.data.base[item.type].min_order_amount.max = item.min_order_amount
-											}
-
-
-
-											if(item.max_discount_amount <= team.data.base[item.type].max_discount_amount.min){
-												team.data.base[item.type].max_discount_amount.min = item.max_discount_amount
-											}
-
-											if(item.max_discount_amount >= team.data.base[item.type].max_discount_amount.max){
-												team.data.base[item.type].max_discount_amount.max = item.max_discount_amount
-											}
-
-
-
-											if(item.usage_limit <= team.data.base[item.type].usage_limit.min){
-												team.data.base[item.type].usage_limit.min = item.usage_limit
-											}
-
-											if(item.usage_limit >= team.data.base[item.type].usage_limit.max){
-												team.data.base[item.type].usage_limit.max = item.usage_limit
-											}
-
-
-
-											if(item.usage_per <= team.data.base[item.type].usage_per.min){
-												team.data.base[item.type].usage_per.min = item.usage_per
-											}
-
-											if(item.usage_per >= team.data.base[item.type].usage_per.max){
-												team.data.base[item.type].usage_per.max = item.usage_per
-											}
-
-
-
-											if(item.started_at <= team.data.base[item.type].started_at.min){
-												team.data.base[item.type].started_at.min = item.started_at
-											}
-
-											if(item.started_at >= team.data.base[item.type].started_at.max){
-												team.data.base[item.type].started_at.max = item.started_at
-											}
-
-
-
-											if(item.expired_at <= team.data.base[item.type].expired_at.min){
-												team.data.base[item.type].expired_at.min = item.expired_at
-											}
-
-											if(item.expired_at >= team.data.base[item.type].expired_at.max){
-												team.data.base[item.type].expired_at.max = item.expired_at
-											}
-										}catch(err){
-											console.log('err team.data.base',err);
-										}
-
-
-
-										var progress = {}
-
-										var relates = {}
-
-										var related = Related(item.type) // 관련 타입 정보 가져옴
-
-										/*
-											두가지 타입
-												import
-													foreign 에서 primary 
-
-												export
-													primary 에서 foreign 
-
-												from : foreign 
-												to : primary 
-													import = 외부 데이터로 내부 데이터 수정
-														order 스캔 진행시
-															draft.type == "goods" && row.type == "order"
-															
-															order items 만 있으면 goods 상세 정보가 없기 때문에 
-															goods 정보 가져와서 order item에 업데이트 해야함
-
-												from : primary 
-												to : foreign
-													export = 내부 데이터로 외부 데이터 수정
-														tracking 스캔 진행시
-															tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
-										*/ 
-										
-										if(related.length){
-											for(var r = 0; r < related.length; r++){
-												var { query, merge } = Relay(related[r], item)
-
-												// console.log('query, merge',query, merge);
-
-												// flow ${type}에 ${column} foreign 값이 없으면 업데이트 해야함
-
-												if(!query || !merge){
-													continue
-												}
-
-												try{
-													if(query.length){
-														var table = query[0].table
-														var type = query[0].type
-														var column = query[0].column
-														var column_value = query[0].value
-														var status = query[0].status
-
-														// if(typeof status != "undefined"){
-														// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
-														// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-														// 	).bind(
-														// 		column_value, team.id, item.cc, status, now
-														// 	).all()
-														// }else{
-														// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
-														// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-														// 	).bind(
-														// 		column_value, team.id, item.cc, now
-														// 	).all()
-														// }
-
-														var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
-															`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
-														).bind(
-															column_value, team.id, item.cc, now
-														).all()
-
-
-														if(results.length == 0){
-															// draft 상태 맞음
-															// 없으면 추가해야함 - 일부 사용자가 직접 팝업으로 띄워야 할수 있음
-
-															/*
-																상품 스캔 하였는데
-																상품 상세페이지 스캔 안되어있으면
-															*/
-
-															/*
-																고객 주문 스캔하였는데
-																배송 시작 정보가 없을시
-															*/
-															updated_at = 0	
-														}
-
-														relates[type] = {
-															query : query,
-															merge : merge,
-															rows : results,
-															type : related[r]
-														}
-													}
-												}catch(err){
-													await env[CenterRegion].prepare(`
-														INSERT INTO console (
-															"id", "bcc", "log", "created_at"
-														) VALUES (
-															?1, ?2, ?3, ?4
-														) ON CONFLICT (id) DO NOTHING
-													`).bind(
-														hashId(),
-														task.bcc,
-														'tracking inner err'+type+err,
-														now // Parameter for created_at (only insert)
-													).run()
-												}
-											}
-										}
-
-											
-
-
-
-										console.log('Object.keys(relates).length',Object.keys(relates).length);
-
-										if(Object.keys(relates).length){
-											for (var type in relates) {
-												// for start
-
-												// type값은 related[i]
-												if (relates.hasOwnProperty(type)) {
-													var relate = relates[type]
-
-													/*
-														시나리오 case
-
-														import
-															order 스캔 진행시
-																type == "goods" && row.type == "order"
-
-																order items 만 있으면 goods 상세 정보가 없기 때문에 
-																goods 정보 가져와서 order item에 업데이트 해야함
-
-														export
-															tracking 스캔 진행시
-																tracking 정보는 있고, order 정보에 tracking 값 업데이트 해야함
-
-													*/
-													
-													var query = relate.query
-
-													if(relate){
-														if(typeof relate.rows != "undefined"){
-															var column = query[1] ? query[1].column : query[0].column
-															var index = query[1] ? query[1].index : query[0].index
-
-
-															if(relate.rows.length){
-																for(var d = 0; d < relate.rows.length; d++){
-																	var row = relate.rows[d]
-
-																	var nodeData = row.data
-
-																	var merge
-
-																	if(relate.merge.update){
-																		merge = relate.merge.update
-																	}
-
-																	if(relate.merge.upsert){
-																		merge = relate.merge.upsert
-																	}
-
-																	if(!merge){
-																		continue
-																	}
-
-																	var foreign = merge.foreign
-
-																	var node = {}
-
-																	var from = row.type == merge.from ? item : row
-
-																	var to = row.type == merge.to ? item : row
-
-																	if(row.type == merge.to){
-																		to.updated_at = updated_at
-																	}
-																	
-																	if(merge.includes){
-																		if(merge.includes.length){
-																			for(var v = 0; v < merge.includes.length; v++){
-																				var include = merge.includes[v]
-
-																				node[include] = from[include]
-																			}
-																		}
-																	}
-
-																	
-
-
-																	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
-
-																	var data = JSON.parse(decompressedJsonString)
-
-																	
-
-																	if(foreign){
-																		if(foreign.from && foreign.to){
-																			if(from[foreign.to]){
-																				to[foreign.from] = from[foreign.to]
-																			}
-																		}
-																	}
-
-
-																	var edgeId = to.id
-
-																	var edgeType = to.type
-
-																	var edge = mergeNode(to, node)
-
-																	edge.id = edgeId
-
-																	edge.type = edgeType
-
-
-																	
-
-																	
-																	if(relate.type == merge.from){
-																		// import
-
-																		if(from.type == "goods" && to.type == "order"){
-																			var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-																				id : edge.id,
-																				no : edge.no ? edge.no : "",
-																				title : edge.title,
-																				link : edge.link,
-																				time : now,
-																				origin : data.origin ? data.origin : "",
-																				data : data
-																			})), { to: 'arraybuffer' })
-
-																			// edge.vectorize = true
-
-																			// edge.data = arr.buffer
-
-																			var metadata = {
-																				title : data.title ? data.title : "",
-																				size : row.size ? row.size : "",
-																				currency : row.currency ? row.currency : "",
-																				carrier : row.carrier ? row.carrier : "",
-																				shipping_fee : row.shipping_fee ? true : false,
-																				shipping_method : row.shipping_method ? row.shipping_method : "",
-																				fulfillment_service : row.fulfillment_service ? row.fulfillment_service : "",
-																				stock_keeping_unit : row.stock_keeping_unit ? row.stock_keeping_unit : "",
-																				bundle_shipping : row.bundle_shipping ? true : false,
-																				used : row.used ? true : false,
-																				lease : row.lease ? true : false,
-																				rental : row.rental ? true : false,
-																				refurbish : row.refurbish ? true : false,
-																				tax_included : row.tax_included ? true : false
-																			}
-
-
-																			var content = JSON.stringify(metadata)
-
-																			var semantic
-
-																			var system = semantic_prompt_system(language).trim()
-
-																			if(models['deepinfra']){
-																				semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
-
-																				models['deepinfra'] -= 1
-
-																			}
-
-																			if(!semantic && gemini_llm_api){
-																				semantic = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
-
-																				models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-																			}
-
-																			if(!semantic){
-																				fallback = 'semantic overflow'
-
-																				continue
-																			}
-
-																			metadata.id = edge.id
-																			metadata.type = edge.type
-																			metadata.from = task.from
-																			metadata.to = task.to
-																			metadata.cc = task.cc
-																			metadata.bcc = task.bcc
-																			metadata.ref = edge.ref
-
-																			var embeddings
-
-																			var $VectorizeVector
-
-																			if(models['cloudflare']){
-																				var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-																					text: [semantic],
-																				})
-
-																				var $VectorizeVector = [
-																					{
-																						id: edge.id,
-																						values: embeddings[0],
-																						metadata: metadata
-																					}
-																				]
-
-																				models['cloudflare'] -= 1
-
-																			}
-
-																			if(!embeddings && models['deepinfra']){
-																				var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', semantic.tirm())
-
-																				var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-																					return {
-																						id: edge.id,
-																						values: values,
-																						metadata: metadata
-																					}
-																				})
-
-																				models['deepinfra'] -= 1
-
-																			}
-
-																			if(embeddings){
-																				fallback = 'embeddings overflow'
-
-																				continue
-																			}
-
-																			await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
-
-																		}
-																	}else{
-																		// export
-																	}
-
-
-																	var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(edge.data))
-
-																	edge.data = JSON.parse(decompressedJsonString)
-
-
-																	edge.updated_at = edge.data.item ? 0 : now
-
-
-
-																	if(edgeType == "sales"){
-																		statements[`logis_${zoneRegion}_sales`].push(
-																			env[`logis_${zoneRegion}_sales`].prepare(`
-																				INSERT INTO sales (
-																					"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "status", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
-																				) VALUES (
-																					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41
-																				) ON CONFLICT (id) DO UPDATE SET
-																					"type" = EXCLUDED."type",
-																					"from" = EXCLUDED."from",
-																					"to" = EXCLUDED."to",
-																					"cc" = EXCLUDED."cc",
-																					"bcc" = EXCLUDED."bcc",
-																					"ref" = EXCLUDED."ref",
-																					"data" = EXCLUDED."data",
-																					"created_at" = EXCLUDED."created_at",
-																					"started_at" = EXCLUDED."started_at",
-																					"expired_at" = EXCLUDED."expired_at",
-																					"index" = EXCLUDED."index",
-																					"event" = EXCLUDED."event",
-																					"views" = EXCLUDED."views",
-																					"goods" = EXCLUDED."goods",
-																					"status" = EXCLUDED."status",
-																					"width" = EXCLUDED."width",
-																					"height" = EXCLUDED."height",
-																					"length" = EXCLUDED."length",
-																					"weight" = EXCLUDED."weight",
-																					"size" = EXCLUDED."size",
-																					"currency" = EXCLUDED."currency",
-																					"supply_price" = EXCLUDED."supply_price",
-																					"sale_price" = EXCLUDED."sale_price",
-																					"discount" = EXCLUDED."discount",
-																					"quantity" = EXCLUDED."quantity",
-																					"tracking" = EXCLUDED."tracking",
-																					"number" = EXCLUDED."number",
-																					"carrier" = EXCLUDED."carrier",
-																					"shipping_fee" = EXCLUDED."shipping_fee",
-																					"shipping_method" = EXCLUDED."shipping_method",
-																					"shipping_duration" = EXCLUDED."shipping_duration",
-																					"fulfillment_service" = EXCLUDED."fulfillment_service",
-																					"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
-																					"bundle_shipping" = EXCLUDED."bundle_shipping",
-																					"used" = EXCLUDED."used",
-																					"lease" = EXCLUDED."lease",
-																					"rental" = EXCLUDED."rental",
-																					"refurbish" = EXCLUDED."refurbish",
-																					"tax_included" = EXCLUDED."tax_included",
-																					"release_date" = EXCLUDED."release_date"
-																			`).bind(
-																				to.id,
-																				edgeType,
-																				to.from,
-																				to.to,
-																				to.cc,
-																				to.bcc,
-																				to.ref,
-																				to.data,
-																				to.created_at,
-																				parseFloat(edge.started_at ? edge.started_at : 0),
-																				parseFloat(edge.expired_at ? edge.expired_at : 0),
-																				parseFloat(edge.index ? edge.index : 0),
-																				parseFloat(edge.event ? edge.event : 0),
-																				parseFloat(edge.views ? edge.views : 0),
-																				parseFloat(edge.goods ? edge.goods : 0),
-																				parseStatus(edge.status),
-																				parseFloat(edge.width ? edge.width : 0),
-																				parseFloat(edge.height ? edge.height : 0),
-																				parseFloat(edge.length ? edge.length : 0),
-																				parseFloat(edge.weight ? edge.weight : 0),
-																				edge.size ? edge.size : "",
-																				edge.currency,
-																				parseFloat(edge.supply_price? edge.supply_price : 0),
-																				parseFloat(edge.sale_price? edge.sale_price : 0),
-																				parseFloat(edge.discount ? edge.discount : 0),
-																				parseFloat(edge.quantity ? edge.quantity : 0),
-																				parseFloat(edge.tracking ? edge.tracking : 0),
-																				edge.number ? edge.number : "",
-																				edge.carrier ? edge.carrier : "",
-																				parseFloat(edge.shipping_fee ? edge.shipping_fee : 0),
-																				edge.shipping_method ? edge.shipping_method : "",
-																				parseFloat(edge.shipping_duration ? edge.shipping_duration : 0),
-																				edge.fulfillment_service ? edge.fulfillment_service : "",
-																				edge.stock_keeping_unit ? edge.stock_keeping_unit : "",
-																				parseFloat(edge.bundle_shipping ? edge.bundle_shipping : 0),
-																				parseFloat(edge.used ? edge.used : 0),
-																				parseFloat(edge.lease ? edge.lease : 0),
-																				parseFloat(edge.rental ? edge.rental : 0),
-																				parseFloat(edge.refurbish ? edge.refurbish : 0),
-																				parseFloat(edge.tax_included ? edge.tax_included : 0),
-																				parseFloat(edge.release_date ? edge.release_date : 0)
-																			)
-																		)
-																	}else if(edgeType == "tracking"){
-																		statements[`logis_${zoneRegion}_tracking`].push(
-																			env[`logis_${zoneRegion}_tracking`].prepare(`
-																				INSERT INTO tracking (
-																					"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-																				) VALUES (
-																					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
-																				) ON CONFLICT (id) DO UPDATE SET
-																					"type" = EXCLUDED."type",
-																					"from" = EXCLUDED."from",
-																					"to" = EXCLUDED."to",
-																					"cc" = EXCLUDED."cc",
-																					"bcc" = EXCLUDED."bcc",
-																					"ref" = EXCLUDED."ref",
-																					"data" = EXCLUDED."data",
-																					"created_at" = EXCLUDED."created_at",
-																					"index" = EXCLUDED."index",
-																					"event" = EXCLUDED."event", 
-																					"goods" = EXCLUDED."goods", 
-																					"order" = EXCLUDED."order", 
-																					"status" = EXCLUDED."status",
-																					"no" = EXCLUDED."no",
-																					"sender_address" = EXCLUDED."sender_address",
-																					"sender_phone" = EXCLUDED."sender_phone",
-																					"recipient_address" = EXCLUDED."recipient_address",
-																					"recipient_phone" = EXCLUDED."recipient_phone",
-																					"width" = EXCLUDED."width",
-																					"height" = EXCLUDED."height",
-																					"length" = EXCLUDED."length",
-																					"weight" = EXCLUDED."weight",
-																					"carrier" = EXCLUDED."carrier",
-																					"shipping_fee" = EXCLUDED."shipping_fee",
-																					"shipping_method" = EXCLUDED."shipping_method",
-																					"shipping_duration" = EXCLUDED."shipping_duration",
-																					"shipping_date" = EXCLUDED."shipping_date",
-																					"delivery_date" = EXCLUDED."delivery_date",
-																					"order_date" = EXCLUDED."order_date",
-																					"payment_date" = EXCLUDED."payment_date",
-																					"payment_method" = EXCLUDED."payment_method",
-																					"payment_origin" = EXCLUDED."payment_origin",
-																					"payment_number" = EXCLUDED."payment_number",
-																					"bundle_shipping" = EXCLUDED."bundle_shipping"
-																			`).bind(
-																				to.id,
-																				to.type,
-																				to.from,
-																				to.to,
-																				to.cc,
-																				to.bcc,
-																				to.ref,
-																				to.data,
-																				to.created_at,
-																				edge.index,
-																				edge.event ? edge.event : 0,
-																				edge.goods ? edge.goods : 0,
-																				edge.order ? edge.order : 0,
-																				parseStatus(edge.status),
-																				edge.no ? edge.no : "",
-																				edge.sender_address ? edge.sender_address : "",
-																				edge.sender_phone ? edge.sender_phone : "",
-																				edge.recipient_address ? edge.recipient_address : "",
-																				edge.recipient_phone ? edge.recipient_phone : "",
-																				parseFloat(edge.width ? edge.width : 0),
-																				parseFloat(edge.height ? edge.height : 0),
-																				parseFloat(edge.length ? edge.length : 0),
-																				parseFloat(edge.weight ? edge.weight : 0),
-																				parseFloat(edge.carrier ? edge.carrier : 0),
-																				parseFloat(edge.shipping_fee ? edge.shipping_fee : 0),
-																				edge.shipping_method ? edge.shipping_method : "",
-																				parseFloat(edge.shipping_duration ? edge.shipping_duration : 0),
-																				parseFloat(edge.shipping_date ? edge.shipping_date : 0),
-																				parseFloat(edge.delivery_date ? edge.delivery_date : 0),
-																				parseFloat(edge.order_date ? edge.order_date : 0),
-																				parseFloat(edge.payment_date ? edge.payment_date : 0),
-																				edge.payment_method ? edge.payment_method : "",
-																				edge.payment_origin ? edge.payment_origin : "",
-																				edge.payment_number ? edge.payment_number : "",
-																				parseFloat(edge.bundle_shipping ? edge.bundle_shipping : 0)
-																			)
-																		)
-																	}else if(edgeType == "event"){
-																		statements[`logis_${zoneRegion}_event`].push(
-																			env[`logis_${zoneRegion}_event`].prepare(`
-																				INSERT INTO event (
-																					"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
-																				) VALUES (
-																					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
-																				) ON CONFLICT (id) DO UPDATE SET
-																					"type" = EXCLUDED."type",
-																					"from" = EXCLUDED."from",
-																					"to" = EXCLUDED."to",
-																					"cc" = EXCLUDED."cc",
-																					"bcc" = EXCLUDED."bcc",
-																					"ref" = EXCLUDED."ref",
-																					"data" = EXCLUDED."data",
-																					"created_at" = EXCLUDED."created_at",
-																					"started_at" = EXCLUDED."started_at",
-																					"expired_at" = EXCLUDED."expired_at",
-																					"index" = EXCLUDED."index",
-																					"event" = EXCLUDED."event",
-																					"number" = EXCLUDED."number",
-																					"address" = EXCLUDED."address",
-																					"status" = EXCLUDED."status",
-																					"code" = EXCLUDED."code",
-																					"discount" = EXCLUDED."discount",
-																					"quantity" = EXCLUDED."quantity",
-																					"usage_per" = EXCLUDED."usage_per",
-																					"usage_limit" = EXCLUDED."usage_limit",
-																					"min_order_amount" = EXCLUDED."min_order_amount",
-																					"max_order_amount" = EXCLUDED."max_order_amount",
-																					"max_discount_amount" = EXCLUDED."max_discount_amount",
-																					"new_customer_only" = EXCLUDED."new_customer_only",
-																					"first_purchase_only" = EXCLUDED."first_purchase_only",
-																					"region_restrictions" = EXCLUDED."region_restrictions"
-																			`).bind(
-																				to.id,
-																				edgeType,
-																				to.from,
-																				to.to,
-																				to.cc,
-																				to.bcc,
-																				to.ref,
-																				to.data,
-																				to.created_at,
-																				parseFloat(edge.started_at ? edge.started_at : 0),
-																				parseFloat(edge.expired_at ? edge.expired_at : 0),
-																				parseFloat(edge.index ? edge.index : 0),
-																				parseFloat(edge.event ? edge.event : 0),
-																				edge.number ? edge.number : "",
-																				edge.address ? edge.address : "",
-																				parseStatus(edge.status),
-																				edge.code ? edge.code : "",
-																				parseFloat(edge.discount ? edge.discount : 0),
-																				parseFloat(edge.quantity ? edge.quantity : 0),
-																				parseFloat(edge.usage_per ? edge.usage_per : 0),
-																				parseFloat(edge.usage_limit ? edge.usage_limit : 0),
-																				parseFloat(edge.min_order_amount ? edge.min_order_amount : 0),
-																				parseFloat(edge.max_order_amount ? edge.max_order_amount : 0),
-																				parseFloat(edge.max_discount_amount ? edge.max_discount_amount : 0),
-																				parseFloat(edge.new_customer_only ? edge.new_customer_only : 0),
-																				parseFloat(edge.first_purchase_only ? edge.first_purchase_only : 0),
-																				parseFloat(edge.region_restrictions ? edge.region_restrictions : 0)
-																			)
-																		)
-																	}
-
-
-
-																	var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${edge.id}' AND "created_at" < ${now} AND "updated_at" = 0 LIMIT 1`).all()
-
-																	if(results.length){
-																		var _item = results[0]
-
-																		if(!_item.updated_at){
-																			if(edge.updated_at){
-																				// before ${type}에 ${column} index 값이 없으면 업데이트 해야함
-																				team.data.base.pages[row.cc][row.type].draft--
-																				team.data.base.pages[row.cc][row.type].count++
-
-																				statements[`logis_${zoneRegion}_items`].push(
-																					env[`logis_${zoneRegion}_items`].prepare(`
-																						UPDATE items SET updated_at = ? WHERE id = ?
-																					`).bind(
-																						now, row.id
-																					)
-																				)
-																			}
-																		}
-																	}
-
-
-																		
-
-																	// for end
-																}
-
-																// if end
-															}else{
-																
-																var draftId = hashId(item.id)
-
-																team.data.base.pages[item.cc][item.type].draft++
-																team.data.base[item.type].count++
-
-																var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${draftId}' AND "created_at" < ${now} LIMIT 1`).all()
-
-																if(results.length){
-																	var _item = results[0]
-
-																	if(!_item.updated_at){
-																		if(updated_at){
-																			statements[`logis_${zoneRegion}_items`].push(
-																				env[`logis_${zoneRegion}_items`].prepare(`
-																					UPDATE items SET updated_at = ? WHERE id = ?
-																				`).bind(
-																					now, item.id
-																				)
-																			)
-																		}
-																	}
-																}else{
-																	var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-																		id : item.id,
-																		no : item.no ? item.no : "",
-																		title : item.title,
-																		link : item.link,
-																		time : now,
-																		data : relate
-																	})), { to: 'arraybuffer' })
-
-																	statements[`logis_${zoneRegion}_items`].push(
-																		env[`logis_${zoneRegion}_items`].prepare(`
-																			INSERT INTO items (
-																				"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-																			) VALUES (
-																				?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-																			) ON CONFLICT (id) DO UPDATE SET
-																				"type" = EXCLUDED."type",
-																				"from" = EXCLUDED."from",
-																				"to" = EXCLUDED."to",
-																				"cc" = EXCLUDED."cc",
-																				"bcc" = EXCLUDED."bcc",
-																				"ref" = EXCLUDED."ref",
-																				"data" = EXCLUDED."data",
-																				"created_at" = EXCLUDED."created_at",
-																				"updated_at" = EXCLUDED."updated_at"
-																		`).bind(
-																			draftId,
-																			type,
-																			item.from,
-																			item.to,
-																			item.cc,
-																			item.bcc,
-																			'',
-																			arr.buffer,
-																			now,
-																			0
-																		)
-																	)
-																}
-
-
-
-
-
-															}
-														}
-													}
-												}
-
-												// for end
-											}
-
-											// if end
-										}
-
-										console.log('typeof item.vectorize',typeof item.vectorize);
-
-										if(item.semantic && !item.vectorize){
-											var metadata = {
-												type: item.type,
-												from: item.from,
-												to: item.to,
-												cc: item.cc,
-												bcc: item.bcc,
-												ref:pageId
-											}
-
-											var embeddings
+											console.log('context.text',context.text);
 
 											if(models['cloudflare']){
-												var { data: embeddings } = await env.AI.run('@cf/google/embeddinggemma-300m', {
-													text: [item.semantic]
+												var embeddings = await env.AI.run('@cf/google/embeddinggemma-300m', {
+													text: [context.text],
 												})
 
-												var $VectorizeVector = [
-													{
-														id: item.id,
-														values: embeddings[0],
-														metadata: metadata
-													}
-												]
+												queryVector = embeddings.data[0];
 
 												models['cloudflare'] -= 1
 
 											}
 
-											if(!embeddings && models['deepinfra']){
-												var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', item.semantic.tirm())
 
-												var $VectorizeVector: VectorizeVector[] = embeddings.map((values, i) => {
-													return {
-														id: item.id,
-														values: values,
-														metadata: metadata
-													}
-												})
+											if(!queryVector && models['deepinfra']){
+												var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', context.text)
+
+												queryVector = embeddings
 
 												models['deepinfra'] -= 1
+
 											}
 
-											console.log('typeof embeddings',typeof embeddings);
-
-											if(!embeddings){
-												fallback = 'embeddings overflow'
+											if(!queryVector){
+												fallback = 'overflow'
 
 												continue
 											}
 
-											await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
+
+
+
+											var condition = ` "type" = '${context.type}' `
+
+											if(context.status){
+												if(type == "sales"){
+													if(context.status == "used" || context.status == "lease" || context.status == "rental" || context.status == "refurbish"){
+														condition += ` AND "${context.status}" > 0 `
+													}
+												}else{
+													var status = parseStatus(context.status)
+
+													if(status){
+														condition += ` AND "status" = ${status} `
+													}
+												}
+											}
+
+											var temp = {}
+
+											/*
+												{
+													"date":{"gte":"2025-06-01T00:00:00","lte":"2025-08-31T23:59:59"},
+													"quantity":{"max":1},
+													"sale_price":{"max":615600}
+												}
+											*/										
+
+											if(Object.keys(context.condition).length){
+												for (var key1 in context.condition) {
+													var obj = context.condition[key1]
+
+													if (context.condition.hasOwnProperty(key1)) {
+														for (var key2 in obj) {
+															var value = obj[key2]
+
+															if(value){
+																if(key2 == "min" || key2 == "max"){
+
+																}else{
+																	if(!temp[key1]){
+																		temp[key1] = true
+
+																		if(isNaN(value)){
+																			if(key1 != "date"){
+																				query.options.filter[key1] = value
+																			}
+
+																			condition += parseCondition(obj, key1, " AND ")
+
+																			if(key1 == "price"){
+																				if(context.condition.currency){
+																					query.options.filter.currency = context.condition.currency
+																				}
+																			}
+
+																		}else{
+																			condition += parseCondition(value, key1, " AND ")
+																		}
+																	}
+																}
+															}
+																
+														}
+													}
+												}
+											}
+
+											console.log('before condition',condition);
+
+											// if(condition){
+											// 	condition = condition.replace(' AND ', '')
+											// 	condition = condition.trim()
+											// }
+
+											console.log('context.condition',JSON.stringify(context.condition));
+
+											console.log('query.options',JSON.stringify(query.options))
+											console.log(`vectorRegion type ${vectorRegion}-${type}`);
+
+											var { matches } = await env[`${vectorRegion}-${type}`].query(queryVector, query.options)
+
+											var rag = {
+												search : {
+													query : context.condition,
+													sql : {
+														results : []
+													},
+													vector : {
+														results : []
+													}
+												}
+											}
+
+											rag.search.sql
+
+											console.log('matches.length',matches.length.toString());
+
+											var matches_condition = ''
+
+											if(matches.length){
+												for(var m = 0; m < matches.length; m++){
+													var match = matches[m]
+
+													if(matches_condition.length){
+														matches_condition += ' OR '
+													}
+
+													matches_condition += `("id" = '${match.id}' AND "to" = '${team.id}' AND "created_at" < ${now})`
+												}
+
+												console.log('matches_condition',matches_condition);
+
+												console.log('type',type);
+
+												try{
+													var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
+
+													if(results.length){
+														for(var r = 0; r < results.length; r++){
+															var result = results[r]
+
+															var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(result.data))
+
+															var data = JSON.parse(decompressedJsonString)
+
+															if(data){
+																if(Object.keys(data).length){
+																	for (var name in data) {
+																		if (data.hasOwnProperty(name)) {
+																			var value = data[name]
+
+																			result[name] = value
+																		}
+																	}
+																}
+															}
+
+															delete results[i].from
+															delete results[i].to
+															delete results[i].cc
+															delete results[i].bcc
+															delete results[i].ref
+															delete results[i].data
+														}
+
+														rag.search.vector = {
+															results : results
+														}
+														
+													}
+												}catch(err){
+													console.log('matches_condition',err);
+												}
+												
+											}
+
+											var orderBy = ''
+
+											if(context.sort && context.by){
+												orderBy = `ORDER BY ${context.by} ${context.sort}`
+											}
+
+											console.log('type',type);
+
+											console.log('after condition',condition);
+
+											if(condition){
+												try{
+													if(condition.indexOf(created_at) > -1){
+														condition += ` AND "created_at" < ${now}`
+													}
+
+													console.log(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`);
+													 
+													var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`).all()
+
+													console.log('results.length',results.length);
+
+													if(results.length){
+														for(var r = 0; r < results.length; r++){
+															var result = results[r]
+
+															var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(safeClone(result.data)))
+
+															var data = JSON.parse(decompressedJsonString)
+
+															if(data){
+																result.data = {}
+
+																if(Object.keys(data).length){
+																	for (var name in data) {
+																		if (data.hasOwnProperty(name)) {
+																			var value = data[name]
+
+																			if(name == "type" || name == "item" || name == "node" || name == "link" || name == "origin" || name == "detail"){
+
+																			}else{
+																				result.data[name] = value
+																			}
+																		}
+																	}
+																}
+															}
+
+															results[r].data = result.data
+
+															delete results[r].from
+															delete results[r].to
+															delete results[r].cc
+															delete results[r].bcc
+															delete results[r].ref
+														}
+
+														rag.search.sql = {
+															results : results
+														}
+													}
+												}catch(err){
+													console.log('text2sql err',err);
+												}
+
+											}
+
+												
+												
+
+
+											var system = 'Return the content related to the {search.text} value from the search results in a JSON structure.'
+
+											var content = context2results(context, [...rag.search.sql.results, ...rag.search.vector.results], language)
+
+
+											var generation
+
+											if(models['deepinfra']){
+												generation = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+
+												models['deepinfra'] -= 1
+
+											}
+
+											if(!generation && gemini_llm_api){
+												generation = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+
+												models[gemini_llm_api+'-'+gemini_llm_model] -= 1
+
+											}
+
+											if(!generation){
+												fallback = 'overflow'
+
+												continue
+											}
+
+
+											console.log('generation', JSON.stringify(generation));
+
+											var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+												id : context.id,
+												markdown : generation.markdown,
+												results: generation.results,
+												search : rag.search
+											})), { to: 'arraybuffer' })
+
+											context.data = arr.buffer
+
+											statements[`logis_${zoneRegion}_talks`].push(
+												env[`logis_${zoneRegion}_talks`].prepare(`
+													INSERT INTO talks (
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+													) VALUES (
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+													) ON CONFLICT (id) DO UPDATE SET
+														"type" = EXCLUDED."type",
+														"from" = EXCLUDED."from",
+														"to" = EXCLUDED."to",
+														"cc" = EXCLUDED."cc",
+														"bcc" = EXCLUDED."bcc",
+														"ref" = EXCLUDED."ref",
+														"data" = EXCLUDED."data",
+														"created_at" = EXCLUDED."created_at",
+														"updated_at" = EXCLUDED."updated_at"
+												`).bind(
+													task.id,
+													context.type,
+													team.id,
+													task.bcc,
+													task.cc,
+													task.bcc,
+													task.ref,
+													context.data,
+													now-100,
+													now
+												)
+											)
+
+											statements[`logis_${zoneRegion}_talks`].push(
+												env[`logis_${zoneRegion}_talks`].prepare(`
+													INSERT INTO talks (
+														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+													) VALUES (
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+													) ON CONFLICT (id) DO UPDATE SET
+														"type" = EXCLUDED."type",
+														"from" = EXCLUDED."from",
+														"to" = EXCLUDED."to",
+														"cc" = EXCLUDED."cc",
+														"bcc" = EXCLUDED."bcc",
+														"ref" = EXCLUDED."ref",
+														"data" = EXCLUDED."data",
+														"created_at" = EXCLUDED."created_at",
+														"updated_at" = EXCLUDED."updated_at"
+												`).bind(
+													context.id,
+													context.type,
+													team.id,
+													task.bcc,
+													task.cc,
+													task.bcc,
+													task.ref,
+													context.data,
+													now,
+													now
+												)
+											)
 										}
-
-										item.data.text = item.semantic
-										item.data.ref = page.ref
-
-										console.log('item',JSON.stringify(item))
-
-										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(item.data)), { to: 'arraybuffer' })
-
-										item.data = arr.buffer
-
-										statements[`logis_${zoneRegion}_items`].push(
-											env[`logis_${zoneRegion}_items`].prepare(`
-												INSERT INTO items (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-												) ON CONFLICT (id) DO UPDATE SET
-													"type" = EXCLUDED."type",
-													"from" = EXCLUDED."from",
-													"to" = EXCLUDED."to",
-													"cc" = EXCLUDED."cc",
-													"bcc" = EXCLUDED."bcc",
-													"ref" = EXCLUDED."ref",
-													"data" = EXCLUDED."data",
-													"created_at" = EXCLUDED."created_at",
-													"updated_at" = EXCLUDED."updated_at"
-											`).bind(
-												item.id,
-												item.type,
-												item.from,
-												item.to,
-												item.cc,
-												item.bcc,
-												item.ref,
-												item.data,
-												now,
-												updated_at
-											)
-										)
-											
-										if(itemType == "sales"){
-											statements[`logis_${zoneRegion}_sales`].push(
-												env[`logis_${zoneRegion}_sales`].prepare(`
-													INSERT INTO sales (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "status", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
-													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41
-													) ON CONFLICT (id) DO UPDATE SET
-														"type" = EXCLUDED."type",
-														"from" = EXCLUDED."from",
-														"to" = EXCLUDED."to",
-														"cc" = EXCLUDED."cc",
-														"bcc" = EXCLUDED."bcc",
-														"ref" = EXCLUDED."ref",
-														"data" = EXCLUDED."data",
-														"created_at" = EXCLUDED."created_at",
-														"started_at" = EXCLUDED."started_at",
-														"expired_at" = EXCLUDED."expired_at",
-														"index" = EXCLUDED."index",
-														"event" = EXCLUDED."event",
-														"views" = EXCLUDED."views",
-														"goods" = EXCLUDED."goods",
-														"status" = EXCLUDED."status",
-														"width" = EXCLUDED."width",
-														"height" = EXCLUDED."height",
-														"length" = EXCLUDED."length",
-														"weight" = EXCLUDED."weight",
-														"size" = EXCLUDED."size",
-														"currency" = EXCLUDED."currency",
-														"supply_price" = EXCLUDED."supply_price",
-														"sale_price" = EXCLUDED."sale_price",
-														"discount" = EXCLUDED."discount",
-														"quantity" = EXCLUDED."quantity",
-														"tracking" = EXCLUDED."tracking",
-														"number" = EXCLUDED."number",
-														"carrier" = EXCLUDED."carrier",
-														"shipping_fee" = EXCLUDED."shipping_fee",
-														"shipping_method" = EXCLUDED."shipping_method",
-														"shipping_duration" = EXCLUDED."shipping_duration",
-														"fulfillment_service" = EXCLUDED."fulfillment_service",
-														"stock_keeping_unit" = EXCLUDED."stock_keeping_unit",
-														"bundle_shipping" = EXCLUDED."bundle_shipping",
-														"used" = EXCLUDED."used",
-														"lease" = EXCLUDED."lease",
-														"rental" = EXCLUDED."rental",
-														"refurbish" = EXCLUDED."refurbish",
-														"tax_included" = EXCLUDED."tax_included",
-														"release_date" = EXCLUDED."release_date"
-												`).bind(
-													item.id,
-													item.type,
-													item.from,
-													item.to,
-													item.cc,
-													item.bcc,
-													item.ref,
-													item.data,
-													item.created_at,
-													parseFloat(item.started_at ? item.started_at : 0),
-													parseFloat(item.expired_at ? item.expired_at : 0),
-													parseFloat(item.index ? item.index : 0),
-													parseFloat(item.event ? item.event : 0),
-													parseFloat(item.views ? item.views : 0),
-													parseFloat(item.goods ? item.goods : 0),
-													item.status,
-													parseFloat(item.width ? item.width : 0),
-													parseFloat(item.height ? item.height : 0),
-													parseFloat(item.length ? item.length : 0),
-													parseFloat(item.weight ? item.weight : 0),
-													item.size ? item.size : "",
-													item.currency ? item.currency : "",
-													parseFloat(item.supply_price? item.supply_price : 0),
-													parseFloat(item.sale_price? item.sale_price : 0),
-													parseFloat(item.discount ? item.discount : 0),
-													parseFloat(item.quantity ? item.quantity : 0),
-													parseFloat(item.tracking ? item.tracking : 0),
-													item.number ? item.number : "",
-													item.carrier ? item.carrier : "",
-													parseFloat(item.shipping_fee ? item.shipping_fee : 0),
-													item.shipping_method ? item.shipping_method : "",
-													parseFloat(item.shipping_duration ? item.shipping_duration : 0),
-													item.fulfillment_service ? item.fulfillment_service : "",
-													item.stock_keeping_unit ? item.stock_keeping_unit : "",
-													parseFloat(item.bundle_shipping ? item.bundle_shipping : 0),
-													parseFloat(item.used ? item.used : 0),
-													parseFloat(item.lease ? item.lease : 0),
-													parseFloat(item.rental ? item.rental : 0),
-													parseFloat(item.refurbish ? item.refurbish : 0),
-													parseFloat(item.tax_included ? item.tax_included : 0),
-													parseFloat(item.release_date ? item.release_date : 0)
-												)
-											)
-										}else if(itemType == "tracking"){
-											statements[`logis_${zoneRegion}_tracking`].push(
-												env[`logis_${zoneRegion}_tracking`].prepare(`
-													INSERT INTO tracking (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
-													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
-													) ON CONFLICT (id) DO UPDATE SET
-														"type" = EXCLUDED."type",
-														"from" = EXCLUDED."from",
-														"to" = EXCLUDED."to",
-														"cc" = EXCLUDED."cc",
-														"bcc" = EXCLUDED."bcc",
-														"ref" = EXCLUDED."ref",
-														"data" = EXCLUDED."data",
-														"created_at" = EXCLUDED."created_at",
-														"index" = EXCLUDED."index",
-														"event" = EXCLUDED."event", 
-														"goods" = EXCLUDED."goods", 
-														"order" = EXCLUDED."order", 
-														"status" = EXCLUDED."status",
-														"no" = EXCLUDED."no",
-														"sender_address" = EXCLUDED."sender_address",
-														"sender_phone" = EXCLUDED."sender_phone",
-														"recipient_address" = EXCLUDED."recipient_address",
-														"recipient_phone" = EXCLUDED."recipient_phone",
-														"width" = EXCLUDED."width",
-														"height" = EXCLUDED."height",
-														"length" = EXCLUDED."length",
-														"weight" = EXCLUDED."weight",
-														"carrier" = EXCLUDED."carrier",
-														"shipping_fee" = EXCLUDED."shipping_fee",
-														"shipping_method" = EXCLUDED."shipping_method",
-														"shipping_duration" = EXCLUDED."shipping_duration",
-														"shipping_date" = EXCLUDED."shipping_date",
-														"delivery_date" = EXCLUDED."delivery_date",
-														"order_date" = EXCLUDED."order_date",
-														"payment_date" = EXCLUDED."payment_date",
-														"payment_method" = EXCLUDED."payment_method",
-														"payment_origin" = EXCLUDED."payment_origin",
-														"payment_number" = EXCLUDED."payment_number",
-														"bundle_shipping" = EXCLUDED."bundle_shipping"
-												`).bind(
-													item.id,
-													item.type,
-													item.from,
-													item.to,
-													item.cc,
-													item.bcc,
-													item.ref,
-													item.data,
-													item.created_at,
-													item.index,
-													item.event ? item.event : 0,
-													item.goods ? item.goods : 0,
-													item.order ? item.order : 0,
-													item.status,
-													item.no ? item.no : "",
-													item.sender_address ? item.sender_address : "",
-													item.sender_phone ? item.sender_phone : "",
-													item.recipient_address ? item.recipient_address : "",
-													item.recipient_phone ? item.recipient_phone : "",
-													parseFloat(item.width ? item.width : 0),
-													parseFloat(item.height ? item.height : 0),
-													parseFloat(item.length ? item.length : 0),
-													parseFloat(item.weight ? item.weight : 0),
-													parseFloat(item.carrier ? item.carrier : 0),
-													parseFloat(item.shipping_fee ? item.shipping_fee : 0),
-													item.shipping_method ? item.shipping_method : "",
-													parseFloat(item.shipping_duration ? item.shipping_duration : 0),
-													parseFloat(item.shipping_date ? item.shipping_date : 0),
-													parseFloat(item.delivery_date ? item.delivery_date : 0),
-													parseFloat(item.order_date ? item.order_date : 0),
-													parseFloat(item.payment_date ? item.payment_date : 0),
-													item.payment_method ? item.payment_method : "",
-													item.payment_origin ? item.payment_origin : "",
-													item.payment_number ? item.payment_number : "",
-													parseFloat(item.bundle_shipping ? item.bundle_shipping : 0)
-												)
-											)
-										}else if(itemType == "event"){
-											statements[`logis_${zoneRegion}_event`].push(
-												env[`logis_${zoneRegion}_event`].prepare(`
-													INSERT INTO event (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
-													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
-													) ON CONFLICT (id) DO UPDATE SET
-														"type" = EXCLUDED."type",
-														"from" = EXCLUDED."from",
-														"to" = EXCLUDED."to",
-														"cc" = EXCLUDED."cc",
-														"bcc" = EXCLUDED."bcc",
-														"ref" = EXCLUDED."ref",
-														"data" = EXCLUDED."data",
-														"created_at" = EXCLUDED."created_at",
-														"started_at" = EXCLUDED."started_at",
-														"expired_at" = EXCLUDED."expired_at",
-														"index" = EXCLUDED."index",
-														"event" = EXCLUDED."event",
-														"number" = EXCLUDED."number",
-														"address" = EXCLUDED."address",
-														"status" = EXCLUDED."status",
-														"code" = EXCLUDED."code",
-														"discount" = EXCLUDED."discount",
-														"quantity" = EXCLUDED."quantity",
-														"usage_per" = EXCLUDED."usage_per",
-														"usage_limit" = EXCLUDED."usage_limit",
-														"min_order_amount" = EXCLUDED."min_order_amount",
-														"max_order_amount" = EXCLUDED."max_order_amount",
-														"max_discount_amount" = EXCLUDED."max_discount_amount",
-														"new_customer_only" = EXCLUDED."new_customer_only",
-														"first_purchase_only" = EXCLUDED."first_purchase_only",
-														"region_restrictions" = EXCLUDED."region_restrictions"
-												`).bind(
-													item.id,
-													item.type,
-													item.from,
-													item.to,
-													item.cc,
-													item.bcc,
-													item.ref,
-													item.data,
-													item.created_at,
-													parseFloat(item.started_at ? item.started_at : 0),
-													parseFloat(item.expired_at ? item.expired_at : 0),
-													parseFloat(item.index ? item.index : 0),
-													parseFloat(item.event ? item.event : 0),
-													item.number ? item.number : "",
-													item.address ? item.address : "",
-													item.status,
-													item.code ? item.code : "",
-													parseFloat(item.discount ? item.discount : 0),
-													parseFloat(item.quantity ? item.quantity : 0),
-													parseFloat(item.usage_per ? item.usage_per : 0),
-													parseFloat(item.usage_limit ? item.usage_limit : 0),
-													parseFloat(item.min_order_amount ? item.min_order_amount : 0),
-													parseFloat(item.max_order_amount ? item.max_order_amount : 0),
-													parseFloat(item.max_discount_amount ? item.max_discount_amount : 0),
-													parseFloat(item.new_customer_only ? item.new_customer_only : 0),
-													parseFloat(item.first_purchase_only ? item.first_purchase_only : 0),
-													parseFloat(item.region_restrictions ? item.region_restrictions : 0)
-												)
-											)
-										}
-											
 									}
-								}
+								}	
+							}
 
-								if(detail && page.type){
-									statements[CenterRegion].push(
-										env[CenterRegion].prepare(`
-											INSERT INTO pages ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
-											VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-											ON CONFLICT(id) DO UPDATE SET
-												"type" = EXCLUDED."type",
-												"from" = EXCLUDED."from",
-												"to" = EXCLUDED."to",
-												"cc" = EXCLUDED."cc",
-												"bcc" = EXCLUDED."bcc",
-												"ref" = EXCLUDED."ref",
-												"data" = EXCLUDED."data",
-												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
-										`).bind(
-											detail.id,
-											detail.type,
-											detail.from,
-											detail.to,
-											detail.cc,
-											detail.bcc,
-											detail.ref,
-											detail.data,
-											now,
-											now
-										)
-									)
+							// for loop end
+						}
 
-									statements[`logis_${zoneRegion}_items`].push(
-										env[`logis_${zoneRegion}_items`].prepare(`
-											INSERT INTO items (
-												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-											) VALUES (
-												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-											) ON CONFLICT (id) DO UPDATE SET
-												"type" = EXCLUDED."type",
-												"from" = EXCLUDED."from",
-												"to" = EXCLUDED."to",
-												"cc" = EXCLUDED."cc",
-												"bcc" = EXCLUDED."bcc",
-												"ref" = EXCLUDED."ref",
-												"data" = EXCLUDED."data",
-												"created_at" = EXCLUDED."created_at",
-												"updated_at" = EXCLUDED."updated_at"
-										`).bind(
-											detail.id,
-											'pages',
-											detail.from,
-											detail.to,
-											detail.cc,
-											detail.bcc,
-											detail.ref,
-											detail.data,
-											now,
-											now
-										)
-									)
-								}
+						
+							
+						if(Object.keys(statements).length){
+							if(fallback){
+								console.log('fallback',fallback);
 
-								task.title = page.text // Analyze the provided Pug template and return it in the following JSON format
-
-								task.semantic = page.text
-
-								if(items.length){
-									var type = talk.type = page.type
-
-									if(page.type == "sales"){
-										type = "sales"
-
-									}else if(page.type == "goods" || page.type == "order"){
-										type = "sales"
-
-									}else if(page.type == "event" || page.type == "coupon"){
-										type = "event"
-
-									}
-
-
-									var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-										no : task.no,
-										title : page.text,
-										semantic : task.semantic
-									})), { to: 'arraybuffer' })
-
-									task.data = arr.buffer
-								}else{
-									/*
-										정보가 없으면
-
-										클라이언트에서 정보를 찾지 못하였다고 안내하기
-
-										가능한 카테고리 안내 메세지 노출해야함
-									*/ 
-
-									talk.type = "empty"
-
-									task.data = null
-								}
-
-								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-									type : page.type,
-									text : task.semantic,
-									link : task.link,
-									time : now,
-									origin : task.origin ? task.origin : ''
-								})), { to: 'arraybuffer' })
-
-								statements[`logis_${zoneRegion}_items`].push(
-									env[`logis_${zoneRegion}_items`].prepare(`
-										INSERT INTO items (
+								statements[`logis_${zoneRegion}_talks`].push(
+									env[`logis_${zoneRegion}_talks`].prepare(`
+										INSERT INTO talks (
 											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 										) VALUES (
 											?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
@@ -5512,678 +6189,29 @@ export default {
 											"created_at" = EXCLUDED."created_at",
 											"updated_at" = EXCLUDED."updated_at"
 									`).bind(
-										task.id,
-										task.type,
+										talk.id,
+										"prompt",
 										task.from,
 										task.to,
 										task.cc,
 										task.bcc,
-										task.ref,
-										arr.buffer,
+										talk.ref,
+										null,
 										now,
 										now
 									)
 								)
-
-									
-
-							}catch(err){
-								console.log('inner err '+err)
-
-								await env[CenterRegion].prepare(`
-									INSERT INTO console (
-										"id", "bcc", "log", "created_at"
-									) VALUES (
-										?1, ?2, ?3, ?4
-									) ON CONFLICT (id) DO NOTHING
-								`).bind(
-									hashId(),
-									task.bcc,
-									'inner err'+err,
-									now // Parameter for created_at (only insert)
-								).run()
 							}
 
-						}else{
-							// SELECT 백터 쿼리
+							talk.data = null
 
-							// 2022년 이후 2023년에 A 쇼핑몰에서 가장 많이 팔린 제품은 뭐야?
+							if(talk.text){
+								var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+									text : talk.text
+								})), { to: 'arraybuffer' })
 
-							/*
-								추후 few shot 추가하기
-								
-								1. 이전 대화 참조
-									id 뎁스 여러번 hashId 거친것 select해서 있으면 이전 대화 참조하기
-
-								2. 프리미엄 사용자
-									vectorize에 프롬프트 semantic 결과값 추가하고 연관된 애들 불러와서 결과 만들기
-
-									아직 개발 안됨
-
-
-								프롬프트 답변값 벡터 데이터 저장 되어있음
-
-								env[CenterRegion]에 저장 되어있어서 그쪽에서 쿼리해야함
-
-							*/ 
-
-							// team.data.base['prompt'].count++
-
-							var paragraphs
-
-							var system = para2graph(language)
-
-							if(models['deepinfra']){
-								var res = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, task.body)
-
-								if(res){
-									paragraphs = res.context
-								}
-
-								models['deepinfra'] -= 1
-
+								talk.data = arr.buffer
 							}
-
-							if(!paragraphs && gemini_llm_api){
-								var res = await Gemini(gemini_llm_api, gemini_llm_model, system, task.body)
-
-								if(res){
-									paragraphs = res.context
-								}
-
-								models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-							}
-
-							if(!paragraphs){
-								fallback = 'para2graph overflow'
-
-								continue
-							}
-
-							console.log('before paragraphs',JSON.stringify(paragraphs))
-
-
-							try{
-								if(paragraphs.length){
-									for(var p = 0; p < paragraphs.length; p++){
-										var paragraph = paragraphs[p]
-
-										paragraphs[p] = paragraph2propertys(task, team, paragraph, current)
-									}
-								}else{
-									fallback = 'paragraph2propertys'
-									// 올바르지 않은 대화요청입니다 리턴해야함
-
-									continue
-								}
-							}catch(err){
-								console.log('paragraphs err', err);
-							}
-
-
-							if(paragraphs.length){
-								paragraphs = rowsTrim(paragraphs)
-							}
-
-							console.log('after paragraphs',JSON.stringify(paragraphs))
-
-							if(paragraphs.length == 0){
-								continue
-							}
-
-
-							var contexts
-
-							var system = graph2contexts(current)
-
-							if(models['deepinfra']){
-								var results = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, `{contexts : ${JSON.stringify(paragraphs)}}`)
-
-								console.log('contexts res',JSON.stringify(results))
-
-								if(results){
-									if(results.contexts){
-										contexts = results.contexts
-									}else if(Object.keys(results).length){
-										if(!results.text){
-											results.text = task.body
-										}
-
-										if(!results.type && paragraphs.length == 1){
-											results.type = paragraphs[0].type
-										}
-
-
-										contexts = [results]
-									}
-								}
-
-								models['deepinfra'] -= 1
-							}
-
-							// if(!contexts && gemini_llm_api){
-							// 	var res = await Gemini(gemini_llm_api, gemini_llm_model, system, `{contexts : ${JSON.stringify(paragraphs)}}`)
-
-							// 	if(res){
-							// 		if(res.contexts){
-							// 			contexts = res.contexts
-							// 		}
-							// 	}
-
-							// 	models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-							// }
-
-
-							if(!contexts){
-								fallback = 'graph2contexts overflow'
-
-								continue
-							}
-
-
-							console.log('contexts',JSON.stringify(contexts))
-
-
-
-
-							var augmented = ''
-
-							// // 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
-							// if(task.topK > 50){
-							// 	var { results, success, error } = await env[`logis_${zoneRegion}_talks`].prepare(
-							// 		`SELECT * FROM talks WHERE "bcc" = '${task.bcc}' AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
-							// 	).all()
-
-							// 	if(results.length){
-							// 		for(var r = 0; r < results.length; r++){
-							// 			var retrieval = results[r]
-
-							// 			var { results, success, error } = await env[`logis_${zoneRegion}_${retrieval.type}`].prepare(
-							// 				`SELECT * FROM ${retrieval.type} WHERE "ref" = '${retrieval.ref}' AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
-							// 			).all()
-
-							// 			var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(retrieval.data))
-
-							// 			var data = JSON.parse(decompressedJsonString)
-
-							// 			if(results.length){
-							// 				augmented += `${p}. ${data.text}\n`
-
-							// 				for(var b = 0; b < results.length; b++){
-							// 					var obj = safeClone(results[b])
-
-							// 					delete obj.from
-							// 					delete obj.to
-							// 					delete obj.cc
-							// 					delete obj.bcc
-							// 					delete obj.ref
-
-							// 					augmented += `${JSON.stringify(obj)}\n`
-							// 				}
-							// 			}
-
-							// 			statements[`logis_${zoneRegion}_talks`].push(
-							// 				env[`logis_${zoneRegion}_talks`].prepare(`
-							// 					UPDATE talks SET updated_at = ? WHERE id = ?
-							// 				`).bind(
-							// 					now, retrieval.id
-							// 				)
-							// 			)
-							// 		}
-
-							// 		if(augmented){
-							// 			augmented = `Reference Context Start\n${augmented}\nReference Context End\n`
-							// 		}
-							// 	}
-							// }
-
-							if(contexts){
-								if(contexts.length){
-									for(var q = 0; q < contexts.length; q++){
-										var context = contexts[q]
-
-										context.id = hashId()
-
-										if(!context.type){
-											continue
-										}
-
-										if(context.date == '#date'){
-											context.date = ''
-										}
-
-										if(context.status == '#status'){
-											context.status = ''
-										}
-
-										if(context.substantial == '#substantial'){
-											context.substantial = ''
-										}
-
-										if(context.find == '#find'){
-											context.find = ''
-										}
-
-
-
-
-
-										var type = context.type
-
-										if(context.type == "sales"){
-											type = "sales"
-
-											context.type = "order"
-
-										}else if(context.type == "goods" || context.type == "order"){
-											type = "sales"
-
-										}else if(context.type == "event" || context.type == "coupon"){
-											type = "event"
-
-										}
-
-
-										context.by = "created_at"
-
-										if(context.substantial){
-											context.by = context.substantial
-										}
-
-
-										context.sort = "DESC"
-
-										if(context.find){
-											if(context.find == 'light' || context.find == 'few' || context.find == 'little'){
-												context.sort = "ASC"
-											}
-										}
-
-
-										var query = {
-											options:{
-												topK: task.topK,
-												returnValues: true, // true 이며 벡터 값 포함
-												returnMetadata: 'all',
-												filter : {
-													type : context.type,
-													to : team.id
-												}
-											}
-										}
-
-										var queryVector
-
-										console.log('context.text',context.text);
-
-										if(models['cloudflare']){
-											var embeddings = await env.AI.run('@cf/google/embeddinggemma-300m', {
-												text: [context.text],
-											})
-
-											queryVector = embeddings.data[0];
-
-											models['cloudflare'] -= 1
-
-										}
-
-
-										if(!queryVector && models['deepinfra']){
-											var embeddings = await Deepinfra(deepinfra, 'google/embeddinggemma-300m', '', context.text)
-
-											queryVector = embeddings
-
-											models['deepinfra'] -= 1
-
-										}
-
-										if(!queryVector){
-											fallback = 'overflow'
-
-											continue
-										}
-
-
-
-
-										var condition = ``
-
-										if(context.status){
-											if(type == "sales"){
-												if(context.status == "used" || context.status == "lease" || context.status == "rental" || context.status == "refurbish"){
-													condition += ` "${context.status}" > 0 `
-												}
-											}else{
-												var status = parseStatus(context.status)
-
-												if(status){
-													condition += ` "status" = ${status} `
-												}
-											}
-										}
-
-										var temp = {}
-
-/*
-	{
-		"date":{"gte":"2025-06-01T00:00:00","lte":"2025-08-31T23:59:59"},
-		"quantity":{"max":1},
-		"sale_price":{"max":615600}
-	}
-*/										
-
-										if(Object.keys(context.condition).length){
-											for (var key1 in context.condition) {
-												var obj = context.condition[key1]
-
-												if (context.condition.hasOwnProperty(key1)) {
-													for (var key2 in obj) {
-														var value = obj[key2]
-
-														if(value){
-															if(key2 == "min" || key2 == "max"){
-
-															}else{
-																if(!temp[key1]){
-																	temp[key1] = true
-
-																	if(isNaN(value)){
-																		if(key1 != "date"){
-																			query.options.filter[key1] = value
-																		}
-
-																		condition += parseCondition(obj, key1, " AND ")
-
-																		if(key1 == "price"){
-																			if(context.condition.currency){
-																				query.options.filter.currency = context.condition.currency
-																			}
-																		}
-
-																	}else{
-																		condition += parseCondition(value, key1, " AND ")
-																	}
-																}
-															}
-														}
-															
-													}
-												}
-											}
-										}
-
-										console.log('before condition',condition);
-
-										if(condition){
-											condition = condition.replace(' AND ', '')
-											condition = condition.trim()
-										}
-
-										console.log('context.condition',JSON.stringify(context.condition));
-
-										console.log('query.options',JSON.stringify(query.options))
-										console.log(`vectorRegion type ${vectorRegion}-${type}`);
-
-										var { matches } = await env[`${vectorRegion}-${type}`].query(queryVector, query.options)
-
-										var rag = {
-											search : {
-												query : context.condition,
-												sql : {
-													results : []
-												},
-												vector : {
-													results : []
-												}
-											}
-										}
-
-										rag.search.sql
-
-										console.log('matches.length',matches.length.toString());
-
-										var matches_condition = ''
-
-										if(matches.length){
-											for(var m = 0; m < matches.length; m++){
-												var match = matches[m]
-
-												if(matches_condition.length){
-													matches_condition += ' OR '
-												}
-
-												matches_condition += `("id" = '${match.id}' AND "to" = '${team.id}' AND "created_at" < ${now})`
-											}
-
-											console.log('matches_condition',matches_condition);
-
-											console.log('type',type);
-
-											try{
-												var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
-
-												if(results.length){
-													for(var r = 0; r < results.length; r++){
-														var result = results[r]
-
-														var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(result.data))
-
-														var data = JSON.parse(decompressedJsonString)
-
-														if(data){
-															if(Object.keys(data).length){
-																for (var name in data) {
-																	if (data.hasOwnProperty(name)) {
-																		var value = data[name]
-
-																		result[name] = value
-																	}
-																}
-															}
-														}
-
-														delete results[i].from
-														delete results[i].to
-														delete results[i].cc
-														delete results[i].bcc
-														delete results[i].ref
-														delete results[i].data
-													}
-
-													rag.search.vector = {
-														results : results
-													}
-													
-												}
-											}catch(err){
-												console.log('matches_condition',err);
-											}
-											
-										}
-
-										var orderBy = ''
-
-										if(context.sort && context.by){
-											orderBy = `ORDER BY ${context.by} ${context.sort}`
-										}
-
-										console.log('type',type);
-
-										console.log('after condition',condition);
-
-										if(condition){
-											try{
-												if(condition.indexOf(created_at) > -1){
-													condition += ` AND "created_at" < ${now}`
-												}
-
-												console.log(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`);
-												 
-												var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`).all()
-
-												console.log('results.length',results.length);
-
-												if(results.length){
-													for(var r = 0; r < results.length; r++){
-														var result = results[r]
-
-														var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(safeClone(result.data)))
-
-														var data = JSON.parse(decompressedJsonString)
-
-														if(data){
-															result.data = {}
-
-															if(Object.keys(data).length){
-																for (var name in data) {
-																	if (data.hasOwnProperty(name)) {
-																		var value = data[name]
-
-																		if(name == "type" || name == "item" || name == "node" || name == "link" || name == "origin" || name == "detail"){
-
-																		}else{
-																			result.data[name] = value
-																		}
-																	}
-																}
-															}
-														}
-
-														results[r].data = result.data
-
-														delete results[r].from
-														delete results[r].to
-														delete results[r].cc
-														delete results[r].bcc
-														delete results[r].ref
-													}
-
-													rag.search.sql = {
-														results : results
-													}
-												}
-											}catch(err){
-												console.log('text2sql err',err);
-											}
-
-										}
-
-											
-											
-
-
-										var system = 'Return the content related to the {search.text} value from the search results in a JSON structure.'
-
-										var content = context2results(context, [...rag.search.sql.results, ...rag.search.vector.results], language)
-
-
-										var generation
-
-										if(models['deepinfra']){
-											generation = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
-
-											models['deepinfra'] -= 1
-
-										}
-
-										if(!generation && gemini_llm_api){
-											generation = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
-
-											models[gemini_llm_api+'-'+gemini_llm_model] -= 1
-
-										}
-
-										if(!generation){
-											fallback = 'overflow'
-
-											continue
-										}
-
-
-										console.log('generation', JSON.stringify(generation));
-
-										var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-											markdown : generation.markdown,
-											results: generation.results,
-											search : rag.search
-										})), { to: 'arraybuffer' })
-
-										context.data = arr.buffer
-
-										statements[`logis_${zoneRegion}_talks`].push(
-											env[`logis_${zoneRegion}_talks`].prepare(`
-												INSERT INTO talks (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-												) ON CONFLICT (id) DO UPDATE SET
-													"type" = EXCLUDED."type",
-													"from" = EXCLUDED."from",
-													"to" = EXCLUDED."to",
-													"cc" = EXCLUDED."cc",
-													"bcc" = EXCLUDED."bcc",
-													"ref" = EXCLUDED."ref",
-													"data" = EXCLUDED."data",
-													"created_at" = EXCLUDED."created_at",
-													"updated_at" = EXCLUDED."updated_at"
-											`).bind(
-												context.id,
-												context.type,
-												team.id,
-												task.bcc,
-												task.cc,
-												task.bcc,
-												task.id,
-												context.data,
-												now-100,
-												now-100
-											)
-										)
-
-										statements[`logis_${zoneRegion}_talks`].push(
-											env[`logis_${zoneRegion}_talks`].prepare(`
-												INSERT INTO talks (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-												) ON CONFLICT (id) DO UPDATE SET
-													"type" = EXCLUDED."type",
-													"from" = EXCLUDED."from",
-													"to" = EXCLUDED."to",
-													"cc" = EXCLUDED."cc",
-													"bcc" = EXCLUDED."bcc",
-													"ref" = EXCLUDED."ref",
-													"data" = EXCLUDED."data",
-													"created_at" = EXCLUDED."created_at",
-													"updated_at" = EXCLUDED."updated_at"
-											`).bind(
-												context.id,
-												context.type,
-												team.id,
-												task.bcc,
-												task.cc,
-												task.bcc,
-												task.id,
-												context.data,
-												now,
-												now
-											)
-										)
-									}
-								}
-							}	
-						}
-
-						// for loop end
-					}
-
-					
-						
-					if(Object.keys(statements).length){
-						if(fallback){
-							console.log('fallback',fallback);
 
 							statements[`logis_${zoneRegion}_talks`].push(
 								env[`logis_${zoneRegion}_talks`].prepare(`
@@ -6203,118 +6231,92 @@ export default {
 										"updated_at" = EXCLUDED."updated_at"
 								`).bind(
 									talk.id,
-									"prompt",
-									task.from,
-									task.to,
-									task.cc,
-									task.bcc,
+									talk.type,
+									talk.from,
+									talk.to,
+									talk.cc,
+									talk.bcc,
 									talk.ref,
-									null,
+									talk.data,
 									now,
 									now
 								)
 							)
+
+							// statements[`logis_${zoneRegion}_talks`].push(
+							// 	env[`logis_${zoneRegion}_talks`].prepare(`
+							// 		UPDATE talks SET updated_at = ? WHERE id = ?
+							// 	`).bind(
+							// 		now, task.id
+							// 	)
+							// )
+
+							
+
+							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({id : team.id, flag : task.flag, team : team, created_at : cron.created_at })), { to: 'arraybuffer' })
+
+							statements[region].push(
+								env[region].prepare(`
+									UPDATE tasks SET task = ?, updated_at = ? WHERE id = ?
+								`).bind(
+									arr.buffer, now, task.id
+								)
+							)
+
+							console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
+
+							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(team.data)), { to: 'arraybuffer' })
+
+							statements[logisRegion].push(
+								env[logisRegion].prepare(`
+									UPDATE users SET data = ?, updated_at = ? WHERE id = ?
+								`).bind(
+									arr.buffer, now, team.id
+								)
+							)
+
+
+
+
+
+
+							limits[task.id.toUpperCase()] = true
 						}
+					}
+				}catch(err){
+					console.log('err',err);
+				}
 
-						talk.data = null
+				if(region){
+					statements[region].push(
+						env[region].prepare(`
+							DELETE FROM tasks WHERE "id" = 'lock'
+						`)
+					)
 
-						if(talk.text){
-							var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-								text : talk.text
-							})), { to: 'arraybuffer' })
+					for (const region in statements) {
+						if (statements.hasOwnProperty(region)) {
+							var batch = statements[region]
 
-							talk.data = arr.buffer
-						}
-
-						statements[`logis_${zoneRegion}_talks`].push(
-							env[`logis_${zoneRegion}_talks`].prepare(`
-								INSERT INTO talks (
-									"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
-								) VALUES (
-									?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-								) ON CONFLICT (id) DO UPDATE SET
-									"type" = EXCLUDED."type",
-									"from" = EXCLUDED."from",
-									"to" = EXCLUDED."to",
-									"cc" = EXCLUDED."cc",
-									"bcc" = EXCLUDED."bcc",
-									"ref" = EXCLUDED."ref",
-									"data" = EXCLUDED."data",
-									"created_at" = EXCLUDED."created_at",
-									"updated_at" = EXCLUDED."updated_at"
-							`).bind(
-								talk.id,
-								talk.type,
-								talk.from,
-								talk.to,
-								talk.cc,
-								talk.bcc,
-								talk.ref,
-								talk.data,
-								now,
-								now
-							)
-						)
-
-						// statements[`logis_${zoneRegion}_talks`].push(
-						// 	env[`logis_${zoneRegion}_talks`].prepare(`
-						// 		UPDATE talks SET updated_at = ? WHERE id = ?
-						// 	`).bind(
-						// 		now, task.id
-						// 	)
-						// )
-
-
-						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({id : team.id, flag : task.flag, team : team, created_at : cron.created_at })), { to: 'arraybuffer' })
-
-						statements[region].push(
-							env[region].prepare(`
-								UPDATE tasks SET task = ?, updated_at = ? WHERE id = ?
-							`).bind(
-								arr.buffer, now, task.id
-							)
-						)
-
-						console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
-
-						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify(team.data)), { to: 'arraybuffer' })
-
-						statements[logisRegion].push(
-							env[logisRegion].prepare(`
-								UPDATE users SET data = ?, updated_at = ? WHERE id = ?
-							`).bind(
-								arr.buffer, now, team.id
-							)
-						)
-
-
-
-						for (const region in statements) {
-							if (statements.hasOwnProperty(region)) {
-								var batch = statements[region]
-
-								if(batch.length){
-									var { results, success, error } = await env[region].batch(batch)
-								}
+							if(batch.length){
+								var { results, success, error } = await env[region].batch(batch)
 							}
 						}
-
-
-						limits[task.id.toUpperCase()] = true
 					}
+				}	
 
+				var results = {}
 
-
-						
-
-
-					return new Response(JSON.stringify({
+				if(limits && models){
+					results = {
 						models : models,
 						limits : limits
-					}), {
-						headers: { "Content-Type": "application/json" },
-					})
+					}
 				}
+
+				return new Response(JSON.stringify(results), {
+					headers: { "Content-Type": "application/json" },
+				})
 			}
 		}catch(err){
 			console.log('err',err);

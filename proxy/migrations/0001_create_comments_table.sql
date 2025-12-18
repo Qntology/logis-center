@@ -198,10 +198,13 @@ CREATE TABLE IF NOT EXISTS zones (
 
 CREATE TABLE IF NOT EXISTS tasks (
     "id" TEXT PRIMARY KEY,
+    "type" TEXT,
+    "from" TEXT,
+    "to" TEXT,
     "cc" TEXT,
     "bcc" TEXT,
-    "task" BLOB NULL,
     "ref" TEXT,
+    "data" BLOB NULL,
     "created_at" INTEGER,
     "updated_at" INTEGER
 );
