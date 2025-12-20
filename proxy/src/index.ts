@@ -2403,6 +2403,7 @@ export default {
 				try{
 					var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "id" = '${json.id}' AND "ref" = '${json.ref}' AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
 
+
 					console.log('results.length',results.length);
 
 					var crons = safeClone(results)
@@ -6263,7 +6264,7 @@ export default {
 
 							statements[region].push(
 								env[region].prepare(`
-									UPDATE tasks SET task = ?, updated_at = ? WHERE id = ?
+									UPDATE tasks SET data = ?, updated_at = ? WHERE id = ?
 								`).bind(
 									arr.buffer, now, task.id
 								)
