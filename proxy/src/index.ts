@@ -2390,6 +2390,16 @@ export default {
 
 				var fallback = ''
 
+				var statements = {}
+					statements[CenterRegion] = []
+					statements[region] = []
+
+				if(!statements[logisRegion]){
+					statements[logisRegion] = []
+				}
+
+				
+
 				try{
 					var { results } = await env[region].prepare(`SELECT * FROM tasks WHERE "id" = '${json.id}' AND "ref" = '${json.ref}' AND "created_at" < ${created_at} AND "updated_at" = 0 ORDER BY created_at ASC LIMIT 1`).all()
 
@@ -2401,7 +2411,7 @@ export default {
 						for(var c = 0; c < crons.length; c++){
 							var cron = crons[c]
 
-							var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.task))
+							var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.data))
 
 							var task = JSON.parse(decompressedJsonString)
 
@@ -2436,6 +2446,17 @@ export default {
 								fallback = 'models'
 
 								continue;
+							}
+
+
+							if(!statements[`logis_${zoneRegion}-${tables[0]}`]){
+								for(var t = 0; t < tables.length; t++){
+									var table = tables[t]
+
+									if(!statements[`logis_${zoneRegion}_${table}`]){
+										statements[`logis_${zoneRegion}_${table}`] = []
+									}
+								}
 							}
 
 							if(!limits[task.from]){
@@ -2476,22 +2497,7 @@ export default {
 							
 
 
-							var statements = {}
-								statements[CenterRegion] = []
-
-							if(!statements[logisRegion]){
-								statements[logisRegion] = []
-							}
-
-							if(!statements[`logis_${zoneRegion}-${tables[0]}`]){
-								for(var t = 0; t < tables.length; t++){
-									var table = tables[t]
-
-									if(!statements[`logis_${zoneRegion}_${table}`]){
-										statements[`logis_${zoneRegion}_${table}`] = []
-									}
-								}
-							}
+						
 
 
 							// 오픈 하기전에 반영해야함
@@ -3052,7 +3058,7 @@ export default {
 												pageType = _page.type
 
 											}else if(task.ref == pageId){
-												var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${hashId(task.cc+pathname.toUpperCase())}' AND "created_at" < ${created_at} LIMIT 1`).all()
+												var { results } = await env[CenterRegion].prepare(`SELECT * FROM pages WHERE "id" = '${hashId(task.cc+url.pathname.toUpperCase())}' AND "created_at" < ${created_at} LIMIT 1`).all()
 
 												if(results.length){
 													var _page = results[0]
@@ -3267,7 +3273,7 @@ export default {
 									
 
 									var detail = {
-										id : hashId(pageType+task.cc.toUpperCase()+pathname),
+										id : hashId(pageType+task.cc.toUpperCase()+url.pathname),
 										type : pageType,
 										from : task.from,
 										to : task.to,

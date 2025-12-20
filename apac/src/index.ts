@@ -155,7 +155,7 @@ async function Cron(event, env, ctx, models, limits, timeout){
 			for(var i = 0; i < len; i++){
 				var cron = results[i]
 
-				var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.task))
+				var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(cron.data))
 
 				var task = JSON.parse(decompressedJsonString)
 
@@ -188,203 +188,206 @@ async function Cron(event, env, ctx, models, limits, timeout){
 
 					var { results } = await env[env.region].prepare(`SELECT * FROM tasks WHERE "created_at" <= ${task.created_at} AND "updated_at" > 0 ORDER BY created_at ASC LIMIT 1`).all()
 
-					console.log('results.length',results.length);
+					if(results){
+						console.log('results.length',results.length);
 
-					var _cron = tasks[t-1]
+						var _cron = tasks[t-1]
 
-					if(results.length){
-						var _cron = results[0]
+						if(results.length){
+							var _cron = results[0]
 
-						var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_cron.task))
+							var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_cron.data))
 
-						var _task = JSON.parse(decompressedJsonString)
+							var _task = JSON.parse(decompressedJsonString)
 
-						var before = _task.team
+							var before = _task.team
 
-						var logisRegion = LogisRegion[_task.flag]
+							var logisRegion = LogisRegion[_task.flag]
 
-						var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'team' AND "id" = '${before.id}' AND "created_at" < ${now} LIMIT 1`).all()
+							var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'team' AND "id" = '${before.id}' AND "created_at" < ${now} LIMIT 1`).all()
 
-						var after = results[0]
+							var after = results[0]
 
-						var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(after.data))
+							var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(after.data))
 
-						after.data = JSON.parse(decompressedJsonString)
+							after.data = JSON.parse(decompressedJsonString)
 
-						var diff = isDiff(before.data, after.data)
+							var diff = isDiff(before.data, after.data)
 
-						console.log('diff',diff);
+							console.log('diff',diff);
 
-						if(diff){
-							timeout.delay += 0.5
+							if(diff){
+								timeout.delay += 0.5
 
-							break
-						}else{
-							console.log('1.remove 2.통과 진입');
-							timeout.delay = 0.5
-							
-
-							await env[env.region].prepare(`
-								DELETE FROM tasks WHERE "id" = '${_cron.id}'
-							`).run()
-
-							if(_cron.id == task.id){
-								console.log('self stop 진입');
 								break
 							}else{
-								limits[_cron.id] = true
+								console.log('1.remove 2.통과 진입');
+								timeout.delay = 0.5
+								
 
-								limits.team = before
+								await env[env.region].prepare(`
+									DELETE FROM tasks WHERE "id" = '${_cron.id}'
+								`).run()
+
+								if(_cron.id == task.id){
+									console.log('self stop 진입');
+									break
+								}else{
+									limits[_cron.id] = true
+
+									limits.team = before
+								}
 							}
-						}
-					}else if(_cron){
-						if(!limits[_cron.id]){
+						}else if(_cron){
+							if(!limits[_cron.id]){
+								timeout.delay += 0.5
+
+								console.log('stop 진입');
+
+								break
+							}else{
+								timeout.delay = 1
+								console.log('통과');
+							}
+						}else if(t == tasks.length - 1 && limits[task.id.toUpperCase()]){
+							console.log('미정');
 							timeout.delay += 0.5
 
-							console.log('stop 진입');
-
 							break
-						}else{
-							timeout.delay = 1
-							console.log('통과');
 						}
-					}else if(t == tasks.length - 1 && limits[task.id.toUpperCase()]){
-						console.log('미정');
-						timeout.delay += 0.5
-
-						break
-					}
 
 
-					var geminiKey = function(gemini1, gemini2){
-						if(Math.floor(Math.random() * 2)){
-							return {
-								first :gemini1,
-								second:gemini2
-							}
-						}else{
-							return {
-								first :gemini2,
-								second:gemini1
+						var geminiKey = function(gemini1, gemini2){
+							if(Math.floor(Math.random() * 2)){
+								return {
+									first :gemini1,
+									second:gemini2
+								}
+							}else{
+								return {
+									first :gemini2,
+									second:gemini1
+								}
 							}
 						}
-					}
 
-					var geminiModel = function(){
-						if(Math.floor(Math.random() * 2)){
-							return {
-								first :'gemini-flash-lite-latest',
-								second:'gemini-flash-lite-latest'
+						var geminiModel = function(){
+							if(Math.floor(Math.random() * 2)){
+								return {
+									first :'gemini-flash-lite-latest',
+									second:'gemini-flash-lite-latest'
+								}
+							}else{
+								return {
+									first :'gemini-flash-lite-latest',
+									second:'gemini-flash-lite-latest'
+								}
 							}
-						}else{
-							return {
-								first :'gemini-flash-lite-latest',
-								second:'gemini-flash-lite-latest'
-							}
+						}
+
+
+
+						var gemini_key = geminiKey(env.gemini1, env.gemini2)
+
+						var gemini_model = geminiModel()
+
+						var gemini_llm_api = ""
+
+						var gemini_llm_model = ""
+
+						if(models[`${gemini_key.first}-${gemini_model.first}`]){
+							gemini_llm_api = gemini_key.first
+							gemini_llm_model = gemini_model.first
+
+							models[`${gemini_key.first}-${gemini_model.second}`]
+
+						}else if(models[`${gemini_key.first}-${gemini_model.second}`]){
+							gemini_llm_api = gemini_key.first
+							gemini_llm_model = gemini_model.second
+
+						}else if(models[`${gemini_key.second}-${gemini_model.first}`]){
+							gemini_llm_api = gemini_key.second
+							gemini_llm_model = gemini_model.first
+
+						}else if(models[`${gemini_key.second}-${gemini_model.second}`]){
+							gemini_llm_api = gemini_key.second
+							gemini_llm_model = gemini_model.second
+
+						}else if(!models['deepinfra']){
+							await env[env.region].prepare(`
+								DELETE FROM tasks WHERE id = "${task.id}"
+							`).run()
+
+							continue
+						}
+
+
+						// lock
+						var { results, success, error } =  await env[env.region].prepare(`
+							INSERT INTO tasks (
+								"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+							) VALUES (
+								?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 
+							) ON CONFLICT (id) DO UPDATE SET
+								"type" = EXCLUDED."type",
+								"from" = EXCLUDED."from",
+								"to" = EXCLUDED."to",
+								"cc" = EXCLUDED."cc",
+								"bcc" = EXCLUDED."bcc",
+								"ref" = EXCLUDED."ref",
+								"data" = EXCLUDED."data",
+								"created_at" = EXCLUDED."created_at",
+								"updated_at" = EXCLUDED."updated_at"
+						`).bind(
+							'lock',
+							'',
+							'',
+							'',
+							'',
+							'',
+							'',
+							null,
+							1,
+							0
+						).run()
+
+						
+
+						var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+							now : now,
+							id : task.id,
+							ref : task.ref,
+							region : env.region,
+							models : models,
+							limits : limits,
+							gemini_llm_api : gemini_llm_api,
+							gemini_llm_model : gemini_llm_model,
+							deepinfra : env.deepinfra
+						})), { to: 'arraybuffer' })
+
+						try{
+							const res = await fetch(`https://proxy.logis.center`, {
+								method: "POST",
+								headers: {
+									'Content-Type': 'application/octet-stream',
+									'Content-Encoding': 'gzip'
+								},
+								body: arr.buffer
+							});
+
+							var _results = await res.json();
+
+							models = _results.models
+							limits = _results.limits
+
+						}catch(err){
+							await env[env.region].prepare(`
+								DELETE FROM tasks WHERE "id" = 'lock'
+							`).run()
+							console.log('err',err);
 						}
 					}
 
-
-
-					var gemini_key = geminiKey(env.gemini1, env.gemini2)
-
-					var gemini_model = geminiModel()
-
-					var gemini_llm_api = ""
-
-					var gemini_llm_model = ""
-
-					if(models[`${gemini_key.first}-${gemini_model.first}`]){
-						gemini_llm_api = gemini_key.first
-						gemini_llm_model = gemini_model.first
-
-						models[`${gemini_key.first}-${gemini_model.second}`]
-
-					}else if(models[`${gemini_key.first}-${gemini_model.second}`]){
-						gemini_llm_api = gemini_key.first
-						gemini_llm_model = gemini_model.second
-
-					}else if(models[`${gemini_key.second}-${gemini_model.first}`]){
-						gemini_llm_api = gemini_key.second
-						gemini_llm_model = gemini_model.first
-
-					}else if(models[`${gemini_key.second}-${gemini_model.second}`]){
-						gemini_llm_api = gemini_key.second
-						gemini_llm_model = gemini_model.second
-
-					}else if(!models['deepinfra']){
-						await env[env.region].prepare(`
-							DELETE FROM tasks WHERE id = "${task.id}"
-						`).run()
-
-						continue
-					}
-
-
-					// lock
-					var { results, success, error } =  await env[env.region].prepare(`
-						INSERT INTO tasks (
-							"id", "type", "from", "to", "cc", "bcc", "ref", "task", "created_at", "updated_at"
-						) VALUES (
-							?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 
-						) ON CONFLICT (id) DO UPDATE SET
-							"type" = EXCLUDED."type",
-							"from" = EXCLUDED."from",
-							"to" = EXCLUDED."to",
-							"cc" = EXCLUDED."cc",
-							"bcc" = EXCLUDED."bcc",
-							"ref" = EXCLUDED."ref",
-							"task" = EXCLUDED."task",
-							"created_at" = EXCLUDED."created_at",
-							"updated_at" = EXCLUDED."updated_at"
-					`).bind(
-						'lock',
-						'',
-						'',
-						'',
-						'',
-						'',
-						'',
-						null,
-						1,
-						0
-					).run()
-
-					
-
-					var arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
-						now : now,
-						id : task.id,
-						ref : task.ref,
-						region : env.region,
-						models : models,
-						limits : limits,
-						gemini_llm_api : gemini_llm_api,
-						gemini_llm_model : gemini_llm_model,
-						deepinfra : env.deepinfra
-					})), { to: 'arraybuffer' })
-
-					try{
-						const res = await fetch(`https://proxy.logis.center`, {
-							method: "POST",
-							headers: {
-								'Content-Type': 'application/octet-stream',
-								'Content-Encoding': 'gzip'
-							},
-							body: arr.buffer
-						});
-
-						var _results = await res.json();
-
-						models = _results.models
-						limits = _results.limits
-
-					}catch(err){
-						await env[env.region].prepare(`
-							DELETE FROM tasks WHERE "id" = 'lock'
-						`).run()
-						console.log('err',err);
-					}
 				}
 			}
 
