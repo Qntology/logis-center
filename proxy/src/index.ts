@@ -453,6 +453,10 @@ const item2json = function(type, href){
 	}else if(type == 'goods'){
 		return `
 			node:${type} form container CSS1 selector,
+			code:{
+				value:product constant code | string,
+				selector:selector
+			},
 			link:'${href}',
 			id:{
 				value:Refer to the ID value from the link or an attribute or input value | string,
@@ -472,10 +476,6 @@ const item2json = function(type, href){
 			},
 			card:{
 				value:card company name or '' | string,
-				selector:selector
-			},
-			code:{
-				value:product constant code | string,
 				selector:selector
 			},
 			model_name:{
@@ -2094,60 +2094,105 @@ function cleanNumber(str){
 	return str
 }
 
-function parseDirtyJson(dirtyString) {
-if (!dirtyString) return null;
+function parseDirtyJson(input) {
+	if (!input) return null;
 
-	// 1단계: 숨겨진 특수 공백(NBSP 등)을 일반 공백으로 치환 (가장 흔한 에러 원인)
-	let s = dirtyString.replace(/[\u00A0\u200B\u202F\uFEFF]/g, " ");
+	// 0️⃣ 이미 객체면 건드리지 않는다
+	if (typeof input !== "string") {
+		return input;
+	}
 
-	// 2단계: 기존의 '깨진 JSON' 수리 로직 적용
-	// 2-1. 홑따옴표 값 -> 쌍따옴표로 변환 및 내부 따옴표 이스케이프
-	s = s.replace(/'([^']*)'/g, (match, inner) => {
-		return `"${inner.replace(/"/g, '\\"')}"`;
-	});
+	let s = input;
 
-	// 2-2. 따옴표 없는 키(Key)에 쌍따옴표 입히기
-	s = s.replace(/(\{|\,)\s*([a-zA-Z0-9_]+)\s*:/g, '$1 "$2":');
+	// 1️⃣ 숨겨진 특수 공백 제거 (항상 안전)
+	s = s.replace(/[\u00A0\u200B\u202F\uFEFF]/g, " ");
 
-	// 3단계: [이번 에러의 핵심] CSS 선택자 등에서 발생하는 내부 따옴표 문제 해결
-	// 예: "selector":"form[name="fregform"]"  ->  "selector":"form[name=\"fregform\"]"
-	// 설명: 값의 시작(":) 뒤에 나오는데, 쉼표(,)나 닫는 중괄호(})가 아닌 곳에 있는 따옴표를 이스케이프 처리
-	
-	// 단순 무식하지만 강력한 방법: name=" 패턴을 name=\" 로 변경
-	s = s.replace(/name="/g, 'name=\\"');
-	// CSS 선택자 끝부분 "] 패턴을 \"] 로 변경 (배열 끝과 구분하기 위해 주의 필요하지만, 보통 CSS 선택자는 문자열 내부임)
-	// 안전을 위해 [name=\\"...\\"] 패턴이 완성되도록 유도
-	s = s.replace(/"]"/g, '\\"]"'); 
-
-	// 4단계: URL 역슬래시 보정 (http://)
-	s = s.replace(/\\"http\\":\/\//g, "http://");
-	s = s.replace(/\\"https\\":\/\//g, "https://");
-
-	// 5단계: 후행 쉼표 제거
-	s = s.replace(/,\s*([\]}])/g, '$1');
-
-	console.log("--- 클린징 된 문자열 ---");
-	// console.log(s); // 디버깅 필요시 주석 해제
-
+	// --------------------------------------------------
+	// 1차 시도: JSON + 주석 + trailing comma
+	// --------------------------------------------------
 	try {
-		return JSON.parse(s);
+		const cleaned = s
+			// block comment 제거
+			.replace(/\/\*[\s\S]*?\*\//g, "")
+			// line comment (줄 시작만)
+			.replace(/^\s*\/\/.*$/gm, "")
+			// trailing comma 제거
+			.replace(/,\s*([\]}])/g, "$1");
+
+		return JSON.parse(cleaned);
+	} catch (_) {
+		// 통과
+	}
+
+	// --------------------------------------------------
+	// 2차 시도: 일반적인 Dirty JSON 복구
+	// (키 따옴표 없음, 홑따옴표 문자열 등)
+	// --------------------------------------------------
+	try {
+		let repaired = s;
+
+		// 홑따옴표 문자열 → 쌍따옴표
+		repaired = repaired.replace(/'([^']*)'/g, (_, inner) => {
+			return `"${inner.replace(/"/g, '\\"')}"`;
+		});
+
+		// 따옴표 없는 키 보정
+		repaired = repaired.replace(
+			/(\{|,)\s*([a-zA-Z0-9_]+)\s*:/g,
+			'$1"$2":'
+		);
+
+		// trailing comma 제거
+		repaired = repaired.replace(/,\s*([\]}])/g, "$1");
+
+		return JSON.parse(repaired);
+	} catch (_) {
+		// 통과
+	}
+
+	// --------------------------------------------------
+	// 3차 시도: CSS selector 내부 따옴표 깨짐 복구
+	// (네가 말한 핵심 로직)
+	// --------------------------------------------------
+	try {
+		let deep = s;
+
+		// name=" → name=\"
+		deep = deep.replace(/name="/g, 'name=\\"');
+
+		// "]" → \"]"
+		deep = deep.replace(/"]"/g, '\\"]"');
+
+		// URL 역슬래시 꼬임 보정
+		deep = deep.replace(/\\"http\\":\/\//g, "http://");
+		deep = deep.replace(/\\"https\\":\/\//g, "https://");
+
+		// trailing comma
+		deep = deep.replace(/,\s*([\]}])/g, "$1");
+
+		return JSON.parse(deep);
+	} catch (_) {
+		// 통과
+	}
+
+	// --------------------------------------------------
+	// 4차 시도: 최후의 수단 (selector 내부 따옴표 강제 이스케이프)
+	// --------------------------------------------------
+	try {
+		let last = s;
+
+		last = last.replace(
+			/([a-zA-Z0-9_]+="[^"]*")/g,
+			(match) => match.replace(/"/g, '\\"')
+		);
+
+		last = last.replace(/,\s*([\]}])/g, "$1");
+
+		return JSON.parse(last);
 	} catch (e) {
-		console.error("1차 파싱 실패, 정밀 복구 시도...");
-		
-		// 최후의 수단: 문자열 값 안에 있는 " 를 \" 로 강제 치환하는 정밀 정규식
-		// ( : 뒤에 오는 " 로 시작해서, ", 나 "} 로 끝나기 전까지의 내용 중 " 를 찾음)
-		// 이 부분은 매우 복잡하므로, 위 단계에서 해결 안 될 경우에만 작동
-		try {
-			 // CSS 선택자 같은 내부 따옴표를 잡기 위한 보완 규칙
-			 s = s.replace(/([a-zA-Z0-9_]+="\w+")/g, (match) => {
-				 return match.replace(/"/g, '\\"');
-			 });
-			 return JSON.parse(s);
-		} catch (e2) {
-			console.error("최종 파싱 실패:", e2.message);
-			console.log("실패한 문자열:\n", s);
-			return null;
-		}
+		console.error("❌ 모든 JSON 복구 실패:", e.message);
+		console.log("실패한 문자열:\n", s);
+		return null;
 	}
 }
 
@@ -3273,18 +3318,21 @@ export default {
 
 									
 
+
 									var detail = {
 										id : hashId(pageType+task.cc.toUpperCase()+url.pathname),
 										type : pageType,
 										from : task.from,
 										to : task.to,
 										cc : task.cc,
-										bcc: task.bcc,
+										bcc: hashId(page.type+task.cc.toUpperCase()),
 										ref: task.ref,
 										data:null,
 										created_at:now,
 										updated_at:now
 									}
+
+
 
 									console.log('isDetail2',JSON.stringify(isDetail));
 
@@ -3468,8 +3516,6 @@ export default {
 
 									page.data = arr.buffer
 
-
-										
 
 									if(page.type){
 										statements[CenterRegion].push(
@@ -3660,6 +3706,16 @@ export default {
 
 											item.id = hashId(team.id+item.index)
 
+											item.flag = task.flag
+											
+											item.from = task.from
+											item.to = task.to
+											item.cc = task.cc
+
+											item.bcc = hashId(item.type+(isDetail ? task.cc.toUpperCase() : task.cc))
+
+											item.ref = hashId(team.id+task.cc+item.link)
+
 											item.data = {
 												id : item.id,
 												no : item.no ? item.no : "",
@@ -3669,7 +3725,28 @@ export default {
 												origin : task.origin ? task.origin : ''
 											}
 
+
+
+
 											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+											if(results.length == 0){
+												var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "to" = '${task.to}' AND "cc" = '${task.cc}' AND "ref" = '${item.ref}' AND "created_at" < ${now} LIMIT 1`).all()
+
+												if(results.length){
+													var _item = results[0]
+
+													var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
+
+													_item.data = JSON.parse(decompressedJsonString)
+
+													item.no = item.data.no = _item.data.no
+
+													item.index = crc32(hashId(item.type+team.id+item.no))
+
+													item.id = hashId(team.id+item.index)
+												}
+											}
 
 											console.log('add results.length',item.type,results.length);
 
@@ -3687,7 +3764,7 @@ export default {
 												if(item.data.item && !_item.data.item){
 													item.data.item = _item.data.item
 													item.data.node = _item.data.node
-													item.ref = _item.data.ref
+													
 												}
 
 												if(item.status){
@@ -3726,15 +3803,7 @@ export default {
 												team.data.base[item.type].count++
 											}
 
-											item.flag = task.flag
 											
-											item.from = task.from
-											item.to = task.to
-											item.cc = task.cc
-
-											item.bcc = hashId(item.type+(isDetail ? task.cc.toUpperCase() : task.cc))
-
-											item.ref = hashId(team.id+task.cc+item.link)
 
 
 											var goods = item.goods ? safeClone(item.goods) : []

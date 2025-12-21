@@ -182,7 +182,7 @@ async function Cron(event, env, ctx, models, limits, timeout){
 					var elapsedTime = Date.now() - timeout.start;
 					var timeLeft = timeout.max - elapsedTime;
 
-					if (timeLeft <= 5000) { // 남은 시간이 0.5초(500ms) 이하이면 종료
+					if (timeLeft <= 10000) { // 남은 시간이 0.5초(500ms) 이하이면 종료
 						break; 
 					}
 
@@ -434,7 +434,7 @@ export default {
 			var elapsedTime = Date.now() - timeout.start;
 			var timeLeft = timeout.max - elapsedTime;
 
-			if (timeLeft <= 5000) { // 남은 시간이 0.5초(500ms) 이하이면 종료
+			if (timeLeft <= 10000) { // 남은 시간이 0.5초(500ms) 이하이면 종료
 				break; 
 			}
 
