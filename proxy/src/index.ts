@@ -2097,46 +2097,65 @@ function cleanNumber(str){
 function parseDirtyJson(input) {
 	if (!input) return null;
 
-	// 0️⃣ 이미 객체면 건드리지 않는다
+	// 0️⃣ 이미 객체면 그대로 반환
 	if (typeof input !== "string") {
 		return input;
 	}
 
 	let s = input;
 
-	// 1️⃣ 숨겨진 특수 공백 제거 (항상 안전)
+	// 1️⃣ 특수 공백 제거 (항상 안전)
 	s = s.replace(/[\u00A0\u200B\u202F\uFEFF]/g, " ");
 
 	// --------------------------------------------------
-	// 1차 시도: JSON + 주석 + trailing comma
+	// 유틸: 쌍따옴표 문자열 보호 / 복원
 	// --------------------------------------------------
-	try {
-		const cleaned = s
-			// block comment 제거
-			.replace(/\/\*[\s\S]*?\*\//g, "")
-			// line comment (줄 시작만)
-			.replace(/^\s*\/\/.*$/gm, "")
-			// trailing comma 제거
-			.replace(/,\s*([\]}])/g, "$1");
+	function protectDoubleQuotedStrings(str) {
+		const store = [];
+		const protectedStr = str.replace(
+			/"([^"\\]*(\\.[^"\\]*)*)"/g,
+			(m) => {
+				const key = `__STR_${store.length}__`;
+				store.push(m);
+				return key;
+			}
+		);
+		return { protectedStr, store };
+	}
 
-		return JSON.parse(cleaned);
-	} catch (_) {
-		// 통과
+	function restoreDoubleQuotedStrings(str, store) {
+		return str.replace(/__STR_(\d+)__/g, (_, i) => store[i]);
 	}
 
 	// --------------------------------------------------
-	// 2차 시도: 일반적인 Dirty JSON 복구
-	// (키 따옴표 없음, 홑따옴표 문자열 등)
+	// 1차: JSON + 주석 + trailing comma
+	// --------------------------------------------------
+	try {
+		const cleaned = s
+			.replace(/\/\*[\s\S]*?\*\//g, "")
+			.replace(/^\s*\/\/.*$/gm, "")
+			.replace(/,\s*([\]}])/g, "$1");
+
+		return JSON.parse(cleaned);
+	} catch (_) {}
+
+	// --------------------------------------------------
+	// 2차: JS Object → JSON (핵심 경로)
 	// --------------------------------------------------
 	try {
 		let repaired = s;
 
-		// 홑따옴표 문자열 → 쌍따옴표
-		repaired = repaired.replace(/'([^']*)'/g, (_, inner) => {
-			return `"${inner.replace(/"/g, '\\"')}"`;
-		});
+		// 🔐 쌍따옴표 문자열 보호
+		const { protectedStr, store } =
+			protectDoubleQuotedStrings(repaired);
+		repaired = protectedStr;
 
-		// 따옴표 없는 키 보정
+		// 홑따옴표 문자열 → 쌍따옴표 (이제 안전)
+		repaired = repaired.replace(/'([^']*)'/g, (_, inner) =>
+			`"${inner.replace(/"/g, '\\"')}"`
+		);
+
+		// 따옴표 없는 key → 쌍따옴표
 		repaired = repaired.replace(
 			/(\{|,)\s*([a-zA-Z0-9_]+)\s*:/g,
 			'$1"$2":'
@@ -2145,48 +2164,55 @@ function parseDirtyJson(input) {
 		// trailing comma 제거
 		repaired = repaired.replace(/,\s*([\]}])/g, "$1");
 
+		// 🔓 보호 복원
+		repaired = restoreDoubleQuotedStrings(repaired, store);
+
 		return JSON.parse(repaired);
-	} catch (_) {
-		// 통과
-	}
+	} catch (_) {}
 
 	// --------------------------------------------------
-	// 3차 시도: CSS selector 내부 따옴표 깨짐 복구
-	// (네가 말한 핵심 로직)
+	// 3차: CSS selector / URL 따옴표 붕괴 복구
 	// --------------------------------------------------
 	try {
 		let deep = s;
 
-		// name=" → name=\"
-		deep = deep.replace(/name="/g, 'name=\\"');
+		// 보호
+		const { protectedStr, store } =
+			protectDoubleQuotedStrings(deep);
+		deep = protectedStr;
 
-		// "]" → \"]"
+		deep = deep.replace(/name="/g, 'name=\\"');
 		deep = deep.replace(/"]"/g, '\\"]"');
 
-		// URL 역슬래시 꼬임 보정
+		// URL 꼬임 복구
 		deep = deep.replace(/\\"http\\":\/\//g, "http://");
 		deep = deep.replace(/\\"https\\":\/\//g, "https://");
 
-		// trailing comma
 		deep = deep.replace(/,\s*([\]}])/g, "$1");
 
+		deep = restoreDoubleQuotedStrings(deep, store);
+
 		return JSON.parse(deep);
-	} catch (_) {
-		// 통과
-	}
+	} catch (_) {}
 
 	// --------------------------------------------------
-	// 4차 시도: 최후의 수단 (selector 내부 따옴표 강제 이스케이프)
+	// 4차: 최후의 수단 (selector 내부 강제 escape)
 	// --------------------------------------------------
 	try {
 		let last = s;
 
+		const { protectedStr, store } =
+			protectDoubleQuotedStrings(last);
+		last = protectedStr;
+
 		last = last.replace(
 			/([a-zA-Z0-9_]+="[^"]*")/g,
-			(match) => match.replace(/"/g, '\\"')
+			(m) => m.replace(/"/g, '\\"')
 		);
 
 		last = last.replace(/,\s*([\]}])/g, "$1");
+
+		last = restoreDoubleQuotedStrings(last, store);
 
 		return JSON.parse(last);
 	} catch (e) {
@@ -2195,6 +2221,7 @@ function parseDirtyJson(input) {
 		return null;
 	}
 }
+
 
 
 
@@ -3757,14 +3784,18 @@ export default {
 											if(results.length){
 												var _item = results[0]
 
-												var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
+												try{
+													var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
 
-												_item.data = JSON.parse(decompressedJsonString)
+													_item.data = JSON.parse(decompressedJsonString)
 
-												if(item.data.item && !_item.data.item){
-													item.data.item = _item.data.item
-													item.data.node = _item.data.node
-													
+													if(item.data.item && !_item.data.item){
+														item.data.item = _item.data.item
+														item.data.node = _item.data.node
+														
+													}
+												}catch(err){
+													console.log('ungzip err',err);
 												}
 
 												if(item.status){
@@ -4595,10 +4626,14 @@ export default {
 																		
 
 
-																		var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
+																		try{
+																			var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(from.data))
 
-																		var data = JSON.parse(decompressedJsonString)
+																			var data = JSON.parse(decompressedJsonString)
 
+																		}catch(err){
+																			console.log('relate err',err);
+																		}
 																		
 
 																		if(foreign){
