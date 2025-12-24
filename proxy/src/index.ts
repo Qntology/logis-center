@@ -331,7 +331,7 @@ const list2json = function(language){
 		node:item parent list CSS1 selector excluding ads,
 		next:list next button CSS1 selector,
 		text:summarize the contents of the items array in ${language},
-		detail:is detail page | boolean,
+		detail:is a detail page or a detail form | boolean,
 		items: [
 			if (type is 'tracking' or 'review') {
 				status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
@@ -2093,139 +2093,85 @@ function cleanNumber(str){
 
 	return str
 }
+// ================================
+// Dirty JSON Parser (Recovery Focused)
+// ================================
+
+const DirtyJsonStats = {
+    total: 0,
+    success: 0,
+    fail: 0,
+};
+
+/**
+ * 정규화 핵심: 에러를 찾는 게 아니라 "JSON 규격으로 강제 개조" 합니다.
+ */
+function normalizeToJsonString(input) {
+    if (typeof input !== "string") return input;
+
+    let s = input.replace(/[\u00A0\u200B\u202F\uFEFF]/g, " ").trim();
+
+    // 1. 백틱(``)이 들어온 경우를 대비해 처리 (사용자 제안 반영)
+    // 백틱 안의 모든 내용을 쌍따옴표로 바꾸되, 내부의 진짜 쌍따옴표는 이스케이프 처리
+    s = s.replace(/`([\s\S]*?)`/g, (_, inner) => `"${inner.replace(/"/g, '\\"')}"`);
+
+    // 2. 키값 따옴표 보정 (key: -> "key":)
+    // 따옴표가 있든 없든 일단 다 발라내서 쌍따옴표로 통일
+    s = s.replace(/([{,])\s*([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
+
+    // 3. 홑따옴표 값 보정 ('value' -> "value")
+    // 값 내부에 쌍따옴표가 있으면 이스케이프 처리
+    s = s.replace(/:\s*'([^']*)'/g, (_, inner) => `: "${inner.replace(/"/g, '\\"')}"`);
+
+    // 4. CSS 셀렉터 등 "문자열 내부의 쌍따옴표" 강제 보호
+    // "node": "form[name="frm"]" 같은 케이스 대응
+    // 원리: ": " 로 시작해서 끝에 "나 ,가 나올 때까지 사이의 쌍따옴표를 찾음
+    s = s.replace(/(":\s*")([\s\S]*?)("(?=\s*[,}\]])) /g, (match, open, body, close) => {
+        // [ ] 내부의 " 를 \" 로 바꿈
+        const fixedBody = body.replace(/="([^"]*)"/g, '=\\"$1\\"');
+        return open + fixedBody + close;
+    });
+
+    // 5. Trailing Comma (후행 콤마) 제거
+    s = s.replace(/,\s*([\]}])/g, "$1");
+
+    // 6. 미종결 문자열 강제 닫기 (비정상 절단 대응)
+    const openBraces = (s.match(/\{/g) || []).length;
+    const closeBraces = (s.match(/\}/g) || []).length;
+    if (openBraces > closeBraces) {
+        s += "}".repeat(openBraces - closeBraces);
+    }
+
+    return s;
+}
 
 function parseDirtyJson(input) {
-	if (!input) return null;
+    DirtyJsonStats.total++;
+    if (!input) return null;
 
-	// 0️⃣ 이미 객체면 그대로 반환
-	if (typeof input !== "string") {
-		return input;
-	}
-
-	let s = input;
-
-	// 1️⃣ 특수 공백 제거 (항상 안전)
-	s = s.replace(/[\u00A0\u200B\u202F\uFEFF]/g, " ");
-
-	// --------------------------------------------------
-	// 유틸: 쌍따옴표 문자열 보호 / 복원
-	// --------------------------------------------------
-	function protectDoubleQuotedStrings(str) {
-		const store = [];
-		const protectedStr = str.replace(
-			/"([^"\\]*(\\.[^"\\]*)*)"/g,
-			(m) => {
-				const key = `__STR_${store.length}__`;
-				store.push(m);
-				return key;
-			}
-		);
-		return { protectedStr, store };
-	}
-
-	function restoreDoubleQuotedStrings(str, store) {
-		return str.replace(/__STR_(\d+)__/g, (_, i) => store[i]);
-	}
-
-	// --------------------------------------------------
-	// 1차: JSON + 주석 + trailing comma
-	// --------------------------------------------------
-	try {
-		const cleaned = s
-			.replace(/\/\*[\s\S]*?\*\//g, "")
-			.replace(/^\s*\/\/.*$/gm, "")
-			.replace(/,\s*([\]}])/g, "$1");
-
-		return JSON.parse(cleaned);
-	} catch (_) {}
-
-	// --------------------------------------------------
-	// 2차: JS Object → JSON (핵심 경로)
-	// --------------------------------------------------
-	try {
-		let repaired = s;
-
-		// 🔐 쌍따옴표 문자열 보호
-		const { protectedStr, store } =
-			protectDoubleQuotedStrings(repaired);
-		repaired = protectedStr;
-
-		// 홑따옴표 문자열 → 쌍따옴표 (이제 안전)
-		repaired = repaired.replace(/'([^']*)'/g, (_, inner) =>
-			`"${inner.replace(/"/g, '\\"')}"`
-		);
-
-		// 따옴표 없는 key → 쌍따옴표
-		repaired = repaired.replace(
-			/(\{|,)\s*([a-zA-Z0-9_]+)\s*:/g,
-			'$1"$2":'
-		);
-
-		// trailing comma 제거
-		repaired = repaired.replace(/,\s*([\]}])/g, "$1");
-
-		// 🔓 보호 복원
-		repaired = restoreDoubleQuotedStrings(repaired, store);
-
-		return JSON.parse(repaired);
-	} catch (_) {}
-
-	// --------------------------------------------------
-	// 3차: CSS selector / URL 따옴표 붕괴 복구
-	// --------------------------------------------------
-	try {
-		let deep = s;
-
-		// 보호
-		const { protectedStr, store } =
-			protectDoubleQuotedStrings(deep);
-		deep = protectedStr;
-
-		deep = deep.replace(/name="/g, 'name=\\"');
-		deep = deep.replace(/"]"/g, '\\"]"');
-
-		// URL 꼬임 복구
-		deep = deep.replace(/\\"http\\":\/\//g, "http://");
-		deep = deep.replace(/\\"https\\":\/\//g, "https://");
-
-		deep = deep.replace(/,\s*([\]}])/g, "$1");
-
-		deep = restoreDoubleQuotedStrings(deep, store);
-
-		return JSON.parse(deep);
-	} catch (_) {}
-
-	// --------------------------------------------------
-	// 4차: 최후의 수단 (selector 내부 강제 escape)
-	// --------------------------------------------------
-	try {
-		let last = s;
-
-		const { protectedStr, store } =
-			protectDoubleQuotedStrings(last);
-		last = protectedStr;
-
-		last = last.replace(
-			/([a-zA-Z0-9_]+="[^"]*")/g,
-			(m) => m.replace(/"/g, '\\"')
-		);
-
-		last = last.replace(/,\s*([\]}])/g, "$1");
-
-		last = restoreDoubleQuotedStrings(last, store);
-
-		return JSON.parse(last);
-	} catch (e) {
-		console.error("❌ 모든 JSON 복구 실패:", e.message);
-		console.log("실패한 문자열:\n", s);
-		return null;
-	}
+    // 1차 시도: 원본 그대로 파싱
+    try {
+        const obj = JSON.parse(input);
+        DirtyJsonStats.success++;
+        return obj;
+    } catch (e) {
+        // 2차 시도: 강제 수리 후 파싱
+        try {
+            const normalized = normalizeToJsonString(input);
+            const obj = JSON.parse(normalized);
+            DirtyJsonStats.success++;
+            return obj;
+        } catch (e2) {
+            // 마지막 수단: 정말 깨진 경우 null 반환
+            DirtyJsonStats.fail++;
+            console.warn("🔧 수리 실패:", e2.message);
+            return null;
+        }
+    }
 }
 
 
-
-
-async function Deepinfra(key, model, system, user, inlineData){
+async function Deepinfra(key, model, system, user, config, inlineData){
 	// DeepInfra API 호출
 	var messages = []
 
@@ -2264,9 +2210,16 @@ async function Deepinfra(key, model, system, user, inlineData){
 		"model" : model,
 		"messages": messages,
 		"max_tokens": 15000,
-		"temperature": 1,
+		"temperature": config ? config.temperature : 0.95,
 		"top_p": 1
 	}
+
+	// if(typeof config == "undefined"){
+	// 	body["response_format"] = {
+	// 		type : "json_object"
+	// 	}
+	// }
+
 
 	var pathname = 'chat/completions'
 
@@ -2301,6 +2254,10 @@ async function Deepinfra(key, model, system, user, inlineData){
 		var content = json.choices[0].message.content.trim();
 
 		console.log('content',content);
+
+		if(config){
+			return content
+		}
 
 		try{
 			var results = JSON.parse(content)
@@ -2623,7 +2580,7 @@ export default {
 								var item
 
 								if(models['deepinfra']){
-									item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', inlineData)
+									item = await Deepinfra(deepinfra, 'google/gemma-3-27b-it', system, '', null, inlineData)
 
 									models['deepinfra'] -= 1
 
@@ -2731,6 +2688,7 @@ export default {
 
 									item = mergeNode(item, _item)
 								}
+
 
 
 								if(type == "tracking"){
@@ -3107,7 +3065,7 @@ export default {
 
 									var url = new URL(task.href)
 
-									var pageId = hashId((task.detail ? task.cc.toUpperCase() : task.cc.toLowerCase())+url.pathname)
+									var pageId = hashId((task.detail ? task.cc.toUpperCase() : task.cc)+url.pathname)
 
 									console.log('pageId',pageId);
 
@@ -3327,7 +3285,6 @@ export default {
 										}
 									}
 
-										
 
 
 									var selectors = {
@@ -3343,7 +3300,6 @@ export default {
 										origin : task.origin ? task.origin : ''
 									}
 
-									
 
 
 									var detail = {
@@ -3755,24 +3711,12 @@ export default {
 
 
 
+
 											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 											if(results.length == 0){
 												var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "to" = '${task.to}' AND "cc" = '${task.cc}' AND "ref" = '${item.ref}' AND "created_at" < ${now} LIMIT 1`).all()
 
-												if(results.length){
-													var _item = results[0]
-
-													var decompressedJsonString = new TextDecoder('utf-8').decode(ungzip(_item.data))
-
-													_item.data = JSON.parse(decompressedJsonString)
-
-													item.no = item.data.no = _item.data.no
-
-													item.index = crc32(hashId(item.type+team.id+item.no))
-
-													item.id = hashId(team.id+item.index)
-												}
 											}
 
 											console.log('add results.length',item.type,results.length);
@@ -3789,13 +3733,25 @@ export default {
 
 													_item.data = JSON.parse(decompressedJsonString)
 
+													item.no = item.data.no = _item.data.no
+
+													item.index = crc32(hashId(item.type+team.id+item.no))
+
+													item.id = hashId(team.id+item.index)
+
 													if(item.data.item && !_item.data.item){
 														item.data.item = _item.data.item
 														item.data.node = _item.data.node
 														
 													}
+
+													if(_item.updated_at){
+														item.bcc = hashId(item.type+task.cc.toUpperCase())
+														item.updated_at = updated_at = now
+													}
 												}catch(err){
-													console.log('ungzip err',err);
+													console.log('ungzip err',err, typeof _item.data);
+													delete _item.data
 												}
 
 												if(item.status){
@@ -3814,14 +3770,13 @@ export default {
 
 													console.log('_item.updated_at',_item.updated_at);
 													console.log('item.updated_at',updated_at);
+
 													if(!_item.updated_at){
 														if(updated_at){
 															team.data.base.pages[task.cc][item.type].draft--
 															team.data.base.pages[task.cc][item.type].count++
 														}
 													}
-
-													// item.updated_at = now
 												}
 
 											}else{
@@ -3889,6 +3844,7 @@ export default {
 															리스트에서는 송장번호가 없음
 															상세페이지에서는 송장번호가 있음
 													*/
+
 
 													if(goods.length && item.tracking_number){
 														for(var g = 0; g < goods.length; g++){
@@ -3974,30 +3930,6 @@ export default {
 																delete _tracking.ref
 
 																tracking = mergeNode(_tracking, tracking)
-
-
-
-
-																var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_tracking.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
-
-																if(results.length){
-																	var _item = results[0]
-
-																	if(!_item.updated_at){
-																		if(updated_at){
-																			team.data.base.pages[task.cc].tracking.draft--
-																			team.data.base.pages[task.cc].tracking.count++
-
-																			statements[`logis_${zoneRegion}_items`].push(
-																				env[`logis_${zoneRegion}_items`].prepare(`
-																					UPDATE items SET updated_at = ? WHERE id = ?
-																				`).bind(
-																					now, _item.id
-																				)
-																			)
-																		}
-																	}
-																}
 															}else{
 																// 처음 저장할때 자연어 LLM으로 전처리해서 벡터 저장해야함
 																var content = JSON.stringify({
@@ -4026,7 +3958,7 @@ export default {
 																var system = semantic_prompt_system(language).trim()
 
 																if(models['deepinfra']){
-																	semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+																	semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content, {"temperature": 1})
 
 																	models['deepinfra'] -= 1
 
@@ -4182,6 +4114,37 @@ export default {
 																	tracking.payment_origin ? tracking.payment_origin : "",
 																	tracking.payment_number ? tracking.payment_number : "",
 																	parseFloat(tracking.bundle_shipping ? tracking.bundle_shipping : 0)
+																)
+															)
+
+
+															statements[`logis_${zoneRegion}_items`].push(
+																env[`logis_${zoneRegion}_items`].prepare(`
+																	INSERT INTO items (
+																		"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+																	) VALUES (
+																		?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+																	) ON CONFLICT (id) DO UPDATE SET
+																		"type" = EXCLUDED."type",
+																		"from" = EXCLUDED."from",
+																		"to" = EXCLUDED."to",
+																		"cc" = EXCLUDED."cc",
+																		"bcc" = EXCLUDED."bcc",
+																		"ref" = EXCLUDED."ref",
+																		"data" = EXCLUDED."data",
+																		"created_at" = EXCLUDED."created_at",
+																		"updated_at" = EXCLUDED."updated_at"
+																`).bind(
+																	tracking.id,
+																	tracking.type,
+																	tracking.from,
+																	tracking.to,
+																	tracking.cc,
+																	tracking.bcc,
+																	tracking.ref,
+																	arr.buffer,
+																	now,
+																	updated_at
 																)
 															)
 														}
@@ -4702,7 +4665,7 @@ export default {
 																				var system = semantic_prompt_system(language).trim()
 
 																				if(models['deepinfra']){
-																					semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content)
+																					semantic = await Deepinfra(deepinfra, 'openai/gpt-oss-20b', system, content, {"temperature": 1})
 
 																					models['deepinfra'] -= 1
 
@@ -6186,7 +6149,7 @@ export default {
 											}
 
 											if(!generation && gemini_llm_api){
-												generation = await Gemini(gemini_llm_api, gemini_llm_model, system, content, {"temperature": 1})
+												generation = await Gemini(gemini_llm_api, gemini_llm_model, system, content)
 
 												models[gemini_llm_api+'-'+gemini_llm_model] -= 1
 
