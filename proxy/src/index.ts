@@ -97,6 +97,18 @@ const randomKey = function(){
 	return parseInt(key.replace("0.",""))
 }
 
+function Digest(text) {
+	// \p{P}: 문장 부호 및 구두점 (Punctuation)
+	// \p{S}: 기호 (Symbol - 화폐, 수학 기호 등)
+	// \p{Z}: 공백 및 구분자 (Separator/Whitespace)
+	// u 플래그 필수
+	
+	const regex = /[\p{P}\p{S}\p{Z}]/gu;
+	
+	return hashId(text.replace(regex, "").toLowerCase());
+}
+
+
 
 function normalizeNumericHomoglyphs(str) {
 	if (typeof str !== 'string') return str;
@@ -378,7 +390,7 @@ const item2json = function(type, href){
 				selector:selector
 			},
 			title:{
-				value:${type} goods title | string,,
+				value:${type} goods title | string,
 				selector:selector
 			} 
 			sender_name:{
@@ -1233,100 +1245,100 @@ const twoPartDomains = ["co.kr","co.uk","co.jp","com.cn","co.in","com.mx","co.id
 	사용자 1000명씩 분할
 		- vectorize, d1 둘다
 
-	apac1-logis_items
-	apac1-logis-goods
-	apac1-logis-order
-	apac1-logis-tracking
-	apac1-logis-event
+	commerce-apac1-logis_items
+	commerce-apac1-logis-goods
+	commerce-apac1-logis-order
+	commerce-apac1-logis-tracking
+	commerce-apac1-logis-event
 
 	...
 
 */ 
 
 
-const CenterRegion = "logis_central"
+const CenterRegion = "commerce_logis_center"
 
 const LogisRegion = {
 	// Western North America
-	'us-w': 'logis_wnam',
-	'ca-w': 'logis_wnam',
+	'us-w': 'commerce_logis_wnam',
+	'ca-w': 'commerce_logis_wnam',
 
 	// Eastern North America
-	'us': 'logis_enam',
-	'ca': 'logis_enam',
-	'mx': 'logis_enam',
-	'cu': 'logis_enam',
-	'do': 'logis_enam',
-	'pr': 'logis_enam',
-	'jm': 'logis_enam',
+	'us': 'commerce_logis_enam',
+	'ca': 'commerce_logis_enam',
+	'mx': 'commerce_logis_enam',
+	'cu': 'commerce_logis_enam',
+	'do': 'commerce_logis_enam',
+	'pr': 'commerce_logis_enam',
+	'jm': 'commerce_logis_enam',
 
 	// Western Europe
-	'gb': 'logis_weur',
-	'ie': 'logis_weur',
-	'fr': 'logis_weur',
-	'de': 'logis_weur',
-	'nl': 'logis_weur',
-	'be': 'logis_weur',
-	'lu': 'logis_weur',
-	'ch': 'logis_weur',
-	'at': 'logis_weur',
-	'es': 'logis_weur',
-	'pt': 'logis_weur',
-	'it': 'logis_weur',
-	'se': 'logis_weur',
-	'no': 'logis_weur',
-	'dk': 'logis_weur',
-	'fi': 'logis_weur',
+	'gb': 'commerce_logis_weur',
+	'ie': 'commerce_logis_weur',
+	'fr': 'commerce_logis_weur',
+	'de': 'commerce_logis_weur',
+	'nl': 'commerce_logis_weur',
+	'be': 'commerce_logis_weur',
+	'lu': 'commerce_logis_weur',
+	'ch': 'commerce_logis_weur',
+	'at': 'commerce_logis_weur',
+	'es': 'commerce_logis_weur',
+	'pt': 'commerce_logis_weur',
+	'it': 'commerce_logis_weur',
+	'se': 'commerce_logis_weur',
+	'no': 'commerce_logis_weur',
+	'dk': 'commerce_logis_weur',
+	'fi': 'commerce_logis_weur',
 
 	// Eastern Europe
-	'ru': 'logis_eeur',
-	'pl': 'logis_eeur',
-	'cz': 'logis_eeur',
-	'hu': 'logis_eeur',
-	'ro': 'logis_eeur',
-	'bg': 'logis_eeur',
-	'ua': 'logis_eeur',
-	'gr': 'logis_eeur',
-	'rs': 'logis_eeur',
+	'ru': 'commerce_logis_eeur',
+	'pl': 'commerce_logis_eeur',
+	'cz': 'commerce_logis_eeur',
+	'hu': 'commerce_logis_eeur',
+	'ro': 'commerce_logis_eeur',
+	'bg': 'commerce_logis_eeur',
+	'ua': 'commerce_logis_eeur',
+	'gr': 'commerce_logis_eeur',
+	'rs': 'commerce_logis_eeur',
 
 	// Asia_Pacific
-	'cn': 'logis_apac',
-	'hk': 'logis_apac',
-	'kr': 'logis_apac',
-	'jp': 'logis_apac',
-	'sg': 'logis_apac',
-	'tw': 'logis_apac',
-	'th': 'logis_apac',
-	'vn': 'logis_apac',
-	'my': 'logis_apac',
-	'ph': 'logis_apac',
-	'id': 'logis_apac',
-	'in': 'logis_apac',
-	'pk': 'logis_apac',
-	'bd': 'logis_apac',
+	'cn': 'commerce_logis_apac',
+	'hk': 'commerce_logis_apac',
+	'kr': 'commerce_logis_apac',
+	'jp': 'commerce_logis_apac',
+	'sg': 'commerce_logis_apac',
+	'tw': 'commerce_logis_apac',
+	'th': 'commerce_logis_apac',
+	'vn': 'commerce_logis_apac',
+	'my': 'commerce_logis_apac',
+	'ph': 'commerce_logis_apac',
+	'id': 'commerce_logis_apac',
+	'in': 'commerce_logis_apac',
+	'pk': 'commerce_logis_apac',
+	'bd': 'commerce_logis_apac',
 
 	// Oceania
-	'au': 'logis_oc',
-	'nz': 'logis_oc',
-	'fj': 'logis_oc',
-	'pg': 'logis_oc',
+	'au': 'commerce_logis_oc',
+	'nz': 'commerce_logis_oc',
+	'fj': 'commerce_logis_oc',
+	'pg': 'commerce_logis_oc',
 
 	// South America
-	'br': 'logis_enam', // Brazil
-	'ar': 'logis_enam', // Argentina
-	'cl': 'logis_enam', // Chile
-	'co': 'logis_enam', // Colombia
-	'pe': 'logis_enam', // Peru
+	'br': 'commerce_logis_enam', // Brazil
+	'ar': 'commerce_logis_enam', // Argentina
+	'cl': 'commerce_logis_enam', // Chile
+	'co': 'commerce_logis_enam', // Colombia
+	'pe': 'commerce_logis_enam', // Peru
 
 	// Africa
-	'za': 'logis_weur', // South Africa
-	'ng': 'logis_weur', // Nigeria
-	'eg': 'logis_weur', // Egypt
+	'za': 'commerce_logis_weur', // South Africa
+	'ng': 'commerce_logis_weur', // Nigeria
+	'eg': 'commerce_logis_weur', // Egypt
 
 	// Middle East
-	'sa': 'logis_eeur', // Saudi Arabia
-	'ae': 'logis_eeur', // United Arab Emirates
-	'tr': 'logis_eeur', // Turkey
+	'sa': 'commerce_logis_eeur', // Saudi Arabia
+	'ae': 'commerce_logis_eeur', // United Arab Emirates
+	'tr': 'commerce_logis_eeur', // Turkey
 };
 
 
@@ -2462,7 +2474,7 @@ export default {
 
 							var zoneRegion = task.zone
 
-							var vectorRegion = 'logis-'+zoneRegion.replace(/_/gi,"-")
+							var vectorRegion = 'commerce-logis-'+zoneRegion
 
 							var language = languageCode[task.flag]
 
@@ -2479,12 +2491,12 @@ export default {
 							}
 
 
-							if(!statements[`logis_${zoneRegion}-${tables[0]}`]){
+							if(!statements[`commerce_logis_${zoneRegion}-${tables[0]}`]){
 								for(var t = 0; t < tables.length; t++){
 									var table = tables[t]
 
-									if(!statements[`logis_${zoneRegion}_${table}`]){
-										statements[`logis_${zoneRegion}_${table}`] = []
+									if(!statements[`commerce_logis_${zoneRegion}_${table}`]){
+										statements[`commerce_logis_${zoneRegion}_${table}`] = []
 									}
 								}
 							}
@@ -2641,12 +2653,18 @@ export default {
 
 								item.id = hashId(team.id+item.index)
 
+								item.digest = ''
+
+								if(item.title){
+									item.digest = Digest(item.title)
+								}
+
 
 								item.from = task.from
 
 								item.to = task.to
 
-								item.cc = task.cc // logis.center로 잡혀져 있음 
+								item.cc = task.cc // commerce.logis.center 잡혀져 있음 
 
 								item.bcc = task.bcc
 
@@ -2659,7 +2677,7 @@ export default {
 								var statusCode = item.status = item.status ? parseStatus(item.status) : 0
 
 
-								var { results } = await env[`logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+								var { results } = await env[`commerce_logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "tracking" = ${item.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 								var sales = results
 
@@ -2692,7 +2710,7 @@ export default {
 
 
 								if(type == "tracking"){
-									var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+									var { results } = await env[`commerce_logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 									if(!team.data.base.pages[task.cc]){
 										team.data.base.pages[task.cc] = {}
@@ -2731,8 +2749,8 @@ export default {
 
 											item.order = _order.index
 
-											statements[`logis_${zoneRegion}_sales`].push(
-												env[`logis_${zoneRegion}_sales`].prepare(`
+											statements[`commerce_logis_${zoneRegion}_sales`].push(
+												env[`commerce_logis_${zoneRegion}_sales`].prepare(`
 													UPDATE sales SET updated_at = ?, status = ?, tracking = ? WHERE id = ?
 												`).bind(
 													now, item.status, item.index, _order.id
@@ -2771,12 +2789,12 @@ export default {
 
 										item.order = _item.index
 
-										statements[`logis_${zoneRegion}_items`].push(
-											env[`logis_${zoneRegion}_items`].prepare(`
+										statements[`commerce_logis_${zoneRegion}_items`].push(
+											env[`commerce_logis_${zoneRegion}_items`].prepare(`
 												INSERT INTO items (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+													"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 												) ON CONFLICT (id) DO UPDATE SET
 													"type" = EXCLUDED."type",
 													"from" = EXCLUDED."from",
@@ -2784,6 +2802,7 @@ export default {
 													"cc" = EXCLUDED."cc",
 													"bcc" = EXCLUDED."bcc",
 													"ref" = EXCLUDED."ref",
+													"digest" = EXCLUDED."digest",
 													"data" = EXCLUDED."data",
 													"created_at" = EXCLUDED."created_at",
 													"updated_at" = EXCLUDED."updated_at"
@@ -2794,8 +2813,9 @@ export default {
 												_item.to,
 												_item.cc,
 												_item.bcc,
-												_item.data,
 												item.id,
+												_item.digest,
+												_item.data,
 												_data.time,
 												now
 											)
@@ -2899,19 +2919,19 @@ export default {
 
 										await env[`${vectorRegion}-${type}`].upsert($VectorizeVector)
 
-										statements[`logis_${zoneRegion}_items`].push(
-											env[`logis_${zoneRegion}_items`].prepare(`
+										statements[`commerce_logis_${zoneRegion}_items`].push(
+											env[`commerce_logis_${zoneRegion}_items`].prepare(`
 												INSERT INTO items (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+													"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 												) ON CONFLICT (id) DO UPDATE SET
 													"type" = EXCLUDED."type",
 													"from" = EXCLUDED."from",
 													"to" = EXCLUDED."to",
 													"cc" = EXCLUDED."cc",
 													"bcc" = EXCLUDED."bcc",
-													"ref" = EXCLUDED."ref",
+													"digest" = EXCLUDED."digest",
 													"data" = EXCLUDED."data",
 													"created_at" = EXCLUDED."created_at",
 													"updated_at" = EXCLUDED."updated_at"
@@ -2923,6 +2943,7 @@ export default {
 												task.cc,
 												task.bcc,
 												task.ref,
+												task.digest,
 												arr.buffer,
 												now,
 												0
@@ -2931,8 +2952,8 @@ export default {
 									}
 
 
-									statements[`logis_${zoneRegion}_tracking`].push(
-										env[`logis_${zoneRegion}_tracking`].prepare(`
+									statements[`commerce_logis_${zoneRegion}_tracking`].push(
+										env[`commerce_logis_${zoneRegion}_tracking`].prepare(`
 											INSERT INTO tracking (
 												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 											) VALUES (
@@ -3310,6 +3331,7 @@ export default {
 										cc : task.cc,
 										bcc: hashId(page.type+task.cc.toUpperCase()),
 										ref: task.ref,
+										digest : '',
 										data:null,
 										created_at:now,
 										updated_at:now
@@ -3491,6 +3513,8 @@ export default {
 
 									page.id = task.page ? task.page.id : pageId
 
+									page.digest = ''
+
 									console.log('page.id',page.id);
 
 									console.log('page',JSON.stringify(page));
@@ -3529,12 +3553,12 @@ export default {
 											)
 										)
 										
-										statements[`logis_${zoneRegion}_items`].push(
-											env[`logis_${zoneRegion}_items`].prepare(`
+										statements[`commerce_logis_${zoneRegion}_items`].push(
+											env[`commerce_logis_${zoneRegion}_items`].prepare(`
 												INSERT INTO items (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+													"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 												) ON CONFLICT (id) DO UPDATE SET
 													"type" = EXCLUDED."type",
 													"from" = EXCLUDED."from",
@@ -3542,6 +3566,7 @@ export default {
 													"cc" = EXCLUDED."cc",
 													"bcc" = EXCLUDED."bcc",
 													"ref" = EXCLUDED."ref",
+													"digest" = EXCLUDED."digest",
 													"data" = EXCLUDED."data",
 													"created_at" = EXCLUDED."created_at",
 													"updated_at" = EXCLUDED."updated_at"
@@ -3553,6 +3578,7 @@ export default {
 												page.cc,
 												page.bcc,
 												page.ref,
+												page.digest,
 												page.data,
 												now,
 												now
@@ -3668,6 +3694,8 @@ export default {
 											}else if(item.type == "event" || item.type == "coupon"){
 												itemType = "event"
 
+											}else{
+												continue
 											}
 
 											if(item.registration_date){
@@ -3708,14 +3736,21 @@ export default {
 												origin : task.origin ? task.origin : ''
 											}
 
+											item.digest = ''
+
+											if(item.title){
+												item.digest = Digest(item.title)
+											}
 
 
 
 
-											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+
+
+											var { results } = await env[`commerce_logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 											if(results.length == 0){
-												var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "to" = '${task.to}' AND "cc" = '${task.cc}' AND "ref" = '${item.ref}' AND "created_at" < ${now} LIMIT 1`).all()
+												var { results } = await env[`commerce_logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "to" = '${task.to}' AND "cc" = '${task.cc}' AND "ref" = '${item.ref}' AND "created_at" < ${now} LIMIT 1`).all()
 
 											}
 
@@ -3724,6 +3759,7 @@ export default {
 											console.log('item.updated_at',item.updated_at ? 'true' : 'false');
 
 											console.log('team.data.base.pages[task.cc][item.type]',JSON.stringify(team.data.base.pages[task.cc]));
+
 
 											if(results.length){
 												var _item = results[0]
@@ -3763,7 +3799,7 @@ export default {
 
 												item = mergeNode(_item, item)
 
-												var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_item.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+												var { results } = await env[`commerce_logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${_item.id}' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 												if(results.length){
 													var _item = results[0]
@@ -3866,7 +3902,7 @@ export default {
 
 																good.index = crc32(hashId('goods'+team.id+good.no))
 
-																var { results } = await env[`logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = 'goods' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+																var { results } = await env[`commerce_logis_${zoneRegion}_sales`].prepare(`SELECT * FROM sales WHERE "type" = 'goods' AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 																if(results.length){
 																	tracking.event = results[0].event
@@ -3880,6 +3916,8 @@ export default {
 																tracking.id = hashId(team.id+tracking.no)
 
 															}
+
+															tracking.digest = item.digest
 
 
 															tracking.status = item.status
@@ -3918,7 +3956,7 @@ export default {
 
 
 
-															var { results } = await env[`logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = ${tracking.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+															var { results } = await env[`commerce_logis_${zoneRegion}_tracking`].prepare(`SELECT * FROM tracking WHERE "index" = ${tracking.index} AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 															if(results.length){
 																var _tracking = safeClone(results[0])
@@ -4037,8 +4075,8 @@ export default {
 
 															console.log('tracking',JSON.stringify(tracking))
 
-															statements[`logis_${zoneRegion}_tracking`].push(
-																env[`logis_${zoneRegion}_tracking`].prepare(`
+															statements[`commerce_logis_${zoneRegion}_tracking`].push(
+																env[`commerce_logis_${zoneRegion}_tracking`].prepare(`
 																	INSERT INTO tracking (
 																		"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 																	) VALUES (
@@ -4118,12 +4156,12 @@ export default {
 															)
 
 
-															statements[`logis_${zoneRegion}_items`].push(
-																env[`logis_${zoneRegion}_items`].prepare(`
+															statements[`commerce_logis_${zoneRegion}_items`].push(
+																env[`commerce_logis_${zoneRegion}_items`].prepare(`
 																	INSERT INTO items (
-																		"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+																		"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 																	) VALUES (
-																		?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+																		?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 																	) ON CONFLICT (id) DO UPDATE SET
 																		"type" = EXCLUDED."type",
 																		"from" = EXCLUDED."from",
@@ -4131,6 +4169,7 @@ export default {
 																		"cc" = EXCLUDED."cc",
 																		"bcc" = EXCLUDED."bcc",
 																		"ref" = EXCLUDED."ref",
+																		"digest" = EXCLUDED."digest",
 																		"data" = EXCLUDED."data",
 																		"created_at" = EXCLUDED."created_at",
 																		"updated_at" = EXCLUDED."updated_at"
@@ -4142,6 +4181,7 @@ export default {
 																	tracking.cc,
 																	tracking.bcc,
 																	tracking.ref,
+																	tracking.digest,
 																	arr.buffer,
 																	now,
 																	updated_at
@@ -4174,7 +4214,7 @@ export default {
 											}
 
 
-											var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
+											var { results } = await env[`commerce_logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "id" = '${item.id}' AND "to" = '${task.to}' AND "created_at" < ${now} LIMIT 1`).all()
 
 											if(results.length){
 												var _item = results[0]
@@ -4191,7 +4231,7 @@ export default {
 
 
 											}else{
-												var { results } = await env[`logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
+												var { results } = await env[`commerce_logis_${zoneRegion}_${itemType}`].prepare(`SELECT * FROM ${itemType} WHERE "index" = ${item.index} AND "to" = '${task.to}' AND "cc" = '${task.cc}' AND "created_at" < ${now} LIMIT 1`).all()
 
 												if(results.length){
 													var _item = results[0]
@@ -4446,20 +4486,20 @@ export default {
 															var status = query[0].status
 
 															// if(typeof status != "undefined"){
-															// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+															// 	var { results } = await env[`commerce_logis_${zoneRegion}_${table}`].prepare(
 															// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "status" < ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
 															// 	).bind(
 															// 		column_value, team.id, item.cc, status, now
 															// 	).all()
 															// }else{
-															// 	var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+															// 	var { results } = await env[`commerce_logis_${zoneRegion}_${table}`].prepare(
 															// 		`SELECT * FROM ${table} WHERE "type" = "${type}" AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
 															// 	).bind(
 															// 		column_value, team.id, item.cc, now
 															// 	).all()
 															// }
 
-															var { results } = await env[`logis_${zoneRegion}_${table}`].prepare(
+															var { results } = await env[`commerce_logis_${zoneRegion}_${table}`].prepare(
 																`SELECT * FROM ${table} WHERE "type" = ? AND "${column}" = ? AND "to" = ? AND "cc" = ? AND "created_at" < ? ORDER BY created_at DESC LIMIT 1`
 															).bind(
 																type, column_value, team.id, item.cc, now
@@ -4752,8 +4792,8 @@ export default {
 
 
 																		if(edgeType == "sales"){
-																			statements[`logis_${zoneRegion}_sales`].push(
-																				env[`logis_${zoneRegion}_sales`].prepare(`
+																			statements[`commerce_logis_${zoneRegion}_sales`].push(
+																				env[`commerce_logis_${zoneRegion}_sales`].prepare(`
 																					INSERT INTO sales (
 																						"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "status", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
 																					) VALUES (
@@ -4844,8 +4884,8 @@ export default {
 																				)
 																			)
 																		}else if(edgeType == "tracking"){
-																			statements[`logis_${zoneRegion}_tracking`].push(
-																				env[`logis_${zoneRegion}_tracking`].prepare(`
+																			statements[`commerce_logis_${zoneRegion}_tracking`].push(
+																				env[`commerce_logis_${zoneRegion}_tracking`].prepare(`
 																					INSERT INTO tracking (
 																						"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 																					) VALUES (
@@ -4924,8 +4964,8 @@ export default {
 																				)
 																			)
 																		}else if(edgeType == "event"){
-																			statements[`logis_${zoneRegion}_event`].push(
-																				env[`logis_${zoneRegion}_event`].prepare(`
+																			statements[`commerce_logis_${zoneRegion}_event`].push(
+																				env[`commerce_logis_${zoneRegion}_event`].prepare(`
 																					INSERT INTO event (
 																						"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
 																					) VALUES (
@@ -4991,7 +5031,7 @@ export default {
 
 
 
-																		var { results } = await env[`logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${edge.id}' AND "created_at" < ${now} AND "updated_at" = 0 LIMIT 1`).all()
+																		var { results } = await env[`commerce_logis_${zoneRegion}_items`].prepare(`SELECT * FROM items WHERE "id" = '${edge.id}' AND "created_at" < ${now} AND "updated_at" = 0 LIMIT 1`).all()
 
 																		if(results.length){
 																			var _item = results[0]
@@ -5002,8 +5042,8 @@ export default {
 																					team.data.base.pages[edge.cc][edge.type].draft--
 																					team.data.base.pages[edge.cc][edge.type].count++
 
-																					statements[`logis_${zoneRegion}_items`].push(
-																						env[`logis_${zoneRegion}_items`].prepare(`
+																					statements[`commerce_logis_${zoneRegion}_items`].push(
+																						env[`commerce_logis_${zoneRegion}_items`].prepare(`
 																							UPDATE items SET updated_at = ? WHERE id = ?
 																						`).bind(
 																							now, row.id
@@ -5032,7 +5072,7 @@ export default {
 																	// var draftId = hashId(item.id)
 
 
-																	var { results } = await env[`logis_${zoneRegion}_${edgeType}`].prepare(`SELECT * FROM ${edgeType} WHERE "index" = '${edge.index}' AND "type" = '${edge.type}' AND "created_at" < ${now} LIMIT 1`).all()
+																	var { results } = await env[`commerce_logis_${zoneRegion}_${edgeType}`].prepare(`SELECT * FROM ${edgeType} WHERE "index" = '${edge.index}' AND "type" = '${edge.type}' AND "created_at" < ${now} LIMIT 1`).all()
 
 																	if(results.length){
 																		var _item = results[0]
@@ -5043,8 +5083,8 @@ export default {
 																				team.data.base.pages[edge.cc][edge.type].count++
 																				team.data.base[edge.type].count++
 
-																				statements[`logis_${zoneRegion}_items`].push(
-																					env[`logis_${zoneRegion}_items`].prepare(`
+																				statements[`commerce_logis_${zoneRegion}_items`].push(
+																					env[`commerce_logis_${zoneRegion}_items`].prepare(`
 																						UPDATE items SET updated_at = ? WHERE id = ?
 																					`).bind(
 																						now, item.id
@@ -5065,12 +5105,12 @@ export default {
 																			data : relate
 																		})), { to: 'arraybuffer' })
 
-																		statements[`logis_${zoneRegion}_items`].push(
-																			env[`logis_${zoneRegion}_items`].prepare(`
+																		statements[`commerce_logis_${zoneRegion}_items`].push(
+																			env[`commerce_logis_${zoneRegion}_items`].prepare(`
 																				INSERT INTO items (
-																					"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+																					"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 																				) VALUES (
-																					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+																					?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 																				) ON CONFLICT (id) DO UPDATE SET
 																					"type" = EXCLUDED."type",
 																					"from" = EXCLUDED."from",
@@ -5078,6 +5118,7 @@ export default {
 																					"cc" = EXCLUDED."cc",
 																					"bcc" = EXCLUDED."bcc",
 																					"ref" = EXCLUDED."ref",
+																					"digest" = EXCLUDED."digest",
 																					"data" = EXCLUDED."data",
 																					"created_at" = EXCLUDED."created_at",
 																					"updated_at" = EXCLUDED."updated_at"
@@ -5089,6 +5130,7 @@ export default {
 																				item.cc,
 																				item.bcc,
 																				'',
+																				item.digest,
 																				arr.buffer,
 																				now,
 																				0
@@ -5164,7 +5206,10 @@ export default {
 													continue
 												}
 
+												
+
 												await env[`${vectorRegion}-${itemType}`].upsert($VectorizeVector)
+
 											}
 
 											item.data.text = item.semantic
@@ -5176,12 +5221,12 @@ export default {
 
 											item.data = arr.buffer
 
-											statements[`logis_${zoneRegion}_items`].push(
-												env[`logis_${zoneRegion}_items`].prepare(`
+											statements[`commerce_logis_${zoneRegion}_items`].push(
+												env[`commerce_logis_${zoneRegion}_items`].prepare(`
 													INSERT INTO items (
-														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+														"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 													) VALUES (
-														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+														?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 													) ON CONFLICT (id) DO UPDATE SET
 														"type" = EXCLUDED."type",
 														"from" = EXCLUDED."from",
@@ -5189,6 +5234,7 @@ export default {
 														"cc" = EXCLUDED."cc",
 														"bcc" = EXCLUDED."bcc",
 														"ref" = EXCLUDED."ref",
+														"digest" = EXCLUDED."digest",
 														"data" = EXCLUDED."data",
 														"created_at" = EXCLUDED."created_at",
 														"updated_at" = EXCLUDED."updated_at"
@@ -5200,6 +5246,7 @@ export default {
 													item.cc,
 													item.bcc,
 													item.ref,
+													item.digest,
 													item.data,
 													now,
 													updated_at
@@ -5207,8 +5254,8 @@ export default {
 											)
 												
 											if(itemType == "sales"){
-												statements[`logis_${zoneRegion}_sales`].push(
-													env[`logis_${zoneRegion}_sales`].prepare(`
+												statements[`commerce_logis_${zoneRegion}_sales`].push(
+													env[`commerce_logis_${zoneRegion}_sales`].prepare(`
 														INSERT INTO sales (
 															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods", "status", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking", "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit", "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date"
 														) VALUES (
@@ -5299,8 +5346,8 @@ export default {
 													)
 												)
 											}else if(itemType == "tracking"){
-												statements[`logis_${zoneRegion}_tracking`].push(
-													env[`logis_${zoneRegion}_tracking`].prepare(`
+												statements[`commerce_logis_${zoneRegion}_tracking`].push(
+													env[`commerce_logis_${zoneRegion}_tracking`].prepare(`
 														INSERT INTO tracking (
 															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no", "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date", "payment_method", "payment_origin", "payment_number", "bundle_shipping"
 														) VALUES (
@@ -5379,8 +5426,8 @@ export default {
 													)
 												)
 											}else if(itemType == "event"){
-												statements[`logis_${zoneRegion}_event`].push(
-													env[`logis_${zoneRegion}_event`].prepare(`
+												statements[`commerce_logis_${zoneRegion}_event`].push(
+													env[`commerce_logis_${zoneRegion}_event`].prepare(`
 														INSERT INTO event (
 															"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "number", "address", "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount", "new_customer_only", "first_purchase_only", "region_restrictions"
 														) VALUES (
@@ -5476,12 +5523,12 @@ export default {
 											)
 										)
 
-										statements[`logis_${zoneRegion}_items`].push(
-											env[`logis_${zoneRegion}_items`].prepare(`
+										statements[`commerce_logis_${zoneRegion}_items`].push(
+											env[`commerce_logis_${zoneRegion}_items`].prepare(`
 												INSERT INTO items (
-													"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+													"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 												) VALUES (
-													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+													?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 												) ON CONFLICT (id) DO UPDATE SET
 													"type" = EXCLUDED."type",
 													"from" = EXCLUDED."from",
@@ -5489,6 +5536,7 @@ export default {
 													"cc" = EXCLUDED."cc",
 													"bcc" = EXCLUDED."bcc",
 													"ref" = EXCLUDED."ref",
+													"digest" = EXCLUDED."digest",
 													"data" = EXCLUDED."data",
 													"created_at" = EXCLUDED."created_at",
 													"updated_at" = EXCLUDED."updated_at"
@@ -5500,6 +5548,7 @@ export default {
 												detail.cc,
 												detail.bcc,
 												detail.ref,
+												detail.digest,
 												detail.data,
 												now,
 												now
@@ -5555,12 +5604,12 @@ export default {
 										origin : task.origin ? task.origin : ''
 									})), { to: 'arraybuffer' })
 
-									statements[`logis_${zoneRegion}_items`].push(
-										env[`logis_${zoneRegion}_items`].prepare(`
+									statements[`commerce_logis_${zoneRegion}_items`].push(
+										env[`commerce_logis_${zoneRegion}_items`].prepare(`
 											INSERT INTO items (
-												"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
+												"id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"
 											) VALUES (
-												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+												?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
 											) ON CONFLICT (id) DO UPDATE SET
 												"type" = EXCLUDED."type",
 												"from" = EXCLUDED."from",
@@ -5568,6 +5617,7 @@ export default {
 												"cc" = EXCLUDED."cc",
 												"bcc" = EXCLUDED."bcc",
 												"ref" = EXCLUDED."ref",
+												"digest" = EXCLUDED."digest",
 												"data" = EXCLUDED."data",
 												"created_at" = EXCLUDED."created_at",
 												"updated_at" = EXCLUDED."updated_at"
@@ -5579,6 +5629,7 @@ export default {
 											task.cc,
 											task.bcc,
 											task.ref,
+											task.digest,
 											arr.buffer,
 											now,
 											now
@@ -5752,7 +5803,7 @@ export default {
 
 								// // 유료 회원이면 이전 컨텍스트 합쳐서 답변하기
 								// if(task.topK > 50){
-								// 	var { results, success, error } = await env[`logis_${zoneRegion}_talks`].prepare(
+								// 	var { results, success, error } = await env[`commerce_logis_${zoneRegion}_talks`].prepare(
 								// 		`SELECT * FROM talks WHERE "bcc" = '${task.bcc}' AND "created_at" < ${created_at} AND "updated_at" = ${task.updated_at} ORDER BY created_at DESC LIMIT 5`
 								// 	).all()
 
@@ -5760,7 +5811,7 @@ export default {
 								// 		for(var r = 0; r < results.length; r++){
 								// 			var retrieval = results[r]
 
-								// 			var { results, success, error } = await env[`logis_${zoneRegion}_${retrieval.type}`].prepare(
+								// 			var { results, success, error } = await env[`commerce_logis_${zoneRegion}_${retrieval.type}`].prepare(
 								// 				`SELECT * FROM ${retrieval.type} WHERE "ref" = '${retrieval.ref}' AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 100`
 								// 			).all()
 
@@ -5784,8 +5835,8 @@ export default {
 								// 				}
 								// 			}
 
-								// 			statements[`logis_${zoneRegion}_talks`].push(
-								// 				env[`logis_${zoneRegion}_talks`].prepare(`
+								// 			statements[`commerce_logis_${zoneRegion}_talks`].push(
+								// 				env[`commerce_logis_${zoneRegion}_talks`].prepare(`
 								// 					UPDATE talks SET updated_at = ? WHERE id = ?
 								// 				`).bind(
 								// 					now, retrieval.id
@@ -6022,7 +6073,7 @@ export default {
 												console.log('type',type);
 
 												try{
-													var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
+													var { results } = await env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
 
 													if(results.length){
 														for(var r = 0; r < results.length; r++){
@@ -6081,7 +6132,7 @@ export default {
 
 													console.log(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`);
 													 
-													var { results } = await env[`logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`).all()
+													var { results } = await env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`).all()
 
 													console.log('results.length',results.length);
 
@@ -6173,8 +6224,8 @@ export default {
 
 											context.data = arr.buffer
 
-											statements[`logis_${zoneRegion}_talks`].push(
-												env[`logis_${zoneRegion}_talks`].prepare(`
+											statements[`commerce_logis_${zoneRegion}_talks`].push(
+												env[`commerce_logis_${zoneRegion}_talks`].prepare(`
 													INSERT INTO talks (
 														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 													) VALUES (
@@ -6203,8 +6254,8 @@ export default {
 												)
 											)
 
-											statements[`logis_${zoneRegion}_talks`].push(
-												env[`logis_${zoneRegion}_talks`].prepare(`
+											statements[`commerce_logis_${zoneRegion}_talks`].push(
+												env[`commerce_logis_${zoneRegion}_talks`].prepare(`
 													INSERT INTO talks (
 														"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 													) VALUES (
@@ -6246,8 +6297,8 @@ export default {
 							if(fallback){
 								console.log('fallback',fallback);
 
-								statements[`logis_${zoneRegion}_talks`].push(
-									env[`logis_${zoneRegion}_talks`].prepare(`
+								statements[`commerce_logis_${zoneRegion}_talks`].push(
+									env[`commerce_logis_${zoneRegion}_talks`].prepare(`
 										INSERT INTO talks (
 											"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 										) VALUES (
@@ -6287,8 +6338,8 @@ export default {
 								talk.data = arr.buffer
 							}
 
-							statements[`logis_${zoneRegion}_talks`].push(
-								env[`logis_${zoneRegion}_talks`].prepare(`
+							statements[`commerce_logis_${zoneRegion}_talks`].push(
+								env[`commerce_logis_${zoneRegion}_talks`].prepare(`
 									INSERT INTO talks (
 										"id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"
 									) VALUES (
@@ -6317,8 +6368,8 @@ export default {
 								)
 							)
 
-							// statements[`logis_${zoneRegion}_talks`].push(
-							// 	env[`logis_${zoneRegion}_talks`].prepare(`
+							// statements[`commerce_logis_${zoneRegion}_talks`].push(
+							// 	env[`commerce_logis_${zoneRegion}_talks`].prepare(`
 							// 		UPDATE talks SET updated_at = ? WHERE id = ?
 							// 	`).bind(
 							// 		now, task.id

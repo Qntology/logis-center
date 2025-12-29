@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS items (
     "cc" TEXT,
     "bcc" TEXT,
     "ref" TEXT,
+    "digest" TEXT,
     "data" BLOB NULL,
     "created_at" INTEGER,
     "updated_at" INTEGER

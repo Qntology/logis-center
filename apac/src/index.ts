@@ -46,89 +46,89 @@ const isDiff = (obj1, obj2) => {
 	return false;
 };
 
-const CenterRegion = "logis_central"
+const CenterRegion = "commerce_logis_center"
 
 const LogisRegion = {
 	// Western North America
-	'us-w': 'logis_wnam',
-	'ca-w': 'logis_wnam',
+	'us-w': 'commerce_logis_wnam',
+	'ca-w': 'commerce_logis_wnam',
 
 	// Eastern North America
-	'us': 'logis_enam',
-	'ca': 'logis_enam',
-	'mx': 'logis_enam',
-	'cu': 'logis_enam',
-	'do': 'logis_enam',
-	'pr': 'logis_enam',
-	'jm': 'logis_enam',
+	'us': 'commerce_logis_enam',
+	'ca': 'commerce_logis_enam',
+	'mx': 'commerce_logis_enam',
+	'cu': 'commerce_logis_enam',
+	'do': 'commerce_logis_enam',
+	'pr': 'commerce_logis_enam',
+	'jm': 'commerce_logis_enam',
 
 	// Western Europe
-	'gb': 'logis_weur',
-	'ie': 'logis_weur',
-	'fr': 'logis_weur',
-	'de': 'logis_weur',
-	'nl': 'logis_weur',
-	'be': 'logis_weur',
-	'lu': 'logis_weur',
-	'ch': 'logis_weur',
-	'at': 'logis_weur',
-	'es': 'logis_weur',
-	'pt': 'logis_weur',
-	'it': 'logis_weur',
-	'se': 'logis_weur',
-	'no': 'logis_weur',
-	'dk': 'logis_weur',
-	'fi': 'logis_weur',
+	'gb': 'commerce_logis_weur',
+	'ie': 'commerce_logis_weur',
+	'fr': 'commerce_logis_weur',
+	'de': 'commerce_logis_weur',
+	'nl': 'commerce_logis_weur',
+	'be': 'commerce_logis_weur',
+	'lu': 'commerce_logis_weur',
+	'ch': 'commerce_logis_weur',
+	'at': 'commerce_logis_weur',
+	'es': 'commerce_logis_weur',
+	'pt': 'commerce_logis_weur',
+	'it': 'commerce_logis_weur',
+	'se': 'commerce_logis_weur',
+	'no': 'commerce_logis_weur',
+	'dk': 'commerce_logis_weur',
+	'fi': 'commerce_logis_weur',
 
 	// Eastern Europe
-	'ru': 'logis_eeur',
-	'pl': 'logis_eeur',
-	'cz': 'logis_eeur',
-	'hu': 'logis_eeur',
-	'ro': 'logis_eeur',
-	'bg': 'logis_eeur',
-	'ua': 'logis_eeur',
-	'gr': 'logis_eeur',
-	'rs': 'logis_eeur',
+	'ru': 'commerce_logis_eeur',
+	'pl': 'commerce_logis_eeur',
+	'cz': 'commerce_logis_eeur',
+	'hu': 'commerce_logis_eeur',
+	'ro': 'commerce_logis_eeur',
+	'bg': 'commerce_logis_eeur',
+	'ua': 'commerce_logis_eeur',
+	'gr': 'commerce_logis_eeur',
+	'rs': 'commerce_logis_eeur',
 
 	// Asia_Pacific
-	'cn': 'logis_apac',
-	'hk': 'logis_apac',
-	'kr': 'logis_apac',
-	'jp': 'logis_apac',
-	'sg': 'logis_apac',
-	'tw': 'logis_apac',
-	'th': 'logis_apac',
-	'vn': 'logis_apac',
-	'my': 'logis_apac',
-	'ph': 'logis_apac',
-	'id': 'logis_apac',
-	'in': 'logis_apac',
-	'pk': 'logis_apac',
-	'bd': 'logis_apac',
+	'cn': 'commerce_logis_apac',
+	'hk': 'commerce_logis_apac',
+	'kr': 'commerce_logis_apac',
+	'jp': 'commerce_logis_apac',
+	'sg': 'commerce_logis_apac',
+	'tw': 'commerce_logis_apac',
+	'th': 'commerce_logis_apac',
+	'vn': 'commerce_logis_apac',
+	'my': 'commerce_logis_apac',
+	'ph': 'commerce_logis_apac',
+	'id': 'commerce_logis_apac',
+	'in': 'commerce_logis_apac',
+	'pk': 'commerce_logis_apac',
+	'bd': 'commerce_logis_apac',
 
 	// Oceania
-	'au': 'logis_oc',
-	'nz': 'logis_oc',
-	'fj': 'logis_oc',
-	'pg': 'logis_oc',
+	'au': 'commerce_logis_oc',
+	'nz': 'commerce_logis_oc',
+	'fj': 'commerce_logis_oc',
+	'pg': 'commerce_logis_oc',
 
 	// South America
-	'br': 'logis_enam', // Brazil
-	'ar': 'logis_enam', // Argentina
-	'cl': 'logis_enam', // Chile
-	'co': 'logis_enam', // Colombia
-	'pe': 'logis_enam', // Peru
+	'br': 'commerce_logis_enam', // Brazil
+	'ar': 'commerce_logis_enam', // Argentina
+	'cl': 'commerce_logis_enam', // Chile
+	'co': 'commerce_logis_enam', // Colombia
+	'pe': 'commerce_logis_enam', // Peru
 
 	// Africa
-	'za': 'logis_weur', // South Africa
-	'ng': 'logis_weur', // Nigeria
-	'eg': 'logis_weur', // Egypt
+	'za': 'commerce_logis_weur', // South Africa
+	'ng': 'commerce_logis_weur', // Nigeria
+	'eg': 'commerce_logis_weur', // Egypt
 
 	// Middle East
-	'sa': 'logis_eeur', // Saudi Arabia
-	'ae': 'logis_eeur', // United Arab Emirates
-	'tr': 'logis_eeur', // Turkey
+	'sa': 'commerce_logis_eeur', // Saudi Arabia
+	'ae': 'commerce_logis_eeur', // United Arab Emirates
+	'tr': 'commerce_logis_eeur', // Turkey
 };
 
 
@@ -366,7 +366,7 @@ async function Cron(event, env, ctx, models, limits, timeout){
 						})), { to: 'arraybuffer' })
 
 						try{
-							const res = await fetch(`https://proxy.logis.center`, {
+							const res = await fetch(`https://proxy.commerce.logis.center`, {
 								method: "POST",
 								headers: {
 									'Content-Type': 'application/octet-stream',
