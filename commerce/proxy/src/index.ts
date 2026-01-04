@@ -2526,6 +2526,8 @@ export default {
 								}
 							}
 
+
+
 							console.log('team.data.base.pages',JSON.stringify(team.data.base.pages));
 
 
@@ -2584,8 +2586,6 @@ export default {
 										}
 									}
 								}
-
-								console.log('address',JSON.stringify(address));
 
 								var system = image2json(task.flag, language, type, address)
 
@@ -2672,7 +2672,9 @@ export default {
 
 								item.created_at = now
 
-								
+
+
+
 
 								var statusCode = item.status = item.status ? parseStatus(item.status) : 0
 
@@ -2774,6 +2776,7 @@ export default {
 											// items 추가 해야함
 										}
 									}
+
 										
 
 									item.ref = task.ref
@@ -3056,6 +3059,7 @@ export default {
 
 									if(selector){
 										try{
+
 											var { document } = parseHTML(`<html><body>${task.body}</body></html>`);
 
 											var $target = document.querySelectorAll(selector)
@@ -3063,6 +3067,7 @@ export default {
 											if($target.length){
 												bool = true
 											}
+
 										}catch(err){
 											console.log('more page err',err);
 										}
