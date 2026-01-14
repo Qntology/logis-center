@@ -15,62 +15,6 @@ import { ethers } from 'ethers'
 	사용자가 안사용하는 벡터 DB 자동 정리하는 기능 추가하기
 */
 
-/*
-	team.data.base.graph
-		page.ref = 레퍼러
-		page.ref 간에 연결을 프로세스로 보여줌
-
-
-		오른쪽 
-			UI 채팅으로 노출시킬 내용은 스캔, 프롬프트 결과만
-
-		왼쪽영역
-			노출할 내용
-				- 페이지 테이블
-				- 연관 테이블
-				- 메모
-
-		실제 page.ref 값
-			shopping_mall.host
-				> goods
-					// tracking 테이블에서 해당 list, detail id 값 참조해서 날짜 값을 기준으로 평가함
-
-					> list 플로우
-						?type=order &created_at = ${Today} &limit = 100
-						
-						~~ 상품명	최근 24시간 주문	재고	상태
-						~~ 상품 A	23건 (+15%)	12	🔥 판매호조
-						~~ 상품 B	0건 (-100%)	150	⚠️ 판매정체
-						
-						> detail
-							~~ “최근 24시간 주문 15건”, “이번 주 82건, 지난주 대비 +12%”
-							~~ 조회 트래킹을 해보세요!
-
-				> order
-					> list 플로우
-						?type=tracking &created_at = ${Today} &limit = 100
-						
-						~~ 주문 대기 상태 상품 리스트 표시
-						~~ 작업자 상태
-						++ 작업 프로세스 플로우 메모
-						++ tracking draft 노출
-
-						> detail 플로우
-							0. event 있으면 플로우 표시
-							1. goods 표시
-							2. order 표시
-							3. tracking 표시
-
-							~~ 주문 대기 상태 상품 정보 표시
-							~~ 작업 상태 or 설정
-
-							++ 작업 프로세스 플로우 메모
-
-							++ tracking draft 노출
-
-*/
-
-
 function crc32(s) { var polynomial = arguments.length < 2 ? 0x04C11DB7 : arguments[1], initialValue = arguments.length < 3 ? 0xFFFFFFFF : arguments[2], finalXORValue = arguments.length < 4 ? 0xFFFFFFFF : arguments[3], crc = initialValue, table = [], i, j, c; function reverse(x, n) { var b = 0; while (n) { b = b * 2 + x % 2; x /= 2; x -= x % 1; n--; } return b; } for (i = 256; i >= 0; i--) { c = reverse(i, 32); for (j = 0; j < 8; j++) { c = ((c * 2) ^ (((c >>> 31) % 2) * polynomial)) >>> 0; } table[i] = reverse(c, 32); } for (i = 0; i < s.length; i++) { c = s.charCodeAt(i); if (c > 255) { throw new RangeError(); } j = (crc % 256) ^ c; crc = ((crc / 256) ^ table[j]) >>> 0; } return (crc ^ finalXORValue) >>> 0; }
 
 var rowsTrim = function(rows, key, value){
@@ -107,8 +51,6 @@ function Digest(text) {
 	
 	return hashId(text.replace(regex, "").toLowerCase());
 }
-
-
 
 function normalizeNumericHomoglyphs(str) {
 	if (typeof str !== 'string') return str;
