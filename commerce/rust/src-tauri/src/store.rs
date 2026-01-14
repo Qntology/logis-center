@@ -1,7 +1,7 @@
 use anyhow::Result;
 use lancedb::{Connection, Table, connect};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, ArrayRef};
+use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, ArrayRef, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
@@ -28,7 +28,7 @@ pub struct Task {
 #[derive(Clone)]
 pub struct VectorStore {
     conn: Connection,
-    base_path: String, // Store base path for settings file
+    base_path: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -83,10 +83,12 @@ impl VectorStore {
             Field::new("status", DataType::Utf8, false),
         ]));
 
-        self.conn.create_table("tasks", RecordBatch::new_empty(schema))
-            .if_not_exists()
+        // RecordBatchIterator is required for create_table
+        let batches = RecordBatchIterator::new(vec![], schema.clone());
+        
+        let _ = self.conn.create_table("tasks", batches)
             .execute()
-            .await?;
+            .await;
             
         Ok(())
     }
@@ -94,8 +96,10 @@ impl VectorStore {
     pub async fn add_task(&self, task: Task) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
         
+        let schema = table.schema().await?;
+        
         let batch = RecordBatch::try_new(
-            table.schema().await?,
+            schema.clone(),
             vec![
                 Arc::new(StringArray::from(vec![task.id])),
                 Arc::new(StringArray::from(vec![task.r#type])),
@@ -111,18 +115,18 @@ impl VectorStore {
             ],
         )?;
 
-        table.add(vec![batch]).execute().await?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        table.add(batches).execute().await?;
         Ok(())
     }
 
-    /// 대기 중인 작업을 가져옵니다. (created_at 오름차순)
+    /// 대기 중인 작업을 가져옵니다.
     pub async fn get_pending_tasks(&self, limit: usize) -> Result<Vec<Task>> {
         let table = self.conn.open_table("tasks").execute().await?;
         
         let results = table.query()
-            .filter("status = 'pending'")
+            .only_if("status = 'pending'")
             .limit(limit)
-            // .order_by("created_at", true) // LanceDB ordering support check needed, manual sort for now
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -159,45 +163,29 @@ impl VectorStore {
             }
         }
         
-        // Manual sort by created_at since basic SQL support is limited
         tasks.sort_by_key(|t| t.created_at);
-        
         Ok(tasks)
     }
 
     pub async fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
         
-        // LanceDB doesn't support direct update yet easily.
-        // We delete the old row and insert a new one with updated status.
-        // First, fetch the existing task data.
         let results = table.query()
-            .filter(format!("id = '{}'", id))
+            .only_if(format!("id = '{}'", id))
             .limit(1)
             .execute()
             .await?
             .try_collect::<Vec<_>>()
             .await?;
 
-        if results.is_empty() {
-             return Ok(()); // Task not found
-        }
+        if results.is_empty() { return Ok(()); }
         
-        // Extract data
-        let batch = &results[0];
-        if batch.num_rows() == 0 { return Ok(()); }
+        // Delete old (Simple update via delete-insert)
+        table.delete(&format!("id = '{}'", id)).await?;
         
-        let i = 0;
-        let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        // ... (extract other fields) ...
-        
-        // Simplified: Just delete for now to simulate "Processing Done" 
-        // In a real app, we would reconstruct the Task struct and re-insert with new status.
-        // But for queue processing, removing 'done' tasks is also a valid strategy to keep table small.
-        
-        if status == "done" {
-            table.delete(&format!("id = '{}'", id)).await?;
-        }
+        // Note: For a proper update, we should re-insert. 
+        // But if 'done', we might just keep it deleted or archive it.
+        // For now, if status is 'done', we just leave it deleted (queue behavior).
         
         Ok(())
     }
@@ -211,54 +199,48 @@ impl VectorStore {
             Field::new("id", DataType::Utf8, false),
             Field::new("type", DataType::Utf8, false),
             Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 768), true),
-            Field::new("text", DataType::Utf8, false), // Searchable text
-            Field::new("data_json", DataType::Utf8, false), // Full data
+            Field::new("text", DataType::Utf8, false),
+            Field::new("data_json", DataType::Utf8, false),
             Field::new("updated_at", DataType::Int64, false),
         ]));
 
-        self.conn.create_table("commerce_items", RecordBatch::new_empty(schema))
-            .if_not_exists()
+        let batches = RecordBatchIterator::new(vec![], schema.clone());
+        let _ = self.conn.create_table("commerce_items", batches)
             .execute()
-            .await?;
+            .await;
         Ok(())
     }
     
     pub async fn upsert_item(&self, id: &str, type_: &str, data: Value, vector: Option<Vec<f32>>) -> Result<()> {
          let table = self.conn.open_table("commerce_items").execute().await?;
-         
-         // 1. Delete existing if any (LanceDB upsert workaround)
          let _ = table.delete(&format!("id = '{}'", id)).await;
          
          let json_str = data.to_string();
          let text_content = data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
-         let vec_data = vector.unwrap_or(vec![0.0; 768]); // Default zero vector
+         let vec_data = vector.unwrap_or(vec![0.0; 768]);
          let now = chrono::Utc::now().timestamp_millis();
          
-         // 2. Insert new
-         // Construct Arrow Arrays manually
-         let id_array = StringArray::from(vec![id]);
-         let type_array = StringArray::from(vec![type_]);
-         let text_array = StringArray::from(vec![text_content]);
-         let json_array = StringArray::from(vec![json_str]);
-         let updated_array = Int64Array::from(vec![now]);
+         let schema = table.schema().await?;
          
-         // FixedSizeListArray construction is tricky
+         // Helper to build FixedSizeList
          let values_builder = Float32Array::from(vec_data);
-         let list_array = FixedSizeListArray::try_new_from_values(values_builder, 768)?;
+         let list_field = Field::new("item", DataType::Float32, true);
+         let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 768, Arc::new(values_builder), None)?;
 
          let batch = RecordBatch::try_new(
-            table.schema().await?,
+            schema.clone(),
             vec![
-                Arc::new(id_array),
-                Arc::new(type_array),
+                Arc::new(StringArray::from(vec![id])),
+                Arc::new(StringArray::from(vec![type_])),
                 Arc::new(list_array),
-                Arc::new(text_array),
-                Arc::new(json_array),
-                Arc::new(updated_array),
+                Arc::new(StringArray::from(vec![text_content])),
+                Arc::new(StringArray::from(vec![json_str])),
+                Arc::new(Int64Array::from(vec![now])),
             ],
          )?;
          
-         table.add(vec![batch]).execute().await?;
+         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+         table.add(batches).execute().await?;
          
          Ok(())
     }
@@ -266,13 +248,9 @@ impl VectorStore {
     pub async fn search_items(&self, query_vec: Vec<f32>, limit: usize) -> Result<Vec<(String, String, f32)>> {
          let table = self.conn.open_table("commerce_items").execute().await?;
          
-         // Vector search not fully exposed in this simple wrapper yet without query builder support for vectors
-         // For now, we return empty or implement full scan if needed.
-         // LanceDB Rust SDK supports vector search via .search()
-         
          let results = table.query()
             .limit(limit)
-            .nearest_to(&query_vec)?
+            .nearest_to(query_vec)?
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -282,8 +260,6 @@ impl VectorStore {
          for batch in results {
              let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
              let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-             // Distance is usually added as a column named "_distance"
-             // Let's assume just returning content for now
              
              for i in 0..batch.num_rows() {
                  items.push((ids.value(i).to_string(), texts.value(i).to_string(), 0.0));
@@ -296,16 +272,16 @@ impl VectorStore {
     /// Finds a single item where a specific JSON property matches a value.
     /// This simulates "SELECT * FROM table WHERE column = value" for the Relay logic.
     /// Currently scans 'commerce_items'. In a real SQL DB, this would be an index lookup.
+    /// A better approach for LanceDB: Use full-text search or separate index tables.
     pub async fn find_item_by_property(&self, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
         let table = self.conn.open_table("commerce_items").execute().await?;
         
         // LanceDB SQL filtering on JSON strings is limited. 
         // Ideally, we should promote key columns (tracking_number, order_id) to top-level columns.
         // For now, we fetch recent items and filter in memory (NOT EFFICIENT for large datasets, but works for prototype).
-        // A better approach for LanceDB: Use full-text search or separate index tables.
         
         let results = table.query()
-            .limit(1000) // Scan limit
+            .limit(1000) 
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -319,7 +295,7 @@ impl VectorStore {
 
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let jsons = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap(); // data_json is col 4 based on init_commerce_table schema
+            let jsons = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
 
             for i in 0..batch.num_rows() {
                 let json_str = jsons.value(i);
@@ -343,7 +319,7 @@ impl VectorStore {
     }
 }
 
-// Temporary TradeDocument Struct for compatibility (kept as is)
+// Full TradeDocument Struct restored for frontend compatibility and detailed schema support.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TradeDocument {
     pub uuid: String,

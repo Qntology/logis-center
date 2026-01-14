@@ -1,13 +1,14 @@
 use anyhow::anyhow;
 use chromiumoxide::{Browser, BrowserConfig, Handler};
-use fantoccini::{ClientBuilder, Locator};
+use fantoccini::ClientBuilder;
 use futures::StreamExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::path::PathBuf;
 use tauri::Emitter;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use once_cell::sync::Lazy;
+use serde_json::{Value, json};
 
 // Global storage to keep browser alive
 static GLOBAL_BROWSER: Lazy<Arc<tokio::sync::Mutex<Option<Arc<Browser>>>>> = Lazy::new(|| {
@@ -161,7 +162,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
     // --- ADDED: JS to Rust Binding ---
     // This allows content.js to call window.__TAURI_POST_TASK__(data)
     let app_handle_for_event = app_handle.clone();
-    page.expose_function("__TAURI_POST_TASK__", move |mut args: Vec<Value>| {
+    page.expose_function("__TAURI_POST_TASK__", move |mut args: Vec<serde_json::Value>| {
         let handle = app_handle_for_event.clone();
         if let Some(payload) = args.pop() {
             println!("[AUTO] Event received from JS. Emitting 'new-task-from-browser'...");

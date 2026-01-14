@@ -136,6 +136,39 @@ impl LogisModel {
         })
     }
 
+    pub async fn chat(&self, system: &str, user_input: &str) -> anyhow::Result<String> {
+        let prompt = format!("{}\n\nUser: {}", system, user_input);
+        // Offload the heavy inference to a blocking task to avoid blocking the async runtime
+        let self_clone = self.generator.clone();
+        let prompt_clone = prompt.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            
+            let content_parts = vec![
+                ChatCompletionRequestMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText { text: prompt_clone }
+                )
+            ];
+
+            let message = ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(content_parts),
+                name: None,
+            };
+
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(message)],
+                model: "qwen3vl".to_string(),
+                max_tokens: Some(2048),
+                temperature: Some(0.1),
+                top_p: Some(0.9),
+                ..Default::default()
+            };
+            
+            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+        }).await?
+    }
+
     fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>) -> anyhow::Result<String> {
         let mut gen = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
         

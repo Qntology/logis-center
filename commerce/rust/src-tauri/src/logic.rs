@@ -103,23 +103,25 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
         ("goods", "order") => {
             if let Some(tracking) = get_val("tracking") {
                 queries.push(QueryInfo { r#type: primary_type.to_string(), table: "sales".to_string(), column: "tracking".to_string(), value: tracking, status: None });
-                return Some((queries, MergeInfo { update: None, upsert: Some(UpsertMerge { includes: sales_includes, from: merge_from, to: merge_to }), from: merge_from, to: merge_to }));
+                return Some((queries, MergeInfo { update: None, upsert: Some(UpsertMerge { includes: sales_includes, from: merge_from.clone(), to: merge_to.clone() }), from: merge_from, to: merge_to }));
             } else {
                 let index_val = get_val("index")?;
                 queries.push(QueryInfo { r#type: primary_type.to_string(), table: "sales".to_string(), column: "index".to_string(), value: index_val.clone(), status: None });
-                return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { includes: sales_includes, column: Some("index".to_string()), value: Some(index_val), foreign: None, from: merge_from, to: merge_to }), from: merge_from, to: merge_to }));
+                return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { includes: sales_includes, column: Some("index".to_string()), value: Some(index_val), foreign: None, from: merge_from.clone(), to: merge_to.clone() }), from: merge_from, to: merge_to }));
             }
         },
         ("tracking", "order") => {
             let index_val = get_val("index")?;
             queries.push(QueryInfo { r#type: foreign_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: index_val.clone(), status: None });
             let includes = if get_val("tracking").is_some() { vec!["width", "height", "length", "weight"] } else { vec!["no", "goods", "event"] };
+            let (from_t, to_t) = if get_val("tracking").is_some() { (merge_to.clone(), merge_from.clone()) } else { (merge_from.clone(), merge_to.clone()) };
+            
             return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
                 includes: includes.into_iter().map(String::from).collect(), 
                 column: Some("index".to_string()), value: Some(index_val), 
                 foreign: Some(ForeignInfo { from: "index".to_string(), to: "tracking".to_string() }),
-                from: if get_val("tracking").is_some() { merge_to.clone() } else { merge_from.clone() },
-                to: if get_val("tracking").is_some() { merge_from.clone() } else { merge_to.clone() }
+                from: from_t,
+                to: to_t
             }), from: merge_from, to: merge_to }));
         },
         ("coupon" | "event", "order") => {
@@ -127,7 +129,7 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
             queries.push(QueryInfo { r#type: foreign_type.to_string(), table: "event".to_string(), column: "index".to_string(), value: event_val, status: None });
             return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
                 includes: vec!["discount".to_string()], column: Some("index".to_string()), value: Some(get_val("index")?), 
-                foreign: None, from: merge_from, to: merge_to 
+                foreign: None, from: merge_from.clone(), to: merge_to.clone() 
             }), from: merge_from, to: merge_to }));
         },
 
@@ -137,14 +139,14 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
             queries.push(QueryInfo { r#type: foreign_type.to_string(), table: "sales".to_string(), column: "goods".to_string(), value: index_val.clone(), status: None });
             return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
                 includes: sales_includes, column: Some("goods".to_string()), value: Some(index_val), 
-                foreign: None, from: merge_to, to: merge_from 
+                foreign: None, from: merge_to.clone(), to: merge_from.clone() 
             }), from: merge_from, to: merge_to }));
         },
         ("tracking", "goods") => {
             queries.push(QueryInfo { r#type: "order".to_string(), table: "tracking".to_string(), column: "goods".to_string(), value: get_val("index")?, status: Some(0) });
             return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
                 includes: vec!["width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"].into_iter().map(String::from).collect(),
-                column: None, value: None, foreign: None, from: merge_to, to: merge_from 
+                column: None, value: None, foreign: None, from: merge_to.clone(), to: merge_from.clone() 
             }), from: merge_from, to: merge_to }));
         },
 
@@ -156,7 +158,7 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
                     includes: vec!["width", "height", "length", "weight", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping"].into_iter().map(String::from).collect(),
                     column: Some("tracking".to_string()), value: Some(get_val("index")?), 
                     foreign: Some(ForeignInfo { from: "index".to_string(), to: "tracking".to_string() }), 
-                    from: merge_to, to: merge_from 
+                    from: merge_to.clone(), to: merge_from.clone() 
                 }), from: merge_from, to: merge_to }));
             } else {
                 queries.push(QueryInfo { r#type: foreign_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: get_val("index")?, status: None });
@@ -164,7 +166,7 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
                     includes: vec!["no", "order", "goods", "event"].into_iter().map(String::from).collect(),
                     column: Some("index".to_string()), value: Some(get_val("index")?), 
                     foreign: Some(ForeignInfo { from: "index".to_string(), to: "order".to_string() }), 
-                    from: merge_from, to: merge_to 
+                    from: merge_from.clone(), to: merge_to.clone() 
                 }), from: merge_from, to: merge_to }));
             }
         },
