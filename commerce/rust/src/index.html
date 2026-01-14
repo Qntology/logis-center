@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Logis AI Widget</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=2" />
+    <link rel="shortcut icon" href="/assets/favicon.svg?v=18" />
+    <link rel="stylesheet" href="styles.css?v=15" />
+    <script type="module" src="/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="widget-wrapper">
+      
+      <!-- 1. The Pill Nav (Always Visible) -->
+      <nav class="pill-nav">
+        <div class="logo-section">
+            <button id="nav-upload-btn" class="nav-btn" title="Upload Image">➕</button>
+        </div>
+        
+        <!-- Nav Image Preview Container -->
+        <div id="nav-preview-container" class="nav-preview-container hidden">
+            <img id="nav-img-thumbnail" src="" />
+            <button id="nav-img-clear" title="Remove image">✕</button>
+        </div>
+
+        <input type="text" id="global-search" class="search-input" placeholder="Search or Ask Prompt" />
+        
+        <div class="nav-icons" style="gap: 8px;">
+          <button id="btn-submit" class="nav-btn" title="AI Search">🔍</button>
+          <button id="btn-extract" class="nav-btn" style="display:none; color: var(--primary);" title="Start Extraction">⚡</button>
+          <button id="btn-auto-launch" class="nav-btn" title="Open Browser">🌐</button>
+          <button id="btn-settings" class="nav-btn" data-tab="settings" title="Config">📦</button>
+        </div>
+      </nav>
+
+      <!-- 2. The Content Panel (Hidden by default) -->
+      <section id="content-panel" class="content-panel">
+        
+        <!-- Tab: List (Primary View) -->
+        <div id="tab-list" class="tab-content active">
+           <!-- View 1: List Table -->
+           <div id="list-view">
+               <div class="header-row">
+                 <div style="display:flex; align-items:center; gap:10px;">
+                    <button id="btn-list-back" class="nav-btn" title="Collapse">⬅︎</button>
+                    <h2>Results</h2>
+                 </div>
+                 <div style="display:flex; gap:5px;">
+                    <button id="btn-delete-selected" class="nav-btn" style="display:none; color: #ef4444;" title="Delete Selected">🗑️ All</button>
+                    <button id="list-refresh-btn" class="nav-btn" title="Refresh">🔄</button>
+                 </div>
+               </div>
+               <div id="list-scroll-container" style="height: 300px; overflow-y: auto;">
+                 <table id="doc-table">
+                   <thead>
+                       <tr>
+                           <th style="width: 30px;"><input type="checkbox" id="select-all-checkbox"></th>
+                           <th>Type</th>
+                           <th>No.</th>
+                           <th>Amount</th>
+                       </tr>
+                   </thead>
+                   <tbody id="doc-tbody"></tbody>
+                 </table>
+                 <div id="loading-indicator" style="display:none; text-align:center; padding:10px; font-size:0.8rem; color:#666;">Loading...</div>
+               </div>
+               <!-- AI Results Area -->
+               <div id="ai-search-results" style="display:none; margin-top:10px; border-top:1px solid #333; padding-top:10px;">
+                    <h3 id="ai-results-title" style="font-size:0.9rem; color:var(--primary);">AI Analysis Results</h3>
+                    <div id="ai-results-content" style="font-size:0.8rem; line-height: 1.4;"></div>
+               </div>
+           </div>
+
+           <!-- View 2: Detail Overlay -->
+           <div id="detail-view" style="display:none; height:100%; flex-direction:column;">
+               <div class="header-row" style="justify-content: space-between;">
+                   <div style="display:flex; align-items:center; gap:10px;">
+                       <button id="btn-detail-back" class="nav-btn">⬅︎</button>
+                       <h2 id="detail-title">Type No</h2>
+                   </div>
+                   <button id="btn-detail-delete" class="nav-btn" style="color: #ef4444;" title="Delete Document">🗑️</button>
+               </div>
+               <div id="detail-content" class="markdown-body" style="overflow-y:auto; flex:1; font-size: 0.85rem; padding-right:5px;">
+                   <!-- Details injected here -->
+               </div>
+           </div>
+        </div>
+
+        <!-- Tab: Query (Removed/Merged) -->
+        
+        <!-- Tab: Automation -->
+        <div id="tab-automation" class="tab-content">
+           <div class="header-row"><h2>Browser Auto</h2></div>
+           <select id="auto-browser"></select>
+           <input type="text" id="auto-url" value="https://google.com">
+           <button id="auto-btn" class="primary-btn">Launch</button>
+           <div id="auto-status" style="margin-top:10px; font-size:0.8rem;"></div>
+        </div>
+
+        <!-- Tab: Settings -->
+        <div id="tab-settings" class="tab-content">
+           <div class="header-row">
+             <div style="display:flex; align-items:center; gap:10px;">
+                <button class="nav-btn" onclick="document.getElementById('nav-back-list').click()">⬅︎</button>
+                <h2>System</h2>
+             </div>
+           </div>
+           <div id="device-status" style="margin-bottom:10px;">Checking system...</div>
+           <button id="unload-btn" class="action-btn" style="background:#ef4444; border:none;">Free Memory</button>
+           <div style="margin-top:20px;">
+                <button id="nav-to-auto" class="action-btn">Open Automation Tool</button>
+           </div>
+        </div>
+        
+        <!-- Hidden Trigger for Back Navigation -->
+        <button id="nav-back-list" style="display:none;"></button>
+
+      </section>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="/main.ts"></script>
+  </body>
+  </body>
+</html>

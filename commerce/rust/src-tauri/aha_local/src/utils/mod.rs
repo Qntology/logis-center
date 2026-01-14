@@ -1,0 +1,161 @@
+pub mod img_utils;
+pub mod tensor_utils;
+
+use anyhow::{Result, anyhow};
+use candle_core::{DType, Device};
+use candle_transformers::generation::{LogitsProcessor, Sampling};
+use std::process::Command;
+
+pub fn get_device(device: Option<&Device>) -> Device {
+    match device {
+        Some(d) => d.clone(),
+        None => {
+            #[cfg(feature = "cuda")]
+            {
+                Device::new_cuda(0).unwrap_or(Device::Cpu)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Device::Cpu
+            }
+        }
+    }
+}
+
+pub fn get_gpu_sm_arch() -> Result<f32> {
+    let output = Command::new("nvidia-smi")
+        .arg("--query-gpu=compute_cap")
+        .arg("--format=csv,noheader")
+        .output()
+        .map_err(|e| anyhow::anyhow!(format!("Failed to execute nvidia-smi: {}", e)))?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(format!(
+            "nvidia-smi failed with status: {}\nError: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let output_str = output_str.trim();
+    let sm_float = match output_str.parse::<f32>() {
+        Ok(num) => num,
+        Err(_) => {
+            return Err(anyhow::anyhow!(format!(
+                "gpr sm arch: {} parse float32 error",
+                output_str
+            )));
+        }
+    };
+    Ok(sm_float)
+}
+
+pub fn get_dtype(dtype: Option<DType>, cfg_dtype: &str) -> DType {
+    match dtype {
+        Some(d) => d,
+        None => {
+            #[cfg(feature = "cuda")]
+            {
+                match cfg_dtype {
+                    "float32" | "float" => DType::F32,
+                    "float64" | "double" => DType::F64,
+                    "float16" => DType::F16,
+                    "bfloat16" => {
+                        let arch = get_gpu_sm_arch();
+                        match arch {
+                            Err(_) => DType::F16,
+                            Ok(a) => {
+                                if a >= 8.0 { DType::BF16 } else { DType::F16 }
+                            }
+                        }
+                    }
+                    "uint8" => DType::U8,
+                    "int8" | "int16" | "int32" | "int64" => DType::I64,
+                    _ => DType::F32,
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                match cfg_dtype {
+                    "float32" | "float" => DType::F32,
+                    "float64" | "double" => DType::F64,
+                    "float16" | "bfloat16" => DType::F16,
+                    "uint8" => DType::U8,
+                    "int8" | "int16" | "int32" | "int64" => DType::I64,
+                    _ => DType::F32,
+                }
+            }
+        }
+    }
+}
+
+pub fn string_to_static_str(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+pub fn find_type_files(path: &str, extension_type: &str) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_path = entry.path();
+
+        if file_path.is_file() {
+            if let Some(extension) = file_path.extension() {
+                 if extension == extension_type {
+                    files.push(file_path.to_string_lossy().to_string());
+                 }
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+pub fn get_logit_processor(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: u64,
+) -> LogitsProcessor {
+    let temperature = temperature.and_then(|v| if v < 1e-7 { None } else { Some(v) });
+    match top_k {
+        None => LogitsProcessor::new(
+            seed,
+            temperature.map(|temp| temp as f64),
+            top_p.map(|tp| tp as f64),
+        ),
+        Some(k) => {
+            let sampling = match temperature {
+                None => Sampling::ArgMax,
+                Some(temperature) => match top_p {
+                    None => Sampling::TopK {
+                        k,
+                        temperature: temperature as f64,
+                    },
+                    Some(p) => Sampling::TopKThenTopP {
+                        k,
+                        p: p as f64,
+                        temperature: temperature as f64,
+                    },
+                },
+            };
+            LogitsProcessor::from_sampling(seed, sampling)
+        }
+    }
+}
+
+// These math helpers might be used by qwen3vl/processor
+pub fn round_by_factor(num: u32, factor: u32) -> u32 {
+    let round = (num as f32 / factor as f32).round() as u32;
+    round * factor
+}
+
+pub fn floor_by_factor(num: f32, factor: u32) -> u32 {
+    let floor = (num / factor as f32).floor() as u32;
+    floor * factor
+}
+
+pub fn ceil_by_factor(num: f32, factor: u32) -> u32 {
+    let ceil = (num / factor as f32).ceil() as u32;
+    ceil * factor
+}

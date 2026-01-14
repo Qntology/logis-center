@@ -4605,6 +4605,10 @@ export default {
 
 																		edge.type = edgeType
 
+																		if(to.id == item.id){
+																			item = edge
+																		}
+
 
 																		
 

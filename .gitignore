@@ -1,5 +1,26 @@
 # Created by https://www.toptal.com/developers/gitignore/api/node,macos
 # Edit at https://www.toptal.com/developers/gitignore?templates=node,macos
+# Python cache
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.lance
+*.gguf
+*.safetensors
+
+# Virtual Environment
+trade/venv/
+
+# Model cache and offload (Large files)
+trade/model_cache/
+trade/model_offload/
+trade/conda_env/
+
+
+# Data and Database
+trade/data/
+trade/data_samsung_galaxy_test/
+trade/data_multi_intent_test/
 
 ### macOS ###
 # General
