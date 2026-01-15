@@ -119,8 +119,7 @@ async fn process_task(
     let model_guard = model_mutex.lock().await;
     let page_info_str = if let Some(model) = model_guard.as_ref() {
         let system = parsing::map_outline(language);
-        let input = light_pug.chars().take(4000).collect::<String>(); // Limit context
-        model.chat(&system, &input).await?
+        model.chat(&system, &light_pug).await?
     } else {
         "{}".to_string()
     };
@@ -151,6 +150,7 @@ async fn process_task(
     println!("[Scheduler] Map Result: Type={}, Detail={}, Node='{}', Item='{}'", page_type, is_detail, node_selector, item_selector);
 
     if page_type == "" || page_type == "unknown" {
+        println!("[Scheduler] Task finished early: Could not classify page type. Raw output: {}", page_info_str);
         return Ok(());
     }
 
