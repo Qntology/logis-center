@@ -10,6 +10,7 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use serde_json::json;
 use regex::Regex;
+use reqwest::Url; // Added for URL parsing
 
 // Global storage to keep browser alive
 static GLOBAL_BROWSER: Lazy<Arc<tokio::sync::Mutex<Option<Arc<Browser>>>>> = Lazy::new(|| {
@@ -46,12 +47,12 @@ const ADMIN_PATTERNS: &[&str] = &[
 ];
 
 fn is_shop(url: &str, patterns: &[&str]) -> bool {
-    if let Ok(parsed_url) = url::Url::parse(url) {
+    if let Ok(parsed_url) = Url::parse(url) {
         let host = parsed_url.host_str().unwrap_or("");
         for pattern in patterns {
             // Convert wildcard pattern to regex
             // e.g., "*.cafe24.com" -> "^.*\.cafe24\.com$"
-            let regex_str = format!("^.*{}.*$", pattern.replace(".", "\\.").replace("*", ".*"));
+            let regex_str = format!("^{}$", pattern.replace(".", "\\.").replace("*", ".*"));
             if let Ok(re) = Regex::new(&regex_str) {
                 if re.is_match(host) {
                     return true;
@@ -62,6 +63,7 @@ fn is_shop(url: &str, patterns: &[&str]) -> bool {
     false
 }
 
+// Removed #[tauri::command] to avoid conflict with lib.rs
 pub async fn run_browser_automation(
     browser_type: String,
     url: String,
@@ -164,7 +166,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                 }
             }
             println!("[AUTO] Browser Handler Exited.");
-            let mut global = GLOBAL_BROWSER.lock().await;
+            let mut global = GLOBAL_BROWSER.lock().await; 
             *global = None; 
             let _ = app_handle_clone.emit("browser-status", "stopped");
         });
@@ -188,10 +190,6 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
     };
 
     // Inject on new document creation (navigation)
-    // Note: evaluate_on_new_document affects *future* navigations or reloads on this target.
-    // For the immediate load, we might need manual injection if timing is missed,
-    // but usually new_page -> goto handles it if we set it up right or just inject manually.
-    // Actually, just simple injection for the current session is requested.
     let _ = page.evaluate(final_script).await;
 
 
@@ -221,9 +219,6 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                             "is_client": is_client,
                             "is_admin": is_admin
                         }));
-                        
-                        // Optional: Auto-inject script here if page changed?
-                        // For now, relying on initial injection or manual trigger.
                     } else {
                         let _ = monitor_handle.emit("browser-match-found", json!({ "found": false }));
                     }
@@ -238,8 +233,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
 }
 
 // --- HTML Extraction Command ---
-// This function will be called when the user clicks the ⚡ button
-#[tauri::command]
+// Removed #[tauri::command] to avoid conflict
 pub async fn extract_html_from_current_tab() -> Result<String, String> {
     let browser_opt = {
         let global = GLOBAL_BROWSER.lock().await;
@@ -287,7 +281,7 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_e| anyhow!("Driver '{}' not found. This browser requires a driver.", driver_binary)?);
+        .map_err(|e| anyhow!("Driver '{}' start failed. Ensure it is installed. Error: {}", driver_binary, e))?;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -307,11 +301,15 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
     }
     let client = client.unwrap();
 
-    client.goto(url).await?;
-    let result = client.execute(script, vec![]).await?;
-    let result_str = serde_json::to_string_pretty(&result).unwrap_or_default();
+    let res = async {
+        client.goto(url).await?;
+        let result = client.execute(script, vec![]).await?;
+        let result_str = serde_json::to_string_pretty(&result).unwrap_or_default();
+        Ok(format!("Driver Success ({}). Result: {}", browser, result_str))
+    }.await;
 
-    Ok(format!("Driver Success ({}). Result: {}", browser, result_str))
+    let _ = child.kill(); // Ensure driver is killed after execution
+    res
 }
 
 // --- Helper Functions ---
@@ -369,13 +367,13 @@ fn find_app_bundle(_: &str) -> Option<String> { None }
 fn find_profile_root(browser: &str) -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
     let path_str = match (cfg!(target_os = "windows"), cfg!(target_os = "macos"), browser) {
-        (true, _, "chrome") => format!(r"{{}}\AppData\Local\Google\Chrome\User Data", home),
-        (true, _, "edge") => format!(r"{{}}\AppData\Local\Microsoft\Edge\User Data", home),
-        (_, true, "chrome") => format!(r"{{}}/Library/Application Support/Google/Chrome", home),
-        (_, true, "edge") => format!(r"{{}}/Library/Application Support/Microsoft Edge", home),
+        (true, _, "chrome") => format!(r"{}\AppData\Local\Google\Chrome\User Data", home),
+        (true, _, "edge") => format!(r"{}\AppData\Local\Microsoft\Edge\User Data", home),
+        (_, true, "chrome") => format!("{}/Library/Application Support/Google/Chrome", home),
+        (_, true, "edge") => format!("{}/Library/Application Support/Microsoft Edge", home),
         _ => match browser {
-            "chrome" => format!(r"{{}}/.config/google-chrome", home),
-            "edge" => format!(r"{{}}/.config/microsoft-edge", home),
+            "chrome" => format!("{}/.config/google-chrome", home),
+            "edge" => format!("{}/.config/microsoft-edge", home),
             _ => return None,
         }
     };
