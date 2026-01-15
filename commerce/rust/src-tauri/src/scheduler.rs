@@ -96,8 +96,15 @@ async fn process_task(
     }
 
     // 1. Fetch Page Content
-    // TODO: Switch to automation::run_browser_automation if HTML is empty/JS-heavy
-    let html = reqwest::get(url).await?.text().await?;
+    // Check if HTML is already provided in the task data (e.g. from browser automation)
+    let html = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+        raw_html.to_string()
+    } else if !url.is_empty() {
+        // Fallback to fetching URL
+        reqwest::get(url).await?.text().await?
+    } else {
+        return Ok(()); // No HTML and no URL
+    };
     
     // =================================================================================
     // STEP 1: Classification (Structure Only) - "Map Outline"

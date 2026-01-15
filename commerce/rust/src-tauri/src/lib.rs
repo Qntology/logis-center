@@ -486,6 +486,11 @@ async fn set_login_state(
 
 
 
+#[tauri::command]
+async fn extract_html_from_current_tab() -> Result<String, String> {
+    automation::extract_html_from_current_tab().await.map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
 pub fn run() {
@@ -642,6 +647,8 @@ pub fn run() {
             launch_browser,
 
             launch_best_browser,
+
+            extract_html_from_current_tab,
 
             check_available_browsers,
 

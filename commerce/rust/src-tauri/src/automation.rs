@@ -5,10 +5,11 @@ use futures::StreamExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::path::PathBuf;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use std::sync::Arc;
 use once_cell::sync::Lazy;
-use serde_json::{Value, json};
+use serde_json::json;
+use regex::Regex;
 
 // Global storage to keep browser alive
 static GLOBAL_BROWSER: Lazy<Arc<tokio::sync::Mutex<Option<Arc<Browser>>>>> = Lazy::new(|| {
@@ -24,6 +25,41 @@ pub struct BrowserStatus {
     pub is_supported: bool, // Chrome/Edge = Driverless Supported
     pub is_installed: bool,
     pub needs_driver: bool, // Firefox/Safari = True
+}
+
+// --- URL Patterns (Ported from JS) ---
+const CLIENT_PATTERNS: &[&str] = &[
+    "*.cafe24.com", "*.makeshop.co.kr", "admin.godo.co.kr", "*.godo.co.kr", "*.firstmall.kr",
+    "admin.sixshop.com", "sixshop.com", "admin.imweb.me", "www.imweb.me", "*.myshopify.com",
+    "sell.smartstore.naver.com", "wing.coupang.com", "soffice.11st.co.kr", "scm.gmarket.co.kr",
+    "scm.auction.co.kr", "seller.interpark.com", "seller.wemakeprice.com", "sell.ssg.com",
+    "marketplus.co.kr", "admin.shopby.co.kr", "creators.kakaomakers.com", "sell.storefarm.naver.com",
+    "partner.wemakeprice.com", "activeitzone.com", "demofran.com"
+];
+
+const ADMIN_PATTERNS: &[&str] = &[
+    "*.cafe24.com", "*.makeshop.co.kr", "*.godomall.com", "*.godo.co.kr", "*.firstmall.kr",
+    "*.sixshop.com", "*.imweb.me", "*.myshopify.com", "*.shopby.co.kr", "*.wisa.co.kr",
+    "*.sellstore.co.kr", "*.squarespace.com", "*.storefarm.naver.com", "*.smartstore.naver.com",
+    "*.gmkt.kr", "*.gmarket.co.kr", "*.auction.co.kr", "*.interpark.com", "*.wemakeprice.com",
+    "*.ssg.com", "*.coupang.com", "*.11st.co.kr", "*.kakaomakers.com", "*.activeitzone.com", "*.demofran.com"
+];
+
+fn is_shop(url: &str, patterns: &[&str]) -> bool {
+    if let Ok(parsed_url) = url::Url::parse(url) {
+        let host = parsed_url.host_str().unwrap_or("");
+        for pattern in patterns {
+            // Convert wildcard pattern to regex
+            // e.g., "*.cafe24.com" -> "^.*\.cafe24\.com$"
+            let regex_str = format!("^.*{}.*$", pattern.replace(".", "\\.").replace("*", ".*"));
+            if let Ok(re) = Regex::new(&regex_str) {
+                if re.is_match(host) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 pub async fn run_browser_automation(
@@ -52,7 +88,6 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
 
     let browser_arc = if let Some(b) = existing_browser {
         println!("[AUTO] Reusing existing browser instance.");
-        // Notify Frontend: Running
         let _ = app_handle.emit("browser-status", "running");
         b
     } else {
@@ -62,12 +97,9 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
         
         println!("[AUTO] Using executable: {:?}", exec_path);
 
-        // Get profile root if exists
-        let profile_root = find_profile_root(browser);
-
         // Function to build config
         let build_config = |_: bool| -> anyhow::Result<BrowserConfig> {
-            let mut args = vec![
+            let args = vec![
                 "--start-maximized", 
                 "--disable-gpu", 
                 "--disable-infobars",
@@ -84,13 +116,8 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                 .no_sandbox()
                 .viewport(None);
             
-            // Use App-Specific Profile for persistence without conflicts
-            // We use a fixed relative path "browser_profile" in the current working directory
-            // or we could use app_handle.path().app_data_dir() if we want it hidden.
-            // For portability, let's use "./browser_profile/{browser}"
             let profile_dir = std::path::Path::new("browser_profiles").join(browser);
             let _ = std::fs::create_dir_all(&profile_dir);
-            
             let abs_profile_dir = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir);
             
             println!("[AUTO] Using isolated app profile at: {:?}", abs_profile_dir);
@@ -99,10 +126,9 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
             builder.args(args).build().map_err(|e| anyhow!("Failed to build config: {}", e))
         };
 
-        // 2. Launch Strategy (Simplified: Single Attempt with Long Timeout)
+        // 2. Launch Strategy
         let launch_result: anyhow::Result<(Browser, Handler)> = async {
-            // We always use the custom profile now, so 'true'/'false' flag is irrelevant
-            let config = build_config(true)?; 
+            let config = build_config(true)?;
             println!("[AUTO] Launching browser... (Timeout: 60s)");
             
             let launch_attempt = tokio::time::timeout(
@@ -113,7 +139,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
             match launch_attempt {
                 Ok(Ok(res)) => Ok(res),
                 Ok(Err(e)) => Err(anyhow!("Launch Error: {}", e)),
-                Err(_) => Err(anyhow!("Launch Timeout (60s). Chrome opened but didn't connect. Please check if a dialog is blocking it.")),
+                Err(_) => Err(anyhow!("Launch Timeout. Check if a dialog is blocking it.")),
             }
         }.await;
 
@@ -126,7 +152,6 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
             *global = Some(new_arc.clone());
         }
         
-        // Notify Frontend: Running
         let _ = app_handle.emit("browser-status", "running");
 
         // Spawn Handler
@@ -138,12 +163,9 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                     break;
                 }
             }
-            // Clear global on exit
-            println!("[AUTO] Browser Handler Exited. Cleaning up global instance...");
-            let mut global = GLOBAL_BROWSER.lock().await; 
+            println!("[AUTO] Browser Handler Exited.");
+            let mut global = GLOBAL_BROWSER.lock().await;
             *global = None; 
-            
-            // Notify Frontend: Stopped
             let _ = app_handle_clone.emit("browser-status", "stopped");
         });
 
@@ -152,141 +174,92 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
 
     println!("[AUTO] Setting up page...");
     
-    // 3. Create or Get Page
-    let mut page = browser_arc.new_page("about:blank").await
+    // 3. Create Page & Navigate
+    let page = browser_arc.new_page(url).await
         .map_err(|e| anyhow!("Failed to create page: {}", e))?;
 
-    // 4. Inject Script on EVERY Navigation
-    println!("[AUTO] Injecting persistent script...");
-
-    // --- Bundle Scripts (Pako -> Content.js) ---
-    // Using include_str! to embed assets at compile time
+    // 4. Inject Persistent Script (Pako + Content.js)
     let pako_lib = include_str!("assets/scripts/pako.min.js");
-    // Dexie removed as we now use Rust LanceDB
     let content_logic = include_str!("assets/scripts/content.js");
-
-    // If a custom script is provided, append it; otherwise use the default bundle
     let final_script = if script.is_empty() {
         format!("{};\n{};", pako_lib, content_logic)
     } else {
         format!("{};\n{};\n{}", pako_lib, content_logic, script)
     };
+
+    // Inject on new document creation (navigation)
+    // Note: evaluate_on_new_document affects *future* navigations or reloads on this target.
+    // For the immediate load, we might need manual injection if timing is missed,
+    // but usually new_page -> goto handles it if we set it up right or just inject manually.
+    // Actually, just simple injection for the current session is requested.
+    let _ = page.evaluate(final_script).await;
+
+
+    // 5. Start Background Monitoring Loop
+    // This loop checks the active tab's URL and emits events for the UI (⚡ button)
+    let monitor_browser = browser_arc.clone();
+    let monitor_handle = app_handle.clone();
     
-use tauri::{Emitter, Manager}; 
-use crate::AppState; 
-use crate::store::VectorStore;
-use futures::future::BoxFuture; // Added import
+    tokio::spawn(async move {
+        loop {
+            // Check if browser is still alive
+            let pages = match monitor_browser.pages().await {
+                Ok(p) => p,
+                Err(_) => break, // Browser closed
+            };
 
-// ...
-
-    // --- ADDED: JS to Rust Binding ---
-    // This allows content.js to call window.__TAURI_POST_TASK__(data)
-    let app_handle_for_event = app_handle.clone();
-    
-    let callback = move |mut args: Vec<serde_json::Value>| -> BoxFuture<'static, anyhow::Result<serde_json::Value>> {
-        let app_handle = app_handle_for_event.clone();
-        Box::pin(async move {
-            let payload = args.pop().unwrap_or(json!({}));
-            
-            // ... (rest of the logic identical to before)
-            // Check for DB commands (select, upsert, delete, clear)
-            let is_db_cmd = payload.get("select").is_some() || 
-                           payload.get("upsert").is_some() || 
-                           payload.get("delete").is_some() ||
-                           payload.get("clear").is_some();
-
-            if is_db_cmd {
-                let state = app_handle.state::<AppState>();
-                let store_guard = state.store.lock().await;
-                
-                if let Some(store) = store_guard.as_ref() {
-                    if let Some(table) = payload.get("select").and_then(|s| s.as_str()) {
-                        let db_table = match table {
-                            "items" => "commerce_items",
-                            "pages" => "commerce_items", 
-                            "users" => "commerce_users",
-                            "crons" => "tasks",
-                            _ => table
-                        };
+            // Get the last active page (usually the user-visible tab)
+            if let Some(active_page) = pages.last() {
+                if let Ok(Some(current_url)) = active_page.url().await {
+                    let is_client = is_shop(&current_url, CLIENT_PATTERNS);
+                    let is_admin = is_shop(&current_url, ADMIN_PATTERNS);
+                    
+                    if is_client || is_admin {
+                        // Notify Frontend to show ⚡ button
+                        let _ = monitor_handle.emit("browser-match-found", json!({
+                            "url": current_url,
+                            "is_client": is_client,
+                            "is_admin": is_admin
+                        }));
                         
-                        if let (Some(key), Some(value)) = (payload.get("key").and_then(|s| s.as_str()), payload.get("value")) {
-                            if let Ok(Some((id, data))) = store.find_item_by_property(db_table, key, value).await {
-                                let mut res = data.clone();
-                                if let Some(obj) = res.as_object_mut() {
-                                    obj.insert("id".to_string(), json!(id));
-                                }
-                                return Ok(json!({ "results": [res] }));
-                            } else {
-                                return Ok(json!({ "results": [] }));
-                            }
-                        } else {
-                             return Ok(json!({ "results": [] }));
-                        }
-                    } 
-                    else if let Some(table) = payload.get("upsert").and_then(|s| s.as_str()) {
-                         let db_table = match table {
-                            "items" => "commerce_items",
-                            "pages" => "commerce_items",
-                            "users" => "commerce_users",
-                            "crons" => "tasks",
-                            _ => table
-                        };
-                        
-                        if let Some(val) = payload.get("value") {
-                            let id = val.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                            let type_ = val.get("type").and_then(|s| s.as_str()).unwrap_or(table);
-                            
-                            if db_table == "tasks" {
-                                let task = crate::store::Task {
-                                    id: id.clone(),
-                                    r#type: val.get("job").and_then(|s| s.as_str()).unwrap_or("cron").to_string(),
-                                    from_source: "browser".to_string(),
-                                    to_dest: "local".to_string(),
-                                    cc: val.get("cc").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                                    bcc: val.get("bcc").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                                    ref_id: val.get("ref").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-                                    data_json: val.to_string(),
-                                    created_at: val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
-                                    updated_at: val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0),
-                                    status: "pending".to_string(),
-                                };
-                                let _ = store.add_task(task).await;
-                                return Ok(json!({ "results": [val] }));
-                            }
-                            
-                            let _ = store.upsert_item(db_table, &id, type_, val.clone(), None).await;
-                            return Ok(json!({ "results": [val] }));
-                        }
-                    }
-                    else if let Some(table) = payload.get("delete").and_then(|s| s.as_str()) {
-                        return Ok(json!({ "results": [] }));
+                        // Optional: Auto-inject script here if page changed?
+                        // For now, relying on initial injection or manual trigger.
+                    } else {
+                        let _ = monitor_handle.emit("browser-match-found", json!({ "found": false }));
                     }
                 }
-                
-                return Ok(json!({ "results": [], "error": "Store not initialized" }));
             }
 
-            println!("[AUTO] Event received from JS. Emitting 'new-task-from-browser'...");
-            app_handle.emit("new-task-from-browser", &payload).unwrap();
-            
-            Ok(json!({ "status": "event_emitted" }))
-        })
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    Ok(format!("Automation Started. Monitoring for target sites..."))
+}
+
+// --- HTML Extraction Command ---
+// This function will be called when the user clicks the ⚡ button
+#[tauri::command]
+pub async fn extract_html_from_current_tab() -> Result<String, String> {
+    let browser_opt = {
+        let global = GLOBAL_BROWSER.lock().await;
+        global.as_ref().cloned()
     };
 
-    /*
-    page.expose_function("__TAURI_POST_TASK__", callback).await.map_err(|e| anyhow!("Failed to expose function: {}", e))?;
-    */
-
-    page.evaluate_on_new_document(&final_script).await
-        .map_err(|e| anyhow!("Failed to set up script injection: {}", e))?;
-
-    // 5. Navigate to Target URL
-    println!("[AUTO] Navigating to {}", url);
-    page.goto(url).await
-        .map_err(|e| anyhow!("Navigation failed: {}", e))?;
-
-    Ok(format!("Automation Started. Script will run on every page load in this tab."))
+    if let Some(browser) = browser_opt {
+        let pages = browser.pages().await.map_err(|e| e.to_string())?;
+        // Use the last page as the active one
+        if let Some(page) = pages.last() {
+            // content() returns the full HTML of the page
+            let html = page.content().await.map_err(|e| e.to_string())?;
+            return Ok(html);
+        }
+        Err("No open tabs found.".to_string())
+    } else {
+        Err("Browser is not running.".to_string())
+    }
 }
+
 
 // --- Legacy Driver Automation (Firefox/Safari) ---
 async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow::Result<String> {
@@ -314,7 +287,7 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_e| anyhow!("Driver '{}' not found. This browser requires a driver.", driver_binary))?;
+        .map_err(|_e| anyhow!("Driver '{}' not found. This browser requires a driver.", driver_binary)?);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -396,13 +369,13 @@ fn find_app_bundle(_: &str) -> Option<String> { None }
 fn find_profile_root(browser: &str) -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
     let path_str = match (cfg!(target_os = "windows"), cfg!(target_os = "macos"), browser) {
-        (true, _, "chrome") => format!(r"{}\AppData\Local\Google\Chrome\User Data", home),
-        (true, _, "edge") => format!(r"{}\AppData\Local\Microsoft\Edge\User Data", home),
-        (_, true, "chrome") => format!(r"{}/Library/Application Support/Google/Chrome", home),
-        (_, true, "edge") => format!(r"{}/Library/Application Support/Microsoft Edge", home),
+        (true, _, "chrome") => format!(r"{{}}\AppData\Local\Google\Chrome\User Data", home),
+        (true, _, "edge") => format!(r"{{}}\AppData\Local\Microsoft\Edge\User Data", home),
+        (_, true, "chrome") => format!(r"{{}}/Library/Application Support/Google/Chrome", home),
+        (_, true, "edge") => format!(r"{{}}/Library/Application Support/Microsoft Edge", home),
         _ => match browser {
-            "chrome" => format!(r"{}/.config/google-chrome", home),
-            "edge" => format!(r"{}/.config/microsoft-edge", home),
+            "chrome" => format!(r"{{}}/.config/google-chrome", home),
+            "edge" => format!(r"{{}}/.config/microsoft-edge", home),
             _ => return None,
         }
     };
