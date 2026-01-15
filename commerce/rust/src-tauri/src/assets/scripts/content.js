@@ -832,116 +832,457 @@
 			return body;
 		}
 
-		// --- Dexie Removed: Switched to LanceDB via Rust Backend ---
-		
+		// Dexie removed in favor of Rust LanceDB
+		const db = {}; 
+
+		marked.setOptions({
+			breaks: true
+		});
+
+
 		var sendMessage = async function(req){
-			// Bridge to Rust Backend
-			if(window.__TAURI_POST_TASK__){
-				// Convert buffers/objects to serializable JSON if needed
-				return await window.__TAURI_POST_TASK__(req);
-			} else {
-				console.log("Rust Bridge not found:", req);
-				return { results: [] };
+			try {
+				// Delegate DB operations to Rust backend via app.request
+				var response = await app.request({ body: req });
+				return response || { results: [] };
+			}catch(error) {
+				console.error("sendMessage error:", error);
+				return { results : [] }
 			}
 		}
 
 		var Upsert = {}
+
 		var Select = {}
+
 		var Delete = {}
+
 		var Clear = {}
 
-		// Send data to Rust to be saved in LanceDB
 		Upsert["items"] = async function(value) {
-			await sendMessage({
-				type: "upsert",
-				table: "items",
-				data: value
-			});
-			return [value];
+			var query = {
+				upsert : "items",
+				value : value
+			}
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
+
+				
 		}
 
-		// Querying from frontend is currently limited in this architecture.
-		// Use empty return or rely on Rust events if bidirectional needed.
+
 		Select["items"] = async function(query) {
-			// For a scraper/collector, we mostly push data. 
-			// If we need to check existence, we might need a sync mechanism or rely on Rust ignoring dups.
-			return []; 
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.select = "items"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
+				
 		}
+
 
 		Delete["items"] = async function(query) {
-			await sendMessage({
-				type: "delete",
-				table: "items",
-				query: query
-			});
-			return [];
+			query.delete = "items"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
+
 		Clear["items"] = async function(query) {
-			return [];
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.clear = "items"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
 		Upsert["pages"] = async function(value) {
-			await sendMessage({
-				type: "upsert",
-				table: "pages",
-				data: value
-			});
-			return [value];
+			var query = {
+				upsert : "pages",
+				value : value
+			}
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
+
 
 		Select["pages"] = async function(query) {
-			return [];
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.select = "pages"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}				
 		}
+
 
 		Delete["pages"] = async function(query) {
-			return [];
+			query.delete = "pages"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
+
 		Clear["pages"] = async function(query) {
-			return [];
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.clear = "pages"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
 		Upsert["users"] = async function(value) {
-			await sendMessage({
-				type: "upsert",
-				table: "users",
-				data: value
-			});
-			return [value];
+			var query = {
+				upsert : "users",
+				value : value
+			}
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
 		Select["users"] = async function(query) {
-			return [];
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.select = "users"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}				
 		}
+
 
 		Delete["users"] = async function(query) {
-			return [];
+			query.delete = "users"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
+
 		Clear["users"] = async function(query) {
-			return [];
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.clear = "users"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
 		Upsert["crons"] = async function(value) {
-			await sendMessage({
-				type: "upsert",
-				table: "tasks", // Mapping crons to tasks table
-				data: value
-			});
-			return [value];
+			var query = {
+				upsert : "crons",
+				value : value
+			}
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
+
 
 		Select["crons"] = async function(query) {
-			return [];
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.select = "crons"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
+
 
 		Delete["crons"] = async function(query) {
-			return [];
+			query.delete = "crons"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
+
 		Clear["crons"] = async function(query) {
-			return [];
+			if(typeof query == "undefined"){
+				query = {}
+			}
+
+			query.clear = "crons"
+
+			if(app.chrome){
+				return new Promise((resolve, reject) => {
+					chrome.runtime.sendMessage(query, (response) => {
+						const err = chrome.runtime.lastError;
+						if (err) {
+							reject(err);
+						} else if (response?.results) {
+							resolve(response.results);
+						} else {
+							reject(response?.error || "Unknown error");
+						}
+					});
+				});
+			}else{
+				var response = await sendMessage(query)
+
+				return response.results
+			}
 		}
 
 

@@ -49,9 +49,6 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
     
     // 첫 번째 매칭되는 요소만 처리
     if let Some(element) = document.select(&selector).next() {
-        // ego_tree::NodeRef로 변환 (element.id()를 통해 node_ref를 얻을 수 없으므로, select 결과의 node를 사용)
-        // scraper::ElementRef는 Deref로 Node를 가리키지 않음. 
-        // ElementRef.node()가 NodeRef를 반환함.
         generate_pug_lines(element.node(), 0, &mut pug_output, &mode);
     }
 
@@ -101,10 +98,6 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 },
                 PugMode::FullContent => {
                     // 2단계: 데이터 추출용 - 주요 속성 및 data- 속성 포함
-                    // 사용자 요청: "attr, data-, src, 속성값 제거와 필요한 class, id, href 속성값을 제외한 나머지 속성값은 제거" -> 
-                    // Step 1 is restricted. Step 2 "original html content... attr, data-, class, id, href properties included"
-                    // So we preserve most relevant attributes here.
-                    
                     for (key, value) in element.attrs() {
                         if key == "id" || key == "class" { continue; }
                         
@@ -136,11 +129,6 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             }
         },
         Node::Text(text) => {
-            // StructureOnly 모드에서는 텍스트 노드 내용을 생략하여 토큰 절약 (구조만 중요함)
-            // 단, 네비게이션 텍스트 등이 중요할 수 있으므로, 짧게 자르거나 포함할 수 있음.
-            // 요청 사항: "구조만" -> 텍스트 제거가 맞을 수 있으나, 리스트/상세 판단에 텍스트가 힌트가 됨.
-            // 여기서는 StructureOnly일 때 텍스트를 제외하거나 최소화하는 것이 좋음.
-            
             if *mode == PugMode::FullContent {
                 let content = text.trim();
                 if !content.is_empty() {
