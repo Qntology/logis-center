@@ -192,7 +192,8 @@ impl VectorStore {
     
     // --- Commerce Items (Sales, Goods, etc.) ---
     
-    pub async fn init_commerce_table(&self) -> Result<()> {
+    pub async fn init_all_tables(&self) -> Result<()> {
+        let tables = vec!["commerce_items", "commerce_sales", "commerce_tracking", "commerce_event"];
         let item_field = Field::new("item", DataType::Float32, true);
         
         let schema = Arc::new(Schema::new(vec![
@@ -204,15 +205,20 @@ impl VectorStore {
             Field::new("updated_at", DataType::Int64, false),
         ]));
 
-        let batches = RecordBatchIterator::new(vec![], schema.clone());
-        let _ = self.conn.create_table("commerce_items", batches)
-            .execute()
-            .await;
+        for table_name in tables {
+            let batches = RecordBatchIterator::new(vec![], schema.clone());
+            let _ = self.conn.create_table(table_name, batches)
+                .execute()
+                .await;
+        }
         Ok(())
     }
     
-    pub async fn upsert_item(&self, id: &str, type_: &str, data: Value, vector: Option<Vec<f32>>) -> Result<()> {
-         let table = self.conn.open_table("commerce_items").execute().await?;
+    pub async fn upsert_item(&self, table_name: &str, id: &str, type_: &str, data: Value, vector: Option<Vec<f32>>) -> Result<()> {
+         // Default to commerce_items if not specified or specific logic needed
+         let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
+         
+         let table = self.conn.open_table(target_table).execute().await?;
          let _ = table.delete(&format!("id = '{}'", id)).await;
          
          let json_str = data.to_string();
@@ -245,8 +251,9 @@ impl VectorStore {
          Ok(())
     }
     
-    pub async fn search_items(&self, query_vec: Vec<f32>, limit: usize) -> Result<Vec<(String, String, f32)>> {
-         let table = self.conn.open_table("commerce_items").execute().await?;
+    pub async fn search_items(&self, table_name: &str, query_vec: Vec<f32>, limit: usize) -> Result<Vec<(String, String, f32)>> {
+         let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
+         let table = self.conn.open_table(target_table).execute().await?;
          
          let results = table.query()
             .limit(limit)
@@ -269,16 +276,9 @@ impl VectorStore {
          Ok(items)
     }
 
-    /// Finds a single item where a specific JSON property matches a value.
-    /// This simulates "SELECT * FROM table WHERE column = value" for the Relay logic.
-    /// Currently scans 'commerce_items'. In a real SQL DB, this would be an index lookup.
-    /// A better approach for LanceDB: Use full-text search or separate index tables.
-    pub async fn find_item_by_property(&self, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
-        let table = self.conn.open_table("commerce_items").execute().await?;
-        
-        // LanceDB SQL filtering on JSON strings is limited. 
-        // Ideally, we should promote key columns (tracking_number, order_id) to top-level columns.
-        // For now, we fetch recent items and filter in memory (NOT EFFICIENT for large datasets, but works for prototype).
+    pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
+        let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
+        let table = self.conn.open_table(target_table).execute().await?;
         
         let results = table.query()
             .limit(1000) 

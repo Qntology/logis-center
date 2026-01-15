@@ -273,7 +273,11 @@ async fn summarize_image(
         let db_path = "data/lancedb"; 
         let _ = std::fs::create_dir_all(db_path);
         match VectorStore::new(db_path).await {
-            Ok(s) => *store_guard = Some(s),
+            Ok(s) => {
+                let _ = s.init_task_table().await;
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            },
             Err(e) => println!("Warning: Failed to init Vector Store: {}", e), 
         }
     }
@@ -301,7 +305,11 @@ async fn search_documents(
         let db_path = "data/lancedb";
         let _ = std::fs::create_dir_all(db_path);
         match VectorStore::new(db_path).await {
-            Ok(s) => *store_guard = Some(s),
+            Ok(s) => {
+                let _ = s.init_task_table().await;
+                let _ = s.init_all_tables().await;
+                *store_guard = Some(s);
+            },
             Err(e) => return Err(format!("Failed to load DB: {}", e)),
         }
     }
@@ -415,6 +423,8 @@ async fn deep_research_command(
         let db_path = "data/lancedb";
         let _ = std::fs::create_dir_all(db_path);
         if let Ok(s) = VectorStore::new(db_path).await {
+            let _ = s.init_task_table().await;
+            let _ = s.init_all_tables().await;
             *store_guard = Some(s);
         }
     }
@@ -533,91 +543,74 @@ pub fn run() {
                 })
 
                 .setup(|app| {
-
                     let store = app.state::<AppState>().store.clone();
+                    let app_handle = app.handle().clone();
 
+                    // Initialize Store on Startup
+                    tauri::async_runtime::spawn(async move {
+                        let mut store_guard = store.lock().await;
+                        let db_path = "data/lancedb";
+                        let _ = std::fs::create_dir_all(db_path);
+                        
+                        match VectorStore::new(db_path).await {
+                            Ok(s) => {
+                                println!("[Setup] VectorStore initialized.");
+                                // Ensure tables exist
+                                if let Err(e) = s.init_task_table().await {
+                                    eprintln!("[Setup] Failed to init task table: {}", e);
+                                }
+                                if let Err(e) = s.init_all_tables().await {
+                                    eprintln!("[Setup] Failed to init commerce tables: {}", e);
+                                }
+                                *store_guard = Some(s);
+                            },
+                            Err(e) => eprintln!("[Setup] Failed to init Vector Store: {}", e), 
+                        }
+                    });
                     
+                    let store_for_event = app.state::<AppState>().store.clone();
 
                     // Listen for events from the injected browser script
-
                     app.listen("new-task-from-browser", move |event| {
-
                         println!("[Event] Received 'new-task-from-browser'");
-
                         
-
                         if let Ok(payload_val) = serde_json::from_str::<serde_json::Value>(event.payload()) {
-
-                            let store_clone = store.clone();
-
+                            let store_clone = store_for_event.clone();
                             
-
                             tauri::async_runtime::spawn(async move {
-
                                 let store_guard = store_clone.lock().await;
-
                                 if let Some(db) = store_guard.as_ref() {
-
                                     let now = chrono::Utc::now().timestamp_millis();
-
                                     
-
                                     // Map JSON payload to Task struct
-
                                     let task = crate::store::Task {
-
                                         id: uuid::Uuid::new_v4().to_string(),
-
                                         r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-
                                         from_source: "injected_script".to_string(),
-
                                         to_dest: "local".to_string(),
-
                                         cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-
                                         bcc: "".to_string(),
-
                                         ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-
                                         data_json: payload_val.to_string(),
-
                                         created_at: now,
-
                                         updated_at: now,
-
                                         status: "pending".to_string(),
-
                                     };
-
         
-
                                     match db.add_task(task).await {
-
                                         Ok(_) => println!("[Event] Task saved to DB successfully."),
-
                                         Err(e) => eprintln!("[Event] Failed to save task: {}", e),
-
                                     }
-
                                 } else {
-
                                     eprintln!("[Event] Database not initialized.");
-
                                 }
-
                             });
-
                         } else {
-
                             eprintln!("[Event] Failed to parse payload: {}", event.payload());
-
                         }
-
                     });
 
                     Ok(())
-
                 })
 
                 .plugin(tauri_plugin_opener::init())

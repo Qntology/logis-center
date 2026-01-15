@@ -158,6 +158,19 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
 
     // 4. Inject Script on EVERY Navigation
     println!("[AUTO] Injecting persistent script...");
+
+    // --- Bundle Scripts (Pako -> Content.js) ---
+    // Using include_str! to embed assets at compile time
+    let pako_lib = include_str!("assets/scripts/pako.min.js");
+    // Dexie removed as we now use Rust LanceDB
+    let content_logic = include_str!("assets/scripts/content.js");
+
+    // If a custom script is provided, append it; otherwise use the default bundle
+    let final_script = if script.is_empty() {
+        format!("{};\n{};", pako_lib, content_logic)
+    } else {
+        format!("{};\n{};\n{}", pako_lib, content_logic, script)
+    };
     
     // --- ADDED: JS to Rust Binding ---
     // This allows content.js to call window.__TAURI_POST_TASK__(data)
@@ -176,7 +189,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
         Ok(json!({ "status": "event_emitted" }))
     }).await.map_err(|e| anyhow!("Failed to expose function: {}", e))?;
 
-    page.evaluate_on_new_document(script).await
+    page.evaluate_on_new_document(&final_script).await
         .map_err(|e| anyhow!("Failed to set up script injection: {}", e))?;
 
     // 5. Navigate to Target URL
