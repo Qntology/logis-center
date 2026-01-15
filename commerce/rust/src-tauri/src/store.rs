@@ -193,7 +193,10 @@ impl VectorStore {
     // --- Commerce Items (Sales, Goods, etc.) ---
     
     pub async fn init_all_tables(&self) -> Result<()> {
-        let tables = vec!["commerce_items", "commerce_sales", "commerce_tracking", "commerce_event"];
+        let tables = vec![
+            "commerce_items", "commerce_sales", "commerce_tracking", "commerce_event", 
+            "commerce_users", "commerce_talks"
+        ];
         let item_field = Field::new("item", DataType::Float32, true);
         
         let schema = Arc::new(Schema::new(vec![

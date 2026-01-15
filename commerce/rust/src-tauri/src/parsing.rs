@@ -145,6 +145,44 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
 // --- Schema Prompts (Ported directly from proxy/src/index.ts) ---
 
+pub fn image2json(region: &str, language: &str, page_type: &str, address: &str) -> String {
+    if page_type == "tracking" {
+        format!(r#"convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.
+		#region : {}
+		#recipient_address : {}
+		#tracking_number is selected from the number that matches the barcode or QR code, among others, based on the #region, excluding the format of a national telephone or mobile phone number, or an order number.
+		{{
+			tracking_number:tracking number or 운송장 번호 or 송장 번호 or 송장번호 or 등기 번호 or 등기번호 or 运单号 or 運單號 or 伝票番号 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Номер накладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
+			recipient_match : shipping label #recipient_address match. Ruled the same despite different floor levels | boolean,
+			barcodes : [barcode number | string] | array,
+			text : summarize the shipping label contents in {}. Masking the address in the summary to District-level and up. Do not mention that information is masked or partially hidden | string,
+		}}"#, region, address, language)
+    } else {
+        String::new()
+    }
+}
+
+pub fn para2graph(language: &str) -> String {
+    format!(r#"convert the natural language content to fit the dataset JSON structure. no explanation.
+	{{ 
+		context : [
+			{{
+				language : "{}",
+				type:'sales' or 'order' or 'goods' or 'tracking' or 'view' or 'review' or 'coupon' or 'event' or '',
+				text:Segment the natural language content into single-type contexts
+			}},...
+		]
+	}}"#, language)
+}
+
+pub fn graph2contexts(current: &str) -> String {
+    format!(r#"convert the natural language content to fit the dataset JSON structure. no explanation.
+	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({}); it will be marked as null if a value is absent
+	# #status : 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error'
+	# #substantial : 'size' or 'weight' or 'shipping_fee' or 'shipping_duration' or 'sale_price' or 'supply_price' or 'low_stock_threshold' or 'discount' or 'min_order_amount' or 'max_discount_amount' or 'usage_limit' or 'usage_per' or ''
+	# #find : 'many' or 'few' or 'much' or 'little' or 'heavy' or 'light' or ''"#, current)
+}
+
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
         "tracking" => r#"#,
