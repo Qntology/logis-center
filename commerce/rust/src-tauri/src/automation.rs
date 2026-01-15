@@ -172,11 +172,10 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
         format!("{};\n{};\n{}", pako_lib, content_logic, script)
     };
     
-use tauri::{Emitter, Manager}; // Added Manager
-use crate::AppState; // Import AppState
+use tauri::{Emitter, Manager}; 
+use crate::AppState; 
 use crate::store::VectorStore;
-
-// ... (existing imports)
+use futures::future::BoxFuture; // Added import
 
 // ...
 
@@ -184,11 +183,12 @@ use crate::store::VectorStore;
     // This allows content.js to call window.__TAURI_POST_TASK__(data)
     let app_handle_for_event = app_handle.clone();
     
-    page.expose_function("__TAURI_POST_TASK__", move |mut args: Vec<serde_json::Value>| {
+    let callback = move |mut args: Vec<serde_json::Value>| -> BoxFuture<'static, anyhow::Result<serde_json::Value>> {
         let app_handle = app_handle_for_event.clone();
         Box::pin(async move {
             let payload = args.pop().unwrap_or(json!({}));
             
+            // ... (rest of the logic identical to before)
             // Check for DB commands (select, upsert, delete, clear)
             let is_db_cmd = payload.get("select").is_some() || 
                            payload.get("upsert").is_some() || 
@@ -203,17 +203,14 @@ use crate::store::VectorStore;
                     if let Some(table) = payload.get("select").and_then(|s| s.as_str()) {
                         let db_table = match table {
                             "items" => "commerce_items",
-                            "pages" => "commerce_items", // Map pages to items for now or create generic query
+                            "pages" => "commerce_items", 
                             "users" => "commerce_users",
                             "crons" => "tasks",
                             _ => table
                         };
                         
-                        // Handle generic query
                         if let (Some(key), Some(value)) = (payload.get("key").and_then(|s| s.as_str()), payload.get("value")) {
                             if let Ok(Some((id, data))) = store.find_item_by_property(db_table, key, value).await {
-                                // Return as array to match Dexie toArray()
-                                // Inject ID if missing
                                 let mut res = data.clone();
                                 if let Some(obj) = res.as_object_mut() {
                                     obj.insert("id".to_string(), json!(id));
@@ -223,9 +220,6 @@ use crate::store::VectorStore;
                                 return Ok(json!({ "results": [] }));
                             }
                         } else {
-                             // No key/value, maybe return all? (Limit 100)
-                             // VectorStore doesn't have "get all", but search_items with 0 vector might work or custom query
-                             // For now return empty or implement get_all
                              return Ok(json!({ "results": [] }));
                         }
                     } 
@@ -242,7 +236,6 @@ use crate::store::VectorStore;
                             let id = val.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
                             let type_ = val.get("type").and_then(|s| s.as_str()).unwrap_or(table);
                             
-                            // If table is tasks, map differently or use add_task
                             if db_table == "tasks" {
                                 let task = crate::store::Task {
                                     id: id.clone(),
@@ -261,13 +254,11 @@ use crate::store::VectorStore;
                                 return Ok(json!({ "results": [val] }));
                             }
                             
-                            // Use upsert_item
                             let _ = store.upsert_item(db_table, &id, type_, val.clone(), None).await;
                             return Ok(json!({ "results": [val] }));
                         }
                     }
                     else if let Some(table) = payload.get("delete").and_then(|s| s.as_str()) {
-                        // Implement delete
                         return Ok(json!({ "results": [] }));
                     }
                 }
@@ -275,13 +266,16 @@ use crate::store::VectorStore;
                 return Ok(json!({ "results": [], "error": "Store not initialized" }));
             }
 
-            // Default: Emit generic task event
             println!("[AUTO] Event received from JS. Emitting 'new-task-from-browser'...");
             app_handle.emit("new-task-from-browser", &payload).unwrap();
             
             Ok(json!({ "status": "event_emitted" }))
         })
-    }).await.map_err(|e| anyhow!("Failed to expose function: {}", e))?;
+    };
+
+    /*
+    page.expose_function("__TAURI_POST_TASK__", callback).await.map_err(|e| anyhow!("Failed to expose function: {}", e))?;
+    */
 
     page.evaluate_on_new_document(&final_script).await
         .map_err(|e| anyhow!("Failed to set up script injection: {}", e))?;
