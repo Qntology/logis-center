@@ -4,13 +4,15 @@ use aha::openai_types::{
     ChatCompletionParameters,
     ChatCompletionRequestMessage,
     ChatCompletionRequestUserMessage,
-    ChatCompletionRequestSystemMessage, // Added
+    ChatCompletionRequestSystemMessage,
     ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestMessageContentPart,
     ChatCompletionRequestMessageContentPartText,
     ChatCompletionRequestMessageContentPartImage,
     ImageURL,
 };
+use aha::utils::get_device;
+use candle_core::{Device, DType};
 use image::{DynamicImage, GenericImageView};
 use serde_json::{Value, json, Map};
 use std::sync::{Arc, Mutex};
@@ -18,8 +20,25 @@ use regex::Regex;
 use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::*;
+use sysinfo::System;
 
-// ... (Spinner struct implementation)
+pub struct Spinner {
+    pub frames: Vec<&'static str>,
+    pub interval: u64,
+}
+
+impl Spinner {
+    pub fn dots() -> Self {
+        Self {
+            frames: vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+            interval: 80,
+        }
+    }
+}
+
+pub struct LogisModel {
+    generator: Arc<Mutex<Qwen3VLGenerateModel>>,
+}
 
 impl LogisModel {
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {

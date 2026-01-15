@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Task {
     pub id: String,
@@ -69,6 +70,7 @@ pub fn merge_node(target: &mut Value, source: &Value) {
     }
 }
 
+#[allow(dead_code)]
 pub fn related(item_type: &str) -> Vec<&str> {
     match item_type {
         "goods" => vec!["order", "tracking", "coupon", "event"],
@@ -81,6 +83,7 @@ pub fn related(item_type: &str) -> Vec<&str> {
     }
 }
 
+#[allow(dead_code)]
 pub fn parse_status(status: &str) -> i32 {
     match status {
         "progress" => 1,

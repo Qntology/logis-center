@@ -1,7 +1,7 @@
 use anyhow::Result;
-use lancedb::{Connection, Table, connect};
+use lancedb::{Connection, connect};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, ArrayRef, RecordBatchIterator};
+use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeListArray, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
@@ -167,7 +167,7 @@ impl VectorStore {
         Ok(tasks)
     }
 
-    pub async fn update_task_status(&self, id: &str, status: &str) -> Result<()> {
+    pub async fn update_task_status(&self, id: &str, _status: &str) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
         
         let results = table.query()

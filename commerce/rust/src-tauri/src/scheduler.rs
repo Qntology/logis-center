@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use anyhow::Result;
 
 // Ported from proxy/src/index.ts `isDiff`
+#[allow(dead_code)]
 fn is_diff(v1: &Value, v2: &Value) -> bool {
     if v1.is_null() && v2.is_null() { return false; }
     if v1.is_null() || v2.is_null() { return true; }

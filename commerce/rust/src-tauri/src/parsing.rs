@@ -172,6 +172,7 @@ pub fn map_outline(language: &str) -> String {
 // ... (Existing prompts: image2json, para2graph, graph2contexts, item2json, list2json)
 
 
+#[allow(dead_code)]
 pub fn image2json(region: &str, language: &str, page_type: &str, address: &str) -> String {
     if page_type == "tracking" {
         format!(r#"convert the shipping label image to fit the dataset JSON structure. Return only the JSON structure result, no explanation.
@@ -189,6 +190,7 @@ pub fn image2json(region: &str, language: &str, page_type: &str, address: &str) 
     }
 }
 
+#[allow(dead_code)]
 pub fn para2graph(language: &str) -> String {
     format!(r#"convert the natural language content to fit the dataset JSON structure. no explanation.
 	{{ 
@@ -202,6 +204,7 @@ pub fn para2graph(language: &str) -> String {
 	}}"#, language)
 }
 
+#[allow(dead_code)]
 pub fn graph2contexts(current: &str) -> String {
     format!(r#"convert the natural language content to fit the dataset JSON structure. no explanation.
 	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({}); it will be marked as null if a value is absent

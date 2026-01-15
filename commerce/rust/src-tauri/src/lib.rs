@@ -456,7 +456,7 @@ async fn set_login_state(
 
 ) -> Result<String, String> {
 
-    let mut store_guard = state.store.lock().await;
+    let store_guard = state.store.lock().await;
 
     if let Some(store) = store_guard.as_ref() {
 
@@ -505,7 +505,7 @@ pub fn run() {
 
     let store_clone = store.clone();
 
-    let store_server = store.clone();
+    let _store_server = store.clone();
 
 
 
@@ -549,7 +549,7 @@ pub fn run() {
 
                 .setup(|app| {
                     let store = app.state::<AppState>().store.clone();
-                    let app_handle = app.handle().clone();
+                    let _app_handle = app.handle().clone();
 
                     // Initialize Store on Startup
                     tauri::async_runtime::spawn(async move {

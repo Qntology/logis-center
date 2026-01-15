@@ -5,7 +5,7 @@ use futures::StreamExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::path::PathBuf;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 use std::sync::Arc;
 use once_cell::sync::Lazy;
 use serde_json::json;
@@ -367,6 +367,7 @@ fn find_app_bundle(bundle_id: &str) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn find_app_bundle(_: &str) -> Option<String> { None }
 
+#[allow(dead_code)]
 fn find_profile_root(browser: &str) -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
     let path_str = match (cfg!(target_os = "windows"), cfg!(target_os = "macos"), browser) {
@@ -385,6 +386,7 @@ fn find_profile_root(browser: &str) -> Option<PathBuf> {
     if path.exists() { Some(path) } else { None }
 }
 
+#[allow(dead_code)]
 fn get_first_profile_name(root: &PathBuf) -> String {
     if root.join("Default").exists() {
         return "Default".to_string();
