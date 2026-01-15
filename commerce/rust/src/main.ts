@@ -562,6 +562,18 @@ async function initBrowserDropdown() { /* Automation Logic */ }
 const extractBtnNav = document.getElementById("btn-extract") as HTMLButtonElement;
 extractBtnNav?.addEventListener("click", async () => { /* Extraction Logic */ });
 
+const autoLaunchBtn = document.getElementById("btn-auto-launch") as HTMLButtonElement;
+autoLaunchBtn?.addEventListener("click", async () => {
+    try {
+        console.log("Launching Best Browser...");
+        // Default to google.com or a neutral start page
+        await invoke("launch_best_browser", { url: "https://google.com" });
+    } catch (e) {
+        console.error("Failed to launch browser:", e);
+        alert("Failed to launch browser: " + e);
+    }
+});
+
 const autoBtn = document.getElementById("auto-btn") as HTMLButtonElement;
 autoBtn?.addEventListener("click", async () => { /* Auto Logic */ });
 
