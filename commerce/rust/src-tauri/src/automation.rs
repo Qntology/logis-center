@@ -35,7 +35,9 @@ const CLIENT_PATTERNS: &[&str] = &[
     "sell.smartstore.naver.com", "wing.coupang.com", "soffice.11st.co.kr", "scm.gmarket.co.kr",
     "scm.auction.co.kr", "seller.interpark.com", "seller.wemakeprice.com", "sell.ssg.com",
     "marketplus.co.kr", "admin.shopby.co.kr", "creators.kakaomakers.com", "sell.storefarm.naver.com",
-    "partner.wemakeprice.com", "activeitzone.com", "demofran.com"
+    "partner.wemakeprice.com", "activeitzone.com", "demofran.com",
+    // Add exact matches for root domains often used with wildcards
+    "cafe24.com", "makeshop.co.kr", "godo.co.kr", "firstmall.kr", "myshopify.com"
 ];
 
 const ADMIN_PATTERNS: &[&str] = &[
@@ -43,7 +45,8 @@ const ADMIN_PATTERNS: &[&str] = &[
     "*.sixshop.com", "*.imweb.me", "*.myshopify.com", "*.shopby.co.kr", "*.wisa.co.kr",
     "*.sellstore.co.kr", "*.squarespace.com", "*.storefarm.naver.com", "*.smartstore.naver.com",
     "*.gmkt.kr", "*.gmarket.co.kr", "*.auction.co.kr", "*.interpark.com", "*.wemakeprice.com",
-    "*.ssg.com", "*.coupang.com", "*.11st.co.kr", "*.kakaomakers.com", "*.activeitzone.com", "*.demofran.com"
+    "*.ssg.com", "*.coupang.com", "*.11st.co.kr", "*.kakaomakers.com", "*.activeitzone.com", "*.demofran.com",
+    "demofran.com", "activeitzone.com"
 ];
 
 fn is_shop(url: &str, patterns: &[&str]) -> bool {

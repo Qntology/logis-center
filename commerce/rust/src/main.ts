@@ -1,6 +1,6 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open, ask } from '@tauri-apps/plugin-dialog';
-import { listen } from '@tauri-apps/api/event';
+import { listen, emit } from '@tauri-apps/api/event';
 import { readFile } from '@tauri-apps/plugin-fs';
 
 // Access global ethers loaded via <script> tag
@@ -562,15 +562,96 @@ async function initBrowserDropdown() { /* Automation Logic */ }
 const extractBtnNav = document.getElementById("btn-extract") as HTMLButtonElement;
 extractBtnNav?.addEventListener("click", async () => { /* Extraction Logic */ });
 
+// --- Browser Match Logic (⚡ Button) ---
+const btnExtract = document.getElementById("btn-extract") as HTMLButtonElement;
+let currentDetectedUrl = "";
+
+// 1. Listen for Browser Match (Show/Hide Button)
+listen("browser-match-found", (event: any) => {
+    const payload = event.payload;
+    if (payload.is_client || payload.is_admin) {
+        currentDetectedUrl = payload.url;
+        if (btnExtract) {
+            btnExtract.style.display = "flex";
+            btnExtract.title = `Extract from ${new URL(payload.url).hostname}`;
+        }
+    } else {
+        if (btnExtract) btnExtract.style.display = "none";
+    }
+});
+
+// 2. Handle Click (Extract & Process)
+btnExtract?.addEventListener("click", async () => {
+    try {
+        btnExtract.disabled = true;
+        btnExtract.innerText = "⏳";
+        
+        console.log("Extracting HTML...");
+        const html = await invoke<string>("extract_html_from_current_tab");
+        
+        console.log("HTML Extracted. Length:", html.length);
+        
+        // Generate Task ID
+        let taskId = `task_${Date.now()}`;
+        if (currentDetectedUrl) {
+            try {
+                const urlObj = new URL(currentDetectedUrl);
+                const link = urlObj.pathname + urlObj.search;
+                const team = currentSession.team || "";
+                const cc = currentSession.cc || "logis.center";
+                // hashId(team + cc + link)
+                taskId = await hashId(team + cc + link);
+            } catch (e) {
+                console.error("ID Generation Failed", e);
+            }
+        }
+
+        // 3. Send to Backend for Processing
+        await emit("new-task-from-browser", {
+            id: taskId,
+            type: "html_extraction",
+            html: html, 
+            link: currentDetectedUrl, 
+            ref_id: currentSession.hash || "manual"
+        });
+        
+        alert("Extraction started! Task ID: " + taskId);
+        
+    } catch (e) {
+        console.error("Extraction failed:", e);
+        alert("Extraction failed: " + e);
+    } finally {
+        btnExtract.disabled = false;
+        btnExtract.innerText = "⚡";
+    }
+});
+
 const autoLaunchBtn = document.getElementById("btn-auto-launch") as HTMLButtonElement;
+
+// Listen for Browser Status to Toggle Button Visibility
+listen("browser-status", (event: any) => {
+    const status = event.payload; // "running" or "stopped"
+    console.log("Browser Status:", status);
+    
+    if (status === "running") {
+        if (autoLaunchBtn) autoLaunchBtn.style.display = "none";
+    } else {
+        if (autoLaunchBtn) autoLaunchBtn.style.display = ""; // Revert to CSS (flex)
+    }
+});
+
 autoLaunchBtn?.addEventListener("click", async () => {
     try {
         console.log("Launching Best Browser...");
-        // Default to google.com or a neutral start page
+        // Optimistically hide button immediately
+        autoLaunchBtn.style.display = "none"; 
+        
         await invoke("launch_best_browser", { url: "https://google.com" });
     } catch (e) {
         console.error("Failed to launch browser:", e);
         alert("Failed to launch browser: " + e);
+        // Show again if failed
+        autoLaunchBtn.style.display = ""; 
     }
 });
 

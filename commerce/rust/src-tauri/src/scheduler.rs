@@ -112,6 +112,7 @@ async fn process_task(
     
     // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
     let light_pug = parsing::convert_to_clean_pug(&html, PugMode::StructureOnly);
+    println!("[Scheduler] Pug (Light) Length: {}, Preview: {:.100}...", light_pug.len(), light_pug.replace("\n", " "));
     
     // 2. LLM Call: Map Outline
     let model_guard = model_mutex.lock().await;
@@ -124,8 +125,22 @@ async fn process_task(
     };
     drop(model_guard);
     
+    println!("[Scheduler] Raw Map Output: {}", page_info_str);
+
     // 3. Parse Map Result
-    let page_info: Value = serde_json::from_str(&page_info_str).unwrap_or(json!({"type": "unknown", "detail": false}));
+    let page_info: Value = serde_json::from_str(&page_info_str).unwrap_or_else(|e| {
+        println!("[Scheduler] JSON Parse Error (Map): {}", e);
+        // Try to find JSON block in markdown
+        if let Some(start) = page_info_str.find("{") {
+            if let Some(end) = page_info_str.rfind("}") {
+                if start < end {
+                    let json_part = &page_info_str[start..=end];
+                    return serde_json::from_str(json_part).unwrap_or(json!({"type": "unknown", "detail": false}));
+                }
+            }
+        }
+        json!({"type": "unknown", "detail": false})
+    });
     
     let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
     let is_detail = page_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);

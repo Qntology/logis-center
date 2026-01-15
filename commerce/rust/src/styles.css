@@ -398,7 +398,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 /* System Message Toggle Logic */
 .system-label {
     position: absolute;
-    top: -29px;
+    top: -82px;
     right: 1em;
     opacity: 0.5;
     cursor: pointer;

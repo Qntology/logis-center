@@ -589,7 +589,10 @@ pub fn run() {
                                     
                                     // Map JSON payload to Task struct
                                     let task = crate::store::Task {
-                                        id: uuid::Uuid::new_v4().to_string(),
+                                        id: payload_val.get("id")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                         r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                                         from_source: "injected_script".to_string(),
                                         to_dest: "local".to_string(),

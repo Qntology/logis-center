@@ -4,6 +4,7 @@ use aha::openai_types::{
     ChatCompletionParameters,
     ChatCompletionRequestMessage,
     ChatCompletionRequestUserMessage,
+    ChatCompletionRequestSystemMessage, // Added
     ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestMessageContentPart,
     ChatCompletionRequestMessageContentPartText,
@@ -18,64 +19,21 @@ use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::*;
 
-// --- CLI Spinners Reflection ---
-// https://github.com/sindresorhus/cli-spinners
-pub struct Spinner {
-    pub frames: Vec<&'static str>,
-    pub interval: u64,
-}
-
-impl Spinner {
-    pub fn dots() -> Self {
-        Self {
-            frames: vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
-            interval: 80,
-        }
-    }
-
-    pub fn line() -> Self {
-        Self {
-            frames: vec!["-", "\\", "|", "/"],
-            interval: 130,
-        }
-    }
-    
-    pub fn dots12() -> Self {
-        Self {
-            frames: vec!["⠁", "⠂", "⢁", "⡁", "⡈", "⡐", "⡠"],
-            interval: 80,
-        }
-    }
-}
-// -------------------------------
-
-
-pub struct LogisModel {
-    pub generator: Arc<Mutex<Qwen3VLGenerateModel>>,
-}
-
-fn log_image_stats(img: &DynamicImage, label: &str) {
-    let (w, h) = img.dimensions();
-    println!("[IMAGE-STATS] {}: {}x{}", label, w, h);
-}
-
-use sysinfo::System;
-
-use aha::utils::get_device;
-use candle_core::{Device, DType};
+// ... (Spinner struct implementation)
 
 impl LogisModel {
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
+        // ... (Keep existing new implementation)
         println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
 
         // 0. Check System Memory
         let mut sys = System::new_all();
         sys.refresh_memory();
         let total_mem = sys.total_memory();
-        let free_mem = sys.available_memory(); // Available is better than free for allocation
+        let free_mem = sys.available_memory();
         
         let used_mem = total_mem - free_mem;
-        let safe_limit = (free_mem as f64 * 0.9) as u64; // Use 90% of available RAM
+        let safe_limit = (free_mem as f64 * 0.9) as u64;
         
         println!("[SYS-INIT] Total RAM: {:.2} GB, Used: {:.2} GB, Available: {:.2} GB", 
             total_mem as f64 / 1024.0 / 1024.0 / 1024.0, 
@@ -137,27 +95,35 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str) -> anyhow::Result<String> {
-        let prompt = format!("{}\n\nUser: {}", system, user_input);
         // Offload the heavy inference to a blocking task to avoid blocking the async runtime
         let self_clone = self.generator.clone();
-        let prompt_clone = prompt.clone();
+        let system_text = system.to_string();
+        let user_text = user_input.to_string();
+        
+        println!("[MODEL-CHAT] Sending Chat Request...");
+        println!("[MODEL-CHAT] System: {:.50}...", system_text.replace("\n", " "));
         
         tokio::task::spawn_blocking(move || {
             let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
             
+            let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: system_text,
+                name: None,
+            });
+
             let content_parts = vec![
                 ChatCompletionRequestMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText { text: prompt_clone }
+                    ChatCompletionRequestMessageContentPartText { text: user_text }
                 )
             ];
 
-            let message = ChatCompletionRequestUserMessage {
+            let user_message = ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(content_parts),
                 name: None,
             };
 
             let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(message)],
+                messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
                 model: "qwen3vl".to_string(),
                 max_tokens: Some(2048),
                 temperature: Some(0.1),
@@ -165,7 +131,9 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+            let response = gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            println!("[MODEL-CHAT] Raw Response: {}", response);
+            Ok(response)
         }).await?
     }
 
