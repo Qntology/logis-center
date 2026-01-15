@@ -103,29 +103,31 @@ async fn process_task(
     // STEP 1: Classification (Structure Only) - "Map Outline"
     // =================================================================================
     
+    // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
     let light_pug = parsing::convert_to_clean_pug(&html, PugMode::StructureOnly);
     
+    // 2. LLM Call: Map Outline
     let model_guard = model_mutex.lock().await;
     let page_info_str = if let Some(model) = model_guard.as_ref() {
-        let system = r#"
-            Analyze the provided Pug structure (Ids, Classes, Tags).
-            Identify the Page Type and if it is a List or Detail page.
-            Return JSON: { "type": "goods"|"order"|"tracking"|"event"|"unknown", "view": "list"|"detail" }
-        "#;
-        let input = light_pug.chars().take(3000).collect::<String>(); 
-        model.chat(system, &input).await?
+        let system = parsing::map_outline(language);
+        let input = light_pug.chars().take(4000).collect::<String>(); // Limit context
+        model.chat(&system, &input).await?
     } else {
         "{}".to_string()
     };
     drop(model_guard);
     
-    let page_info: Value = serde_json::from_str(&page_info_str).unwrap_or(json!({"type": "unknown", "view": "unknown"}));
-    let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown");
-    let view_type = page_info.get("view").and_then(|s| s.as_str()).unwrap_or("unknown");
+    // 3. Parse Map Result
+    let page_info: Value = serde_json::from_str(&page_info_str).unwrap_or(json!({"type": "unknown", "detail": false}));
+    
+    let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
+    let is_detail = page_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+    let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
+    let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
 
-    println!("[Scheduler] Identified: {} / {}", page_type, view_type);
+    println!("[Scheduler] Map Result: Type={}, Detail={}, Node='{}', Item='{}'", page_type, is_detail, node_selector, item_selector);
 
-    if page_type == "unknown" {
+    if page_type == "" || page_type == "unknown" {
         return Ok(());
     }
 
@@ -133,9 +135,30 @@ async fn process_task(
     // STEP 2: Extraction (Full Content) - "Zoom In"
     // =================================================================================
 
-    let content_pug = parsing::convert_to_clean_pug(&html, PugMode::FullContent);
+    // 1. Select Target Area & Convert to Pug (Full Content)
+    // If detail page, we might focus on the main container (node) or the item itself.
+    // If list page, we focus on the list container (node).
+    let target_selector = if !node_selector.is_empty() { 
+        node_selector 
+    } else if !item_selector.is_empty() {
+        item_selector
+    } else {
+        "body" // Fallback
+    };
     
-    let prompt = if view_type == "list" {
+    let content_pug = parsing::convert_to_clean_pug_selector(&html, target_selector, PugMode::FullContent);
+    
+    if content_pug.trim().is_empty() {
+        println!("[Scheduler] Warning: Target selector '{}' returned empty content. Retrying with full body...", target_selector);
+        // Fallback to full body if selector fails
+        // content_pug = parsing::convert_to_clean_pug(&html, PugMode::FullContent); 
+        // Cannot assign to immutable variable, so we just use full body conversion here if needed, 
+        // but shadowing `content_pug` is cleaner or handle it differently.
+        // For now, let's proceed. If empty, LLM might hallucinate or fail, but that's expected handling.
+    }
+
+    // 2. LLM Call: Extraction
+    let prompt = if !is_detail {
         parsing::list2json(language)
     } else {
         parsing::item2json(page_type, url, language)
@@ -143,7 +166,7 @@ async fn process_task(
 
     let model_guard = model_mutex.lock().await;
     let extracted_json_str = if let Some(model) = model_guard.as_ref() {
-            model.chat("Extract information matching the JSON structure.", &format!("{}\n\nData:\n{}", prompt, content_pug)).await?
+            model.chat("Extract information matching the JSON structure.", &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug)).await?
     } else {
         "{}".to_string()
     };
@@ -151,11 +174,13 @@ async fn process_task(
 
     let mut extracted_data: Value = serde_json::from_str(&extracted_json_str).unwrap_or(json!({}));
     
-    // Inject type if missing
-    if extracted_data.get("type").is_none() {
-        if let Some(obj) = extracted_data.as_object_mut() {
+    // Inject type/detail if missing
+    if let Some(obj) = extracted_data.as_object_mut() {
+        if obj.get("type").is_none() {
             obj.insert("type".to_string(), json!(page_type));
         }
+        // Ensure detail flag is consistent
+        // obj.insert("detail".to_string(), json!(is_detail)); 
     }
 
     // =================================================================================

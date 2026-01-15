@@ -1,18 +1,19 @@
-use scraper::{Html, Node};
+use scraper::{Html, Node, Selector};
 use ego_tree::NodeRef;
 
 #[derive(PartialEq)]
 pub enum PugMode {
-    StructureOnly, // 1단계: 타입 식별용 (텍스트/링크 제거, 구조만)
-    FullContent,   // 2단계: 데이터 추출용 (텍스트/링크/속성 포함)
+    StructureOnly, // 1단계: 구조 파악 (ID, Class, Href 만 유지)
+    FullContent,   // 2단계: 데이터 추출 (모든 주요 속성 포함)
 }
 
-/// HTML을 설정된 모드에 따라 간결한 Pug 포맷으로 변환합니다.
+/// HTML 전체를 변환
 pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
     let document = Html::parse_document(html);
     let mut pug_output = String::new();
 
-    // 문서의 루트부터 순회 시작
+    // 문서의 루트부터 순회 시작 (html -> body 탐색)
+    let mut found_body = false;
     for child in document.tree.root().children() {
         if let Some(element) = child.value().as_element() {
             if element.name() == "html" {
@@ -20,6 +21,7 @@ pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
                      if let Some(body_el) = html_child.value().as_element() {
                          if body_el.name() == "body" {
                              generate_pug_lines(html_child, 0, &mut pug_output, &mode);
+                             found_body = true;
                          }
                      }
                  }
@@ -28,12 +30,34 @@ pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
     }
     
     // 만약 html/body 구조가 파싱되지 않았다면 루트부터 시도
-    if pug_output.is_empty() {
+    if !found_body {
          generate_pug_lines(document.tree.root(), 0, &mut pug_output, &mode);
     }
 
     pug_output
 }
+
+/// 특정 Selector에 해당하는 요소만 추출하여 변환 (Zoom-In)
+pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMode) -> String {
+    let document = Html::parse_document(html);
+    let selector = match Selector::parse(selector_str) {
+        Ok(s) => s,
+        Err(_) => return String::new(), // Invalid selector
+    };
+
+    let mut pug_output = String::new();
+    
+    // 첫 번째 매칭되는 요소만 처리
+    if let Some(element) = document.select(&selector).next() {
+        // ego_tree::NodeRef로 변환 (element.id()를 통해 node_ref를 얻을 수 없으므로, select 결과의 node를 사용)
+        // scraper::ElementRef는 Deref로 Node를 가리키지 않음. 
+        // ElementRef.node()가 NodeRef를 반환함.
+        generate_pug_lines(element.node(), 0, &mut pug_output, &mode);
+    }
+
+    pug_output
+}
+
 
 fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode) {
     let indent = "    ".repeat(indent_level);
@@ -42,12 +66,12 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
         Node::Element(element) => {
             let tag_name = element.name();
 
-            // proxy/src/index.ts의 제외 태그 목록 반영
-            if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta"].contains(&tag_name) {
+            // 광고 및 불필요한 태그 필터링
+            if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head"].contains(&tag_name) {
                 return;
             }
             
-            // base64 이미지는 제외 (토큰 절약)
+            // base64 이미지는 항상 제외
             if tag_name == "img" {
                 if let Some(src) = element.attr("src") {
                     if src.contains("base64") { return; }
@@ -67,32 +91,31 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 line.push_str(&format!(".{}", class));
             }
 
-            // Attributes
+            // Attributes Filter
             match mode {
                 PugMode::StructureOnly => {
-                    // 1단계: 구조 파악용 - 입력 필드 타입 정도만 남김
-                    if let Some(val) = element.attr("type") {
-                        attrs.push(format!("type='{}'", val));
+                    // 1단계: ID, Class(위에서 처리됨), Href 만 유지
+                    if let Some(val) = element.attr("href") {
+                        attrs.push(format!("href='{}'", val));
                     }
                 },
                 PugMode::FullContent => {
-                    // 2단계: 데이터 추출용 - 주요 속성 포함
-                    // proxy/src/index.ts의 allowed attributes 반영
-                    let allowed_attrs = [
-                        "src", "href", "type", "name", "value", "placeholder", 
-                        "checked", "selected", "disabled", "readonly", "rows", "cols"
-                    ];
+                    // 2단계: 데이터 추출용 - 주요 속성 및 data- 속성 포함
+                    // 사용자 요청: "attr, data-, src, 속성값 제거와 필요한 class, id, href 속성값을 제외한 나머지 속성값은 제거" -> 
+                    // Step 1 is restricted. Step 2 "original html content... attr, data-, class, id, href properties included"
+                    // So we preserve most relevant attributes here.
                     
                     for (key, value) in element.attrs() {
                         if key == "id" || key == "class" { continue; }
                         
-                        // data- 속성 또는 허용된 속성
-                        if key.starts_with("data-") || allowed_attrs.contains(&key) {
+                        // 모든 data- 속성 허용 및 주요 표준 속성 허용
+                        if key.starts_with("data-") || [
+                            "src", "href", "type", "name", "value", "placeholder", "title", "alt",
+                            "checked", "selected", "disabled", "readonly", "rows", "cols", "action", "method"
+                        ].contains(&key) {
                              if ["checked", "selected", "disabled", "readonly"].contains(&key) {
-                                 // Boolean 속성
                                  attrs.push(key.to_string());
                              } else {
-                                 // 값 속성 (따옴표 이스케이프 처리)
                                  let safe_val = value.replace("\"", "'" ).replace("\n", "");
                                  attrs.push(format!(r#"{}='{}'"#, key, safe_val));
                              }
@@ -105,12 +128,6 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 line.push_str(&format!("({})", attrs.join(" ")));
             }
 
-            // textarea 값 처리 (HTML 파서에서는 텍스트 노드로 잡히지만 명시적 처리)
-            if tag_name == "textarea" && *mode == PugMode::FullContent {
-                // scraper 라이브러리 구조상 textarea의 내용은 자식 Text 노드로 옴.
-                // 아래 재귀 호출에서 처리됨.
-            }
-
             output.push_str(&line);
             output.push('\n');
 
@@ -119,23 +136,25 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             }
         },
         Node::Text(text) => {
-            // 텍스트 노드 처리
+            // StructureOnly 모드에서는 텍스트 노드 내용을 생략하여 토큰 절약 (구조만 중요함)
+            // 단, 네비게이션 텍스트 등이 중요할 수 있으므로, 짧게 자르거나 포함할 수 있음.
+            // 요청 사항: "구조만" -> 텍스트 제거가 맞을 수 있으나, 리스트/상세 판단에 텍스트가 힌트가 됨.
+            // 여기서는 StructureOnly일 때 텍스트를 제외하거나 최소화하는 것이 좋음.
+            
             if *mode == PugMode::FullContent {
                 let content = text.trim();
                 if !content.is_empty() {
                     for line in content.lines() {
                         let trimmed_line = line.trim();
                         if !trimmed_line.is_empty() {
-                            // Pug의 텍스트 파이프(|) 문법 사용
                             output.push_str(&format!("{}| {}
-", indent, trimmed_line.replace("\"", "'" ))); // Corrected: escaped " to \"
+", indent, trimmed_line.replace("\"", "'" )));
                         }
                     }
                 }
             }
         },
         _ => {
-            // 주석 등 기타 노드는 무시하되 자식은 순회
             for child in node.children() {
                 generate_pug_lines(child, indent_level, output, mode);
             }
@@ -143,7 +162,20 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
     }
 }
 
-// --- Schema Prompts (Ported directly from proxy/src/index.ts) ---
+pub fn map_outline(language: &str) -> String {
+    format!(r#"Analyze the HTML structure and classify the page.
+    Return JSON:
+    {{
+        "type": "order" | "goods" | "tracking" | "review" | "coupon" | "event" | "",
+        "item": "CSS1 selector for individual items (excluding ads/recommendations)",
+        "node": "CSS1 selector for the parent list container",
+        "detail": boolean (true if detail page, false if list)
+    }}
+    Language: {}"#, language)
+}
+
+// ... (Existing prompts: image2json, para2graph, graph2contexts, item2json, list2json)
+
 
 pub fn image2json(region: &str, language: &str, page_type: &str, address: &str) -> String {
     if page_type == "tracking" {
