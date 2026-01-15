@@ -47,9 +47,16 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
 
     let mut pug_output = String::new();
     
-    // 첫 번째 매칭되는 요소만 처리
-    if let Some(element) = document.select(&selector).next() {
-        generate_pug_lines(element.node(), 0, &mut pug_output, &mode);
+    // ElementRef doesn't expose the underlying NodeRef publicly.
+    // So we manually traverse the tree, wrap nodes in ElementRef to check matches,
+    // and then use the matching NodeRef directly.
+    for node in document.tree.root().descendants() {
+        if let Some(element_ref) = scraper::ElementRef::wrap(node) {
+            if selector.matches(&element_ref) {
+                 generate_pug_lines(node, 0, &mut pug_output, &mode);
+                 break; // Process only the first match
+            }
+        }
     }
 
     pug_output
