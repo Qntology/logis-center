@@ -63,7 +63,8 @@ body {
 /* --- 1. Pill Nav Bar (Always Visible) --- */
 .pill-nav {
   width: 100%;
-  height: 64px;
+  height: 58px;
+  max-height: 58px;
   position: relative;
   z-index: 100;
   
@@ -301,3 +302,329 @@ table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
 th { text-align: left; color: var(--text-muted); padding: 8px; border-bottom: 1px solid var(--glass-border); }
 td { padding: 8px; border-bottom: 1px solid rgba(0,0,0,0.05); }
 tr:hover { background: rgba(0,0,0,0.05); }
+
+[data-tab="settings"]::after{content: '🗨️'; font-family: 'Noto Color Emoji';}
+[data-tab="settings"][class*="active"]::after{content: '💬';}
+
+
+/* --- CHAT UI STYLES (Ported from content.js) --- */
+.chat-container {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    padding-bottom: 60px; /* Space for form */
+}
+
+/* 180deg Rotation Trick for Stick-to-Bottom Scroll */
+.chat-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 2em;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    height: 100%;
+    box-sizing: border-box;
+    /* Ported from content.js: direction: rtl; transform: rotate(180deg); */
+    direction: rtl; 
+    transform: rotate(180deg);
+}
+
+.chat-talks {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+    box-sizing: border-box;
+    transform: rotate(180deg);
+}
+
+/* Individual Messages */
+.chat-talk {
+    position: relative;
+    display: block;
+    margin-bottom: 2em;
+    padding: 10px;
+    text-align: right; /* User default */
+}
+
+.chat-talk.system {
+    text-align: left; /* System default */
+}
+
+.chat-message {
+    position: relative;
+    overflow: hidden;
+    display: inline-block;
+    padding: 10px;
+    border: 1px solid #000;
+    border-radius: 1em;
+    text-align: left;
+    max-width: 85%;
+    background-color: rgba(0,0,0,0.8);
+    color: #fff;
+}
+
+.chat-talk.user .chat-message {
+    background-color: var(--primary);
+    color: #000;
+    border-top-right-radius: 2px;
+}
+
+.chat-talk.system .chat-message {
+    background-color: rgba(0,0,0,0.1);
+    color: #000;
+    border-top-left-radius: 2px;
+}
+
+.chat-created-at {
+    display: block;
+    margin-top: 10px;
+    width: 100%;
+    font-size: 8px;
+    text-align: right;
+    color: #666;
+}
+
+.chat-talk.system .chat-created-at {
+    text-align: left;
+}
+
+/* System Message Toggle Logic */
+.system-label {
+    position: absolute;
+    top: -29px;
+    right: 1em;
+    opacity: 0.5;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+.system-label:before {
+    content: "✅";
+    margin-right: 5px;
+    filter: sepia(100%) saturate(100%) grayscale(1);
+}
+
+#system-toggle:checked ~ .chat-container .system-label {
+    opacity: 1;
+}
+#system-toggle:checked ~ .chat-container .system-label:before {
+    filter: none;
+}
+
+#system-toggle:checked ~ .chat-container .chat-talk {
+    display: none;
+}
+#system-toggle:checked ~ .chat-container .chat-talk.system {
+    display: block;
+}
+
+
+/* Input Form */
+.chat-form {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+}
+.chat-form input[type="text"] {
+    padding: 0 4em 0 1em; /* Space for button */
+    width: 100%;
+    height: 67px;
+    background-color: #fff;
+    color: #000;
+    box-sizing: border-box;
+    margin: 0;
+    border-radius: 0;
+    border-top: 1px solid #ccc;
+}
+.chat-form button {
+    position: absolute;
+    right: 1em;
+    bottom: 15px;
+    height: 40px;
+    border-radius: 8px;
+}
+.chat-form.hidden {
+    display: none;
+}
+
+/* QR Auth Styles */
+.qrcode {
+    display: none;
+    margin: 20px auto;
+    padding: 15px;
+    background-color: #fff;
+    border-radius: 1em;
+    max-width: 230px;
+    transform: rotate(180deg); /* Counter-rotate to look straight */
+    box-shadow: 0 0 15px rgba(0,0,0,0.1);
+}
+.qrcode img {
+    width: 100%;
+    height: auto;
+}
+.qrauth {
+    display: block; /* Visible when needed */
+    margin: 0 auto;
+    border-radius: 1em;
+    height: 36px;
+    line-height: 36px;
+    background-color: #fff;
+    color: #000;
+    font-weight: 900;
+    text-transform: uppercase;
+    text-decoration: underline;
+    text-align: center;
+    cursor: pointer;
+    box-shadow: 0 0 20px 0px #00000055;
+    width: 200px;
+}
+
+/* Hide Logout by default */
+#btn-logout.hidden { display: none; }
+
+
+/* --- NAVIGATION CATEGORIES OVERLAY (Updated) --- */
+.nav-categories {
+    position: absolute;
+    top: 50px; /* Below header */
+    left: 0;
+    width: 100%;
+    height: calc(100% - 50px);
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    z-index: 20;
+    padding: 10px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+    
+    /* Animation */
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+}
+
+.nav-categories.visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.nav-categories.hidden {
+    display: none; /* Hard hide */
+}
+
+/* Profile Section Styles (Ported & Adapted) */
+.nav-profile {
+    position: relative;
+    bottom: auto; /* Override absolute positioning from content.js */
+    width: 100%;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #eee;
+}
+
+.profile-card {
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    padding: 0.7em;
+    border-radius: 1em;
+    min-height: 40px;
+    background-color: #000;
+    box-shadow: 0 0 20px 0px rgba(0,0,0,0.5);
+    color: #fff;
+    margin-bottom: 10px;
+}
+
+.profile-favicon {
+    width: 30px;
+    height: 30px;
+    background-color: #333;
+    border-radius: 50%;
+    margin-right: 10px;
+    background-size: cover;
+    background-position: center;
+}
+
+.profile-info {
+    flex: 1;
+}
+
+.profile-name-group {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+#nav-profile-name {
+    font-size: 16px;
+    font-weight: bold;
+}
+
+.link-btn {
+    background: none;
+    border: none;
+    color: #fff;
+    text-decoration: underline;
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0.8;
+}
+.link-btn:hover { opacity: 1; }
+
+.profile-menu {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.nav-menu-btn {
+    background: none;
+    border: none;
+    text-decoration: underline;
+    font-size: 12px;
+    cursor: pointer;
+    color: #333;
+}
+
+/* Nav Lists */
+.nav-section h3 {
+    margin: 0 0 8px 0;
+    font-size: 0.9rem;
+    color: var(--primary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 4px;
+}
+
+.scroll-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.nav-item {
+    padding: 6px 12px;
+    background: rgba(0,0,0,0.05);
+    border-radius: 15px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.nav-item:hover {
+    background: var(--primary);
+    color: white;
+}
+
+/* Hidden Utility */
+.hidden { display: none !important; }

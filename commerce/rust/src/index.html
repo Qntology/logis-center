@@ -6,7 +6,12 @@
     <title>Logis AI Widget</title>
     <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg?v=2" />
     <link rel="shortcut icon" href="/assets/favicon.svg?v=18" />
-    <link rel="stylesheet" href="styles.css?v=15" />
+    <link rel="stylesheet" href="styles.css?20" />
+    <script src="/ethers.umd.min.js"></script>
+    <script src="/qrcode.min.js"></script>
+    <script src="/marked.js"></script>
+    <script src="/pako.js"></script>
+    <script src="/blockies.js"></script>
     <script type="module" src="/main.ts" defer></script>
   </head>
   <body>
@@ -30,7 +35,7 @@
           <button id="btn-submit" class="nav-btn" title="AI Search">🔍</button>
           <button id="btn-extract" class="nav-btn" style="display:none; color: var(--primary);" title="Start Extraction">⚡</button>
           <button id="btn-auto-launch" class="nav-btn" title="Open Browser">🌐</button>
-          <button id="btn-settings" class="nav-btn" data-tab="settings" title="Config">📦</button>
+          <button id="btn-settings" class="nav-btn" data-tab="settings" title="Config"></button>
         </div>
       </nav>
 
@@ -40,7 +45,7 @@
         <!-- Tab: List (Primary View) -->
         <div id="tab-list" class="tab-content active">
            <!-- View 1: List Table -->
-           <div id="list-view">
+           <div id="list-view" style="position: relative;">
                <div class="header-row">
                  <div style="display:flex; align-items:center; gap:10px;">
                     <button id="btn-list-back" class="nav-btn" title="Collapse">⬅︎</button>
@@ -51,6 +56,44 @@
                     <button id="list-refresh-btn" class="nav-btn" title="Refresh">🔄</button>
                  </div>
                </div>
+               
+               <!-- Navigation Categories Overlay (Profile + Lists) -->
+               <div id="nav-categories" class="nav-categories hidden">
+                   <!-- Profile Section (Top) -->
+                   <div class="nav-profile">
+                       <div class="profile-card">
+                           <div class="profile-favicon" id="nav-profile-favicon"></div>
+                           <div class="profile-info">
+                               <div class="profile-name-group">
+                                   <input type="text" id="nav-profile-name-input" class="hidden" placeholder="Name">
+                                   <strong id="nav-profile-name">Sign In</strong>
+                                   <button id="nav-profile-edit" class="link-btn hidden">Edit</button>
+                               </div>
+                           </div>
+                       </div>
+                       <div class="profile-menu">
+                           <button id="nav-signin" class="nav-menu-btn">Sign In</button>
+                           <button id="nav-signout" class="nav-menu-btn hidden">Sign Out</button>
+                       </div>
+                   </div>
+
+                   <!-- Scroll Lists -->
+                   <div class="nav-scroll">
+                       <div class="nav-section">
+                           <h3>Membership</h3>
+                           <div id="nav-list-membership" class="scroll-list"></div>
+                       </div>
+                       <div class="nav-section">
+                           <h3>Pages</h3>
+                           <div id="nav-list-pages" class="scroll-list"></div>
+                       </div>
+                       <div class="nav-section">
+                           <h3>Users</h3>
+                           <div id="nav-list-users" class="scroll-list"></div>
+                       </div>
+                   </div>
+               </div>
+
                <div id="list-scroll-container" style="height: 300px; overflow-y: auto;">
                  <table id="doc-table">
                    <thead>
@@ -98,18 +141,57 @@
            <div id="auto-status" style="margin-top:10px; font-size:0.8rem;"></div>
         </div>
 
-        <!-- Tab: Settings -->
+        <!-- Tab: Settings (Chat & System) -->
         <div id="tab-settings" class="tab-content">
            <div class="header-row">
              <div style="display:flex; align-items:center; gap:10px;">
-                <button class="nav-btn" onclick="document.getElementById('nav-back-list').click()">⬅︎</button>
-                <h2>System</h2>
+                <button id="btn-settings-back" class="nav-btn">⬅︎</button>
              </div>
            </div>
-           <div id="device-status" style="margin-bottom:10px;">Checking system...</div>
-           <button id="unload-btn" class="action-btn" style="background:#ef4444; border:none;">Free Memory</button>
-           <div style="margin-top:20px;">
-                <button id="nav-to-auto" class="action-btn">Open Automation Tool</button>
+           
+           <!-- Chat UI Container -->
+           <div class="aside right" style="height: calc(100% - 40px); display: flex; flex-direction: column; position: relative;">
+                
+                <!-- Chat Interface (Always Visible for Logs) -->
+                <div id="chat-interface" class="chat-interface" style="display:flex; flex-direction:column; height:100%;">
+                    
+                    <!-- Auth Header -->
+                    <div id="auth-header" style="padding: 0 10px 10px; border-bottom: 1px solid #eee; display:flex; justify-content:space-between; align-items:center;">
+                        <span id="auth-status-text" style="font-size: 0.8rem; color: #666;">Waiting for Auth...</span>
+                        <div style="display:flex; gap:5px;">
+                            <button id="btn-qr-auth" class="action-btn" style="width:auto; padding: 4px 8px; font-size:0.75rem; margin:0;">QR Verify</button>
+                            <button id="btn-logout" class="hidden" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:0.8rem;">Exit</button>
+                        </div>
+                    </div>
+
+                    <!-- System Toggle (Hidden Checkbox Logic) -->
+                    <input type="checkbox" id="system-toggle" checked style="display:none;">
+                    
+                    <div class="chat-container">
+                        <label for="system-toggle" class="system-label">System Message <i class="count"></i></label>
+                        
+                        <div class="chat-scroll" id="chat-scroll">
+                            <div class="chat-talks">
+                                <div class="qrcode"></div>
+                            </div>
+                            <div class="chat-bottom"></div>
+                        </div>
+                        
+                        <!-- Chat Input (Hidden until Authed) -->
+                        <form name="chat-form" class="chat-form hidden">
+                            <input type="text" name="talk" placeholder="Message..." required autocomplete="off">
+                            <button type="submit" class="primary-btn" style="width:auto; padding: 0 15px;">➤</button>
+                        </form>
+                    </div>
+                </div>
+           </div>
+           
+           <!-- Original Settings Content (Hidden or moved? User said "reflect chat", implies replacement or addition) -->
+           <!-- Keeping vital buttons accessible via a hidden menu or bottom if needed, but for now focusing on Chat as requested -->
+           <div id="settings-tools" style="margin-top:10px; padding-top:10px; border-top:1px solid #333; display:none;">
+               <div id="device-status">Checking system...</div>
+               <button id="unload-btn" class="action-btn" style="background:#ef4444; border:none;">Free Memory</button>
+               <button id="nav-to-auto" class="action-btn">Open Automation Tool</button>
            </div>
         </div>
         
