@@ -12,9 +12,9 @@ use store::{VectorStore, TradeDocument};
 use std::sync::Arc;
 use serde_json::{Value, json};
 
-struct AppState {
-    model: Arc<Mutex<Option<LogisModel>>>,
-    store: Arc<Mutex<Option<VectorStore>>>,
+pub struct AppState {
+    pub model: Arc<Mutex<Option<LogisModel>>>,
+    pub store: Arc<Mutex<Option<VectorStore>>>,
 }
 
 #[tauri::command]
@@ -289,7 +289,7 @@ async fn summarize_image(
         // or map extracted_data to TradeDocument if strict schema is needed.
         // For flexibility, we use upsert_item with "image_summary" type.
         
-        let _ = store.upsert_item(&doc_uuid, "image_summary", extracted_data.clone(), Some(embedding)).await;
+        let _ = store.upsert_item("commerce_items", &doc_uuid, "image_summary", extracted_data.clone(), Some(embedding)).await;
     }
 
     Ok(serde_json::to_string_pretty(&extracted_data).unwrap_or(summary))
@@ -326,7 +326,7 @@ async fn search_documents(
 
     // Search
     if let Some(store) = store_guard.as_ref() {
-        store.search_items(query_vec, 10).await.map_err(|e| e.to_string())
+        store.search_items("commerce_items", query_vec, 10).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }
@@ -432,7 +432,7 @@ async fn deep_research_command(
     if let Some(store) = store_guard.as_ref() {
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
-        if let Ok(results) = store.search_items(emb, 3).await {
+        if let Ok(results) = store.search_items("commerce_items", emb, 3).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();

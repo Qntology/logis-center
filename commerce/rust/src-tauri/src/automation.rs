@@ -153,7 +153,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
     println!("[AUTO] Setting up page...");
     
     // 3. Create or Get Page
-    let page = browser_arc.new_page("about:blank").await
+    let mut page = browser_arc.new_page("about:blank").await
         .map_err(|e| anyhow!("Failed to create page: {}", e))?;
 
     // 4. Inject Script on EVERY Navigation
@@ -172,21 +172,115 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
         format!("{};\n{};\n{}", pako_lib, content_logic, script)
     };
     
+use tauri::{Emitter, Manager}; // Added Manager
+use crate::AppState; // Import AppState
+use crate::store::VectorStore;
+
+// ... (existing imports)
+
+// ...
+
     // --- ADDED: JS to Rust Binding ---
     // This allows content.js to call window.__TAURI_POST_TASK__(data)
     let app_handle_for_event = app_handle.clone();
+    
     page.expose_function("__TAURI_POST_TASK__", move |mut args: Vec<serde_json::Value>| {
-        let handle = app_handle_for_event.clone();
-        if let Some(payload) = args.pop() {
+        let app_handle = app_handle_for_event.clone();
+        Box::pin(async move {
+            let payload = args.pop().unwrap_or(json!({}));
+            
+            // Check for DB commands (select, upsert, delete, clear)
+            let is_db_cmd = payload.get("select").is_some() || 
+                           payload.get("upsert").is_some() || 
+                           payload.get("delete").is_some() ||
+                           payload.get("clear").is_some();
+
+            if is_db_cmd {
+                let state = app_handle.state::<AppState>();
+                let store_guard = state.store.lock().await;
+                
+                if let Some(store) = store_guard.as_ref() {
+                    if let Some(table) = payload.get("select").and_then(|s| s.as_str()) {
+                        let db_table = match table {
+                            "items" => "commerce_items",
+                            "pages" => "commerce_items", // Map pages to items for now or create generic query
+                            "users" => "commerce_users",
+                            "crons" => "tasks",
+                            _ => table
+                        };
+                        
+                        // Handle generic query
+                        if let (Some(key), Some(value)) = (payload.get("key").and_then(|s| s.as_str()), payload.get("value")) {
+                            if let Ok(Some((id, data))) = store.find_item_by_property(db_table, key, value).await {
+                                // Return as array to match Dexie toArray()
+                                // Inject ID if missing
+                                let mut res = data.clone();
+                                if let Some(obj) = res.as_object_mut() {
+                                    obj.insert("id".to_string(), json!(id));
+                                }
+                                return Ok(json!({ "results": [res] }));
+                            } else {
+                                return Ok(json!({ "results": [] }));
+                            }
+                        } else {
+                             // No key/value, maybe return all? (Limit 100)
+                             // VectorStore doesn't have "get all", but search_items with 0 vector might work or custom query
+                             // For now return empty or implement get_all
+                             return Ok(json!({ "results": [] }));
+                        }
+                    } 
+                    else if let Some(table) = payload.get("upsert").and_then(|s| s.as_str()) {
+                         let db_table = match table {
+                            "items" => "commerce_items",
+                            "pages" => "commerce_items",
+                            "users" => "commerce_users",
+                            "crons" => "tasks",
+                            _ => table
+                        };
+                        
+                        if let Some(val) = payload.get("value") {
+                            let id = val.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                            let type_ = val.get("type").and_then(|s| s.as_str()).unwrap_or(table);
+                            
+                            // If table is tasks, map differently or use add_task
+                            if db_table == "tasks" {
+                                let task = crate::store::Task {
+                                    id: id.clone(),
+                                    r#type: val.get("job").and_then(|s| s.as_str()).unwrap_or("cron").to_string(),
+                                    from_source: "browser".to_string(),
+                                    to_dest: "local".to_string(),
+                                    cc: val.get("cc").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                                    bcc: val.get("bcc").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                                    ref_id: val.get("ref").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                                    data_json: val.to_string(),
+                                    created_at: val.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                                    updated_at: val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                                    status: "pending".to_string(),
+                                };
+                                let _ = store.add_task(task).await;
+                                return Ok(json!({ "results": [val] }));
+                            }
+                            
+                            // Use upsert_item
+                            let _ = store.upsert_item(db_table, &id, type_, val.clone(), None).await;
+                            return Ok(json!({ "results": [val] }));
+                        }
+                    }
+                    else if let Some(table) = payload.get("delete").and_then(|s| s.as_str()) {
+                        // Implement delete
+                        return Ok(json!({ "results": [] }));
+                    }
+                }
+                
+                return Ok(json!({ "results": [], "error": "Store not initialized" }));
+            }
+
+            // Default: Emit generic task event
             println!("[AUTO] Event received from JS. Emitting 'new-task-from-browser'...");
-            // Emit a Tauri event that the main app can listen to
-            handle.emit("new-task-from-browser", payload).unwrap();
-        } else {
-            println!("[AUTO] Warning: __TAURI_POST_TASK__ called with no arguments.");
-        }
-        
-        // This must return a valid JSON value to resolve the JS promise
-        Ok(json!({ "status": "event_emitted" }))
+            app_handle.emit("new-task-from-browser", &payload).unwrap();
+            
+            Ok(json!({ "status": "event_emitted" }))
+        })
     }).await.map_err(|e| anyhow!("Failed to expose function: {}", e))?;
 
     page.evaluate_on_new_document(&final_script).await

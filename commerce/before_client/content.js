@@ -832,42 +832,8 @@
 			return body;
 		}
 
-		const db = new Dexie("logis-center");
-
-		db.version(2).stores({
-			items : `
-				id,
-				type,
-				from,
-				to,
-				cc,
-				bcc,
-				ref,
-				created_at,
-				updated_at
-			`,
-			pages : `
-				id,
-				type,
-				from,
-				to,
-				cc,
-				bcc,
-				ref,
-				data,
-				created_at,
-				updated_at
-			`,
-			crons : `
-				id,
-				cc,
-				bcc,
-				job,
-				ref,
-				created_at,
-				updated_at
-			`
-		});
+		// Dexie removed in favor of Rust LanceDB
+		const db = {}; 
 
 		marked.setOptions({
 			breaks: true
@@ -875,61 +841,13 @@
 
 
 		var sendMessage = async function(req){
-			var results = {};
-			
 			try {
-				if(req.select){
-					var collection = db[req.select]
-
-					if(req.key){
-						collection = collection.where(req.key)
-					}
-
-					if(req.value){
-						collection = collection.equals(req.value)
-					}
-
-					if(req.above){ 
-						//  above() (보다 큼: > ) 
-						collection = collection.above(req.above)
-					}
-
-					if(req.below){
-						//  below() (보다 작음: < )
-						collection = collection.below(req.below)
-					}
-
-					if(req.limit){
-						//  below() (보다 작음: < )
-						collection = collection.limit(req.limit)
-					}
-
-					if(req.orderBy){
-						collection = collection.orderBy(req.orderBy)
-					}
-
-					if(req.desc){
-						collection = collection.reverse()
-					}
-
-					results = await collection.toArray();
-					
-
-				}else if(req.upsert){
-					results = await db[req.upsert].put(req.value);
-
-				}else if(req.delete){
-					results = await db[req.delete].put(req.key);
-					
-				}else if(req.clear){
-					results = await db[req.clear].clear();
-
-				}
-
-				return { results : results }
-
+				// Delegate DB operations to Rust backend via app.request
+				var response = await app.request({ body: req });
+				return response || { results: [] };
 			}catch(error) {
-				return { results : results }
+				console.error("sendMessage error:", error);
+				return { results : [] }
 			}
 		}
 
