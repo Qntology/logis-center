@@ -53,12 +53,13 @@ async function hashId(text?: string): Promise<string> {
 }
 
 async function reqUrl(baseParams: any = {}): Promise<string> {
-    const origin = encodeURIComponent(window.location.origin);
-    const href = encodeURIComponent(window.location.href);
+    const origin = encodeURIComponent("https://commerce.logis.center");
+    const href = encodeURIComponent("https://commerce.logis.center/");
     const created_at = Date.now();
     const crons = encodeURIComponent("[]"); 
     
-    const pathname = new URL(window.location.href).pathname.toLowerCase();
+    // Calculate 'to' parameter based on hardcoded path
+    const pathname = "/"; 
     const cc = currentSession.cc || "logis.center";
     const to = await hashId(cc + pathname);
 
@@ -267,21 +268,18 @@ function performQrAuth() {
     const body = `Hash: ${currentSession.hash}`;
     const mailto = `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     
-    // Open Mail Client
-    window.location.href = mailto;
-    document.getElementById("auth-status-text")!.innerText = "📧 Check email & scan QR...";
-
     // Show QR Code
+    document.getElementById("auth-status-text")!.innerText = "📧 Scan QR to Login...";
+
     const qrContainer = document.querySelector('.qrcode') as HTMLElement;
-    const btnQr = document.getElementById("btn-qr-auth");
     
     if (qrContainer && QRCode) {
-        qrContainer.innerHTML = ""; // Clear prev
+        qrContainer.innerHTML = "<div style='font-weight:bold; text-align:center;'>QR Sign in</div>"; // Debug
         qrContainer.style.display = "block"; // Make visible
         new QRCode(qrContainer, {
             text: mailto,
-            width: 200,
-            height: 200,
+            width: 300,
+            height: 300,
             colorDark : "#000000",
             colorLight : "#ffffff",
             correctLevel : QRCode.CorrectLevel.H
