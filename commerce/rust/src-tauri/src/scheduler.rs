@@ -253,13 +253,16 @@ async fn process_task(
     }
     
     // Sync 'id' and 'index' for logic compatibility
-    if let Some(id_val) = normalized_data.get("id") {
+    let id_opt = normalized_data.get("id").cloned();
+    let index_opt = normalized_data.get("index").cloned();
+
+    if let Some(id_val) = id_opt {
         if normalized_data.get("index").is_none() {
-            normalized_data.as_object_mut().unwrap().insert("index".to_string(), id_val.clone());
+            normalized_data.as_object_mut().unwrap().insert("index".to_string(), id_val);
         }
-    } else if let Some(idx_val) = normalized_data.get("index") {
+    } else if let Some(idx_val) = index_opt {
         if normalized_data.get("id").is_none() {
-            normalized_data.as_object_mut().unwrap().insert("id".to_string(), idx_val.clone());
+            normalized_data.as_object_mut().unwrap().insert("id".to_string(), idx_val);
         }
     }
     

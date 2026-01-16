@@ -256,6 +256,80 @@ impl LogisModel {
         }
     }
 
+    pub async fn chat_with_image_spinner(
+        &self, 
+        prompt: String, 
+        image: Option<DynamicImage>,
+        app_handle: &tauri::AppHandle,
+        event_name: &str,
+        base_payload: Value
+    ) -> anyhow::Result<String> {
+        let self_clone = self.generator.clone();
+        
+        let task = tokio::task::spawn_blocking(move || {
+            let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            
+            let mut content_parts = Vec::new();
+            
+            if let Some(img) = image {
+                let mut buf = Cursor::new(Vec::new());
+                img.write_to(&mut buf, image::ImageFormat::Png)?;
+                let b64 = BASE64_STANDARD.encode(buf.into_inner());
+                let url = format!("data:image/png;base64,{}", b64);
+                
+                content_parts.push(ChatCompletionRequestMessageContentPart::ImageURL(
+                    ChatCompletionRequestMessageContentPartImage {
+                        image_url: ImageURL { url, detail: None }
+                    }
+                ));
+            }
+
+            content_parts.push(ChatCompletionRequestMessageContentPart::Text(
+                ChatCompletionRequestMessageContentPartText { text: prompt }
+            ));
+
+            let message = ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(content_parts),
+                name: None,
+            };
+
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(message)],
+                model: "qwen3vl".to_string(),
+                max_tokens: Some(1024),
+                temperature: Some(0.1),
+                top_p: Some(0.9),
+                ..Default::default()
+            };
+            
+            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+        });
+
+        let spinner = Spinner::dots();
+        let mut idx = 0;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(spinner.interval));
+        
+        tokio::pin!(task);
+
+        loop {
+            tokio::select! {
+                res = &mut task => {
+                    return res.map_err(|e| anyhow!("Task join error: {}", e))?; 
+                }
+                _ = interval.tick() => {
+                    let frame = spinner.frames[idx % spinner.frames.len()];
+                    idx += 1;
+                    
+                    let mut payload = base_payload.clone();
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("spinner".to_string(), json!(frame));
+                    }
+                    let _ = app_handle.emit(event_name, payload);
+                }
+            }
+        }
+    }
+
     fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>) -> anyhow::Result<String> {
         let mut gen = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
         
