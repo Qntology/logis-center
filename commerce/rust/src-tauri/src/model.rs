@@ -38,6 +38,7 @@ impl Spinner {
 
 pub struct LogisModel {
     generator: Arc<Mutex<Qwen3VLGenerateModel>>,
+    is_cpu_mode: bool,
 }
 
 impl LogisModel {
@@ -143,7 +144,12 @@ impl LogisModel {
 
         Ok(Self {
             generator: Arc::new(Mutex::new(generator)),
+            is_cpu_mode: device.is_cpu(),
         })
+    }
+
+    pub fn is_cpu(&self) -> bool {
+        self.is_cpu_mode
     }
 
     pub async fn chat(&self, system: &str, user_input: &str) -> anyhow::Result<String> {
