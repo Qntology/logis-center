@@ -45,27 +45,58 @@ impl LogisModel {
         // ... (Keep existing new implementation)
         println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
 
-        // 0. Check System Memory
+        // 0. Check System Memory (Real-time)
         let mut sys = System::new_all();
-        sys.refresh_memory();
+        sys.refresh_memory(); 
+        
         let total_mem = sys.total_memory();
-        let free_mem = sys.available_memory();
+        let free_mem = sys.available_memory(); // Available includes cache/buffers that can be reclaimed
         
-        let used_mem = total_mem - free_mem;
-        let safe_limit = (free_mem as f64 * 0.9) as u64;
+        // 1. Calculate Safe Limit (80% of Available RAM to allow OS breathing room)
+        let safe_limit = (free_mem as f64 * 0.8) as u64;
         
-        println!("[SYS-INIT] Total RAM: {:.2} GB, Used: {:.2} GB, Available: {:.2} GB", 
-            total_mem as f64 / 1024.0 / 1024.0 / 1024.0, 
-            used_mem as f64 / 1024.0 / 1024.0 / 1024.0,
-            free_mem as f64 / 1024.0 / 1024.0 / 1024.0
-        );
+        // 2. Precise/Dynamic Model Requirement Calculation
+        // Qwen2.5-VL-2B-Instruct-Q4_K_M GGUF file size is approx 1.6 GB.
+        let base_model_size: u64 = 1_717_986_918; // ~1.6 GB
         
-        println!("[SYS-INIT] Safe Allocation Limit (90% of Avail): {:.2} GB", safe_limit as f64 / 1024.0 / 1024.0 / 1024.0);
+        // Dynamically adjust requirement based on Total System RAM
+        let estimated_req = if total_mem <= 8 * 1024 * 1024 * 1024 {
+            // Case A: Low System RAM (<= 8GB)
+            // Strategy: Very Conservative. 
+            // Requirement: Model (1.6GB) + Context/Overhead (1.5GB) = ~3.1 GB
+            println!("[SYS-INIT] Low System RAM (<= 8GB) detected. Setting Strict Minimum Requirements.");
+            base_model_size + (1536 * 1024 * 1024) 
+        } else {
+            // Case B: Standard System RAM (> 8GB)
+            // Strategy: Stable fit. Reserve space for larger context and OS overhead.
+            // Requirement: Model (1.6GB) + Context (1.0GB) + Safety Buffer (0.9GB) = ~3.5 GB
+            println!("[SYS-INIT] Standard System RAM (> 8GB) detected. Setting Recommended Requirements.");
+            base_model_size + (1024 * 1024 * 1024) + (900 * 1024 * 1024)
+        };
+        
+        println!("[SYS-INIT] Real-time Memory Check:");
+        println!("  - Total RAM: {:.2} GB", total_mem as f64 / 1024.0 / 1024.0 / 1024.0);
+        println!("  - Available: {:.2} GB", free_mem as f64 / 1024.0 / 1024.0 / 1024.0);
+        println!("  - Safe Limit (80%): {:.2} GB", safe_limit as f64 / 1024.0 / 1024.0 / 1024.0);
+        println!("  - Required (Dynamic): {:.2} GB", estimated_req as f64 / 1024.0 / 1024.0 / 1024.0);
+        
+        let mut final_device_preference = device_preference;
 
-        // Estimate Model Size (2B parameters ~ 4GB in F32 + overhead)
-        let estimated_req = 4 * 1024 * 1024 * 1024; 
-        if safe_limit < estimated_req { 
-            println!("⚠️ [WARNING] Available RAM ({:.2} GB) might be insufficient for model (est. 4 GB). OOM risk high.", safe_limit as f64 / 1024.0 / 1024.0 / 1024.0);
+        // Force CPU if RAM is critically low on 8GB systems (< 3GB available)
+        // This prevents the GPU driver from crashing due to shared memory exhaustion
+        if total_mem <= 8 * 1024 * 1024 * 1024 && free_mem < 3 * 1024 * 1024 * 1024 {
+             println!("⚠️ [WARNING] Critical Low RAM (< 3GB) on 8GB System. Forcing CPU Mode for stability.");
+             final_device_preference = Some("cpu");
+        } else if safe_limit < estimated_req { 
+            println!("⚠️ [WARNING] Available RAM ({:.2} GB) is below safe threshold ({:.2} GB) for GPU inference.", 
+                safe_limit as f64 / 1024.0 / 1024.0 / 1024.0,
+                estimated_req as f64 / 1024.0 / 1024.0 / 1024.0
+            );
+            
+            if device_preference.is_none() || device_preference == Some("cuda") {
+                println!("[SYS-INIT] 🔄 Auto-switching to CPU mode to prevent CUDA OOM (OS paging will handle overflow).");
+                final_device_preference = Some("cpu");
+            }
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models")
@@ -84,8 +115,8 @@ impl LogisModel {
 
         println!("[MODEL-01] Loading Qwen3-VL from: {}", model_dir.display());
 
-        let device = if let Some("cpu") = device_preference {
-            println!("[MODEL-01] Forcing CPU Device as requested.");
+        let device = if let Some("cpu") = final_device_preference {
+            println!("[MODEL-01] Using CPU Device (Forced or Requested).");
             Device::Cpu
         } else {
             get_device(None)
@@ -154,6 +185,75 @@ impl LogisModel {
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }).await?
+    }
+
+    pub async fn chat_with_spinner(
+        &self, 
+        system: &str, 
+        user_input: &str,
+        app_handle: &tauri::AppHandle,
+        event_name: &str,
+        base_payload: Value
+    ) -> anyhow::Result<String> {
+        let self_clone = self.generator.clone();
+        let system_text = system.to_string();
+        let user_text = user_input.to_string();
+        
+        let task = tokio::task::spawn_blocking(move || {
+            let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            
+            let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: system_text,
+                name: None,
+            });
+
+            let content_parts = vec![
+                ChatCompletionRequestMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText { text: user_text }
+                )
+            ];
+
+            let user_message = ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(content_parts),
+                name: None,
+            };
+
+            let params = ChatCompletionParameters {
+                messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
+                model: "qwen3vl".to_string(),
+                max_tokens: Some(2048),
+                temperature: Some(0.1),
+                top_p: Some(0.9),
+                ..Default::default()
+            };
+            
+            let response = gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            Ok(response)
+        });
+
+        let spinner = Spinner::dots();
+        let mut idx = 0;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(spinner.interval));
+        
+        tokio::pin!(task);
+
+        loop {
+            tokio::select! {
+                res = &mut task => {
+                    return res.map_err(|e| anyhow!("Task join error: {}", e))?; 
+                }
+                _ = interval.tick() => {
+                    let frame = spinner.frames[idx % spinner.frames.len()];
+                    idx += 1;
+                    
+                    let mut payload = base_payload.clone();
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("spinner".to_string(), json!(frame));
+                    }
+                    let _ = app_handle.emit(event_name, payload);
+                }
+            }
+        }
     }
 
     fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>) -> anyhow::Result<String> {

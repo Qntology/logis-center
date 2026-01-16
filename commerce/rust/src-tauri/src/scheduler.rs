@@ -7,6 +7,7 @@ use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
 use serde_json::{Value, json};
 use anyhow::Result;
+use tauri::Emitter;
 
 // Ported from proxy/src/index.ts `isDiff`
 #[allow(dead_code)]
@@ -19,6 +20,7 @@ fn is_diff(v1: &Value, v2: &Value) -> bool {
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
+    app_handle: tauri::AppHandle,
 ) {
     println!("[Scheduler] Background worker started.");
     
@@ -60,7 +62,7 @@ pub async fn start_background_worker(
                     }
                 }
 
-                match process_task(task.clone(), &store, &model).await {
+                match process_task(task.clone(), &store, &model, &app_handle).await {
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
                         let store_guard = store.lock().await;
@@ -84,9 +86,15 @@ pub async fn start_background_worker(
 async fn process_task(
     task: Task, 
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
-    model_mutex: &Arc<Mutex<Option<LogisModel>>>)
--> Result<()> {
+    model_mutex: &Arc<Mutex<Option<LogisModel>>>,
+    app_handle: &tauri::AppHandle
+) -> Result<()> {
     
+    // Initial Progress
+    let _ = app_handle.emit("extraction-progress", json!({
+        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
+    }));
+
     // Parse Task Data
     let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("");
@@ -111,6 +119,10 @@ async fn process_task(
     // STEP 1: Classification (Structure Only) - "Map Outline"
     // =================================================================================
     
+    let _ = app_handle.emit("extraction-progress", json!({
+        "category": "Classification", "summary": "Analyzing page structure...", "spinner": "⠋"
+    }));
+
     // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
     let light_pug = parsing::convert_to_clean_pug(&html, PugMode::StructureOnly);
     
@@ -123,6 +135,9 @@ async fn process_task(
     
     if model_guard.is_none() {
         println!("[Scheduler] Model not initialized. Loading Qwen3-VL...");
+        let _ = app_handle.emit("extraction-progress", json!({
+            "category": "Loading Model", "summary": "Loading AI Model...", "spinner": "⠋"
+        }));
         if let Ok(m) = LogisModel::new(None).await {
             *model_guard = Some(m);
         } else {
@@ -132,7 +147,9 @@ async fn process_task(
 
     let page_info_str = if let Some(model) = model_guard.as_ref() {
         let system = parsing::map_outline(language);
-        model.chat(&system, &light_pug).await?
+        model.chat_with_spinner(&system, &light_pug, app_handle, "extraction-progress", json!({
+            "category": "Classification", "summary": "Analyzing page structure..."
+        })).await?
     } else {
         "{}".to_string()
     };
@@ -158,6 +175,10 @@ async fn process_task(
     // =================================================================================
     // STEP 2: Extraction (Full Content) - "Zoom In"
     // =================================================================================
+
+    let _ = app_handle.emit("extraction-progress", json!({
+        "category": "Extraction", "summary": format!("Extracting {} data...", page_type), "spinner": "⠋"
+    }));
 
     let target_selector = if !node_selector.is_empty() { 
         node_selector 
@@ -191,7 +212,11 @@ async fn process_task(
     }
 
     let extracted_json_str = if let Some(model) = model_guard.as_ref() {
-            model.chat("Extract information matching the JSON structure.", &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug)).await?
+            model.chat_with_spinner("Extract information matching the JSON structure.", 
+                &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug),
+                app_handle, "extraction-progress", json!({
+                "category": "Extraction", "summary": format!("Extracting {} data...", page_type)
+            })).await?
     } else {
         "{}".to_string()
     };
@@ -212,6 +237,10 @@ async fn process_task(
     // =================================================================================
     // STEP 3: Logic Relay, Merge & Save
     // =================================================================================
+
+    let _ = app_handle.emit("extraction-progress", json!({
+        "category": "Saving", "summary": "Saving to database...", "spinner": "⠋"
+    }));
 
     if let Some((queries, merge_info)) = logic::relay(page_type, &extracted_data) {
         println!("[Scheduler] Relay logic triggered. Queries: {}", queries.len());
@@ -282,9 +311,15 @@ async fn process_task(
                 .unwrap_or_else(|| task.id.as_str())
                 .to_string();
                 
-                let _ = db.upsert_item(&target_table, &id, page_type, extracted_data, None).await;
+                let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), None).await;
         }
     }    
+    
+    // Final Done Event
+    let _ = app_handle.emit("extraction-progress", json!({
+        "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
+    }));
+
         Ok(())
     }
     

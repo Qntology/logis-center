@@ -508,27 +508,6 @@ pub fn run() {
     let _store_server = store.clone();
 
 
-
-        // Spawn Scheduler
-
-
-
-        tauri::async_runtime::spawn(async move {
-
-
-
-            scheduler::start_background_worker(store_clone, model_clone).await;
-
-
-
-        });
-
-
-
-    
-
-
-
         tauri::Builder::default()
 
 
@@ -571,6 +550,15 @@ pub fn run() {
                             },
                             Err(e) => eprintln!("[Setup] Failed to init Vector Store: {}", e), 
                         }
+                    });
+                    
+                    // Start Background Scheduler
+                    let scheduler_store = app.state::<AppState>().store.clone();
+                    let scheduler_model = app.state::<AppState>().model.clone();
+                    let scheduler_handle = app.handle().clone();
+
+                    tauri::async_runtime::spawn(async move {
+                        scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_handle).await;
                     });
                     
                     let store_for_event = app.state::<AppState>().store.clone();

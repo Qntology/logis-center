@@ -1,0 +1,258 @@
+div#wrapper
+    div#main_wrap
+        section
+            h2
+                | 전체 주문통계
+                a.btn_small(href='http://demofran.com/admin/order.php?code=list')
+                    | 주문내역 바로가기
+            div.order_vbx
+                dl.od_bx1
+                    dt
+                        | 전체 주문현황
+                    dd
+                        p.ddtit
+                            | 총 주문건수
+                        p
+                            | 9
+                    dd.total
+                        p.ddtit
+                            | 총 주문액
+                        p
+                            | 1,657,200
+                dl.od_bx2
+                    dt
+                        | 주문상태 현황
+                    dd
+                        p.ddtit
+                            | 입금대기
+                        p
+                            | 0
+                    dd
+                        p.ddtit
+                            | 입금완료
+                        p
+                            | 0
+                    dd
+                        p.ddtit
+                            | 배송준비
+                        p
+                            | 0
+                    dd
+                        p.ddtit
+                            | 배송중
+                        p
+                            | 0
+                    dd
+                        p.ddtit
+                            | 배송완료
+                        p
+                            | 1
+                dl.od_bx2
+                    dt
+                        | 구매확정/클래임 현황
+                    dd
+                        p.ddtit
+                            | 구매미확정
+                        p
+                            | 0
+                    dd
+                        p.ddtit
+                            | 취소
+                        p
+                            | 8
+                    dd
+                        p.ddtit
+                            | 환불
+                        p
+                            | 0
+                    dd
+                        p.ddtit
+                            | 반품
+                        p
+                            | 0
+                    dd
+                        p.ddtit
+                            | 교환
+                        p
+                            | 0
+        section.sidx_head01
+            h2
+                | 최근 주문내역
+                a.btn_small(href='http://demofran.com/admin/order.php?code=list')
+                    | 주문내역 바로가기
+            table
+                thead
+                    tr
+                        th
+                            | 주문번호
+                        th
+                            | 주문자명
+                        th
+                            | 수령자명
+                        th
+                            | 전화번호
+                        th
+                            | 결제방법
+                        th
+                            | 총주문액
+                        th
+                            | 주문일시
+                tbody
+                    tr.tr_alignc
+                        td
+                            | 25102210135198
+                        td
+                            | 테스트A
+                        td
+                            | 테스트A
+                        td
+                            | 010-0000-0000
+                        td
+                            | 무통장
+                        td
+                            | 89,000
+                        td
+                            | 2025-10-22 10:14 (수)
+                    tr.tr_alignc
+                        td
+                            | 25090411260805
+                        td
+                            | 관리자
+                        td
+                            | 관리자
+                        td
+                            | 010-0000-0000
+                        td
+                            | 포인트
+                        td
+                            | 0
+                        td
+                            | 2025-09-04 11:26 (목)
+                    tr.tr_alignc
+                        td
+                            | 25072214510065
+                        td
+                            | 관리자
+                        td
+                            | 관리자
+                        td
+                            | 010-0000-0000
+                        td
+                            | 무통장
+                        td
+                            | 35,000
+                        td
+                            | 2025-07-22 14:52 (화)
+                    tr.tr_alignc
+                        td
+                            | 25032009552090
+                        td
+                            | 한글만
+                        td
+                            | 한글만
+                        td
+                            | 010-1111-1111
+                        td
+                            | 무통장
+                        td
+                            | 89,000
+                        td
+                            | 2025-03-20 09:55 (목)
+                    tr.tr_alignc
+                        td
+                            | 25032009244976
+                        td
+                            | 두글만
+                        td
+                            | 두글만
+                        td
+                            | 010-2222-2222
+                        td
+                            | 무통장
+                        td
+                            | 35,000
+                        td
+                            | 2025-03-20 09:25 (목)
+        section.sidx_head01
+            h2
+                | 최근 회원가입
+                a.btn_small(href='http://demofran.com/admin/member.php?code=list')
+                    | 회원관리 바로가기
+            table
+                thead
+                    tr
+                        th
+                            | 이름
+                        th
+                            | 아이디
+                        th
+                            | 레벨
+                        th
+                            | 이메일
+                        th
+                            | 접속횟수
+                        th
+                            | 추천인
+                        th
+                            | 가입일시
+                tbody
+                    tr.tr_alignc
+                        td
+                            | 가맹점몰
+                        td
+                            | submall
+                        td
+                            | 가맹점
+                        td
+                            | spmallnara@naver.com
+                        td
+                            | 19
+                        td
+                            | admin
+                        td
+                            | 2024-12-16 06:14 (월)
+                    tr.tr_alignc
+                        td
+                            | 세글만
+                        td
+                            | test3
+                        td
+                            | 일반회원
+                        td
+                            | test3@gmail.com
+                        td
+                            | 71
+                        td
+                            | test1
+                        td
+                            | 2020-10-04 18:05 (일)
+                    tr.tr_alignc
+                        td
+                            | 두글만
+                        td
+                            | test2
+                        td
+                            | 일반회원
+                        td
+                            | test2@gmail.com
+                        td
+                            | 842
+                        td
+                            | admin
+                        td
+                            | 2020-10-04 18:05 (일)
+                    tr.tr_alignc
+                        td
+                            | 한글만
+                        td
+                            | test1
+                        td
+                            | 가맹점
+                        td
+                            | test1@gmail.com
+                        td
+                            | 988
+                        td
+                            | admin
+                        td
+                            | 2020-10-04 18:04 (일)

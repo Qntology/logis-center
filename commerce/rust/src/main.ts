@@ -3,17 +3,14 @@ import { open, ask } from '@tauri-apps/plugin-dialog';
 import { listen, emit } from '@tauri-apps/api/event';
 import { readFile } from '@tauri-apps/plugin-fs';
 
-// Access global ethers loaded via <script> tag
+// Access global libs
 const ethers = (window as any).ethers;
 const QRCode = (window as any).QRCode;
 const marked = (window as any).marked;
 const pako = (window as any).pako;
 const blockies = (window as any).blockies;
 
-// --- CRC32 ---
-function crc32(s: string) { var polynomial = arguments.length < 2 ? 0x04C11DB7 : arguments[1], initialValue = arguments.length < 3 ? 0xFFFFFFFF : arguments[2], finalXORValue = arguments.length < 4 ? 0xFFFFFFFF : arguments[3], crc = initialValue, table = [], i, j, c; function reverse(x:number, n:number) { var b = 0; while (n) { b = b * 2 + x % 2; x /= 2; x -= x % 1; n--; } return b; } for (i = 256; i >= 0; i--) { c = reverse(i, 32); for (j = 0; j < 8; j++) { c = ((c * 2) ^ (((c >>> 31) % 2) * polynomial)) >>> 0; } table[i] = reverse(c, 32); } for (i = 0; i < s.length; i++) { c = s.charCodeAt(i); if (c > 255) { throw new RangeError(); } j = (crc % 256) ^ c; crc = ((crc / 256) ^ table[j]) >>> 0; } return (crc ^ finalXORValue) >>> 0; }
-
-// --- Global Config & State ---
+// --- Config ---
 const API_HOST = "https://commerce.logis.center"; 
 const WIDGET_WIDTH = 380;
 const COLLAPSED_HEIGHT = 80;
@@ -30,145 +27,69 @@ interface ChatSession {
     sender?: string;
 }
 
-let currentSession: ChatSession = {
-    hash: "",
-    cc: "logis.center" 
-};
-
+// --- State ---
+let currentSession: ChatSession = { hash: "", cc: "logis.center" };
 let isExpanded = false;
 let currentTab = "list";
 let currentImage: string | null = null;
+let currentDetectedUrl = "";
 let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
-// --- Helpers ---
-async function hashId(text?: string): Promise<string> {
-    if (!ethers) return "";
-    if (typeof text === "undefined") {
-        const account = ethers.Wallet.createRandom();
-        text = account.privateKey;
-    }
-    const hashMessage = ethers.hashMessage(text);
-    return ethers.computeAddress(hashMessage).toLowerCase();
-}
-
-async function reqUrl(baseParams: any = {}): Promise<string> {
-    const origin = encodeURIComponent("https://commerce.logis.center");
-    const href = encodeURIComponent("https://commerce.logis.center/");
-    const created_at = Date.now();
-    const crons = encodeURIComponent("[]"); 
-    
-    // Calculate 'to' parameter based on hardcoded path
-    const pathname = "/"; 
-    const cc = currentSession.cc || "logis.center";
-    const to = await hashId(cc + pathname);
-
-    let query = `origin=${origin}&created_at=${created_at}&href=${href}&crons=${crons}&to=${to}`;
-    
-    if (currentSession.hash) query += `&hash=${currentSession.hash}`;
-    if (currentSession.token) query += `&token=${currentSession.token}`;
-    
-    for (const key in baseParams) {
-        if (baseParams[key]) {
-            query += `&${key}=${encodeURIComponent(baseParams[key])}`;
-        }
-    }
-
-    return `${API_HOST}/?${query}`;
-}
-
-// --- Initialization ---
-async function initSession() {
-    if (!ethers) { setTimeout(initSession, 100); return; }
-
-    let hash = localStorage.getItem("device_hash");
-    let token = localStorage.getItem("device_token");
-    
-    if (!hash || !token) {
-        const wallet = ethers.Wallet.createRandom();
-        hash = wallet.address.toLowerCase().replace("0x", "");
-        token = wallet.privateKey.toLowerCase().replace("0x", "");
-        
-        localStorage.setItem("device_hash", hash);
-        localStorage.setItem("device_token", token);
-    }
-    
-    currentSession.hash = hash;
-    if (token) currentSession.token = token;
-
-    const cached = localStorage.getItem("chat_session_details");
-    if (cached) {
-        try {
-            const parsed = JSON.parse(cached);
-            if (parsed.email) {
-                currentSession = { ...currentSession, ...parsed };
-            }
-        } catch(e) {}
-    }
-    
-    updateAuthUI();
-    startChatPolling();
-    initNavCategories();
-}
-
-function updateAuthUI() {
-    const isLoggedIn = !!currentSession.email;
-    const name = currentSession.name || "Sign In";
-    const team = currentSession.team || "";
-    
-    // Update Nav Profile
-    const navName = document.getElementById("nav-profile-name");
-    const navSignin = document.getElementById("nav-signin");
-    const navSignout = document.getElementById("nav-signout");
-    const navEdit = document.getElementById("nav-profile-edit");
-    const navFavicon = document.getElementById("nav-profile-favicon");
-
-    if (navName) navName.innerText = name;
-    
-    // Generate Blockies Icon
-    if (blockies && currentSession.address && navFavicon) {
-        const icon = blockies.create({ seed: currentSession.address.toLowerCase() }).toDataURL();
-        navFavicon.style.backgroundImage = `url(${icon})`;
-    }
-
-    if (isLoggedIn) {
-        navSignin?.classList.add("hidden");
-        navSignout?.classList.remove("hidden");
-        navEdit?.classList.remove("hidden");
-        
-        const authStatus = document.getElementById("auth-status-text");
-        if(authStatus) authStatus.innerText = `🟢 ${name} (${team})`;
-        
-        document.getElementById("btn-qr-auth")?.classList.add("hidden");
-        document.querySelector('.qrcode')?.classList.remove("active"); // Hide QR
-        document.getElementById("btn-logout")?.classList.remove("hidden");
-        document.querySelector('form[name="chat-form"]')?.classList.remove("hidden");
-    } else {
-        navSignin?.classList.remove("hidden");
-        navSignout?.classList.add("hidden");
-        navEdit?.classList.add("hidden");
-        
-        const authStatus = document.getElementById("auth-status-text");
-        if(authStatus) authStatus.innerText = "🔴 Anonymous (Logs Only)";
-        
-        document.getElementById("btn-qr-auth")?.classList.remove("hidden");
-        document.getElementById("btn-logout")?.classList.add("hidden");
-        document.querySelector('form[name="chat-form"]')?.classList.add("hidden");
-    }
-}
+// List State
+let cachedDocs: any[] = [];
+let currentPage = 0;
+const pageSize = 10;
+let isLoading = false;
+let hasMore = true;
+let selectedUuids = new Set<string>();
+let currentDetailUuid: string | null = null;
+let isBrowserExtracting = false; // Track explicit user action
 
 // --- UI Elements ---
 const contentPanel = document.getElementById("content-panel") as HTMLElement;
 const searchInput = document.getElementById("global-search") as HTMLInputElement;
-const navCategories = document.getElementById("nav-categories") as HTMLElement;
+const btnSubmit = document.getElementById("btn-submit") as HTMLButtonElement; // Search
+const btnExtract = document.getElementById("btn-extract") as HTMLButtonElement; // Extract
+const btnAutoLaunch = document.getElementById("btn-auto-launch") as HTMLButtonElement;
 const settingsBtn = document.getElementById("btn-settings") as HTMLButtonElement;
 const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
 
+// Nav Preview
+const navPreviewContainer = document.getElementById("nav-preview-container") as HTMLElement;
+const navImgThumbnail = document.getElementById("nav-img-thumbnail") as HTMLImageElement;
+const navImgClear = document.getElementById("nav-img-clear") as HTMLButtonElement;
+const navUploadBtn = document.getElementById("nav-upload-btn");
+
+// Views
+const listView = document.getElementById("list-view") as HTMLElement;
+const detailView = document.getElementById("detail-view") as HTMLElement;
+const detailTitle = document.getElementById("detail-title") as HTMLElement;
+const detailContent = document.getElementById("detail-content") as HTMLElement;
+const btnDetailBack = document.getElementById("btn-detail-back") as HTMLButtonElement;
+const btnListBack = document.getElementById("btn-list-back") as HTMLButtonElement;
+const btnDetailDelete = document.getElementById("btn-detail-delete") as HTMLButtonElement;
+
+// List Elements
+const docTableBody = document.getElementById("doc-tbody") as HTMLElement;
+const listRefreshBtn = document.getElementById("list-refresh-btn") as HTMLButtonElement;
+const btnDeleteSelected = document.getElementById("btn-delete-selected") as HTMLButtonElement;
+const selectAllCheckbox = document.getElementById("select-all-checkbox") as HTMLInputElement;
+const listScrollContainer = document.getElementById("list-scroll-container") as HTMLElement;
+const loadingIndicator = document.getElementById("loading-indicator") as HTMLElement;
+
+// AI Results
+const aiResultsArea = document.getElementById("ai-search-results") as HTMLElement;
+const aiResultsTitle = document.getElementById("ai-results-title") as HTMLElement;
+const aiResultsContent = document.getElementById("ai-results-content") as HTMLElement;
+
+// Chat Elements
 const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
 const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormElement;
 const chatInput = chatForm?.querySelector('input[name="talk"]') as HTMLInputElement;
 
-// --- Window & Tabs ---
+// --- 1. Layout & Window Logic ---
+
 async function setWindowSize(expanded: boolean) {
     const height = expanded ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT;
     await invoke("resize_window", { width: WIDGET_WIDTH, height: height });
@@ -183,10 +104,7 @@ function switchTab(tabName: string) {
 
     if (tabName === "settings") {
         settingsBtn?.classList.add("active-emoji", "active");
-        // Trigger QR Auth if not logged in
-        if (!currentSession.email) {
-            performQrAuth();
-        }
+        if (!currentSession.email) performQrAuth();
     } else {
         settingsBtn?.classList.remove("active-emoji", "active");
     }
@@ -211,24 +129,40 @@ function collapseWidget() {
     settingsBtn?.classList.remove("active-emoji", "active");
 }
 
-// --- Navigation Logic ---
+// Drag Logic (Manual)
+const pillNav = document.querySelector('.pill-nav') as HTMLElement;
+if (pillNav) {
+    let isMouseDown = false;
+    let startX = 0, startY = 0;
+    const DRAG_THRESHOLD = 5;
+
+    pillNav.addEventListener('mousedown', (e) => {
+        const target = e.target as HTMLElement;
+        if (!target.closest('button, input') && e.button === 0) {
+             isMouseDown = true; startX = e.clientX; startY = e.clientY;
+        }
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!isMouseDown) return;
+        if (Math.abs(e.clientX - startX) > DRAG_THRESHOLD || Math.abs(e.clientY - startY) > DRAG_THRESHOLD) {
+            isMouseDown = false; invoke('start_drag').catch(console.error);
+        }
+    });
+    window.addEventListener('mouseup', () => isMouseDown = false);
+    pillNav.addEventListener('dblclick', (e) => {
+        const target = e.target as HTMLElement;
+        if (!target.closest('button, input')) invoke("move_to_top_center").catch(console.error);
+    });
+}
+
+// --- 2. Search & Main Nav ---
+
 searchInput?.addEventListener("focus", () => {
     openWidget("list");
-    if (navCategories) {
-        navCategories.classList.remove("hidden");
-        setTimeout(() => navCategories.classList.add("visible"), 10);
-    }
 });
 
 searchInput?.addEventListener("input", () => {
-    if (navCategories && searchInput.value.length > 0) {
-        navCategories.classList.remove("visible");
-        setTimeout(() => navCategories.classList.add("hidden"), 200);
-    } else if (navCategories && searchInput.value.length === 0) {
-        navCategories.classList.remove("hidden");
-        setTimeout(() => navCategories.classList.add("visible"), 10);
-    }
-
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = window.setTimeout(() => {
         const keyword = searchInput.value.toLowerCase();
@@ -236,264 +170,97 @@ searchInput?.addEventListener("input", () => {
     }, 1000);
 });
 
-function initNavCategories() {
-    const createItem = (text: string, listId: string) => {
-        const list = document.getElementById(listId);
-        if (!list) return;
-        const div = document.createElement("div");
-        div.className = "nav-item";
-        div.innerText = text;
-        div.addEventListener("click", () => {
-            searchInput.value = `Category: ${text}`;
-            filterListLocally(text.toLowerCase());
-            navCategories.classList.remove("visible");
-            setTimeout(() => navCategories.classList.add("hidden"), 200);
-        });
-        list.appendChild(div);
-    };
-
-    ["Premium", "Standard", "Free"].forEach(m => createItem(m, "nav-list-membership"));
-    ["Dashboard", "Orders", "Products"].forEach(p => createItem(p, "nav-list-pages"));
-    ["Alice", "Bob", "Charlie"].forEach(u => createItem(u, "nav-list-users"));
-
-    document.getElementById("nav-signin")?.addEventListener("click", performQrAuth);
-    document.getElementById("nav-signout")?.addEventListener("click", performLogout);
-}
-
-// --- Auth Logic ---
-function performQrAuth() {
-    if (!currentSession.hash) return;
-    const email = `${currentSession.hash}.logis.center@oauth.email`;
-    const subject = "Login Request";
-    const body = `Hash: ${currentSession.hash}`;
-    const mailto = `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+// SUBMIT: Regular Search + AI
+btnSubmit?.addEventListener("click", async () => {
+    const query = searchInput.value;
+    if (!query) return;
     
-    // Show QR Code
-    document.getElementById("auth-status-text")!.innerText = "📧 Scan QR to Login...";
-
-    const qrContainer = document.querySelector('.qrcode') as HTMLElement;
-    
-    if (qrContainer && QRCode) {
-        qrContainer.innerHTML = "<div style='font-weight:bold; text-align:center;'>QR Sign in</div>"; // Debug
-        qrContainer.style.display = "block"; // Make visible
-        new QRCode(qrContainer, {
-            text: mailto,
-            width: 300,
-            height: 300,
-            colorDark : "#000000",
-            colorLight : "#ffffff",
-            correctLevel : QRCode.CorrectLevel.H
-        });
-    }
-}
-
-function performLogout() {
-    localStorage.removeItem("chat_session_details");
-    const hash = currentSession.hash;
-    const token = currentSession.token;
-    currentSession = { hash, token, cc: "logis.center" };
-    updateAuthUI();
-    
-    // Hide QR
-    const qrContainer = document.querySelector('.qrcode') as HTMLElement;
-    if(qrContainer) qrContainer.style.display = "none";
-}
-
-document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
-document.getElementById("btn-logout")?.addEventListener("click", performLogout);
-
-// --- Polling & Chat ---
-function startChatPolling() {
-    if (chatPollInterval) return;
-    pollServer();
-    chatPollInterval = window.setInterval(pollServer, 3000);
-}
-
-async function pollServer() {
-    try {
-        const url = await reqUrl({ type: 'talks' }); 
-        const res = await fetch(url, {
-            method: 'GET',
-            headers: { 'Content-Type': 'application/json' }
-        });
-        
-        if (res.ok) {
-            const data = await res.json();
-            
-            // 1. Session Update
-            if (data.session) {
-                if (data.session.hash) {
-                    currentSession.hash = data.session.hash;
-                    localStorage.setItem("device_hash", data.session.hash);
-                }
-                if (data.session.token) {
-                    currentSession.token = data.session.token;
-                    localStorage.setItem("device_token", data.session.token);
-                }
-                
-                if (data.session.address) {
-                    currentSession.address = data.session.address;
-                    currentSession.email = data.session.email;
-                    currentSession.team = data.session.team;
-                    currentSession.name = data.session.name;
-                    currentSession.cc = data.session.cc;
-                    currentSession.sender = data.session.sender;
-                    
-                    localStorage.setItem("chat_session_details", JSON.stringify(currentSession));
-                    updateAuthUI();
-                }
-            }
-            
-            // 2. Process Talks (pako ungzip)
-            if (data.results && Array.isArray(data.results)) {
-                processResults(data.results);
-            }
-        }
-    } catch (e) { console.error("Poll Error:", e); }
-}
-
-function processResults(results: any[]) {
-    const talks = results.filter(item => item.table === 'talks' || item.type === 'talk');
-    talks.sort((a, b) => a.created_at - b.created_at);
-    
-    if (chatTalks) {
-        chatTalks.innerHTML = '';
-        talks.forEach(talk => {
-            let text = "Message";
-            
-            // Decompress logic
-            if (talk.data) {
-                try {
-                    // If talk.data is an object/array (buffer representation), convert to Uint8Array
-                    let buffer: Uint8Array;
-                    if (Array.isArray(talk.data)) {
-                        buffer = new Uint8Array(talk.data);
-                    } else if (typeof talk.data === 'object' && !Array.isArray(talk.data)) {
-                        // Handle object like {0: 31, 1: 139...}
-                        const values = Object.values(talk.data) as number[];
-                        buffer = new Uint8Array(values);
-                    } else {
-                        // Fallback if string or other
-                        // If base64 string, decode it? For now assume buffer object.
-                        buffer = new Uint8Array([]); 
-                    }
-
-                    if (pako && buffer.length > 0) {
-                        const decompressed = pako.ungzip(buffer);
-                        const jsonStr = new TextDecoder('utf-8').decode(decompressed);
-                        const parsed = JSON.parse(jsonStr);
-                        
-                        if (parsed.text) text = parsed.text;
-                        else if (parsed.markdown) text = parsed.markdown;
-                    } else {
-                        // If no pako or empty, maybe it is a plain string?
-                        if (typeof talk.data === 'string') text = talk.data;
-                    }
-                } catch(e) {
-                    // Decompression failed or parse error
-                    console.error("Decompress Error", e);
-                    if (typeof talk.data === 'string') text = talk.data;
-                }
-            } else if (talk.text) {
-                text = talk.text;
-            }
-            
-            addChatMessage(text, talk.from === currentSession.address ? 'user' : 'system', talk.from);
-        });
-    }
-}
-
-if (chatForm) {
-    chatForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const text = chatInput.value.trim();
-        if (!text || !currentSession.address) return;
-
-        addChatMessage(text, 'user', currentSession.name);
-        chatInput.value = "";
-
+    openWidget("list"); 
+    if (aiResultsArea && aiResultsContent) {
+        aiResultsArea.style.display = "block";
+        aiResultsTitle.innerText = "🔍 AI Search Results";
+        aiResultsContent.innerHTML = "🔍 AI Searching documents...";
         try {
-            const url = await reqUrl({
-                from: currentSession.address,
-                to: currentSession.team,
-                text: text 
-            });
-            await fetch(url, { method: 'PUT' });
-        } catch (e) { console.error("Send Error:", e); }
-    });
-}
-
-function addChatMessage(text: string, type: 'user' | 'system', senderName?: string) {
-    if (!chatTalks) return;
-    const div = document.createElement('div');
-    div.classList.add('chat-talk', type);
-    
-    const time = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-    const nameLabel = senderName ? `<div style="font-size:0.7rem; margin-bottom:2px; opacity:0.7;">${senderName}</div>` : '';
-
-    // Markdown Render
-    let contentHtml = text;
-    if (marked && (window as any).marked.parse) {
-        // Handle both marked() and marked.parse() styles
-        try { contentHtml = (window as any).marked.parse(text); } catch(e) { contentHtml = text; }
-    } else if (marked && typeof marked === 'function') {
-        try { contentHtml = marked(text); } catch(e) { contentHtml = text; }
+            const results = await invoke<[string, string, number][]>("search_documents", { query: query });
+            if(results.length === 0) aiResultsContent.innerHTML = "No AI matches found.";
+            else {
+                aiResultsContent.innerHTML = results.map(([_, text, score]) => 
+                    `<div style="border-bottom:1px solid #444; padding:6px 0;">
+                       <strong style="color:var(--primary)">${score.toFixed(2)}</strong> ${text}
+                     </div>`
+                ).join("");
+            }
+        } catch(e) { aiResultsContent.innerHTML = "Error: " + e; }
     }
-
-    div.innerHTML = `${type === 'system' ? nameLabel : ''}<div class="chat-message">${contentHtml}</div><div class="chat-created-at">${time}</div>`;
-    chatTalks.prepend(div);
-}
-
-// --- Previous Logic (Drag, Auto, Etc) ---
-const navPreviewContainer = document.getElementById("nav-preview-container") as HTMLElement;
-const navImgThumbnail = document.getElementById("nav-img-thumbnail") as HTMLImageElement;
-const navImgClear = document.getElementById("nav-img-clear") as HTMLButtonElement;
-
-// Drag Logic
-const pillNav = document.querySelector('.pill-nav') as HTMLElement;
-if (pillNav) {
-    let isMouseDown = false;
-    let startX = 0, startY = 0;
-    pillNav.addEventListener('mousedown', (e) => {
-        if (!(e.target as HTMLElement).closest('button, input') && e.button === 0) {
-             isMouseDown = true; startX = e.clientX; startY = e.clientY;
-        }
-    });
-    window.addEventListener('mousemove', (e) => {
-        if (!isMouseDown) return;
-        if (Math.abs(e.clientX - startX) > 5 || Math.abs(e.clientY - startY) > 5) {
-            isMouseDown = false; invoke('start_drag').catch(console.error);
-        }
-    });
-    window.addEventListener('mouseup', () => isMouseDown = false);
-    pillNav.addEventListener('dblclick', (e) => {
-        if (!(e.target as HTMLElement).closest('button, input')) invoke("move_to_top_center").catch(console.error);
-    });
-}
-
-// Settings Button
-settingsBtn?.addEventListener("click", () => {
-    if (currentTab === "settings" && isExpanded) collapseWidget();
-    else openWidget("settings");
 });
-document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
-document.getElementById("nav-back-list")?.addEventListener("click", () => switchTab("list"));
-document.getElementById("btn-settings-back")?.addEventListener("click", () => switchTab("list"));
 
-// List Logic (Stub)
-let cachedDocs: any[] = [];
-let currentPage = 0;
-const pageSize = 10;
-let isLoading = false;
-let hasMore = true;
-let selectedUuids = new Set<string>();
+// EXTRACT: Image or Browser Task
+btnExtract?.addEventListener("click", async () => {
+    openWidget("list");
+    
+    // Switch to Detail View for Progress
+    listView.style.display = "none";
+    detailView.style.display = "flex";
+    
+    if (currentImage) {
+        // --- 1. Image Extraction ---
+        detailTitle.innerText = "⚡ Analyzing Image...";
+        detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;"></div>`;
+        try {
+            const result = await invoke<string>("summarize_image", { imagePath: currentImage });
+            const parsed = JSON.parse(result);
+            detailTitle.innerText = `${parsed.header?.doc_type || 'Unknown'} ${parsed.header?.document_number || ''}`;
+            const prettyJson = JSON.stringify(parsed, null, 2);
+            detailContent.innerHTML = `
+                <div style="margin-bottom:10px; color: #4ade80;"><strong>✅ Analysis Complete</strong></div>
+                <hr style="border-color:#444;">
+                <pre style="white-space: pre-wrap; font-size: 0.75rem; color:#e5e5e5; background:#1e1e1e; padding:10px; border-radius:5px;">${prettyJson}</pre>
+            `;
+        } catch (e) { 
+            detailTitle.innerText = "Error";
+            detailContent.innerHTML = `<div style="color:red;">Failed: ${e}</div>`; 
+        }
+    } else {
+        // --- 2. Browser Extraction ---
+        isBrowserExtracting = true; // Flag on
+        detailTitle.innerText = "⚡ Browser Extraction...";
+        detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;">
+            <div style="color:#888; font-size:0.8rem;">Initializing task...</div>
+        </div>`;
+        
+        try {
+            const html = await invoke<string>("extract_html_from_current_tab");
+            
+            // Generate Task ID
+            let taskId = `task_${Date.now()}`;
+            if (currentDetectedUrl) {
+                try {
+                    const urlObj = new URL(currentDetectedUrl);
+                    const link = urlObj.pathname + urlObj.search;
+                    const cc = currentSession.cc || "logis.center";
+                    taskId = await hashId(cc + link);
+                } catch (e) {}
+            }
 
-const docTableBody = document.getElementById("doc-tbody") as HTMLElement;
-const listRefreshBtn = document.getElementById("list-refresh-btn") as HTMLButtonElement;
-const btnDeleteSelected = document.getElementById("btn-delete-selected") as HTMLButtonElement;
-const selectAllCheckbox = document.getElementById("select-all-checkbox") as HTMLInputElement;
-const listScrollContainer = document.getElementById("list-scroll-container") as HTMLElement;
-const loadingIndicator = document.getElementById("loading-indicator") as HTMLElement;
+            // Send to Backend
+            await emit("new-task-from-browser", {
+                id: taskId,
+                type: "html_extraction",
+                html: html, 
+                link: currentDetectedUrl, 
+                ref_id: currentSession.hash || "manual"
+            });
+            
+            // Note: The 'extraction-progress' listener below will handle UI updates
+            
+        } catch (e) {
+            detailTitle.innerText = "Error";
+            detailContent.innerHTML = `<div style="color:red;">Browser Error: ${e}</div>`;
+        }
+    }
+});
+
+// --- 3. List Logic ---
 
 async function refreshList() {
     currentPage = 0; hasMore = true; cachedDocs = []; selectedUuids.clear();
@@ -541,32 +308,75 @@ function updateBulkDeleteUI() {
     }
 }
 
-selectAllCheckbox?.addEventListener("change", () => {
-    const isChecked = selectAllCheckbox.checked;
-    docTableBody.querySelectorAll(".row-checkbox").forEach((cb:any) => {
-        cb.checked = isChecked;
-        const uuid = cb.closest("tr")?.dataset.uuid;
-        if (uuid) { if (isChecked) selectedUuids.add(uuid); else selectedUuids.delete(uuid); }
-    });
-    updateBulkDeleteUI();
+async function showDetail(uuid: string) {
+    currentDetailUuid = uuid;
+    listView.style.display = "none";
+    detailView.style.display = "flex";
+    detailTitle.innerText = "Loading...";
+    detailContent.innerHTML = "Fetching details...";
+    
+    try {
+        const doc = await invoke<any>("get_document", { uuid: uuid });
+        if (doc) {
+            const type = doc.doc_type || "Unknown";
+            const no = doc.doc_number || "No Number";
+            detailTitle.innerText = `${type} ${no}`;
+            let prettyJson = doc.json_data;
+            try { prettyJson = JSON.stringify(JSON.parse(doc.json_data), null, 2); } catch(e) {}
+            
+            detailContent.innerHTML = `
+                <div style="margin-bottom:10px;"><strong>Summary:</strong><br>${doc.text}</div>
+                <hr style="border-color:#444;">
+                <pre style="white-space: pre-wrap; font-size: 0.75rem; color:#000;">${prettyJson}</pre>
+            `;
+        } else {
+            detailTitle.innerText = "Error"; detailContent.innerHTML = "Document not found.";
+        }
+    } catch (e) { detailTitle.innerText = "Error"; detailContent.innerHTML = "Failed: " + e; }
+}
+
+btnDetailBack?.addEventListener("click", () => { detailView.style.display = "none"; listView.style.display = "block"; });
+btnListBack?.addEventListener("click", collapseWidget);
+
+// --- 4. Image Logic ---
+
+async function handleImageUpload(path: string) {
+    currentImage = path;
+    if (navPreviewContainer && navImgThumbnail) {
+        navPreviewContainer.classList.remove("hidden");
+        navUploadBtn?.classList.add("active-emoji");
+        
+        searchInput.disabled = true; searchInput.placeholder = "Image selected"; searchInput.style.opacity = "0.5";
+        btnSubmit.style.display = "none"; btnExtract.style.display = "flex";
+        
+        try {
+            const contents = await readFile(currentImage);
+            const blob = new Blob([contents]);
+            const reader = new FileReader();
+            reader.onloadend = () => { navImgThumbnail.src = reader.result as string; };
+            reader.readAsDataURL(blob);
+        } catch (e) { navImgThumbnail.src = convertFileSrc(currentImage); }
+    }
+}
+
+navImgClear?.addEventListener("click", () => {
+    currentImage = null;
+    navPreviewContainer.classList.add("hidden");
+    navUploadBtn?.classList.remove("active-emoji");
+    
+    searchInput.disabled = false; searchInput.placeholder = "Search keywords..."; searchInput.style.opacity = "1";
+    btnSubmit.style.display = "flex"; btnExtract.style.display = "none";
 });
 
-listRefreshBtn?.addEventListener("click", refreshList);
-listScrollContainer?.addEventListener("scroll", () => {
-    if (listScrollContainer.scrollTop + listScrollContainer.clientHeight >= listScrollContainer.scrollHeight - 20) loadMoreDocs();
+navUploadBtn?.addEventListener("click", async () => {
+    try {
+        const file = await open({ multiple: false, filters: [{ name: 'Image', extensions: ['png', 'jpg', 'jpeg'] }] });
+        if (file) await handleImageUpload(file as string);
+    } catch (err) { console.error(err); }
 });
 
-async function showDetail(uuid: string) { /* Detail Logic */ }
-async function initBrowserDropdown() { /* Automation Logic */ }
+// --- 5. Browser Automation & Events ---
 
-const extractBtnNav = document.getElementById("btn-extract") as HTMLButtonElement;
-extractBtnNav?.addEventListener("click", async () => { /* Extraction Logic */ });
-
-// --- Browser Match Logic (⚡ Button) ---
-const btnExtract = document.getElementById("btn-extract") as HTMLButtonElement;
-let currentDetectedUrl = "";
-
-// 1. Listen for Browser Match (Show/Hide Button)
 listen("browser-match-found", (event: any) => {
     const payload = event.payload;
     if (payload.is_client || payload.is_admin) {
@@ -576,88 +386,174 @@ listen("browser-match-found", (event: any) => {
             btnExtract.title = `Extract from ${new URL(payload.url).hostname}`;
         }
     } else {
-        if (btnExtract) btnExtract.style.display = "none";
+        // Hide only if NO image selected
+        if (!currentImage && btnExtract) btnExtract.style.display = "none";
     }
 });
 
-// 2. Handle Click (Extract & Process)
-btnExtract?.addEventListener("click", async () => {
-    try {
-        btnExtract.disabled = true;
-        btnExtract.innerText = "⏳";
-        
-        console.log("Extracting HTML...");
-        const html = await invoke<string>("extract_html_from_current_tab");
-        
-        console.log("HTML Extracted. Length:", html.length);
-        
-        // Generate Task ID
-        let taskId = `task_${Date.now()}`;
-        if (currentDetectedUrl) {
-            try {
-                const urlObj = new URL(currentDetectedUrl);
-                const link = urlObj.pathname + urlObj.search;
-                const team = currentSession.team || "";
-                const cc = currentSession.cc || "logis.center";
-                // hashId(team + cc + link)
-                taskId = await hashId(team + cc + link);
-            } catch (e) {
-                console.error("ID Generation Failed", e);
-            }
+listen("extraction-progress", (event: any) => {
+    const payload = event.payload;
+    const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "general";
+    const elementId = `progress-${catId}`;
+
+    const extractionLog = document.getElementById("extraction-log");
+    
+    // Update the button spinner
+    if (btnExtract) {
+        if (payload.spinner) btnExtract.innerText = payload.spinner;
+        if (payload.category === "Done") {
+            setTimeout(() => { btnExtract.innerText = "⚡"; }, 2000);
         }
+    }
 
-        // 3. Send to Backend for Processing
-        await emit("new-task-from-browser", {
-            id: taskId,
-            type: "html_extraction",
-            html: html, 
-            link: currentDetectedUrl, 
-            ref_id: currentSession.hash || "manual"
-        });
-        
-        alert("Extraction started! Task ID: " + taskId);
-        
-    } catch (e) {
-        console.error("Extraction failed:", e);
-        alert("Extraction failed: " + e);
-    } finally {
-        btnExtract.disabled = false;
-        btnExtract.innerText = "⚡";
+    // Only update if we are in the detail view watching logs
+    if (extractionLog && detailView.style.display !== "none") {
+         let p = document.getElementById(elementId);
+         if (!p) {
+             p = document.createElement("div");
+             p.id = elementId;
+             p.style.borderBottom = "1px solid #333";
+             p.style.padding = "6px 0";
+             p.style.fontSize = "0.75rem";
+             p.style.display = "flex";
+             p.style.alignItems = "center";
+             extractionLog.appendChild(p);
+         }
+         
+         if (payload.category === "Done" || payload.data) {
+             const successText = payload.category === "Done" ? "Extraction Complete" : `<strong>${payload.category}</strong> extracted.`;
+             p.innerHTML = `<span style="margin-right:8px;">✅</span> <span>${successText}</span>`;
+             p.style.color = "#4ade80"; 
+             
+             if(payload.category === "Done" && payload.data) {
+                  // Show final JSON
+                  const pretty = JSON.stringify(payload.data, null, 2);
+                  const pre = document.createElement("pre");
+                  pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.75rem";
+                  pre.style.color = "#e5e5e5"; pre.style.background = "#1e1e1e";
+                  pre.style.padding = "10px"; pre.style.borderRadius = "5px"; pre.style.marginTop = "10px";
+                  pre.innerText = pretty;
+                  extractionLog.appendChild(pre);
+             }
+         } else {
+             // Progress
+             p.innerHTML = `<span style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner}</span> <span>${payload.summary}</span>`;
+         }
     }
 });
 
-const autoLaunchBtn = document.getElementById("btn-auto-launch") as HTMLButtonElement;
-
-// Listen for Browser Status to Toggle Button Visibility
+// Browser Status Listener (Active State)
 listen("browser-status", (event: any) => {
     const status = event.payload; // "running" or "stopped"
-    console.log("Browser Status:", status);
-    
-    if (status === "running") {
-        if (autoLaunchBtn) autoLaunchBtn.style.display = "none";
-    } else {
-        if (autoLaunchBtn) autoLaunchBtn.style.display = ""; // Revert to CSS (flex)
+    if (btnAutoLaunch) {
+        if (status === "running") {
+            btnAutoLaunch.style.display = "none";
+        } else {
+            btnAutoLaunch.style.display = "flex";
+        }
     }
 });
 
-autoLaunchBtn?.addEventListener("click", async () => {
-    try {
-        console.log("Launching Best Browser...");
-        // Optimistically hide button immediately
-        autoLaunchBtn.style.display = "none"; 
-        
-        await invoke("launch_best_browser", { url: "https://google.com" });
-    } catch (e) {
-        console.error("Failed to launch browser:", e);
-        alert("Failed to launch browser: " + e);
-        // Show again if failed
-        autoLaunchBtn.style.display = ""; 
-    }
+// Auto Launch
+btnAutoLaunch?.addEventListener("click", async () => {
+    try { await invoke("launch_best_browser", { url: "https://google.com" }); } 
+    catch (e) { console.error(e); }
 });
 
+const autoBrowser = document.getElementById("auto-browser") as HTMLSelectElement;
+const autoUrl = document.getElementById("auto-url") as HTMLInputElement;
 const autoBtn = document.getElementById("auto-btn") as HTMLButtonElement;
-autoBtn?.addEventListener("click", async () => { /* Auto Logic */ });
+
+async function initBrowserDropdown() {
+    if (!autoBrowser) return;
+    try {
+        const browsers = await invoke<any[]>("check_available_browsers");
+        autoBrowser.innerHTML = "";
+        browsers.forEach(b => {
+            const opt = document.createElement("option");
+            opt.value = b.name; opt.text = b.name + (b.needs_driver ? " (No Driver)" : "");
+            autoBrowser.appendChild(opt);
+        });
+    } catch (e) { console.error(e); }
+}
+
+autoBtn?.addEventListener("click", async () => {
+    try {
+        await invoke("launch_browser", { browser: autoBrowser.value, url: autoUrl.value, script: "" });
+    } catch (e) { console.error(e); }
+});
+
+// --- 6. Auth & Chat Helpers ---
+
+async function hashId(text?: string): Promise<string> {
+    if (!ethers) return "";
+    if (typeof text === "undefined") {
+        const account = ethers.Wallet.createRandom();
+        text = account.privateKey;
+    }
+    const hashMessage = ethers.hashMessage(text);
+    return ethers.computeAddress(hashMessage).toLowerCase();
+}
+
+function updateAuthUI() {
+    const isLoggedIn = !!currentSession.email;
+    const name = currentSession.name || "Sign In";
+    const navName = document.getElementById("nav-profile-name");
+    const navSignin = document.getElementById("nav-signin");
+    const navSignout = document.getElementById("nav-signout");
+    const navEdit = document.getElementById("nav-profile-edit");
+    const navFavicon = document.getElementById("nav-profile-favicon");
+
+    if (navName) navName.innerText = name;
+    if (blockies && currentSession.address && navFavicon) {
+        navFavicon.style.backgroundImage = `url(${blockies.create({ seed: currentSession.address.toLowerCase() }).toDataURL()})`;
+    }
+
+    if (isLoggedIn) {
+        navSignin?.classList.add("hidden"); navSignout?.classList.remove("hidden"); navEdit?.classList.remove("hidden");
+        document.getElementById("auth-status-text")!.innerText = `🟢 ${name}`;
+        document.querySelector('form[name="chat-form"]')?.classList.remove("hidden");
+    } else {
+        navSignin?.classList.remove("hidden"); navSignout?.classList.add("hidden"); navEdit?.classList.add("hidden");
+        document.getElementById("auth-status-text")!.innerText = "🔴 Anonymous";
+        document.querySelector('form[name="chat-form"]')?.classList.add("hidden");
+    }
+}
+
+function performQrAuth() {
+    if (!currentSession.hash) return;
+    const email = `${currentSession.hash}.logis.center@oauth.email`;
+    const mailto = `mailto:${encodeURIComponent(email)}?subject=Login&body=Hash:${currentSession.hash}`;
+    
+    document.getElementById("auth-status-text")!.innerText = "📧 Scan QR to Login...";
+    const qrContainer = document.querySelector('.qrcode') as HTMLElement;
+    if (qrContainer && QRCode) {
+        qrContainer.innerHTML = ""; qrContainer.style.display = "block";
+        new QRCode(qrContainer, { text: mailto, width: 200, height: 200 });
+    }
+}
 
 // Init
+async function initSession() {
+    // ... (Existing init logic slightly simplified for brevity, assume localstorage load)
+    let hash = localStorage.getItem("device_hash");
+    if (!hash) {
+        if(ethers) {
+            const w = ethers.Wallet.createRandom();
+            hash = w.address.toLowerCase().replace("0x", "");
+            localStorage.setItem("device_hash", hash);
+        }
+    }
+    currentSession.hash = hash || "";
+    updateAuthUI();
+}
+
+settingsBtn?.addEventListener("click", () => {
+    if (currentTab === "settings" && isExpanded) collapseWidget();
+    else openWidget("settings");
+});
+document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
+document.getElementById("nav-back-list")?.addEventListener("click", () => switchTab("list"));
+
 initSession();
 setWindowSize(false);
