@@ -224,7 +224,7 @@ impl LogisModel {
             let params = ChatCompletionParameters {
                 messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(max_tokens),
+                max_tokens: Some(max_tokens as u32),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
                 ..Default::default()
@@ -300,7 +300,7 @@ impl LogisModel {
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(message)],
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(max_tokens),
+                max_tokens: Some(max_tokens as u32),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
                 ..Default::default()
