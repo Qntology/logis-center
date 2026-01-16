@@ -97,6 +97,59 @@ async fn process_task(
 
     // Parse Task Data
     let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    
+    // --- Image Extraction Logic ---
+    if task.r#type == "image_extraction" {
+        let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
+        
+        let _ = app_handle.emit("extraction-progress", json!({
+            "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
+        }));
+
+        if let Ok(img) = image::open(image_path) {
+             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
+             
+             let prompt = parsing::image2json("kr", language, "tracking", ""); // Defaults
+             
+             let mut model_guard = model_mutex.lock().await;
+             if model_guard.is_none() {
+                 let _ = app_handle.emit("extraction-progress", json!({
+                    "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
+                 }));
+                 if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
+             }
+             
+             let result_str = if let Some(model) = model_guard.as_ref() {
+                 model.chat_with_image_spinner(&prompt, Some(dynamic_image), app_handle, "extraction-progress", json!({
+                     "category": "Vision Analysis", "summary": "Analyzing image content..."
+                 })).await?
+             } else {
+                 "{}".to_string()
+             };
+             drop(model_guard);
+             
+             let extracted_data = parse_json_from_llm(&result_str);
+             
+             // Save Result
+             let store_guard = store_mutex.lock().await;
+             if let Some(db) = store_guard.as_ref() {
+                 let id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task.id).to_string();
+                 let _ = db.upsert_item("commerce_tracking", &id, "tracking", extracted_data.clone(), None).await;
+             }
+             
+             let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
+             }));
+             
+             return Ok(());
+        } else {
+             let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
+             }));
+             return Ok(());
+        }
+    }
+
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("");
     let language = "english"; // Default, ideally detect from content or task
 

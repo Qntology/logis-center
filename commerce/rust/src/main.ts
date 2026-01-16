@@ -205,20 +205,25 @@ btnExtract?.addEventListener("click", async () => {
     if (currentImage) {
         // --- 1. Image Extraction ---
         detailTitle.innerText = "⚡ Analyzing Image...";
-        detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;"></div>`;
+        detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;">
+            <div style="color:#888; font-size:0.8rem;">Queuing image task...</div>
+        </div>`;
+        
         try {
-            const result = await invoke<string>("summarize_image", { imagePath: currentImage });
-            const parsed = JSON.parse(result);
-            detailTitle.innerText = `${parsed.header?.doc_type || 'Unknown'} ${parsed.header?.document_number || ''}`;
-            const prettyJson = JSON.stringify(parsed, null, 2);
-            detailContent.innerHTML = `
-                <div style="margin-bottom:10px; color: #4ade80;"><strong>✅ Analysis Complete</strong></div>
-                <hr style="border-color:#444;">
-                <pre style="white-space: pre-wrap; font-size: 0.75rem; color:#e5e5e5; background:#1e1e1e; padding:10px; border-radius:5px;">${prettyJson}</pre>
-            `;
+            // Generate Task ID
+            const taskId = `img_${Date.now()}`;
+            
+            // Send to Backend Scheduler
+            await emit("new-task-from-browser", {
+                id: taskId,
+                type: "image_extraction",
+                image_path: currentImage, 
+                ref_id: currentSession.hash || "manual"
+            });
+            
         } catch (e) { 
             detailTitle.innerText = "Error";
-            detailContent.innerHTML = `<div style="color:red;">Failed: ${e}</div>`; 
+            detailContent.innerHTML = `<div style="color:red;">Failed to queue: ${e}</div>`; 
         }
     } else {
         // --- 2. Browser Extraction ---
