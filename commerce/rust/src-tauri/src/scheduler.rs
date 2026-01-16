@@ -113,10 +113,23 @@ async fn process_task(
     
     // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
     let light_pug = parsing::convert_to_clean_pug(&html, PugMode::StructureOnly);
-    println!("[Scheduler] Pug (Light) Length: {}, Preview: {:.100}...", light_pug.len(), light_pug.replace("\n", " "));
+    
+    // Save Light Pug to file for debugging
+    let _ = std::fs::write("debug_light_pug.txt", &light_pug);
+    println!("[Scheduler] Saved Light Pug to debug_light_pug.txt (Length: {})", light_pug.len());
     
     // 2. LLM Call: Map Outline
-    let model_guard = model_mutex.lock().await;
+    let mut model_guard = model_mutex.lock().await;
+    
+    if model_guard.is_none() {
+        println!("[Scheduler] Model not initialized. Loading Qwen3-VL...");
+        if let Ok(m) = LogisModel::new(None).await {
+            *model_guard = Some(m);
+        } else {
+            return Ok(());
+        }
+    }
+
     let page_info_str = if let Some(model) = model_guard.as_ref() {
         let system = parsing::map_outline(language);
         model.chat(&system, &light_pug).await?
@@ -127,20 +140,8 @@ async fn process_task(
     
     println!("[Scheduler] Raw Map Output: {}", page_info_str);
 
-    // 3. Parse Map Result
-    let page_info: Value = serde_json::from_str(&page_info_str).unwrap_or_else(|e| {
-        println!("[Scheduler] JSON Parse Error (Map): {}", e);
-        // Try to find JSON block in markdown
-        if let Some(start) = page_info_str.find("{") {
-            if let Some(end) = page_info_str.rfind("}") {
-                if start < end {
-                    let json_part = &page_info_str[start..=end];
-                    return serde_json::from_str(json_part).unwrap_or(json!({"type": "unknown", "detail": false}));
-                }
-            }
-        }
-        json!({"type": "unknown", "detail": false})
-    });
+    // 3. Parse Map Result (Using helper logic to handle markdown blocks)
+    let page_info: Value = parse_json_from_llm(&page_info_str);
     
     let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
     let is_detail = page_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -150,7 +151,7 @@ async fn process_task(
     println!("[Scheduler] Map Result: Type={}, Detail={}, Node='{}', Item='{}'", page_type, is_detail, node_selector, item_selector);
 
     if page_type == "" || page_type == "unknown" {
-        println!("[Scheduler] Task finished early: Could not classify page type. Raw output: {}", page_info_str);
+        println!("[Scheduler] Task finished early: Could not classify page type.");
         return Ok(());
     }
 
@@ -158,26 +159,22 @@ async fn process_task(
     // STEP 2: Extraction (Full Content) - "Zoom In"
     // =================================================================================
 
-    // 1. Select Target Area & Convert to Pug (Full Content)
-    // If detail page, we might focus on the main container (node) or the item itself.
-    // If list page, we focus on the list container (node).
     let target_selector = if !node_selector.is_empty() { 
         node_selector 
     } else if !item_selector.is_empty() {
         item_selector
     } else {
-        "body" // Fallback
+        "body"
     };
     
     let content_pug = parsing::convert_to_clean_pug_selector(&html, target_selector, PugMode::FullContent);
     
+    // Save Full Content Pug to file for debugging
+    let _ = std::fs::write("debug_content_pug.txt", &content_pug);
+    println!("[Scheduler] Saved Content Pug to debug_content_pug.txt (Length: {})", content_pug.len());
+
     if content_pug.trim().is_empty() {
-        println!("[Scheduler] Warning: Target selector '{}' returned empty content. Retrying with full body...", target_selector);
-        // Fallback to full body if selector fails
-        // content_pug = parsing::convert_to_clean_pug(&html, PugMode::FullContent); 
-        // Cannot assign to immutable variable, so we just use full body conversion here if needed, 
-        // but shadowing `content_pug` is cleaner or handle it differently.
-        // For now, let's proceed. If empty, LLM might hallucinate or fail, but that's expected handling.
+        println!("[Scheduler] Warning: Target selector '{}' returned empty content.", target_selector);
     }
 
     // 2. LLM Call: Extraction
@@ -187,7 +184,12 @@ async fn process_task(
         parsing::item2json(page_type, url, language)
     };
 
-    let model_guard = model_mutex.lock().await;
+    println!("[Scheduler] Sending Extraction Request (PUG Length: {})...", content_pug.len());
+    let mut model_guard = model_mutex.lock().await;
+    if model_guard.is_none() {
+        if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
+    }
+
     let extracted_json_str = if let Some(model) = model_guard.as_ref() {
             model.chat("Extract information matching the JSON structure.", &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug)).await?
     } else {
@@ -195,7 +197,8 @@ async fn process_task(
     };
     drop(model_guard);
 
-    let mut extracted_data: Value = serde_json::from_str(&extracted_json_str).unwrap_or(json!({}));
+    println!("[Scheduler] Raw Extraction Output: {}", extracted_json_str);
+    let mut extracted_data: Value = parse_json_from_llm(&extracted_json_str);
     
     // Inject type/detail if missing
     if let Some(obj) = extracted_data.as_object_mut() {
@@ -248,7 +251,13 @@ async fn process_task(
             let text_to_embed = target_data.to_string();
             
             drop(store_guard); 
-            let model_guard = model_mutex.lock().await;
+            let mut model_guard = model_mutex.lock().await;
+            if model_guard.is_none() {
+                if let Ok(m) = LogisModel::new(None).await {
+                     *model_guard = Some(m);
+                }
+            }
+            
             let vector = if let Some(model) = model_guard.as_ref() {
                 model.get_embedding(text_to_embed).await.ok()
             } else {
@@ -276,5 +285,38 @@ async fn process_task(
                 let _ = db.upsert_item(&target_table, &id, page_type, extracted_data, None).await;
         }
     }    
-    Ok(())
-}
+        Ok(())
+    }
+    
+    fn parse_json_from_llm(text: &str) -> Value {
+        if let Ok(v) = serde_json::from_str(text) {
+            return v;
+        }
+        
+        // Try to find JSON block in markdown
+        if let Some(start) = text.find("{") {
+            if let Some(end) = text.rfind("}") {
+                if start < end {
+                    let json_part = &text[start..=end];
+                    if let Ok(v) = serde_json::from_str(json_part) {
+                        return v;
+                    }
+                }
+            }
+        }
+        
+        // Try array block
+        if let Some(start) = text.find("[") {
+            if let Some(end) = text.rfind("]") {
+                if start < end {
+                    let json_part = &text[start..=end];
+                    if let Ok(v) = serde_json::from_str(json_part) {
+                        return v;
+                    }
+                }
+            }
+        }
+    
+        json!({})
+    }
+    

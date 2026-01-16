@@ -142,8 +142,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                     for line in content.lines() {
                         let trimmed_line = line.trim();
                         if !trimmed_line.is_empty() {
-                            output.push_str(&format!("{}| {}
-", indent, trimmed_line.replace("\"", "'" )));
+                            output.push_str(&format!("{}| {}\n", indent, trimmed_line.replace("\"", "'" )));
                         }
                     }
                 }
@@ -213,6 +212,7 @@ pub fn graph2contexts(current: &str) -> String {
 	# #find : 'many' or 'few' or 'much' or 'little' or 'heavy' or 'light' or ''"#, current)
 }
 
+#[allow(dead_code)]
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
         "tracking" => r#"
@@ -683,6 +683,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     ", language, schema)
 }
 
+#[allow(dead_code)]
 pub fn list2json(language: &str) -> String {
     format!("\n    Analyze the provided Pug template and return it in the following JSON format, no explanation.
     {{ 
