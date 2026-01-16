@@ -158,14 +158,13 @@ async fn process_task(
     }
 
     // 1. Fetch Page Content
-    // Check if HTML is already provided in the task data (e.g. from browser automation)
     let html = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
         raw_html.to_string()
     } else if !url.is_empty() {
         // Fallback to fetching URL
         reqwest::get(url).await?.text().await?
     } else {
-        return Ok(()); // No HTML and no URL
+        return Ok(())
     };
     
     // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
@@ -190,6 +189,17 @@ async fn process_task(
         }
     }
 
+    // Check CPU Warning
+    if let Some(model) = model_guard.as_ref() {
+        if model.is_cpu() {
+            let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Warning", 
+                "summary": "Low RAM. Running on CPU (Slow)...", 
+                "spinner": "⚠️"
+            }));
+        }
+    }
+
     let _ = app_handle.emit("extraction-progress", json!({
         "category": "Classification", "summary": "Analyzing page structure...", "spinner": "⠋"
     }));
@@ -202,11 +212,11 @@ async fn process_task(
     } else {
         "{}".to_string()
     };
-    drop(model_guard);
+    drop(model_guard); // Release lock
     
     println!("[Scheduler] Raw Map Output: {}", page_info_str);
 
-    // 3. Parse Map Result (Using helper logic to handle markdown blocks)
+    // 3. Parse Map Result
     let page_info: Value = parse_json_from_llm(&page_info_str);
     
     // Emit Classification Result
@@ -236,10 +246,6 @@ async fn process_task(
     // STEP 2: Extraction (Full Content) - "Zoom In"
     // =================================================================================
 
-    let _ = app_handle.emit("extraction-progress", json!({
-        "category": "Extraction", "summary": format!("Extracting {} data...", page_type), "spinner": "⠋"
-    }));
-
     let target_selector = if !node_selector.is_empty() { 
         node_selector 
     } else if !item_selector.is_empty() {
@@ -248,44 +254,108 @@ async fn process_task(
         "body"
     };
     
-    let content_pug = parsing::convert_to_clean_pug_selector(&html, target_selector, PugMode::FullContent);
-    
-    // Save Full Content Pug to file for debugging
-    let _ = std::fs::write("debug_content_pug.txt", &content_pug);
-    println!("[Scheduler] Saved Content Pug to debug_content_pug.txt (Length: {})", content_pug.len());
-
-    if content_pug.trim().is_empty() {
-        println!("[Scheduler] Warning: Target selector '{}' returned empty content.", target_selector);
-    }
-
-    // 2. LLM Call: Extraction
     let mut extracted_data = json!({});
 
     if !is_detail {
-        // --- List Page Logic (Monolithic) ---
-        let prompt = parsing::list2json(language);
-        let extracted_json_str = if let Some(model) = model_guard.as_ref() {
-                model.chat_with_spinner("Extract information matching the JSON structure.", 
-                    &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug),
-                    app_handle, "extraction-progress", json!({
-                    "category": "Extraction", "summary": format!("Extracting list data...")
-                }), 2048).await? 
-        } else {
-            "{}".to_string()
-        };
-        extracted_data = parse_json_from_llm(&extracted_json_str);
+        // --- List Page Logic (Item-wise Chunking) ---
+        let _ = app_handle.emit("extraction-progress", json!({
+            "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
+        }));
+
+        let item_pugs = parsing::split_html_to_pug_list(&html, target_selector, PugMode::FullContent);
+        let total_items = item_pugs.len();
+        
+        let _ = app_handle.emit("extraction-progress", json!({
+            "category": "List Processing", 
+            "summary": format!("Found {} items to extract.", total_items),
+            "spinner": "✅"
+        }));
+
+        let mut items_array = Vec::new();
+        // Use item2json schema to extract details for each list item
+        let fields_prompts = parsing::item2json(page_type, url, language);
+
+        for (i, item_pug) in item_pugs.iter().enumerate() {
+            let mut item_data = json!({});
+            
+            let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Extraction", 
+                "summary": format!("Extracting Item {}/{}: ...", i + 1, total_items), 
+                "spinner": "⠋"
+            }));
+
+            // Re-acquire lock for each item extraction loop
+            let model_guard = model_mutex.lock().await; 
+
+            for (field_name, field_prompt) in &fields_prompts {
+                // Optimization: Skip heavy fields for list view
+                if field_name == "description" || field_name == "detail_images" { continue; }
+
+                let field_json_str = if let Some(model) = model_guard.as_ref() {
+                    model.chat_with_spinner(
+                        "Extract ONLY the requested field from the Pug snippet. Return valid JSON.", 
+                        &format!("{}\n\nItem Pug Snippet:\n{}", field_prompt, item_pug),
+                        app_handle, "extraction-progress", json!({
+                            "category": "Extraction", 
+                            "summary": format!("Item {}/{}: {}", i + 1, total_items, field_name)
+                        }), 
+                        512 // Fast token limit for list items
+                    ).await?
+                } else {
+                    "{}".to_string()
+                };
+                
+                let field_result = parse_json_from_llm(&field_json_str);
+                
+                // Merge field result
+                // field_result is likely { "field_name": { ... } } or { "value": ... }
+                if let Some(val) = field_result.get(field_name) {
+                    item_data.as_object_mut().unwrap().insert(field_name.clone(), val.clone());
+                } else {
+                    // If the model returned just the object without the field key wrapper
+                    item_data.as_object_mut().unwrap().insert(field_name.clone(), field_result.clone());
+                }
+            }
+            drop(model_guard); 
+
+            // Normalize ID/Index for the item
+            if let Some(id_val) = item_data.get("id").cloned() {
+                 if item_data.get("index").is_none() { 
+                     item_data.as_object_mut().unwrap().insert("index".to_string(), id_val);
+                 }
+            }
+
+            items_array.push(item_data.clone());
+            
+            // Show intermediate item result
+            let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Extraction", 
+                "summary": format!("Item {} extracted.", i + 1),
+                "data": item_data
+            }));
+        }
+        
+        extracted_data.as_object_mut().unwrap().insert("items".to_string(), json!(items_array));
+        extracted_data.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
+
     } else {
         // --- Detail Page Logic (Field-by-Field) ---
-        // Get breakdown of fields
+        // Zoom in first
+        let content_pug = parsing::convert_to_clean_pug_selector(&html, target_selector, PugMode::FullContent);
+        // Save Debug
+        let _ = std::fs::write("debug_content_pug.txt", &content_pug);
+
         let fields_prompts = parsing::item2json(page_type, url, language);
         
         for (field_name, field_prompt) in fields_prompts {
-            // Emit progress for this field
             let _ = app_handle.emit("extraction-progress", json!({
                 "category": "Extraction", 
                 "summary": format!("Extracting field: {}", field_name), 
                 "spinner": "⠋"
             }));
+
+            // Acquire lock
+            let model_guard = model_mutex.lock().await;
 
             let field_json_str = if let Some(model) = model_guard.as_ref() {
                 model.chat_with_spinner(
@@ -295,29 +365,19 @@ async fn process_task(
                         "category": "Extraction", 
                         "summary": format!("Extracting field: {}", field_name)
                     }), 
-                    1024 // Lower token limit for single field
+                    1024 
                 ).await?
             } else {
                 "{}".to_string()
             };
+            drop(model_guard);
             
             // Parse and Merge
             let field_data = parse_json_from_llm(&field_json_str);
             if let Some(obj) = extracted_data.as_object_mut() {
-                // Flatten the {value: ..., selector: ...} structure immediately if possible, 
-                // or just insert the result. 
-                // Since `item2json` prompts now ask for {value: ..., selector: ...}, we keep it compliant with the schema
-                // or let the normalization step handle it later.
-                // Here we just merge the key-value pair.
-                
-                // The prompt asks for { value: ..., selector: ... } for a specific field name.
-                // Usually LLM returns { "field_name": { ... } } or just { "value": ... }.
-                // Let's handle both cases flexibly.
-                
                 if let Some(val) = field_data.get(&field_name) {
                     obj.insert(field_name.clone(), val.clone());
                 } else {
-                    // Fallback: assume the whole response IS the field value object
                     obj.insert(field_name.clone(), field_data.clone());
                 }
             }
@@ -325,29 +385,21 @@ async fn process_task(
             // Show intermediate result in UI
             let _ = app_handle.emit("extraction-progress", json!({
                 "category": "Extraction", 
-                "summary": format!("Field '{}' extracted.", field_name), 
+                "summary": format!("Field '{}' extracted.", field_name),
                 "spinner": "✅",
-                "data": json!({ field_name: extracted_data.get(&field_name) }) 
+                "data": json!({ field_name.clone(): extracted_data.get(&field_name) })
             }));
         }
     }
     
-    drop(model_guard); // Release model lock after all extractions
-
-    // println!("[Scheduler] Raw Extraction Output: {}", extracted_json_str); // No single output anymore
-    // let mut extracted_data: Value = parse_json_from_llm(&extracted_json_str); // Already done incrementally
-    
-    // Inject type/detail if missing
+    // Inject type if missing
     if let Some(obj) = extracted_data.as_object_mut() {
         if obj.get("type").is_none() {
             obj.insert("type".to_string(), json!(page_type));
         }
-        // Ensure detail flag is consistent
-        // obj.insert("detail".to_string(), json!(is_detail)); 
     }
 
-    // --- Normalization Step (Added) ---
-    // Flatten {value: ..., selector: ...} structures and sync id/index
+    // --- Normalization Step ---
     let mut normalized_data = json!({});
     if let Some(obj) = extracted_data.as_object() {
         for (k, v) in obj {
@@ -364,7 +416,7 @@ async fn process_task(
         }
     }
     
-    // Sync 'id' and 'index' for logic compatibility
+    // Sync 'id' and 'index'
     let id_opt = normalized_data.get("id").cloned();
     let index_opt = normalized_data.get("index").cloned();
 
@@ -378,7 +430,6 @@ async fn process_task(
         }
     }
     
-    // Replace extracted_data with normalized version
     extracted_data = normalized_data;
 
     // =================================================================================
@@ -398,18 +449,12 @@ async fn process_task(
             let mut target_id = format!("{}_{}", page_type, chrono::Utc::now().timestamp_millis());
             
             let mut found_existing = false;
-            
-            // Map logic table names to DB table names
             let to_table = format!("commerce_{}", merge_info.to);
 
             for query in queries {
                 let query_table = format!("commerce_{}", query.table);
                 if let Ok(Some((id, existing_data))) = db.find_item_by_property(&query_table, &query.column, &query.value).await {
                     println!("[Scheduler] Found existing item: {} in {}", id, query_table);
-                    
-                    // Check diff before merging/saving to avoid redundant writes
-                    // if !is_diff(&target_data, &existing_data) { ... } // Logic optimization possible here
-                    
                     logic::merge_node(&mut target_data, &existing_data);
                     target_id = id;
                     found_existing = true;
@@ -423,15 +468,12 @@ async fn process_task(
                 }
             }
 
-            // Generate Vector
             let text_to_embed = target_data.to_string();
-            
             drop(store_guard); 
+            
             let mut model_guard = model_mutex.lock().await;
             if model_guard.is_none() {
-                if let Ok(m) = LogisModel::new(None).await {
-                     *model_guard = Some(m);
-                }
+                if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
             }
             
             let vector = if let Some(model) = model_guard.as_ref() {
@@ -450,7 +492,6 @@ async fn process_task(
     } else {
         // Simple Save (No Relay)
         let target_table = format!("commerce_{}", page_type);
-        
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
                 let id = extracted_data.get("id")
@@ -467,38 +508,27 @@ async fn process_task(
         "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
     }));
 
-        Ok(())
-    }
+    Ok(())
+}
+
+fn parse_json_from_llm(text: &str) -> Value {
+    if let Ok(v) = serde_json::from_str(text) { return v; }
     
-    fn parse_json_from_llm(text: &str) -> Value {
-        if let Ok(v) = serde_json::from_str(text) {
-            return v;
-        }
-        
-        // Try to find JSON block in markdown
-        if let Some(start) = text.find("{") {
-            if let Some(end) = text.rfind("}") {
-                if start < end {
-                    let json_part = &text[start..=end];
-                    if let Ok(v) = serde_json::from_str(json_part) {
-                        return v;
-                    }
-                }
+    if let Some(start) = text.find("{") {
+        if let Some(end) = text.rfind("}") {
+            if start < end {
+                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
             }
         }
-        
-        // Try array block
-        if let Some(start) = text.find("[") {
-            if let Some(end) = text.rfind("]") {
-                if start < end {
-                    let json_part = &text[start..=end];
-                    if let Ok(v) = serde_json::from_str(json_part) {
-                        return v;
-                    }
-                }
-            }
-        }
-    
-        json!({})
     }
     
+    if let Some(start) = text.find("[") {
+        if let Some(end) = text.rfind("]") {
+            if start < end {
+                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
+            }
+        }
+    }
+
+    json!({})
+}
