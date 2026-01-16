@@ -259,31 +259,83 @@ async fn process_task(
     }
 
     // 2. LLM Call: Extraction
-    let prompt = if !is_detail {
-        parsing::list2json(language)
-    } else {
-        parsing::item2json(page_type, url, language)
-    };
+    let mut extracted_data = json!({});
 
-    println!("[Scheduler] Sending Extraction Request (PUG Length: {})...", content_pug.len());
-    let mut model_guard = model_mutex.lock().await;
-    if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
+    if !is_detail {
+        // --- List Page Logic (Monolithic) ---
+        let prompt = parsing::list2json(language);
+        let extracted_json_str = if let Some(model) = model_guard.as_ref() {
+                model.chat_with_spinner("Extract information matching the JSON structure.", 
+                    &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug),
+                    app_handle, "extraction-progress", json!({
+                    "category": "Extraction", "summary": format!("Extracting list data...")
+                }), 2048).await? 
+        } else {
+            "{}".to_string()
+        };
+        extracted_data = parse_json_from_llm(&extracted_json_str);
+    } else {
+        // --- Detail Page Logic (Field-by-Field) ---
+        // Get breakdown of fields
+        let fields_prompts = parsing::item2json(page_type, url, language);
+        
+        for (field_name, field_prompt) in fields_prompts {
+            // Emit progress for this field
+            let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Extraction", 
+                "summary": format!("Extracting field: {}", field_name), 
+                "spinner": "⠋"
+            }));
+
+            let field_json_str = if let Some(model) = model_guard.as_ref() {
+                model.chat_with_spinner(
+                    "Extract ONLY the requested field from the Pug template. Return valid JSON.", 
+                    &format!("{}\n\nData (Zoomed In):\n{}", field_prompt, content_pug),
+                    app_handle, "extraction-progress", json!({
+                        "category": "Extraction", 
+                        "summary": format!("Extracting field: {}", field_name)
+                    }), 
+                    1024 // Lower token limit for single field
+                ).await?
+            } else {
+                "{}".to_string()
+            };
+            
+            // Parse and Merge
+            let field_data = parse_json_from_llm(&field_json_str);
+            if let Some(obj) = extracted_data.as_object_mut() {
+                // Flatten the {value: ..., selector: ...} structure immediately if possible, 
+                // or just insert the result. 
+                // Since `item2json` prompts now ask for {value: ..., selector: ...}, we keep it compliant with the schema
+                // or let the normalization step handle it later.
+                // Here we just merge the key-value pair.
+                
+                // The prompt asks for { value: ..., selector: ... } for a specific field name.
+                // Usually LLM returns { "field_name": { ... } } or just { "value": ... }.
+                // Let's handle both cases flexibly.
+                
+                if let Some(val) = field_data.get(&field_name) {
+                    obj.insert(field_name.clone(), val.clone());
+                } else {
+                    // Fallback: assume the whole response IS the field value object
+                    obj.insert(field_name.clone(), field_data.clone());
+                }
+            }
+            
+            // Show intermediate result in UI
+            let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Extraction", 
+                "summary": format!("Field '{}' extracted.", field_name), 
+                "spinner": "✅",
+                "data": json!({ field_name: extracted_data.get(&field_name) }) 
+            }));
+        }
     }
+    
+    drop(model_guard); // Release model lock after all extractions
 
-    let extracted_json_str = if let Some(model) = model_guard.as_ref() {
-            model.chat_with_spinner("Extract information matching the JSON structure.", 
-                &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug),
-                app_handle, "extraction-progress", json!({
-                "category": "Extraction", "summary": format!("Extracting {} data...", page_type)
-            }), 2048).await? // Use 2048 tokens for full extraction
-    } else {
-        "{}".to_string()
-    };
-    drop(model_guard);
-
-    println!("[Scheduler] Raw Extraction Output: {}", extracted_json_str);
-    let mut extracted_data: Value = parse_json_from_llm(&extracted_json_str);
+    // println!("[Scheduler] Raw Extraction Output: {}", extracted_json_str); // No single output anymore
+    // let mut extracted_data: Value = parse_json_from_llm(&extracted_json_str); // Already done incrementally
     
     // Inject type/detail if missing
     if let Some(obj) = extracted_data.as_object_mut() {
