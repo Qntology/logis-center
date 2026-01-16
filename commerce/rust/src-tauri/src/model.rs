@@ -53,8 +53,8 @@ impl LogisModel {
         let total_mem = sys.total_memory();
         let free_mem = sys.available_memory(); // Available includes cache/buffers that can be reclaimed
         
-        // 1. Calculate Safe Limit (80% of Available RAM to allow OS breathing room)
-        let safe_limit = (free_mem as f64 * 0.8) as u64;
+        // 1. Calculate Safe Limit (90% of Available RAM, keeping 10% strictly free)
+        let safe_limit = (free_mem as f64 * 0.9) as u64;
         
         // 2. Precise/Dynamic Model Requirement Calculation
         // Qwen2.5-VL-2B-Instruct-Q4_K_M GGUF file size is approx 1.6 GB.
@@ -78,21 +78,28 @@ impl LogisModel {
         println!("[SYS-INIT] Real-time Memory Check:");
         println!("  - Total RAM: {:.2} GB", total_mem as f64 / 1024.0 / 1024.0 / 1024.0);
         println!("  - Available: {:.2} GB", free_mem as f64 / 1024.0 / 1024.0 / 1024.0);
-        println!("  - Safe Limit (80%): {:.2} GB", safe_limit as f64 / 1024.0 / 1024.0 / 1024.0);
+        println!("  - Safe Limit (90%): {:.2} GB", safe_limit as f64 / 1024.0 / 1024.0 / 1024.0);
         println!("  - Required (Dynamic): {:.2} GB", estimated_req as f64 / 1024.0 / 1024.0 / 1024.0);
         
         let mut final_device_preference = device_preference;
 
-        // [Memory Defense Logic] - RELAXED
-        // Instead of forcing CPU, we just warn. Let the lower-level 'get_device' decide based on CUDA availability.
-        if total_mem <= 8 * 1024 * 1024 * 1024 && free_mem < 3 * 1024 * 1024 * 1024 {
-             println!("⚠️ [DEFENSE] Low RAM detected. proceeding with preference (GPU if available).");
-        } else if safe_limit < estimated_req { 
-            println!("⚠️ [DEFENSE] Available RAM below estimated requirement. Proceeding cautiously.");
+        // [Memory Defense Logic] - STRICT ENFORCEMENT
+        // If requirements exceed the 90% safe limit of available RAM, we MUST fallback to CPU.
+        // CUDA OOM is fatal, but System OOM can often be handled by OS paging/swap.
+        if safe_limit < estimated_req { 
+            println!("⚠️ [DEFENSE] Safety Buffer Violated (Required {:.2} > Safe {:.2}).", 
+                estimated_req as f64 / 1024.0 / 1024.0 / 1024.0,
+                safe_limit as f64 / 1024.0 / 1024.0 / 1024.0
+            );
+            println!("⚠️ [DEFENSE] Switching to CPU mode to prevent Out-Of-Memory crash.");
+            
+            final_device_preference = Some("cpu");
         }
         
-        // Force CPU only if explicitly requested
-        if device_preference == Some("cpu") {
+        // Force CPU only if explicitly requested (or forced by defense above)
+        if final_device_preference == Some("cpu") {
+            // keep it
+        } else if device_preference == Some("cpu") {
             final_device_preference = Some("cpu");
         } else {
             // Default to whatever the user asked, or auto-detect
