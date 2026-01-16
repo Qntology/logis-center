@@ -131,7 +131,8 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                     for line in content.lines() {
                         let trimmed_line = line.trim();
                         if !trimmed_line.is_empty() {
-                            output.push_str(&format!("{}| {}\n", indent, trimmed_line.replace("\"", "'" )));
+                            output.push_str(&format!("{}| {}
+", indent, trimmed_line.replace("\"", "'" )));
                         }
                     }
                 }
@@ -286,7 +287,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
                 value:yyyy-MM-ddThh:mm:ss | string,
                 selector:selector
             },
-        "#.to_string(),
+        "###.to_string(),
         
         "goods" => {
             let t = r###" 
