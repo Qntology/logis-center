@@ -234,6 +234,38 @@ async fn process_task(
         // obj.insert("detail".to_string(), json!(is_detail)); 
     }
 
+    // --- Normalization Step (Added) ---
+    // Flatten {value: ..., selector: ...} structures and sync id/index
+    let mut normalized_data = json!({});
+    if let Some(obj) = extracted_data.as_object() {
+        for (k, v) in obj {
+            let val = if let Some(inner_obj) = v.as_object() {
+                if let Some(value_field) = inner_obj.get("value") {
+                    value_field.clone()
+                } else {
+                    v.clone()
+                }
+            } else {
+                v.clone()
+            };
+            normalized_data.as_object_mut().unwrap().insert(k.clone(), val);
+        }
+    }
+    
+    // Sync 'id' and 'index' for logic compatibility
+    if let Some(id_val) = normalized_data.get("id") {
+        if normalized_data.get("index").is_none() {
+            normalized_data.as_object_mut().unwrap().insert("index".to_string(), id_val.clone());
+        }
+    } else if let Some(idx_val) = normalized_data.get("index") {
+        if normalized_data.get("id").is_none() {
+            normalized_data.as_object_mut().unwrap().insert("id".to_string(), idx_val.clone());
+        }
+    }
+    
+    // Replace extracted_data with normalized version
+    extracted_data = normalized_data;
+
     // =================================================================================
     // STEP 3: Logic Relay, Merge & Save
     // =================================================================================
