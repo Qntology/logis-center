@@ -43,7 +43,6 @@ pub struct LogisModel {
 
 impl LogisModel {
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        // ... (Keep existing new implementation)
         println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
 
         // 0. Check System Memory (Real-time)
@@ -53,57 +52,45 @@ impl LogisModel {
         let total_mem = sys.total_memory();
         let free_mem = sys.available_memory(); // Available includes cache/buffers that can be reclaimed
         
-        // 1. Calculate Safe Limit (90% of Available RAM, keeping 10% strictly free)
-        let safe_limit = (free_mem as f64 * 0.9) as u64;
-        
-        // 2. Precise/Dynamic Model Requirement Calculation
-        // Qwen2.5-VL-2B-Instruct-Q4_K_M GGUF file size is approx 1.6 GB.
-        let base_model_size: u64 = 1_717_986_918; // ~1.6 GB
-        
-        // Dynamically adjust requirement based on Total System RAM
-        let estimated_req = if total_mem <= 8 * 1024 * 1024 * 1024 {
-            // Case A: Low System RAM (<= 8GB)
-            // Strategy: Very Conservative. 
-            // Requirement: Model (1.6GB) + Context/Overhead (1.5GB) = ~3.1 GB
-            println!("[SYS-INIT] Low System RAM (<= 8GB) detected. Setting Strict Minimum Requirements.");
-            base_model_size + (1536 * 1024 * 1024) 
-        } else {
-            // Case B: Standard System RAM (> 8GB)
-            // Strategy: Stable fit. Reserve space for larger context and OS overhead.
-            // Requirement: Model (1.6GB) + Context (1.0GB) + Safety Buffer (0.9GB) = ~3.5 GB
-            println!("[SYS-INIT] Standard System RAM (> 8GB) detected. Setting Recommended Requirements.");
-            base_model_size + (1024 * 1024 * 1024) + (900 * 1024 * 1024)
-        };
-        
-        println!("[SYS-INIT] Real-time Memory Check:");
-        println!("  - Total RAM: {:.2} GB", total_mem as f64 / 1024.0 / 1024.0 / 1024.0);
-        println!("  - Available: {:.2} GB", free_mem as f64 / 1024.0 / 1024.0 / 1024.0);
-        println!("  - Safe Limit (90%): {:.2} GB", safe_limit as f64 / 1024.0 / 1024.0 / 1024.0);
-        println!("  - Required (Dynamic): {:.2} GB", estimated_req as f64 / 1024.0 / 1024.0 / 1024.0);
-        
-        let mut final_device_preference = device_preference;
+        // Check for CUDA availability
+        let has_gpu = candle_core::utils::cuda_is_available();
 
-        // [Memory Defense Logic] - STRICT ENFORCEMENT
-        // If requirements exceed the 90% safe limit of available RAM, we MUST fallback to CPU.
-        // CUDA OOM is fatal, but System OOM can often be handled by OS paging/swap.
-        if safe_limit < estimated_req { 
-            println!("⚠️ [DEFENSE] Safety Buffer Violated (Required {:.2} > Safe {:.2}).", 
-                estimated_req as f64 / 1024.0 / 1024.0 / 1024.0,
-                safe_limit as f64 / 1024.0 / 1024.0 / 1024.0
-            );
-            println!("⚠️ [DEFENSE] Switching to CPU mode to prevent Out-Of-Memory crash.");
-            
-            final_device_preference = Some("cpu");
+        // [Smart Memory Strategy]
+        // 1. If GPU is available, ALWAYS prefer it. GPU uses VRAM, saving System RAM.
+        // 2. Only fallback to CPU if GPU is missing.
+        // 3. System RAM 10% buffer rule is a "Warning Line", not a "Stop Sign".
+        
+        let safe_available_ram = (free_mem as f64 * 0.9) as u64; // Target: Keep 10% free
+        let req_ram_estimate = if has_gpu {
+            512 * 1024 * 1024 // GPU needs very little System RAM (just overhead)
+        } else {
+            3 * 1024 * 1024 * 1024 // CPU needs full model in System RAM (~3GB)
+        };
+
+        println!("[SYS-INIT] Memory Check:");
+        println!("  - Available RAM: {:.2} GB", free_mem as f64 / 1024.0 / 1024.0 / 1024.0);
+        println!("  - 10% Buffer Threshold: RAM should stay above {:.2} GB used.", (total_mem as f64 * 0.1) / 1024.0 / 1024.0 / 1024.0);
+
+        if safe_available_ram < req_ram_estimate {
+            println!("⚠️ [SMART-MANAGE] System RAM is tight (Available < Required + 10% Buffer).");
+            if has_gpu {
+                println!("✅ [SMART-MANAGE] GPU Detected. Proceeding with GPU (Optimal choice for Low RAM).");
+                // Do NOT switch to CPU. GPU is the lifesaver here.
+            } else {
+                println!("⚠️ [SMART-MANAGE] GPU Missing. CPU mode might hit Swap/Paging. Proceeding cautiously.");
+            }
+        } else {
+            println!("✅ [SMART-MANAGE] Sufficient RAM available.");
         }
         
-        // Force CPU only if explicitly requested (or forced by defense above)
-        if final_device_preference == Some("cpu") {
-            // keep it
-        } else if device_preference == Some("cpu") {
+        // Final Device Assignment Logic
+        let final_device_preference;
+        // We never force CPU unless the USER explicitly asked for it.
+        if device_preference == Some("cpu") {
             final_device_preference = Some("cpu");
         } else {
-            // Default to whatever the user asked, or auto-detect
-            final_device_preference = device_preference;
+            // Default: Auto-detect (will pick CUDA if available)
+            final_device_preference = device_preference; 
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models")
@@ -126,7 +113,11 @@ impl LogisModel {
             println!("[MODEL-01] Using CPU Device (Forced or Requested).");
             Device::Cpu
         } else {
-            get_device(None)
+            let d = get_device(None);
+            if d.is_cpu() && has_gpu {
+                 println!("[MODEL-01] Warning: candle failed to pick GPU despite CUDA being available. Forcing CPU.");
+            }
+            d
         };
 
         // CPU usually requires F32 for reliable matmul support in candle
@@ -142,7 +133,7 @@ impl LogisModel {
             model_dir.to_str().unwrap(),
             Some(&device), 
             dtype 
-        ).map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e))?;
+        ).map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e)?);
 
         println!("[MODEL-02] Qwen3-VL Generator initialized.");
 
@@ -253,7 +244,7 @@ impl LogisModel {
         loop {
             tokio::select! {
                 res = &mut task => {
-                    return res.map_err(|e| anyhow!("Task join error: {}", e))?; 
+                    return res.map_err(|e| anyhow!("Task join error: {}", e))?;
                 }
                 _ = interval.tick() => {
                     let frame = spinner.frames[idx % spinner.frames.len()];
@@ -316,7 +307,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e)?)
         });
 
         let spinner = Spinner::dots();
@@ -328,7 +319,7 @@ impl LogisModel {
         loop {
             tokio::select! {
                 res = &mut task => {
-                    return res.map_err(|e| anyhow!("Task join error: {}", e))?; 
+                    return res.map_err(|e| anyhow!("Task join error: {}", e))?;
                 }
                 _ = interval.tick() => {
                     let frame = spinner.frames[idx % spinner.frames.len()];
@@ -380,7 +371,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e)?)
     }
 
     pub async fn run_inference_with_spinner(
@@ -429,7 +420,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e)?)
         });
         
         let spinner = Spinner::dots();
@@ -446,7 +437,7 @@ impl LogisModel {
                     // res is Result<Result<String, Error>, JoinError>
                     // Outer ? handles JoinError
                     // Inner logic returns Result<String, Error>
-                    return res.map_err(|e| anyhow!("Task join error: {}", e))?; 
+                    return res.map_err(|e| anyhow!("Task join error: {}", e))?;
                 }
                 _ = interval.tick() => {
                     // Update spinner
@@ -504,9 +495,8 @@ impl LogisModel {
         2. SHIPPING: CI (Commercial Invoice), PL (Packing List), BL (Bill of Lading), AWB (Airway Bill), SA (Shipping Advice), DO (Delivery Order), AN (Arrival Notice), BC (Booking Confirm)
         3. CUSTOMS: ED (Export Declaration), ID (Import Declaration), CINV (Customs Invoice), CO (Certificate of Origin)
         4. CERTIFICATES: IC (Inspection Cert), WC (Weight Cert), CA (Analysis Cert), PHYTO (Phytosanitary), HC (Health Cert), BEN_CERT (Beneficiary Cert)
-        5. SPECIAL: DGD (Dangerous Goods), MSDS, POA (Power of Attorney), BIZ_LIC (Business License), INS (Insurance Policy)
-        
-        Return JSON: {"doc_type": "CODE"}"###;
+        5. SPECIAL: DGD (Dangerous Goods), MSDS, POA (Power of Attorney), BIZ_LIC (Business License), INS (Insurance Policy)        
+        Return JSON: {{"doc_type": "CODE"}}"###;
         
         let detected_type = {
             // Emitting spinner for classification
@@ -563,7 +553,7 @@ impl LogisModel {
                     app_handle, 
                     "extraction-progress", 
                     json!({ "summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat })
-                ).await?
+                ).await?;
             };
 
             log(&format!("[DEBUG] Raw Extraction ({}): {}", mission.cat, res_text));
@@ -630,7 +620,7 @@ REQUIRED JSON FORMAT:
   "filters": {{
       "category.field_path": {{ "$operator": value }}
   }}
-}} 
+}}
 
 Query: {}
 JSON Output:"###, schema_def, doc_type, query);
@@ -705,7 +695,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
     }
 
     fn get_search_schema_definitions(&self, _doc_type: &str) -> String {
-        r###"{
+        r###"{ 
   "header.document_type": { "desc": "Type (Invoice, BL, AWB, PO, BC, AN, DO...)", "type": "String" },
   "header.document_number": { "desc": "ID, Doc No, Reference No", "type": "String" },
   "header.po_number": { "desc": "Purchase Order No (PO)", "type": "String" },
@@ -1206,7 +1196,7 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
             _ => "\"\""
         };
         let comma = if i < schema_fields.len() - 1 { "," } else { "" };
-        lines.push(format!("    \"{}\": {} // {}: {} {} ({}).", key, default_val, comma, mode, desc, dtype));
+        lines.push(format!("    \"{}\": {} // {}: {} {} ({})\n.", key, default_val, comma, mode, desc, dtype));
     }
     
     if is_list { lines.push("  }]".to_string()); } 

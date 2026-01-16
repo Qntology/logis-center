@@ -203,38 +203,49 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
 
 
     // 5. Start Background Monitoring Loop
-    // This loop checks the active tab's URL and emits events for the UI (⚡ button)
+    // Improved loop to detect the ACTUAL active/visible tab
     let monitor_browser = browser_arc.clone();
     let monitor_handle = app_handle.clone();
     
     tokio::spawn(async move {
+        let mut last_detected_url = String::new();
+
         loop {
-            // Check if browser is still alive
             let pages = match monitor_browser.pages().await {
                 Ok(p) => p,
-                Err(_) => break, // Browser closed
+                Err(_) => break, 
             };
 
-            // Get the last active page (usually the user-visible tab)
-            if let Some(active_page) = pages.last() {
-                if let Ok(Some(current_url)) = active_page.url().await {
+            let mut match_found = false;
+
+            // Iterate backwards to find the most recently created/active page
+            for page in pages.iter().rev() {
+                if let Ok(Some(current_url)) = page.url().await {
                     let is_client = is_shop(&current_url, CLIENT_PATTERNS);
                     let is_admin = is_shop(&current_url, ADMIN_PATTERNS);
                     
                     if is_client || is_admin {
-                        // Notify Frontend to show ⚡ button
-                        let _ = monitor_handle.emit("browser-match-found", json!({
-                            "url": current_url,
-                            "is_client": is_client,
-                            "is_admin": is_admin
-                        }));
-                    } else {
-                        let _ = monitor_handle.emit("browser-match-found", json!({ "found": false }));
+                        // Only emit if the URL or active status changed
+                        if current_url != last_detected_url {
+                            let _ = monitor_handle.emit("browser-match-found", json!({
+                                "url": current_url.clone(),
+                                "is_client": is_client,
+                                "is_admin": is_admin
+                            }));
+                            last_detected_url = current_url;
+                        }
+                        match_found = true;
+                        break; // Found the active matching tab
                     }
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            if !match_found && !last_detected_url.is_empty() {
+                let _ = monitor_handle.emit("browser-match-found", json!({ "found": false }));
+                last_detected_url = String::new();
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await; // Faster polling (0.5s)
         }
     });
 
