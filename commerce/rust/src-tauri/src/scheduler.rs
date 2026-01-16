@@ -123,7 +123,7 @@ async fn process_task(
              let result_str = if let Some(model) = model_guard.as_ref() {
                  model.chat_with_image_spinner(prompt, Some(dynamic_image), app_handle, "extraction-progress", json!({
                      "category": "Vision Analysis", "summary": "Analyzing image content..."
-                 })).await?
+                 }), 1024).await?
              } else {
                  "{}".to_string()
              };
@@ -198,7 +198,7 @@ async fn process_task(
         let system = parsing::map_outline(language);
         model.chat_with_spinner(&system, &light_pug, app_handle, "extraction-progress", json!({
             "category": "Classification", "summary": "Analyzing page structure..."
-        })).await?
+        }), 512).await? // [Optimization] Limit to 512 tokens for classification
     } else {
         "{}".to_string()
     };
@@ -276,7 +276,7 @@ async fn process_task(
                 &format!("{}\n\nData (Zoomed In):\n{}", prompt, content_pug),
                 app_handle, "extraction-progress", json!({
                 "category": "Extraction", "summary": format!("Extracting {} data...", page_type)
-            })).await?
+            }), 2048).await? // Use 2048 tokens for full extraction
     } else {
         "{}".to_string()
     };

@@ -82,19 +82,21 @@ impl LogisModel {
         
         let mut final_device_preference = device_preference;
 
-        // Force CPU if RAM is critically low on 8GB systems (< 3GB available)
-        // This prevents the GPU driver from crashing due to shared memory exhaustion
+        // [Memory Defense Logic] Restore strictly for system stability.
+        // If memory is critically low, we must restrict device usage to prevent system-wide OOM.
         if total_mem <= 8 * 1024 * 1024 * 1024 && free_mem < 3 * 1024 * 1024 * 1024 {
-             println!("⚠️ [WARNING] Critical Low RAM (< 3GB) on 8GB System. Forcing CPU Mode for stability.");
-             final_device_preference = Some("cpu");
+             println!("⚠️ [DEFENSE] Critical Low RAM (< 3GB) detected on 8GB System. Ensuring safe execution mode.");
+             // If GPU is not explicitly requested, or if we need to fall back for stability:
+             if device_preference.is_none() {
+                 final_device_preference = Some("cpu");
+             }
         } else if safe_limit < estimated_req { 
-            println!("⚠️ [WARNING] Available RAM ({:.2} GB) is below safe threshold ({:.2} GB) for GPU inference.", 
+            println!("⚠️ [DEFENSE] Available RAM ({:.2} GB) is below safe threshold ({:.2} GB).", 
                 safe_limit as f64 / 1024.0 / 1024.0 / 1024.0,
                 estimated_req as f64 / 1024.0 / 1024.0 / 1024.0
             );
             
-            if device_preference.is_none() || device_preference == Some("cuda") {
-                println!("[SYS-INIT] 🔄 Auto-switching to CPU mode to prevent CUDA OOM (OS paging will handle overflow).");
+            if device_preference.is_none() {
                 final_device_preference = Some("cpu");
             }
         }
@@ -193,7 +195,8 @@ impl LogisModel {
         user_input: &str,
         app_handle: &tauri::AppHandle,
         event_name: &str,
-        base_payload: Value
+        base_payload: Value,
+        max_tokens: usize
     ) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
@@ -221,7 +224,7 @@ impl LogisModel {
             let params = ChatCompletionParameters {
                 messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(2048),
+                max_tokens: Some(max_tokens),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
                 ..Default::default()
@@ -262,7 +265,8 @@ impl LogisModel {
         image: Option<DynamicImage>,
         app_handle: &tauri::AppHandle,
         event_name: &str,
-        base_payload: Value
+        base_payload: Value,
+        max_tokens: usize
     ) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
         
@@ -296,7 +300,7 @@ impl LogisModel {
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(message)],
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(1024),
+                max_tokens: Some(max_tokens),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
                 ..Default::default()
