@@ -83,23 +83,20 @@ impl LogisModel {
         
         let mut final_device_preference = device_preference;
 
-        // [Memory Defense Logic] Restore strictly for system stability.
-        // If memory is critically low, we must restrict device usage to prevent system-wide OOM.
+        // [Memory Defense Logic] - RELAXED
+        // Instead of forcing CPU, we just warn. Let the lower-level 'get_device' decide based on CUDA availability.
         if total_mem <= 8 * 1024 * 1024 * 1024 && free_mem < 3 * 1024 * 1024 * 1024 {
-             println!("⚠️ [DEFENSE] Critical Low RAM (< 3GB) detected on 8GB System. Ensuring safe execution mode.");
-             // If GPU is not explicitly requested, or if we need to fall back for stability:
-             if device_preference.is_none() {
-                 final_device_preference = Some("cpu");
-             }
+             println!("⚠️ [DEFENSE] Low RAM detected. proceeding with preference (GPU if available).");
         } else if safe_limit < estimated_req { 
-            println!("⚠️ [DEFENSE] Available RAM ({:.2} GB) is below safe threshold ({:.2} GB).", 
-                safe_limit as f64 / 1024.0 / 1024.0 / 1024.0,
-                estimated_req as f64 / 1024.0 / 1024.0 / 1024.0
-            );
-            
-            if device_preference.is_none() {
-                final_device_preference = Some("cpu");
-            }
+            println!("⚠️ [DEFENSE] Available RAM below estimated requirement. Proceeding cautiously.");
+        }
+        
+        // Force CPU only if explicitly requested
+        if device_preference == Some("cpu") {
+            final_device_preference = Some("cpu");
+        } else {
+            // Default to whatever the user asked, or auto-detect
+            final_device_preference = device_preference;
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models")
