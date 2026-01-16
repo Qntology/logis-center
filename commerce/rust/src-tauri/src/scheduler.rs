@@ -209,6 +209,17 @@ async fn process_task(
     // 3. Parse Map Result (Using helper logic to handle markdown blocks)
     let page_info: Value = parse_json_from_llm(&page_info_str);
     
+    // Emit Classification Result
+    let _ = app_handle.emit("extraction-progress", json!({
+        "category": "Classification", 
+        "summary": format!("Map: Type={}, Detail={}", 
+            page_info.get("type").and_then(|s| s.as_str()).unwrap_or("?"),
+            page_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false)
+        ), 
+        "spinner": "✅", 
+        "data": page_info
+    }));
+    
     let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
     let is_detail = page_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
     let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");

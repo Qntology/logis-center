@@ -147,13 +147,14 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 }
 
 pub fn map_outline(language: &str) -> String {
-    let template = r###"Analyze the provided Pug template structure and classify the page.
+    let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation.
+    #type : document category
     Return JSON:
     {
-        "type": "order" | "goods" | "tracking" | "review" | "coupon" | "event" | "",
-        "item": "CSS1 selector for individual items (excluding ads/recommendations)",
-        "node": "CSS1 selector for the parent list container",
-        "detail": boolean (true if detail page, false if list)
+        "type":'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
+        "item": type based item CSS1 selector excluding ads,
+        "node": item parent list CSS1 selector excluding ads,
+        "detail": is a detail page or a detail form | boolean,
     }
     Language: {LANGUAGE}"###;
     
@@ -186,7 +187,7 @@ pub fn para2graph(language: &str) -> String {
 		"context": [
 			{
 				"language": "{LANGUAGE}",
-				"type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
+				"type": "sales" or "order" or "goods" or "tracking" or "view" or "review" or "coupon" or "event" or "",
 				"text": "Segment the natural language content into single-type contexts"
 			}
 		]

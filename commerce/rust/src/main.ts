@@ -446,7 +446,7 @@ listen("extraction-progress", (event: any) => {
              p.innerHTML = `<span style="margin-right:8px;">✅</span> <span>${successText}</span>`;
              p.style.color = "#4ade80"; 
              
-             if(payload.category === "Done" && payload.data) {
+             if(payload.data) {
                   // Show final JSON
                   const pretty = JSON.stringify(payload.data, null, 2);
                   const pre = document.createElement("pre");
@@ -454,7 +454,13 @@ listen("extraction-progress", (event: any) => {
                   pre.style.color = "#e5e5e5"; pre.style.background = "#1e1e1e";
                   pre.style.padding = "10px"; pre.style.borderRadius = "5px"; pre.style.marginTop = "10px";
                   pre.innerText = pretty;
-                  extractionLog.appendChild(pre);
+                  
+                  // Check if pre already exists to avoid dupes (if multiple events fire)
+                  if(!p.querySelector("pre")) {
+                      p.appendChild(pre); // Append inside the div or log container?
+                      // Better to append to log container to keep flow
+                      extractionLog.appendChild(pre);
+                  }
              }
          } else {
              // Progress
