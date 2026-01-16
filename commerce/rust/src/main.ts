@@ -44,7 +44,7 @@ let isLoading = false;
 let hasMore = true;
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
-let isBrowserExtracting = false; // Track explicit user action
+let isExtracting = false; // Track any extraction task
 
 // --- UI Elements ---
 const contentPanel = document.getElementById("content-panel") as HTMLElement;
@@ -201,14 +201,17 @@ btnExtract?.addEventListener("click", async () => {
     // Switch to Detail View for Progress
     listView.style.display = "none";
     detailView.style.display = "flex";
+
+    // Block re-execution if already running
+    if (isExtracting) {
+        return;
+    }
     
     if (currentImage) {
         // --- 1. Image Extraction ---
+        isExtracting = true;
         detailTitle.innerText = "⚡ Analyzing Image...";
-        detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;">
-            <div style="color:#888; font-size:0.8rem;">Queuing image task...</div>
-        </div>`;
-        
+        detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;"></div>`;
         try {
             // Generate Task ID
             const taskId = `img_${Date.now()}`;
@@ -222,12 +225,13 @@ btnExtract?.addEventListener("click", async () => {
             });
             
         } catch (e) { 
+            isExtracting = false;
             detailTitle.innerText = "Error";
             detailContent.innerHTML = `<div style="color:red;">Failed to queue: ${e}</div>`; 
         }
     } else {
         // --- 2. Browser Extraction ---
-        isBrowserExtracting = true; // Flag on
+        isExtracting = true;
         detailTitle.innerText = "⚡ Browser Extraction...";
         detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;">
             <div style="color:#888; font-size:0.8rem;">Initializing task...</div>
@@ -437,6 +441,7 @@ listen("extraction-progress", (event: any) => {
          }
          
          if (payload.category === "Done" || payload.data) {
+             isExtracting = false; // Reset state
              const successText = payload.category === "Done" ? "Extraction Complete" : `<strong>${payload.category}</strong> extracted.`;
              p.innerHTML = `<span style="margin-right:8px;">✅</span> <span>${successText}</span>`;
              p.style.color = "#4ade80"; 

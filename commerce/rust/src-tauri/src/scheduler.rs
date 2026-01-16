@@ -97,7 +97,8 @@ async fn process_task(
 
     // Parse Task Data
     let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
-    
+    let language = "english"; // Default, ideally detect from content or task
+
     // --- Image Extraction Logic ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
@@ -120,7 +121,7 @@ async fn process_task(
              }
              
              let result_str = if let Some(model) = model_guard.as_ref() {
-                 model.chat_with_image_spinner(&prompt, Some(dynamic_image), app_handle, "extraction-progress", json!({
+                 model.chat_with_image_spinner(prompt, Some(dynamic_image), app_handle, "extraction-progress", json!({
                      "category": "Vision Analysis", "summary": "Analyzing image content..."
                  })).await?
              } else {
@@ -151,7 +152,6 @@ async fn process_task(
     }
 
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("");
-    let language = "english"; // Default, ideally detect from content or task
 
     if url.is_empty() {
         return Ok(()) // Or Err if URL is mandatory
@@ -168,14 +168,6 @@ async fn process_task(
         return Ok(()); // No HTML and no URL
     };
     
-    // =================================================================================
-    // STEP 1: Classification (Structure Only) - "Map Outline"
-    // =================================================================================
-    
-    let _ = app_handle.emit("extraction-progress", json!({
-        "category": "Classification", "summary": "Analyzing page structure...", "spinner": "⠋"
-    }));
-
     // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
     let light_pug = parsing::convert_to_clean_pug(&html, PugMode::StructureOnly);
     
@@ -197,6 +189,10 @@ async fn process_task(
             return Ok(());
         }
     }
+
+    let _ = app_handle.emit("extraction-progress", json!({
+        "category": "Classification", "summary": "Analyzing page structure...", "spinner": "⠋"
+    }));
 
     let page_info_str = if let Some(model) = model_guard.as_ref() {
         let system = parsing::map_outline(language);
