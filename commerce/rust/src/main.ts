@@ -386,8 +386,8 @@ listen("browser-match-found", (event: any) => {
             btnExtract.title = `Extract from ${new URL(payload.url).hostname}`;
         }
     } else {
-        // Hide only if NO image selected
-        if (!currentImage && btnExtract) btnExtract.style.display = "none";
+        // Hide only if NO image selected AND NOT currently extracting via browser
+        if (!currentImage && btnExtract && !isBrowserExtracting) btnExtract.style.display = "none";
     }
 });
 
@@ -408,6 +408,17 @@ listen("extraction-progress", (event: any) => {
 
     // Only update if we are in the detail view watching logs
     if (extractionLog && detailView.style.display !== "none") {
+         
+         // 1. Visual Cleanup: Mark previous steps as done if focus moves to a new category
+         Array.from(extractionLog.children).forEach((child: any) => {
+             // If it is a progress row, is NOT the current one, and doesn't have a checkmark yet
+             if (child.id.startsWith("progress-") && child.id !== elementId && !child.innerHTML.includes("✅")) {
+                 const textSpan = child.querySelector("span:last-child");
+                 const text = textSpan ? textSpan.innerText : "Completed";
+                 child.innerHTML = `<span style="margin-right:8px; color:#666;">✅</span> <span style="color:#888;">${text}</span>`;
+             }
+         });
+
          let p = document.getElementById(elementId);
          if (!p) {
              p = document.createElement("div");
