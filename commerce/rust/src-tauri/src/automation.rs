@@ -10,7 +10,7 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use serde_json::json;
 use regex::Regex;
-use reqwest::Url; // Added for URL parsing
+use reqwest::Url;
 
 // Global storage to keep browser alive
 static GLOBAL_BROWSER: Lazy<Arc<tokio::sync::Mutex<Option<Arc<Browser>>>>> = Lazy::new(|| {
@@ -53,13 +53,19 @@ fn is_shop(url: &str, patterns: &[&str]) -> bool {
     if let Ok(parsed_url) = Url::parse(url) {
         let host = parsed_url.host_str().unwrap_or("");
         for pattern in patterns {
-            // Convert wildcard pattern to regex
-            // e.g., "*.cafe24.com" -> "^.*\.cafe24\.com$"
             let regex_str = format!("^{}$", pattern.replace(".", "\\.").replace("*", ".*"));
             if let Ok(re) = Regex::new(&regex_str) {
                 if re.is_match(host) {
                     return true;
                 }
+            }
+        }
+    } else {
+        // Fallback: If URL parsing fails, check if pattern exists in the string directly
+        for pattern in patterns {
+            let clean_pattern = pattern.replace("*.", "");
+            if url.contains(&clean_pattern) {
+                return true;
             }
         }
     }
@@ -267,18 +273,27 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
             } else if cfg!(target_os = "macos") {
                 "geckodriver_mac"
             } else { 
-                "geckodriver" 
+                "geckodriver" // Linux & others
             };
              (name.to_string(), DRIVER_PORT, serde_json::json!({ "browserName": "firefox" }))
         },
         "safari" => {
-             ("/usr/bin/safaridriver".to_string(), DRIVER_PORT, serde_json::json!({ "browserName": "safari" }))
+             if cfg!(target_os = "macos") {
+                 ("/usr/bin/safaridriver".to_string(), DRIVER_PORT, serde_json::json!({ "browserName": "safari" }))
+             } else {
+                 return Err(anyhow!("Safari is only supported on macOS"));
+             }
         },
         _ => return Err(anyhow!("Unsupported browser for driver mode")),
     };
 
     println!("[AUTO] Legacy Mode: {} requires driver {}", browser, driver_binary);
     
+    // Attempt to kill existing driver instances on port (Linux/Mac mostly)
+    if !cfg!(target_os = "windows") {
+        let _ = Command::new("pkill").arg("-f").arg(&driver_binary).output();
+    }
+
     let mut child = Command::new(&driver_binary)
         .arg(format!("--port={}", port))
         .stdout(Stdio::null())
@@ -286,6 +301,7 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
         .spawn()
         .map_err(|e| anyhow!("Driver '{}' start failed. Ensure it is installed. Error: {}", driver_binary, e))?;
 
+    // Give driver time to start
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut caps_map = serde_json::map::Map::new();
@@ -358,7 +374,15 @@ fn find_app_bundle(bundle_id: &str) -> Option<String> {
         let s = String::from_utf8_lossy(&o.stdout);
         if !s.trim().is_empty() {
              let app_path = s.lines().next()?.trim();
-             let binary_name = if bundle_id.contains("Chrome") { "Google Chrome" } else { "Microsoft Edge" };
+             let binary_name = if bundle_id.contains("Chrome") { "Google Chrome" } 
+                               else if bundle_id.contains("Edge") { "Microsoft Edge" }
+                               else if bundle_id.contains("Firefox") { "firefox" }
+                               else { return None };
+             
+             // Firefox bundle binary location is slightly different often
+             if binary_name == "firefox" {
+                 return Some(format!("{}/Contents/MacOS/firefox", app_path));
+             }
              return Some(format!("{}/Contents/MacOS/{}", app_path, binary_name));
         }
     }
@@ -406,66 +430,77 @@ fn get_first_profile_name(root: &PathBuf) -> String {
     "Default".to_string()
 }
 
+// Find browser binary path across Windows, Mac, and Linux
 fn find_browser_path(browser: &str) -> Option<PathBuf> {
-    let potential_paths = match browser {
+    let mut potential_paths = Vec::new();
+
+    match browser {
         "chrome" => {
-            let mut paths = Vec::new();
             if cfg!(target_os = "windows") {
-                paths.push(r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string());
-                paths.push(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".to_string());
-                if let Some(p) = find_path_in_registry("chrome.exe") { paths.push(p); }
+                potential_paths.push(r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string());
+                potential_paths.push(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".to_string());
+                if let Some(p) = find_path_in_registry("chrome.exe") { potential_paths.push(p); }
             } else if cfg!(target_os = "macos") {
-                paths.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string());
-                if let Some(p) = find_app_bundle("com.google.Chrome") { paths.push(p); }
+                potential_paths.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string());
+                if let Some(p) = find_app_bundle("com.google.Chrome") { potential_paths.push(p); }
             } else {
-                return which::which("google-chrome").ok()
-                    .or_else(|| which::which("google-chrome-stable").ok())
-                    .or_else(|| which::which("chromium").ok())
-                    .or_else(|| which::which("chrome").ok());
+                // Linux / Unix
+                if let Ok(p) = which::which("google-chrome") { return Some(p); }
+                if let Ok(p) = which::which("google-chrome-stable") { return Some(p); }
+                if let Ok(p) = which::which("chromium") { return Some(p); }
+                if let Ok(p) = which::which("chromium-browser") { return Some(p); }
+                if let Ok(p) = which::which("chrome") { return Some(p); }
             }
-            paths
         },
         "edge" => {
-            let mut paths = Vec::new();
             if cfg!(target_os = "windows") {
-                paths.push(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_string());
-                paths.push(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".to_string());
-                if let Some(p) = find_path_in_registry("msedge.exe") { paths.push(p); }
+                potential_paths.push(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_string());
+                potential_paths.push(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".to_string());
+                if let Some(p) = find_path_in_registry("msedge.exe") { potential_paths.push(p); }
             } else if cfg!(target_os = "macos") {
-                paths.push("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".to_string());
-                if let Some(p) = find_app_bundle("com.microsoft.edgemac") { paths.push(p); }
+                potential_paths.push("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".to_string());
+                if let Some(p) = find_app_bundle("com.microsoft.edgemac") { potential_paths.push(p); }
             } else {
-                return which::which("microsoft-edge").ok()
-                    .or_else(|| which::which("microsoft-edge-stable").ok())
-                    .or_else(|| which::which("edge").ok());
+                // Linux / Unix
+                if let Ok(p) = which::which("microsoft-edge") { return Some(p); }
+                if let Ok(p) = which::which("microsoft-edge-stable") { return Some(p); }
+                if let Ok(p) = which::which("edge") { return Some(p); }
             }
-            paths
         },
         "firefox" => {
              if cfg!(target_os = "windows") {
-                 vec![
-                     r"C:\Program Files\Mozilla Firefox\firefox.exe".to_string(),
-                     r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe".to_string(),
-                 ]
+                 potential_paths.push(r"C:\Program Files\Mozilla Firefox\firefox.exe".to_string());
+                 potential_paths.push(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe".to_string());
+             } else if cfg!(target_os = "macos") {
+                 potential_paths.push("/Applications/Firefox.app/Contents/MacOS/firefox".to_string());
+                 if let Some(p) = find_app_bundle("org.mozilla.firefox") { potential_paths.push(p); }
              } else {
-                 return which::which("firefox").ok();
+                 // Linux / Unix
+                 if let Ok(p) = which::which("firefox") { return Some(p); }
              }
         },
         _ => return None,
     };
+
+    // Check hardcoded/detected paths
     for p in potential_paths {
         let path = PathBuf::from(&p);
         if path.exists() { return Some(path); }
     }
+
+    // Fallback: simple command check
     match browser {
         "chrome" => which::which("chrome").ok(),
         "edge" => which::which("msedge").ok(),
+        "firefox" => which::which("firefox").ok(),
         _ => None,
     }
 }
 
 pub fn get_available_browsers() -> Vec<BrowserStatus> {
     let mut browsers = Vec::new();
+    
+    // Check Chrome
     if find_browser_path("chrome").is_some() {
         browsers.push(BrowserStatus {
             name: "chrome".to_string(),
@@ -474,6 +509,8 @@ pub fn get_available_browsers() -> Vec<BrowserStatus> {
             needs_driver: false,
         });
     }
+    
+    // Check Edge
     if find_browser_path("edge").is_some() {
          browsers.push(BrowserStatus {
             name: "edge".to_string(),
@@ -482,15 +519,11 @@ pub fn get_available_browsers() -> Vec<BrowserStatus> {
             needs_driver: false,
         });
     }
+    
+    // Check Firefox
     if find_browser_path("firefox").is_some() {
-        let driver = if cfg!(target_os = "windows") { 
-            "geckodriver.exe" 
-        } else if cfg!(target_os = "macos") {
-            "geckodriver_mac"
-        } else { 
-            "geckodriver" 
-        };
-        let has_driver = is_in_path(driver) || check_file_exists(driver);
+        let driver_name = if cfg!(target_os = "windows") { "geckodriver.exe" } else { "geckodriver" };
+        let has_driver = is_in_path(driver_name) || check_file_exists(driver_name);
         browsers.push(BrowserStatus {
             name: "firefox".to_string(),
             is_supported: true,
@@ -498,13 +531,16 @@ pub fn get_available_browsers() -> Vec<BrowserStatus> {
             needs_driver: !has_driver,
         });
     }
+    
+    // Check Safari (Mac Only)
     if cfg!(target_os = "macos") {
         browsers.push(BrowserStatus {
             name: "safari".to_string(),
             is_supported: true,
             is_installed: true,
-            needs_driver: true,
+            needs_driver: true, // Always needs driver mode
         });
     }
+    
     browsers
 }
