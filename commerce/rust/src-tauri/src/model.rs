@@ -133,7 +133,7 @@ impl LogisModel {
             model_dir.to_str().unwrap(),
             Some(&device), 
             dtype 
-        ).map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e)?);
+        ).map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e))?;
 
         println!("[MODEL-02] Qwen3-VL Generator initialized.");
 
@@ -307,7 +307,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e)?)
+            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         let spinner = Spinner::dots();
@@ -371,7 +371,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e)?)
+        gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -420,7 +420,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e)?)
+            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
         });
         
         let spinner = Spinner::dots();
@@ -553,7 +553,7 @@ impl LogisModel {
                     app_handle, 
                     "extraction-progress", 
                     json!({ "summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat })
-                ).await?;
+                ).await?
             };
 
             log(&format!("[DEBUG] Raw Extraction ({}): {}", mission.cat, res_text));
