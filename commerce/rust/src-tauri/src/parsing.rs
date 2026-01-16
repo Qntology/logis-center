@@ -148,13 +148,16 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
 pub fn map_outline(language: &str) -> String {
     let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation.
-    #type : document category
+    # type : document type 'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or ''
+    # item : type based item CSS1 selector excluding ads
+    # node : item parent list CSS1 selector excluding ads
+    # detail : is a detail page or a detail form
     Return JSON:
     {
-        "type":'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
-        "item": type based item CSS1 selector excluding ads,
-        "node": item parent list CSS1 selector excluding ads,
-        "detail": is a detail page or a detail form | boolean,
+        "type": '',
+        "item": '',
+        "node": '',
+        "detail": boolean
     }
     Language: {LANGUAGE}"###;
     
