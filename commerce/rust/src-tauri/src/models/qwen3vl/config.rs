@@ -80,7 +80,7 @@ pub struct Qwen3VLConfig {
     pub video_token_id: usize,
     pub vision_config: Qwen3VLVisionConfig,
     pub vision_start_token_id: usize,
-    pub vision_token_id: usize,
+    pub vision_end_token_id: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -91,16 +91,16 @@ pub struct Size {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PreprocessorConfig {
-    pub do_convert_rgb: bool,
-    pub do_normalize: bool,
-    pub do_pad: bool,
-    pub do_resize: bool,
-    pub do_rescale: bool,
+    pub do_convert_rgb: Option<bool>,
+    pub do_normalize: Option<bool>,
+    pub do_pad: Option<bool>,
+    pub do_resize: Option<bool>,
+    pub do_rescale: Option<bool>,
     pub image_mean: Vec<f32>,
     pub image_std: Vec<f32>,
-    pub max_pixels: usize,
-    pub min_pixels: usize,
-    pub rescale_factor: f64,
+    pub max_pixels: Option<usize>,
+    pub min_pixels: Option<usize>,
+    pub rescale_factor: Option<f64>,
     pub patch_size: usize,
     pub merge_size: usize,
     pub temporal_patch_size: usize,

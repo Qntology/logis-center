@@ -228,7 +228,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                 };
                 
                 if is_visible {
-                     println!("[AUTO-DEBUG] Found visible tab: {:?}", page.url().await);
+                     // println!("[AUTO-DEBUG] Found visible tab: {:?}", page.url().await);
                 } else {
                      // println!("[AUTO-DEBUG] Tab {} is hidden", i);
                 }
