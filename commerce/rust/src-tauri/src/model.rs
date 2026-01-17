@@ -66,13 +66,13 @@ impl LogisModel {
             let usable_vram = if free_vram > buffer_size { free_vram - buffer_size } else { 0 };
             let required_vram = 3_000_000_000; // ~3GB
 
-            println!("[VRAM-CHECK] CUDA | Total: {{:.2}} GB, Free: {{:.2}} GB, Usable: {{:.2}} GB", 
+            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB, Usable: {:.2} GB", 
                 total_vram as f64/1e9, free_vram as f64/1e9, usable_vram as f64/1e9);
 
             if usable_vram >= required_vram {
                 return (true, "Sufficient CUDA VRAM".to_string());
             } else {
-                return (false, format!("Insufficient CUDA VRAM (Usable: {{:.2}} GB < Required: {{:.2}} GB)", usable_vram as f64/1e9, required_vram as f64/1e9));
+                return (false, format!("Insufficient CUDA VRAM (Usable: {:.2} GB < Required: {:.2} GB)", usable_vram as f64/1e9, required_vram as f64/1e9));
             }
         }
 
@@ -88,25 +88,25 @@ impl LogisModel {
         let required_mem = 3_000_000_000; 
 
         let mode = if is_metal { "Metal (Unified)" } else { "System RAM" };
-        println!("[MEM-CHECK] {} | Total: {{:.2}} GB, Available: {{:.2}} GB, Usable: {{:.2}} GB", 
+        println!("[MEM-CHECK] {} | Total: {:.2} GB, Available: {:.2} GB, Usable: {:.2} GB", 
             mode, total_mem as f64/1e9, free_mem as f64/1e9, usable_mem as f64/1e9);
 
         if usable_mem >= required_mem {
             (true, format!("Sufficient {}", mode))
         } else {
-            (false, format!("Insufficient {} (Usable: {{:.2}} GB < Required: {{:.2}} GB)", mode, usable_mem as f64/1e9, required_mem as f64/1e9))
+            (false, format!("Insufficient {} (Usable: {:.2} GB < Required: {:.2} GB)", mode, usable_mem as f64/1e9, required_mem as f64/1e9))
         }
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[DEBUG] LogisModel::new called. Preference: {{:?}}", device_preference);
+        println!("[DEBUG] LogisModel::new called. Preference: {:?}", device_preference);
         println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
 
         // Detect Capabilities
         let has_cuda = candle_core::utils::cuda_is_available();
         let has_metal = candle_core::utils::metal_is_available();
         
-        println!("[DEBUG] Device Capability: CUDA={{}}, Metal={{}}", has_cuda, has_metal);
+        println!("[DEBUG] Device Capability: CUDA={}, Metal={}", has_cuda, has_metal);
 
         // Select Device Logic
         let mut target_device = Device::Cpu;
@@ -159,7 +159,7 @@ impl LogisModel {
         let device_for_task = target_device.clone();
         let model_path_for_task = model_path.clone();
 
-        println!("[MODEL-01] Initializing on device: {{:?}}", target_device);
+        println!("[MODEL-01] Initializing on device: {:?}", target_device);
 
         let init_result = tokio::task::spawn_blocking(move || {
             Qwen3VLGenerateModel::init(&model_path_for_task, Some(&device_for_task), dtype)
@@ -171,7 +171,7 @@ impl LogisModel {
                 let err_str = e.to_string();
                 // If failed on GPU/Metal, try fallback to CPU
                 if !target_device.is_cpu() {
-                    println!("⚠️ [FALLBACK] Init failed on {{:?}}: {{}}. Retrying on CPU...", target_device, err_str);
+                    println!("⚠️ [FALLBACK] Init failed on {:?}: {}. Retrying on CPU...", target_device, err_str);
                     let retry_device = Device::Cpu;
                     let retry_path = model_path.clone();
                     
@@ -235,7 +235,7 @@ impl LogisModel {
             };
             
             let response = gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?;
-            println!("[MODEL-CHAT] Raw Response: {{}}", response);
+            println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }).await?
     }
@@ -507,12 +507,12 @@ impl LogisModel {
         let log = |msg: &str| {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {
                 use std::io::Write;
-                let _ = writeln!(f, "{{}}", msg);
+                let _ = writeln!(f, "{}", msg);
             }
-            println!("{{}}", msg);
+            println!("{}", msg);
         };
 
-        log(&format!("[PROCESS-01] Opening image: {{}}", image_path));
+        log(&format!("[PROCESS-01] Opening image: {}", image_path));
         let full_img_raw = image::open(&image_path)?;
         let full_img_raw = DynamicImage::ImageRgb8(full_img_raw.to_rgb8());
         
@@ -522,18 +522,18 @@ impl LogisModel {
         let free_mem_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         
         let (main_resize, thumb_resize) = if free_mem_gb < 4.0 {
-            log(&format!("[PROCESS-CONFIG] Low RAM ({{:.2}} GB) detected. Using Conservative Mode (1024px/512px).", free_mem_gb));
+            log(&format!("[PROCESS-CONFIG] Low RAM ({:.2} GB) detected. Using Conservative Mode (1024px/512px).", free_mem_gb));
             (1024, 512)
         } else {
-            log(&format!("[PROCESS-CONFIG] RAM sufficient ({{:.2}} GB). Using Standard Mode (1536px/768px).", free_mem_gb));
+            log(&format!("[PROCESS-CONFIG] RAM sufficient ({:.2} GB). Using Standard Mode (1536px/768px).", free_mem_gb));
             (1536, 768)
         };
         
-        log(&format!("[PROCESS-02] Global Resize to {{}}px width...", main_resize));
+        log(&format!("[PROCESS-02] Global Resize to {}px width...", main_resize));
         let master_img = full_img_raw.resize(main_resize, u32::MAX, image::imageops::FilterType::Triangle);
         let (w, h) = master_img.dimensions();
 
-        log(&format!("[PROCESS-03] Creating Classification Thumbnail ({{:?}}px)...", thumb_resize));
+        log(&format!("[PROCESS-03] Creating Classification Thumbnail ({:?}px)...", thumb_resize));
         let class_img = master_img.resize(thumb_resize, u32::MAX, image::imageops::FilterType::Triangle);
 
         log("[PROCESS-04] Running Classification...");
@@ -543,7 +543,7 @@ impl LogisModel {
         3. CUSTOMS: ED (Export Declaration), ID (Import Declaration), CINV (Customs Invoice), CO (Certificate of Origin)
         4. CERTIFICATES: IC (Inspection Cert), WC (Weight Cert), CA (Analysis Cert), PHYTO (Phytosanitary), HC (Health Cert), BEN_CERT (Beneficiary Cert)
         5. SPECIAL: DGD (Dangerous Goods), MSDS, POA (Power of Attorney), BIZ_LIC (Business License), INS (Insurance Policy)        
-        Return JSON: {{"doc_type": "CODE"}}"###;
+        Return JSON: {"doc_type": "CODE"}"###;
         
         let detected_type = {
             // Emitting spinner for classification
@@ -555,7 +555,7 @@ impl LogisModel {
                 json!({ {"summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing"} })
             ).await?;
 
-            log(&format!("[DEBUG] Raw Classification Response: {{}}", res));
+            log(&format!("[DEBUG] Raw Classification Response: {}", res));
             let dtype = extract_json_field(&res, "doc_type").unwrap_or("Unknown".to_string());
             
             // Emit success for classification
@@ -564,7 +564,7 @@ impl LogisModel {
             dtype
         };
         
-        log(&format!("[DEBUG] Detected Type: {{}}", detected_type));
+        log(&format!("[DEBUG] Detected Type: {}", detected_type));
 
         let mut root = Map::new();
         root.insert("header".to_string(), json!({ {"doc_type": &detected_type} }));
@@ -579,7 +579,7 @@ impl LogisModel {
         let missions = get_slice_config(&detected_type);
         
         for (i, mission) in missions.iter().enumerate() {
-            log(&format!("\n[SEQ-MISSION {{}}] Category: {{}}", i + 1, mission.cat));
+            log(&format!("\n[SEQ-MISSION {}] Category: {}", i + 1, mission.cat));
             
             let res_text = {
                 let (top_pct, bot_pct) = mission.box_range;
@@ -590,20 +590,20 @@ impl LogisModel {
                 let processed_img = master_img.crop_imm(0, start_y, w, crop_h);
                 
                 let schema = get_category_schema(mission.cat, &detected_type);
-                let prompt = format!("MISSION: Extract fields for category '{{}}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{{\n{{}}\n}}", mission.cat.to_uppercase(), schema);
+                let prompt = format!("MISSION: Extract fields for category '{}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{\n{}\n}", mission.cat.to_uppercase(), schema);
                 
-                let task_desc = format!("[{{}}] {{}} ({{}}%~{{}}%)", detected_type, mission.cat.to_uppercase(), (top_pct*100.0) as i32, (bot_pct*100.0) as i32);
+                let task_desc = format!("[{}] {} ({}%~{}%)", detected_type, mission.cat.to_uppercase(), (top_pct*100.0) as i32, (bot_pct*100.0) as i32);
                 
                 self.run_inference_with_spinner(
                     prompt, 
                     Some(processed_img), 
                     app_handle, 
                     "extraction-progress", 
-                    json!({ {"summary": format!("Analyzing: {{}}", task_desc), "raw": format!("Analyzing {{}}...", task_desc), "category": mission.cat} })
+                    json!({ {"summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat} })
                 ).await?;
             };
 
-            log(&format!("[DEBUG] Raw Extraction ({{}}): {{}}", mission.cat, res_text));
+            log(&format!("[DEBUG] Raw Extraction ({}): {}", mission.cat, res_text));
 
             if let Some(json_val) = extract_json_from_text(&res_text) {
                 merge_json_manual(&mut root, mission.cat, json_val.clone());
@@ -622,8 +622,8 @@ impl LogisModel {
     }
 
     pub async fn split_query_contexts(&self, query: String) -> anyhow::Result<Vec<Value>> {
-        let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}}]};
-        let prompt = format!("{{}}\n\nQuery: {{}}\nJSON Output:", system_prompt, query);
+        let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}]";
+        let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
         
         let res = self.run_inference_text(prompt, None)?;
         if let Some(json_val) = extract_json_from_text(&res) {
@@ -645,7 +645,7 @@ impl LogisModel {
             return Ok(vec![json_val]);
         }
         
-        Ok(vec![json!({ {"query": query, "$header": { "$$document_type": "ALL" }} })])
+        Ok(vec![json!({ {"query": query, "$header": { "$$document_type": "ALL" } })])
     }
 
     pub async fn parse_query_to_filters(&self, query: String, doc_type: Option<String>) -> anyhow::Result<Value> {
@@ -662,12 +662,12 @@ DYNAMIC SCHEMA:
 {}
 
 REQUIRED JSON FORMAT: 
-{{
-  "header": {{ "document_type": "{}" }},
-  "filters": {{
-      "category.field_path": {{ "$operator": value }}
-  }}
-}}
+{
+  "header": { "document_type": "{}" },
+  "filters": {
+      "category.field_path": { "$operator": value }
+  }
+}
 
 Query: {}
 JSON Output:"###, schema_def, doc_type, query);
@@ -686,9 +686,9 @@ JSON Output:"###, schema_def, doc_type, query);
 1. SEARCH: Finding specific documents by filters (e.g., 'Find Samsung invoices').
 2. RESEARCH: Complex questions requiring cross-referencing or deep analysis (e.g., 'What is the trend of our shipping delays?').
 
-Output JSON: {{"intent": "SEARCH|RESEARCH"}}"###;
+Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
 
-        let prompt = format!("{}\n\nQuery: {{}}\nJSON Output:", system_prompt, query);
+        let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
         let res = self.run_inference_text(prompt, None)?;
         
         let intent = extract_json_from_text(&res)
@@ -716,22 +716,22 @@ Output JSON: {{"intent": "SEARCH|RESEARCH"}}"###;
 
         for (i, step) in steps.iter().enumerate() {
             let frame = spinner.frames[i % spinner.frames.len()];
-            status_history.push_str(&format!("**{{}} {{}}**\n", frame, step));
+            status_history.push_str(&format!("**{} {}**\n", frame, step));
             let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": frame} }));
 
-            let prompt = format!("Given this context: {{}}\n\nTask: {{}}\nQuery: {{}}\n\nProvide deep insight for this specific step.", context_data, step, query);
+            let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
             // In a real implementation, we might want to stream this too, but for now we wait for the step result
             let step_result = self.run_inference_text(prompt, None)?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
-            status_history.push_str(&format!("> {{}}...\n\n", short_res.replace("\n", " ")));
+            status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
             let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": "✅"} }));
         }
 
         // 3. Final Report
         status_history.push_str("### 📊 Final Research Report\n\n");
-        let final_prompt = format!("CONTEXT: {{}}\nQUERY: {{}}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
+        let final_prompt = format!("CONTEXT: {}\nQUERY: {}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
         
         let report = self.run_inference_text(final_prompt, None)?;
         status_history.push_str(&report);
@@ -1233,8 +1233,8 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
     let is_list = category == "items" || category == "containers";
     let cat_key = if category == "items" { "line_items" } else { category };
     let mut lines = Vec::new();
-    if is_list { lines.push(format!("  \"{{}}\": [{{ ", cat_key)); } 
-    else { lines.push(format!("  \"{{}}\": {{ ", cat_key)); }
+    if is_list { lines.push(format!("  \"{}\": [{ ", cat_key)); } 
+    else { lines.push(format!("  \"{}\": { ", cat_key)); }
     
     for (i, (key, desc, dtype, mode)) in schema_fields.iter().enumerate() {
         let default_val = match dtype.as_str() {
@@ -1243,7 +1243,7 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
             _ => "\"\""
         };
         let comma = if i < schema_fields.len() - 1 { "," } else { "" };
-        lines.push(format!("    \"{{}}\": {{}} // {{}} ({{}}) ({})\n.", key, default_val, comma, mode, desc, dtype));
+        lines.push(format!("    \"{}\": {}{} // {} {}\n", key, default_val, comma, mode, desc, dtype));
     }
     
     if is_list { lines.push("  }]".to_string()); } 
@@ -1252,7 +1252,7 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
 }
 
 fn extract_json_from_text(text: &str) -> Option<Value> {
-    let re = Regex::new(r"(?s)(\[.*\]|\{{.*\}})").ok()?;
+    let re = Regex::new(r"(?s)(\[.*\]|\{.*\})").ok()?;
     let caps = re.captures(text)?;
     let raw = caps.get(1)?.as_str();
     let clean = raw.replace("```json", "").replace("```", "").trim().to_string();
