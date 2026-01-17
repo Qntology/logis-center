@@ -41,39 +41,39 @@ impl Spinner {
 pub struct LogisModel {
     generator: Arc<Mutex<Qwen3VLGenerateModel>>,
     is_cpu_mode: bool,
+    max_tokens_limit: u32,
 }
 
 impl LogisModel {
-    fn check_memory_status(is_cuda: bool, is_metal: bool) -> (bool, String) {
+    // Returns (Is Safe to Try GPU, Message, Usable VRAM in Bytes)
+    fn check_memory_status(is_cuda: bool, is_metal: bool) -> (bool, String, u64) {
         // 1. CUDA VRAM Check
         if is_cuda {
             let nvml = match Nvml::init() {
                 Ok(n) => n,
-                Err(e) => return (false, format!("NVML Init Failed: {}", e)),
+                Err(e) => return (false, format!("NVML Init Failed: {}", e), 0),
             };
             let device = match nvml.device_by_index(0) {
                 Ok(d) => d,
-                Err(e) => return (false, format!("GPU Not Found: {}", e)),
+                Err(e) => return (false, format!("GPU Not Found: {}", e), 0),
             };
             let memory = match device.memory_info() {
                 Ok(m) => m,
-                Err(e) => return (false, format!("VRAM Check Failed: {}", e)),
+                Err(e) => return (false, format!("VRAM Check Failed: {}", e), 0),
             };
 
             let total_vram = memory.total;
-            let free_vram = memory.free;
+            let free_vram = memory.free; // free_vram = total - used
+            
+            // Formula: Usable = (Total - Used) - 10% of Total
             let buffer_size = (total_vram as f64 * 0.10) as u64; 
             let usable_vram = if free_vram > buffer_size { free_vram - buffer_size } else { 0 };
-            let required_vram = 3_000_000_000; // ~3GB
-
-            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB, Usable: {:.2} GB", 
+            
+            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB, Usable (Free - 10% Buffer): {:.2} GB", 
                 total_vram as f64/1e9, free_vram as f64/1e9, usable_vram as f64/1e9);
 
-            if usable_vram >= required_vram {
-                return (true, "Sufficient CUDA VRAM".to_string());
-            } else {
-                return (false, format!("Insufficient CUDA VRAM (Usable: {:.2} GB < Required: {:.2} GB)", usable_vram as f64/1e9, required_vram as f64/1e9));
-            }
+            // Removing fixed threshold check. Allow attempt even if VRAM seems low.
+            return (true, format!("VRAM Check Passed (Usable: {:.2} GB)", usable_vram as f64/1e9), usable_vram);
         }
 
         // 2. Metal / CPU System RAM Check
@@ -85,17 +85,13 @@ impl LogisModel {
         let buffer_size = (total_mem as f64 * 0.10) as u64;
         let usable_mem = if free_mem > buffer_size { free_mem - buffer_size } else { 0 };
         
-        let required_mem = 3_000_000_000; 
+        // Removed fixed required_mem check for CPU/Metal as well.
 
         let mode = if is_metal { "Metal (Unified)" } else { "System RAM" };
         println!("[MEM-CHECK] {} | Total: {:.2} GB, Available: {:.2} GB, Usable: {:.2} GB", 
             mode, total_mem as f64/1e9, free_mem as f64/1e9, usable_mem as f64/1e9);
 
-        if usable_mem >= required_mem {
-            (true, format!("Sufficient {}", mode))
-        } else {
-            (false, format!("Insufficient {} (Usable: {:.2} GB < Required: {:.2} GB)", mode, usable_mem as f64/1e9, required_mem as f64/1e9))
-        }
+        (true, format!("Sufficient {}", mode), usable_mem)
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
@@ -118,7 +114,7 @@ impl LogisModel {
         } else {
             // Priority: CUDA > Metal > CPU
             if has_cuda {
-                let (ok, msg) = Self::check_memory_status(true, false);
+                let (ok, msg, _) = Self::check_memory_status(true, false);
                 if ok {
                     println!("✅ [DEVICE] Selecting CUDA: {}", msg);
                     target_device = get_device(None); 
@@ -127,7 +123,7 @@ impl LogisModel {
                     force_cpu = true; 
                 }
             } else if has_metal {
-                let (ok, msg) = Self::check_memory_status(false, true);
+                let (ok, msg, _) = Self::check_memory_status(false, true);
                 if ok {
                     println!("✅ [DEVICE] Selecting Metal: {}", msg);
                     target_device = Device::new_metal(0).unwrap_or(Device::Cpu);
@@ -143,11 +139,15 @@ impl LogisModel {
 
         if force_cpu {
             target_device = Device::Cpu;
-            let (ok, msg) = Self::check_memory_status(false, false);
+            let (ok, msg, _) = Self::check_memory_status(false, false);
             if !ok {
                 println!("⚠️ [WARNING] System RAM is also tight for CPU mode: {}", msg);
             }
         }
+
+        // Fixed Context Tokens as requested
+        let max_tokens_limit = 768;
+        println!("[CONFIG] Token limit fixed to: {}", max_tokens_limit);
 
         let base_path = std::fs::canonicalize("src-tauri/models")
             .or_else(|_| std::fs::canonicalize("models"))?;
@@ -155,7 +155,7 @@ impl LogisModel {
         let model_dir = if gguf_dir.exists() { gguf_dir } else { base_path };
         let model_path = model_dir.to_str().unwrap().to_string();
 
-        let mut dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let device_for_task = target_device.clone();
         let model_path_for_task = model_path.clone();
 
@@ -192,6 +192,7 @@ impl LogisModel {
         Ok(Self {
             generator: Arc::new(Mutex::new(generator)),
             is_cpu_mode: target_device.is_cpu(),
+            max_tokens_limit,
         })
     }
 
@@ -203,6 +204,7 @@ impl LogisModel {
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
         let user_text = user_input.to_string();
+        let max_tok = self.max_tokens_limit;
         
         println!("[MODEL-CHAT] Sending Chat Request...");
         
@@ -228,7 +230,7 @@ impl LogisModel {
             let params = ChatCompletionParameters {
                 messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(2048),
+                max_tokens: Some(max_tok),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
                 ..Default::default()
