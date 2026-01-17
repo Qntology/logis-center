@@ -16,7 +16,7 @@ pub struct Qwen3VLGenerationConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Qwen3VLVisionConfig {
     pub depth: usize,
-    pub embed_dim: usize,
+    pub embed_dim: Option<usize>,
     pub hidden_act: Activation,
     pub hidden_size: usize,
     pub in_channels: usize,
@@ -34,12 +34,12 @@ pub struct Qwen3VLVisionConfig {
 pub struct RopeScaling {
     pub mrope_section: Vec<usize>, 
     pub rope_type: String,
-    pub r#type: String,
+    pub mrope_interleaved: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Qwen3VLTextConfig {
-    pub architectural: String, 
+    pub architectural: Option<String>, 
     pub attention_bias: bool,
     pub attention_dropout: f32,
     pub bos_token_id: u32,
@@ -50,7 +50,7 @@ pub struct Qwen3VLTextConfig {
     pub initializer_range: f32,
     pub intermediate_size: usize,
     pub max_position_embeddings: usize,
-    pub max_window_layers: usize,
+    pub max_window_layers: Option<usize>,
     pub model_type: String, 
     pub num_attention_heads: usize,
     pub num_hidden_layers: usize,
@@ -58,24 +58,24 @@ pub struct Qwen3VLTextConfig {
     pub rms_norm_eps: f64,
     pub rope_scaling: RopeScaling,
     pub rope_theta: f32,
-    pub sliding_window: usize,
+    pub sliding_window: Option<usize>,
     pub tie_word_embeddings: bool,
     pub use_cache: bool,
-    pub use_sliding_window: bool,
+    pub use_sliding_window: Option<bool>,
     pub vocab_size: usize,
     pub dtype: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Qwen3VLConfig {
-    pub architectural: String, 
-    pub auto_map: std::collections::HashMap<String, String>,
-    pub hidden_size: usize,
+    pub architectures: Option<Vec<String>>, 
+    pub auto_map: Option<std::collections::HashMap<String, String>>,
+    pub hidden_size: Option<usize>,
     pub image_token_id: usize,
     pub model_type: String, 
     pub text_config: Qwen3VLTextConfig,
     pub tie_word_embeddings: bool,
-    pub torch_dtype: String,
+    pub torch_dtype: Option<String>,
     pub transformers_version: String,
     pub video_token_id: usize,
     pub vision_config: Qwen3VLVisionConfig,

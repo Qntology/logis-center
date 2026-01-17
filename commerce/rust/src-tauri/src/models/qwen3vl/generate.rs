@@ -50,43 +50,30 @@ impl Qwen3VLGenerateModel {
         
         // Check for GGUF files first
         let gguf_files = find_type_files(path, "gguf")?;
+        println!("[DEBUG] Found {} GGUF files in {}", gguf_files.len(), path);
+        
         let qwen3_vl = if !gguf_files.is_empty() {
             // Find mmproj (vision) and main model
             let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
             let model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned();
 
             if let (Some(mmproj), Some(main)) = (mmproj_path, model_path.clone()) {
-                println!("Loading GGUF Vision from: {:?}", mmproj);
-                println!("Loading GGUF Main from: {:?}", main);
+                println!("[DEBUG] Loading GGUF Vision from: {:?}", mmproj);
+                println!("[DEBUG] Loading GGUF Main from: {:?}", main);
                 
                 let mut mmproj_file = std::fs::File::open(&mmproj)?;
+                println!("[DEBUG] Reading mmproj content...");
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_file)?;
+                println!("[DEBUG] mmproj content read successfully.");
                 
                 let mut main_file = std::fs::File::open(&main)?;
-                // Note: We might need to handle content reading differently if `QuantizedQwen3VLModel` consumes it
-                // Currently `QuantizedQwen3VLModel::new` takes `ct` and `reader`.
-                // We likely need to modify `QuantizedQwen3VLModel::new` to accept TWO contents or readers.
-                // But for now, let's assume we pass the mmproj content and main file reader? 
-                // Wait, `from_gguf_content` inside `new` uses `ct` (content) and `reader`.
-                // We need to pass both context.
-                
-                // Let's modify the call to pass mmproj info.
-                // However, `QuantizedQwen3VLModel::new` signature is: 
-                // pub fn new<R>(config, ct, reader, device)
-                
-                // We need to change `QuantizedQwen3VLModel::new` signature in the other file first.
-                // For this step, I will just call it with a TODO logic or assume `QuantizedQwen3VLModel`
-                // will be updated to handle separate vision loading.
-                
-                // Actually, the previous error "cannot find tensor visual..." happened because we were loading `mmproj` file as the MAIN file!
-                // The log said: `Loading GGUF model from: ...mmproj-Qwen3VL-2B-Instruct-F16.gguf`
-                // This means `gguf_files[0]` happened to be `mmproj`.
-                
-                // We need to load the MAIN model (Qwen3VL-2B-Instruct-Q4_K_M.gguf) as the primary reader,
-                // and pass the `mmproj` content/reader for the vision part.
-                
+                println!("[DEBUG] Reading main model content...");
                 let main_content = gguf_file::Content::read(&mut main_file)?;
+                println!("[DEBUG] main model content read successfully.");
+                
+                println!("[DEBUG] Initializing QuantizedQwen3VLModel...");
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &device, dtype)?;
+                println!("[DEBUG] QuantizedQwen3VLModel initialized.");
                 ModelVariant::Quantized(model)
             } else if let Some(main) = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }) {
                  // Fallback if only one file found (maybe combined?)

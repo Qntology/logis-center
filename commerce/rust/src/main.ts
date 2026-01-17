@@ -395,8 +395,10 @@ listen("browser-match-found", (event: any) => {
             btnExtract.title = `Extract from ${new URL(payload.url).hostname}`;
         }
     } else {
-        // Hide only if NO image selected AND NOT currently extracting via browser
-        if (!currentImage && btnExtract && !isBrowserExtracting) btnExtract.style.display = "none";
+        // Force hide if no match, unless an image is manually selected
+        if (!currentImage) {
+             if (btnExtract) btnExtract.style.display = "none";
+        }
     }
 });
 

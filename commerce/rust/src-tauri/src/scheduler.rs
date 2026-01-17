@@ -117,7 +117,16 @@ async fn process_task(
                  let _ = app_handle.emit("extraction-progress", json!({
                     "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
                  }));
-                 if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
+                 match LogisModel::new(None).await {
+                     Ok(m) => *model_guard = Some(m),
+                     Err(e) => {
+                         println!("[Scheduler] Failed to load LogisModel: {:?}", e);
+                         let _ = app_handle.emit("extraction-progress", json!({
+                            "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
+                         }));
+                         return Ok(()); // Stop task processing but don't crash worker
+                     }
+                 }
              }
              
              let result_str = if let Some(model) = model_guard.as_ref() {
@@ -182,10 +191,12 @@ async fn process_task(
         let _ = app_handle.emit("extraction-progress", json!({
             "category": "Loading Model", "summary": "Loading AI Model...", "spinner": "⠋"
         }));
-        if let Ok(m) = LogisModel::new(None).await {
-            *model_guard = Some(m);
-        } else {
-            return Ok(());
+        match LogisModel::new(None).await {
+            Ok(m) => *model_guard = Some(m),
+            Err(e) => {
+                println!("[Scheduler] Model Init Error: {:?}", e);
+                return Ok(());
+            }
         }
     }
 

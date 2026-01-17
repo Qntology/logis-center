@@ -218,7 +218,7 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
 
             let mut active_tab_found = false;
 
-            for page in pages.iter() {
+            for (i, page) in pages.iter().enumerate() {
                 // Check if this tab is the active one (visible)
                 let is_visible = match page.evaluate("document.visibilityState").await {
                     Ok(res) => {
@@ -226,10 +226,22 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                     },
                     Err(_) => false,
                 };
+                
+                if is_visible {
+                     println!("[AUTO-DEBUG] Found visible tab: {:?}", page.url().await);
+                } else {
+                     // println!("[AUTO-DEBUG] Tab {} is hidden", i);
+                }
 
                 if is_visible {
                     active_tab_found = true;
-                    if let Ok(Some(current_url)) = page.url().await {
+                    
+                    // Use JS evaluation for reliable URL detection (fixes bookmark/stale state issues)
+                    let current_url_res = page.evaluate("window.location.href").await;
+                    
+                    if let Ok(val) = current_url_res {
+                        let current_url = val.into_value::<String>().unwrap_or_default();
+                        
                         // Only emit if the URL implies a change in state or it's a new URL
                         if current_url != last_detected_url {
                             let is_client = is_shop(&current_url, CLIENT_PATTERNS);

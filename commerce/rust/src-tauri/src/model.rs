@@ -133,11 +133,21 @@ impl LogisModel {
 
         println!("[DEBUG] Calling Qwen3VLGenerateModel::init...");
         let start = std::time::Instant::now();
-        let generator = Qwen3VLGenerateModel::init(
-            model_dir.to_str().unwrap(),
-            Some(&device), 
-            dtype 
-        ).map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e))?;
+        
+        // Clone/Copy variables for the blocking task
+        let model_path = model_dir.to_str().unwrap().to_string();
+        let device_clone = device.clone(); 
+        
+        let generator = tokio::task::spawn_blocking(move || {
+            Qwen3VLGenerateModel::init(
+                &model_path,
+                Some(&device_clone), 
+                dtype 
+            )
+        }).await
+          .map_err(|e| anyhow!("Blocking task failed: {}", e))?
+          .map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e))?;
+          
         println!("[DEBUG] Qwen3VLGenerateModel::init took {:.2?}", start.elapsed());
 
         println!("[MODEL-02] Qwen3-VL Generator initialized.");

@@ -31,7 +31,9 @@ impl Qwen3VLVisionPatchEmbed {
         let patch_size = cfg.patch_size;
         let temporal_patch_size = cfg.temporal_patch_size;
         let in_channels = cfg.in_channels;
-        let embed_dim = cfg.hidden_size;
+        // Use embed_dim if present, otherwise fallback to hidden_size
+        let embed_dim = cfg.embed_dim.unwrap_or(cfg.hidden_size);
+        
         // conv3d weight key: visual.patch_embed.proj.weight, value: Tensor[dims 1024, 3, 2, 16, 16; bf16, cuda:0]
         // (1024, 3, 2, 16, 16) -> (1024, 1536) -> (1536, 1024)
         let conv3d_weight = vb
