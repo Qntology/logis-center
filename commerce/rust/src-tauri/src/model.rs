@@ -151,15 +151,24 @@ impl LogisModel {
             }
         }
 
-        // Dynamic Context Tokens based on VRAM
-        let max_tokens_limit = if !force_cpu && detected_vram > 0 && detected_vram < 2_000_000_000 {
-             println!("[CONFIG] Low VRAM ({:.2} GB). Setting max_tokens to 1024.", detected_vram as f64/1e9);
-             1024
+        // Dynamic Context Tokens based on VRAM Budget
+        let max_tokens_limit = if !force_cpu && detected_vram > 0 {
+             let vram_mb = detected_vram as f64 / 1_000_000.0;
+             
+             // Formula: (Free VRAM - 1.5GB Baseline) * Scaling Factor
+             // 1.5GB is roughly what the model weights consume on GPU initially.
+             // We scale the context window by remaining memory.
+             let calculated = ((vram_mb - 1500.0) * 2.0) as i32;
+             
+             let limit = calculated.clamp(512, 8192) as u32;
+             
+             println!("[CONFIG] Dynamic Context: VRAM {:.0} MB -> {} Tokens (Range: 512-8192)", vram_mb, limit);
+             limit
         } else {
-             println!("[CONFIG] Setting max_tokens to 2048.");
+             println!("[CONFIG] CPU Mode or Unknown VRAM. Defaulting to 2048 tokens.");
              2048
         };
-        println!("[CONFIG] Token limit set to: {}", max_tokens_limit);
+        println!("[CONFIG] Final Token limit set to: {}", max_tokens_limit);
 
         let base_path = std::fs::canonicalize("src-tauri/models")
             .or_else(|_| std::fs::canonicalize("models"))?;
@@ -174,7 +183,7 @@ impl LogisModel {
         println!("[MODEL-01] Initializing on device: {:?}", target_device);
 
         let init_result = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init(&model_path_for_task, Some(&device_for_task), dtype)
+            Qwen3VLGenerateModel::init(&model_path_for_task, Some(&device_for_task), dtype, Some(max_tokens_limit as usize))
         }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))?;
 
         let generator = match init_result {
@@ -188,7 +197,7 @@ impl LogisModel {
                     let retry_path = model_path.clone();
                     
                     let fallback_gen = tokio::task::spawn_blocking(move || {
-                        Qwen3VLGenerateModel::init(&retry_path, Some(&retry_device), Some(DType::F32))
+                        Qwen3VLGenerateModel::init(&retry_path, Some(&retry_device), Some(DType::F32), Some(max_tokens_limit as usize))
                     }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))? 
                       .map_err(|e| anyhow!("CPU Fallback failed: {}", e))?;
                     

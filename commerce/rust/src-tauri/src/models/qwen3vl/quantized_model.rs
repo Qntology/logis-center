@@ -347,27 +347,44 @@ impl QuantizedQwen3VLTextModel {
         let mut current_device = device.clone();
         
         // --- Organic Budget-based Optimization ---
-        // Instead of a hard threshold, we simulate filling the VRAM.
-        // Qwen2-VL-2B Q4 Estimates:
-        // - Weight per layer: ~50 MB
-        // - Runtime Buffer (KV + Act) per layer: ~30 MB
-        // - Total Cost per Layer: ~80 MB
-        // - Safety Floor (LM Head + OS Overhead): 600 MB
+        // 1. Calculate actual Layer Weight Cost from GGUF metadata
+        let mut layer_weight_size = 0_u64;
+        // Determine prefix for Layer 0 to scan
+        let probe_prefix_gguf = "blk.0.";
+        let probe_prefix_std = "model.layers.0.";
+        let layer_prefix = if ct.tensor_infos.keys().any(|k| k.starts_with(probe_prefix_gguf)) { probe_prefix_gguf } else { probe_prefix_std };
+
+        for (name, info) in &ct.tensor_infos {
+            if name.starts_with(layer_prefix) {
+                let elements: usize = info.shape.iter().product();
+                // Estimate size: (elements / block_size) * type_size
+                let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
+                layer_weight_size += size as u64;
+            }
+        }
         
-        let cost_per_layer: u64 = 80_000_000; 
-        let safety_floor: u64 = 600_000_000;
+        let estimated_activation_buffer = 20_000_000; // 20MB buffer for activations
+        let cost_per_layer = if layer_weight_size > 0 { layer_weight_size + estimated_activation_buffer } else { 60_000_000 }; // Fallback to 60MB
+
+        let mut safety_floor: u64 = 300_000_000; // Default floor
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
 
-        // Get initial reading
+        // 2. Get System VRAM & Dynamic Safety Floor
         if current_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         println!("[VRAM-BUDGET] Initial Free: {:.2} GB. Target Floor: {:.2} GB. Cost/Layer: {:.2} MB", 
-                            mem.free as f64/1e9, safety_floor as f64/1e9, cost_per_layer as f64/1e6);
+                         
+                         // Dynamic Floor: 8% of Total VRAM or 300MB, whichever is larger
+                         // For 4GB card -> ~320MB. For 24GB card -> ~1.9GB.
+                         let dynamic_floor = (mem.total as f64 * 0.08) as u64;
+                         safety_floor = std::cmp::max(300_000_000, dynamic_floor);
+
+                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Target Floor: {:.2} GB. Calc Cost/Layer: {:.2} MB", 
+                            mem.total as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e9, cost_per_layer as f64/1e6);
                      }
                  }
              }
@@ -539,8 +556,29 @@ impl QuantizedQwen3VLModel {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        // Shared NVML instance for this scope
+        let nvml = Nvml::init().ok();
+
+        // 1. Vision Model - Dynamic Loading
+        let mut vision_device = device.clone();
+        if vision_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(0) {
+                     if let Ok(mem) = dev.memory_info() {
+                         // Vision Cost (~600MB) + Safety Buffer (300MB) = 900MB Required
+                         if mem.free < 900_000_000 {
+                             println!("[OFFLOAD] VRAM Free: {:.2} GB. Switching Vision Model to CPU.", mem.free as f64/1e9);
+                             vision_device = Device::Cpu;
+                         }
+                     }
+                 }
+             }
+        }
+        
+        let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
+
         // Load Vision from mmproj file
-        let vb_visual = from_gguf_content(config, ct_vision, reader_vision, device, dtype)?;
+        let vb_visual = from_gguf_content(config, ct_vision, reader_vision, &vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(config.vision_config.clone(), vb_visual.pp("visual"))?;
         
         // Load Language Model from main file

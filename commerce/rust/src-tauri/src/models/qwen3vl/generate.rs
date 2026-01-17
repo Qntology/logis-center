@@ -35,10 +35,11 @@ pub struct Qwen3VLGenerateModel {
     eos_token_id2: u32,
     generation_config: Qwen3VLGenerationConfig,
     model_name: String,
+    hard_token_limit: Option<usize>,
 }
 
 impl Qwen3VLGenerateModel {
-    pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
+    pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>, hard_token_limit: Option<usize>) -> Result<Self> {
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
         let config_path = std::path::Path::new(path).join("config.json");
@@ -109,6 +110,7 @@ impl Qwen3VLGenerateModel {
             eos_token_id2: generation_config.eos_token_id[1] as u32,
             generation_config,
             model_name: "qwen3vl".to_string(),
+            hard_token_limit,
         })
     }
 
@@ -151,7 +153,23 @@ impl Qwen3VLGenerateModel {
         let video_grid_thw_tensor = input.video_grid_thw.take();
         
         let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
-        let sample_len = mes.max_tokens.unwrap_or(1024);
+        
+        let requested_tokens = mes.max_tokens.unwrap_or(1024);
+        let mut sample_len = requested_tokens;
+        
+        if let Some(limit) = self.hard_token_limit {
+            let current_usage = seq_len;
+            if current_usage >= limit {
+                 println!("[WARN] Input length {} exceeds hard limit {}. Truncating generation.", current_usage, limit);
+                 sample_len = 16; 
+            } else {
+                 let available = limit - current_usage;
+                 if (sample_len as usize) > available {
+                      println!("[CONFIG] Clamping generation: Requested {} -> Available {} (Total Limit: {})", sample_len, available, limit);
+                      sample_len = available as u32;
+                 }
+            }
+        }
 
         // Wrap generation in a closure/block to ensure cleanup happens
         let generation_result: Result<Vec<u32>> = (|| {
