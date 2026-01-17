@@ -146,7 +146,7 @@ impl LogisModel {
         }
 
         // Fixed Context Tokens as requested
-        let max_tokens_limit = 768;
+        let max_tokens_limit = 2048;
         println!("[CONFIG] Token limit fixed to: {}", max_tokens_limit);
 
         let base_path = std::fs::canonicalize("src-tauri/models")
@@ -417,7 +417,7 @@ impl LogisModel {
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(message)],
             model: "qwen3vl".to_string(),
-            max_tokens: Some(1024), // Reduced from 2048 to save memory
+            max_tokens: Some(self.max_tokens_limit),
             temperature: Some(0.1),
             top_p: Some(0.9),
             ..Default::default()
@@ -435,6 +435,7 @@ impl LogisModel {
         base_payload: Value
     ) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
+        let max_tok = self.max_tokens_limit;
         
         // Spawn the heavy task using Tokio directly for standard behavior
         let task = tokio::task::spawn_blocking(move || {
@@ -466,7 +467,7 @@ impl LogisModel {
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(message)],
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(1024),
+                max_tokens: Some(max_tok),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
                 ..Default::default()
@@ -524,11 +525,11 @@ impl LogisModel {
         let free_mem_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         
         let (main_resize, thumb_resize) = if free_mem_gb < 4.0 {
-            log(&format!("[PROCESS-CONFIG] Low RAM ({:.2} GB) detected. Using Conservative Mode (1024px/512px).", free_mem_gb));
-            (1024, 512)
+            log(&format!("[PROCESS-CONFIG] Low RAM ({:.2} GB) detected. Using Conservative Mode (768px/384px).", free_mem_gb));
+            (768, 384)
         } else {
-            log(&format!("[PROCESS-CONFIG] RAM sufficient ({:.2} GB). Using Standard Mode (1536px/768px).", free_mem_gb));
-            (1536, 768)
+            log(&format!("[PROCESS-CONFIG] RAM sufficient ({:.2} GB). Using Standard Mode (1024px/512px).", free_mem_gb));
+            (1024, 512)
         };
         
         log(&format!("[PROCESS-02] Global Resize to {}px width...", main_resize));
