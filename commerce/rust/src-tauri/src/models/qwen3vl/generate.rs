@@ -129,16 +129,27 @@ impl Qwen3VLGenerateModel {
         let mut logit_processor =
             get_logit_processor(Some(temperature), Some(top_p), Some(top_k), seed);
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
+        // Make input mutable to take ownership of fields
+        let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
         let mut input_ids = self
             .tokenizer
             .text_encode(input.replace_text.clone(), &self.device)?;
         let mut seq_len = input_ids.dim(1)?;
         let mut seqlen_offset = 0;
-        let mut pixel_values = input.pixel_values.as_ref();
-        let image_grid_thw = input.image_grid_thw.as_ref();
-        let mut pixel_values_video = input.pixel_values_video.as_ref();
-        let video_grid_thw = input.video_grid_thw.as_ref();
+        
+        // Take ownership of large tensors
+        let mut pixel_values = input.pixel_values.take();
+        let image_grid_thw = input.image_grid_thw.take(); // Clone needed if reused? No, standard Qwen3VLModel usually expects Option<&Tensor> or Tensor.
+        // Wait, forward methods expect Option<&Tensor>. We need to own the Tensor and pass reference.
+        // But to drop it, we must own it in a mutable Option.
+        
+        // We'll keep image_grid_thw as Option<Tensor> to pass reference, but pixel_values is the big one.
+        // Let's redefine image_grid_thw variable.
+        let image_grid_thw_tensor = image_grid_thw; // Move ownership
+        
+        let mut pixel_values_video = input.pixel_values_video.take();
+        let video_grid_thw_tensor = input.video_grid_thw.take();
+        
         let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
         let sample_len = mes.max_tokens.unwrap_or(1024);
 
@@ -149,19 +160,19 @@ impl Qwen3VLGenerateModel {
                 let logits = match &mut self.qwen3_vl {
                     ModelVariant::Standard(m) => m.forward(
                         &input_ids,
-                        pixel_values,
-                        image_grid_thw,
-                        pixel_values_video,
-                        video_grid_thw,
+                        pixel_values.as_ref(),
+                        image_grid_thw_tensor.as_ref(),
+                        pixel_values_video.as_ref(),
+                        video_grid_thw_tensor.as_ref(),
                         Some(&cache_position),
                         seqlen_offset,
                     )?,
                     ModelVariant::Quantized(m) => m.forward(
                         &input_ids,
-                        pixel_values,
-                        image_grid_thw,
-                        pixel_values_video,
-                        video_grid_thw,
+                        pixel_values.as_ref(),
+                        image_grid_thw_tensor.as_ref(),
+                        pixel_values_video.as_ref(),
+                        video_grid_thw_tensor.as_ref(),
                         Some(&cache_position),
                         seqlen_offset,
                     )?,
@@ -176,8 +187,13 @@ impl Qwen3VLGenerateModel {
                 seq_len = 1;
                 input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
                 cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
-                pixel_values = None;
-                pixel_values_video = None;
+                
+                // CRITICAL: Drop pixel_values immediately after first iteration (prefill)
+                // This frees the massive vision tensor from GPU memory.
+                if pixel_values.is_some() {
+                    pixel_values = None;
+                    pixel_values_video = None;
+                }
             }
             Ok(generate)
         })();

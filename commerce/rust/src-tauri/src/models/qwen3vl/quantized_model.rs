@@ -136,15 +136,16 @@ impl QuantizedQwen3VLTextAttention {
             .transpose(1, 2)?;
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
-                (key_states, value_states)
+                let k = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let v = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (k, v)
             }
         };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,
@@ -153,6 +154,11 @@ impl QuantizedQwen3VLTextAttention {
             attention_mask,
             self.scaling,
         )?;
+
+        // Update KV cache without cloning if possible. 
+        // Since key_states and value_states are owned here, we can just move them.
+        self.kv_cache = Some((key_states, value_states));
+
         let attn_output =
             attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
