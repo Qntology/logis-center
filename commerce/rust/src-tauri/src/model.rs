@@ -1,6 +1,6 @@
 use anyhow::anyhow;
-use aha::models::qwen3vl::generate::Qwen3VLGenerateModel;
-use aha::openai_types::{
+use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
+use crate::openai_types::{
     ChatCompletionParameters,
     ChatCompletionRequestMessage,
     ChatCompletionRequestUserMessage,
@@ -11,7 +11,7 @@ use aha::openai_types::{
     ChatCompletionRequestMessageContentPartImage,
     ImageURL,
 };
-use aha::utils::get_device;
+use crate::utils::get_device;
 use candle_core::{Device, DType};
 use image::{DynamicImage, GenericImageView};
 use serde_json::{Value, json, Map};

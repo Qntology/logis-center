@@ -19,7 +19,6 @@ tauri = { version = "2.9.5", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-aha = { path = "aha_local", features = ["cuda"] }
 # mistralrs = { path = "mistralrs/mistralrs", default-features = false, features = ["cuda"] }
 image = { version = "0.25", features = ["jpeg", "png"] }
 base64 = "0.22"
@@ -36,6 +35,14 @@ tauri-plugin-shell = "2"
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
 sysinfo = "0.30"
 candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+tokenizers = "0.22.1"
+num = "0.4.3"
+minijinja = "2.12.0"
+rayon = "1.10"
+dirs = "6.0.0"
+url = "2.5.7"
 fantoccini = "0.19"
 chromiumoxide = { version = "0.8.0", features = ["tokio-runtime"] }
 which = "6.0"
@@ -47,7 +54,7 @@ arrow-schema = "56.2.0"
 ego-tree = "0.10"
 
 [features]
-cuda = ["aha/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 
 [profile.dev]

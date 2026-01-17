@@ -5,6 +5,13 @@ mod parsing;
 mod logic;
 mod scheduler;
 
+pub mod models;
+pub mod utils;
+pub mod openai_types;
+pub mod position_embed;
+pub mod chat_template;
+pub mod tokenizer;
+
 use tauri::{State, Manager, Listener}; // Added Manager
 use tokio::sync::Mutex;
 use model::LogisModel;

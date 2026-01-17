@@ -20,29 +20,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aha"
-version = "0.1.6"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "candle-core",
- "candle-nn",
- "candle-transformers",
- "chrono",
- "dirs",
- "image",
- "minijinja",
- "num",
- "rayon",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8596,20 +8573,25 @@ dependencies = [
 name = "rust"
 version = "0.1.0"
 dependencies = [
- "aha",
  "anyhow",
  "arrow-array",
  "arrow-schema",
  "base64 0.22.1",
  "candle-core",
+ "candle-nn",
+ "candle-transformers",
  "chromiumoxide",
  "chrono",
+ "dirs",
  "ego-tree",
  "fantoccini",
  "futures",
  "image",
  "lancedb",
+ "minijinja",
+ "num",
  "once_cell",
+ "rayon",
  "regex",
  "reqwest",
  "scraper",
@@ -8622,7 +8604,9 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-opener",
  "tauri-plugin-shell",
+ "tokenizers",
  "tokio",
+ "url",
  "uuid",
  "which 6.0.3",
 ]
