@@ -59,7 +59,7 @@ cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 
 
 [profile.dev]
-opt-level = 2      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
+opt-level = 0      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
 incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
 
 [profile.release]

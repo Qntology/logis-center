@@ -43,6 +43,7 @@ pub struct LogisModel {
 
 impl LogisModel {
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
+        println!("[DEBUG] LogisModel::new called. Preference: {:?}", device_preference);
         println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
 
         // 0. Check System Memory (Real-time)
@@ -54,6 +55,7 @@ impl LogisModel {
         
         // Check for CUDA availability
         let has_gpu = candle_core::utils::cuda_is_available();
+        println!("[DEBUG] CUDA Check: has_gpu={}", has_gpu);
 
         // [Smart Memory Strategy]
         // 1. If GPU is available, ALWAYS prefer it. GPU uses VRAM, saving System RAM.
@@ -129,11 +131,14 @@ impl LogisModel {
             Some(DType::BF16)
         };
 
+        println!("[DEBUG] Calling Qwen3VLGenerateModel::init...");
+        let start = std::time::Instant::now();
         let generator = Qwen3VLGenerateModel::init(
             model_dir.to_str().unwrap(),
             Some(&device), 
             dtype 
         ).map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e))?;
+        println!("[DEBUG] Qwen3VLGenerateModel::init took {:.2?}", start.elapsed());
 
         println!("[MODEL-02] Qwen3-VL Generator initialized.");
 
@@ -456,6 +461,7 @@ impl LogisModel {
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle) -> anyhow::Result<Value> {
+        println!("[DEBUG] process_image_full called with path: {}", image_path);
         let log_file = "debug_log.txt";
         let log = |msg: &str| {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {

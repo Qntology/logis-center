@@ -216,17 +216,25 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                 Err(_) => break, 
             };
 
-            let mut match_found = false;
+            let mut active_tab_found = false;
 
-            // Iterate backwards to find the most recently created/active page
-            for page in pages.iter().rev() {
-                if let Ok(Some(current_url)) = page.url().await {
-                    let is_client = is_shop(&current_url, CLIENT_PATTERNS);
-                    let is_admin = is_shop(&current_url, ADMIN_PATTERNS);
-                    
-                    if is_client || is_admin {
-                        // Only emit if the URL or active status changed
+            for page in pages.iter() {
+                // Check if this tab is the active one (visible)
+                let is_visible = match page.evaluate("document.visibilityState").await {
+                    Ok(res) => {
+                        res.into_value::<String>().unwrap_or_default() == "visible"
+                    },
+                    Err(_) => false,
+                };
+
+                if is_visible {
+                    active_tab_found = true;
+                    if let Ok(Some(current_url)) = page.url().await {
+                        // Only emit if the URL implies a change in state or it's a new URL
                         if current_url != last_detected_url {
+                            let is_client = is_shop(&current_url, CLIENT_PATTERNS);
+                            let is_admin = is_shop(&current_url, ADMIN_PATTERNS);
+                            
                             let _ = monitor_handle.emit("browser-match-found", json!({
                                 "url": current_url.clone(),
                                 "is_client": is_client,
@@ -234,18 +242,17 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                             }));
                             last_detected_url = current_url;
                         }
-                        match_found = true;
-                        break; // Found the active matching tab
                     }
+                    // Found the active tab, no need to check others
+                    break;
                 }
             }
 
-            if !match_found && !last_detected_url.is_empty() {
-                let _ = monitor_handle.emit("browser-match-found", json!({ "found": false }));
-                last_detected_url = String::new();
-            }
+            // Optional: If no tab is visible (e.g. browser minimized or separate issue), 
+            // we might want to retain the last state or do nothing. 
+            // Currently, we just wait for the next poll.
 
-            tokio::time::sleep(Duration::from_millis(500)).await; // Faster polling (0.5s)
+            tokio::time::sleep(Duration::from_millis(500)).await; 
         }
     });
 
