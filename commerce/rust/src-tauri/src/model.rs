@@ -19,8 +19,10 @@ use std::sync::{Arc, Mutex};
 use regex::Regex;
 use tauri::Emitter;
 use std::io::Cursor;
-use base64::prelude::*;
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use sysinfo::System;
+use nvml_wrapper::Nvml;
 
 pub struct Spinner {
     pub frames: Vec<&'static str>,
@@ -42,119 +44,154 @@ pub struct LogisModel {
 }
 
 impl LogisModel {
-    pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[DEBUG] LogisModel::new called. Preference: {:?}", device_preference);
-        println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
+    fn check_memory_status(is_cuda: bool, is_metal: bool) -> (bool, String) {
+        // 1. CUDA VRAM Check
+        if is_cuda {
+            let nvml = match Nvml::init() {
+                Ok(n) => n,
+                Err(e) => return (false, format!("NVML Init Failed: {}", e)),
+            };
+            let device = match nvml.device_by_index(0) {
+                Ok(d) => d,
+                Err(e) => return (false, format!("GPU Not Found: {}", e)),
+            };
+            let memory = match device.memory_info() {
+                Ok(m) => m,
+                Err(e) => return (false, format!("VRAM Check Failed: {}", e)),
+            };
 
-        // 0. Check System Memory (Real-time)
+            let total_vram = memory.total;
+            let free_vram = memory.free;
+            let buffer_size = (total_vram as f64 * 0.10) as u64; 
+            let usable_vram = if free_vram > buffer_size { free_vram - buffer_size } else { 0 };
+            let required_vram = 3_000_000_000; // ~3GB
+
+            println!("[VRAM-CHECK] CUDA | Total: {{:.2}} GB, Free: {{:.2}} GB, Usable: {{:.2}} GB", 
+                total_vram as f64/1e9, free_vram as f64/1e9, usable_vram as f64/1e9);
+
+            if usable_vram >= required_vram {
+                return (true, "Sufficient CUDA VRAM".to_string());
+            } else {
+                return (false, format!("Insufficient CUDA VRAM (Usable: {{:.2}} GB < Required: {{:.2}} GB)", usable_vram as f64/1e9, required_vram as f64/1e9));
+            }
+        }
+
+        // 2. Metal / CPU System RAM Check
         let mut sys = System::new_all();
-        sys.refresh_memory(); 
+        sys.refresh_memory();
         
         let total_mem = sys.total_memory();
-        let free_mem = sys.available_memory(); // Available includes cache/buffers that can be reclaimed
+        let free_mem = sys.available_memory();
+        let buffer_size = (total_mem as f64 * 0.10) as u64;
+        let usable_mem = if free_mem > buffer_size { free_mem - buffer_size } else { 0 };
         
-        // Check for CUDA availability
-        let has_gpu = candle_core::utils::cuda_is_available();
-        println!("[DEBUG] CUDA Check: has_gpu={}", has_gpu);
+        let required_mem = 3_000_000_000; 
 
-        // [Smart Memory Strategy]
-        // 1. If GPU is available, ALWAYS prefer it. GPU uses VRAM, saving System RAM.
-        // 2. Only fallback to CPU if GPU is missing.
-        // 3. System RAM 10% buffer rule is a "Warning Line", not a "Stop Sign".
-        
-        let safe_available_ram = (free_mem as f64 * 0.9) as u64; // Target: Keep 10% free
-        let req_ram_estimate = if has_gpu {
-            512 * 1024 * 1024 // GPU needs very little System RAM (just overhead)
+        let mode = if is_metal { "Metal (Unified)" } else { "System RAM" };
+        println!("[MEM-CHECK] {} | Total: {{:.2}} GB, Available: {{:.2}} GB, Usable: {{:.2}} GB", 
+            mode, total_mem as f64/1e9, free_mem as f64/1e9, usable_mem as f64/1e9);
+
+        if usable_mem >= required_mem {
+            (true, format!("Sufficient {}", mode))
         } else {
-            3 * 1024 * 1024 * 1024 // CPU needs full model in System RAM (~3GB)
-        };
-
-        println!("[SYS-INIT] Memory Check:");
-        println!("  - Available RAM: {:.2} GB", free_mem as f64 / 1024.0 / 1024.0 / 1024.0);
-        println!("  - 10% Buffer Threshold: RAM should stay above {:.2} GB used.", (total_mem as f64 * 0.1) / 1024.0 / 1024.0 / 1024.0);
-
-        if safe_available_ram < req_ram_estimate {
-            println!("⚠️ [SMART-MANAGE] System RAM is tight (Available < Required + 10% Buffer).");
-            if has_gpu {
-                println!("✅ [SMART-MANAGE] GPU Detected. Proceeding with GPU (Optimal choice for Low RAM).");
-                // Do NOT switch to CPU. GPU is the lifesaver here.
-            } else {
-                println!("⚠️ [SMART-MANAGE] GPU Missing. CPU mode might hit Swap/Paging. Proceeding cautiously.");
-            }
-        } else {
-            println!("✅ [SMART-MANAGE] Sufficient RAM available.");
+            (false, format!("Insufficient {} (Usable: {{:.2}} GB < Required: {{:.2}} GB)", mode, usable_mem as f64/1e9, required_mem as f64/1e9))
         }
+    }
+
+    pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
+        println!("[DEBUG] LogisModel::new called. Preference: {{:?}}", device_preference);
+        println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
+
+        // Detect Capabilities
+        let has_cuda = candle_core::utils::cuda_is_available();
+        let has_metal = candle_core::utils::metal_is_available();
         
-        // Final Device Assignment Logic
-        let final_device_preference;
-        // We never force CPU unless the USER explicitly asked for it.
+        println!("[DEBUG] Device Capability: CUDA={{}}, Metal={{}}", has_cuda, has_metal);
+
+        // Select Device Logic
+        let mut target_device = Device::Cpu;
+        let mut force_cpu = false;
+
         if device_preference == Some("cpu") {
-            final_device_preference = Some("cpu");
+            println!("[CONFIG] User forced CPU.");
+            force_cpu = true;
         } else {
-            // Default: Auto-detect (will pick CUDA if available)
-            final_device_preference = device_preference; 
+            // Priority: CUDA > Metal > CPU
+            if has_cuda {
+                let (ok, msg) = Self::check_memory_status(true, false);
+                if ok {
+                    println!("✅ [DEVICE] Selecting CUDA: {}", msg);
+                    target_device = get_device(None); // Should return CUDA if avail
+                } else {
+                    println!("⚠️ [DEVICE] CUDA available but skipped: {}", msg);
+                    // Fallback to CPU
+                    force_cpu = true; 
+                }
+            } else if has_metal {
+                let (ok, msg) = Self::check_memory_status(false, true);
+                if ok {
+                    println!("✅ [DEVICE] Selecting Metal: {}", msg);
+                    target_device = Device::new_metal(0).unwrap_or(Device::Cpu);
+                } else {
+                    println!("⚠️ [DEVICE] Metal available but skipped: {}", msg);
+                    force_cpu = true;
+                }
+            } else {
+                println!("[DEVICE] No GPU detected. Using CPU.");
+                force_cpu = true;
+            }
+        }
+
+        if force_cpu {
+            target_device = Device::Cpu;
+            // Optional: Check CPU RAM again? 
+            let (ok, msg) = Self::check_memory_status(false, false);
+            if !ok {
+                println!("⚠️ [WARNING] System RAM is also tight for CPU mode: {}", msg);
+            }
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models")
             .or_else(|_| std::fs::canonicalize("models"))?;
-
-        // Prioritize GGUF directory
         let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
-        
-        let model_dir = if gguf_dir.exists() {
-            println!("[MODEL-01] Found GGUF directory: {}", gguf_dir.display());
-            gguf_dir
-        } else {
-            println!("[MODEL-01] GGUF directory not found at {}, using base path...", gguf_dir.display());
-            base_path
-        };
-
-        println!("[MODEL-01] Loading Qwen3-VL from: {}", model_dir.display());
-
-        let device = if let Some("cpu") = final_device_preference {
-            println!("[MODEL-01] Using CPU Device (Forced or Requested).");
-            Device::Cpu
-        } else {
-            let d = get_device(None);
-            if d.is_cpu() && has_gpu {
-                 println!("[MODEL-01] Warning: candle failed to pick GPU despite CUDA being available. Forcing CPU.");
-            }
-            d
-        };
-
-        // CPU usually requires F32 for reliable matmul support in candle
-        let dtype = if device.is_cpu() {
-            println!("[MODEL-CONFIG] CPU detected -> Using F32 precision.");
-            Some(DType::F32)
-        } else {
-            println!("[MODEL-CONFIG] GPU detected -> Using BF16 precision.");
-            Some(DType::BF16)
-        };
-
-        println!("[DEBUG] Calling Qwen3VLGenerateModel::init...");
-        let start = std::time::Instant::now();
-        
-        // Clone/Copy variables for the blocking task
+        let model_dir = if gguf_dir.exists() { gguf_dir } else { base_path };
         let model_path = model_dir.to_str().unwrap().to_string();
-        let device_clone = device.clone(); 
-        
-        let generator = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init(
-                &model_path,
-                Some(&device_clone), 
-                dtype 
-            )
-        }).await
-          .map_err(|e| anyhow!("Blocking task failed: {}", e))?
-          .map_err(|e| anyhow!("Failed to init Qwen3VL: {}", e))?;
-          
-        println!("[DEBUG] Qwen3VLGenerateModel::init took {:.2?}", start.elapsed());
 
-        println!("[MODEL-02] Qwen3-VL Generator initialized.");
+        let mut dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+        let device_for_task = target_device.clone();
+        let model_path_for_task = model_path.clone();
+
+        println!("[MODEL-01] Initializing on device: {{:?}}", target_device);
+
+        let init_result = tokio::task::spawn_blocking(move || {
+            Qwen3VLGenerateModel::init(&model_path_for_task, Some(&device_for_task), dtype)
+        }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))?;
+
+        let generator = match init_result {
+            Ok(gen) => gen,
+            Err(e) => {
+                let err_str = e.to_string();
+                // If failed on GPU/Metal, try fallback to CPU
+                if !target_device.is_cpu() {
+                    println!("⚠️ [FALLBACK] Init failed on {{:?}}: {{}}. Retrying on CPU...", target_device, err_str);
+                    let retry_device = Device::Cpu;
+                    let retry_path = model_path.clone();
+                    
+                    tokio::task::spawn_blocking(move || {
+                        Qwen3VLGenerateModel::init(&retry_path, Some(&retry_device), Some(DType::F32))
+                    }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))?.
+                      map_err(|e| anyhow!("CPU Fallback failed: {}", e))?;
+                } else {
+                    return Err(anyhow!("Failed to init Qwen3VL: {}", e));
+                }
+            }
+        };
+
+        println!("[MODEL-02] Qwen3-VL Generator initialized successfully.");
 
         Ok(Self {
             generator: Arc::new(Mutex::new(generator)),
-            is_cpu_mode: device.is_cpu(),
+            is_cpu_mode: target_device.is_cpu(),
         })
     }
 
@@ -163,13 +200,11 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str) -> anyhow::Result<String> {
-        // Offload the heavy inference to a blocking task to avoid blocking the async runtime
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
         let user_text = user_input.to_string();
         
         println!("[MODEL-CHAT] Sending Chat Request...");
-        println!("[MODEL-CHAT] System: {:.50}...", system_text.replace("\n", " "));
         
         tokio::task::spawn_blocking(move || {
             let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
@@ -200,7 +235,7 @@ impl LogisModel {
             };
             
             let response = gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?;
-            println!("[MODEL-CHAT] Raw Response: {}", response);
+            println!("[MODEL-CHAT] Raw Response: {{}}", response);
             Ok(response)
         }).await?
     }
@@ -386,7 +421,9 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+        // Fix: Wrap in Ok(...) because generate returns Result<String>, and map_err returns Result<String>.
+        // run_inference_text returns anyhow::Result<String>.
+        Ok(gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?)
     }
 
     pub async fn run_inference_with_spinner(
@@ -476,12 +513,12 @@ impl LogisModel {
         let log = |msg: &str| {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {
                 use std::io::Write;
-                let _ = writeln!(f, "{}", msg);
+                let _ = writeln!(f, "{{}}", msg);
             }
-            println!("{}", msg);
+            println!("{{}}", msg);
         };
 
-        log(&format!("[PROCESS-01] Opening image: {}", image_path));
+        log(&format!("[PROCESS-01] Opening image: {{}}", image_path));
         let full_img_raw = image::open(&image_path)?;
         let full_img_raw = DynamicImage::ImageRgb8(full_img_raw.to_rgb8());
         
@@ -491,18 +528,18 @@ impl LogisModel {
         let free_mem_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         
         let (main_resize, thumb_resize) = if free_mem_gb < 4.0 {
-            log(&format!("[PROCESS-CONFIG] Low RAM ({:.2} GB) detected. Using Conservative Mode (1024px/512px).", free_mem_gb));
+            log(&format!("[PROCESS-CONFIG] Low RAM ({{:.2}} GB) detected. Using Conservative Mode (1024px/512px).", free_mem_gb));
             (1024, 512)
         } else {
-            log(&format!("[PROCESS-CONFIG] RAM sufficient ({:.2} GB). Using Standard Mode (1536px/768px).", free_mem_gb));
+            log(&format!("[PROCESS-CONFIG] RAM sufficient ({{:.2}} GB). Using Standard Mode (1536px/768px).", free_mem_gb));
             (1536, 768)
         };
         
-        log(&format!("[PROCESS-02] Global Resize to {}px width...", main_resize));
+        log(&format!("[PROCESS-02] Global Resize to {{}}px width...", main_resize));
         let master_img = full_img_raw.resize(main_resize, u32::MAX, image::imageops::FilterType::Triangle);
         let (w, h) = master_img.dimensions();
 
-        log(&format!("[PROCESS-03] Creating Classification Thumbnail ({:?}px)...", thumb_resize));
+        log(&format!("[PROCESS-03] Creating Classification Thumbnail ({{:?}}px)...", thumb_resize));
         let class_img = master_img.resize(thumb_resize, u32::MAX, image::imageops::FilterType::Triangle);
 
         log("[PROCESS-04] Running Classification...");
@@ -524,7 +561,7 @@ impl LogisModel {
                 json!({ "summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing" })
             ).await?;
 
-            log(&format!("[DEBUG] Raw Classification Response: {}", res));
+            log(&format!("[DEBUG] Raw Classification Response: {{}}", res));
             let dtype = extract_json_field(&res, "doc_type").unwrap_or("Unknown".to_string());
             
             // Emit success for classification
@@ -533,7 +570,7 @@ impl LogisModel {
             dtype
         };
         
-        log(&format!("[DEBUG] Detected Type: {}", detected_type));
+        log(&format!("[DEBUG] Detected Type: {{}}", detected_type));
 
         let mut root = Map::new();
         root.insert("header".to_string(), json!({ "doc_type": &detected_type }));
@@ -548,7 +585,7 @@ impl LogisModel {
         let missions = get_slice_config(&detected_type);
         
         for (i, mission) in missions.iter().enumerate() {
-            log(&format!("\n[SEQ-MISSION {}] Category: {}", i + 1, mission.cat));
+            log(&format!("\n[SEQ-MISSION {{}}] Category: {{}}", i + 1, mission.cat));
             
             let res_text = {
                 let (top_pct, bot_pct) = mission.box_range;
@@ -559,20 +596,21 @@ impl LogisModel {
                 let processed_img = master_img.crop_imm(0, start_y, w, crop_h);
                 
                 let schema = get_category_schema(mission.cat, &detected_type);
-                let prompt = format!("MISSION: Extract fields for category '{}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{{\n{}\n}}", mission.cat.to_uppercase(), schema);
+                let prompt = format!("MISSION: Extract fields for category '{{}}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{{\n{{}}
+}}", mission.cat.to_uppercase(), schema);
                 
-                let task_desc = format!("[{}] {} ({}%~{}%)", detected_type, mission.cat.to_uppercase(), (top_pct*100.0) as i32, (bot_pct*100.0) as i32);
+                let task_desc = format!("[{{}}] {{}} ({{}}%~{{}}%)", detected_type, mission.cat.to_uppercase(), (top_pct*100.0) as i32, (bot_pct*100.0) as i32);
                 
                 self.run_inference_with_spinner(
                     prompt, 
                     Some(processed_img), 
                     app_handle, 
                     "extraction-progress", 
-                    json!({ "summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat })
-                ).await?
+                    json!({ "summary": format!("Analyzing: {{}}", task_desc), "raw": format!("Analyzing {{}}...", task_desc), "category": mission.cat })
+                ).await?;
             };
 
-            log(&format!("[DEBUG] Raw Extraction ({}): {}", mission.cat, res_text));
+            log(&format!("[DEBUG] Raw Extraction ({{}}): {{}}", mission.cat, res_text));
 
             if let Some(json_val) = extract_json_from_text(&res_text) {
                 merge_json_manual(&mut root, mission.cat, json_val.clone());
@@ -592,7 +630,10 @@ impl LogisModel {
 
     pub async fn split_query_contexts(&self, query: String) -> anyhow::Result<Vec<Value>> {
         let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}}]";
-        let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
+        let prompt = format!("{{}}
+
+Query: {{}}
+JSON Output:", system_prompt, query);
         
         let res = self.run_inference_text(prompt, None)?;
         if let Some(json_val) = extract_json_from_text(&res) {
@@ -655,9 +696,12 @@ JSON Output:"###, schema_def, doc_type, query);
 1. SEARCH: Finding specific documents by filters (e.g., 'Find Samsung invoices').
 2. RESEARCH: Complex questions requiring cross-referencing or deep analysis (e.g., 'What is the trend of our shipping delays?').
 
-Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
+Output JSON: {{"intent": "SEARCH|RESEARCH"}}"###;
 
-        let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
+        let prompt = format!("{{}}
+
+Query: {{}}
+JSON Output:", system_prompt, query);
         let res = self.run_inference_text(prompt, None)?;
         
         let intent = extract_json_from_text(&res)
@@ -685,23 +729,31 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
 
         for (i, step) in steps.iter().enumerate() {
             let frame = spinner.frames[i % spinner.frames.len()];
-            status_history.push_str(&format!("**{} {}**\n", frame, step));
+            status_history.push_str(&format!("**{{}} {{}}**\n", frame, step));
             let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": frame }));
 
-            let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
+            let prompt = format!("Given this context: {{}}
+
+Task: {{}}
+Query: {{}}
+
+Provide deep insight for this specific step.", context_data, step, query);
             
             // In a real implementation, we might want to stream this too, but for now we wait for the step result
             let step_result = self.run_inference_text(prompt, None)?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
-            status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
+            status_history.push_str(&format!("> {{}}...\n\n", short_res.replace("\n", " ")));
             let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));
         }
 
         // 3. Final Report
         status_history.push_str("### 📊 Final Research Report\n\n");
-        let final_prompt = format!("CONTEXT: {}\nQUERY: {}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
-        
+        let final_prompt = format!("CONTEXT: {{}}
+QUERY: {{}}
+
+Based on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
+
         let report = self.run_inference_text(final_prompt, None)?;
         status_history.push_str(&report);
         
@@ -1197,13 +1249,12 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
         _ => {}
     }
 
-    if schema_fields.is_empty() { return "{}".to_string(); }
-    
+    if schema_fields.is_empty() { return "{}".to_string(); }    
     let is_list = category == "items" || category == "containers";
     let cat_key = if category == "items" { "line_items" } else { category };
     let mut lines = Vec::new();
-    if is_list { lines.push(format!("  \"{}\": [{{", cat_key)); } 
-    else { lines.push(format!("  \"{}\": {{ ", cat_key)); }
+    if is_list { lines.push(format!("  \"{{}}\": [{{ ", cat_key)); } 
+    else { lines.push(format!("  \"{{}}\": {{ ", cat_key)); }
     
     for (i, (key, desc, dtype, mode)) in schema_fields.iter().enumerate() {
         let default_val = match dtype.as_str() {
@@ -1212,7 +1263,7 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
             _ => "\"\""
         };
         let comma = if i < schema_fields.len() - 1 { "," } else { "" };
-        lines.push(format!("    \"{}\": {} // {}: {} {} ({})\n.", key, default_val, comma, mode, desc, dtype));
+        lines.push(format!("    \"{{}}\": {{}} // {{}} ({{}}) ({})\n.", key, default_val, comma, mode, desc, dtype));
     }
     
     if is_list { lines.push("  }]".to_string()); } 
@@ -1221,7 +1272,7 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
 }
 
 fn extract_json_from_text(text: &str) -> Option<Value> {
-    let re = Regex::new(r"(?s)(\[.*\]|\{.*\})").ok()?;
+    let re = Regex::new(r"(?s)(\[.*\]|\{{.*\}})").ok()?;
     let caps = re.captures(text)?;
     let raw = caps.get(1)?.as_str();
     let clean = raw.replace("```json", "").replace("```", "").trim().to_string();

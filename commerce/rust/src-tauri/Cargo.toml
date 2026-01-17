@@ -52,10 +52,12 @@ lancedb = { version = "0.23.1", default-features = false }
 arrow-array = "56.2.0"
 arrow-schema = "56.2.0"
 ego-tree = "0.10"
+nvml-wrapper = "0.9.0"
 
 [features]
 default = ["cuda"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 
 
 [profile.dev]

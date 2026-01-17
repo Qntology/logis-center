@@ -140,47 +140,56 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values_video = input.pixel_values_video.as_ref();
         let video_grid_thw = input.video_grid_thw.as_ref();
         let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
-        let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
-        for _ in 0..sample_len {
-            let logits = match &mut self.qwen3_vl {
-                ModelVariant::Standard(m) => m.forward(
-                    &input_ids,
-                    pixel_values,
-                    image_grid_thw,
-                    pixel_values_video,
-                    video_grid_thw,
-                    Some(&cache_position),
-                    seqlen_offset,
-                )?,
-                ModelVariant::Quantized(m) => m.forward(
-                    &input_ids,
-                    pixel_values,
-                    image_grid_thw,
-                    pixel_values_video,
-                    video_grid_thw,
-                    Some(&cache_position),
-                    seqlen_offset,
-                )?,
-            };
-            let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-            let next_token = logit_processor.sample(&logits)?;
-            generate.push(next_token);
-            if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
-                break;
+
+        // Wrap generation in a closure/block to ensure cleanup happens
+        let generation_result: Result<Vec<u32>> = (|| {
+            let mut generate = Vec::new();
+            for _ in 0..sample_len {
+                let logits = match &mut self.qwen3_vl {
+                    ModelVariant::Standard(m) => m.forward(
+                        &input_ids,
+                        pixel_values,
+                        image_grid_thw,
+                        pixel_values_video,
+                        video_grid_thw,
+                        Some(&cache_position),
+                        seqlen_offset,
+                    )?,
+                    ModelVariant::Quantized(m) => m.forward(
+                        &input_ids,
+                        pixel_values,
+                        image_grid_thw,
+                        pixel_values_video,
+                        video_grid_thw,
+                        Some(&cache_position),
+                        seqlen_offset,
+                    )?,
+                };
+                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                let next_token = logit_processor.sample(&logits)?;
+                generate.push(next_token);
+                if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                    break;
+                }
+                seqlen_offset += seq_len;
+                seq_len = 1;
+                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+                cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
+                pixel_values = None;
+                pixel_values_video = None;
             }
-            seqlen_offset += seq_len;
-            seq_len = 1;
-            input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
-            cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
-            pixel_values = None;
-            pixel_values_video = None;
-        }
-        let res = self.tokenizer.token_decode(generate)?;
+            Ok(generate)
+        })();
+
+        // Always clear cache to prevent VRAM leaks
         match &mut self.qwen3_vl {
             ModelVariant::Standard(m) => m.clear_kv_cache(),
             ModelVariant::Quantized(m) => m.clear_kv_cache(),
         }
+
+        let generate = generation_result?;
+        let res = self.tokenizer.token_decode(generate)?;
         Ok(res)
     }
 }
