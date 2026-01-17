@@ -645,7 +645,7 @@ impl LogisModel {
             return Ok(vec![json_val]);
         }
         
-        Ok(vec![json!({ {"query": query, "$header": { "$$document_type": "ALL" } })])
+        Ok(vec![json!({ "query": query, "$header": { "$$document_type": "ALL" } })])
     }
 
     pub async fn parse_query_to_filters(&self, query: String, doc_type: Option<String>) -> anyhow::Result<Value> {
