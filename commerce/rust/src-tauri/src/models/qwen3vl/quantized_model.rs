@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, Module, RmsNorm, VarBuilder};
+use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use nvml_wrapper::Nvml;
 
@@ -18,6 +18,34 @@ use crate::{
         prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
     },
 };
+
+// Local RmsNorm implementation exposing weight and device
+#[derive(Clone, Debug)]
+pub struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    pub fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+    
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let hidden_states = hidden_states.to_dtype(dtype)?;
+        hidden_states.broadcast_mul(&self.weight)
+    }
+}
 
 // Wrapper for QMatMul to act like Linear
 pub struct QLinear {
