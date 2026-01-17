@@ -121,10 +121,9 @@ impl LogisModel {
                 let (ok, msg) = Self::check_memory_status(true, false);
                 if ok {
                     println!("✅ [DEVICE] Selecting CUDA: {}", msg);
-                    target_device = get_device(None); // Should return CUDA if avail
+                    target_device = get_device(None); 
                 } else {
                     println!("⚠️ [DEVICE] CUDA available but skipped: {}", msg);
-                    // Fallback to CPU
                     force_cpu = true; 
                 }
             } else if has_metal {
@@ -144,7 +143,6 @@ impl LogisModel {
 
         if force_cpu {
             target_device = Device::Cpu;
-            // Optional: Check CPU RAM again? 
             let (ok, msg) = Self::check_memory_status(false, false);
             if !ok {
                 println!("⚠️ [WARNING] System RAM is also tight for CPU mode: {}", msg);
@@ -177,10 +175,12 @@ impl LogisModel {
                     let retry_device = Device::Cpu;
                     let retry_path = model_path.clone();
                     
-                    tokio::task::spawn_blocking(move || {
+                    let fallback_gen = tokio::task::spawn_blocking(move || {
                         Qwen3VLGenerateModel::init(&retry_path, Some(&retry_device), Some(DType::F32))
-                    }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))?.
-                      map_err(|e| anyhow!("CPU Fallback failed: {}", e))?;
+                    }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))? 
+                      .map_err(|e| anyhow!("CPU Fallback failed: {}", e))?;
+                    
+                    fallback_gen
                 } else {
                     return Err(anyhow!("Failed to init Qwen3VL: {}", e));
                 }
@@ -421,8 +421,6 @@ impl LogisModel {
             ..Default::default()
         };
         
-        // Fix: Wrap in Ok(...) because generate returns Result<String>, and map_err returns Result<String>.
-        // run_inference_text returns anyhow::Result<String>.
         Ok(gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?)
     }
 
@@ -486,9 +484,6 @@ impl LogisModel {
             tokio::select! {
                 res = &mut task => {
                     // Task finished
-                    // res is Result<Result<String, Error>, JoinError>
-                    // Outer ? handles JoinError
-                    // Inner logic returns Result<String, Error>
                     return res.map_err(|e| anyhow!("Task join error: {}", e))?;
                 }
                 _ = interval.tick() => {
@@ -500,7 +495,6 @@ impl LogisModel {
                     if let Some(obj) = payload.as_object_mut() {
                         obj.insert("spinner".to_string(), json!(frame));
                     }
-                    // Emit spinner event (best effort)
                     let _ = app_handle.emit(event_name, payload);
                 }
             }
@@ -558,14 +552,14 @@ impl LogisModel {
                 Some(class_img), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing" })
+                json!({ {"summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing"} })
             ).await?;
 
             log(&format!("[DEBUG] Raw Classification Response: {{}}", res));
             let dtype = extract_json_field(&res, "doc_type").unwrap_or("Unknown".to_string());
             
             // Emit success for classification
-            let _ = app_handle.emit("extraction-progress", json!({ "category": "Processing", "data": { "doc_type": dtype }, "spinner": "✅" }));
+            let _ = app_handle.emit("extraction-progress", json!({ {"category": "Processing", "data": { "doc_type": dtype }, "spinner": "✅"} }));
             
             dtype
         };
@@ -573,7 +567,7 @@ impl LogisModel {
         log(&format!("[DEBUG] Detected Type: {{}}", detected_type));
 
         let mut root = Map::new();
-        root.insert("header".to_string(), json!({ "doc_type": &detected_type }));
+        root.insert("header".to_string(), json!({ {"doc_type": &detected_type} }));
         root.insert("parties".to_string(), Value::Object(Map::new()));
         root.insert("logistics".to_string(), Value::Object(Map::new()));
         root.insert("conditions".to_string(), Value::Object(Map::new()));
@@ -596,8 +590,7 @@ impl LogisModel {
                 let processed_img = master_img.crop_imm(0, start_y, w, crop_h);
                 
                 let schema = get_category_schema(mission.cat, &detected_type);
-                let prompt = format!("MISSION: Extract fields for category '{{}}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{{\n{{}}
-}}", mission.cat.to_uppercase(), schema);
+                let prompt = format!("MISSION: Extract fields for category '{{}}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{{\n{{}}\n}}", mission.cat.to_uppercase(), schema);
                 
                 let task_desc = format!("[{{}}] {{}} ({{}}%~{{}}%)", detected_type, mission.cat.to_uppercase(), (top_pct*100.0) as i32, (bot_pct*100.0) as i32);
                 
@@ -606,7 +599,7 @@ impl LogisModel {
                     Some(processed_img), 
                     app_handle, 
                     "extraction-progress", 
-                    json!({ "summary": format!("Analyzing: {{}}", task_desc), "raw": format!("Analyzing {{}}...", task_desc), "category": mission.cat })
+                    json!({ {"summary": format!("Analyzing: {{}}", task_desc), "raw": format!("Analyzing {{}}...", task_desc), "category": mission.cat} })
                 ).await?;
             };
 
@@ -615,7 +608,7 @@ impl LogisModel {
             if let Some(json_val) = extract_json_from_text(&res_text) {
                 merge_json_manual(&mut root, mission.cat, json_val.clone());
                 // Emit final success for this step (without spinner or with success symbol)
-                let _ = app_handle.emit("extraction-progress", json!({ "category": mission.cat, "data": json_val, "spinner": "✅" }));
+                let _ = app_handle.emit("extraction-progress", json!({ {"category": mission.cat, "data": json_val, "spinner": "✅"} }));
             }
         }
 
@@ -629,11 +622,8 @@ impl LogisModel {
     }
 
     pub async fn split_query_contexts(&self, query: String) -> anyhow::Result<Vec<Value>> {
-        let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}}]";
-        let prompt = format!("{{}}
-
-Query: {{}}
-JSON Output:", system_prompt, query);
+        let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}}]};
+        let prompt = format!("{{}}\n\nQuery: {{}}\nJSON Output:", system_prompt, query);
         
         let res = self.run_inference_text(prompt, None)?;
         if let Some(json_val) = extract_json_from_text(&res) {
@@ -655,7 +645,7 @@ JSON Output:", system_prompt, query);
             return Ok(vec![json_val]);
         }
         
-        Ok(vec![json!({ "query": query, "$header": { "$$document_type": "ALL" } })])
+        Ok(vec![json!({ {"query": query, "$header": { "$$document_type": "ALL" }} })])
     }
 
     pub async fn parse_query_to_filters(&self, query: String, doc_type: Option<String>) -> anyhow::Result<Value> {
@@ -698,10 +688,7 @@ JSON Output:"###, schema_def, doc_type, query);
 
 Output JSON: {{"intent": "SEARCH|RESEARCH"}}"###;
 
-        let prompt = format!("{{}}
-
-Query: {{}}
-JSON Output:", system_prompt, query);
+        let prompt = format!("{}\n\nQuery: {{}}\nJSON Output:", system_prompt, query);
         let res = self.run_inference_text(prompt, None)?;
         
         let intent = extract_json_from_text(&res)
@@ -718,7 +705,7 @@ JSON Output:", system_prompt, query);
 
         // 1. Context Gathering
         status_history.push_str("✅ Context gathered.\n\n");
-        let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": spinner.frames[0] }));
+        let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": spinner.frames[0]} }));
 
         // 2. Multi-step reasoning loop
         let steps = vec![
@@ -730,34 +717,26 @@ JSON Output:", system_prompt, query);
         for (i, step) in steps.iter().enumerate() {
             let frame = spinner.frames[i % spinner.frames.len()];
             status_history.push_str(&format!("**{{}} {{}}**\n", frame, step));
-            let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": frame }));
+            let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": frame} }));
 
-            let prompt = format!("Given this context: {{}}
-
-Task: {{}}
-Query: {{}}
-
-Provide deep insight for this specific step.", context_data, step, query);
+            let prompt = format!("Given this context: {{}}\n\nTask: {{}}\nQuery: {{}}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
             // In a real implementation, we might want to stream this too, but for now we wait for the step result
             let step_result = self.run_inference_text(prompt, None)?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {{}}...\n\n", short_res.replace("\n", " ")));
-            let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));
+            let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": "✅"} }));
         }
 
         // 3. Final Report
         status_history.push_str("### 📊 Final Research Report\n\n");
-        let final_prompt = format!("CONTEXT: {{}}
-QUERY: {{}}
-
-Based on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
-
+        let final_prompt = format!("CONTEXT: {{}}\nQUERY: {{}}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
+        
         let report = self.run_inference_text(final_prompt, None)?;
         status_history.push_str(&report);
         
-        let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));
+        let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": "✅"} }));
 
         Ok(report)
     }
@@ -1250,6 +1229,7 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
     }
 
     if schema_fields.is_empty() { return "{}".to_string(); }    
+    
     let is_list = category == "items" || category == "containers";
     let cat_key = if category == "items" { "line_items" } else { category };
     let mut lines = Vec::new();
