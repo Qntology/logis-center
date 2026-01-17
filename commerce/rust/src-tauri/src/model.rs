@@ -421,7 +421,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        Ok(gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?)
+        gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -543,7 +543,7 @@ impl LogisModel {
         3. CUSTOMS: ED (Export Declaration), ID (Import Declaration), CINV (Customs Invoice), CO (Certificate of Origin)
         4. CERTIFICATES: IC (Inspection Cert), WC (Weight Cert), CA (Analysis Cert), PHYTO (Phytosanitary), HC (Health Cert), BEN_CERT (Beneficiary Cert)
         5. SPECIAL: DGD (Dangerous Goods), MSDS, POA (Power of Attorney), BIZ_LIC (Business License), INS (Insurance Policy)        
-        Return JSON: {"doc_type": "CODE"}"###;
+        Return JSON: {{"doc_type": "CODE"}}"###;
         
         let detected_type = {
             // Emitting spinner for classification
@@ -552,14 +552,14 @@ impl LogisModel {
                 Some(class_img), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ {"summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing"} })
+                json!({ "summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing" })
             ).await?;
 
             log(&format!("[DEBUG] Raw Classification Response: {}", res));
             let dtype = extract_json_field(&res, "doc_type").unwrap_or("Unknown".to_string());
             
             // Emit success for classification
-            let _ = app_handle.emit("extraction-progress", json!({ {"category": "Processing", "data": { "doc_type": dtype }, "spinner": "✅"} }));
+            let _ = app_handle.emit("extraction-progress", json!({ "category": "Processing", "data": { "doc_type": dtype }, "spinner": "✅" }));
             
             dtype
         };
@@ -567,7 +567,7 @@ impl LogisModel {
         log(&format!("[DEBUG] Detected Type: {}", detected_type));
 
         let mut root = Map::new();
-        root.insert("header".to_string(), json!({ {"doc_type": &detected_type} }));
+        root.insert("header".to_string(), json!({ "doc_type": &detected_type }));
         root.insert("parties".to_string(), Value::Object(Map::new()));
         root.insert("logistics".to_string(), Value::Object(Map::new()));
         root.insert("conditions".to_string(), Value::Object(Map::new()));
@@ -590,25 +590,36 @@ impl LogisModel {
                 let processed_img = master_img.crop_imm(0, start_y, w, crop_h);
                 
                 let schema = get_category_schema(mission.cat, &detected_type);
-                let prompt = format!("MISSION: Extract fields for category '{}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{\n{}\n}", mission.cat.to_uppercase(), schema);
+                let prompt = format!("MISSION: Extract fields for category '{}'.\nRULES: Valid JSON ONLY.\nSCHEMA:\n{{\n{}\n}}", mission.cat.to_uppercase(), schema);
                 
-                let task_desc = format!("[{}] {} ({}%~{}%)", detected_type, mission.cat.to_uppercase(), (top_pct*100.0) as i32, (bot_pct*100.0) as i32);
+                                let task_desc = format!("[{}] {} ({}%~{}%)", detected_type, mission.cat.to_uppercase(), (top_pct*100.0) as i32, (bot_pct*100.0) as i32);
                 
-                self.run_inference_with_spinner(
-                    prompt, 
-                    Some(processed_img), 
-                    app_handle, 
-                    "extraction-progress", 
-                    json!({ {"summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat} })
-                ).await?;
-            };
-
-            log(&format!("[DEBUG] Raw Extraction ({}): {}", mission.cat, res_text));
+                                
+                
+                                self.run_inference_with_spinner(
+                
+                                    prompt, 
+                
+                                    Some(processed_img), 
+                
+                                    app_handle, 
+                
+                                    "extraction-progress", 
+                
+                                    json!({ "summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat })
+                
+                                ).await?
+                
+                            };
+                
+                
+                
+                            log(&format!("[DEBUG] Raw Extraction ({}) : {}", mission.cat, res_text));
 
             if let Some(json_val) = extract_json_from_text(&res_text) {
                 merge_json_manual(&mut root, mission.cat, json_val.clone());
                 // Emit final success for this step (without spinner or with success symbol)
-                let _ = app_handle.emit("extraction-progress", json!({ {"category": mission.cat, "data": json_val, "spinner": "✅"} }));
+                let _ = app_handle.emit("extraction-progress", json!({ "category": mission.cat, "data": json_val, "spinner": "✅" }));
             }
         }
 
@@ -622,7 +633,7 @@ impl LogisModel {
     }
 
     pub async fn split_query_contexts(&self, query: String) -> anyhow::Result<Vec<Value>> {
-        let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}]";
+        let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}}]";
         let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
         
         let res = self.run_inference_text(prompt, None)?;
@@ -662,12 +673,12 @@ DYNAMIC SCHEMA:
 {}
 
 REQUIRED JSON FORMAT: 
-{
-  "header": { "document_type": "{}" },
-  "filters": {
-      "category.field_path": { "$operator": value }
-  }
-}
+{{
+  "header": {{ "document_type": "{}" }},
+  "filters": {{
+      "category.field_path": {{ "$operator": value }}
+  }}
+}}
 
 Query: {}
 JSON Output:"###, schema_def, doc_type, query);
@@ -705,7 +716,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
 
         // 1. Context Gathering
         status_history.push_str("✅ Context gathered.\n\n");
-        let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": spinner.frames[0]} }));
+        let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": spinner.frames[0] }));
 
         // 2. Multi-step reasoning loop
         let steps = vec![
@@ -717,7 +728,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
         for (i, step) in steps.iter().enumerate() {
             let frame = spinner.frames[i % spinner.frames.len()];
             status_history.push_str(&format!("**{} {}**\n", frame, step));
-            let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": frame} }));
+            let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": frame }));
 
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
@@ -726,7 +737,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
-            let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": "✅"} }));
+            let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));
         }
 
         // 3. Final Report
@@ -736,7 +747,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
         let report = self.run_inference_text(final_prompt, None)?;
         status_history.push_str(&report);
         
-        let _ = app_handle.emit("research-update", json!({ {"text": status_history, "spinner": "✅"} }));
+        let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));
 
         Ok(report)
     }
@@ -1233,8 +1244,14 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
     let is_list = category == "items" || category == "containers";
     let cat_key = if category == "items" { "line_items" } else { category };
     let mut lines = Vec::new();
-    if is_list { lines.push(format!("  \"{}\": [{ ", cat_key)); } 
-    else { lines.push(format!("  \"{}\": { ", cat_key)); }
+    if is_list { 
+        lines.push(format!("  \"{}\": [", cat_key)); 
+        lines.push("{ ".to_string());
+    } 
+    else { 
+        lines.push(format!("  \"{}\": ", cat_key)); 
+        lines.push("{ ".to_string());
+    }
     
     for (i, (key, desc, dtype, mode)) in schema_fields.iter().enumerate() {
         let default_val = match dtype.as_str() {
@@ -1243,10 +1260,10 @@ fn get_category_schema(category: &str, doc_type: &str) -> String {
             _ => "\"\""
         };
         let comma = if i < schema_fields.len() - 1 { "," } else { "" };
-        lines.push(format!("    \"{}\": {}{} // {} {}\n", key, default_val, comma, mode, desc, dtype));
+        lines.push(format!("    \"{}\": {}{} // {} {} ({})", key, default_val, comma, mode, desc, dtype));
     }
     
-    if is_list { lines.push("  }]".to_string()); } 
+    if is_list { lines.push("  ]".to_string()); } 
     else { lines.push("  }".to_string()); }
     lines.join("\n")
 }
