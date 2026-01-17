@@ -356,7 +356,7 @@ impl QuantizedQwen3VLTextModel {
 
         for (name, info) in &ct.tensor_infos {
             if name.starts_with(layer_prefix) {
-                let elements: usize = info.shape.iter().product();
+                let elements: usize = info.shape.elem_count();
                 // Estimate size: (elements / block_size) * type_size
                 let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
                 layer_weight_size += size as u64;
@@ -544,6 +544,7 @@ pub struct QuantizedQwen3VLModel {
     language_model: QuantizedQwen3VLTextModel,
     lm_head: QLinear,
     rope_deltas: Option<Tensor>,
+    vision_device: Device,
 }
 
 impl QuantizedQwen3VLModel {
@@ -619,6 +620,7 @@ impl QuantizedQwen3VLModel {
             language_model,
             lm_head,
             rope_deltas: None,
+            vision_device,
         })
     }
     
@@ -627,9 +629,23 @@ impl QuantizedQwen3VLModel {
         pixel_values: &Tensor,
         image_grid_thw: &Tensor,
     ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        // Ensure inputs are on the same device as the vision model
+        let pixel_values = if !pixel_values.device().same_device(&self.vision_device) {
+            pixel_values.to_device(&self.vision_device)?
+        } else {
+            pixel_values.clone()
+        };
+
+        let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) {
+            image_grid_thw.to_device(&self.vision_device)?
+        } else {
+            image_grid_thw.clone()
+        };
+
         let (image_embeds, deepstack_image_embeds) =
-            self.visual.forward(pixel_values, image_grid_thw)?;
-        let split_sizes: Vec<usize> = prod_tensor_last_dim(image_grid_thw)?
+            self.visual.forward(&pixel_values, &image_grid_thw)?;
+        
+        let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?
             .to_vec1::<u32>()?
             .iter()
             .map(|&x| x as usize / self.config.vision_config.spatial_merge_size.pow(2))

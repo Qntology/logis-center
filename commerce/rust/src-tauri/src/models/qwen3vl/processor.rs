@@ -13,6 +13,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, IndexOp, Shape, Tensor};
 use image::DynamicImage;
+use sysinfo::System;
 
 #[derive(Clone)]
 pub struct VisionInput {
@@ -94,13 +95,33 @@ impl Qwen3VLProcessor {
     ) -> Result<Tensor> {
         let img_h = img.height();
         let img_w = img.width();
+        
+        // --- Dynamic Resolution Capping ---
+        let mut sys = System::new_all();
+        sys.refresh_memory();
+        let free_mem = sys.available_memory();
+        
+        // Default limits from config
+        let mut longest_edge = self.img_process_cfg.size.longest_edge as u32;
+        let shortest_edge = self.img_process_cfg.size.shortest_edge as u32;
+        
+        // If free RAM < 2GB, aggressively cap resolution to 1024px
+        if free_mem < 2_000_000_000 {
+            if longest_edge > 1024 {
+                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping Image Resolution to 1024px.", free_mem as f64 / 1e9);
+                longest_edge = 1024;
+            }
+        }
+        
         let (resize_h, resize_w) = img_smart_resize(
             img_h,
             img_w,
             (self.img_process_cfg.patch_size * self.img_process_cfg.merge_size) as u32,
-            self.img_process_cfg.size.shortest_edge as u32,
-            self.img_process_cfg.size.longest_edge as u32,
+            shortest_edge,
+            longest_edge,
         )?;
+        // ----------------------------------
+
         let img = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::CatmullRom);
         let img_tensor = img_transform(&img, img_mean, img_std, &self.device, self.dtype)?;
         let img_tensor = img_tensor.unsqueeze(0)?;
