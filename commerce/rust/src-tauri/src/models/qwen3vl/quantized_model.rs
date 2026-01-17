@@ -266,14 +266,23 @@ impl QuantizedQwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // 1. Detect device of this layer
+        // 1. Detect device AND dtype of this layer
         let dev = self.input_layernorm.weight().device();
+        let target_dtype = self.input_layernorm.weight().dtype();
         
-        // 2. Ensure inputs are on this device
-        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
-        let cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
-        let sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
+        // 2. Ensure inputs are on this device and dtype
+        //    (Clone via Cow logic or explicit clone if needed, here we use explicit clones/conversions for safety)
+        let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        if xs.dtype() != target_dtype { xs = xs.to_dtype(target_dtype)?; }
+
+        let mut cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
+        if cos.dtype() != target_dtype { cos = cos.to_dtype(target_dtype)?; }
+
+        let mut sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
+        if sin.dtype() != target_dtype { sin = sin.to_dtype(target_dtype)?; }
+
         let attention_mask = if let Some(mask) = attention_mask {
+             // Mask is usually F32 or specific, but we ensure device match
              Some(if !mask.device().same_device(dev) { mask.to_device(dev)? } else { mask.clone() })
         } else {
              None
@@ -337,24 +346,53 @@ impl QuantizedQwen3VLTextModel {
         let nvml = Nvml::init().ok();
         let mut current_device = device.clone();
         
-        // VRAM Offload Threshold: 500 MB (leave room for activations)
-        let vram_threshold = 500_000_000; 
+        // --- Organic Budget-based Optimization ---
+        // Instead of a hard threshold, we simulate filling the VRAM.
+        // Qwen2-VL-2B Q4 Estimates:
+        // - Weight per layer: ~50 MB
+        // - Runtime Buffer (KV + Act) per layer: ~30 MB
+        // - Total Cost per Layer: ~80 MB
+        // - Safety Floor (LM Head + OS Overhead): 600 MB
+        
+        let cost_per_layer: u64 = 80_000_000; 
+        let safety_floor: u64 = 600_000_000;
+        let mut simulated_free_vram: u64 = 0;
+        let mut is_vram_checked = false;
+
+        // Get initial reading
+        if current_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(0) {
+                     if let Ok(mem) = dev.memory_info() {
+                         simulated_free_vram = mem.free;
+                         is_vram_checked = true;
+                         println!("[VRAM-BUDGET] Initial Free: {:.2} GB. Target Floor: {:.2} GB. Cost/Layer: {:.2} MB", 
+                            mem.free as f64/1e9, safety_floor as f64/1e9, cost_per_layer as f64/1e6);
+                     }
+                 }
+             }
+        }
 
         let mut layers = vec![];
         for layer_idx in 0..config.num_hidden_layers {
-            // Check VRAM if running on CUDA
-            if current_device.is_cuda() {
-                 if let Some(nvml_inst) = &nvml {
-                     if let Ok(dev) = nvml_inst.device_by_index(0) {
-                         if let Ok(mem) = dev.memory_info() {
-                             if mem.free < vram_threshold {
-                                 println!("[OFFLOAD] VRAM Low ({:.2} MB). Switching Layer {} and subsequent to CPU.", mem.free as f64/1e6, layer_idx);
-                                 current_device = Device::Cpu;
-                             }
-                         }
+            // Organic Check
+            if current_device.is_cuda() && is_vram_checked {
+                 // Check if we have budget for this layer + safety floor
+                 if simulated_free_vram > (cost_per_layer + safety_floor) {
+                     // Allocating to GPU
+                     simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
+                 } else {
+                     // Budget exhausted
+                     if current_device.is_cuda() { // Only print once when switching
+                        println!("[OFFLOAD] Budget Exhausted (Est. Free: {:.2} MB). Switching Layer {} and subsequent to CPU.", 
+                            simulated_free_vram as f64/1e6, layer_idx);
                      }
+                     current_device = Device::Cpu;
                  }
             }
+
+            // Determine dtype: If CPU, force F32. Else use requested dtype (BF16).
+            let layer_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
 
             // Determine prefix: "model.layers.N" or "blk.N"
             let standard = format!("{base_name}.layers.{layer_idx}");
@@ -372,12 +410,12 @@ impl QuantizedQwen3VLTextModel {
                 reader,
                 &prefix,
                 &current_device,
-                dtype,
+                layer_dtype,
             )?;
             layers.push(layer)
         }
         
-        // Norm - load on same device as last layer
+        // Norm - load on same device as last layer, with matching dtype
         let norm_name = format!("{base_name}.norm");
         let alt_norm = "output_norm";
         let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) {
@@ -386,7 +424,8 @@ impl QuantizedQwen3VLTextModel {
             &norm_name
         };
         
-        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, dtype)?;
+        let norm_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
+        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, norm_dtype)?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.mrope_section.clone();
@@ -514,8 +553,8 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         if mem.free < 200_000_000 { // 200MB threshold
-                             println!("[OFFLOAD] VRAM Low for Head. Switching to CPU.");
+                         if mem.free < 200_000_000 { // 200MB threshold (Safety Floor preserved this)
+                             println!("[OFFLOAD] VRAM Free: {:.2} GB. Switching Head to CPU.", mem.free as f64/1e9);
                              head_device = Device::Cpu;
                          }
                      }
@@ -523,14 +562,17 @@ impl QuantizedQwen3VLModel {
              }
         }
 
+        // Determine head dtype: F32 if CPU, else inherit
+        let head_dtype = if head_device.is_cpu() { DType::F32 } else { dtype };
+
         // Try 'lm_head', then 'output', then fallback to 'token_embd' (tied weights)
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", &head_device, dtype) {
+        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", &head_device, head_dtype) {
             l
-        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", &head_device, dtype) {
+        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", &head_device, head_dtype) {
             l
         } else {
             // Fallback for tied embeddings or GGUF specific naming 'token_embd'
-            get_qlinear(ct_main, reader_main, "token_embd", &head_device, dtype)?
+            get_qlinear(ct_main, reader_main, "token_embd", &head_device, head_dtype)?
         };
 
         Ok(Self {
