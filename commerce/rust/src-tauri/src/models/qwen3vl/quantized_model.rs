@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, RmsNorm, VarBuilder};
 use candle_core::quantized::{gguf_file, QMatMul};
+use nvml_wrapper::Nvml;
 
 use crate::{
     models::{
@@ -22,14 +23,26 @@ use crate::{
 pub struct QLinear {
     inner: QMatMul,
     bias: Option<Tensor>,
+    device: Device, // Track device explicitly
 }
 
 impl QLinear {
-    pub fn new(inner: QMatMul, bias: Option<Tensor>) -> Self {
-        Self { inner, bias }
+    pub fn new(inner: QMatMul, bias: Option<Tensor>, device: Device) -> Self {
+        Self { inner, bias, device }
+    }
+    
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // Auto-move input to this layer's device
+        let xs = if !xs.device().same_device(&self.device) {
+            xs.to_device(&self.device)?
+        } else {
+            xs.clone() // QMatMul likely needs owned or cow, but here we clone for safety
+        };
+
         // QMatMul typically expects F32 input
         let xs_f32 = xs.to_dtype(DType::F32)?;
         let out = self.inner.forward(&xs_f32)?;
@@ -122,7 +135,9 @@ impl QuantizedQwen3VLTextAttention {
             self.num_attention_heads,
             self.head_dim,
         ))?;
+        // Norms are also on specific device
         let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
+        
         let key_states = self.k_proj.forward(xs)?.reshape((
             b_sz,
             q_len,
@@ -223,9 +238,22 @@ impl QuantizedQwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        // 1. Detect device of this layer
+        let dev = self.input_layernorm.weight().device();
+        
+        // 2. Ensure inputs are on this device
+        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        let cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
+        let sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
+        let attention_mask = if let Some(mask) = attention_mask {
+             Some(if !mask.device().same_device(dev) { mask.to_device(dev)? } else { mask.clone() })
+        } else {
+             None
+        };
+
         let residual = xs.clone();
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
+        let xs = self.input_layernorm.forward(&xs)?;
+        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
         let xs = residual.add(&xs)?;
         
         let residual = xs.clone();
@@ -277,13 +305,33 @@ impl QuantizedQwen3VLTextModel {
              return Err(anyhow!("Failed to load embedding. Tried {}, {}", token_emb_name, alt_token_emb));
         };
 
+        // Initialize NVML for dynamic VRAM check
+        let nvml = Nvml::init().ok();
+        let mut current_device = device.clone();
+        
+        // VRAM Offload Threshold: 500 MB (leave room for activations)
+        let vram_threshold = 500_000_000; 
+
         let mut layers = vec![];
         for layer_idx in 0..config.num_hidden_layers {
+            // Check VRAM if running on CUDA
+            if current_device.is_cuda() {
+                 if let Some(nvml_inst) = &nvml {
+                     if let Ok(dev) = nvml_inst.device_by_index(0) {
+                         if let Ok(mem) = dev.memory_info() {
+                             if mem.free < vram_threshold {
+                                 println!("[OFFLOAD] VRAM Low ({:.2} MB). Switching Layer {} and subsequent to CPU.", mem.free as f64/1e6, layer_idx);
+                                 current_device = Device::Cpu;
+                             }
+                         }
+                     }
+                 }
+            }
+
             // Determine prefix: "model.layers.N" or "blk.N"
             let standard = format!("{base_name}.layers.{layer_idx}");
             let gguf_blk = format!("blk.{layer_idx}");
             
-            // Heuristic: Check for input layernorm weight
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) {
                 gguf_blk
             } else {
@@ -295,13 +343,13 @@ impl QuantizedQwen3VLTextModel {
                 ct,
                 reader,
                 &prefix,
-                device,
+                &current_device,
                 dtype,
             )?;
             layers.push(layer)
         }
         
-        // Norm
+        // Norm - load on same device as last layer
         let norm_name = format!("{base_name}.norm");
         let alt_norm = "output_norm";
         let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) {
@@ -310,7 +358,7 @@ impl QuantizedQwen3VLTextModel {
             &norm_name
         };
         
-        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, device, dtype)?;
+        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, dtype)?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.mrope_section.clone();
@@ -344,11 +392,14 @@ impl QuantizedQwen3VLTextModel {
             .unsqueeze(0)?
             .broadcast_as((3, b_size, seq_len))?,
         };
+        
+        // RoPE is computed here. Usually on inputs_embeds.device() (GPU).
         let (cos, sin) = self.rotary_emb.forward(
             &position_ids,
             inputs_embeds.dtype(),
             self.mrope_section.clone(),
         )?;
+        
         let mut xs = inputs_embeds.clone();
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
@@ -362,18 +413,35 @@ impl QuantizedQwen3VLTextModel {
                 )?)
             }
         };
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+            
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
+                    // Deepstack logic might need device check too
+                    let mask = visual_pos_masks.unwrap();
+                    let embed = &deepstack_embeds[layer_idx];
+                    
+                    // Move to xs device
+                    let mask = if !mask.device().same_device(xs.device()) { mask.to_device(xs.device())? } else { mask.clone() };
+                    let embed = if !embed.device().same_device(xs.device()) { embed.to_device(xs.device())? } else { embed.clone() };
+
                     xs = mask_index_add(
                         &xs.squeeze(0)?,
-                        &visual_pos_masks.unwrap().squeeze(0)?,
-                        &deepstack_embeds[layer_idx],
+                        &mask.squeeze(0)?,
+                        &embed,
                     )?
                     .unsqueeze(0)?;
                 }
             }
+        }
+        
+        // Final Norm - ensure xs is on norm device
+        let norm_dev = self.norm.weight().device();
+        if !xs.device().same_device(norm_dev) {
+            xs = xs.to_device(norm_dev)?;
         }
         let xs = xs.apply(&self.norm)?;
         Ok(xs)
@@ -411,15 +479,30 @@ impl QuantizedQwen3VLModel {
         // Load Language Model from main file
         let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", device, dtype)?;
         
-        // LM Head
+        // LM Head - Check VRAM again to decide device
+        let nvml = Nvml::init().ok();
+        let mut head_device = device.clone();
+        if head_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(0) {
+                     if let Ok(mem) = dev.memory_info() {
+                         if mem.free < 200_000_000 { // 200MB threshold
+                             println!("[OFFLOAD] VRAM Low for Head. Switching to CPU.");
+                             head_device = Device::Cpu;
+                         }
+                     }
+                 }
+             }
+        }
+
         // Try 'lm_head', then 'output', then fallback to 'token_embd' (tied weights)
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", device, dtype) {
+        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", &head_device, dtype) {
             l
-        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", device, dtype) {
+        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", &head_device, dtype) {
             l
         } else {
             // Fallback for tied embeddings or GGUF specific naming 'token_embd'
-            get_qlinear(ct_main, reader_main, "token_embd", device, dtype)?
+            get_qlinear(ct_main, reader_main, "token_embd", &head_device, dtype)?
         };
 
         Ok(Self {
@@ -515,8 +598,18 @@ impl QuantizedQwen3VLModel {
             None, // deepstack not fully implemented
         )?;
         
+        // Output from language model might be on CPU if last layer offloaded.
+        // LM Head might be on GPU or CPU.
         let seq_len = outputs.dim(1)?;
         let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
+        
+        // Ensure hidden_state is on lm_head device
+        let hidden_state = if !hidden_state.device().same_device(self.lm_head.device()) {
+            hidden_state.to_device(self.lm_head.device())?
+        } else {
+            hidden_state
+        };
+
         let logits = self.lm_head.forward(&hidden_state)?;
         Ok(logits)
     }
@@ -536,7 +629,7 @@ fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader
     } else {
         None
     };
-    Ok(QLinear::new(weight, bias))
+    Ok(QLinear::new(weight, bias, device.clone()))
 }
 
 fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {

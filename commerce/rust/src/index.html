@@ -118,7 +118,10 @@
                        <button id="btn-detail-back" class="nav-btn">⬅︎</button>
                        <h2 id="detail-title">Type No</h2>
                    </div>
-                   <button id="btn-detail-delete" class="nav-btn" style="color: #ef4444;" title="Delete Document">🗑️</button>
+                   <div style="display:flex; gap:5px;">
+                        <button id="btn-stop-task" class="nav-btn" style="display:none; color: #ef4444;" title="Stop Extraction">🛑</button>
+                        <button id="btn-detail-delete" class="nav-btn" style="color: #ef4444;" title="Delete Document">🗑️</button>
+                   </div>
                </div>
                <div id="detail-content" class="markdown-body" style="overflow-y:auto; flex:1; font-size: 0.85rem; padding-right:5px; padding-bottom: 20px;">
                    <!-- Extraction Logs or Details injected here -->

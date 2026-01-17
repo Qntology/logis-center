@@ -130,13 +130,13 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
 
 pub fn map_outline(language: &str) -> String {
     let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation.
-    # type : 'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or ''
+    # type : document type
     # item : type based item CSS1 selector excluding ads
     # node : item parent list CSS1 selector excluding ads
     # detail : is a detail page or a detail form
     Return JSON:
     {
-        "type": '',
+        "type": 'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
         "item": '',
         "node": '',
         "detail": boolean,

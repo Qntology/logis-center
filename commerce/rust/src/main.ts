@@ -69,6 +69,7 @@ const detailContent = document.getElementById("detail-content") as HTMLElement;
 const btnDetailBack = document.getElementById("btn-detail-back") as HTMLButtonElement;
 const btnListBack = document.getElementById("btn-list-back") as HTMLButtonElement;
 const btnDetailDelete = document.getElementById("btn-detail-delete") as HTMLButtonElement;
+const btnStopTask = document.getElementById("btn-stop-task") as HTMLButtonElement; // Added
 
 // List Elements
 const docTableBody = document.getElementById("doc-tbody") as HTMLElement;
@@ -202,6 +203,10 @@ btnExtract?.addEventListener("click", async () => {
     listView.style.display = "none";
     detailView.style.display = "flex";
 
+    // Toggle Buttons
+    if (btnDetailDelete) btnDetailDelete.style.display = "none";
+    if (btnStopTask) btnStopTask.style.display = "flex";
+
     // Block re-execution if already running
     if (isExtracting) {
         return;
@@ -266,6 +271,17 @@ btnExtract?.addEventListener("click", async () => {
             detailTitle.innerText = "Error";
             detailContent.innerHTML = `<div style="color:red;">Browser Error: ${e}</div>`;
         }
+    }
+});
+
+// Stop Task
+btnStopTask?.addEventListener("click", async () => {
+    if (confirm("Stop current extraction?")) {
+        try {
+            await invoke("stop_current_extraction");
+            // UI update will happen via extraction-progress event or we can force it here
+            btnStopTask.innerText = "Stopping...";
+        } catch(e) { console.error(e); }
     }
 });
 
@@ -395,8 +411,8 @@ listen("browser-match-found", (event: any) => {
             btnExtract.title = `Extract from ${new URL(payload.url).hostname}`;
         }
     } else {
-        // Force hide if no match, unless an image is manually selected
-        if (!currentImage) {
+        // Force hide if no match, unless an image is manually selected OR extraction is running
+        if (!currentImage && !isExtracting) {
              if (btnExtract) btnExtract.style.display = "none";
         }
     }
@@ -444,6 +460,11 @@ listen("extraction-progress", (event: any) => {
          
          if (payload.category === "Done" || payload.data) {
              isExtracting = false; // Reset state
+             
+             // Reset Buttons
+             if (btnStopTask) { btnStopTask.style.display = "none"; btnStopTask.innerText = "🛑"; }
+             if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+
              const successText = payload.category === "Done" ? "Extraction Complete" : `<strong>${payload.category}</strong> extracted.`;
              p.innerHTML = `<span style="margin-right:8px;">✅</span> <span>${successText}</span>`;
              p.style.color = "#4ade80"; 

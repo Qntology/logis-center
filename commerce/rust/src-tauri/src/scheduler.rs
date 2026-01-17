@@ -8,6 +8,7 @@ use crate::model::LogisModel;
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Ported from proxy/src/index.ts `isDiff`
 #[allow(dead_code)]
@@ -20,6 +21,7 @@ fn is_diff(v1: &Value, v2: &Value) -> bool {
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
+    cancellation_token: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
 ) {
     println!("[Scheduler] Background worker started.");
@@ -54,6 +56,9 @@ pub async fn start_background_worker(
             for task in pending_tasks {
                 println!("[Scheduler] Processing task: {}", task.id);
                 
+                // Reset cancellation token for the new task
+                cancellation_token.store(false, Ordering::SeqCst);
+                
                 // Mark as processing
                 {
                     let store_guard = store.lock().await;
@@ -62,7 +67,7 @@ pub async fn start_background_worker(
                     }
                 }
 
-                match process_task(task.clone(), &store, &model, &app_handle).await {
+                match process_task(task.clone(), &store, &model, &cancellation_token, &app_handle).await {
                     Ok(_) => {
                         println!("[Scheduler] Task completed: {}", task.id);
                         let store_guard = store.lock().await;
@@ -71,10 +76,22 @@ pub async fn start_background_worker(
                         }
                     },
                     Err(e) => {
-                        println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, e);
-                        let store_guard = store.lock().await;
-                        if let Some(db) = store_guard.as_ref() {
-                            let _ = db.update_task_status(&task.id, "error").await;
+                        if e.to_string().contains("Task cancelled") {
+                             println!("[Scheduler] Task cancelled: {}", task.id);
+                             let store_guard = store.lock().await;
+                             if let Some(db) = store_guard.as_ref() {
+                                 let _ = db.update_task_status(&task.id, "cancelled").await;
+                             }
+                             // Emit cancelled event to UI to reset state
+                             let _ = app_handle.emit("extraction-progress", json!({
+                                "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null
+                             }));
+                        } else {
+                            println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, e);
+                            let store_guard = store.lock().await;
+                            if let Some(db) = store_guard.as_ref() {
+                                let _ = db.update_task_status(&task.id, "error").await;
+                            }
                         }
                     }
                 }
@@ -87,9 +104,13 @@ async fn process_task(
     task: Task, 
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
+    cancellation_token: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle
 ) -> Result<()> {
     
+    // Check Cancellation
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
     // Initial Progress
     let _ = app_handle.emit("extraction-progress", json!({
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
@@ -112,6 +133,9 @@ async fn process_task(
              
              let prompt = parsing::image2json("kr", language, "tracking", ""); // Defaults
              
+             // Check Cancellation
+             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
              let mut model_guard = model_mutex.lock().await;
              if model_guard.is_none() {
                  let _ = app_handle.emit("extraction-progress", json!({
@@ -129,6 +153,9 @@ async fn process_task(
                  }
              }
              
+             // Check Cancellation before Inference
+             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
              let result_str = if let Some(model) = model_guard.as_ref() {
                  model.chat_with_image_spinner(prompt, Some(dynamic_image), app_handle, "extraction-progress", json!({
                      "category": "Vision Analysis", "summary": "Analyzing image content..."
@@ -176,6 +203,9 @@ async fn process_task(
         return Ok(())
     };
     
+    // Check Cancellation
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
     // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
     let light_pug = parsing::convert_to_clean_pug(&html, PugMode::StructureOnly);
     
@@ -214,6 +244,9 @@ async fn process_task(
     let _ = app_handle.emit("extraction-progress", json!({
         "category": "Classification", "summary": "Analyzing page structure...", "spinner": "⠋"
     }));
+    
+    // Check Cancellation before Inference
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let page_info_str = if let Some(model) = model_guard.as_ref() {
         let system = parsing::map_outline(language);
@@ -252,6 +285,9 @@ async fn process_task(
         println!("[Scheduler] Task finished early: Could not classify page type.");
         return Ok(());
     }
+    
+    // Check Cancellation
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // =================================================================================
     // STEP 2: Extraction (Full Content) - "Zoom In"
@@ -287,6 +323,9 @@ async fn process_task(
         let fields_prompts = parsing::item2json(page_type, url, language);
 
         for (i, item_pug) in item_pugs.iter().enumerate() {
+            // Check Cancellation inside Loop
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
             let mut item_data = json!({});
             
             let _ = app_handle.emit("extraction-progress", json!({
@@ -359,6 +398,9 @@ async fn process_task(
         let fields_prompts = parsing::item2json(page_type, url, language);
         
         for (field_name, field_prompt) in fields_prompts {
+            // Check Cancellation inside Loop
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
             let _ = app_handle.emit("extraction-progress", json!({
                 "category": "Extraction", 
                 "summary": format!("Extracting field: {}", field_name), 
@@ -403,6 +445,9 @@ async fn process_task(
         }
     }
     
+    // Check Cancellation
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
     // Inject type if missing
     if let Some(obj) = extracted_data.as_object_mut() {
         if obj.get("type").is_none() {
@@ -446,6 +491,9 @@ async fn process_task(
     // =================================================================================
     // STEP 3: Logic Relay, Merge & Save
     // =================================================================================
+    
+    // Check Cancellation
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let _ = app_handle.emit("extraction-progress", json!({
         "category": "Saving", "summary": "Saving to database...", "spinner": "⠋"

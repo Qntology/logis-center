@@ -17,11 +17,19 @@ use tokio::sync::Mutex;
 use model::LogisModel;
 use store::{VectorStore, TradeDocument};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 
 pub struct AppState {
     pub model: Arc<Mutex<Option<LogisModel>>>,
     pub store: Arc<Mutex<Option<VectorStore>>>,
+    pub cancellation_token: Arc<AtomicBool>,
+}
+
+#[tauri::command]
+async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, String> {
+    state.cancellation_token.store(true, Ordering::SeqCst);
+    Ok("Stop signal sent.".to_string())
 }
 
 #[tauri::command]
@@ -505,6 +513,7 @@ pub fn run() {
     let model = Arc::new(Mutex::new(None));
 
     let store = Arc::new(Mutex::new(None));
+    let cancellation_token = Arc::new(AtomicBool::new(false));
 
 
 
@@ -530,6 +539,7 @@ pub fn run() {
                     model: model,
 
                     store: store,
+                    cancellation_token: cancellation_token.clone(),
 
                 })
 
@@ -562,10 +572,11 @@ pub fn run() {
                     // Start Background Scheduler
                     let scheduler_store = app.state::<AppState>().store.clone();
                     let scheduler_model = app.state::<AppState>().model.clone();
+                    let scheduler_cancel = app.state::<AppState>().cancellation_token.clone();
                     let scheduler_handle = app.handle().clone();
 
                     tauri::async_runtime::spawn(async move {
-                        scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_handle).await;
+                        scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_cancel, scheduler_handle).await;
                     });
                     
                     let store_for_event = app.state::<AppState>().store.clone();
@@ -647,6 +658,8 @@ pub fn run() {
             launch_best_browser,
 
             extract_html_from_current_tab,
+            
+            stop_current_extraction,
 
             check_available_browsers,
 

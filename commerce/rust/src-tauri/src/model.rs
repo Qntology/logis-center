@@ -65,15 +65,18 @@ impl LogisModel {
             let total_vram = memory.total;
             let free_vram = memory.free; // free_vram = total - used
             
-            // Formula: Usable = (Total - Used) - 10% of Total
-            let buffer_size = (total_vram as f64 * 0.10) as u64; 
+            // Aggressive Mode: Only reserve 5% for OS overhead, no fixed blocks.
+            // This maximizes usable VRAM reporting to force GPU usage.
+            let buffer_size = (total_vram as f64 * 0.05) as u64; 
+
             let usable_vram = if free_vram > buffer_size { free_vram - buffer_size } else { 0 };
             
-            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB, Usable (Free - 10% Buffer): {:.2} GB", 
-                total_vram as f64/1e9, free_vram as f64/1e9, usable_vram as f64/1e9);
+            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB, Buffer: {:.2} GB, Usable: {:.2} GB", 
+                total_vram as f64/1e9, free_vram as f64/1e9, buffer_size as f64/1e9, usable_vram as f64/1e9);
 
-            // Removing fixed threshold check. Allow attempt even if VRAM seems low.
-            return (true, format!("VRAM Check Passed (Usable: {:.2} GB)", usable_vram as f64/1e9), usable_vram);
+            // Always return true to force GPU usage.
+            // We rely on the token limiter in 'new()' to handle low-memory situations dynamically.
+            return (true, format!("VRAM Check Passed (Aggressive). Usable: {:.2} GB", usable_vram as f64/1e9), usable_vram);
         }
 
         // 2. Metal / CPU System RAM Check
@@ -107,6 +110,7 @@ impl LogisModel {
         // Select Device Logic
         let mut target_device = Device::Cpu;
         let mut force_cpu = false;
+        let mut detected_vram = 0_u64;
 
         if device_preference == Some("cpu") {
             println!("[CONFIG] User forced CPU.");
@@ -114,7 +118,8 @@ impl LogisModel {
         } else {
             // Priority: CUDA > Metal > CPU
             if has_cuda {
-                let (ok, msg, _) = Self::check_memory_status(true, false);
+                let (ok, msg, vram) = Self::check_memory_status(true, false);
+                detected_vram = vram;
                 if ok {
                     println!("✅ [DEVICE] Selecting CUDA: {}", msg);
                     target_device = get_device(None); 
@@ -123,7 +128,8 @@ impl LogisModel {
                     force_cpu = true; 
                 }
             } else if has_metal {
-                let (ok, msg, _) = Self::check_memory_status(false, true);
+                let (ok, msg, vram) = Self::check_memory_status(false, true);
+                detected_vram = vram;
                 if ok {
                     println!("✅ [DEVICE] Selecting Metal: {}", msg);
                     target_device = Device::new_metal(0).unwrap_or(Device::Cpu);
@@ -145,9 +151,15 @@ impl LogisModel {
             }
         }
 
-        // Fixed Context Tokens as requested
-        let max_tokens_limit = 2048;
-        println!("[CONFIG] Token limit fixed to: {}", max_tokens_limit);
+        // Dynamic Context Tokens based on VRAM
+        let max_tokens_limit = if !force_cpu && detected_vram > 0 && detected_vram < 2_000_000_000 {
+             println!("[CONFIG] Low VRAM ({:.2} GB). Setting max_tokens to 1024.", detected_vram as f64/1e9);
+             1024
+        } else {
+             println!("[CONFIG] Setting max_tokens to 2048.");
+             2048
+        };
+        println!("[CONFIG] Token limit set to: {}", max_tokens_limit);
 
         let base_path = std::fs::canonicalize("src-tauri/models")
             .or_else(|_| std::fs::canonicalize("models"))?;
