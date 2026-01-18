@@ -657,44 +657,61 @@ Definition: {}
         // We feed chunks one by one to build up the KV cache context.
         // We only ask for the result at the very end.
         let chunks_len = chunks.len();
+        let mut full_context_accumulated = String::new(); // Accumulate context here
         
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let is_last = chunk_idx == chunks_len - 1;
             
+            // Append current chunk to accumulator
+            // Note: We don't just append the raw chunk, we append the *formatted* prompt content if possible,
+            // but since the prompt template changes (Instruction wrapper), simply appending raw text might confuse the model if we re-send full prompt.
+            // BETTER STRATEGY:
+            // The KV cache stores the *tokens* of the previous request. 
+            // If we send [Prompt_A + Chunk_1], cache has Tokens(Prompt_A + Chunk_1).
+            // Next request: [Prompt_A + Chunk_1 + Chunk_2].
+            // Cache Hit: Tokens(Prompt_A + Chunk_1). New input: Chunk_2.
+            
+            // So we MUST accumulate the content in the prompt.
+            full_context_accumulated.push_str(chunk);
+            full_context_accumulated.push('\n');
+
             // Prepare prompt
             let prompt = if is_last {
                 // Final Chunk: Ask for the extraction based on ALL previous context
                 format!(
 r#"[CONTEXT]
-You have read the full Pug (Jade) template of a webpage in previous turns.
-This is the FINAL PART ({}/{}) of the template.
+You are reading a Pug (Jade) template.
+Here is the full content so far:
+
+[FULL INPUT SNIPPET]
+{}
 
 [SCHEMA]
 Target Fields: {:?}
+
+[INSTRUCTION]
+Based on the WHOLE template above, extract the target fields.
+Return valid JSON only: {{ "field": value, ... }}
+If a field is split across chunks, combine them intelligently."#,
+                    full_context_accumulated,
+                    fields_prompts.iter().map(|(k, _)| k).collect::<Vec<_>>()
+                )
+            } else {
+                // Intermediate Chunk: Just read and remember
+                // We send the FULL accumulated text so far. 
+                // The KV cache will recognize the prefix and only process the NEW part (the latest chunk).
+                format!(
+r#"[CONTEXT]
+You are reading a Pug (Jade) template.
+Here is the content so far:
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Based on the WHOLE template you have read (including previous parts), extract the target fields.
-Return valid JSON only: {{ "field": value, ... }}
-If a field is split across chunks, combine them intelligently."#,
-                    chunk_idx + 1, chunks_len,
-                    fields_prompts.iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                    chunk
-                )
-            } else {
-                // Intermediate Chunk: Just read and remember
-                format!(
-r#"[CONTEXT]
-This is PART {}/{} of a Pug (Jade) template.
 Read and memorize this content for the next step. Do NOT generate JSON yet.
-Just say "CONTINUE".
-
-[INPUT SNIPPET]
-{}"#,
-                    chunk_idx + 1, chunks_len,
-                    chunk
+Just say "CONTINUE"."#,
+                    full_context_accumulated
                 )
             };
 
@@ -702,7 +719,7 @@ Just say "CONTINUE".
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Ingestion", 
-                "summary": format!("Reading part {}/{}...", chunk_idx + 1, chunks_len),
+                "summary": format!("Reading part {}/{} ({} chars)...", chunk_idx + 1, chunks_len, full_context_accumulated.len()),
                 "spinner": "⠋"
             }));
 
