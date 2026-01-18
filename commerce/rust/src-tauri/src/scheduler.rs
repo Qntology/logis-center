@@ -194,7 +194,7 @@ async fn process_task(
     }
 
     // 1. Fetch Page Content
-    let html = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+    let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
         raw_html.to_string()
     } else if !url.is_empty() {
         // Fallback to fetching URL
@@ -206,8 +206,18 @@ async fn process_task(
     // Check Cancellation
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // 1. Convert to lightweight Pug (Structure Only: ID, Class, Href)
-    let light_pug = parsing::convert_to_clean_pug(&html, PugMode::StructureOnly);
+    // OPTIMIZATION: Pre-clean ONCE (String is Send, so we can keep it)
+    let clean_html = parsing::pre_clean_html(&raw_html_content);
+    // Drop raw content to free memory
+    drop(raw_html_content); 
+    
+    // SCOPE 1: Parse for Light Pug (Structure Only)
+    // We must drop 'document' before awaiting LLM because scraper::Html is !Send
+    let light_pug = {
+        let document = scraper::Html::parse_document(&clean_html);
+        let lp = parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly);
+        lp
+    }; // document dropped here
     
     // Save Light Pug to file for debugging
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
@@ -309,7 +319,12 @@ async fn process_task(
             "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
         }));
 
-        let item_pugs = parsing::split_html_to_pug_list(&html, target_selector, PugMode::FullContent);
+        // SCOPE 2: Parse for Extraction (Re-parsing clean_html, but necessary for !Send)
+        let item_pugs = {
+            let document = scraper::Html::parse_document(&clean_html);
+            parsing::split_doc_to_pug_list(&document, target_selector, PugMode::FullContent)
+        }; // document dropped
+        
         let total_items = item_pugs.len();
         
         let _ = app_handle.emit("extraction-progress", json!({
@@ -391,7 +406,11 @@ async fn process_task(
     } else {
         // --- Detail Page Logic (Field-by-Field) ---
         // Zoom in first
-        let content_pug = parsing::convert_to_clean_pug_selector(&html, target_selector, PugMode::FullContent);
+        // SCOPE 2: Parse for Extraction
+        let content_pug = {
+            let document = scraper::Html::parse_document(&clean_html);
+            parsing::convert_doc_to_clean_pug_selector(&document, target_selector, PugMode::FullContent)
+        }; // document dropped
         
         // --- Selector Check: If node/item selector yielded no content, stop. ---
         if content_pug.trim().is_empty() {

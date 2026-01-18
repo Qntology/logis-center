@@ -67,19 +67,15 @@ impl LogisModel {
             let total_vram = memory.total;
             let free_vram = memory.free; // free_vram = total - used
             
-            // Aggressive Mode: Only reserve 5% for OS overhead, no fixed blocks.
-            // This maximizes usable VRAM reporting to force GPU usage.
-            // [Adjusted] Increased buffer to 15% to prevent OOM when sharing resources or running heavy contexts.
-            let buffer_size = (total_vram as f64 * 0.15) as u64; 
-
-            let usable_vram = if free_vram > buffer_size { free_vram - buffer_size } else { 0 };
+            // We will dynamically reserve 10% of the *current* free VRAM during allocation 
+            // to account for user activity fluctuation.
+            // Here we just report the raw state.
+            let usable_vram = free_vram;
             
-            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB, Buffer: {:.2} GB, Usable: {:.2} GB", 
-                total_vram as f64/1e9, free_vram as f64/1e9, buffer_size as f64/1e9, usable_vram as f64/1e9);
+            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB. (Will reserve 10% dynamic safety buffer)", 
+                total_vram as f64/1e9, free_vram as f64/1e9);
 
-            // Always return true to force GPU usage.
-            // We rely on the token limiter in 'new()' to handle low-memory situations dynamically.
-            return (true, format!("VRAM Check Passed (Aggressive). Usable: {:.2} GB", usable_vram as f64/1e9), usable_vram);
+            return (true, format!("VRAM Check Passed. Free: {:.2} GB", usable_vram as f64/1e9), usable_vram);
         }
 
         // 2. Metal / CPU System RAM Check
@@ -154,45 +150,59 @@ impl LogisModel {
             }
         }
 
-        // Dynamic Context Tokens based on VRAM Budget
+        let base_path = std::fs::canonicalize("src-tauri/models")
+            .or_else(|_| std::fs::canonicalize("models"))?;
+        
+        let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
+
+        // Dynamic Context Tokens based on Fluid VRAM
         let max_tokens_limit = if !force_cpu && detected_vram > 0 {
              let vram_mb = detected_vram as f64 / 1_000_000.0;
              
-             // Formula: (Free VRAM - 1.5GB Baseline) * Scaling Factor
-             // 1.5GB is roughly what the model weights consume on GPU initially.
-             // We scale the context window by remaining memory.
-             let calculated = ((vram_mb - 1500.0) * 2.0) as i32;
+             // 1. User Safety Margin: Reserve 10% of currently free VRAM
+             let fluid_safety_margin = vram_mb * 0.10;
              
-             let limit = calculated.clamp(512, 8192) as u32;
+             // 2. Real Model Weight Calculation (File System Scan)
+             let mut real_model_weights = 0.0;
+             if let Ok(entries) = std::fs::read_dir(&gguf_dir) {
+                 for entry in entries.flatten() {
+                     if let Ok(meta) = entry.metadata() {
+                         if entry.path().extension().map_or(false, |e| e == "gguf") {
+                             real_model_weights += meta.len() as f64 / 1_000_000.0;
+                         }
+                     }
+                 }
+             }
+             if real_model_weights == 0.0 { real_model_weights = 2200.0; } // Fallback if scan fails
+
+             // 3. Estimated Runtime Overhead (CUDA Context + scratch buffers) ~ 500MB
+             let runtime_overhead = 500.0;
+
+             let usable_fluid_vram = vram_mb - fluid_safety_margin - real_model_weights - runtime_overhead;
+
+             // 4. Calculate Context Limit
+             // KV Cache Cost per token (BF16) approx: 180KB
+             let mb_per_1k_tokens = 180.0; 
+
+             let limit = if usable_fluid_vram <= 0.0 {
+                 println!("[CONFIG] VRAM tight (Free: {:.0}MB, W: {:.0}MB). Minimal context.", vram_mb, real_model_weights);
+                 512 // Absolute minimum
+             } else {
+                 let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
+                 capacity.clamp(512.0, 32768.0) as u32
+             };
              
-             println!("[CONFIG] Dynamic Context: VRAM {:.0} MB -> {} Tokens (Range: 512-8192)", vram_mb, limit);
+             println!("[CONFIG] Fluid Context Calc: Free {:.0}MB - Safety {:.0}MB - Weights {:.0}MB - Overhead {:.0}MB = {:.0}MB for KV. -> Limit: {}", 
+                vram_mb, fluid_safety_margin, real_model_weights, runtime_overhead, usable_fluid_vram, limit);
              limit
         } else {
              println!("[CONFIG] CPU Mode or Unknown VRAM. Defaulting to 2048 tokens.");
              2048
         };
         println!("[CONFIG] Final Token limit set to: {}", max_tokens_limit);
-
-        let base_path = std::fs::canonicalize("src-tauri/models")
-            .or_else(|_| std::fs::canonicalize("models"))?;
         
         // --- Init Embedding Model (Gemma-300m) ---
         let embedding_model_path = base_path.join("embeddinggemma-300m");
-        let embedding_model = if embedding_model_path.exists() {
-            println!("[MODEL-01] Loading Embedding Model from: {:?}", embedding_model_path);
-            match EmbeddingModel::new(&embedding_model_path) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    println!("⚠️ [WARNING] Failed to load Embedding Model: {}", e);
-                    None
-                }
-            }
-        } else {
-            println!("⚠️ [WARNING] Embedding model path not found: {:?}", embedding_model_path);
-            None
-        };
-
-        let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         let model_dir = if gguf_dir.exists() { gguf_dir } else { base_path };
         let model_path = model_dir.to_str().unwrap().to_string();
 
@@ -229,6 +239,21 @@ impl LogisModel {
         };
 
         println!("[MODEL-02] Qwen3-VL Generator initialized successfully.");
+
+        // Restore Embedding Model Initialization
+        let embedding_model = if embedding_model_path.exists() {
+            println!("[MODEL-01] Loading Embedding Model from: {:?}", embedding_model_path);
+            match EmbeddingModel::new(&embedding_model_path) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    println!("⚠️ [WARNING] Failed to load Embedding Model: {}", e);
+                    None
+                }
+            }
+        } else {
+            println!("⚠️ [WARNING] Embedding model path not found: {:?}", embedding_model_path);
+            None
+        };
 
         Ok(Self {
             generator: Arc::new(Mutex::new(generator)),
@@ -548,6 +573,15 @@ impl LogisModel {
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle) -> anyhow::Result<Value> {
         println!("[DEBUG] process_image_full called with path: {}", image_path);
+        
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    println!("[VRAM-LOG-PROCESS-START] Free: {:.2} MB", mem.free as f64 / 1_000_000.0);
+                }
+            }
+        }
+
         let log_file = "debug_log.txt";
         let log = |msg: &str| {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {

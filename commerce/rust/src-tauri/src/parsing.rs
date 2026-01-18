@@ -1,5 +1,6 @@
 use scraper::{Html, Node, Selector};
 use ego_tree::NodeRef;
+use regex::Regex;
 
 #[derive(PartialEq)]
 pub enum PugMode {
@@ -7,9 +8,25 @@ pub enum PugMode {
     FullContent,
 }
 
-pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
-    let document = Html::parse_document(html);
+pub fn pre_clean_html(html: &str) -> String {
+    // Combine regexes for single-pass cleaning (Script, Style, SVG, Comments)
+    // Note: Recursive nested tags (like SVG inside SVG) aren't handled perfectly by Regex, 
+    // but sufficient for cleaning.
+    // Pattern: 
+    // 1. Comments: <!--.*?-->
+    // 2. Tags with content: <(script|style|svg)[^>]*>.*?</\1>
+    
+    // Using a non-greedy dot match `.*?` with `s` flag (dot matches newline)
+    let re = Regex::new(r"(?is)(<!--.*?-->)|(<(script|style|svg|noscript)[^>]*>.*?</\3>)").unwrap();
+    
+    re.replace_all(html, "").to_string()
+}
+
+pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
     let mut pug_output = String::new();
+    // Pre-allocate decent size to avoid reallocs
+    pug_output.reserve(1024 * 10); 
+    
     let mut found_body = false;
     for child in document.tree.root().children() {
         if let Some(element) = child.value().as_element() {
@@ -31,13 +48,19 @@ pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
     pug_output
 }
 
-pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMode) -> String {
+pub fn convert_to_clean_pug(html: &str, mode: PugMode) -> String {
     let document = Html::parse_document(html);
+    convert_doc_to_clean_pug(&document, mode)
+}
+
+pub fn convert_doc_to_clean_pug_selector(document: &Html, selector_str: &str, mode: PugMode) -> String {
     let selector = match Selector::parse(selector_str) {
         Ok(s) => s,
         Err(_) => return String::new(),
     };
     let mut pug_output = String::new();
+    pug_output.reserve(1024 * 5);
+
     for node in document.tree.root().descendants() {
         if let Some(element_ref) = scraper::ElementRef::wrap(node) {
             if selector.matches(&element_ref) {
@@ -49,24 +72,49 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
     pug_output
 }
 
+pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMode) -> String {
+    let document = Html::parse_document(html);
+    convert_doc_to_clean_pug_selector(&document, selector_str, mode)
+}
+
 fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode) {
+    // Safety break for deep recursion
+    if indent_level > 50 { return; }
+
     let indent = "    ".repeat(indent_level);
     match node.value() {
         Node::Element(element) => {
             let tag_name = element.name();
-            if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head"].contains(&tag_name) { return; }
+            // Expanded blacklist
+            if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use"].contains(&tag_name) { return; }
+            
             if tag_name == "img" {
                 if let Some(src) = element.attr("src") {
-                    if src.contains("base64") { return; }
+                    if src.len() > 1000 || src.contains("base64") { return; }
                 }
             }
-            let mut line = format!("{}{}", indent, tag_name);
+            
+            let mut line = String::with_capacity(64);
+            line.push_str(&indent);
+            line.push_str(tag_name);
+
             let mut attrs = Vec::new();
-            if let Some(id) = element.id() { line.push_str(&format!("#{}", id)); }
-            for class in element.classes() { line.push_str(&format!(".{}", class)); }
+            if let Some(id) = element.id() { 
+                line.push('#');
+                line.push_str(id);
+            }
+            for class in element.classes() { 
+                line.push('.');
+                line.push_str(class);
+            }
+            
             match mode {
                 PugMode::StructureOnly => {
-                    if let Some(val) = element.attr("href") { attrs.push(format!("href='{}'", val)); }
+                    if let Some(val) = element.attr("href") { 
+                         // Truncate long hrefs
+                         let val = if val.len() > 200 { &val[..200] } else { val };
+                         attrs.push(format!("href='{}'", val)); 
+                    }
                 },
                 PugMode::FullContent => {
                     for (key, value) in element.attrs() {
@@ -75,27 +123,44 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                              if ["checked", "selected", "disabled", "readonly"].contains(&key) {
                                  attrs.push(key.to_string());
                              } else {
-                                 let safe_val = value.replace("\"", "'" ).replace("\n", "");
-                                 attrs.push(format!(r#"{}='{}'"#, key, safe_val));
+                                 // Truncate overly long attribute values to save memory/tokens
+                                 let val_clean = value.replace("\"", "'" ).replace("\n", "");
+                                 let val_trunc = if val_clean.len() > 300 { 
+                                     format!("{}...", &val_clean[..300]) 
+                                 } else { 
+                                     val_clean 
+                                 };
+                                 attrs.push(format!(r#"{}='{}'"#, key, val_trunc));
                              }
                         }
                     }
                 }
             }
-            if !attrs.is_empty() { line.push_str(&format!("({})", attrs.join(" "))); }
+            if !attrs.is_empty() { 
+                line.push('(');
+                line.push_str(&attrs.join(" "));
+                line.push(')');
+            }
+            
             output.push_str(&line);
             output.push('\n');
+            
             for child in node.children() { generate_pug_lines(child, indent_level + 1, output, mode); }
         },
         Node::Text(text) => {
             if *mode == PugMode::FullContent {
                 let content = text.trim();
                 if !content.is_empty() {
-                    for line in content.lines() {
+                    // Truncate very long text nodes
+                    let content_trunc = if content.len() > 2000 { &content[..2000] } else { content };
+                    
+                    for line in content_trunc.lines() {
                         let trimmed_line = line.trim();
                         if !trimmed_line.is_empty() {
-                            output.push_str(&format!("{}| {}
-", indent, trimmed_line.replace("\"", "'" )));
+                            output.push_str(&indent);
+                            output.push_str("| ");
+                            output.push_str(&trimmed_line.replace("\"", "'" ));
+                            output.push('\n');
                         }
                     }
                 }
@@ -107,8 +172,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
     }
 }
 
-pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> Vec<String> {
-    let document = Html::parse_document(html);
+pub fn split_doc_to_pug_list(document: &Html, selector_str: &str, mode: PugMode) -> Vec<String> {
     let selector = match Selector::parse(selector_str) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -118,6 +182,7 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
         if let Some(element_ref) = scraper::ElementRef::wrap(node) {
             if selector.matches(&element_ref) {
                  let mut pug_output = String::new();
+                 pug_output.reserve(2048);
                  generate_pug_lines(node, 0, &mut pug_output, &mode);
                  if !pug_output.trim().is_empty() {
                      pug_list.push(pug_output);
@@ -126,6 +191,11 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
         }
     }
     pug_list
+}
+
+pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> Vec<String> {
+    let document = Html::parse_document(html);
+    split_doc_to_pug_list(&document, selector_str, mode)
 }
 
 pub fn map_outline(language: &str) -> String {

@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use nvml_wrapper::Nvml;
 
 use crate::{
     chat_template::ChatTemplate,
@@ -73,7 +74,13 @@ impl Qwen3VLGenerateModel {
                 println!("[DEBUG] main model content read successfully.");
                 
                 println!("[DEBUG] Initializing QuantizedQwen3VLModel...");
-                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &device, dtype)?;
+                
+                // Calculate KV Cache Reservation
+                let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
+                // Heuristic: ~180KB per token for Qwen2-VL-2B (BF16)
+                let kv_reserve = max_tokens * 180_000;
+                
+                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &device, dtype, kv_reserve)?;
                 println!("[DEBUG] QuantizedQwen3VLModel initialized.");
                 ModelVariant::Quantized(model)
             } else if let Some(main) = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }) {
@@ -85,7 +92,11 @@ impl Qwen3VLGenerateModel {
                  // We'll duplicate for now, assuming combined.
                  let mut file2 = std::fs::File::open(&main)?; 
                  let content2 = gguf_file::Content::read(&mut file2)?;
-                 let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &device, dtype)?;
+                 
+                 let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
+                 let kv_reserve = max_tokens * 180_000;
+                 
+                 let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &device, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
             } else {
                  return Err(anyhow!("No valid GGUF model found"));
@@ -174,7 +185,17 @@ impl Qwen3VLGenerateModel {
         // Wrap generation in a closure/block to ensure cleanup happens
         let generation_result: Result<Vec<u32>> = (|| {
             let mut generate = Vec::new();
-            for _ in 0..sample_len {
+            for i in 0..sample_len {
+                if i % 10 == 0 { // Log every 10 tokens to reduce spam
+                    if let Ok(nvml) = Nvml::init() {
+                        if let Ok(dev) = nvml.device_by_index(0) {
+                            if let Ok(mem) = dev.memory_info() {
+                                println!("[VRAM-LOG-GEN-STEP {}] Free: {:.2} MB", i, mem.free as f64 / 1_000_000.0);
+                            }
+                        }
+                    }
+                }
+
                 let logits = match &mut self.qwen3_vl {
                     ModelVariant::Standard(m) => m.forward(
                         &input_ids,

@@ -327,6 +327,7 @@ impl QuantizedQwen3VLTextModel {
         base_name: &str,
         device: &Device,
         dtype: DType,
+        kv_reserve: u64, // New param
     ) -> Result<Self> {
         // Embeddings: Try standard and GGUF names
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
@@ -366,11 +367,11 @@ impl QuantizedQwen3VLTextModel {
         let estimated_activation_buffer = 20_000_000; // 20MB buffer for activations
         let cost_per_layer = if layer_weight_size > 0 { layer_weight_size + estimated_activation_buffer } else { 60_000_000 }; // Fallback to 60MB
 
-        let mut safety_floor: u64 = 300_000_000; // Default floor
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
+        let mut safety_floor: u64 = 0;
 
-        // 2. Get System VRAM & Dynamic Safety Floor
+        // 2. Get System VRAM & Set Dynamic Safety Floor (10% of Fluid Resource + KV Reserve)
         if current_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
@@ -378,13 +379,13 @@ impl QuantizedQwen3VLTextModel {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
                          
-                         // Dynamic Floor: 8% of Total VRAM or 300MB, whichever is larger
-                         // For 4GB card -> ~320MB. For 24GB card -> ~1.9GB.
-                         let dynamic_floor = (mem.total as f64 * 0.08) as u64;
-                         safety_floor = std::cmp::max(300_000_000, dynamic_floor);
+                         // USER REQUIREMENT: Reserve 10% of *currently available* fluid resources
+                         // PLUS the guaranteed space for KV Cache (calculated from max_tokens)
+                         let fluid_margin = (mem.free as f64 * 0.10) as u64;
+                         safety_floor = fluid_margin + kv_reserve;
 
-                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Target Floor: {:.2} GB. Calc Cost/Layer: {:.2} MB", 
-                            mem.total as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e9, cost_per_layer as f64/1e6);
+                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Floor(10%+KV): {:.2} MB. Cost/Layer: {:.2} MB", 
+                            mem.total as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
                      }
                  }
              }
@@ -394,15 +395,16 @@ impl QuantizedQwen3VLTextModel {
         for layer_idx in 0..config.num_hidden_layers {
             // Organic Check
             if current_device.is_cuda() && is_vram_checked {
-                 // Check if we have budget for this layer + safety floor
+                 // Check if we have budget: Layer Cost + Safety Floor
+                 // We simulate the depletion of VRAM as we load layers.
                  if simulated_free_vram > (cost_per_layer + safety_floor) {
                      // Allocating to GPU
                      simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                  } else {
                      // Budget exhausted
                      if current_device.is_cuda() { // Only print once when switching
-                        println!("[OFFLOAD] Budget Exhausted (Est. Free: {:.2} MB). Switching Layer {} and subsequent to CPU.", 
-                            simulated_free_vram as f64/1e6, layer_idx);
+                        println!("[OFFLOAD] Budget Exhausted (Est. Free: {:.2} MB < Floor {:.2} MB + Layer {:.2} MB). Switching Layer {} and subsequent to CPU.", 
+                            simulated_free_vram as f64/1e6, safety_floor as f64/1e6, cost_per_layer as f64/1e6, layer_idx);
                      }
                      current_device = Device::Cpu;
                  }
@@ -556,9 +558,23 @@ impl QuantizedQwen3VLModel {
         reader_vision: &mut R2,
         device: &Device,
         dtype: DType,
+        kv_reserve: u64, // New param
     ) -> Result<Self> {
         // Shared NVML instance for this scope
         let nvml = Nvml::init().ok();
+
+        // --- Organic Budget Calculation for Vision ---
+        let mut vision_weight_size = 0_u64;
+        for (_, info) in &ct_vision.tensor_infos {
+            let elements: usize = info.shape.elem_count();
+            let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
+            vision_weight_size += size as u64;
+        }
+        // Vision Runtime Overhead (Activation buffers ~ 300MB est. dynamically?)
+        // We'll use a dynamic activation buffer based on hidden size if possible, or a safe dynamic factor.
+        // For now, let's assume 30% of weight size as activation overhead for Vision.
+        let vision_overhead = (vision_weight_size as f64 * 0.30) as u64;
+        let vision_total_cost = vision_weight_size + vision_overhead;
 
         // 1. Vision Model - Dynamic Loading
         let mut vision_device = device.clone();
@@ -566,9 +582,12 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         // Vision Cost (~600MB) + Safety Buffer (300MB) = 900MB Required
-                         if mem.free < 900_000_000 {
-                             println!("[OFFLOAD] VRAM Free: {:.2} GB. Switching Vision Model to CPU.", mem.free as f64/1e9);
+                         // Fluid Safety Floor: 10% of Current Free + KV Reserve
+                         let safety_floor = (mem.free as f64 * 0.10) as u64 + kv_reserve;
+                         
+                         if mem.free < (vision_total_cost + safety_floor) {
+                             println!("[OFFLOAD] Vision Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Vision to CPU.", 
+                                mem.free as f64/1e9, vision_total_cost as f64/1e9, safety_floor as f64/1e9);
                              vision_device = Device::Cpu;
                          }
                      }
@@ -583,8 +602,20 @@ impl QuantizedQwen3VLModel {
         let visual = Qwen3VLVisionModel::new(config.vision_config.clone(), vb_visual.pp("visual"))?;
         
         // Load Language Model from main file
-        let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", device, dtype)?;
+        let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", device, dtype, kv_reserve)?;
         
+        // --- Organic Budget Calculation for Head ---
+        let mut head_weight_size = 0_u64;
+        let head_names = ["lm_head.weight", "output.weight", "token_embd.weight"];
+        for name in head_names {
+            if let Some(info) = ct_main.tensor_infos.get(name) {
+                let elements: usize = info.shape.elem_count();
+                let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
+                head_weight_size = size as u64;
+                break;
+            }
+        }
+
         // LM Head - Check VRAM again to decide device
         let nvml = Nvml::init().ok();
         let mut head_device = device.clone();
@@ -592,8 +623,11 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         if mem.free < 200_000_000 { // 200MB threshold (Safety Floor preserved this)
-                             println!("[OFFLOAD] VRAM Free: {:.2} GB. Switching Head to CPU.", mem.free as f64/1e9);
+                         let safety_floor = (mem.free as f64 * 0.10) as u64 + kv_reserve;
+                         
+                         if mem.free < (head_weight_size + safety_floor) {
+                             println!("[OFFLOAD] Head Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Head to CPU.", 
+                                mem.free as f64/1e9, head_weight_size as f64/1e9, safety_floor as f64/1e9);
                              head_device = Device::Cpu;
                          }
                      }
@@ -691,11 +725,31 @@ impl QuantizedQwen3VLModel {
         cache_position: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        // [VRAM-LOG] Start of Forward
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    println!("[VRAM-LOG-FWD-START] Free: {:.2} MB", mem.free as f64 / 1_000_000.0);
+                }
+            }
+        }
+
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
         
         if let Some(pixel_values) = pixel_values {
             if let Some(image_grid_thw) = image_grid_thw {
+                 println!("[VRAM-LOG] Starting Vision Encoder...");
                  let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?;
+                 
+                 // [VRAM-LOG] After Vision
+                 if let Ok(nvml) = Nvml::init() {
+                    if let Ok(dev) = nvml.device_by_index(0) {
+                        if let Ok(mem) = dev.memory_info() {
+                            println!("[VRAM-LOG-FWD-VISION-DONE] Free: {:.2} MB", mem.free as f64 / 1_000_000.0);
+                        }
+                    }
+                 }
+
                  let image_embeds = Tensor::cat(&image_embeds, 0)?;
                  let vision_mask = self.get_placeholder_mask(input_ids, true)?;
                  inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
