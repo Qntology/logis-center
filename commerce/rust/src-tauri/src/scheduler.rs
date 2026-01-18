@@ -796,7 +796,7 @@ Definition: {}
             let vector = if let Some(model) = model_guard.as_ref() {
                 let text_clone = text_to_embed.clone();
                 tokio::select!{
-                    res = model.get_embedding(text_clone) => res.ok(),
+                    res = model.get_embedding(text_clone) => Some(res?),
                     _ = async {
                         loop {
                             if cancellation_token.load(Ordering::Relaxed) { break; }

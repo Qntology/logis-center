@@ -84,6 +84,9 @@ impl RotaryEmbedding {
         let cos = self.cos.narrow(0, 0, seq_len)?;
         let sin = self.sin.narrow(0, 0, seq_len)?;
         
+        let cos = Tensor::cat(&[&cos, &cos], candle_core::D::Minus1)?;
+        let sin = Tensor::cat(&[&sin, &sin], candle_core::D::Minus1)?;
+
         let apply_rotary = |x: &Tensor| -> candle_core::Result<Tensor> {
             let last_dim = x.dim(candle_core::D::Minus1)?;
             let x1 = x.narrow(candle_core::D::Minus1, 0, last_dim / 2)?;
@@ -235,7 +238,10 @@ impl Model {
     }
 
     pub fn forward(&self, input_ids: &Tensor) -> candle_core::Result<Tensor> {
-        let mut x = self.embed_tokens.forward(input_ids)?;
+        let (b, s) = input_ids.dims2()?;
+        let input_flat = input_ids.flatten_all()?;
+        let mut x = self.embed_tokens.forward(&input_flat)?;
+        x = x.reshape((b, s, ()))?;
         
         let scale = (x.dim(candle_core::D::Minus1)? as f64).sqrt();
         x = (x * scale)?;

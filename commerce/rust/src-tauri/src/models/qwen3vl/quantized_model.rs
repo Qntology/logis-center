@@ -74,9 +74,13 @@ impl QLinear {
             xs.clone() // QMatMul likely needs owned or cow, but here we clone for safety
         };
 
-        // QMatMul typically expects F32 input
+        // QMatMul typically expects F32 input and 2D shape [tokens, hidden]
         let xs_f32 = xs.to_dtype(DType::F32)?;
-        let out = self.inner.forward(&xs_f32)?;
+        let (b, s, h) = xs_f32.dims3()?;
+        let xs_f32_flat = xs_f32.reshape((b * s, h))?;
+        
+        let out = self.inner.forward(&xs_f32_flat)?;
+        let out = out.reshape((b, s, ()))?;
         
         // Cast back to target dtype (from bias if available, else xs dtype)
         let target_dtype = self.bias.as_ref().map(|b| b.dtype()).unwrap_or(xs.dtype());
@@ -794,7 +798,11 @@ impl QuantizedQwen3VLModel {
         cache_position: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        // Flatten input_ids to Rank 1 for Embedding, then reshape back to Rank 3
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let flat_input = input_ids.flatten_all()?;
+        let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
+        let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
         
         if let Some(pixel_values) = pixel_values {
             if let Some(image_grid_thw) = image_grid_thw {
