@@ -330,20 +330,15 @@ async fn process_task(
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
     // Chunking Logic for Classification
-    // Instead of truncating, we ingest the whole light_pug structure
     let classify_chunks = chunk_text(&light_pug, 4000, 500);
     let classify_chunks_len = classify_chunks.len();
     
-    // Ingest chunks for Classification
+    // Lock model once for the entire classification phase
+    let model_guard = model_mutex.lock().await;
+
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         for (i, chunk) in classify_chunks.iter().enumerate() {
-            let is_last = i == classify_chunks_len - 1;
-            
-            // For the last chunk, we don't just "ingest", we ask the question (Step 1)
-            // But actually, it's cleaner to ingest ALL, then ask.
-            // Let's ingest all first.
-            
             let prompt = format!(
 r#"[CONTEXT]
 You are reading the structural skeleton (Pug/Jade) of a webpage to understand its type and layout.
@@ -364,24 +359,29 @@ Just say "ACKNOWLEDGED"."#,
                 "spinner": "⠋"
             }));
 
-            tokio::select!{
+            let res: Result<String> = tokio::select!{
                 res = model.chat_with_spinner(
                     "You are a helpful assistant.", 
                     &prompt,
                     &app_handle_clone, 
                     "extraction-progress", 
                     json!({ "category": "Classification Ingestion" }), 
-                    20, // Minimal tokens
+                    20, 
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
-                ) => res?,
+                ) => res,
                 _ = async {
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
-                } => { return Err(anyhow::anyhow!("Task cancelled")); }
-            }
+                } => { 
+                    drop(model_guard);
+                    cleanup_task_resources(&task.id);
+                    return Err(anyhow::anyhow!("Task cancelled")); 
+                }
+            };
+            res?;
         }
     }
 
@@ -390,22 +390,23 @@ Just say "ACKNOWLEDGED"."#,
         "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋"
     }));
     
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    if cancellation_token.load(Ordering::Relaxed) { 
+        drop(model_guard);
+        cleanup_task_resources(&task.id);
+        return Err(anyhow::anyhow!("Task cancelled")); 
+    }
 
     let mut final_page_info = json!({});
     
-    // Step 1: Identify Type (Now context is fully loaded in task.id session)
+    // Step 1: Identify Type
     let page_type_res = if let Some(model) = model_guard.as_ref() {
         let system_text = parsing::page_type_prompt(language);
         let app_handle_clone = app_handle.clone();
-
-        // We send the prompt as a new User message. The context is already in KV cache.
-        // We don't need to re-send the input.
         let prompt = "Now that you have read the full structure, analyze it and identify the primary category.";
 
-        tokio::select!{
+        let res: Result<String> = tokio::select!{
             res = model.chat_with_spinner(
-                &system_text, // Use system prompt instruction
+                &system_text, 
                 prompt,
                 &app_handle_clone, 
                 "extraction-progress", 
@@ -413,14 +414,19 @@ Just say "ACKNOWLEDGED"."#,
                 256, 
                 Some(cancellation_token.clone()), 
                 Some(task.id.clone())
-            ) => res?,
+            ) => res,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-            } => { return Err(anyhow::anyhow!("Task cancelled")); }
-        }
+            } => { 
+                drop(model_guard);
+                cleanup_task_resources(&task.id);
+                return Err(anyhow::anyhow!("Task cancelled")); 
+            }
+        };
+        res?
     } else { "{}".to_string() };
     
     println!("[Scheduler] Checkpoint: Classification End");
@@ -435,19 +441,16 @@ Just say "ACKNOWLEDGED"."#,
 
     final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
-    // Step 2: Identify Selectors (Building on History)
+    // Step 2: Identify Selectors
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type), "spinner": "⠋"
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type, language); // This returns the prompt string
+        let next_question = parsing::page_selectors_prompt(&page_type, language);
         let app_handle_clone = app_handle.clone();
-
-        // page_selectors_prompt returns the full prompt text including TASK/SCHEMA.
-        // We send it as user message.
         
-        tokio::select!{
+        let res: Result<String> = tokio::select!{
             res = model.chat_with_spinner(
                 "You are a helpful assistant.", 
                 &next_question,
@@ -459,14 +462,19 @@ Just say "ACKNOWLEDGED"."#,
                 256, 
                 Some(cancellation_token.clone()), 
                 Some(task.id.clone())
-            ) => res?,
+            ) => res,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-            } => { return Err(anyhow::anyhow!("Task cancelled")); }
-        }
+            } => { 
+                drop(model_guard);
+                cleanup_task_resources(&task.id);
+                return Err(anyhow::anyhow!("Task cancelled")); 
+            }
+        };
+        res?
     } else { "{}".to_string() };
     drop(model_guard);
     
