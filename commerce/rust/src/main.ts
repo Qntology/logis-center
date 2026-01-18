@@ -283,6 +283,8 @@ btnStopTask?.addEventListener("click", async () => {
 
     // 2. Update UI immediately to show feedback
     btnStopTask.innerText = "Stopping...";
+    if (detailTitle) detailTitle.innerText = "🛑 Stopping...";
+    isExtracting = false; // Prevent further UI updates from blocking logic
     
     try {
         // 3. Send command

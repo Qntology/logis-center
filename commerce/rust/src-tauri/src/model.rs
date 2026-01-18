@@ -16,7 +16,7 @@ use crate::utils::get_device;
 use candle_core::{Device, DType};
 use image::{DynamicImage, GenericImageView};
 use serde_json::{Value, json, Map};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use regex::Regex;
 use tauri::Emitter;
 use std::io::Cursor;
@@ -193,7 +193,15 @@ impl LogisModel {
                  1024 // Try 1024 anyway instead of 512, trusting chunking
              } else {
                  let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
-                 capacity.clamp(1024.0, 32768.0) as u32
+                 
+                 // [Optimization] For < 6GB VRAM, cap context at 4096 to prioritize Layer Offloading to GPU.
+                 // 4096 is enough for our 3000-char chunks.
+                 if detected_vram < 6_000_000_000 {
+                     println!("[CONFIG] Low VRAM (<6GB) detected. Capping context to 4096 to save VRAM for layers.");
+                     capacity.clamp(1024.0, 4096.0) as u32
+                 } else {
+                     capacity.clamp(1024.0, 32768.0) as u32
+                 }
              };
              
              println!("[CONFIG] Final Context Limit: {}", limit);
@@ -270,7 +278,7 @@ impl LogisModel {
         self.is_cpu_mode
     }
 
-    pub async fn chat(&self, system: &str, user_input: &str) -> anyhow::Result<String> {
+    pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
         let user_text = user_input.to_string();
@@ -306,7 +314,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }).await?
@@ -319,7 +327,8 @@ impl LogisModel {
         app_handle: &tauri::AppHandle,
         event_name: &str,
         base_payload: Value,
-        max_tokens: usize
+        max_tokens: usize,
+        cancel_token: Option<Arc<AtomicBool>>
     ) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
@@ -353,7 +362,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))?;
             Ok(response)
         });
 
@@ -389,7 +398,8 @@ impl LogisModel {
         app_handle: &tauri::AppHandle,
         event_name: &str,
         base_payload: Value,
-        max_tokens: usize
+        max_tokens: usize,
+        cancel_token: Option<Arc<AtomicBool>>
     ) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
         
@@ -429,7 +439,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         let spinner = Spinner::dots();
@@ -457,7 +467,7 @@ impl LogisModel {
         }
     }
 
-    fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>) -> anyhow::Result<String> {
+    fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let mut gen = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
         
         let mut content_parts = Vec::new();
@@ -493,7 +503,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -502,7 +512,8 @@ impl LogisModel {
         image: Option<DynamicImage>, 
         app_handle: &tauri::AppHandle,
         event_name: &str,
-        base_payload: Value
+        base_payload: Value,
+        cancel_token: Option<Arc<AtomicBool>>
     ) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let max_tok = self.max_tokens_limit;
@@ -543,7 +554,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))
         });
         
         let spinner = Spinner::dots();
@@ -574,7 +585,7 @@ impl LogisModel {
         }
     }
 
-    pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle) -> anyhow::Result<Value> {
+    pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
         println!("[DEBUG] process_image_full called with path: {}", image_path);
         
         if let Ok(nvml) = Nvml::init() {
@@ -634,7 +645,8 @@ impl LogisModel {
                 Some(class_img), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing" })
+                json!({ "summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing" }),
+                cancel_token.clone()
             ).await?;
 
             log(&format!("[DEBUG] Raw Classification Response: {}", res));
@@ -688,7 +700,8 @@ impl LogisModel {
                 
                                     "extraction-progress", 
                 
-                                    json!({ "summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat })
+                                    json!({ "summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat }),
+                                    cancel_token.clone()
                 
                                 ).await?
                 
@@ -726,7 +739,7 @@ impl LogisModel {
         let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}}]";
         let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
         
-        let res = self.run_inference_text(prompt, None)?;
+        let res = self.run_inference_text(prompt, None, None)?;
         if let Some(json_val) = extract_json_from_text(&res) {
             if json_val.is_array() {
                 // Ensure the keys match what lib.rs search_documents expects ($header, $$document_type)
@@ -773,7 +786,7 @@ REQUIRED JSON FORMAT:
 Query: {}
 JSON Output:"###, schema_def, doc_type, query);
 
-        let res = self.run_inference_text(prompt, None)?;
+        let res = self.run_inference_text(prompt, None, None)?;
         if let Some(json_val) = extract_json_from_text(&res) {
             return Ok(json_val);
         }
@@ -790,7 +803,7 @@ JSON Output:"###, schema_def, doc_type, query);
 Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
 
         let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
-        let res = self.run_inference_text(prompt, None)?;
+        let res = self.run_inference_text(prompt, None, None)?;
         
         let intent = extract_json_from_text(&res)
             .and_then(|v| v.get("intent").and_then(|s| s.as_str()).map(|s| s.to_string()))
@@ -800,7 +813,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
     }
 
     // --- Ported from Python (logic.py) ---
-    pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle) -> anyhow::Result<String> {
+    pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let spinner = Spinner::dots();
         let mut status_history = format!("### 🔍 Deep Research: '{}'\n\n", query);
 
@@ -823,7 +836,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
             // In a real implementation, we might want to stream this too, but for now we wait for the step result
-            let step_result = self.run_inference_text(prompt, None)?;
+            let step_result = self.run_inference_text(prompt, None, cancel_token.clone())?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
@@ -834,7 +847,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
         status_history.push_str("### 📊 Final Research Report\n\n");
         let final_prompt = format!("CONTEXT: {}\nQUERY: {}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
         
-        let report = self.run_inference_text(final_prompt, None)?;
+        let report = self.run_inference_text(final_prompt, None, cancel_token)?;
         status_history.push_str(&report);
         
         let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));

@@ -20,6 +20,7 @@ use crate::{
     },
     openai_types::ChatCompletionParameters,
 };
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 enum ModelVariant {
     Standard(Qwen3VLModel),
@@ -125,7 +126,7 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>) -> Result<String> {
         let temperature = match mes.temperature {
             None => self.generation_config.temperature,
             Some(tem) => tem as f32,
@@ -201,6 +202,13 @@ impl Qwen3VLGenerateModel {
         let generation_result: Result<Vec<u32>> = (|| {
             let mut generate = Vec::new();
             for i in 0..sample_len {
+                // Check cancellation
+                if let Some(flag) = &cancel_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        return Err(anyhow!("Generation cancelled"));
+                    }
+                }
+
                 if i % 10 == 0 { // Log every 10 tokens to reduce spam
                     if let Ok(nvml) = Nvml::init() {
                         if let Ok(dev) = nvml.device_by_index(0) {
