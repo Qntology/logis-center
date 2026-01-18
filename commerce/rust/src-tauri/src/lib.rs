@@ -29,7 +29,13 @@ pub struct AppState {
 #[tauri::command]
 async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, String> {
     state.cancellation_token.store(true, Ordering::SeqCst);
-    Ok("Stop signal sent.".to_string())
+    
+    // Force drop model to release VRAM/RAM
+    let mut model_guard = state.model.lock().await;
+    *model_guard = None;
+    println!("[STOP] Model dropped and resources released.");
+
+    Ok("Stop signal sent and resources released.".to_string())
 }
 
 #[tauri::command]
