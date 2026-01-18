@@ -436,8 +436,12 @@ listen("extraction-progress", (event: any) => {
     // Update the button spinner
     if (btnExtract) {
         if (payload.spinner) btnExtract.innerText = payload.spinner;
-        if (payload.category === "Done") {
-            setTimeout(() => { btnExtract.innerText = "⚡"; }, 2000);
+        
+        // If the task ended (Done or Error), reset the button after a delay
+        if (payload.category === "Done" || payload.category === "Error") {
+            setTimeout(() => { 
+                if (btnExtract) btnExtract.innerText = "⚡"; 
+            }, 2000);
         }
     }
 
@@ -467,15 +471,20 @@ listen("extraction-progress", (event: any) => {
          }
          
          if (payload.category === "Done" || payload.data) {
-             isExtracting = false; // Reset state
+             isExtracting = false; // Reset global state
              
              // Reset Buttons
-             if (btnStopTask) { btnStopTask.style.display = "none"; btnStopTask.innerText = "🛑"; }
+             if (btnStopTask) { 
+                 btnStopTask.style.display = "none"; 
+                 btnStopTask.innerText = "🛑"; 
+             }
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
 
-             const successText = payload.category === "Done" ? "Extraction Complete" : `<strong>${payload.category}</strong> extracted.`;
-             p.innerHTML = `<span style="margin-right:8px;">✅</span> <span>${successText}</span>`;
-             p.style.color = "#4ade80"; 
+             const isCancelled = payload.summary && payload.summary.includes("Cancelled");
+             const successText = isCancelled ? "Task Cancelled" : (payload.category === "Done" ? "Extraction Complete" : `<strong>${payload.category}</strong> extracted.`);
+             
+             p.innerHTML = `<span style="margin-right:8px;">${isCancelled ? "🛑" : "✅"}</span> <span>${successText}</span>`;
+             p.style.color = isCancelled ? "#ef4444" : "#4ade80"; 
              
              if(payload.data) {
                   // Show final JSON
@@ -486,13 +495,15 @@ listen("extraction-progress", (event: any) => {
                   pre.style.padding = "10px"; pre.style.borderRadius = "5px"; pre.style.marginTop = "10px";
                   pre.innerText = pretty;
                   
-                  // Check if pre already exists to avoid dupes (if multiple events fire)
                   if(!p.querySelector("pre")) {
-                      p.appendChild(pre); // Append inside the div or log container?
-                      // Better to append to log container to keep flow
                       extractionLog.appendChild(pre);
                   }
              }
+         } else if (payload.category === "Error") {
+             isExtracting = false;
+             if (btnStopTask) btnStopTask.style.display = "none";
+             p.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary}</span>`;
+             p.style.color = "#ef4444";
          } else {
              // Progress
              p.innerHTML = `<span style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner}</span> <span>${payload.summary}</span>`;
