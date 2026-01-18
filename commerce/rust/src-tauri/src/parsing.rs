@@ -17,7 +17,8 @@ pub fn pre_clean_html(html: &str) -> String {
     // 2. Tags with content: <(script|style|svg)[^>]*>.*?</\1>
     
     // Using a non-greedy dot match `.*?` with `s` flag (dot matches newline)
-    let re = Regex::new(r"(?is)(<!--.*?-->)|(<(script|style|svg|noscript)[^>]*>.*?</\3>)").unwrap();
+    // Expanded to avoid backreferences which are not supported in Rust regex crate
+    let re = Regex::new(r"(?is)(<!--.*?-->)|(<script[^>]*>.*?</script>)|(<style[^>]*>.*?</style>)|(<svg[^>]*>.*?</svg>)|(<noscript[^>]*>.*?</noscript>)").unwrap();
     
     re.replace_all(html, "").to_string()
 }
