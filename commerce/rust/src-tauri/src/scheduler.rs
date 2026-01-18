@@ -20,32 +20,37 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     let mut start = 0;
     
     while start < text.len() {
-        let mut end = (start + chunk_size).min(text.len());
+        let target_end = (start + chunk_size).min(text.len());
+        let mut end = target_end;
         
-        // Backtrack to the last newline to avoid splitting a Pug line
-        if end < text.len() {
-            if let Some(last_newline) = text[start..end].rfind('\n') {
-                end = start + last_newline + 1; 
+        // Find the NEXT newline after target_end to include the current line fully
+        if target_end < text.len() {
+            if let Some(next_newline) = text[target_end..].find('\n') {
+                // Include the full line by moving end to the newline position
+                end = target_end + next_newline + 1;
+            } else {
+                // If no more newlines are found, take the rest of the text
+                end = text.len();
             }
         }
         
         chunks.push(text[start..end].to_string());
         
-        if end == text.len() {
+        if end >= text.len() {
             break;
         }
         
         // Calculate next start with overlap
         let mut next_start = end.saturating_sub(overlap);
         
-        // Align start to the *next* newline to ensure the next chunk starts cleanly
-        if next_start < end {
-             if let Some(next_newline) = text[next_start..end].find('\n') {
-                 next_start = next_start + next_newline + 1;
+        // Align next_start to the START of a line (find the first newline in the overlap zone)
+        if next_start > start && next_start < end {
+             if let Some(line_start) = text[next_start..end].find('\n') {
+                 next_start = next_start + line_start + 1;
              }
         }
         
-        // Ensure progress
+        // Prevent infinite loops or zero progress
         if next_start >= end {
             next_start = end; 
         }
@@ -393,7 +398,7 @@ async fn process_task(
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             // Chunking for List Items
-            let chunks = chunk_text(item_pug, 6000, 500); 
+            let chunks = chunk_text(item_pug, 4000, 200); 
             let mut item_data = json!({});
             
             let _ = app_handle.emit("extraction-progress", json!({ 
@@ -402,20 +407,41 @@ async fn process_task(
 
             let model_guard = model_mutex.lock().await; 
 
-            for (field_name, field_prompt) in &fields_prompts {
+            for (field_name, field_schema) in &fields_prompts {
                 if field_name == "description" || field_name == "detail_images" { continue; }
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-                for chunk in &chunks {
+                for (chunk_idx, chunk) in chunks.iter().enumerate() {
                     let field_json_str = if let Some(model) = model_guard.as_ref() {
-                        let prompt = format!("{}
+                        let prompt = format!(
+r#"[CONTEXT]
+This is PART {}/{} of a Pug (Jade) template snippet representing a list item on a webpage.
+The snippet may start or end in the middle of a tag.
 
-Snippet:
-{}", field_prompt, chunk);
+[SCHEMA]
+Field: "{}"
+Definition: {}
+
+[INPUT SNIPPET]
+{}
+
+[INSTRUCTION]
+1. Analyze the SNIPPET to find the value for '{}'.
+2. Only extract data clearly visible in this snippet.
+3. Ignore broken tags/syntax at boundaries.
+4. Return valid JSON only: {{ "{}": value }}
+5. If not found, return empty JSON {{}}."#,
+                            chunk_idx + 1, chunks.len(),
+                            field_name, field_schema,
+                            chunk,
+                            field_name,
+                            field_name
+                        );
+
                         let app_handle_clone = app_handle.clone();
 
                         tokio::select!{
-                            res = model.chat_with_spinner("Extract ONLY the requested field. Return JSON.", 
+                            res = model.chat_with_spinner("You are a strict data extraction parser. Return valid JSON only.", 
                                 &prompt,
                                 &app_handle_clone, "extraction-progress", json!({ 
                                     "category": "Extraction", 
@@ -481,7 +507,7 @@ Snippet:
         let chunks = chunk_text(&content_pug, 8000, 1000); 
         let fields_prompts = parsing::item2json(page_type, &url, language);
         
-        for (field_name, field_prompt) in fields_prompts {
+        for (field_name, field_schema) in fields_prompts {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let _ = app_handle.emit("extraction-progress", json!({ 
@@ -493,16 +519,36 @@ Snippet:
             // Iterate over chunks and merge results
             for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 let field_json_str = if let Some(model) = model_guard.as_ref() {
-                    // Optimized Prompt for Pug Snippets
                     let prompt = format!(
-                        "CONTEXT: This is PART {}/{} of a Pug (HTML) template.\nTASK: {}\n\n[PUG SNIPPET]\n{}\n\nINSTRUCTION: Extract the field value if present in this snippet. Ignore incomplete tags at boundaries. Return valid JSON only.", 
-                        chunk_idx+1, chunks.len(), field_prompt, chunk
+r#"[CONTEXT]
+This is PART {}/{} of a Pug (Jade) template snippet representing a webpage.
+The snippet may start or end in the middle of a tag.
+
+[SCHEMA]
+Field: "{}"
+Definition: {}
+
+[INPUT SNIPPET]
+{}
+
+[INSTRUCTION]
+1. Analyze the SNIPPET to find the value for '{}'.
+2. Only extract data clearly visible in this snippet.
+3. Ignore broken tags/syntax at boundaries.
+4. Return valid JSON only: {{ "{}": value }}
+5. If not found, return empty JSON {{}}."#,
+                        chunk_idx + 1, chunks.len(),
+                        field_name, field_schema,
+                        chunk,
+                        field_name,
+                        field_name
                     );
+
                     let app_handle_clone = app_handle.clone();
 
                     tokio::select!{
                         res = model.chat_with_spinner(
-                            "You are a data extractor. Return JSON.", 
+                            "You are a strict data extraction parser. Return valid JSON only.", 
                             &prompt,
                             &app_handle_clone, "extraction-progress", json!({ 
                                 "category": "Extraction", 

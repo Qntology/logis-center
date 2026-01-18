@@ -387,9 +387,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> Vec<(String, St
         _ => {} // Do nothing for other page types
     }
 
-    fields.into_iter().map(|(k, schema)| {
-        (k.clone(), base_prompt.replace("{}", &k).replace("{{}}", &k).replace("{{}}", &schema))
-    }).collect()
+    fields.into_iter().collect()
 }
 
 pub fn list2json(language: &str) -> String {
