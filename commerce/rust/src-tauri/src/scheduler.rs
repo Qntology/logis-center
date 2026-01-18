@@ -235,7 +235,7 @@ async fn process_task(
                  tokio::select!{
                      res = model.chat_with_image_spinner(prompt_clone, Some(dynamic_image), &app_handle_clone, "extraction-progress", json!({ 
                         "category": "Vision Analysis", "summary": "Analyzing image content..."
-                    }), 1024, Some(cancellation_token.clone())) => res?,
+                    }), 1024, Some(cancellation_token.clone()), Some(task.id.clone())) => res?,
                      _ = async {
                          loop {
                              if cancellation_token.load(Ordering::Relaxed) { break; }

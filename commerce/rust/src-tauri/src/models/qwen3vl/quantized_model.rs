@@ -5,6 +5,7 @@ use candle_core::quantized::{gguf_file, QMatMul};
 use nvml_wrapper::Nvml;
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::collections::HashMap;
 
 use crate::{
     models::{
@@ -220,7 +221,10 @@ impl QuantizedQwen3VLTextAttention {
     pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
         if let Some((k, v)) = &self.kv_cache {
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-            candle_core::safetensors::save(&[("k", k), ("v", v)], &file)?;
+            let mut map = HashMap::new();
+            map.insert("k", k.clone());
+            map.insert("v", v.clone());
+            candle_core::safetensors::save(&map, &file)?;
             self.kv_cache = None;
         }
         Ok(())
