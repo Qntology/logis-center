@@ -118,7 +118,7 @@ pub async fn start_background_worker(
     println!("[Scheduler] Background worker started.");
     
     tokio::spawn(async move {
-        let mut delay_secs = 1; 
+        let mut delay_secs = 1;
         
         loop {
             sleep(Duration::from_secs(delay_secs)).await;
@@ -191,8 +191,7 @@ async fn process_task(
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle
-) -> Result<()>
-{
+) -> Result<()> {
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -342,27 +341,32 @@ async fn process_task(
     
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
+        let mut full_context_accumulated = String::new(); // Accumulate context here
+
         for (i, chunk) in classify_chunks.iter().enumerate() {
-            // PROOF LOG
+            // Append current chunk
+            full_context_accumulated.push_str(chunk);
+            full_context_accumulated.push('\n');
+
             println!("[Classification-Loop] Ingesting structural part {}/{} to LLM (Session: {})", i + 1, classify_chunks_len, task.id);
             
             let prompt = format!(
 r#"[CONTEXT]
-You are reading the structural skeleton (Pug/Jade) of a webpage to understand its type and layout.
-Part {}/{}.
+    You are reading the structural skeleton (Pug/Jade) of a webpage to understand its type and layout.
+    Here is the accumulated content so far:
 
-[INPUT SNIPPET]
-{}
+    [INPUT SNIPPET]
+    {}
 
-[INSTRUCTION]
-Read and memorize this structure. Do NOT generate JSON yet.
-Just say \"ACKNOWLEDGED\"."#,
-                i + 1, classify_chunks_len, chunk
+    [INSTRUCTION]
+    Read and memorize this structure. Do NOT generate JSON yet.
+    Just say "ACKNOWLEDGED"."#,
+                full_context_accumulated
             );
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Classification Ingestion", 
-                "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
+                "summary": format!("Reading structure part {}/{} ({} chars)...", i + 1, classify_chunks_len, full_context_accumulated.len()),
                 "spinner": "⠋"
             }));
 
@@ -434,6 +438,8 @@ Just say \"ACKNOWLEDGED\"."#,
         };
         res?
     } else { "{}".to_string() };
+    
+    println!("[Scheduler] Checkpoint: Classification End");
     
     let type_info = parse_json_from_llm(&page_type_res);
     let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
@@ -539,51 +545,48 @@ Just say \"ACKNOWLEDGED\"."#,
             // PROOF LOG
             println!("[List-Loop] Ingesting item part {}/{} to LLM (Session: {})", i + 1, total_items, list_session_id);
             
-            full_context_accumulated.push_str(&format!("---\nITEM {} ---
-{}", i + 1, item_pug));
+            full_context_accumulated.push_str(&format!("---\nITEM {} ---\n{}", i + 1, item_pug));
             full_context_accumulated.push('\n');
 
             let prompt = if is_last {
                 println!("[List-FINAL] All items ingested. Requesting FINAL JSON list extraction.");
                 let mut schema_definitions = String::new();
                 for (name, schema) in &fields_prompts {
-                    schema_definitions.push_str(&format!("### Field: {}
-Schema/Definition: {}
-\n", name, schema));
+                    schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
                 }
 
                 format!(
 r#"[CONTEXT]
-You have been reading a list of items from a webpage part by part. 
-Below is the COMPLETELY ACCUMULATED list of Pug (Jade) snippets.
+    You have been reading a list of items from a webpage part by part. 
+    Below is the COMPLETELY ACCUMULATED list of Pug (Jade) snippets.
 
-[FULL LIST CONTENT]
-{}
+    [FULL LIST CONTENT]
+    {}
 
-[EXTRACTION SCHEMA]
-Please extract all items and list-level metadata precisely according to these definitions:
-{}
+    [EXTRACTION SCHEMA]
+    Please extract all items and list-level metadata precisely according to these definitions:
+    {}
 
-[FINAL INSTRUCTION]
-1. Based on the FULL LIST CONTENT, extract all items into an \"items\" array.
-2. Include list-level metadata like \"type\", \"item\", \"node\", etc.
-3. Return ONLY a single valid JSON object.
-4. No preamble, no explanation. Just raw JSON."#,
+    [FINAL INSTRUCTION]
+    1. Based on the FULL LIST CONTENT, extract all items into an \"items\" array.
+    2. Include list-level metadata like \"type\", \"item\", \"node\", etc.
+    3. Return ONLY a single valid JSON object.
+    4. No preamble, no explanation. Just raw JSON."#,
                     full_context_accumulated,
                     schema_definitions
                 )
             } else {
                 format!(
 r#"[CONTEXT]
-You are reading a list of items from a webpage.
-Here is the accumulated item snippets so far:
+    You are reading a list of items from a webpage.
+    Here is the accumulated item snippets so far:
 
-[INPUT SNIPPET]
-{}
+    [INPUT SNIPPET]
+    {}
 
-[INSTRUCTION]
-Read and memorize these items. Do NOT generate JSON yet. 
-Just say \"ACKNOWLEDGED\"."#,
+    [INSTRUCTION]
+    Read and memorize these items. Do NOT generate JSON yet. 
+    Just say \"ACKNOWLEDGED"."#,
                     full_context_accumulated
                 )
             };
@@ -627,6 +630,7 @@ Just say \"ACKNOWLEDGED\"."#,
             let response = res?;
 
             if is_last {
+                println!("[EXTRACT-FINAL] Result: {}", response);
                 extracted_data = parse_json_from_llm(&response);
             }
         }
@@ -666,44 +670,42 @@ Just say \"ACKNOWLEDGED\"."#,
                 println!("[Detail-FINAL] All content ingested. Requesting FINAL JSON extraction.");
                 let mut schema_definitions = String::new();
                 for (name, schema) in &fields_prompts {
-                    schema_definitions.push_str(&format!("### Field: {}
-Schema/Definition: {}
-\n", name, schema));
+                    schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
                 }
 
                 format!(
 r#"[CONTEXT]
-You have been reading a Pug (Jade) template part by part. 
-Below is the COMPLETELY ACCUMULATED content of the template.
+    You have been reading a Pug (Jade) template part by part. 
+    Below is the COMPLETELY ACCUMULATED content of the template.
 
-[FULL CONTENT]
-{}
+    [FULL CONTENT]
+    {}
 
-[EXTRACTION SCHEMA]
-Please extract the following data points precisely according to these definitions:
-{}
+    [EXTRACTION SCHEMA]
+    Please extract the following data points precisely according to these definitions:
+    {}
 
-[FINAL INSTRUCTION]
-1. Based on the FULL CONTENT, extract all fields mentioned in the EXTRACTION SCHEMA.
-2. Return ONLY a single valid JSON object.
-3. No preamble, no explanation, no markdown code blocks. Just the raw JSON.
-4. If a value is missing, use null."#,
+    [FINAL INSTRUCTION]
+    1. Based on the FULL CONTENT, extract all fields mentioned in the EXTRACTION SCHEMA.
+    2. Return ONLY a single valid JSON object.
+    3. No preamble, no explanation, no markdown code blocks. Just the raw JSON.
+    4. If a value is missing, use null."#,
                     full_context_accumulated,
                     schema_definitions
                 )
             } else {
                 format!(
 r#"[CONTEXT]
-You are reading a Pug (Jade) template. 
-Here is the accumulated content so far:
+    You are reading a Pug (Jade) template. 
+    Here is the accumulated content so far:
 
-[INPUT SNIPPET]
-{}
+    [INPUT SNIPPET]
+    {}
 
-[INSTRUCTION]
-Read and memorize this content. Do NOT generate JSON yet. 
-When all parts are sent, I will ask you to extract data into JSON.
-Just say \"ACKNOWLEDGED\"."#,
+    [INSTRUCTION]
+    Read and memorize this content. Do NOT generate JSON yet. 
+    When all parts are sent, I will ask you to extract data into JSON.
+    Just say \"ACKNOWLEDGED"."#,
                     full_context_accumulated
                 )
             };
@@ -889,6 +891,7 @@ Just say \"ACKNOWLEDGED\"."#,
         "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
     }));
 
+    // Cleanup all KV Cache subdirectories for this task
     cleanup_task_resources(&task.id);
 
     Ok(())
