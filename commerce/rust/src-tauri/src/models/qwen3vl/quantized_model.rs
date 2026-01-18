@@ -380,13 +380,13 @@ impl QuantizedQwen3VLTextModel {
                          is_vram_checked = true;
                          
                          // USER REQUIREMENT: Reserve 10% of *currently available* fluid resources
-                         // OR a minimum of 1.2GB to prevent runtime OOM on low-VRAM systems.
+                         // OR a minimum of 300MB (System/Display overhead) to prevent runtime OOM.
                          // PLUS the guaranteed space for KV Cache (calculated from max_tokens)
-                         let min_absolute_margin = 1_200_000_000;
+                         let min_absolute_margin = 300_000_000;
                          let fluid_margin = (mem.free as f64 * 0.10) as u64;
                          safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
 
-                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Floor(Max(10%,1.2G)+KV): {:.2} MB. Cost/Layer: {:.2} MB", 
+                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Floor(Max(10%,300MB)+KV): {:.2} MB. Cost/Layer: {:.2} MB", 
                             mem.total as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
                      }
                  }
@@ -584,8 +584,8 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         // Fluid Safety Floor: 10% of Current Free OR 1.2GB min + KV Reserve
-                         let min_absolute_margin = 1_200_000_000;
+                         // Fluid Safety Floor: 10% of Current Free OR 300MB min + KV Reserve
+                         let min_absolute_margin = 300_000_000;
                          let fluid_margin = (mem.free as f64 * 0.10) as u64;
                          let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
                          
@@ -627,7 +627,7 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         let min_absolute_margin = 1_200_000_000;
+                         let min_absolute_margin = 300_000_000;
                          let fluid_margin = (mem.free as f64 * 0.10) as u64;
                          let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
                          
