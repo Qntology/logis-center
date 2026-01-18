@@ -540,7 +540,7 @@ impl QuantizedQwen3VLTextModel {
                 Some(prepare_causal_attention_mask(
                     b_size,
                     seq_len,
-                    0,
+                    seqlen_offset,
                     inputs_embeds.device(),
                 )?)
             }
