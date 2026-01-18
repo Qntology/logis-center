@@ -199,19 +199,29 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
     split_doc_to_pug_list(&document, selector_str, mode)
 }
 
-pub fn map_outline(language: &str) -> String {
-    let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation.
-    #type : document category type('order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | '')
-    #detail : is a detail page or a detail form
-    Return JSON:
-    {
-        "type": '#type',
-        "item": 'type based item CSS1 selector excluding ads',
-        "node": 'type based parent list CSS1 selector excluding ads',
-        "detail": boolean,
-    }
+pub fn page_type_prompt(language: &str) -> String {
+    let template = r###"Analyze the provided Pug template snippet and identify the primary category of this page.
+    category: 'order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | ''.
+    Return valid JSON only: { "type": "category" }
     Language: {LANGUAGE}"###;
     template.replace("{LANGUAGE}", language)
+}
+
+pub fn page_selectors_prompt(page_type: &str, language: &str) -> String {
+    let template = r###"The page is confirmed as type '{TYPE}'. 
+    Analyze the provided Pug template snippet and identify the structural CSS1 selectors for this type.
+    - 'item': CSS1 selector for individual items in a list (exclude ads).
+    - 'node': CSS1 selector for the parent container of the items.
+    - 'detail': boolean (true if this is a single item detail page, false if it is a list).
+    
+    Return valid JSON only:
+    {
+        "item": "selector",
+        "node": "selector",
+        "detail": boolean
+    }
+    Language: {LANGUAGE}"###;
+    template.replace("{TYPE}", page_type).replace("{LANGUAGE}", language)
 }
 
 pub fn image2json(region: &str, language: &str, page_type: &str, address: &str) -> String {

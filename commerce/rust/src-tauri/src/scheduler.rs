@@ -326,19 +326,22 @@ async fn process_task(
     }
 
     let _ = app_handle.emit("extraction-progress", json!({ 
-        "category": "Classification", "summary": "Analyzing page structure...", "spinner": "⠋"
+        "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋"
     }));
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let page_info_str = if let Some(model) = model_guard.as_ref() {
-        let system = parsing::map_outline(language);
+    let mut final_page_info = json!({});
+
+    // Step 1: Identify Type
+    let page_type_res = if let Some(model) = model_guard.as_ref() {
+        let system = parsing::page_type_prompt(language);
         let app_handle_clone = app_handle.clone();
 
         tokio::select!{
             res = model.chat_with_spinner(&system, &classify_input, &app_handle_clone, "extraction-progress", json!({ 
-                "category": "Classification", "summary": "Analyzing page structure..."
-            }), 512, Some(cancellation_token.clone())) => res?,
+                "category": "Classification", "summary": "Identifying page type..."
+            }), 256, Some(cancellation_token.clone())) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -346,12 +349,50 @@ async fn process_task(
                 }
             } => { return Err(anyhow::anyhow!("Task cancelled")); }
         }
-    } else {
-        "{}".to_string()
-    };
+    } else { "{}".to_string() };
+    
+    let type_info = parse_json_from_llm(&page_type_res);
+    let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    
+    if page_type.is_empty() || page_type == "unknown" {
+        drop(model_guard);
+        return Ok(());
+    }
+
+    final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
+
+    // Step 2: Identify Selectors
+    let _ = app_handle.emit("extraction-progress", json!({ 
+        "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type), "spinner": "⠋"
+    }));
+
+    let page_selectors_res = if let Some(model) = model_guard.as_ref() {
+        let system = parsing::page_selectors_prompt(&page_type, language);
+        let app_handle_clone = app_handle.clone();
+
+        tokio::select!{
+            res = model.chat_with_spinner(&system, &classify_input, &app_handle_clone, "extraction-progress", json!({ 
+                "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type)
+            }), 256, Some(cancellation_token.clone())) => res?,
+            _ = async {
+                loop {
+                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+        }
+    } else { "{}".to_string() };
     drop(model_guard);
     
-    let page_info: Value = parse_json_from_llm(&page_info_str);
+    let selector_info = parse_json_from_llm(&page_selectors_res);
+    // Merge selectors into final_page_info
+    if let Some(obj) = selector_info.as_object() {
+        for (k, v) in obj {
+            final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone());
+        }
+    }
+    
+    let page_info = final_page_info; // Re-alias for original logic
     
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", 
