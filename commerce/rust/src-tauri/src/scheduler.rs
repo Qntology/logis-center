@@ -596,13 +596,13 @@ async fn process_task(
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
             let mut target_data = extracted_data.clone();
-            let mut target_id = format!("{}_{{}}", page_type, chrono::Utc::now().timestamp_millis());
+            let mut target_id = format!("{}_{}", page_type, chrono::Utc::now().timestamp_millis());
             
             let mut found_existing = false;
-            let to_table = format!("commerce_{{}}", merge_info.to);
+            let to_table = format!("commerce_{}", merge_info.to);
 
             for query in queries {
-                let query_table = format!("commerce_{{}}", query.table);
+                let query_table = format!("commerce_{}", query.table);
                 if let Ok(Some((id, existing_data))) = db.find_item_by_property(&query_table, &query.column, &query.value).await {
                     println!("[Scheduler] Found existing item: {} in {}", id, query_table);
                     logic::merge_node(&mut target_data, &existing_data);
@@ -653,7 +653,7 @@ async fn process_task(
         }
     } else {
         // Simple Save (No Relay)
-        let target_table = format!("commerce_{{}}", page_type);
+        let target_table = format!("commerce_{}", page_type);
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
                 let id = extracted_data.get("id")
