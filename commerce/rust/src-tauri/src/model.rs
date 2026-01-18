@@ -197,11 +197,28 @@ impl LogisModel {
              } else {
                  let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
                  
-                 // [Optimization] For < 6GB VRAM, cap context at 2048 to prioritize Layer Offloading to GPU.
-                 // 4096 was causing split-brain (CPU/GPU) slowdown. 2048 ensures full GPU offload.
+                 // [Optimization] For < 6GB VRAM, we rely on System RAM (Unified/Shared).
+                 // Calculate limit based on REAL available system RAM.
                  if detected_vram < 6_000_000_000 {
-                     println!("[CONFIG] Low VRAM (<6GB) detected. Capping context to 2048 to force ALL layers onto GPU.");
-                     capacity.clamp(1024.0, 2048.0) as u32
+                     let mut sys = System::new_all();
+                     sys.refresh_memory();
+                     let avail_ram = sys.available_memory(); // Bytes
+                     
+                     // Reserve 2GB for OS/App + 2GB for Model Weights (Fallback)
+                     let safe_buffer = 4_000_000_000; 
+                     let usable_for_kv = avail_ram.saturating_sub(safe_buffer) as f64;
+                     
+                     // 180KB per token estimate
+                     let ram_based_limit = usable_for_kv / 180_000.0;
+                     
+                     // Minimum 4096 for Pug context, Max 32k
+                     let final_limit = ram_based_limit.clamp(4096.0, 32768.0); 
+                     
+                     println!("[CONFIG] Low VRAM (<6GB). Using System RAM Strategy.");
+                     println!("[CONFIG] Sys RAM: Available {:.2} GB | Usable(minus 4GB): {:.2} GB | Calc Limit: {}", 
+                        avail_ram as f64/1e9, usable_for_kv/1e9, final_limit);
+                        
+                     final_limit as u32
                  } else {
                      capacity.clamp(1024.0, 32768.0) as u32
                  }

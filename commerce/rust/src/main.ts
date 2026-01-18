@@ -410,43 +410,81 @@ navUploadBtn?.addEventListener("click", async () => {
     } catch (err) { console.error(err); }
 });
 
+// State for Button Visibility
+let isBrowserRunning = false;
+let isBrowserMatch = false;
+
+// Unified Button State Manager
+function updateExtractButtonState() {
+    if (!btnExtract) return;
+
+    // Condition 1: If extracting, show spinner/stop state (handled by extraction logic usually, but here we ensure visibility)
+    if (isExtracting) {
+        btnExtract.style.display = "flex";
+        return;
+    }
+
+    // Condition 2: Image Mode
+    if (currentImage) {
+        btnExtract.style.display = "flex";
+        btnExtract.innerText = "⚡";
+        btnExtract.title = "Extract from Image";
+        return;
+    }
+
+    // Condition 3: Browser Mode
+    // Show ONLY if browser is running AND we are on a matched shop page
+    if (isBrowserRunning && isBrowserMatch) {
+        btnExtract.style.display = "flex";
+        btnExtract.innerText = "⚡";
+        btnExtract.title = currentDetectedUrl ? `Extract from ${new URL(currentDetectedUrl).hostname}` : "Extract from Page";
+        return;
+    }
+
+    // Default: Hide
+    btnExtract.style.display = "none";
+}
+
 // --- 5. Browser Automation & Events ---
+
+listen("browser-status", (event: any) => {
+    const status = event.payload; // "running" or "stopped"
+    isBrowserRunning = (status === "running");
+    
+    if (btnAutoLaunch) {
+        btnAutoLaunch.style.display = isBrowserRunning ? "none" : "flex";
+    }
+    
+    if (!isBrowserRunning) {
+        isBrowserMatch = false; // Reset match if browser stops
+        currentDetectedUrl = "";
+    }
+    updateExtractButtonState();
+});
 
 listen("browser-match-found", (event: any) => {
     const payload = event.payload;
     if (payload.is_client || payload.is_admin) {
+        isBrowserMatch = true;
         currentDetectedUrl = payload.url;
-        if (btnExtract) {
-            btnExtract.style.display = "flex";
-            btnExtract.title = `Extract from ${new URL(payload.url).hostname}`;
-        }
     } else {
-        // Force hide if no match, unless an image is manually selected OR extraction is running
-        if (!currentImage && !isExtracting) {
-             if (btnExtract) btnExtract.style.display = "none";
-        }
+        isBrowserMatch = false;
+        // Keep currentDetectedUrl for reference if needed, or clear it?
+        // Let's keep it but mark match false.
     }
+    updateExtractButtonState();
 });
 
 listen("extraction-progress", (event: any) => {
     const payload = event.payload;
-    // Sanitize category ID
     const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "general";
     const elementId = `progress-${catId}`;
 
     const extractionLog = document.getElementById("extraction-log");
     
-    // Update Button State
-    if (btnExtract) {
+    // Update Button Text during extraction
+    if (btnExtract && isExtracting) {
         if (payload.spinner) btnExtract.innerText = payload.spinner;
-        if (payload.category === "Done" || payload.category === "Error") {
-            setTimeout(() => { 
-                if (btnExtract) {
-                    btnExtract.innerText = "⚡";
-                    btnExtract.style.display = currentDetectedUrl ? "flex" : "none";
-                }
-            }, 2000);
-        }
     }
 
     if (extractionLog && detailView.style.display !== "none") {
@@ -455,7 +493,7 @@ listen("extraction-progress", (event: any) => {
          // 1. Find or Create Row
          let p = document.getElementById(elementId);
          if (!p) {
-             // Mark ALL previous active rows as done before creating a new one
+             // Mark previous active rows as done
              Array.from(extractionLog.children).forEach((child: any) => {
                  if (child.id.startsWith("progress-") && !child.innerHTML.includes("✅") && !child.innerHTML.includes("❌")) {
                      const textSpan = child.querySelector(".log-text");
@@ -470,13 +508,12 @@ listen("extraction-progress", (event: any) => {
              p.style.padding = "8px 0";
              p.style.fontSize = "0.8rem";
              p.style.display = "flex";
-             p.style.flexDirection = "column"; // Changed to column to handle data
+             p.style.flexDirection = "column";
              p.style.gap = "4px";
              extractionLog.appendChild(p);
          }
 
-         // 2. Render Content based on State
-         // Header Row (Icon + Text)
+         // 2. Render Content
          const icon = payload.category === "Error" ? "❌" : (payload.category === "Done" ? (summaryText.includes("Cancelled") ? "🛑" : "✅") : (payload.spinner || "⠋"));
          const color = payload.category === "Error" ? "#ef4444" : (payload.category === "Done" ? "#4ade80" : "var(--primary)");
          
@@ -485,38 +522,25 @@ listen("extraction-progress", (event: any) => {
                         <span class="log-text" style="color:#e5e5e5;">${summaryText}</span>
                      </div>`;
 
-         // Data Row (JSON)
          if(payload.data && typeof payload.data === 'object') {
               const pretty = JSON.stringify(payload.data, null, 2);
               html += `<pre style="white-space: pre-wrap; font-size: 0.75rem; color:#aaa; background:#252525; padding:8px; borderRadius:4px; margin-top:5px; width:100%; overflow-x:auto;">${pretty}</pre>`;
          }
 
          p.innerHTML = html;
-
-         // Scroll to bottom
          extractionLog.scrollTop = extractionLog.scrollHeight;
 
-         // 3. Handle Done/Error Global UI
-         if (payload.category === "Done") {
+         // 3. Handle Done/Error - Reset State
+         if (payload.category === "Done" || payload.category === "Error") {
              isExtracting = false; 
              if (btnStopTask) { btnStopTask.style.display = "none"; btnStopTask.innerText = "🛑"; }
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
-         } else if (payload.category === "Error") {
-             isExtracting = false;
-             if (btnStopTask) btnStopTask.style.display = "none";
+             
+             // Wait a bit then refresh button state based on CURRENT environment
+             setTimeout(() => {
+                 updateExtractButtonState();
+             }, 2000);
          }
-    }
-});
-
-// Browser Status Listener (Active State)
-listen("browser-status", (event: any) => {
-    const status = event.payload; // "running" or "stopped"
-    if (btnAutoLaunch) {
-        if (status === "running") {
-            btnAutoLaunch.style.display = "none";
-        } else {
-            btnAutoLaunch.style.display = "flex";
-        }
     }
 });
 

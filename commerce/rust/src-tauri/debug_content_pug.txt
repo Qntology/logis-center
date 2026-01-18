@@ -1,220 +1,76 @@
 tbody
-    tr
-        th
-            | 검색어
+    tr.tr_alignc
         td
-            select(name='sfl')
-                option(value='gname')
-                    | 상품명
-                option(value='gcode')
-                    | 상품코드
-                option(value='mb_id')
-                    | 업체코드
-                option(value='maker')
-                    | 제조사
-                option(value='origin')
-                    | 원산지
-                option(value='model')
-                    | 모델명
-                option(value='explan')
-                    | 짧은설명
-            input.frm_input(name='stx' type='text' value='')
-    tr
-        th
-            | 카테고리
+            | 25102210135198
         td
-            select#sel_ca1(name='sel_ca1')
-                option(value='')
-                    | =카테고리선택=
-                option(value='002')
-                    | 식품/생필품
-                option(value='001')
-                    | 패션의류/잡화/뷰티
-                option(value='003')
-                    | 출산/유아동
-                option(value='004')
-                    | 생활/건강
-                option(value='005')
-                    | 가구/인테리어
-                option(value='007')
-                    | 스포츠/레저/자동차/공구
-                option(value='006')
-                    | 가전/디지털/컴퓨터
-                option(value='008')
-                    | 도서/여행/e쿠폰/취미
-            select#sel_ca2(name='sel_ca2')
-                option(value='')
-                    | =카테고리선택=
-            select#sel_ca3(name='sel_ca3')
-                option(value='')
-                    | =카테고리선택=
-            select#sel_ca4(name='sel_ca4')
-                option(value='')
-                    | =카테고리선택=
-            select#sel_ca5(name='sel_ca5')
-                option(value='')
-                    | =카테고리선택=
-    tr
-        th
-            | 기간검색
+            | 테스트A
         td
-            select#q_date_field(name='q_date_field')
-                option(value='update_time')
-                    | 최근수정일
-                option(value='reg_time')
-                    | 최초등록일
-            label.sound_only
-                | 시작일
-            input#fr_date.frm_input.hasDatepicker.w80(name='fr_date' type='text' value='')
-            | ~
-            label.sound_only
-                | 종료일
-            input#to_date.frm_input.hasDatepicker.w80(name='to_date' type='text' value='')
-            span.btn_group
-                input.btn_small.white(type='button' value='오늘')
-                input.btn_small.white(type='button' value='어제')
-                input.btn_small.white(type='button' value='일주일')
-                input.btn_small.white(type='button' value='지난달')
-                input.btn_small.white(type='button' value='1개월')
-                input.btn_small.white(type='button' value='3개월')
-                input.btn_small.white(type='button' value='전체')
-    tr
-        th
-            | 브랜드
+            | 테스트A
         td
-            select(name='q_brand')
-                option(selected value='')
-                    | 전체
-                option(value='1')
-                    | 테스트 기업
-                option(value='2')
-                    | 테스트 기업
-                option(value='3')
-                    | 테스트 기업
-                option(value='4')
-                    | 테스트 기업
-                option(value='5')
-                    | 테스트 기업
-                option(value='6')
-                    | 테스트 기업
-                option(value='7')
-                    | 테스트 기업
-                option(value='8')
-                    | 테스트 기업
-        th
-            | 배송가능 지역
+            | 010-0000-0000
         td
-            select(name='q_zone')
-                option(selected value='')
-                    | 전체
-                option(value='전국')
-                    | 전국
-                option(value='강원도')
-                    | 강원도
-                option(value='경기도')
-                    | 경기도
-                option(value='경상도')
-                    | 경상도
-                option(value='서울/경기도')
-                    | 서울/경기도
-                option(value='서울특별시')
-                    | 서울특별시
-                option(value='전라도')
-                    | 전라도
-                option(value='제주도')
-                    | 제주도
-                option(value='충청도')
-                    | 충청도
-    tr
-        th
-            | 상품재고
+            | 무통장
         td
-            select#q_stock_field(name='q_stock_field')
-                option(value='stock_qty')
-                    | 재고수량
-                option(value='noti_qty')
-                    | 통보수량
-            label.sound_only
-                | 재고수량 시작
-            input#fr_stock.frm_input(name='fr_stock' type='text' value='')
-            | 개 이상 ~
-            label.sound_only
-                | 재고수량 끝
-            input#to_stock.frm_input(name='to_stock' type='text' value='')
-            | 개 이하
-        th
-            | 상품가격
+            | 89,000
         td
-            select#q_price_field(name='q_price_field')
-                option(value='goods_price')
-                    | 판매가격
-                option(value='supply_price')
-                    | 공급가격
-                option(value='normal_price')
-                    | 시중가격
-                option(value='gpoint')
-                    | 포인트
-            label.sound_only
-                | 상품가격 시작
-            input#fr_price.frm_input(name='fr_price' type='text' value='')
-            | 원 이상 ~
-            label.sound_only
-                | 상품가격 끝
-            input#to_price.frm_input(name='to_price' type='text' value='')
-            | 원 이하
-    tr
-        th
-            | 판매여부
+            | 2025-10-22 10:14 (수)
+    tr.tr_alignc
         td
-            label
-                input(checked name='q_isopen' type='radio' value='')
-                | 전체
-            label
-                input(name='q_isopen' type='radio' value='1')
-                | 진열
-            label
-                input(name='q_isopen' type='radio' value='2')
-                | 품절
-            label
-                input(name='q_isopen' type='radio' value='3')
-                | 단종
-            label
-                input(name='q_isopen' type='radio' value='4')
-                | 중지
-        th
-            | 필수옵션
+            | 25090411260805
         td
-            label
-                input(checked name='q_option' type='radio' value='')
-                | 전체
-            label
-                input(name='q_option' type='radio' value='1')
-                | 사용
-            label
-                input(name='q_option' type='radio' value='0')
-                | 미사용
-    tr
-        th
-            | 과세유형
+            | 관리자
         td
-            label
-                input(checked name='q_notax' type='radio' value='')
-                | 전체
-            label
-                input(name='q_notax' type='radio' value='1')
-                | 과세
-            label
-                input(name='q_notax' type='radio' value='0')
-                | 비과세
-        th
-            | 추가옵션
+            | 관리자
         td
-            label
-                input(checked name='q_supply' type='radio' value='')
-                | 전체
-            label
-                input(name='q_supply' type='radio' value='1')
-                | 사용
-            label
-                input(name='q_supply' type='radio' value='0')
-                | 미사용
+            | 010-0000-0000
+        td
+            | 포인트
+        td
+            | 0
+        td
+            | 2025-09-04 11:26 (목)
+    tr.tr_alignc
+        td
+            | 25072214510065
+        td
+            | 관리자
+        td
+            | 관리자
+        td
+            | 010-0000-0000
+        td
+            | 무통장
+        td
+            | 35,000
+        td
+            | 2025-07-22 14:52 (화)
+    tr.tr_alignc
+        td
+            | 25032009552090
+        td
+            | 한글만
+        td
+            | 한글만
+        td
+            | 010-1111-1111
+        td
+            | 무통장
+        td
+            | 89,000
+        td
+            | 2025-03-20 09:55 (목)
+    tr.tr_alignc
+        td
+            | 25032009244976
+        td
+            | 두글만
+        td
+            | 두글만
+        td
+            | 010-2222-2222
+        td
+            | 무통장
+        td
+            | 35,000
+        td
+            | 2025-03-20 09:25 (목)

@@ -188,11 +188,23 @@ impl Qwen3VLGenerateModel {
                          if let Ok(file) = fs::File::open(&token_path) {
                              let reader = std::io::BufReader::new(file);
                              if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                 // Check strict prefix match
-                                 if !cached_tokens.is_empty() && full_input_ids_vec.starts_with(&cached_tokens) {
-                                     println!("[KV-DISK] Cache Hit! Loading {} tokens from disk...", cached_tokens.len());
-                                     if m.load_kv_cache(path, &self.device).is_ok() {
-                                         seqlen_offset = cached_tokens.len();
+                                 // --- Longest Common Prefix (LCP) Calculation ---
+                                 let min_len = std::cmp::min(cached_tokens.len(), full_input_ids_vec.len());
+                                 let mut match_len = 0;
+                                 for i in 0..min_len {
+                                     if cached_tokens[i] == full_input_ids_vec[i] {
+                                         match_len += 1;
+                                     } else {
+                                         break;
+                                     }
+                                 }
+
+                                 if match_len > 0 {
+                                     println!("[KV-DISK] Cache Hit (Partial)! Loading {} matching tokens from disk...", match_len);
+                                     
+                                     // Call with limit to slice cache
+                                     if m.load_kv_cache(path, &self.device, Some(match_len)).is_ok() {
+                                         seqlen_offset = match_len;
                                          loaded = true;
                                          
                                          // Slice input_ids to process only NEW tokens
@@ -203,8 +215,6 @@ impl Qwen3VLGenerateModel {
                                              println!("[KV-DISK] Processing only {} new tokens.", seq_len);
                                          } else {
                                              // No new tokens (unlikely in chat, but possible). 
-                                             // Provide dummy input or handle gracefully? 
-                                             // Forward expects input. Let's assume there is always new input in this flow.
                                              println!("[KV-DISK] Warning: No new tokens to process. Re-processing last token.");
                                              input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
                                              seqlen_offset = seq_len - 1;
@@ -212,7 +222,7 @@ impl Qwen3VLGenerateModel {
                                          }
                                      }
                                  } else {
-                                     println!("[KV-DISK] Cache Mismatch. Starting fresh.");
+                                     println!("[KV-DISK] Cache Mismatch (No common prefix). Starting fresh.");
                                  }
                              }
                          }
@@ -325,16 +335,16 @@ impl Qwen3VLGenerateModel {
                      println!("[KV-DISK] Saving KV cache to {:?}", path);
                      if m.offload_kv_cache(path).is_ok() {
                          // Save tokens.json
-                         let mut all_tokens = full_input_ids_vec;
-                         all_tokens.extend(&generate);
+                         let all_tokens = full_input_ids_vec;
+                         // all_tokens.extend(&generate); 
                          
                          // CRITICAL FIX: The KV cache contains states for inputs PROCESSED so far.
                          // The loop ends after generating a token, but that token hasn't been fed back into forward() yet.
                          // So the KV cache size is (input + generated) - 1.
                          // We must sync tokens.json to match the actual KV cache size.
-                         if !all_tokens.is_empty() {
-                             all_tokens.pop(); 
-                         }
+                         // if !all_tokens.is_empty() {
+                         //    all_tokens.pop(); 
+                         // }
 
                          let token_path = path.join("tokens.json");
                          if let Ok(file) = fs::File::create(&token_path) {

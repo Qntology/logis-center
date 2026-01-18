@@ -247,12 +247,21 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, limit: Option<usize>) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         if file.exists() {
             let tensors = candle_core::safetensors::load(&file, device)?;
-            let k = tensors.get("k").ok_or(anyhow!("Missing k in kv cache"))?.clone();
-            let v = tensors.get("v").ok_or(anyhow!("Missing v in kv cache"))?.clone();
+            let mut k = tensors.get("k").ok_or(anyhow!("Missing k in kv cache"))?.clone();
+            let mut v = tensors.get("v").ok_or(anyhow!("Missing v in kv cache"))?.clone();
+            
+            if let Some(len) = limit {
+                let current_len = k.dim(2)?;
+                if len < current_len {
+                    k = k.narrow(2, 0, len)?;
+                    v = v.narrow(2, 0, len)?;
+                }
+            }
+
             self.kv_cache = Some((k, v));
         }
         Ok(())
@@ -361,8 +370,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.offload_kv_cache(path)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
-        self.self_attn.load_kv_cache(path, device)
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, limit: Option<usize>) -> Result<()> {
+        self.self_attn.load_kv_cache(path, device, limit)
     }
 }
 
@@ -608,10 +617,10 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, limit: Option<usize>) -> Result<()> {
         if path.exists() {
             for layer in self.layers.iter_mut() {
-                layer.load_kv_cache(path, device)?;
+                layer.load_kv_cache(path, device, limit)?;
             }
         }
         Ok(())
@@ -872,8 +881,8 @@ impl QuantizedQwen3VLModel {
         self.language_model.offload_kv_cache(path)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
-        self.language_model.load_kv_cache(path, device)
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, limit: Option<usize>) -> Result<()> {
+        self.language_model.load_kv_cache(path, device, limit)
     }
 }
 
