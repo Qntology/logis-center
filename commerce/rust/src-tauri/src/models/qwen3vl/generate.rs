@@ -327,6 +327,15 @@ impl Qwen3VLGenerateModel {
                          // Save tokens.json
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
+                         
+                         // CRITICAL FIX: The KV cache contains states for inputs PROCESSED so far.
+                         // The loop ends after generating a token, but that token hasn't been fed back into forward() yet.
+                         // So the KV cache size is (input + generated) - 1.
+                         // We must sync tokens.json to match the actual KV cache size.
+                         if !all_tokens.is_empty() {
+                             all_tokens.pop(); 
+                         }
+
                          let token_path = path.join("tokens.json");
                          if let Ok(file) = fs::File::create(&token_path) {
                              let _ = serde_json::to_writer(file, &all_tokens);

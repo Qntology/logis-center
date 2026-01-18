@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use nvml_wrapper::Nvml;
@@ -199,12 +199,25 @@ impl QuantizedQwen3VLTextAttention {
             }
         };
 
+        // Robust Masking: Slice mask to fit actual key length if mask is too long
+        let actual_seq_len = key_states.dim(2)?;
+        let adjusted_mask = if let Some(mask) = attention_mask {
+            let mask_len = mask.dim(D::Minus1)?;
+            if mask_len > actual_seq_len {
+                Some(mask.narrow(D::Minus1, 0, actual_seq_len)?)
+            } else {
+                Some(mask.clone())
+            }
+        } else {
+            None
+        };
+
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,
             &value_states,
             Some(self.num_kv_groups),
-            attention_mask,
+            adjusted_mask.as_ref(),
             self.scaling,
         )?;
 
