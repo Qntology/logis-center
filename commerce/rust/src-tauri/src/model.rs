@@ -47,35 +47,40 @@ pub struct LogisModel {
 }
 
 impl LogisModel {
-    // Returns (Is Safe to Try GPU, Message, Usable VRAM in Bytes)
-    fn check_memory_status(is_cuda: bool, is_metal: bool) -> (bool, String, u64) {
+    // Returns (Is Safe to Try GPU, Message, Usable VRAM in Bytes, Device ID)
+    fn check_memory_status(is_cuda: bool, is_metal: bool) -> (bool, String, u64, usize) {
         // 1. CUDA VRAM Check
         if is_cuda {
             let nvml = match Nvml::init() {
                 Ok(n) => n,
-                Err(e) => return (false, format!("NVML Init Failed: {}", e), 0),
+                Err(e) => return (false, format!("NVML Init Failed: {}", e), 0, 0),
             };
-            let device = match nvml.device_by_index(0) {
-                Ok(d) => d,
-                Err(e) => return (false, format!("GPU Not Found: {}", e), 0),
-            };
-            let memory = match device.memory_info() {
-                Ok(m) => m,
-                Err(e) => return (false, format!("VRAM Check Failed: {}", e), 0),
-            };
-
-            let total_vram = memory.total;
-            let free_vram = memory.free; // free_vram = total - used
             
-            // We will dynamically reserve 10% of the *current* free VRAM during allocation 
+            let count = nvml.device_count().unwrap_or(1);
+            let mut best_id = 0;
+            let mut max_free = 0;
+            let mut total_vram_log = 0;
+
+            for i in 0..count {
+                if let Ok(device) = nvml.device_by_index(i) {
+                    if let Ok(mem) = device.memory_info() {
+                        if mem.free > max_free {
+                            max_free = mem.free;
+                            best_id = i;
+                            total_vram_log = mem.total;
+                        }
+                    }
+                }
+            }
+
+            // We will dynamically reserve 5% of the *current* free VRAM during allocation 
             // to account for user activity fluctuation.
-            // Here we just report the raw state.
-            let usable_vram = free_vram;
+            let usable_vram = max_free;
             
-            println!("[VRAM-CHECK] CUDA | Total: {:.2} GB, Free: {:.2} GB. (Will reserve 10% dynamic safety buffer)", 
-                total_vram as f64/1e9, free_vram as f64/1e9);
+            println!("[VRAM-CHECK] Best CUDA GPU: ID {} | Total: {:.2} GB, Free: {:.2} GB.", 
+                best_id, total_vram_log as f64/1e9, max_free as f64/1e9);
 
-            return (true, format!("VRAM Check Passed. Free: {:.2} GB", usable_vram as f64/1e9), usable_vram);
+            return (true, format!("VRAM Check Passed. ID: {}, Free: {:.2} GB", best_id, usable_vram as f64/1e9), usable_vram, best_id as usize);
         }
 
         // 2. Metal / CPU System RAM Check
@@ -87,13 +92,11 @@ impl LogisModel {
         let buffer_size = (total_mem as f64 * 0.10) as u64;
         let usable_mem = if free_mem > buffer_size { free_mem - buffer_size } else { 0 };
         
-        // Removed fixed required_mem check for CPU/Metal as well.
-
         let mode = if is_metal { "Metal (Unified)" } else { "System RAM" };
         println!("[MEM-CHECK] {} | Total: {:.2} GB, Available: {:.2} GB, Usable: {:.2} GB", 
             mode, total_mem as f64/1e9, free_mem as f64/1e9, usable_mem as f64/1e9);
 
-        (true, format!("Sufficient {}", mode), usable_mem)
+        (true, format!("Sufficient {}", mode), usable_mem, 0)
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
@@ -117,17 +120,17 @@ impl LogisModel {
         } else {
             // Priority: CUDA > Metal > CPU
             if has_cuda {
-                let (ok, msg, vram) = Self::check_memory_status(true, false);
+                let (ok, msg, vram, best_id) = Self::check_memory_status(true, false);
                 detected_vram = vram;
                 if ok {
                     println!("✅ [DEVICE] Selecting CUDA: {}", msg);
-                    target_device = get_device(None); 
+                    target_device = Device::new_cuda(best_id).unwrap_or(Device::Cpu);
                 } else {
                     println!("⚠️ [DEVICE] CUDA available but skipped: {}", msg);
                     force_cpu = true; 
                 }
             } else if has_metal {
-                let (ok, msg, vram) = Self::check_memory_status(false, true);
+                let (ok, msg, vram, _) = Self::check_memory_status(false, true);
                 detected_vram = vram;
                 if ok {
                     println!("✅ [DEVICE] Selecting Metal: {}", msg);
@@ -144,7 +147,7 @@ impl LogisModel {
 
         if force_cpu {
             target_device = Device::Cpu;
-            let (ok, msg, _) = Self::check_memory_status(false, false);
+            let (ok, msg, _, _) = Self::check_memory_status(false, false);
             if !ok {
                 println!("⚠️ [WARNING] System RAM is also tight for CPU mode: {}", msg);
             }
@@ -795,7 +798,7 @@ JSON Output:"###, schema_def, doc_type, query);
     }
 
     // --- Ported from Python (search_engine.py) ---
-    pub async fn parse_query_intent(&self, query: String) -> anyhow::Result<String> {
+    pub async fn parse_query_intent(&self, query: String, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let system_prompt = r###"Classify the query into one of these types:
 1. SEARCH: Finding specific documents by filters (e.g., 'Find Samsung invoices').
 2. RESEARCH: Complex questions requiring cross-referencing or deep analysis (e.g., 'What is the trend of our shipping delays?').
@@ -803,7 +806,7 @@ JSON Output:"###, schema_def, doc_type, query);
 Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
 
         let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
-        let res = self.run_inference_text(prompt, None, None)?;
+        let res = self.run_inference_text(prompt, None, cancel_token)?;
         
         let intent = extract_json_from_text(&res)
             .and_then(|v| v.get("intent").and_then(|s| s.as_str()).map(|s| s.to_string()))

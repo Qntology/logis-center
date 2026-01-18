@@ -5,20 +5,49 @@ use anyhow::{Result, anyhow};
 use candle_core::{DType, Device};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use std::process::Command;
+use nvml_wrapper::Nvml;
+
+pub fn get_best_device() -> Device {
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(count) = nvml.device_count() {
+                let mut best_id = 0;
+                let mut max_free = 0;
+                println!("[DEVICE-SCAN] Found {} NVIDIA GPUs.", count);
+                
+                for i in 0..count {
+                    if let Ok(device) = nvml.device_by_index(i) {
+                        if let Ok(mem) = device.memory_info() {
+                            println!("[DEVICE-SCAN] GPU {}: Free {:.2} GB / Total {:.2} GB", 
+                                i, mem.free as f64 / 1e9, mem.total as f64 / 1e9);
+                            if mem.free > max_free {
+                                max_free = mem.free;
+                                best_id = i;
+                            }
+                        }
+                    }
+                }
+                
+                if max_free > 0 {
+                    println!("✅ [DEVICE-SELECT] Best GPU is ID {} with {:.2} GB Free.", best_id, max_free as f64 / 1e9);
+                    return Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu);
+                }
+            }
+        }
+        // Fallback to 0 if NVML fails but CUDA feature is on
+        Device::new_cuda(0).unwrap_or(Device::Cpu)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Device::Cpu
+    }
+}
 
 pub fn get_device(device: Option<&Device>) -> Device {
     match device {
         Some(d) => d.clone(),
-        None => {
-            #[cfg(feature = "cuda")]
-            {
-                Device::new_cuda(0).unwrap_or(Device::Cpu)
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Device::Cpu
-            }
-        }
+        None => get_best_device()
     }
 }
 
