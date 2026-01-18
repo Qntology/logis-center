@@ -281,7 +281,7 @@ impl LogisModel {
         self.is_cpu_mode
     }
 
-    pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+    pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
         let user_text = user_input.to_string();
@@ -317,7 +317,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }).await?
@@ -331,42 +331,51 @@ impl LogisModel {
         event_name: &str,
         base_payload: Value,
         max_tokens: usize,
-        cancel_token: Option<Arc<AtomicBool>>
+        cancel_token: Option<Arc<AtomicBool>>,
+        session_id: Option<String>
+    ) -> anyhow::Result<String> {
+        let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: system.to_string(),
+            name: None,
+        });
+
+        let content_parts = vec![
+            ChatCompletionRequestMessageContentPart::Text(
+                ChatCompletionRequestMessageContentPartText { text: user_input.to_string() }
+            )
+        ];
+
+        let user_message = ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(content_parts),
+            name: None,
+        };
+
+        let params = ChatCompletionParameters {
+            messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(max_tokens as u32),
+            temperature: Some(0.1),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+
+        self.chat_params_with_spinner(params, app_handle, event_name, base_payload, cancel_token, session_id).await
+    }
+
+    pub async fn chat_params_with_spinner(
+        &self, 
+        params: ChatCompletionParameters,
+        app_handle: &tauri::AppHandle,
+        event_name: &str,
+        base_payload: Value,
+        cancel_token: Option<Arc<AtomicBool>>,
+        session_id: Option<String>
     ) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
-        let system_text = system.to_string();
-        let user_text = user_input.to_string();
         
         let task = tokio::task::spawn_blocking(move || {
             let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
-            
-            let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content: system_text,
-                name: None,
-            });
-
-            let content_parts = vec![
-                ChatCompletionRequestMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText { text: user_text }
-                )
-            ];
-
-            let user_message = ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(content_parts),
-                name: None,
-            };
-
-            let params = ChatCompletionParameters {
-                messages: vec![system_message, ChatCompletionRequestMessage::User(user_message)],
-                model: "qwen3vl".to_string(),
-                max_tokens: Some(max_tokens as u32),
-                temperature: Some(0.1),
-                top_p: Some(0.9),
-                ..Default::default()
-            };
-            
-            let response = gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))?;
-            Ok(response)
+            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         let spinner = Spinner::dots();
@@ -402,7 +411,8 @@ impl LogisModel {
         event_name: &str,
         base_payload: Value,
         max_tokens: usize,
-        cancel_token: Option<Arc<AtomicBool>>
+        cancel_token: Option<Arc<AtomicBool>>,
+        session_id: Option<String>
     ) -> anyhow::Result<String> {
         let self_clone = self.generator.clone();
         
@@ -442,7 +452,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         let spinner = Spinner::dots();
@@ -470,7 +480,7 @@ impl LogisModel {
         }
     }
 
-    fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+    fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
         let mut gen = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
         
         let mut content_parts = Vec::new();
@@ -506,7 +516,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -516,7 +526,8 @@ impl LogisModel {
         app_handle: &tauri::AppHandle,
         event_name: &str,
         base_payload: Value,
-        cancel_token: Option<Arc<AtomicBool>>
+        cancel_token: Option<Arc<AtomicBool>>,
+        session_id: Option<String>
     ) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let max_tok = self.max_tokens_limit;
@@ -557,7 +568,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
         
         let spinner = Spinner::dots();
@@ -649,7 +660,8 @@ impl LogisModel {
                 app_handle, 
                 "extraction-progress", 
                 json!({ "summary": "Identifying document type...", "raw": "Analyzing...", "category": "Processing" }),
-                cancel_token.clone()
+                cancel_token.clone(),
+                None
             ).await?;
 
             log(&format!("[DEBUG] Raw Classification Response: {}", res));
@@ -704,7 +716,8 @@ impl LogisModel {
                                     "extraction-progress", 
                 
                                     json!({ "summary": format!("Analyzing: {}", task_desc), "raw": format!("Analyzing {}...", task_desc), "category": mission.cat }),
-                                    cancel_token.clone()
+                                    cancel_token.clone(),
+                                    None
                 
                                 ).await?
                 
@@ -742,7 +755,7 @@ impl LogisModel {
         let system_prompt = "Split user query into JSON sub-queries with document type. Structure: [{\"query\": \"...\", \"header\": {\"document_type\": \"TYPE\"}}]";
         let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
         
-        let res = self.run_inference_text(prompt, None, None)?;
+        let res = self.run_inference_text(prompt, None, None, None)?;
         if let Some(json_val) = extract_json_from_text(&res) {
             if json_val.is_array() {
                 // Ensure the keys match what lib.rs search_documents expects ($header, $$document_type)
@@ -789,7 +802,7 @@ REQUIRED JSON FORMAT:
 Query: {}
 JSON Output:"###, schema_def, doc_type, query);
 
-        let res = self.run_inference_text(prompt, None, None)?;
+        let res = self.run_inference_text(prompt, None, None, None)?;
         if let Some(json_val) = extract_json_from_text(&res) {
             return Ok(json_val);
         }
@@ -806,7 +819,7 @@ JSON Output:"###, schema_def, doc_type, query);
 Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
 
         let prompt = format!("{}\n\nQuery: {}\nJSON Output:", system_prompt, query);
-        let res = self.run_inference_text(prompt, None, cancel_token)?;
+        let res = self.run_inference_text(prompt, None, cancel_token, None)?;
         
         let intent = extract_json_from_text(&res)
             .and_then(|v| v.get("intent").and_then(|s| s.as_str()).map(|s| s.to_string()))
@@ -839,7 +852,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
             // In a real implementation, we might want to stream this too, but for now we wait for the step result
-            let step_result = self.run_inference_text(prompt, None, cancel_token.clone())?;
+            let step_result = self.run_inference_text(prompt, None, cancel_token.clone(), None)?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
@@ -850,7 +863,7 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
         status_history.push_str("### 📊 Final Research Report\n\n");
         let final_prompt = format!("CONTEXT: {}\nQUERY: {}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
         
-        let report = self.run_inference_text(final_prompt, None, cancel_token)?;
+        let report = self.run_inference_text(final_prompt, None, cancel_token, None)?;
         status_history.push_str(&report);
         
         let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));

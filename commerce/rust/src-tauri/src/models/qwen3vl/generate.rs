@@ -21,6 +21,7 @@ use crate::{
     openai_types::ChatCompletionParameters,
 };
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::fs;
 
 enum ModelVariant {
     Standard(Qwen3VLModel),
@@ -126,7 +127,7 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
         let temperature = match mes.temperature {
             None => self.generation_config.temperature,
             Some(tem) => tem as f32,
@@ -149,6 +150,7 @@ impl Qwen3VLGenerateModel {
             .tokenizer
             .text_encode(input.replace_text.clone(), &self.device)?;
         let mut seq_len = input_ids.dim(1)?;
+        let full_input_ids_vec = input_ids.to_vec1::<u32>()?; // Save original full input for saving later
         
         println!("[GENERATE] Input Token Count: {}", seq_len);
 
@@ -165,6 +167,63 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut seqlen_offset = 0;
+
+        // KV Cache Disk Loading (Prefix Caching)
+        let cache_path = if let Some(sid) = &session_id {
+             let p = std::path::Path::new("tmp_kv").join(sid);
+             if !p.exists() { let _ = fs::create_dir_all(&p); }
+             Some(p)
+        } else {
+             None
+        };
+
+        if let Some(path) = &cache_path {
+             match &mut self.qwen3_vl {
+                 ModelVariant::Quantized(m) => {
+                     let token_path = path.join("tokens.json");
+                     let mut loaded = false;
+                     if token_path.exists() {
+                         if let Ok(file) = fs::File::open(&token_path) {
+                             let reader = std::io::BufReader::new(file);
+                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 // Check strict prefix match
+                                 if !cached_tokens.is_empty() && full_input_ids_vec.starts_with(&cached_tokens) {
+                                     println!("[KV-DISK] Cache Hit! Loading {} tokens from disk...", cached_tokens.len());
+                                     if m.load_kv_cache(path, &self.device).is_ok() {
+                                         seqlen_offset = cached_tokens.len();
+                                         loaded = true;
+                                         
+                                         // Slice input_ids to process only NEW tokens
+                                         let remaining = seq_len.saturating_sub(seqlen_offset);
+                                         if remaining > 0 {
+                                             input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
+                                             seq_len = remaining;
+                                             println!("[KV-DISK] Processing only {} new tokens.", seq_len);
+                                         } else {
+                                             // No new tokens (unlikely in chat, but possible). 
+                                             // Provide dummy input or handle gracefully? 
+                                             // Forward expects input. Let's assume there is always new input in this flow.
+                                             println!("[KV-DISK] Warning: No new tokens to process. Re-processing last token.");
+                                             input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
+                                             seqlen_offset = seq_len - 1;
+                                             seq_len = 1;
+                                         }
+                                     }
+                                 } else {
+                                     println!("[KV-DISK] Cache Mismatch. Starting fresh.");
+                                 }
+                             }
+                         }
+                     }
+                     
+                     if !loaded {
+                         // Ensure cache is clear if we are not loading
+                         m.clear_kv_cache();
+                     }
+                 },
+                 _ => {} 
+             }
+        }
         
         // Take ownership of large tensors
         let mut pixel_values = input.pixel_values.take();
@@ -255,13 +314,32 @@ impl Qwen3VLGenerateModel {
             Ok(generate)
         })();
 
-        // Always clear cache to prevent VRAM leaks
-        match &mut self.qwen3_vl {
-            ModelVariant::Standard(m) => m.clear_kv_cache(),
-            ModelVariant::Quantized(m) => m.clear_kv_cache(),
+        let generate = generation_result?;
+
+        // KV Cache Disk Offloading or Clearing
+        if let Some(path) = &cache_path {
+             match &mut self.qwen3_vl {
+                 ModelVariant::Quantized(m) => {
+                     println!("[KV-DISK] Saving KV cache to {:?}", path);
+                     if m.offload_kv_cache(path).is_ok() {
+                         // Save tokens.json
+                         let mut all_tokens = full_input_ids_vec;
+                         all_tokens.extend(&generate);
+                         let token_path = path.join("tokens.json");
+                         if let Ok(file) = fs::File::create(&token_path) {
+                             let _ = serde_json::to_writer(file, &all_tokens);
+                         }
+                     }
+                 },
+                 ModelVariant::Standard(m) => m.clear_kv_cache(),
+             }
+        } else {
+            match &mut self.qwen3_vl {
+                ModelVariant::Standard(m) => m.clear_kv_cache(),
+                ModelVariant::Quantized(m) => m.clear_kv_cache(),
+            }
         }
 
-        let generate = generation_result?;
         let res = self.tokenizer.token_decode(generate)?;
         Ok(res)
     }

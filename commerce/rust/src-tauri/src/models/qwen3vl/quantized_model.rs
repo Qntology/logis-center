@@ -3,6 +3,8 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use nvml_wrapper::Nvml;
+use std::path::{Path, PathBuf};
+use std::fs;
 
 use crate::{
     models::{
@@ -100,6 +102,7 @@ pub struct QuantizedQwen3VLTextAttention {
     head_dim: usize,
     scaling: f64,
     kv_cache: Option<(Tensor, Tensor)>,
+    layer_idx: usize,
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -111,6 +114,7 @@ impl QuantizedQwen3VLTextAttention {
         is_gguf_naming: bool,
         device: &Device,
         dtype: DType,
+        layer_idx: usize,
     ) -> Result<Self> {
         let _hidden_size = config.hidden_size;
         let num_attention_heads = config.num_attention_heads;
@@ -146,6 +150,7 @@ impl QuantizedQwen3VLTextAttention {
             head_dim,
             scaling,
             kv_cache: None,
+            layer_idx,
         })
     }
 
@@ -211,6 +216,26 @@ impl QuantizedQwen3VLTextAttention {
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None
     }
+
+    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+        if let Some((k, v)) = &self.kv_cache {
+            let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+            candle_core::safetensors::save(&[("k", k), ("v", v)], &file)?;
+            self.kv_cache = None;
+        }
+        Ok(())
+    }
+
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
+        let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+        if file.exists() {
+            let tensors = candle_core::safetensors::load(&file, device)?;
+            let k = tensors.get("k").ok_or(anyhow!("Missing k in kv cache"))?.clone();
+            let v = tensors.get("v").ok_or(anyhow!("Missing v in kv cache"))?.clone();
+            self.kv_cache = Some((k, v));
+        }
+        Ok(())
+    }
 }
 
 pub struct QuantizedQwen3VLTextDecoderLayer {
@@ -230,6 +255,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         base_name: &str,
         device: &Device,
         dtype: DType,
+        layer_idx: usize,
     ) -> Result<Self> {
         // Detect GGUF naming convention
         let is_gguf_naming = base_name.starts_with("blk.");
@@ -240,7 +266,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
 
-        let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype)?;
+        let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?;
         
         let mlp_gate = get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?;
         let mlp_up = get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?;
@@ -308,6 +334,14 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
     pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+        self.self_attn.offload_kv_cache(path)
+    }
+
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
+        self.self_attn.load_kv_cache(path, device)
     }
 }
 
@@ -432,6 +466,7 @@ impl QuantizedQwen3VLTextModel {
                 &prefix,
                 &current_device,
                 layer_dtype,
+                layer_idx,
             )?;
             layers.push(layer)
         }
@@ -540,6 +575,25 @@ impl QuantizedQwen3VLTextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+
+    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            fs::create_dir_all(path)?;
+        }
+        for layer in self.layers.iter_mut() {
+            layer.offload_kv_cache(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
+        if path.exists() {
+            for layer in self.layers.iter_mut() {
+                layer.load_kv_cache(path, device)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -787,6 +841,14 @@ impl QuantizedQwen3VLModel {
 
     pub fn clear_kv_cache(&mut self) {
         self.language_model.clear_kv_cache();
+    }
+
+    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+        self.language_model.offload_kv_cache(path)
+    }
+
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device) -> Result<()> {
+        self.language_model.load_kv_cache(path, device)
     }
 }
 

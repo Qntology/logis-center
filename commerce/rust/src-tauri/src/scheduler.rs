@@ -9,6 +9,14 @@ use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs;
+
+use crate::openai_types::{
+    ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestAssistantMessage
+};
 
 // Helper to chunk text with overlap, strictly respecting newlines for Pug
 fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
@@ -332,16 +340,40 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut final_page_info = json!({});
+    let mut chat_messages = Vec::new();
 
     // Step 1: Identify Type
     let page_type_res = if let Some(model) = model_guard.as_ref() {
-        let system = parsing::page_type_prompt(language);
+        let system_text = parsing::page_type_prompt(language);
         let app_handle_clone = app_handle.clone();
 
+        chat_messages.push(ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: system_text,
+            name: None,
+        }));
+
+        chat_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(vec![
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
+                    text: format!("Analyze this Pug template:\n\n{}", classify_input)
+                })
+            ]),
+            name: None,
+        }));
+
+        let params = ChatCompletionParameters {
+            messages: chat_messages.clone(),
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(256),
+            temperature: Some(0.1),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+
         tokio::select!{
-            res = model.chat_with_spinner(&system, &classify_input, &app_handle_clone, "extraction-progress", json!({ 
+            res = model.chat_params_with_spinner(params, &app_handle_clone, "extraction-progress", json!({ 
                 "category": "Classification", "summary": "Identifying page type..."
-            }), 256, Some(cancellation_token.clone())) => res?,
+            }), Some(cancellation_token.clone()), Some(task.id.clone())) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -361,19 +393,40 @@ async fn process_task(
 
     final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
-    // Step 2: Identify Selectors
+    // Add Assistant's Answer to History
+    chat_messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+        content: Some(page_type_res),
+        name: None,
+        tool_calls: None,
+    }));
+
+    // Step 2: Identify Selectors (Building on History)
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type), "spinner": "⠋"
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let system = parsing::page_selectors_prompt(&page_type, language);
+        let next_question = parsing::page_selectors_prompt(&page_type, language);
         let app_handle_clone = app_handle.clone();
 
+        chat_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(next_question),
+            name: None,
+        }));
+
+        let params = ChatCompletionParameters {
+            messages: chat_messages.clone(),
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(256),
+            temperature: Some(0.1),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+
         tokio::select!{
-            res = model.chat_with_spinner(&system, &classify_input, &app_handle_clone, "extraction-progress", json!({ 
+            res = model.chat_params_with_spinner(params, &app_handle_clone, "extraction-progress", json!({ 
                 "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type)
-            }), 256, Some(cancellation_token.clone())) => res?,
+            }), Some(cancellation_token.clone()), Some(task.id.clone())) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -437,9 +490,15 @@ async fn process_task(
         let fields_prompts = parsing::item2json(page_type, &url, language);
 
         for (i, item_pug) in item_pugs.iter().enumerate() {
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            if cancellation_token.load(Ordering::Relaxed) { 
+                cleanup_task_resources(&task.id);
+                return Err(anyhow::anyhow!("Task cancelled")); 
+            }
 
             println!("\n[EXTRACT-ITEM {}/{}] Snippet: {}...", i+1, total_items, item_pug.replace("\n", " ").chars().take(100).collect::<String>());
+
+            // [NEW] Separate session for each list item to prevent context contamination
+            let item_session_id = format!("{}_item_{}", task.id, i);
 
             // Chunking for List Items
             let chunks = chunk_text(item_pug, 2500, 300); 
@@ -453,7 +512,11 @@ async fn process_task(
 
             for (field_name, field_schema) in &fields_prompts {
                 if field_name == "description" || field_name == "detail_images" { continue; }
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                if cancellation_token.load(Ordering::Relaxed) { 
+                    drop(model_guard);
+                    cleanup_task_resources(&task.id);
+                    return Err(anyhow::anyhow!("Task cancelled")); 
+                }
 
                 for (chunk_idx, chunk) in chunks.iter().enumerate() {
                     let field_json_str = if let Some(model) = model_guard.as_ref() {
@@ -491,14 +554,18 @@ Definition: {}
                                     "category": "Extraction", 
                                     "summary": format!("Item {}/{}: {}", i + 1, total_items, field_name)
                                 }), 
-                                512, Some(cancellation_token.clone())
+                                512, Some(cancellation_token.clone()), Some(item_session_id.clone())
                             ) => res?,
                             _ = async {
                                 loop {
                                     if cancellation_token.load(Ordering::Relaxed) { break; }
                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 }
-                            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                            } => { 
+                                drop(model_guard);
+                                cleanup_task_resources(&task.id);
+                                return Err(anyhow::anyhow!("Task cancelled")); 
+                            }
                         }
                     } else {
                         "{}".to_string()
@@ -550,9 +617,15 @@ Definition: {}
         // CHUNKING: Split huge content into 3000-char chunks with 500-char overlap (CPU Optimized)
         let chunks = chunk_text(&content_pug, 3000, 500); 
         let fields_prompts = parsing::item2json(page_type, &url, language);
+
+        // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
+        let detail_session_id = format!("{}_detail", task.id);
         
         for (field_name, field_schema) in fields_prompts {
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            if cancellation_token.load(Ordering::Relaxed) { 
+                cleanup_task_resources(&task.id);
+                return Err(anyhow::anyhow!("Task cancelled")); 
+            }
 
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Extraction", "summary": format!("Extracting field: {}", field_name), "spinner": "⠋"
@@ -600,14 +673,18 @@ Definition: {}
                                 "category": "Extraction", 
                                 "summary": format!("Extracting field: {} ({}/{})", field_name, chunk_idx+1, chunks.len())
                             }), 
-                            1024, Some(cancellation_token.clone())
+                            1024, Some(cancellation_token.clone()), Some(detail_session_id.clone())
                         ) => res?,
                         _ = async {
                             loop {
                                 if cancellation_token.load(Ordering::Relaxed) { break; }
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
-                        } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                        } => { 
+                            drop(model_guard);
+                            cleanup_task_resources(&task.id);
+                            return Err(anyhow::anyhow!("Task cancelled")); 
+                        }
                     }
                 } else {
                     "{}".to_string()
@@ -749,8 +826,26 @@ Definition: {}
         "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
     }));
 
+    // Cleanup all KV Cache subdirectories for this task
+    cleanup_task_resources(&task.id);
+
     Ok(())
 }
+
+fn cleanup_task_resources(task_id: &str) {
+    println!("[Cleanup] Removing KV cache for task: {}", task_id);
+    let base_path = std::path::Path::new("tmp_kv");
+    if let Ok(entries) = fs::read_dir(base_path) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with(task_id) {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+}
+
 fn parse_json_from_llm(text: &str) -> Value {
     if let Ok(v) = serde_json::from_str(text) { return v; }
     if let Some(start) = text.find("{") {
