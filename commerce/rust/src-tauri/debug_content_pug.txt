@@ -1,302 +1,1027 @@
-div.L3eUgb(data-hveid='1')
-    div#ZnpjSd
-    div.Ne6nSd.n1xJcf.o3j99
-        a.MV3Tnb(href='https://about.google/?fg=1&utm_source=google-KR&utm_medium=referral&utm_campaign=hp-header')
-            | Google 정보
-        a.MV3Tnb(href='https://store.google.com/KR?utm_source=hp_header&utm_medium=google_ooo&utm_campaign=GS100042&hl=ko-KR')
-            | 스토어
-        div.LX3sZb
-            div
-                header#gb.gb_Dd.gb_H.gb_y
-                    div.gb_1.gb_M.gb_Qf.gb_Xf(data-ogbl='')
-                        div.gb_0.gb_1
-                            a.gb_Z(data-pid='23' href='https://mail.google.com/mail/&ogbl')
-                                | Gmail
-                        div.gb_0.gb_1
-                            a.gb_Z(data-pid='2' href='https://www.google.com/imghp?hl=ko&ogbl')
-                                | 이미지
-                    div#gbwa.gb_1.gb_J.gb_vd(data-ogsr-alt='' data-ogsr-fb='true')
-                        div.gb_D
-                            a.gb_B(href='https://www.google.co.kr/intl/ko/about/products')
-                    div.gb_z(data-ogsr-up='')
-                        a.gb_A(href='https://accounts.google.com/ServiceLogin?hl=ko&passive=true&continue=https://www.google.com/&ec=futura_exp_og_so_72776762_e')
-                            span.gb_U
-                                | 로그인
-                        div
-                        div
-    div#LS8OJ.LLD4me.LS8OJ.o3j99.yr19Zb
-        div.k1zIA.rSk4se
-    div.ikrT4e.o3j99.om7nvf
-        dialog#spch-dlg.spch-dlg
-            div#spch.spch
-                button#spchx.pz5bj
-                    span.wuXmqc.z1asCe
-                div#spchc.spchc
-                    div.inner-container
-                        div.button-container
-                            span#spchl.r8s4j
-                            span#spchb.LgbsSe
-                                div.microphone
-                                    span.receiver
-                                    div.wrapper
-                                        span.stem
-                                        span.shell
-                        div.df8vVc
-                            span#yZ04Ef.z5vYxf
-                            span#KHjmsf.z5vYxf
-                        div.google-logo
-                    div.permission-bar
-                        div.permission-bar-gradient
-        form(action='/search' method='GET')
-            div
-                div.A8SBwf(data-alt='false' data-biboe='false' data-hp='true')
-                    div.RNNXgb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q3tUDCAQ')
-                        div.SDkEP
-                            div.A7sPV.xZi7jd
-                                button.sF3Vod(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q0J0RCAU' type='button')
-                                    span.pJMg1
-                                div.luYL9e(data-hveid='6' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QupYSCAY')
-                                    ul.GrtgLe
-                                        li
-                                            button.Fgfcge.HG0NCb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q1p0RCAc' type='button')
-                                                span.z1asCe
-                                                span
-                                                    | 이미지 업로드
-                                        li
-                                            button.Fgfcge.HnzfWe(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q1J0RCAg' type='button')
-                                                span.z1asCe
-                                                span
-                                                    | 파일 업로드
-                                    input(type='file')
-                                    input(type='file')
-                            div.FcQxmf
-                                button.XOUhue(data-hveid='9' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QvpoSCAk' type='button')
-                                    div.Uouhf
-                                        div.neurLd(data-hveid='10' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q2rsOCAo')
-                                        div.jpQ9s
-                                            span.tCH3ze.wuXmqc.z1asCe
-                                    span.gPW5yd
-                            div.a4bIc(data-hpmde='false' data-mnr='20')
-                                div.YacQv
-                                textarea#APjFqb.gLFyf(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q39UDCAs' name='q' placeholder='' rows='1' title='검색' value='')
-                            div.dRYYxd.fM33ce
-                                div.BKRPef
-                                    div.vOY7J(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q05YFCAw')
-                                        span.ExCKkf.rzyADb.z1asCe
-                                div.WC2Die
-                                    div.Umvnrc
-                                        span.ly0Ckb
-                                            img.yAnw3c(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_2' src='/tia/tia.png')
-                                    div.XDyW0e(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qvs8DCA0')
-                                    div.nDcEnd(data-base-lens-url='https://lens.google.com' data-is-images-mode='false' data-propagated-experiment-ids='' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QhqEICA4')
-                                button.Y5MKCd.plR5qb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QteYPCA8' type='button')
-                                    div.xL0qi
-                                        div.iydNQb
-                                    div.mTurwe
-                                        div.iydNQb
-                                    div.bvUkz
-                                    div.u4Uk3c
-                                        span.PD3zdc.z1asCe
-                                        span
-                                            | AI 모드
-                        div.M8H8pb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4d8ICBA')
-                    div.EyBRub.UUbT9(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4tUDCBE')
-                        div(data-bkt='searchbox' data-fhs='' data-maindata='[null,null,null,'autocomplete_user_feedback_kp_id',null,11,null,null,null,null,null,5010715,'searchbox',null,'AutocompletePrediction',null,null,null,null,11]' data-ofbl='114,120,134' data-pid='5010715')
-                            div#_7zZsafHnGeXm2roPz4K-6Q0_1
-                                div#_7zZsafHnGeXm2roPz4K-6Q0_3.yp(data-async-type='kp_feedback' data-jiis='up' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q68cECBI')
-                        div.YB4h9.ky4hfd(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QlokGCBM')
-                            div#_7zZsafHnGeXm2roPz4K-6Q0_5
-                                span.Job8vb.wuXmqc.z1asCe(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QmIkGCBQ')
-                                div.C85rO
-                                    | 무엇에 관한 의견인지 선택하세요.
-                        div.RjPuVb
-                        div.aajZCb
-                            div.xtSCL
-                            div#Alh6id.mkHrUc
-                                div.erkvQe
-                                div.rLrQHf
-                            div#shJ2Vb.OBMEnb
-                                ul.G43f7e
-                            div#ynRric.ynRric
-                            li#YMXe.PZPZlf.sbct(data-attrid='AutocompletePrediction' data-entityid='autocomplete_user_feedback_kp_id' data-view-type='1')
-                                div.eIPGRd
-                                    div.sbic
-                                        div.j0GJWd
-                                            div
-                                                img.AZNDm.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_3')
-                                            div.iQxPRb
-                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_4')
-                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_5')
-                                    div.pcTkSc
-                                        div.lnnVSe
-                                            div.wM6W7d
-                                                span
-                                            div.ClJ9Yb
-                                                div.zjKSsb
-                                                span.dKU7sc
-                                            div.a5RLac
-                                                span
-                                        div.MagqMc.Sz7Lee.U48fD
-                                            hr.Bi9oQd
-                                            div.ZFiwCf
-                                                span.JGD2rd.LGwnxb
-                                                    | 더보기
-                                                span.w2fKdd.z1asCe
-                                    div.AQZ9Vd
-                                        div.sbai
-                                            | 삭제
-                            li#d6ItKb.AB2Fdd(data-view-type='9')
-                                div.eIPGRd
-                                    div#fU0xAb.ZDHp
-                                        div.kZtr1b
-                                            div.lnnVSe
-                                                div.SHFPkb
-                                                div.bTSf5c
-                                                div.PnfqLc
-                                                div.HrUlUc
-                                            div.Tnv2td
-                                                span.JKu1je.z1asCe.z76Rnb
-                                            div.Vlt3wb
-                                        span.XAFD5c
-                                        div.j0GJWd
-                                            div
-                                                img.AZNDm.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_6')
-                                            div.iQxPRb
-                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_7')
-                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_8')
-                            li#mitGyb.PZPZlf.sbct(data-attrid='AutocompletePrediction' data-entityid='autocomplete_user_feedback_kp_id' data-view-type='8')
-                                div.eIPGRd.hdt0ld
-                                    div.sbic
-                                    div.pcTkSc
-                                        div.lnnVSe
-                                            div.wM6W7d
-                                                span
-                                            div.ClJ9Yb
-                                                span.dKU7sc
-                                    div.AQZ9Vd
-                                        div.sbai
-                                            | 삭제
-                            div#fU0xAb.ZDHp
-                                div.kZtr1b
-                                    div.lnnVSe
-                                        div.SHFPkb
-                                        div.bTSf5c
-                                        div.PnfqLc
-                                        div.HrUlUc
-                                    div.Tnv2td
-                                        span.JKu1je.z1asCe.z76Rnb
-                                    div.Vlt3wb
-                                span.XAFD5c
-                                div.j0GJWd
-                                    div
-                                        img.AZNDm.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_9')
-                                    div.iQxPRb
-                                        img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_10')
-                                        img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_11')
-                            li#TN4rFf.IDVnvc.PZPZlf(data-attrid='AutocompletePrediction' data-entityid='autocomplete_user_feedback_kp_id' data-view-type='6')
-                                div.cRV9hb
-                                    div.aVbWac
-                                        div.sbic
-                                    div.pcTkSc
-                                        div.lnnVSe
-                                            div.wM6W7d
-                                                span
-                                            div.ClJ9Yb
-                                                span.dKU7sc
-                            div.lJ9FBc
-                                center
-                                    input.gNO89b(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4dUDCBY' name='btnK' type='submit' value='Google 검색')
-                                    input.RNmpXc(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q19QECBc' name='btnI' type='submit' value='I’m Feeling Lucky')
-                        div
-                            div.WzNHm.mWcf0e(data-dccl='false' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q6scECBg')
-                                div.LRZwuc.VfL2Y
-                                    | 부적절한 예상 검색어 신고
-                    div.FPdoLc.lJ9FBc
-                        center
-                            input.gNO89b(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4dUDCBk' name='btnK' type='submit' value='Google 검색')
-                            input.RNmpXc(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q19QECBo' name='btnI' type='submit' value='I’m Feeling Lucky')
-                    div
-                    g-snackbar#ow12(data-os='1')
-                        div.LH3wG
-                            div.yK6jqe(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4G8IGw')
-                                div.b77HKf
-                                    div.rIxsve
-                                        span.Txngnb.wHYlTd.yUTMj(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qt8EOCBw')
-                                            | 업로드할 수 없습니다. .avif, .bmp, .jpeg, .pdf, .png, .webp 형식 중 하나의 파일을 사용하세요.
-                div
-            div#tophf
-                input(name='sca_esv' type='hidden' value='8530cd522fd4492a')
-                input(name='source' type='hidden' value='hp')
-                input(name='ei' type='hidden' value='7zZsafHnGeXm2roPz4K-6Q0')
-                input(name='iflsig' type='hidden' value='AFdpzrgAAAAAaWxE_wg2gRdEo-qLgC8rmcNyzC5Xv_jZ')
-    div.o3j99.qarstb
-        div
-            div#_7zZsafHnGeXm2roPz4K-6Q0_7.yp(data-aipm='1' data-async-type='hpba' data-eaip='true' data-ecom='true' data-endpoint='2' data-jiis='up' data-oaipm='0' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qj-0KCB0')
-                div
-        div
-            div#_7zZsafHnGeXm2roPz4K-6Q0_8.yf(data-aipm='1' data-async-type='hpba' data-eaip='true' data-ecom='true' data-endpoint='1' data-istweed='true' data-jiis='up' data-oaipm='0' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qj-0KCB4')
-                div
-        div#gws-output-pages-elements-homepage_additional_languages__als.vcVZ7d
-            div#SIvCob
-                | Google 지원 언어:
-                a(href='https://www.google.com/setprefs?sig=0_UB1_v6WLeyM4Ch94uDDlFuRo-Tc%3D&hl=en&source=homepage&sa=X&ved=0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q2ZgBCCA')
-                    | English
-    div
-    div.o3j99
-        div.c93Gbe
-            div.uU7dJb
-                | 대한민국
-            div.KxwPGc.SSwjIe(data-sfe='false' data-sfsw='1200')
-                div.AghGtd.KxwPGc
-                    a.pHiOh(href='https://www.google.com/intl/ko_kr/ads/?subid=ww-ww-et-g-awa-a-g_hpafoot1_1!o2&utm_source=google.com&utm_medium=referral&utm_campaign=google_hpafooter&fg=1')
-                        | 광고
-                    a.pHiOh(href='https://www.google.com/services/?subid=ww-ww-et-g-awa-a-g_hpbfoot1_1!o2&utm_source=google.com&utm_medium=referral&utm_campaign=google_hpbfooter&fg=1')
-                        | 비즈니스
-                    a.pHiOh(href='https://google.com/search/howsearchworks/?fg=1')
-                        | 검색의 원리
-                div.KxwPGc.iTjxkf
-                    a.pHiOh(href='https://policies.google.com/privacy?hl=ko&fg=1')
-                        | 개인정보처리방침
-                    a.pHiOh(href='https://policies.google.com/terms?hl=ko&fg=1')
-                        | 약관
-                    span
-                        span(data-ffp='false')
-                            g-popup
-                                div.CcNe6e
-                                    div.ayzqOc.pHiOh
-                                        | 설정
-                                div.UjBGL.iRQHZe.pkWBse
-                                    g-menu.PBn44e.cF4V5c.iQXTJe.wplJBd.yTik0
-                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
-                                            div.HG1dvd.OSrXXb.YpcDnf
-                                                a(href='https://www.google.com/preferences?hl=ko&fg=1')
-                                                    | 검색 설정
-                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
-                                            div.HG1dvd.OSrXXb.YpcDnf
-                                                a(href='/advanced_search?hl=ko&fg=1')
-                                                    | 고급검색
-                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
-                                            div.HG1dvd.OSrXXb.YpcDnf
-                                                a(href='/history/privacyadvisor/search/unauth?utm_source=googlemenu&fg=1&cctld=com')
-                                                    | Google 검색에 표시되는 데이터
-                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
-                                            div.HG1dvd.OSrXXb.YpcDnf
-                                                a(href='/history/optout?hl=ko&fg=1')
-                                                    | 검색 기록
-                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
-                                            div.HG1dvd.OSrXXb.YpcDnf
-                                                a(href='https://support.google.com/websearch/?p=ws_results_help&hl=ko&fg=1')
-                                                    | 검색 도움말
-                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
-                                            div.HG1dvd.OSrXXb.YpcDnf
-                                                span(data-bucket='websearch' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4ogOCCw')
-                                                    | 의견 보내기
-                                        g-menu-item.EpPYLd.GZnQqe.LGiluc(data-short-label='')
-                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
-                                            div.HG1dvd.OSrXXb.YpcDnf
-                                                div#YUIDDb.y0fQ9c(data-spl='/setprefs?hl=ko&prev=https://www.google.com/?pccc%3D1&sig=0_UB1_v6WLeyM4Ch94uDDlFuRo-Tc%3D&cs=1')
-                                                    div.tFYjZe(data-spt='1' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QqsEHCC0')
-                                                        | 어두운 테마: 사용
-                                                        div.iOHNLb
-                                                            span.tSAV7.z1asCe
-            div(data-fc='-1' data-pcon='-1' data-pcs='0')
+div#wrapper
+    div#snb
+        div.ico_config.snb_header
+            h2
+                i.ion-bag.ionicons
+                | 상품관리
+        dl
+            dt.g10.menu_toggle
+                | 상품관리
+            dd.active.g10
+                a(href='http://demofran.com/admin/goods.php?code=list')
+                    | 전체 상품관리
+            dd.g10
+                a(href='http://demofran.com/admin/goods.php?code=supply')
+                    | 공급사 대기상품
+                    em
+                        | 0
+            dd.g10
+                a(href='http://demofran.com/admin/goods.php?code=supply2')
+                    | 공급사 보류상품
+                    em
+                        | 0
+            dd.g10
+                a(href='http://demofran.com/admin/goods.php?code=userlist')
+                    | 가맹점 상품관리
+            dd.g10
+                a(href='http://demofran.com/admin/goods.php?code=type')
+                    | 상품 진열관리
+            dd.g10
+                a(href='http://demofran.com/admin/goods.php?code=brand_list')
+                    | 브랜드 관리
+            dd.g10
+                a(href='http://demofran.com/admin/goods.php?code=plan')
+                    | 기획전 관리
+            dt.g20.menu_toggle
+                | 재고관리
+            dd.g20
+                a(href='http://demofran.com/admin/goods.php?code=stock')
+                    | 상품 재고관리
+                    em
+                        | 0
+            dd.g20
+                a(href='http://demofran.com/admin/goods.php?code=optstock')
+                    | 상품 옵션재고관리
+                    em
+                        | 0
+            dt.g30.menu_toggle
+                | 일괄처리
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=xls_reg')
+                    | 상품 엑셀일괄등록
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=xls_option_reg')
+                    | 옵션 엑셀일괄등록
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=xls_mod')
+                    | 상품 엑셀일괄수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getprice')
+                    | 빠른 판매가격 수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getpoint')
+                    | 빠른 적립포인트 수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getuse')
+                    | 빠른 판매여부 수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getmove')
+                    | 빠른 상품이동 수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getbrand')
+                    | 빠른 브랜드 수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getdelivery')
+                    | 빠른 배송비 수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getbuylevel')
+                    | 빠른 구매가능레벨 수정
+            dd.g30
+                a(href='http://demofran.com/admin/goods.php?code=getpartner')
+                    | 빠른 가맹점노출 수정
+            dt.g40.menu_toggle
+                | 문의 / 후기
+            dd.g40
+                a(href='http://demofran.com/admin/goods.php?code=qa')
+                    | 상품 문의관리
+                    em
+                        | 0
+            dd.g40
+                a(href='http://demofran.com/admin/goods.php?code=review')
+                    | 상품 후기관리
+            dt.g50.menu_toggle
+                | 쿠폰관리
+            dd.g50
+                a(href='http://demofran.com/admin/goods.php?code=gift')
+                    | 쿠폰관리 (인쇄용)
+            dd.g50
+                a(href='http://demofran.com/admin/goods.php?code=coupon')
+                    | 쿠폰관리 (온라인)
+            dt.g60.menu_toggle
+                | 기타관리
+            dd.g60
+                a(href='http://demofran.com/admin/goods.php?code=price')
+                    | 가격비교사이트 연동
+            dd.g60
+                a(href='http://demofran.com/admin/goods.php?code=popular_list')
+                    | 상품 검색어관리
+            dd.g60
+                a(href='http://demofran.com/admin/goods.php?code=popular_rank')
+                    | 상품 검색어순위
+    div#content
+        div.breadcrumb
+            span
+                | HOME
+            i.ion-ios-arrow-right.ionicons
+            | 상품관리
+            i.ion-ios-arrow-right.ionicons
+            | 전체 상품관리
+        div.s_wrap
+            h1
+                | 전체 상품관리
+            h2
+                | 기본검색
+            form#fsearch(method='get' name='fsearch')
+                input(name='code' type='hidden' value='list')
+                div.tbl_frm01
+                    table.tablef
+                        colgroup
+                            col.w100
+                            col
+                            col.w100
+                            col
+                        tbody
+                            tr
+                                th
+                                    | 검색어
+                                td
+                                    select(name='sfl')
+                                        option(value='gname')
+                                            | 상품명
+                                        option(value='gcode')
+                                            | 상품코드
+                                        option(value='mb_id')
+                                            | 업체코드
+                                        option(value='maker')
+                                            | 제조사
+                                        option(value='origin')
+                                            | 원산지
+                                        option(value='model')
+                                            | 모델명
+                                        option(value='explan')
+                                            | 짧은설명
+                                    input.frm_input(name='stx' type='text' value='')
+                            tr
+                                th
+                                    | 카테고리
+                                td
+                                    select#sel_ca1(name='sel_ca1')
+                                        option(value='')
+                                            | =카테고리선택=
+                                        option(value='002')
+                                            | 식품/생필품
+                                        option(value='001')
+                                            | 패션의류/잡화/뷰티
+                                        option(value='003')
+                                            | 출산/유아동
+                                        option(value='004')
+                                            | 생활/건강
+                                        option(value='005')
+                                            | 가구/인테리어
+                                        option(value='007')
+                                            | 스포츠/레저/자동차/공구
+                                        option(value='006')
+                                            | 가전/디지털/컴퓨터
+                                        option(value='008')
+                                            | 도서/여행/e쿠폰/취미
+                                    select#sel_ca2(name='sel_ca2')
+                                        option(value='')
+                                            | =카테고리선택=
+                                    select#sel_ca3(name='sel_ca3')
+                                        option(value='')
+                                            | =카테고리선택=
+                                    select#sel_ca4(name='sel_ca4')
+                                        option(value='')
+                                            | =카테고리선택=
+                                    select#sel_ca5(name='sel_ca5')
+                                        option(value='')
+                                            | =카테고리선택=
+                            tr
+                                th
+                                    | 기간검색
+                                td
+                                    select#q_date_field(name='q_date_field')
+                                        option(value='update_time')
+                                            | 최근수정일
+                                        option(value='reg_time')
+                                            | 최초등록일
+                                    label.sound_only
+                                        | 시작일
+                                    input#fr_date.frm_input.hasDatepicker.w80(name='fr_date' type='text' value='')
+                                    | ~
+                                    label.sound_only
+                                        | 종료일
+                                    input#to_date.frm_input.hasDatepicker.w80(name='to_date' type='text' value='')
+                                    span.btn_group
+                                        input.btn_small.white(type='button' value='오늘')
+                                        input.btn_small.white(type='button' value='어제')
+                                        input.btn_small.white(type='button' value='일주일')
+                                        input.btn_small.white(type='button' value='지난달')
+                                        input.btn_small.white(type='button' value='1개월')
+                                        input.btn_small.white(type='button' value='3개월')
+                                        input.btn_small.white(type='button' value='전체')
+                            tr
+                                th
+                                    | 브랜드
+                                td
+                                    select(name='q_brand')
+                                        option(selected value='')
+                                            | 전체
+                                        option(value='1')
+                                            | 테스트 기업
+                                        option(value='2')
+                                            | 테스트 기업
+                                        option(value='3')
+                                            | 테스트 기업
+                                        option(value='4')
+                                            | 테스트 기업
+                                        option(value='5')
+                                            | 테스트 기업
+                                        option(value='6')
+                                            | 테스트 기업
+                                        option(value='7')
+                                            | 테스트 기업
+                                        option(value='8')
+                                            | 테스트 기업
+                                th
+                                    | 배송가능 지역
+                                td
+                                    select(name='q_zone')
+                                        option(selected value='')
+                                            | 전체
+                                        option(value='전국')
+                                            | 전국
+                                        option(value='강원도')
+                                            | 강원도
+                                        option(value='경기도')
+                                            | 경기도
+                                        option(value='경상도')
+                                            | 경상도
+                                        option(value='서울/경기도')
+                                            | 서울/경기도
+                                        option(value='서울특별시')
+                                            | 서울특별시
+                                        option(value='전라도')
+                                            | 전라도
+                                        option(value='제주도')
+                                            | 제주도
+                                        option(value='충청도')
+                                            | 충청도
+                            tr
+                                th
+                                    | 상품재고
+                                td
+                                    select#q_stock_field(name='q_stock_field')
+                                        option(value='stock_qty')
+                                            | 재고수량
+                                        option(value='noti_qty')
+                                            | 통보수량
+                                    label.sound_only
+                                        | 재고수량 시작
+                                    input#fr_stock.frm_input(name='fr_stock' type='text' value='')
+                                    | 개 이상 ~
+                                    label.sound_only
+                                        | 재고수량 끝
+                                    input#to_stock.frm_input(name='to_stock' type='text' value='')
+                                    | 개 이하
+                                th
+                                    | 상품가격
+                                td
+                                    select#q_price_field(name='q_price_field')
+                                        option(value='goods_price')
+                                            | 판매가격
+                                        option(value='supply_price')
+                                            | 공급가격
+                                        option(value='normal_price')
+                                            | 시중가격
+                                        option(value='gpoint')
+                                            | 포인트
+                                    label.sound_only
+                                        | 상품가격 시작
+                                    input#fr_price.frm_input(name='fr_price' type='text' value='')
+                                    | 원 이상 ~
+                                    label.sound_only
+                                        | 상품가격 끝
+                                    input#to_price.frm_input(name='to_price' type='text' value='')
+                                    | 원 이하
+                            tr
+                                th
+                                    | 판매여부
+                                td
+                                    label
+                                        input(checked name='q_isopen' type='radio' value='')
+                                        | 전체
+                                    label
+                                        input(name='q_isopen' type='radio' value='1')
+                                        | 진열
+                                    label
+                                        input(name='q_isopen' type='radio' value='2')
+                                        | 품절
+                                    label
+                                        input(name='q_isopen' type='radio' value='3')
+                                        | 단종
+                                    label
+                                        input(name='q_isopen' type='radio' value='4')
+                                        | 중지
+                                th
+                                    | 필수옵션
+                                td
+                                    label
+                                        input(checked name='q_option' type='radio' value='')
+                                        | 전체
+                                    label
+                                        input(name='q_option' type='radio' value='1')
+                                        | 사용
+                                    label
+                                        input(name='q_option' type='radio' value='0')
+                                        | 미사용
+                            tr
+                                th
+                                    | 과세유형
+                                td
+                                    label
+                                        input(checked name='q_notax' type='radio' value='')
+                                        | 전체
+                                    label
+                                        input(name='q_notax' type='radio' value='1')
+                                        | 과세
+                                    label
+                                        input(name='q_notax' type='radio' value='0')
+                                        | 비과세
+                                th
+                                    | 추가옵션
+                                td
+                                    label
+                                        input(checked name='q_supply' type='radio' value='')
+                                        | 전체
+                                    label
+                                        input(name='q_supply' type='radio' value='1')
+                                        | 사용
+                                    label
+                                        input(name='q_supply' type='radio' value='0')
+                                        | 미사용
+                div.btn_confirm
+                    input.btn_medium(type='submit' value='검색')
+                    input#frmRest.btn_medium.grey(type='button' value='초기화')
+            form#fgoodslist(action='./goods/goods_list_update.php' method='post' name='fgoodslist')
+                input(name='q1' type='hidden' value='code=list')
+                input(name='page' type='hidden' value='1')
+                div.local_ov.mart30
+                    | 전체 :
+                    b.fc_red
+                        | 13
+                    | 건 조회
+                    span.ov_a
+                        select#page_rows
+                            option(selected value='30')
+                                | 30줄 정렬
+                            option(value='50')
+                                | 50줄 정렬
+                            option(value='100')
+                                | 100줄 정렬
+                            option(value='150')
+                                | 150줄 정렬
+                div.local_frm01
+                    input.btn_lsmall.bx-white(name='act_button' type='submit' value='선택삭제')
+                    input.btn_lsmall.bx-white(name='act_button' type='submit' value='선택순위수정')
+                    input.btn_lsmall.bx-white(name='act_button' type='submit' value='선택상품복사')
+                    a.btn_lsmall.bx-white(href='./goods/goods_list_excel.php?code=list')
+                        i.fa.fa-file-excel-o
+                        | 엑셀저장
+                    a.btn_lsmall.fr.red(href='./goods.php?code=form')
+                        i.ion-android-add.ionicons
+                        | 상품등록
+                div.tbl_head02
+                    table#sodr_list.tablef
+                        colgroup
+                            col.w50
+                            col.w50
+                            col.w60
+                            col.w120
+                            col
+                            col
+                            col.w80
+                            col.w80
+                            col.w90
+                            col.w90
+                            col.w90
+                            col.w90
+                            col.w60
+                            col.w60
+                        thead
+                            tr
+                                th
+                                    input(name='chkall' type='checkbox' value='1')
+                                th
+                                    | 번호
+                                th
+                                    | 이미지
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=gcode&orderby=asc')
+                                        | 상품코드
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=gname&orderby=asc')
+                                        | 상품명
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=reg_time&orderby=asc')
+                                        | 최초등록일
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=isopen&orderby=asc')
+                                        | 진열
+                                th.th_bg
+                                    | 가격정보
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=rank&orderby=asc')
+                                        | 순위
+                                th
+                                    | 관리
+                            tr.rows
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=mb_id&orderby=asc')
+                                        | 업체코드
+                                th
+                                    | 공급사명
+                                th
+                                    | 카테고리
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=update_time&orderby=asc')
+                                        | 최근수정일
+                                th
+                                    a(href='/admin/goods.php?code=list&page=&filed=stock_qty&orderby=asc')
+                                        | 재고
+                                th.th_bg
+                                    a(href='/admin/goods.php?code=list&page=&filed=normal_price&orderby=asc')
+                                        | 시중가
+                                th.th_bg
+                                    a(href='/admin/goods.php?code=list&page=&filed=supply_price&orderby=asc')
+                                        | 공급가
+                                th.th_bg
+                                    a(href='/admin/goods.php?code=list&page=&filed=goods_price&orderby=asc')
+                                        | 판매가
+                                th.th_bg
+                                    a(href='/admin/goods.php?code=list&page=&filed=gpoint&orderby=asc')
+                                        | 포인트
+                        tbody
+                            tr.list0
+                                td
+                                    input(name='gs_id[0]' type='hidden' value='13')
+                                    input(name='chk[]' type='checkbox' value='0')
+                                td
+                                    | 13
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=13')
+                                        img(src='http://demofran.com/data/goods/1735175576/thumb-L1HcL19cWvrb9W1DvdDN46aaTm9BTh_40x40.jpg')
+                                td
+                                    | 1735175576
+                                td.tal
+                                    | 테스트 상품3
+                                td
+                                    | 24-12-26
+                                td
+                                    | 진열
+                                td.tar
+                                    | 0
+                                td.tar
+                                    | 0
+                                td.tar
+                                    | 0
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[0]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=13&page=1&bak=list')
+                                        | 수정
+                            tr.list0.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 가전/디지털/컴퓨터 > 노트북/PC
+                                td.fc_00f
+                                    | 24-12-26
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list1
+                                td
+                                    input(name='gs_id[1]' type='hidden' value='12')
+                                    input(name='chk[]' type='checkbox' value='1')
+                                td
+                                    | 12
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=12')
+                                        img(src='http://demofran.com/data/goods/1726045860/thumb-12_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg')
+                                td
+                                    | 1726045860
+                                td.tal
+                                    | 테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 684,000
+                                td.tar
+                                    | 492,480
+                                td.tar
+                                    | 615,600
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[1]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=12&page=1&bak=list')
+                                        | 수정
+                            tr.list1.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                    | 외 1건
+                                td.fc_00f
+                                    | 24-10-08
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list0
+                                td
+                                    input(name='gs_id[2]' type='hidden' value='11')
+                                    input(name='chk[]' type='checkbox' value='2')
+                                td
+                                    | 11
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=11')
+                                        img(src='http://demofran.com/data/goods/1726045859/thumb-11_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg')
+                                td
+                                    | 1726045859
+                                td.tal
+                                    | 테스트 상품 스몰 체리 롱 슬리브 티셔츠
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 140,000
+                                td.tar
+                                    | 71,200
+                                td.tar
+                                    | 89,000
+                                td.tar
+                                    | 4,450
+                                td
+                                    input.frm_input(name='rank[2]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=11&page=1&bak=list')
+                                        | 수정
+                            tr.list0.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-12-04
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list1
+                                td
+                                    input(name='gs_id[3]' type='hidden' value='10')
+                                    input(name='chk[]' type='checkbox' value='3')
+                                td
+                                    | 10
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=10')
+                                        img(src='http://demofran.com/data/goods/1726045858/thumb-10_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg')
+                                td
+                                    | 1726045858
+                                td.tal
+                                    | 테스트 플랫 카라 골지 니트 (GBSKN045P)
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 70,000
+                                td.tar
+                                    | 28,000
+                                td.tar
+                                    | 35,000
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[3]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=10&page=1&bak=list')
+                                        | 수정
+                            tr.list1.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-12-04
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list0
+                                td
+                                    input(name='gs_id[4]' type='hidden' value='9')
+                                    input(name='chk[]' type='checkbox' value='4')
+                                td
+                                    | 9
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=9')
+                                        img(src='http://demofran.com/data/goods/1726045857/thumb-9_4_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg')
+                                td
+                                    | 1726045857
+                                td.tal
+                                    | 테스트 플랫 카라 골지 니트 (GBSKN045P)
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 70,000
+                                td.tar
+                                    | 28,000
+                                td.tar
+                                    | 35,000
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[4]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=9&page=1&bak=list')
+                                        | 수정
+                            tr.list0.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list1
+                                td
+                                    input(name='gs_id[5]' type='hidden' value='8')
+                                    input(name='chk[]' type='checkbox' value='5')
+                                td
+                                    | 8
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=8')
+                                        img(src='http://demofran.com/data/goods/1726045856/thumb-8_5_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg')
+                                td
+                                    | 1726045856
+                                td.tal
+                                    | 테스트 상품 스몰 체리 롱 슬리브 티셔츠
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 140,000
+                                td.tar
+                                    | 71,200
+                                td.tar
+                                    | 89,000
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[5]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=8&page=1&bak=list')
+                                        | 수정
+                            tr.list1.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list0
+                                td
+                                    input(name='gs_id[6]' type='hidden' value='7')
+                                    input(name='chk[]' type='checkbox' value='6')
+                                td
+                                    | 7
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=7')
+                                        img(src='http://demofran.com/data/goods/1726045855/thumb-7_6_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg')
+                                td
+                                    | 1726045855
+                                td.tal
+                                    | 테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 684,000
+                                td.tar
+                                    | 492,480
+                                td.tar
+                                    | 615,600
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[6]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=7&page=1&bak=list')
+                                        | 수정
+                            tr.list0.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                    | 외 1건
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list1
+                                td
+                                    input(name='gs_id[7]' type='hidden' value='6')
+                                    input(name='chk[]' type='checkbox' value='7')
+                                td
+                                    | 6
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=6')
+                                        img(src='http://demofran.com/data/goods/1726045851/thumb-6_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg')
+                                td
+                                    | 1726045851
+                                td.tal
+                                    | 테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 684,000
+                                td.tar
+                                    | 492,480
+                                td.tar
+                                    | 615,600
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[7]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=6&page=1&bak=list')
+                                        | 수정
+                            tr.list1.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                    | 외 1건
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list0
+                                td
+                                    input(name='gs_id[8]' type='hidden' value='5')
+                                    input(name='chk[]' type='checkbox' value='8')
+                                td
+                                    | 5
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=5')
+                                        img(src='http://demofran.com/data/goods/1726045850/thumb-5_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg')
+                                td
+                                    | 1726045850
+                                td.tal
+                                    | 테스트 상품 스몰 체리 롱 슬리브 티셔츠
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 140,000
+                                td.tar
+                                    | 71,200
+                                td.tar
+                                    | 89,000
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[8]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=5&page=1&bak=list')
+                                        | 수정
+                            tr.list0.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list1
+                                td
+                                    input(name='gs_id[9]' type='hidden' value='4')
+                                    input(name='chk[]' type='checkbox' value='9')
+                                td
+                                    | 4
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=4')
+                                        img(src='http://demofran.com/data/goods/1726045849/thumb-4_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg')
+                                td
+                                    | 1726045849
+                                td.tal
+                                    | 테스트 플랫 카라 골지 니트 (GBSKN045P)
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 70,000
+                                td.tar
+                                    | 28,000
+                                td.tar
+                                    | 35,000
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[9]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=4&page=1&bak=list')
+                                        | 수정
+                            tr.list1.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list0
+                                td
+                                    input(name='gs_id[10]' type='hidden' value='3')
+                                    input(name='chk[]' type='checkbox' value='10')
+                                td
+                                    | 3
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=3')
+                                        img(src='http://demofran.com/data/goods/1726045737/thumb-37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg')
+                                td
+                                    | 1726045737
+                                td.tal
+                                    | 테스트 플랫 카라 골지 니트 (GBSKN045P)
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 70,000
+                                td.tar
+                                    | 28,000
+                                td.tar
+                                    | 35,000
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[10]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=3&page=1&bak=list')
+                                        | 수정
+                            tr.list0.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list1
+                                td
+                                    input(name='gs_id[11]' type='hidden' value='2')
+                                    input(name='chk[]' type='checkbox' value='11')
+                                td
+                                    | 2
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=2')
+                                        img(src='http://demofran.com/data/goods/1726045193/thumb-SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg')
+                                td
+                                    | 1726045193
+                                td.tal
+                                    | 테스트 상품 스몰 체리 롱 슬리브 티셔츠
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 140,000
+                                td.tar
+                                    | 71,200
+                                td.tar
+                                    | 89,000
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[11]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=2&page=1&bak=list')
+                                        | 수정
+                            tr.list1.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                td.fc_00f
+                                    | 24-12-04
+                                td
+                                    span.txt_false
+                                        | 무제한
+                            tr.list0
+                                td
+                                    input(name='gs_id[12]' type='hidden' value='1')
+                                    input(name='chk[]' type='checkbox' value='12')
+                                td
+                                    | 1
+                                td
+                                    a(href='http://demofran.com/shop/view.php?index_no=1')
+                                        img(src='http://demofran.com/data/goods/1726043335/thumb-Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg')
+                                td
+                                    | 1726043335
+                                td.tal
+                                    | 테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287
+                                td
+                                    | 24-09-11
+                                td
+                                    | 진열
+                                td.tar
+                                    | 684,000
+                                td.tar
+                                    | 492,480
+                                td.tar
+                                    | 615,600
+                                td.tar
+                                    | 0
+                                td
+                                    input.frm_input(name='rank[12]' type='text' value='0')
+                                td
+                                    a.btn_small(href='./goods.php?code=form&w=u&gs_id=1&page=1&bak=list')
+                                        | 수정
+                            tr.list0.rows
+                                td.fc_00f
+                                    | admin
+                                td.tal.txt_succeed
+                                    | 샘플샵
+                                td.tal.txt_succeed
+                                    span.fsitem
+                                        | 패션의류/잡화/뷰티
+                                    | 외 1건
+                                td.fc_00f
+                                    | 24-09-11
+                                td
+                                    span.txt_false
+                                        | 무제한
+                div.local_frm02
+                    input.btn_lsmall.bx-white(name='act_button' type='submit' value='선택삭제')
+                    input.btn_lsmall.bx-white(name='act_button' type='submit' value='선택순위수정')
+                    input.btn_lsmall.bx-white(name='act_button' type='submit' value='선택상품복사')
+                    a.btn_lsmall.bx-white(href='./goods/goods_list_excel.php?code=list')
+                        i.fa.fa-file-excel-o
+                        | 엑셀저장
+                    a.btn_lsmall.fr.red(href='./goods.php?code=form')
+                        i.ion-android-add.ionicons
+                        | 상품등록

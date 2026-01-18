@@ -470,9 +470,6 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
-        // [VRAM-LOG] Log Sequence Length
-        println!("[TEXT-FWD] Batch: {}, SeqLen: {}, Offset: {}", b_size, seq_len, seqlen_offset);
-
         let position_ids = match position_ids {
             Some(ids) => ids.clone(),
             None => Tensor::arange(
@@ -507,17 +504,6 @@ impl QuantizedQwen3VLTextModel {
         };
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // [VRAM-LOG] Monitor VRAM during layers (sampled)
-            if layer_idx % 5 == 0 || layer_idx < 3 {
-                if let Ok(nvml) = Nvml::init() {
-                    if let Ok(dev) = nvml.device_by_index(0) {
-                        if let Ok(mem) = dev.memory_info() {
-                            println!("[TEXT-LAYER-{}] Free VRAM: {:.2} MB", layer_idx, mem.free as f64 / 1_000_000.0);
-                        }
-                    }
-                }
-            }
-
             // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
@@ -642,14 +628,18 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         let min_absolute_margin = 300_000_000;
-                         let fluid_margin = (mem.free as f64 * 0.10) as u64;
+                         // [AGGRESSIVE] For Head, use minimal margins to avoid Split-Brain performance penalty
+                         let min_absolute_margin = 100_000_000; // 100MB
+                         let fluid_margin = (mem.free as f64 * 0.01) as u64; // 1%
                          let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
                          
                          if mem.free < (head_weight_size + safety_floor) {
                              println!("[OFFLOAD] Head Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Head to CPU.", 
                                 mem.free as f64/1e9, head_weight_size as f64/1e9, safety_floor as f64/1e9);
                              head_device = Device::Cpu;
+                         } else {
+                             println!("[VRAM-BUDGET] Fitting Head on GPU. Free: {:.2} GB > Cost {:.2} GB + Safety {:.2} GB.", 
+                                mem.free as f64/1e9, head_weight_size as f64/1e9, safety_floor as f64/1e9);
                          }
                      }
                  }
@@ -746,15 +736,6 @@ impl QuantizedQwen3VLModel {
         cache_position: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
-        // [VRAM-LOG] Start of Forward
-        if let Ok(nvml) = Nvml::init() {
-            if let Ok(dev) = nvml.device_by_index(0) {
-                if let Ok(mem) = dev.memory_info() {
-                    println!("[VRAM-LOG-FWD-START] Free: {:.2} MB", mem.free as f64 / 1_000_000.0);
-                }
-            }
-        }
-
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
         
         if let Some(pixel_values) = pixel_values {
@@ -762,15 +743,6 @@ impl QuantizedQwen3VLModel {
                  println!("[VRAM-LOG] Starting Vision Encoder...");
                  let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?;
                  
-                 // [VRAM-LOG] After Vision
-                 if let Ok(nvml) = Nvml::init() {
-                    if let Ok(dev) = nvml.device_by_index(0) {
-                        if let Ok(mem) = dev.memory_info() {
-                            println!("[VRAM-LOG-FWD-VISION-DONE] Free: {:.2} MB", mem.free as f64 / 1_000_000.0);
-                        }
-                    }
-                 }
-
                  let image_embeds = Tensor::cat(&image_embeds, 0)?;
                  let vision_mask = self.get_placeholder_mask(input_ids, true)?;
                  inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;

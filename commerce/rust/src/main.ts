@@ -203,11 +203,11 @@ btnExtract?.addEventListener("click", async () => {
     listView.style.display = "none";
     detailView.style.display = "flex";
 
-    // Toggle Buttons
+    // Toggle Buttons (Ensure Stop button is visible if running)
     if (btnDetailDelete) btnDetailDelete.style.display = "none";
     if (btnStopTask) btnStopTask.style.display = "flex";
 
-    // Block re-execution if already running
+    // Block re-execution if already running (just show view)
     if (isExtracting) {
         return;
     }
@@ -472,7 +472,8 @@ listen("extraction-progress", (event: any) => {
              extractionLog.appendChild(p);
          }
          
-         if (payload.category === "Done" || payload.data) {
+         // 1. Done State
+         if (payload.category === "Done") {
              isExtracting = false; // Reset global state
              
              // Reset Buttons
@@ -483,32 +484,45 @@ listen("extraction-progress", (event: any) => {
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
 
              const isCancelled = payload.summary && payload.summary.includes("Cancelled");
-             const successText = isCancelled ? "Task Cancelled" : (payload.category === "Done" ? "Extraction Complete" : `<strong>${payload.category}</strong> extracted.`);
+             const successText = isCancelled ? "Task Cancelled" : "Extraction Complete";
              
              p.innerHTML = `<span style="margin-right:8px;">${isCancelled ? "🛑" : "✅"}</span> <span>${successText}</span>`;
              p.style.color = isCancelled ? "#ef4444" : "#4ade80"; 
              
              if(payload.data) {
-                  // Show final JSON
                   const pretty = JSON.stringify(payload.data, null, 2);
                   const pre = document.createElement("pre");
                   pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.75rem";
                   pre.style.color = "#e5e5e5"; pre.style.background = "#1e1e1e";
                   pre.style.padding = "10px"; pre.style.borderRadius = "5px"; pre.style.marginTop = "10px";
                   pre.innerText = pretty;
-                  
-                  if(!p.querySelector("pre")) {
-                      extractionLog.appendChild(pre);
-                  }
+                  extractionLog.appendChild(pre);
              }
-         } else if (payload.category === "Error") {
+         } 
+         // 2. Error State
+         else if (payload.category === "Error") {
              isExtracting = false;
              if (btnStopTask) btnStopTask.style.display = "none";
              p.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary}</span>`;
              p.style.color = "#ef4444";
-         } else {
+         } 
+         // 3. Progress State (including intermediate items)
+         else {
              // Progress
              p.innerHTML = `<span style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner}</span> <span>${payload.summary}</span>`;
+             
+             // Render Intermediate Data
+             if(payload.data) {
+                  const pretty = JSON.stringify(payload.data, null, 2);
+                  const pre = document.createElement("pre");
+                  pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.75rem";
+                  pre.style.color = "#aaa"; pre.style.background = "#252525";
+                  pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px";
+                  pre.innerText = pretty;
+                  p.appendChild(pre); // Append to the current progress line container
+                  p.style.flexDirection = "column"; // Stack text and code
+                  p.style.alignItems = "flex-start";
+             }
          }
     }
 });

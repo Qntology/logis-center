@@ -197,11 +197,11 @@ impl LogisModel {
              } else {
                  let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
                  
-                 // [Optimization] For < 6GB VRAM, cap context at 4096 to prioritize Layer Offloading to GPU.
-                 // 4096 is enough for our 3000-char chunks.
+                 // [Optimization] For < 6GB VRAM, cap context at 2048 to prioritize Layer Offloading to GPU.
+                 // 4096 was causing split-brain (CPU/GPU) slowdown. 2048 ensures full GPU offload.
                  if detected_vram < 6_000_000_000 {
-                     println!("[CONFIG] Low VRAM (<6GB) detected. Capping context to 4096 to save VRAM for layers.");
-                     capacity.clamp(1024.0, 4096.0) as u32
+                     println!("[CONFIG] Low VRAM (<6GB) detected. Capping context to 2048 to force ALL layers onto GPU.");
+                     capacity.clamp(1024.0, 2048.0) as u32
                  } else {
                      capacity.clamp(1024.0, 32768.0) as u32
                  }

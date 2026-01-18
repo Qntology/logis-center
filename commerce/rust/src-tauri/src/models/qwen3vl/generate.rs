@@ -208,16 +208,11 @@ impl Qwen3VLGenerateModel {
                         return Err(anyhow!("Generation cancelled"));
                     }
                 }
-
-                if i % 10 == 0 { // Log every 10 tokens to reduce spam
-                    if let Ok(nvml) = Nvml::init() {
-                        if let Ok(dev) = nvml.device_by_index(0) {
-                            if let Ok(mem) = dev.memory_info() {
-                                println!("[VRAM-LOG-GEN-STEP {}] Free: {:.2} MB", i, mem.free as f64 / 1_000_000.0);
-                            }
-                        }
-                    }
-                }
+                
+                // Alive signal
+                use std::io::Write;
+                print!(".");
+                std::io::stdout().flush().ok();
 
                 let logits = match &mut self.qwen3_vl {
                     ModelVariant::Standard(m) => m.forward(

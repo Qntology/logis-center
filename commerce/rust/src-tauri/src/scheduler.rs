@@ -155,6 +155,7 @@ pub async fn start_background_worker(
                              let _ = app_handle.emit("extraction-progress", json!({ 
                                 "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
+                             break; // Stop processing pending tasks batch to prevent immediate model reload
                         } else {
                             println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, e);
                             let store_guard = store.lock().await;
@@ -397,8 +398,10 @@ async fn process_task(
         for (i, item_pug) in item_pugs.iter().enumerate() {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+            println!("\n[EXTRACT-ITEM {}/{}] Snippet: {}...", i+1, total_items, item_pug.replace("\n", " ").chars().take(100).collect::<String>());
+
             // Chunking for List Items
-            let chunks = chunk_text(item_pug, 4000, 200); 
+            let chunks = chunk_text(item_pug, 2500, 300); 
             let mut item_data = json!({});
             
             let _ = app_handle.emit("extraction-progress", json!({ 
@@ -518,6 +521,8 @@ Definition: {}
             
             // Iterate over chunks and merge results
             for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                println!("\n[EXTRACT-CHUNK {}/{}] Snippet: {}...", chunk_idx+1, chunks.len(), chunk.replace("\n", " ").chars().take(100).collect::<String>());
+                
                 let field_json_str = if let Some(model) = model_guard.as_ref() {
                     let prompt = format!(
 r#"[CONTEXT]
