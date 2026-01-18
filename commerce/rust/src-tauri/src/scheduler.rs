@@ -503,8 +503,8 @@ Definition: {}
 
         let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
         
-        // CHUNKING: Split huge content into 8000-char chunks with 1000-char overlap
-        let chunks = chunk_text(&content_pug, 8000, 1000); 
+        // CHUNKING: Split huge content into 3000-char chunks with 500-char overlap (CPU Optimized)
+        let chunks = chunk_text(&content_pug, 3000, 500); 
         let fields_prompts = parsing::item2json(page_type, &url, language);
         
         for (field_name, field_schema) in fields_prompts {
