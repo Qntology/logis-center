@@ -226,7 +226,7 @@ async fn process_task(
                  tokio::select!{
                      res = model.chat_with_image_spinner(prompt_clone, Some(dynamic_image), &app_handle_clone, "extraction-progress", json!({ 
                         "category": "Vision Analysis", "summary": "Analyzing image content..."
-                    }), 1024) => res?,
+                    }), 1024, Some(cancellation_token.clone())) => res?,
                      _ = async {
                          loop {
                              if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -337,7 +337,7 @@ async fn process_task(
         tokio::select!{
             res = model.chat_with_spinner(&system, &classify_input, &app_handle_clone, "extraction-progress", json!({ 
                 "category": "Classification", "summary": "Analyzing page structure..."
-            }), 512) => res?,
+            }), 512, Some(cancellation_token.clone())) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -447,7 +447,7 @@ Definition: {}
                                     "category": "Extraction", 
                                     "summary": format!("Item {}/{}: {}", i + 1, total_items, field_name)
                                 }), 
-                                512 
+                                512, Some(cancellation_token.clone())
                             ) => res?,
                             _ = async {
                                 loop {
@@ -554,7 +554,7 @@ Definition: {}
                                 "category": "Extraction", 
                                 "summary": format!("Extracting field: {} ({}/{})", field_name, chunk_idx+1, chunks.len())
                             }), 
-                            1024 
+                            1024, Some(cancellation_token.clone())
                         ) => res?,
                         _ = async {
                             loop {

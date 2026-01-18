@@ -228,7 +228,7 @@ async fn summarize_image(
     
     let mut extraction_result = {
         let model = model_guard.as_ref().unwrap();
-        model.process_image_full(image_path.clone(), &app_handle).await
+        model.process_image_full(image_path.clone(), &app_handle, Some(state.cancellation_token.clone())).await
     };
 
     if let Err(e) = &extraction_result {
@@ -249,7 +249,7 @@ async fn summarize_image(
                     // Retry extraction
                     if let Some(model) = model_guard.as_ref() {
                         println!("[VISION-RETRY] Retrying process_image_full on CPU...");
-                        extraction_result = model.process_image_full(image_path.clone(), &app_handle).await;
+                        extraction_result = model.process_image_full(image_path.clone(), &app_handle, Some(state.cancellation_token.clone())).await;
                     }
                 },
                 Err(init_err) => {
@@ -412,7 +412,7 @@ async fn check_query_intent(
     }
     
     if let Some(model) = model_guard.as_ref() {
-        model.parse_query_intent(query).await.map_err(|e| e.to_string())
+        model.parse_query_intent(query, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
     } else {
         Err("Model not initialized".to_string())
     }
@@ -462,7 +462,7 @@ async fn deep_research_command(
     }
     
     // 2. Run Deep Research
-    model.run_deep_research(query, context_data, &app_handle).await.map_err(|e| e.to_string())
+    model.run_deep_research(query, context_data, &app_handle, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
