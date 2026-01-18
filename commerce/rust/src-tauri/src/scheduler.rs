@@ -392,6 +392,22 @@ async fn process_task(
         // --- Detail Page Logic (Field-by-Field) ---
         // Zoom in first
         let content_pug = parsing::convert_to_clean_pug_selector(&html, target_selector, PugMode::FullContent);
+        
+        // --- Selector Check: If node/item selector yielded no content, stop. ---
+        if content_pug.trim().is_empty() {
+            println!("[Scheduler] Selector '{}' not found in HTML. Skipping extraction.", target_selector);
+            let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Error", 
+                "summary": format!("Selector '{}' not found.", target_selector), 
+                "spinner": "❌"
+            }));
+            // Emit Done to reset UI state
+            let _ = app_handle.emit("extraction-progress", json!({
+                "category": "Done", "summary": "Extraction Failed", "spinner": "🛑", "data": null
+            }));
+            return Ok(());
+        }
+
         // Save Debug
         let _ = std::fs::write("debug_content_pug.txt", &content_pug);
 

@@ -276,12 +276,20 @@ btnExtract?.addEventListener("click", async () => {
 
 // Stop Task
 btnStopTask?.addEventListener("click", async () => {
-    if (confirm("Stop current extraction?")) {
-        try {
-            await invoke("stop_current_extraction");
-            // UI update will happen via extraction-progress event or we can force it here
-            btnStopTask.innerText = "Stopping...";
-        } catch(e) { console.error(e); }
+    // 1. Confirm First
+    if (!confirm("Stop current extraction?")) {
+        return;
+    }
+
+    // 2. Update UI immediately to show feedback
+    btnStopTask.innerText = "Stopping...";
+    
+    try {
+        // 3. Send command
+        await invoke("stop_current_extraction");
+    } catch(e) { 
+        console.error(e); 
+        btnStopTask.innerText = "Error";
     }
 });
 

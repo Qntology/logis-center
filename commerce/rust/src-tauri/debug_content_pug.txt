@@ -1,12 +1,302 @@
-body
-    cr-iconset(name='ntp')
-    cr-iconset(name='composebox')
-    cr-iconset(name='thumbnail')
-    cr-iconset(name='cr20')
-    cr-iconset(name='cr')
-    cr-iconset(name='iph')
-    cr-iconset(name='ntp-promo')
-    cr-iconset(name='modules')
-    cr-iconset(name='tab_resumption')
-    cr-iconset(name='tab_groups')
-    ntp-app
+div.L3eUgb(data-hveid='1')
+    div#ZnpjSd
+    div.Ne6nSd.n1xJcf.o3j99
+        a.MV3Tnb(href='https://about.google/?fg=1&utm_source=google-KR&utm_medium=referral&utm_campaign=hp-header')
+            | Google 정보
+        a.MV3Tnb(href='https://store.google.com/KR?utm_source=hp_header&utm_medium=google_ooo&utm_campaign=GS100042&hl=ko-KR')
+            | 스토어
+        div.LX3sZb
+            div
+                header#gb.gb_Dd.gb_H.gb_y
+                    div.gb_1.gb_M.gb_Qf.gb_Xf(data-ogbl='')
+                        div.gb_0.gb_1
+                            a.gb_Z(data-pid='23' href='https://mail.google.com/mail/&ogbl')
+                                | Gmail
+                        div.gb_0.gb_1
+                            a.gb_Z(data-pid='2' href='https://www.google.com/imghp?hl=ko&ogbl')
+                                | 이미지
+                    div#gbwa.gb_1.gb_J.gb_vd(data-ogsr-alt='' data-ogsr-fb='true')
+                        div.gb_D
+                            a.gb_B(href='https://www.google.co.kr/intl/ko/about/products')
+                    div.gb_z(data-ogsr-up='')
+                        a.gb_A(href='https://accounts.google.com/ServiceLogin?hl=ko&passive=true&continue=https://www.google.com/&ec=futura_exp_og_so_72776762_e')
+                            span.gb_U
+                                | 로그인
+                        div
+                        div
+    div#LS8OJ.LLD4me.LS8OJ.o3j99.yr19Zb
+        div.k1zIA.rSk4se
+    div.ikrT4e.o3j99.om7nvf
+        dialog#spch-dlg.spch-dlg
+            div#spch.spch
+                button#spchx.pz5bj
+                    span.wuXmqc.z1asCe
+                div#spchc.spchc
+                    div.inner-container
+                        div.button-container
+                            span#spchl.r8s4j
+                            span#spchb.LgbsSe
+                                div.microphone
+                                    span.receiver
+                                    div.wrapper
+                                        span.stem
+                                        span.shell
+                        div.df8vVc
+                            span#yZ04Ef.z5vYxf
+                            span#KHjmsf.z5vYxf
+                        div.google-logo
+                    div.permission-bar
+                        div.permission-bar-gradient
+        form(action='/search' method='GET')
+            div
+                div.A8SBwf(data-alt='false' data-biboe='false' data-hp='true')
+                    div.RNNXgb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q3tUDCAQ')
+                        div.SDkEP
+                            div.A7sPV.xZi7jd
+                                button.sF3Vod(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q0J0RCAU' type='button')
+                                    span.pJMg1
+                                div.luYL9e(data-hveid='6' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QupYSCAY')
+                                    ul.GrtgLe
+                                        li
+                                            button.Fgfcge.HG0NCb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q1p0RCAc' type='button')
+                                                span.z1asCe
+                                                span
+                                                    | 이미지 업로드
+                                        li
+                                            button.Fgfcge.HnzfWe(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q1J0RCAg' type='button')
+                                                span.z1asCe
+                                                span
+                                                    | 파일 업로드
+                                    input(type='file')
+                                    input(type='file')
+                            div.FcQxmf
+                                button.XOUhue(data-hveid='9' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QvpoSCAk' type='button')
+                                    div.Uouhf
+                                        div.neurLd(data-hveid='10' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q2rsOCAo')
+                                        div.jpQ9s
+                                            span.tCH3ze.wuXmqc.z1asCe
+                                    span.gPW5yd
+                            div.a4bIc(data-hpmde='false' data-mnr='20')
+                                div.YacQv
+                                textarea#APjFqb.gLFyf(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q39UDCAs' name='q' placeholder='' rows='1' title='검색' value='')
+                            div.dRYYxd.fM33ce
+                                div.BKRPef
+                                    div.vOY7J(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q05YFCAw')
+                                        span.ExCKkf.rzyADb.z1asCe
+                                div.WC2Die
+                                    div.Umvnrc
+                                        span.ly0Ckb
+                                            img.yAnw3c(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_2' src='/tia/tia.png')
+                                    div.XDyW0e(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qvs8DCA0')
+                                    div.nDcEnd(data-base-lens-url='https://lens.google.com' data-is-images-mode='false' data-propagated-experiment-ids='' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QhqEICA4')
+                                button.Y5MKCd.plR5qb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QteYPCA8' type='button')
+                                    div.xL0qi
+                                        div.iydNQb
+                                    div.mTurwe
+                                        div.iydNQb
+                                    div.bvUkz
+                                    div.u4Uk3c
+                                        span.PD3zdc.z1asCe
+                                        span
+                                            | AI 모드
+                        div.M8H8pb(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4d8ICBA')
+                    div.EyBRub.UUbT9(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4tUDCBE')
+                        div(data-bkt='searchbox' data-fhs='' data-maindata='[null,null,null,'autocomplete_user_feedback_kp_id',null,11,null,null,null,null,null,5010715,'searchbox',null,'AutocompletePrediction',null,null,null,null,11]' data-ofbl='114,120,134' data-pid='5010715')
+                            div#_7zZsafHnGeXm2roPz4K-6Q0_1
+                                div#_7zZsafHnGeXm2roPz4K-6Q0_3.yp(data-async-type='kp_feedback' data-jiis='up' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q68cECBI')
+                        div.YB4h9.ky4hfd(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QlokGCBM')
+                            div#_7zZsafHnGeXm2roPz4K-6Q0_5
+                                span.Job8vb.wuXmqc.z1asCe(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QmIkGCBQ')
+                                div.C85rO
+                                    | 무엇에 관한 의견인지 선택하세요.
+                        div.RjPuVb
+                        div.aajZCb
+                            div.xtSCL
+                            div#Alh6id.mkHrUc
+                                div.erkvQe
+                                div.rLrQHf
+                            div#shJ2Vb.OBMEnb
+                                ul.G43f7e
+                            div#ynRric.ynRric
+                            li#YMXe.PZPZlf.sbct(data-attrid='AutocompletePrediction' data-entityid='autocomplete_user_feedback_kp_id' data-view-type='1')
+                                div.eIPGRd
+                                    div.sbic
+                                        div.j0GJWd
+                                            div
+                                                img.AZNDm.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_3')
+                                            div.iQxPRb
+                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_4')
+                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_5')
+                                    div.pcTkSc
+                                        div.lnnVSe
+                                            div.wM6W7d
+                                                span
+                                            div.ClJ9Yb
+                                                div.zjKSsb
+                                                span.dKU7sc
+                                            div.a5RLac
+                                                span
+                                        div.MagqMc.Sz7Lee.U48fD
+                                            hr.Bi9oQd
+                                            div.ZFiwCf
+                                                span.JGD2rd.LGwnxb
+                                                    | 더보기
+                                                span.w2fKdd.z1asCe
+                                    div.AQZ9Vd
+                                        div.sbai
+                                            | 삭제
+                            li#d6ItKb.AB2Fdd(data-view-type='9')
+                                div.eIPGRd
+                                    div#fU0xAb.ZDHp
+                                        div.kZtr1b
+                                            div.lnnVSe
+                                                div.SHFPkb
+                                                div.bTSf5c
+                                                div.PnfqLc
+                                                div.HrUlUc
+                                            div.Tnv2td
+                                                span.JKu1je.z1asCe.z76Rnb
+                                            div.Vlt3wb
+                                        span.XAFD5c
+                                        div.j0GJWd
+                                            div
+                                                img.AZNDm.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_6')
+                                            div.iQxPRb
+                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_7')
+                                                img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_8')
+                            li#mitGyb.PZPZlf.sbct(data-attrid='AutocompletePrediction' data-entityid='autocomplete_user_feedback_kp_id' data-view-type='8')
+                                div.eIPGRd.hdt0ld
+                                    div.sbic
+                                    div.pcTkSc
+                                        div.lnnVSe
+                                            div.wM6W7d
+                                                span
+                                            div.ClJ9Yb
+                                                span.dKU7sc
+                                    div.AQZ9Vd
+                                        div.sbai
+                                            | 삭제
+                            div#fU0xAb.ZDHp
+                                div.kZtr1b
+                                    div.lnnVSe
+                                        div.SHFPkb
+                                        div.bTSf5c
+                                        div.PnfqLc
+                                        div.HrUlUc
+                                    div.Tnv2td
+                                        span.JKu1je.z1asCe.z76Rnb
+                                    div.Vlt3wb
+                                span.XAFD5c
+                                div.j0GJWd
+                                    div
+                                        img.AZNDm.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_9')
+                                    div.iQxPRb
+                                        img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_10')
+                                        img.EOLKOc.uHGFVd(alt='' data-atf='0' data-csiid='7zZsafHnGeXm2roPz4K-6Q0_11')
+                            li#TN4rFf.IDVnvc.PZPZlf(data-attrid='AutocompletePrediction' data-entityid='autocomplete_user_feedback_kp_id' data-view-type='6')
+                                div.cRV9hb
+                                    div.aVbWac
+                                        div.sbic
+                                    div.pcTkSc
+                                        div.lnnVSe
+                                            div.wM6W7d
+                                                span
+                                            div.ClJ9Yb
+                                                span.dKU7sc
+                            div.lJ9FBc
+                                center
+                                    input.gNO89b(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4dUDCBY' name='btnK' type='submit' value='Google 검색')
+                                    input.RNmpXc(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q19QECBc' name='btnI' type='submit' value='I’m Feeling Lucky')
+                        div
+                            div.WzNHm.mWcf0e(data-dccl='false' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q6scECBg')
+                                div.LRZwuc.VfL2Y
+                                    | 부적절한 예상 검색어 신고
+                    div.FPdoLc.lJ9FBc
+                        center
+                            input.gNO89b(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4dUDCBk' name='btnK' type='submit' value='Google 검색')
+                            input.RNmpXc(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q19QECBo' name='btnI' type='submit' value='I’m Feeling Lucky')
+                    div
+                    g-snackbar#ow12(data-os='1')
+                        div.LH3wG
+                            div.yK6jqe(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4G8IGw')
+                                div.b77HKf
+                                    div.rIxsve
+                                        span.Txngnb.wHYlTd.yUTMj(data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qt8EOCBw')
+                                            | 업로드할 수 없습니다. .avif, .bmp, .jpeg, .pdf, .png, .webp 형식 중 하나의 파일을 사용하세요.
+                div
+            div#tophf
+                input(name='sca_esv' type='hidden' value='8530cd522fd4492a')
+                input(name='source' type='hidden' value='hp')
+                input(name='ei' type='hidden' value='7zZsafHnGeXm2roPz4K-6Q0')
+                input(name='iflsig' type='hidden' value='AFdpzrgAAAAAaWxE_wg2gRdEo-qLgC8rmcNyzC5Xv_jZ')
+    div.o3j99.qarstb
+        div
+            div#_7zZsafHnGeXm2roPz4K-6Q0_7.yp(data-aipm='1' data-async-type='hpba' data-eaip='true' data-ecom='true' data-endpoint='2' data-jiis='up' data-oaipm='0' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qj-0KCB0')
+                div
+        div
+            div#_7zZsafHnGeXm2roPz4K-6Q0_8.yf(data-aipm='1' data-async-type='hpba' data-eaip='true' data-ecom='true' data-endpoint='1' data-istweed='true' data-jiis='up' data-oaipm='0' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Qj-0KCB4')
+                div
+        div#gws-output-pages-elements-homepage_additional_languages__als.vcVZ7d
+            div#SIvCob
+                | Google 지원 언어:
+                a(href='https://www.google.com/setprefs?sig=0_UB1_v6WLeyM4Ch94uDDlFuRo-Tc%3D&hl=en&source=homepage&sa=X&ved=0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q2ZgBCCA')
+                    | English
+    div
+    div.o3j99
+        div.c93Gbe
+            div.uU7dJb
+                | 대한민국
+            div.KxwPGc.SSwjIe(data-sfe='false' data-sfsw='1200')
+                div.AghGtd.KxwPGc
+                    a.pHiOh(href='https://www.google.com/intl/ko_kr/ads/?subid=ww-ww-et-g-awa-a-g_hpafoot1_1!o2&utm_source=google.com&utm_medium=referral&utm_campaign=google_hpafooter&fg=1')
+                        | 광고
+                    a.pHiOh(href='https://www.google.com/services/?subid=ww-ww-et-g-awa-a-g_hpbfoot1_1!o2&utm_source=google.com&utm_medium=referral&utm_campaign=google_hpbfooter&fg=1')
+                        | 비즈니스
+                    a.pHiOh(href='https://google.com/search/howsearchworks/?fg=1')
+                        | 검색의 원리
+                div.KxwPGc.iTjxkf
+                    a.pHiOh(href='https://policies.google.com/privacy?hl=ko&fg=1')
+                        | 개인정보처리방침
+                    a.pHiOh(href='https://policies.google.com/terms?hl=ko&fg=1')
+                        | 약관
+                    span
+                        span(data-ffp='false')
+                            g-popup
+                                div.CcNe6e
+                                    div.ayzqOc.pHiOh
+                                        | 설정
+                                div.UjBGL.iRQHZe.pkWBse
+                                    g-menu.PBn44e.cF4V5c.iQXTJe.wplJBd.yTik0
+                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
+                                            div.HG1dvd.OSrXXb.YpcDnf
+                                                a(href='https://www.google.com/preferences?hl=ko&fg=1')
+                                                    | 검색 설정
+                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
+                                            div.HG1dvd.OSrXXb.YpcDnf
+                                                a(href='/advanced_search?hl=ko&fg=1')
+                                                    | 고급검색
+                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
+                                            div.HG1dvd.OSrXXb.YpcDnf
+                                                a(href='/history/privacyadvisor/search/unauth?utm_source=googlemenu&fg=1&cctld=com')
+                                                    | Google 검색에 표시되는 데이터
+                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
+                                            div.HG1dvd.OSrXXb.YpcDnf
+                                                a(href='/history/optout?hl=ko&fg=1')
+                                                    | 검색 기록
+                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
+                                            div.HG1dvd.OSrXXb.YpcDnf
+                                                a(href='https://support.google.com/websearch/?p=ws_results_help&hl=ko&fg=1')
+                                                    | 검색 도움말
+                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
+                                            div.HG1dvd.OSrXXb.YpcDnf
+                                                span(data-bucket='websearch' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90Q4ogOCCw')
+                                                    | 의견 보내기
+                                        g-menu-item.EpPYLd.GZnQqe.LGiluc(data-short-label='')
+                                        g-menu-item.EpPYLd.GZnQqe(data-short-label='')
+                                            div.HG1dvd.OSrXXb.YpcDnf
+                                                div#YUIDDb.y0fQ9c(data-spl='/setprefs?hl=ko&prev=https://www.google.com/?pccc%3D1&sig=0_UB1_v6WLeyM4Ch94uDDlFuRo-Tc%3D&cs=1')
+                                                    div.tFYjZe(data-spt='1' data-ved='0ahUKEwixm_vJ95OSAxVls1YBHU-BL90QqsEHCC0')
+                                                        | 어두운 테마: 사용
+                                                        div.iOHNLb
+                                                            span.tSAV7.z1asCe
+            div(data-fc='-1' data-pcon='-1' data-pcs='0')
