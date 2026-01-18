@@ -96,20 +96,35 @@ impl Qwen3VLProcessor {
         let img_h = img.height();
         let img_w = img.width();
         
-        // --- Dynamic Resolution Capping ---
+        // --- Dynamic Resolution Capping (RAM & VRAM) ---
         let mut sys = System::new_all();
         sys.refresh_memory();
-        let free_mem = sys.available_memory();
+        let free_ram = sys.available_memory();
         
-        // Default limits from config
         let mut longest_edge = self.img_process_cfg.size.longest_edge as u32;
         let shortest_edge = self.img_process_cfg.size.shortest_edge as u32;
         
-        // If free RAM < 2GB, aggressively cap resolution to 1024px
-        if free_mem < 2_000_000_000 {
+        // 1. System RAM Check
+        if free_ram < 2_000_000_000 {
             if longest_edge > 1024 {
-                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping Image Resolution to 1024px.", free_mem as f64 / 1e9);
+                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping to 1024px.", free_ram as f64 / 1e9);
                 longest_edge = 1024;
+            }
+        }
+
+        // 2. VRAM Check (New)
+        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    if mem.free < 1_500_000_000 {
+                        let cap = if mem.free < 800_000_000 { 768 } else { 896 };
+                        if longest_edge > cap {
+                            println!("[PROCESSOR] Low VRAM ({:.2} MB). Capping Image to {}px to save Attention memory.", 
+                                mem.free as f64 / 1e6, cap);
+                            longest_edge = cap;
+                        }
+                    }
+                }
             }
         }
         

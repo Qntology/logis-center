@@ -380,11 +380,13 @@ impl QuantizedQwen3VLTextModel {
                          is_vram_checked = true;
                          
                          // USER REQUIREMENT: Reserve 10% of *currently available* fluid resources
+                         // OR a minimum of 1.2GB to prevent runtime OOM on low-VRAM systems.
                          // PLUS the guaranteed space for KV Cache (calculated from max_tokens)
+                         let min_absolute_margin = 1_200_000_000;
                          let fluid_margin = (mem.free as f64 * 0.10) as u64;
-                         safety_floor = fluid_margin + kv_reserve;
+                         safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
 
-                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Floor(10%+KV): {:.2} MB. Cost/Layer: {:.2} MB", 
+                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Floor(Max(10%,1.2G)+KV): {:.2} MB. Cost/Layer: {:.2} MB", 
                             mem.total as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
                      }
                  }
@@ -582,8 +584,10 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         // Fluid Safety Floor: 10% of Current Free + KV Reserve
-                         let safety_floor = (mem.free as f64 * 0.10) as u64 + kv_reserve;
+                         // Fluid Safety Floor: 10% of Current Free OR 1.2GB min + KV Reserve
+                         let min_absolute_margin = 1_200_000_000;
+                         let fluid_margin = (mem.free as f64 * 0.10) as u64;
+                         let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
                          
                          if mem.free < (vision_total_cost + safety_floor) {
                              println!("[OFFLOAD] Vision Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Vision to CPU.", 
@@ -623,7 +627,9 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         let safety_floor = (mem.free as f64 * 0.10) as u64 + kv_reserve;
+                         let min_absolute_margin = 1_200_000_000;
+                         let fluid_margin = (mem.free as f64 * 0.10) as u64;
+                         let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
                          
                          if mem.free < (head_weight_size + safety_floor) {
                              println!("[OFFLOAD] Head Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Head to CPU.", 
