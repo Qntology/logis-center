@@ -469,6 +469,10 @@ impl QuantizedQwen3VLTextModel {
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
+        
+        // [VRAM-LOG] Log Sequence Length
+        println!("[TEXT-FWD] Batch: {}, SeqLen: {}, Offset: {}", b_size, seq_len, seqlen_offset);
+
         let position_ids = match position_ids {
             Some(ids) => ids.clone(),
             None => Tensor::arange(
@@ -503,6 +507,17 @@ impl QuantizedQwen3VLTextModel {
         };
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // [VRAM-LOG] Monitor VRAM during layers (sampled)
+            if layer_idx % 5 == 0 || layer_idx < 3 {
+                if let Ok(nvml) = Nvml::init() {
+                    if let Ok(dev) = nvml.device_by_index(0) {
+                        if let Ok(mem) = dev.memory_info() {
+                            println!("[TEXT-LAYER-{}] Free VRAM: {:.2} MB", layer_idx, mem.free as f64 / 1_000_000.0);
+                        }
+                    }
+                }
+            }
+
             // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             

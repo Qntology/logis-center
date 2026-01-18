@@ -148,6 +148,21 @@ impl Qwen3VLGenerateModel {
             .tokenizer
             .text_encode(input.replace_text.clone(), &self.device)?;
         let mut seq_len = input_ids.dim(1)?;
+        
+        println!("[GENERATE] Input Token Count: {}", seq_len);
+
+        // HARD SAFETY CHECK: Truncate Input if it exceeds limit
+        if let Some(limit) = self.hard_token_limit {
+            // Reserve a small buffer for generation (e.g., 64 tokens)
+            let max_input = if limit > 64 { limit - 64 } else { limit };
+            
+            if seq_len > max_input {
+                println!("⚠️ [WARN] Input too long ({} > {}). Truncating to prevent OOM.", seq_len, max_input);
+                input_ids = input_ids.narrow(1, 0, max_input)?;
+                seq_len = max_input;
+            }
+        }
+
         let mut seqlen_offset = 0;
         
         // Take ownership of large tensors

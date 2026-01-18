@@ -10,12 +10,83 @@ use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// Ported from proxy/src/index.ts `isDiff`
-#[allow(dead_code)]
-fn is_diff(v1: &Value, v2: &Value) -> bool {
-    if v1.is_null() && v2.is_null() { return false; }
-    if v1.is_null() || v2.is_null() { return true; }
-    v1 != v2
+// Helper to chunk text with overlap, strictly respecting newlines for Pug
+fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+    if text.len() <= chunk_size {
+        return vec![text.to_string()];
+    }
+    
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    
+    while start < text.len() {
+        let mut end = (start + chunk_size).min(text.len());
+        
+        // Backtrack to the last newline to avoid splitting a Pug line
+        if end < text.len() {
+            if let Some(last_newline) = text[start..end].rfind('\n') {
+                end = start + last_newline + 1; 
+            }
+        }
+        
+        chunks.push(text[start..end].to_string());
+        
+        if end == text.len() {
+            break;
+        }
+        
+        // Calculate next start with overlap
+        let mut next_start = end.saturating_sub(overlap);
+        
+        // Align start to the *next* newline to ensure the next chunk starts cleanly
+        if next_start < end {
+             if let Some(next_newline) = text[next_start..end].find('\n') {
+                 next_start = next_start + next_newline + 1;
+             }
+        }
+        
+        // Ensure progress
+        if next_start >= end {
+            next_start = end; 
+        }
+        start = next_start;
+    }
+    chunks
+}
+
+// Deep merge for JSON objects
+fn merge_json_results(target: &mut Value, source: &Value) {
+    if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
+        for (k, v) in source_obj {
+            // If value is null or empty string/array, ignore
+            if v.is_null() { continue; }
+            if let Some(s) = v.as_str() { if s.is_empty() { continue; } }
+            if let Some(a) = v.as_array() { if a.is_empty() { continue; } }
+            
+            // If target doesn't have it or target is empty, overwrite
+            let should_update = match target_obj.get(k) {
+                None => true,
+                Some(tv) => {
+                    tv.is_null() || 
+                    (tv.is_string() && tv.as_str() == Some("")) ||
+                    (tv.is_array() && tv.as_array().unwrap().is_empty())
+                }
+            };
+
+            if should_update {
+                target_obj.insert(k.clone(), v.clone());
+            } else if let Some(target_inner) = target_obj.get_mut(k) {
+                // If both are objects, recurse
+                if target_inner.is_object() && v.is_object() {
+                    merge_json_results(target_inner, v);
+                }
+                // Lists? Simply append for now (might duplicate, but safe for search)
+                else if let (Some(ta), Some(sa)) = (target_inner.as_array_mut(), v.as_array()) {
+                    ta.extend(sa.clone());
+                }
+            }
+        }
+    }
 }
 
 pub async fn start_background_worker(
@@ -27,7 +98,6 @@ pub async fn start_background_worker(
     println!("[Scheduler] Background worker started.");
     
     tokio::spawn(async move {
-        // Imitating the timeout/delay logic from proxy/src/index.ts
         let mut delay_secs = 1;
         
         loop {
@@ -42,24 +112,19 @@ pub async fn start_background_worker(
                         Err(e) => println!("[Scheduler] Failed to fetch tasks: {:?}", e),
                     }
                 }
-            } // Release lock
+            }
 
             if pending_tasks.is_empty() {
-                // Increase delay if no tasks (up to a limit), similar to adaptive timeout
                 delay_secs = (delay_secs + 1).min(10); 
                 continue;
             } else {
-                // Reset delay if tasks found
                 delay_secs = 1;
             }
 
             for task in pending_tasks {
                 println!("[Scheduler] Processing task: {}", task.id);
-                
-                // Reset cancellation token for the new task
                 cancellation_token.store(false, Ordering::SeqCst);
                 
-                // Mark as processing
                 {
                     let store_guard = store.lock().await;
                     if let Some(db) = store_guard.as_ref() {
@@ -82,9 +147,8 @@ pub async fn start_background_worker(
                              if let Some(db) = store_guard.as_ref() {
                                  let _ = db.update_task_status(&task.id, "cancelled").await;
                              }
-                             // Emit cancelled event to UI to reset state
-                             let _ = app_handle.emit("extraction-progress", json!({
-                                "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null
+                             let _ = app_handle.emit("extraction-progress", json!({ 
+                                "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
                         } else {
                             println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, e);
@@ -106,65 +170,58 @@ async fn process_task(
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle
-) -> Result<()> {
+) -> Result<()>
+{
     
-    // Check Cancellation
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // Initial Progress
-    let _ = app_handle.emit("extraction-progress", json!({
+    let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
     }));
 
-    // Parse Task Data
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
-    let language = "english"; // Default, ideally detect from content or task
+    let language = "english"; 
 
     // --- Image Extraction Logic ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
         
-        let _ = app_handle.emit("extraction-progress", json!({
+        let _ = app_handle.emit("extraction-progress", json!({ 
             "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
         }));
 
         if let Ok(img) = image::open(image_path) {
              let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
+             let prompt = parsing::image2json("kr", language, "tracking", "");
              
-             let prompt = parsing::image2json("kr", language, "tracking", ""); // Defaults
-             
-             // Check Cancellation
              if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
              let mut model_guard = model_mutex.lock().await;
              if model_guard.is_none() {
-                 let _ = app_handle.emit("extraction-progress", json!({
+                 let _ = app_handle.emit("extraction-progress", json!({ 
                     "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
                  }));
                  match LogisModel::new(None).await {
                      Ok(m) => *model_guard = Some(m),
                      Err(e) => {
-                         println!("[Scheduler] Failed to load LogisModel: {:?}", e);
-                         let _ = app_handle.emit("extraction-progress", json!({
+                         let _ = app_handle.emit("extraction-progress", json!({ 
                             "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
                          }));
-                         return Ok(()); // Stop task processing but don't crash worker
+                         return Ok(());
                      }
                  }
              }
              
-             // Check Cancellation before Inference
              if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
              let result_str = if let Some(model) = model_guard.as_ref() {
                  let prompt_clone = prompt.clone();
                  let app_handle_clone = app_handle.clone();
                  
-                 // Run inference with cancellation monitoring
-                 tokio::select! {
-                     res = model.chat_with_image_spinner(prompt_clone, Some(dynamic_image), &app_handle_clone, "extraction-progress", json!({
-                         "category": "Vision Analysis", "summary": "Analyzing image content..."
-                     }), 1024) => res?,
+                 tokio::select!{
+                     res = model.chat_with_image_spinner(prompt_clone, Some(dynamic_image), &app_handle_clone, "extraction-progress", json!({ 
+                        "category": "Vision Analysis", "summary": "Analyzing image content..."
+                    }), 1024) => res?,
                      _ = async {
                          loop {
                              if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -179,23 +236,21 @@ async fn process_task(
              
              let extracted_data = parse_json_from_llm(&result_str);
              
-             // Check Cancellation after Inference
              if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-             // Save Result
              let store_guard = store_mutex.lock().await;
              if let Some(db) = store_guard.as_ref() {
                  let id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task.id).to_string();
                  let _ = db.upsert_item("commerce_tracking", &id, "tracking", extracted_data.clone(), None).await;
              }
              
-             let _ = app_handle.emit("extraction-progress", json!({
+             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
              }));
              
              return Ok(());
         } else {
-             let _ = app_handle.emit("extraction-progress", json!({
+             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
              }));
              return Ok(());
@@ -205,50 +260,44 @@ async fn process_task(
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
     if url.is_empty() {
-        return Ok(()) // Or Err if URL is mandatory
+        return Ok (());
     }
 
-    // 1. Fetch Page Content
     let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
         let content = raw_html.to_string();
-        // OPTIMIZATION: Remove large HTML from JSON immediately to free one copy
         if let Some(obj) = task_data.as_object_mut() {
             obj.remove("html");
         }
         content
-    } else if !url.is_empty() { 
-        // Fallback to fetching URL
+    } else if !url.is_empty() {
         reqwest::get(&url).await?.text().await?
     } else {
-        return Ok(())
+        return Ok (());
     };
     
-    // Check Cancellation before Browser Extraction
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // OPTIMIZATION: Pre-clean ONCE (String is Send, so we can keep it)
     let clean_html = parsing::pre_clean_html(&raw_html_content);
-    // Drop raw content to free memory
     drop(raw_html_content); 
     
-    // SCOPE 1: Parse for Light Pug (Structure Only)
-    // We must drop 'document' before awaiting LLM because scraper::Html is !Send
     let light_pug = {
         let document = scraper::Html::parse_document(&clean_html);
-        let lp = parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly);
-        lp
-    }; // document dropped here
+        parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly)
+    }; 
     
-    // Save Light Pug to file for debugging
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
-    println!("[Scheduler] Saved Light Pug to debug_light_pug.txt (Length: {})", light_pug.len());
     
-    // 2. LLM Call: Map Outline
+    // Chunking Logic for Classification
+    let classify_input = if light_pug.len() > 8000 {
+        light_pug[..8000].to_string()
+    } else {
+        light_pug.clone()
+    };
+
     let mut model_guard = model_mutex.lock().await;
     
     if model_guard.is_none() {
-        println!("[Scheduler] Model not initialized. Loading Qwen3-VL...");
-        let _ = app_handle.emit("extraction-progress", json!({
+        let _ = app_handle.emit("extraction-progress", json!({ 
             "category": "Loading Model", "summary": "Loading AI Model...", "spinner": "⠋"
         }));
         match LogisModel::new(None).await {
@@ -260,10 +309,9 @@ async fn process_task(
         }
     }
 
-    // Check CPU Warning
     if let Some(model) = model_guard.as_ref() {
         if model.is_cpu() {
-            let _ = app_handle.emit("extraction-progress", json!({
+            let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Warning", 
                 "summary": "Low RAM. Running on CPU (Slow)...", 
                 "spinner": "⚠️"
@@ -271,20 +319,18 @@ async fn process_task(
         }
     }
 
-    let _ = app_handle.emit("extraction-progress", json!({
+    let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", "summary": "Analyzing page structure...", "spinner": "⠋"
     }));
     
-    // Check Cancellation before Inference
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let page_info_str = if let Some(model) = model_guard.as_ref() {
         let system = parsing::map_outline(language);
-        let light_pug_clone = light_pug.clone();
         let app_handle_clone = app_handle.clone();
 
-        tokio::select! {
-            res = model.chat_with_spinner(&system, &light_pug_clone, &app_handle_clone, "extraction-progress", json!({
+        tokio::select!{
+            res = model.chat_with_spinner(&system, &classify_input, &app_handle_clone, "extraction-progress", json!({ 
                 "category": "Classification", "summary": "Analyzing page structure..."
             }), 512) => res?,
             _ = async {
@@ -297,15 +343,11 @@ async fn process_task(
     } else {
         "{}".to_string()
     };
-    drop(model_guard); // Release lock
+    drop(model_guard);
     
-    println!("[Scheduler] Raw Map Output: {}", page_info_str);
-
-    // 3. Parse Map Result
     let page_info: Value = parse_json_from_llm(&page_info_str);
     
-    // Emit Classification Result
-    let _ = app_handle.emit("extraction-progress", json!({
+    let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", 
         "summary": format!("Map: Type={}, Detail={}", 
             page_info.get("type").and_then(|s| s.as_str()).unwrap_or("?"),
@@ -320,89 +362,153 @@ async fn process_task(
     let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
     let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
 
-    println!("[Scheduler] Map Result: Type={}, Detail={}, Node='{}', Item='{}'", page_type, is_detail, node_selector, item_selector);
-
     if page_type == "" || page_type == "unknown" {
-        println!("[Scheduler] Task finished early: Could not classify page type.");
-        return Ok(());
+        return Ok (());
     }
     
-    // Check Cancellation
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // =================================================================================
-    // STEP 2: Extraction (Full Content) - "Zoom In"
-    // =================================================================================
-
-    let target_selector = if !node_selector.is_empty() { 
-        node_selector 
-    } else if !item_selector.is_empty() {
-        item_selector
-    } else {
-        "body"
-    };
-    
+    let target_selector = if !node_selector.is_empty() { node_selector } else if !item_selector.is_empty() { item_selector } else { "body" };
     let mut extracted_data = json!({});
 
     if !is_detail {
-        // --- List Page Logic (Item-wise Chunking) ---
-        let _ = app_handle.emit("extraction-progress", json!({
+        let _ = app_handle.emit("extraction-progress", json!({ 
             "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
         }));
 
-        // SCOPE 2: Parse for Extraction (Re-parsing clean_html, but necessary for !Send)
         let item_pugs = {
             let document = scraper::Html::parse_document(&clean_html);
             parsing::split_doc_to_pug_list(&document, target_selector, PugMode::FullContent)
-        }; // document dropped
+        }; 
         
         let total_items = item_pugs.len();
-        
-        let _ = app_handle.emit("extraction-progress", json!({
-            "category": "List Processing", 
-            "summary": format!("Found {} items to extract.", total_items),
-            "spinner": "✅"
+        let _ = app_handle.emit("extraction-progress", json!({ 
+            "category": "List Processing", "summary": format!("Found {} items to extract.", total_items), "spinner": "✅"
         }));
 
         let mut items_array = Vec::new();
-        // Use item2json schema to extract details for each list item
         let fields_prompts = parsing::item2json(page_type, &url, language);
 
         for (i, item_pug) in item_pugs.iter().enumerate() {
-            // Check Cancellation inside Loop
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+            // Chunking for List Items
+            let chunks = chunk_text(item_pug, 6000, 500); 
             let mut item_data = json!({});
             
-            let _ = app_handle.emit("extraction-progress", json!({
-                "category": "Extraction", 
-                "summary": format!("Extracting Item {}/{}: ...", i + 1, total_items), 
-                "spinner": "⠋"
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Extraction", "summary": format!("Extracting Item {}/{}: ...", i + 1, total_items), "spinner": "⠋"
             }));
 
-            // Re-acquire lock for each item extraction loop
             let model_guard = model_mutex.lock().await; 
 
             for (field_name, field_prompt) in &fields_prompts {
-                // Optimization: Skip heavy fields for list view
                 if field_name == "description" || field_name == "detail_images" { continue; }
-
-                // Check Cancellation before field extraction
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+                for chunk in &chunks {
+                    let field_json_str = if let Some(model) = model_guard.as_ref() {
+                        let prompt = format!("{}
+
+Snippet:
+{}", field_prompt, chunk);
+                        let app_handle_clone = app_handle.clone();
+
+                        tokio::select!{
+                            res = model.chat_with_spinner("Extract ONLY the requested field. Return JSON.", 
+                                &prompt,
+                                &app_handle_clone, "extraction-progress", json!({ 
+                                    "category": "Extraction", 
+                                    "summary": format!("Item {}/{}: {}", i + 1, total_items, field_name)
+                                }), 
+                                512 
+                            ) => res?,
+                            _ = async {
+                                loop {
+                                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                        }
+                    } else {
+                        "{}".to_string()
+                    };
+                    
+                    let field_result = parse_json_from_llm(&field_json_str);
+                    if let Some(val) = field_result.get(field_name) {
+                        if !val.is_null() {
+                             item_data.as_object_mut().unwrap().insert(field_name.clone(), val.clone());
+                        }
+                    } else if !field_result.as_object().unwrap().is_empty() {
+                         item_data.as_object_mut().unwrap().insert(field_name.clone(), field_result.clone());
+                    }
+                }
+            }
+            drop(model_guard); 
+
+            if let Some(id_val) = item_data.get("id").cloned() {
+                 if item_data.get("index").is_none() { item_data.as_object_mut().unwrap().insert("index".to_string(), id_val); }
+            }
+            items_array.push(item_data.clone());
+            
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Extraction", "summary": format!("Item {} extracted.", i + 1), "data": item_data
+            }));
+        }
+        
+        extracted_data.as_object_mut().unwrap().insert("items".to_string(), json!(items_array));
+        extracted_data.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
+
+    } else {
+        let content_pug = {
+            let document = scraper::Html::parse_document(&clean_html);
+            parsing::convert_doc_to_clean_pug_selector(&document, target_selector, PugMode::FullContent)
+        }; 
+        
+        if content_pug.trim().is_empty() {
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Error", "summary": format!("Selector '{}' not found.", target_selector), "spinner": "❌"
+            }));
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Done", "summary": "Extraction Failed", "spinner": "🛑", "data": null
+            }));
+            return Ok(());
+        }
+
+        let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
+        
+        // CHUNKING: Split huge content into 8000-char chunks with 1000-char overlap
+        let chunks = chunk_text(&content_pug, 8000, 1000); 
+        let fields_prompts = parsing::item2json(page_type, &url, language);
+        
+        for (field_name, field_prompt) in fields_prompts {
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Extraction", "summary": format!("Extracting field: {}", field_name), "spinner": "⠋"
+            }));
+
+            let model_guard = model_mutex.lock().await;
+            
+            // Iterate over chunks and merge results
+            for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 let field_json_str = if let Some(model) = model_guard.as_ref() {
-                    let prompt = format!("{}\n\nItem Pug Snippet:\n{}", field_prompt, item_pug);
+                    // Optimized Prompt for Pug Snippets
+                    let prompt = format!(
+                        "CONTEXT: This is PART {}/{} of a Pug (HTML) template.\nTASK: {}\n\n[PUG SNIPPET]\n{}\n\nINSTRUCTION: Extract the field value if present in this snippet. Ignore incomplete tags at boundaries. Return valid JSON only.", 
+                        chunk_idx+1, chunks.len(), field_prompt, chunk
+                    );
                     let app_handle_clone = app_handle.clone();
 
-                    tokio::select! {
+                    tokio::select!{
                         res = model.chat_with_spinner(
-                            "Extract ONLY the requested field from the Pug snippet. Return valid JSON.", 
+                            "You are a data extractor. Return JSON.", 
                             &prompt,
-                            &app_handle_clone, "extraction-progress", json!({
+                            &app_handle_clone, "extraction-progress", json!({ 
                                 "category": "Extraction", 
-                                "summary": format!("Item {}/{}: {}", i + 1, total_items, field_name)
+                                "summary": format!("Extracting field: {} ({}/{})", field_name, chunk_idx+1, chunks.len())
                             }), 
-                            512 
+                            1024 
                         ) => res?,
                         _ = async {
                             loop {
@@ -415,178 +521,71 @@ async fn process_task(
                     "{}".to_string()
                 };
                 
-                let field_result = parse_json_from_llm(&field_json_str);
+                let field_data = parse_json_from_llm(&field_json_str);
                 
-                // Merge field result
-                if let Some(val) = field_result.get(field_name) {
-                    item_data.as_object_mut().unwrap().insert(field_name.clone(), val.clone());
-                } else {
-                    item_data.as_object_mut().unwrap().insert(field_name.clone(), field_result.clone());
+                if let Some(obj) = extracted_data.as_object_mut() {
+                    let mut temp_wrapper = serde_json::Map::new();
+                    if let Some(val) = field_data.get(&field_name) {
+                        temp_wrapper.insert(field_name.clone(), val.clone());
+                    } else if !field_data.as_object().unwrap().is_empty() {
+                        temp_wrapper.insert(field_name.clone(), field_data.clone());
+                    }
+                    
+                    merge_json_results(&mut Value::Object(obj.clone()), &Value::Object(temp_wrapper));
+                    
+                    if let Some(new_val) = field_data.get(&field_name) {
+                         if !new_val.is_null() {
+                             let existing = obj.get(&field_name);
+                             let is_empty = existing.map_or(true, |v| v.is_null() || (v.is_string() && v.as_str().unwrap().is_empty()));
+                             if is_empty {
+                                 obj.insert(field_name.clone(), new_val.clone());
+                             }
+                         }
+                    }
                 }
             }
-            drop(model_guard); 
-
-            // Normalize ID/Index for the item
-            if let Some(id_val) = item_data.get("id").cloned() {
-                 if item_data.get("index").is_none() { 
-                     item_data.as_object_mut().unwrap().insert("index".to_string(), id_val);
-                 }
-            }
-
-            items_array.push(item_data.clone());
-            
-            // Show intermediate item result
-            let _ = app_handle.emit("extraction-progress", json!({
-                "category": "Extraction", 
-                "summary": format!("Item {} extracted.", i + 1),
-                "data": item_data
-            }));
-        }
-        
-        extracted_data.as_object_mut().unwrap().insert("items".to_string(), json!(items_array));
-        extracted_data.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
-
-    } else {
-        // --- Detail Page Logic (Field-by-Field) ---
-        // SCOPE 2: Parse for Extraction
-        let content_pug = {
-            let document = scraper::Html::parse_document(&clean_html);
-            parsing::convert_doc_to_clean_pug_selector(&document, target_selector, PugMode::FullContent)
-        }; // document dropped
-        
-        // --- Selector Check: If node/item selector yielded no content, stop. ---
-        if content_pug.trim().is_empty() {
-            println!("[Scheduler] Selector '{}' not found in HTML. Skipping extraction.", target_selector);
-            let _ = app_handle.emit("extraction-progress", json!({
-                "category": "Error", 
-                "summary": format!("Selector '{}' not found.", target_selector), 
-                "spinner": "❌"
-            }));
-            // Emit Done to reset UI state
-            let _ = app_handle.emit("extraction-progress", json!({
-                "category": "Done", "summary": "Extraction Failed", "spinner": "🛑", "data": null
-            }));
-            return Ok(());
-        }
-
-        // Save Debug
-        let _ = std::fs::write("debug_content_pug.txt", &content_pug);
-
-        let fields_prompts = parsing::item2json(page_type, &url, language);
-        
-        for (field_name, field_prompt) in fields_prompts {
-            // Check Cancellation inside Loop
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-            let _ = app_handle.emit("extraction-progress", json!({
-                "category": "Extraction", 
-                "summary": format!("Extracting field: {}", field_name), 
-                "spinner": "⠋"
-            }));
-
-            // Acquire lock
-            let model_guard = model_mutex.lock().await;
-
-            let field_json_str = if let Some(model) = model_guard.as_ref() {
-                let prompt = format!("{}\n\nData (Zoomed In):\n{}", field_prompt, content_pug);
-                let app_handle_clone = app_handle.clone();
-
-                tokio::select! {
-                    res = model.chat_with_spinner(
-                        "Extract ONLY the requested field from the Pug template. Return valid JSON.", 
-                        &prompt,
-                        &app_handle_clone, "extraction-progress", json!({
-                            "category": "Extraction", 
-                            "summary": format!("Extracting field: {}", field_name)
-                        }), 
-                        1024 
-                    ) => res?,
-                    _ = async {
-                        loop {
-                            if cancellation_token.load(Ordering::Relaxed) { break; }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    } => { return Err(anyhow::anyhow!("Task cancelled")); }
-                }
-            } else {
-                "{}".to_string()
-            };
             drop(model_guard);
             
-            // Parse and Merge
-            let field_data = parse_json_from_llm(&field_json_str);
-            if let Some(obj) = extracted_data.as_object_mut() {
-                if let Some(val) = field_data.get(&field_name) {
-                    obj.insert(field_name.clone(), val.clone());
-                } else {
-                    obj.insert(field_name.clone(), field_data.clone());
-                }
-            }
+            let mut field_map = serde_json::Map::new();
+            field_map.insert(field_name.clone(), extracted_data.get(&field_name).cloned().unwrap_or(Value::Null));
             
-                        // Show intermediate result in UI
-                        let mut field_map = serde_json::Map::new();
-                        field_map.insert(field_name.clone(), extracted_data.get(&field_name).cloned().unwrap_or(Value::Null));
-                        
-                        let _ = app_handle.emit("extraction-progress", json!({
-                            "category": "Extraction", 
-                            "summary": format!("Field '{}' extracted.", field_name),
-                            "spinner": "✅",
-                            "data": Value::Object(field_map)
-                        }));
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Extraction", "summary": format!("Field '{}' extracted.", field_name), "spinner": "✅",
+                "data": Value::Object(field_map)
+            }));
         }
     }
     
-    // Check Cancellation before Embedding
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // Inject type if missing
     if let Some(obj) = extracted_data.as_object_mut() {
-        if obj.get("type").is_none() {
-            obj.insert("type".to_string(), json!(page_type));
-        }
+        if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
     }
 
-    // --- Normalization Step ---
     let mut normalized_data = json!({});
     if let Some(obj) = extracted_data.as_object() {
         for (k, v) in obj {
             let val = if let Some(inner_obj) = v.as_object() {
-                if let Some(value_field) = inner_obj.get("value") {
-                    value_field.clone()
-                } else {
-                    v.clone()
-                }
-            } else {
-                v.clone()
-            };
+                if let Some(value_field) = inner_obj.get("value") { value_field.clone() } else { v.clone() }
+            } else { v.clone() };
             normalized_data.as_object_mut().unwrap().insert(k.clone(), val);
         }
     }
     
-    // Sync 'id' and 'index'
     let id_opt = normalized_data.get("id").cloned();
     let index_opt = normalized_data.get("index").cloned();
 
     if let Some(id_val) = id_opt {
-        if normalized_data.get("index").is_none() {
-            normalized_data.as_object_mut().unwrap().insert("index".to_string(), id_val);
-        }
+        if normalized_data.get("index").is_none() { normalized_data.as_object_mut().unwrap().insert("index".to_string(), id_val); }
     } else if let Some(idx_val) = index_opt {
-        if normalized_data.get("id").is_none() {
-            normalized_data.as_object_mut().unwrap().insert("id".to_string(), idx_val);
-        }
+        if normalized_data.get("id").is_none() { normalized_data.as_object_mut().unwrap().insert("id".to_string(), idx_val); }
     }
     
     extracted_data = normalized_data;
 
-    // =================================================================================
-    // STEP 3: Logic Relay, Merge & Save
-    // =================================================================================
-    
-    // Check Cancellation
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let _ = app_handle.emit("extraction-progress", json!({
+    let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Saving", "summary": "Saving to database...", "spinner": "⠋"
     }));
 
@@ -597,7 +596,6 @@ async fn process_task(
         if let Some(db) = store_guard.as_ref() {
             let mut target_data = extracted_data.clone();
             let mut target_id = format!("{}_{}", page_type, chrono::Utc::now().timestamp_millis());
-            
             let mut found_existing = false;
             let to_table = format!("commerce_{}", merge_info.to);
 
@@ -622,16 +620,13 @@ async fn process_task(
             drop(store_guard); 
             
             let mut model_guard = model_mutex.lock().await;
-            if model_guard.is_none() {
-                if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
-            }
+            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
             
-            // Check Cancellation before Embedding
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let vector = if let Some(model) = model_guard.as_ref() {
                 let text_clone = text_to_embed.clone();
-                tokio::select! {
+                tokio::select!{
                     res = model.get_embedding(text_clone) => res.ok(),
                     _ = async {
                         loop {
@@ -640,9 +635,7 @@ async fn process_task(
                         }
                     } => { return Err(anyhow::anyhow!("Task cancelled")); }
                 }
-            } else {
-                None
-            };
+            } else { None };
             drop(model_guard);
             
             let store_guard = store_mutex.lock().await;
@@ -652,29 +645,22 @@ async fn process_task(
             }
         }
     } else {
-        // Simple Save (No Relay)
         let target_table = format!("commerce_{}", page_type);
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
-                let id = extracted_data.get("id")
-                .and_then(|s| s.as_str())
-                .unwrap_or_else(|| task.id.as_str())
-                .to_string();
-                
+                let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
                 let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), None).await;
         }
     }    
     
-    // Final Done Event
-    let _ = app_handle.emit("extraction-progress", json!({
+    let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
     }));
 
     Ok(())
 }
 fn parse_json_from_llm(text: &str) -> Value {
-    if let Ok(v) = serde_json::from_str(text) { return v; } // This line is correct
-    
+    if let Ok(v) = serde_json::from_str(text) { return v; }
     if let Some(start) = text.find("{") {
         if let Some(end) = text.rfind("}") {
             if start < end {
@@ -682,7 +668,6 @@ fn parse_json_from_llm(text: &str) -> Value {
             }
         }
     }
-    
     if let Some(start) = text.find("[") {
         if let Some(end) = text.rfind("]") {
             if start < end {
@@ -690,6 +675,5 @@ fn parse_json_from_llm(text: &str) -> Value {
             }
         }
     }
-
     json!({})
 }
