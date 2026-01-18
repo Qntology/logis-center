@@ -330,34 +330,58 @@ async fn process_task(
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
     // Chunking Logic for Classification
-    let classify_input = if light_pug.len() > 8000 {
-        light_pug[..8000].to_string()
-    } else {
-        light_pug.clone()
-    };
-
-    let mut model_guard = model_mutex.lock().await;
+    // Instead of truncating, we ingest the whole light_pug structure
+    let classify_chunks = chunk_text(&light_pug, 4000, 500);
+    let classify_chunks_len = classify_chunks.len();
     
-    if model_guard.is_none() {
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "category": "Loading Model", "summary": "Loading AI Model...", "spinner": "⠋"
-        }));
-        match LogisModel::new(None).await {
-            Ok(m) => *model_guard = Some(m),
-            Err(e) => {
-                println!("[Scheduler] Model Init Error: {:?}", e);
-                return Ok(());
-            }
-        }
-    }
-
+    // Ingest chunks for Classification
     if let Some(model) = model_guard.as_ref() {
-        if model.is_cpu() {
+        let app_handle_clone = app_handle.clone();
+        for (i, chunk) in classify_chunks.iter().enumerate() {
+            let is_last = i == classify_chunks_len - 1;
+            
+            // For the last chunk, we don't just "ingest", we ask the question (Step 1)
+            // But actually, it's cleaner to ingest ALL, then ask.
+            // Let's ingest all first.
+            
+            let prompt = format!(
+r#"[CONTEXT]
+You are reading the structural skeleton (Pug/Jade) of a webpage to understand its type and layout.
+Part {}/{}.
+
+[INPUT SNIPPET]
+{}
+
+[INSTRUCTION]
+Read and memorize this structure. Do NOT generate JSON yet.
+Just say "ACKNOWLEDGED"."#,
+                i + 1, classify_chunks_len, chunk
+            );
+            
             let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Warning", 
-                "summary": "Low RAM. Running on CPU (Slow)...", 
-                "spinner": "⚠️"
+                "category": "Classification Ingestion", 
+                "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
+                "spinner": "⠋"
             }));
+
+            tokio::select!{
+                res = model.chat_with_spinner(
+                    "You are a helpful assistant.", 
+                    &prompt,
+                    &app_handle_clone, 
+                    "extraction-progress", 
+                    json!({ "category": "Classification Ingestion" }), 
+                    20, // Minimal tokens
+                    Some(cancellation_token.clone()), 
+                    Some(task.id.clone())
+                ) => res?,
+                _ = async {
+                    loop {
+                        if cancellation_token.load(Ordering::Relaxed) { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                } => { return Err(anyhow::anyhow!("Task cancelled")); }
+            }
         }
     }
 
@@ -369,41 +393,27 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut final_page_info = json!({});
-    let mut chat_messages = Vec::new();
-
-    // Step 1: Identify Type
+    
+    // Step 1: Identify Type (Now context is fully loaded in task.id session)
     let page_type_res = if let Some(model) = model_guard.as_ref() {
-        // ... (system prompt) ...
         let system_text = parsing::page_type_prompt(language);
         let app_handle_clone = app_handle.clone();
 
-        chat_messages.push(ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: system_text,
-            name: None,
-        }));
-
-        chat_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
-                    text: format!("Analyze this Pug template:\n\n{}", classify_input)
-                })
-            ]),
-            name: None,
-        }));
-
-        let params = ChatCompletionParameters {
-            messages: chat_messages.clone(),
-            model: "qwen3vl".to_string(),
-            max_tokens: Some(256),
-            temperature: Some(0.1),
-            top_p: Some(0.9),
-            ..Default::default()
-        };
+        // We send the prompt as a new User message. The context is already in KV cache.
+        // We don't need to re-send the input.
+        let prompt = "Now that you have read the full structure, analyze it and identify the primary category.";
 
         tokio::select!{
-            res = model.chat_params_with_spinner(params, &app_handle_clone, "extraction-progress", json!({ 
-                "category": "Classification", "summary": "Identifying page type..."
-            }), Some(cancellation_token.clone()), Some(task.id.clone())) => res?,
+            res = model.chat_with_spinner(
+                &system_text, // Use system prompt instruction
+                prompt,
+                &app_handle_clone, 
+                "extraction-progress", 
+                json!({ "category": "Classification", "summary": "Identifying page type..." }), 
+                256, 
+                Some(cancellation_token.clone()), 
+                Some(task.id.clone())
+            ) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -425,40 +435,31 @@ async fn process_task(
 
     final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
-    // Add Assistant's Answer to History
-    chat_messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-        content: Some(page_type_res),
-        name: None,
-        tool_calls: None,
-    }));
-
     // Step 2: Identify Selectors (Building on History)
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type), "spinner": "⠋"
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type, language);
+        let next_question = parsing::page_selectors_prompt(&page_type, language); // This returns the prompt string
         let app_handle_clone = app_handle.clone();
 
-        chat_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-            content: ChatCompletionRequestUserMessageContent::Text(next_question),
-            name: None,
-        }));
-
-        let params = ChatCompletionParameters {
-            messages: chat_messages.clone(),
-            model: "qwen3vl".to_string(),
-            max_tokens: Some(256),
-            temperature: Some(0.1),
-            top_p: Some(0.9),
-            ..Default::default()
-        };
-
+        // page_selectors_prompt returns the full prompt text including TASK/SCHEMA.
+        // We send it as user message.
+        
         tokio::select!{
-            res = model.chat_params_with_spinner(params, &app_handle_clone, "extraction-progress", json!({ 
-                "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type)
-            }), Some(cancellation_token.clone()), Some(task.id.clone())) => res?,
+            res = model.chat_with_spinner(
+                "You are a helpful assistant.", 
+                &next_question,
+                &app_handle_clone, 
+                "extraction-progress", 
+                json!({ 
+                    "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type)
+                }), 
+                256, 
+                Some(cancellation_token.clone()), 
+                Some(task.id.clone())
+            ) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }

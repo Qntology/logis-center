@@ -295,7 +295,7 @@ impl EmbeddingModel {
         let mean = (sum / (s as f64)).map_err(anyhow::Error::msg)?;
         
         let norm = mean.sqr().map_err(anyhow::Error::msg)?.sum_all().map_err(anyhow::Error::msg)?.sqrt().map_err(anyhow::Error::msg)?;
-        let normalized = (mean / norm).map_err(anyhow::Error::msg)?;
+        let normalized = mean.broadcast_div(&norm).map_err(anyhow::Error::msg)?;
         
         let vec: Vec<f32> = normalized.flatten_all().map_err(anyhow::Error::msg)?.to_vec1().map_err(anyhow::Error::msg)?;
         Ok(vec)
