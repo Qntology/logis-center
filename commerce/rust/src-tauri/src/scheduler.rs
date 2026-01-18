@@ -653,107 +653,95 @@ Definition: {}
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
         let detail_session_id = format!("{}_detail", task.id);
         
-        for (field_name, field_schema) in fields_prompts {
-            if cancellation_token.load(Ordering::Relaxed) { 
-                cleanup_task_resources(&task.id);
-                return Err(anyhow::anyhow!("Task cancelled")); 
-            }
-
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Extraction", "summary": format!("Extracting field: {}", field_name), "spinner": "⠋"
-            }));
-
-            let model_guard = model_mutex.lock().await;
+        // Phase 1: Ingest all chunks (Prefill)
+        // We feed chunks one by one to build up the KV cache context.
+        // We only ask for the result at the very end.
+        let chunks_len = chunks.len();
+        
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let is_last = chunk_idx == chunks_len - 1;
             
-            // Iterate over chunks and merge results
-            for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                println!("\n[EXTRACT-CHUNK {}/{}] Snippet: {}...", chunk_idx+1, chunks.len(), chunk.replace("\n", " ").chars().take(100).collect::<String>());
-                
-                let field_json_str = if let Some(model) = model_guard.as_ref() {
-                    let prompt = format!(
+            // Prepare prompt
+            let prompt = if is_last {
+                // Final Chunk: Ask for the extraction based on ALL previous context
+                format!(
 r#"[CONTEXT]
-This is PART {}/{} of a Pug (Jade) template snippet representing a webpage.
-The snippet may start or end in the middle of a tag.
+You have read the full Pug (Jade) template of a webpage in previous turns.
+This is the FINAL PART ({}/{}) of the template.
 
 [SCHEMA]
-Field: "{}"
-Definition: {}
+Target Fields: {:?}
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-1. Analyze the SNIPPET to find the value for '{}'.
-2. Only extract data clearly visible in this snippet.
-3. Ignore broken tags/syntax at boundaries.
-4. Return valid JSON only: {{ "{}": value }}
-5. If not found, return empty JSON {{}}."#,
-                        chunk_idx + 1, chunks.len(),
-                        field_name, field_schema,
-                        chunk,
-                        field_name,
-                        field_name
-                    );
+Based on the WHOLE template you have read (including previous parts), extract the target fields.
+Return valid JSON only: {{ "field": value, ... }}
+If a field is split across chunks, combine them intelligently."#,
+                    chunk_idx + 1, chunks_len,
+                    fields_prompts.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                    chunk
+                )
+            } else {
+                // Intermediate Chunk: Just read and remember
+                format!(
+r#"[CONTEXT]
+This is PART {}/{} of a Pug (Jade) template.
+Read and memorize this content for the next step. Do NOT generate JSON yet.
+Just say "CONTINUE".
 
-                    let app_handle_clone = app_handle.clone();
+[INPUT SNIPPET]
+{}"#,
+                    chunk_idx + 1, chunks_len,
+                    chunk
+                )
+            };
 
-                    tokio::select!{
-                        res = model.chat_with_spinner(
-                            "You are a strict data extraction parser. Return valid JSON only.", 
-                            &prompt,
-                            &app_handle_clone, "extraction-progress", json!({ 
-                                "category": "Extraction", 
-                                "summary": format!("Extracting field: {} ({}/{})", field_name, chunk_idx+1, chunks.len())
-                            }), 
-                            1024, Some(cancellation_token.clone()), Some(detail_session_id.clone())
-                        ) => res?,
-                        _ = async {
-                            loop {
-                                if cancellation_token.load(Ordering::Relaxed) { break; }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                        } => { 
-                            drop(model_guard);
-                            cleanup_task_resources(&task.id);
-                            return Err(anyhow::anyhow!("Task cancelled")); 
-                        }
-                    }
-                } else {
-                    "{}".to_string()
-                };
-                
-                let field_data = parse_json_from_llm(&field_json_str);
-                
-                if let Some(obj) = extracted_data.as_object_mut() {
-                    let mut temp_wrapper = serde_json::Map::new();
-                    if let Some(val) = field_data.get(&field_name) {
-                        temp_wrapper.insert(field_name.clone(), val.clone());
-                    } else if !field_data.as_object().unwrap().is_empty() {
-                        temp_wrapper.insert(field_name.clone(), field_data.clone());
-                    }
-                    
-                    merge_json_results(&mut Value::Object(obj.clone()), &Value::Object(temp_wrapper));
-                    
-                    if let Some(new_val) = field_data.get(&field_name) {
-                         if !new_val.is_null() {
-                             let existing = obj.get(&field_name);
-                             let is_empty = existing.map_or(true, |v| v.is_null() || (v.is_string() && v.as_str().unwrap().is_empty()));
-                             if is_empty {
-                                 obj.insert(field_name.clone(), new_val.clone());
-                             }
-                         }
-                    }
-                }
-            }
-            drop(model_guard);
-            
-            let mut field_map = serde_json::Map::new();
-            field_map.insert(field_name.clone(), extracted_data.get(&field_name).cloned().unwrap_or(Value::Null));
+            let max_tokens = if is_last { 2048 } else { 10 }; // Minimal tokens for intermediate steps
             
             let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Extraction", "summary": format!("Field '{}' extracted.", field_name), "spinner": "✅",
-                "data": Value::Object(field_map)
+                "category": "Ingestion", 
+                "summary": format!("Reading part {}/{}...", chunk_idx + 1, chunks_len),
+                "spinner": "⠋"
             }));
+
+            let model_guard = model_mutex.lock().await;
+            
+            let response = if let Some(model) = model_guard.as_ref() {
+                let app_handle_clone = app_handle.clone();
+                tokio::select!{
+                    res = model.chat_with_spinner(
+                        "You are a helpful assistant. Read the context carefully.", 
+                        &prompt,
+                        &app_handle_clone, 
+                        "extraction-progress", 
+                        json!({ "category": "Ingestion" }), 
+                        max_tokens, 
+                        Some(cancellation_token.clone()), 
+                        Some(detail_session_id.clone())
+                    ) => res?,
+                    _ = async {
+                        loop {
+                            if cancellation_token.load(Ordering::Relaxed) { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => { 
+                        drop(model_guard);
+                        cleanup_task_resources(&task.id);
+                        return Err(anyhow::anyhow!("Task cancelled")); 
+                    }
+                }
+            } else {
+                "{}".to_string()
+            };
+            drop(model_guard);
+
+            if is_last {
+                println!("[EXTRACT-FINAL] Result: {}", response);
+                let full_data = parse_json_from_llm(&response);
+                extracted_data = full_data;
+            }
         }
     }
     
