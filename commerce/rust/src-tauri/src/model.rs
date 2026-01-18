@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
+use crate::models::embedding::EmbeddingModel;
 use crate::openai_types::{
     ChatCompletionParameters,
     ChatCompletionRequestMessage,
@@ -40,6 +41,7 @@ impl Spinner {
 
 pub struct LogisModel {
     generator: Arc<Mutex<Qwen3VLGenerateModel>>,
+    embedding_model: Arc<Mutex<Option<EmbeddingModel>>>,
     is_cpu_mode: bool,
     max_tokens_limit: u32,
 }
@@ -67,7 +69,8 @@ impl LogisModel {
             
             // Aggressive Mode: Only reserve 5% for OS overhead, no fixed blocks.
             // This maximizes usable VRAM reporting to force GPU usage.
-            let buffer_size = (total_vram as f64 * 0.05) as u64; 
+            // [Adjusted] Increased buffer to 15% to prevent OOM when sharing resources or running heavy contexts.
+            let buffer_size = (total_vram as f64 * 0.15) as u64; 
 
             let usable_vram = if free_vram > buffer_size { free_vram - buffer_size } else { 0 };
             
@@ -172,6 +175,23 @@ impl LogisModel {
 
         let base_path = std::fs::canonicalize("src-tauri/models")
             .or_else(|_| std::fs::canonicalize("models"))?;
+        
+        // --- Init Embedding Model (Gemma-300m) ---
+        let embedding_model_path = base_path.join("embeddinggemma-300m");
+        let embedding_model = if embedding_model_path.exists() {
+            println!("[MODEL-01] Loading Embedding Model from: {:?}", embedding_model_path);
+            match EmbeddingModel::new(&embedding_model_path) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    println!("⚠️ [WARNING] Failed to load Embedding Model: {}", e);
+                    None
+                }
+            }
+        } else {
+            println!("⚠️ [WARNING] Embedding model path not found: {:?}", embedding_model_path);
+            None
+        };
+
         let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         let model_dir = if gguf_dir.exists() { gguf_dir } else { base_path };
         let model_path = model_dir.to_str().unwrap().to_string();
@@ -212,6 +232,7 @@ impl LogisModel {
 
         Ok(Self {
             generator: Arc::new(Mutex::new(generator)),
+            embedding_model: Arc::new(Mutex::new(embedding_model)),
             is_cpu_mode: target_device.is_cpu(),
             max_tokens_limit,
         })
@@ -650,10 +671,18 @@ impl LogisModel {
         Ok(Value::Object(root))
     }
 
-    pub async fn get_embedding(&self, _text: String) -> anyhow::Result<Vec<f32>> {
-        // Placeholder for future embedding model integration (e.g. Gemma-300m)
-        // Currently returns a zero vector to prevent crashes while maintaining search structure.
-        Ok(vec![0.0; 768])
+    pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
+        let embedding_model_arc = self.embedding_model.clone();
+        
+        tokio::task::spawn_blocking(move || {
+            let guard = embedding_model_arc.lock().unwrap();
+            if let Some(model) = guard.as_ref() {
+                model.embed(&text).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
+            } else {
+                // Fallback to zeros if model failed to load
+                Ok(vec![0.0; 768])
+            }
+        }).await?
     }
 
     pub async fn split_query_contexts(&self, query: String) -> anyhow::Result<Vec<Value>> {
