@@ -159,8 +159,8 @@ impl LogisModel {
         let max_tokens_limit = if !force_cpu && detected_vram > 0 {
              let vram_mb = detected_vram as f64 / 1_000_000.0;
              
-             // 1. User Safety Margin: Reserve 10% of currently free VRAM
-             let fluid_safety_margin = vram_mb * 0.10;
+             // 1. User Safety Margin: Reserve 5% of currently free VRAM (Optimized for 4GB Cards)
+             let fluid_safety_margin = vram_mb * 0.05;
              
              // 2. Real Model Weight Calculation (File System Scan)
              let mut real_model_weights = 0.0;
@@ -175,25 +175,28 @@ impl LogisModel {
              }
              if real_model_weights == 0.0 { real_model_weights = 2200.0; } // Fallback if scan fails
 
-             // 3. Estimated Runtime Overhead (CUDA Context + scratch buffers) ~ 500MB
-             let runtime_overhead = 500.0;
+             // 3. Estimated Runtime Overhead (CUDA Context + scratch buffers) ~ 250MB (Lowered from 500)
+             let runtime_overhead = 250.0;
 
              let usable_fluid_vram = vram_mb - fluid_safety_margin - real_model_weights - runtime_overhead;
+
+             println!("[VRAM-DEBUG] Free: {:.2} MB | Weights: {:.2} MB | Margin(5%): {:.2} MB | Overhead: {:.2} MB", 
+                vram_mb, real_model_weights, fluid_safety_margin, runtime_overhead);
+             println!("[VRAM-DEBUG] Usable for KV Cache: {:.2} MB", usable_fluid_vram);
 
              // 4. Calculate Context Limit
              // KV Cache Cost per token (BF16) approx: 180KB
              let mb_per_1k_tokens = 180.0; 
 
              let limit = if usable_fluid_vram <= 0.0 {
-                 println!("[CONFIG] VRAM tight (Free: {:.0}MB, W: {:.0}MB). Minimal context.", vram_mb, real_model_weights);
-                 512 // Absolute minimum
+                 println!("⚠️ [CONFIG] VRAM very tight. Forcing minimal context (1024) to try GPU.");
+                 1024 // Try 1024 anyway instead of 512, trusting chunking
              } else {
                  let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
-                 capacity.clamp(512.0, 32768.0) as u32
+                 capacity.clamp(1024.0, 32768.0) as u32
              };
              
-             println!("[CONFIG] Fluid Context Calc: Free {:.0}MB - Safety {:.0}MB - Weights {:.0}MB - Overhead {:.0}MB = {:.0}MB for KV. -> Limit: {}", 
-                vram_mb, fluid_safety_margin, real_model_weights, runtime_overhead, usable_fluid_vram, limit);
+             println!("[CONFIG] Final Context Limit: {}", limit);
              limit
         } else {
              println!("[CONFIG] CPU Mode or Unknown VRAM. Defaulting to 2048 tokens.");
