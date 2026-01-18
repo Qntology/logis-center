@@ -518,7 +518,7 @@ async fn process_task(
             "category": "List Processing", "summary": format!("Found {} items to extract.", total_items), "spinner": "✅"
         }));
 
-        let fields_prompts = parsing::list2json(language);
+        let fields_prompts = parsing::list2json(page_type, language);
         let list_session_id = format!("{}_list", task.id);
         let mut full_context_accumulated = String::new();
 
