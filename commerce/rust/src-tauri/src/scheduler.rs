@@ -333,6 +333,7 @@ async fn process_task(
         }
     }
 
+    println!("[Scheduler] Checkpoint: Classification Start");
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋"
     }));
@@ -344,6 +345,7 @@ async fn process_task(
 
     // Step 1: Identify Type
     let page_type_res = if let Some(model) = model_guard.as_ref() {
+        // ... (system prompt) ...
         let system_text = parsing::page_type_prompt(language);
         let app_handle_clone = app_handle.clone();
 
@@ -382,6 +384,8 @@ async fn process_task(
             } => { return Err(anyhow::anyhow!("Task cancelled")); }
         }
     } else { "{}".to_string() };
+    
+    println!("[Scheduler] Checkpoint: Classification End");
     
     let type_info = parse_json_from_llm(&page_type_res);
     let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
@@ -793,6 +797,7 @@ Definition: {}
             
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+            println!("[Scheduler] Checkpoint: Embedding Start (Relay)");
             let vector = if let Some(model) = model_guard.as_ref() {
                 let text_clone = text_to_embed.clone();
                 tokio::select!{
@@ -818,7 +823,31 @@ Definition: {}
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
                 let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
-                let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), None).await;
+                let text_to_embed = extracted_data.to_string();
+                drop(store_guard);
+
+                let mut model_guard = model_mutex.lock().await;
+                if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
+                
+                println!("[Scheduler] Checkpoint: Embedding Start (Direct)");
+                let vector = if let Some(model) = model_guard.as_ref() {
+                    let text_clone = text_to_embed.clone();
+                    tokio::select!{
+                        res = model.get_embedding(text_clone) => Some(res?),
+                        _ = async {
+                            loop {
+                                if cancellation_token.load(Ordering::Relaxed) { break; }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                    }
+                } else { None };
+                drop(model_guard);
+
+                let store_guard = store_mutex.lock().await;
+                if let Some(db) = store_guard.as_ref() {
+                    let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), vector).await;
+                }
         }
     }    
     

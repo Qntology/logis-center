@@ -238,10 +238,9 @@ impl Model {
     }
 
     pub fn forward(&self, input_ids: &Tensor) -> candle_core::Result<Tensor> {
-        let (b, s) = input_ids.dims2()?;
-        let input_flat = input_ids.flatten_all()?;
-        let mut x = self.embed_tokens.forward(&input_flat)?;
-        x = x.reshape((b, s, ()))?;
+        let seq_len = input_ids.dim(0)?;
+        let mut x = self.embed_tokens.forward(input_ids)?;
+        x = x.reshape((1, seq_len, ()))?;
         
         let scale = (x.dim(candle_core::D::Minus1)? as f64).sqrt();
         x = (x * scale)?;
@@ -287,7 +286,8 @@ impl EmbeddingModel {
         
         if token_ids.is_empty() { return Ok(vec![0.0; 768]); }
         
-        let input_tensor = Tensor::new(token_ids, &self.device).map_err(anyhow::Error::msg)?.unsqueeze(0).map_err(anyhow::Error::msg)?;
+        // Pass Rank 1 Tensor [seq_len]
+        let input_tensor = Tensor::new(token_ids, &self.device).map_err(anyhow::Error::msg)?;
         let hidden_states = self.model.forward(&input_tensor).map_err(anyhow::Error::msg)?;
         
         let (_b, s, _h) = hidden_states.dims3().map_err(anyhow::Error::msg)?;

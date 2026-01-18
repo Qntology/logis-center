@@ -150,10 +150,11 @@ impl Qwen3VLGenerateModel {
             .tokenizer
             .text_encode(input.replace_text.clone(), &self.device)?;
         let mut seq_len = input_ids.dim(1)?;
-        let full_input_ids_vec = input_ids.to_vec1::<u32>()?; // Save original full input for saving later
         
         println!("[GENERATE] Input Token Count: {}", seq_len);
         println!("[GENERATE] Input Shape: {:?}", input_ids.shape());
+
+        let full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
 
         // HARD SAFETY CHECK: Truncate Input if it exceeds limit
         if let Some(limit) = self.hard_token_limit {
