@@ -518,116 +518,98 @@ async fn process_task(
             "category": "List Processing", "summary": format!("Found {} items to extract.", total_items), "spinner": "✅"
         }));
 
-        let mut items_array = Vec::new();
-        let fields_prompts = parsing::item2json(page_type, &url, language);
+        let fields_prompts = parsing::list2json(language);
+        let list_session_id = format!("{}_list", task.id);
+        let mut full_context_accumulated = String::new();
 
         for (i, item_pug) in item_pugs.iter().enumerate() {
-            if cancellation_token.load(Ordering::Relaxed) { 
-                cleanup_task_resources(&task.id);
-                return Err(anyhow::anyhow!("Task cancelled")); 
-            }
+            let is_last = i == total_items - 1;
+            full_context_accumulated.push_str(&format!("--- ITEM {} ---\n", i + 1));
+            full_context_accumulated.push_str(item_pug);
+            full_context_accumulated.push('\n');
 
-            println!("\n[EXTRACT-ITEM {}/{}] Snippet: {}...", i+1, total_items, item_pug.replace("\n", " ").chars().take(100).collect::<String>());
-
-            // [NEW] Separate session for each list item to prevent context contamination
-            let item_session_id = format!("{}_item_{}", task.id, i);
-
-            // Chunking for List Items
-            let chunks = chunk_text(item_pug, 2500, 300); 
-            let mut item_data = json!({});
-            
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Extraction", "summary": format!("Extracting Item {}/{}: ...", i + 1, total_items), "spinner": "⠋"
-            }));
-
-            let model_guard = model_mutex.lock().await; 
-
-            for (field_name, field_schema) in &fields_prompts {
-                if field_name == "description" || field_name == "detail_images" { continue; }
-                if cancellation_token.load(Ordering::Relaxed) { 
-                    drop(model_guard);
-                    cleanup_task_resources(&task.id);
-                    return Err(anyhow::anyhow!("Task cancelled")); 
+            let prompt = if is_last {
+                let mut schema_definitions = String::new();
+                for (name, schema) in &fields_prompts {
+                    schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
                 }
 
-                for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                    let field_json_str = if let Some(model) = model_guard.as_ref() {
-                        let prompt = format!(
+                format!(
 r#"[CONTEXT]
-This is PART {}/{} of a Pug (Jade) template snippet representing a list item on a webpage.
-The snippet may start or end in the middle of a tag.
+You have been reading a list of items from a webpage part by part. 
+Below is the COMPLETELY ACCUMULATED list of Pug (Jade) snippets.
 
-[SCHEMA]
-Field: "{}"
-Definition: {}
+[FULL LIST CONTENT]
+{}
+
+[EXTRACTION SCHEMA]
+Please extract all items and list-level metadata precisely according to these definitions:
+{}
+
+[FINAL INSTRUCTION]
+1. Based on the FULL LIST CONTENT, extract all items into an "items" array.
+2. Include list-level metadata like "type", "item", "node", etc.
+3. Return ONLY a single valid JSON object.
+4. No preamble, no explanation. Just raw JSON."#,
+                    full_context_accumulated,
+                    schema_definitions
+                )
+            } else {
+                format!(
+r#"[CONTEXT]
+You are reading a list of items from a webpage.
+Here is the accumulated item snippets so far:
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-1. Analyze the SNIPPET to find the value for '{}'.
-2. Only extract data clearly visible in this snippet.
-3. Ignore broken tags/syntax at boundaries.
-4. Return valid JSON only: {{ "{}": value }}
-5. If not found, return empty JSON {{}}."#,
-                            chunk_idx + 1, chunks.len(),
-                            field_name, field_schema,
-                            chunk,
-                            field_name,
-                            field_name
-                        );
+Read and memorize these items. Do NOT generate JSON yet.
+Just say "ACKNOWLEDGED"."#,
+                    full_context_accumulated
+                )
+            };
 
-                        let app_handle_clone = app_handle.clone();
-
-                        tokio::select!{
-                            res = model.chat_with_spinner("You are a strict data extraction parser. Return valid JSON only.", 
-                                &prompt,
-                                &app_handle_clone, "extraction-progress", json!({ 
-                                    "category": "Extraction", 
-                                    "summary": format!("Item {}/{}: {}", i + 1, total_items, field_name)
-                                }), 
-                                512, Some(cancellation_token.clone()), Some(item_session_id.clone())
-                            ) => res?,
-                            _ = async {
-                                loop {
-                                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            } => { 
-                                drop(model_guard);
-                                cleanup_task_resources(&task.id);
-                                return Err(anyhow::anyhow!("Task cancelled")); 
-                            }
-                        }
-                    } else {
-                        "{}".to_string()
-                    };
-                    
-                    let field_result = parse_json_from_llm(&field_json_str);
-                    if let Some(val) = field_result.get(field_name) {
-                        if !val.is_null() {
-                             item_data.as_object_mut().unwrap().insert(field_name.clone(), val.clone());
-                        }
-                    } else if !field_result.as_object().unwrap().is_empty() {
-                         item_data.as_object_mut().unwrap().insert(field_name.clone(), field_result.clone());
-                    }
-                }
-            }
-            drop(model_guard); 
-
-            if let Some(id_val) = item_data.get("id").cloned() {
-                 if item_data.get("index").is_none() { item_data.as_object_mut().unwrap().insert("index".to_string(), id_val); }
-            }
-            items_array.push(item_data.clone());
+            let max_tokens = if is_last { 4096 } else { 20 };
             
             let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Extraction", "summary": format!("Item {} extracted.", i + 1), "data": item_data
+                "category": "List Ingestion", 
+                "summary": format!("Reading Item {}/{}...", i + 1, total_items),
+                "spinner": "⠋"
             }));
-        }
-        
-        extracted_data.as_object_mut().unwrap().insert("items".to_string(), json!(items_array));
-        extracted_data.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
+            let model_guard = model_mutex.lock().await;
+            let response = if let Some(model) = model_guard.as_ref() {
+                let app_handle_clone = app_handle.clone();
+                tokio::select!{
+                    res = model.chat_with_spinner(
+                        "You are a helpful assistant. Read the context carefully.", 
+                        &prompt,
+                        &app_handle_clone, 
+                        "extraction-progress", 
+                        json!({ "category": "List Ingestion" }), 
+                        max_tokens, 
+                        Some(cancellation_token.clone()), 
+                        Some(list_session_id.clone())
+                    ) => res?,
+                    _ = async {
+                        loop {
+                            if cancellation_token.load(Ordering::Relaxed) { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => { 
+                        drop(model_guard);
+                        cleanup_task_resources(&task.id);
+                        return Err(anyhow::anyhow!("Task cancelled")); 
+                    }
+                }
+            } else { "{}".to_string() };
+            drop(model_guard);
+
+            if is_last {
+                extracted_data = parse_json_from_llm(&response);
+            }
+        }
     } else {
         let content_pug = {
             let document = scraper::Html::parse_document(&clean_html);
@@ -677,45 +659,51 @@ Definition: {}
 
             // Prepare prompt
             let prompt = if is_last {
-                // Final Chunk: Ask for the extraction based on ALL previous context
+                // Final Chunk: Include the FULL SCHEMA for all fields
+                let mut schema_definitions = String::new();
+                for (name, schema) in &fields_prompts {
+                    schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
+                }
+
                 format!(
 r#"[CONTEXT]
-You are reading a Pug (Jade) template.
-Here is the full content so far:
+You have been reading a Pug (Jade) template part by part. 
+Below is the COMPLETELY ACCUMULATED content of the template.
 
-[FULL INPUT SNIPPET]
+[FULL CONTENT]
 {}
 
-[SCHEMA]
-Target Fields: {:?}
+[EXTRACTION SCHEMA]
+Please extract the following data points precisely according to these definitions:
+{}
 
-[INSTRUCTION]
-Based on the WHOLE template above, extract the target fields.
-Return valid JSON only: {{ "field": value, ... }}
-If a field is split across chunks, combine them intelligently."#,
+[FINAL INSTRUCTION]
+1. Based on the FULL CONTENT, extract all fields mentioned in the EXTRACTION SCHEMA.
+2. Return ONLY a single valid JSON object.
+3. No preamble, no explanation, no markdown code blocks. Just the raw JSON.
+4. If a value is missing, use null."#,
                     full_context_accumulated,
-                    fields_prompts.iter().map(|(k, _)| k).collect::<Vec<_>>()
+                    schema_definitions
                 )
             } else {
                 // Intermediate Chunk: Just read and remember
-                // We send the FULL accumulated text so far. 
-                // The KV cache will recognize the prefix and only process the NEW part (the latest chunk).
                 format!(
 r#"[CONTEXT]
-You are reading a Pug (Jade) template.
-Here is the content so far:
+You are reading a Pug (Jade) template. 
+Here is the accumulated content so far:
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Read and memorize this content for the next step. Do NOT generate JSON yet.
-Just say "CONTINUE"."#,
+Read and memorize this content. Do NOT generate JSON yet. 
+When all parts are sent, I will ask you to extract data into JSON.
+Just say "ACKNOWLEDGED"."#,
                     full_context_accumulated
                 )
             };
 
-            let max_tokens = if is_last { 2048 } else { 10 }; // Minimal tokens for intermediate steps
+            let max_tokens = if is_last { 2048 } else { 20 }; // Minimal tokens for acknowledgment
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Ingestion", 

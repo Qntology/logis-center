@@ -347,7 +347,7 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> Vec<(String, St
             fields.push(("node".to_string(), r#"node:order form container CSS1 selector"#.to_string()));
             fields.push(("link".to_string(), format!("link : '{}'", href)));
             fields.push(("id".to_string(), r#"\n            id:{\n                value:Refer to the ID value from the link or an attribute or input value | string,\n                selector:selector\n            }"#.to_string()));
-            fields.push(("tracking_number".to_string(), r#"\n            tracking_number:{\n                value:tracking number | string,\n                selector:selector\n            }"#.to_string()));
+            fields.push(("tracking_number".to_string(), r#"Tracking Number | 운송장 번호 | 运单호 | 運單號 | 伝표번호 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string"#.to_string()));
             fields.push(("status".to_string(), r#"\n            status:{\n                value:'draft' | 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error',\n                selector:selector\n            }"#.to_string()));
             fields.push(("goods".to_string(), r#"\n            goods:[{\n                title:{\n                    value:goods title | string,\n                    selector:selector\n                },\n                link:{\n                    value:URL includes a manage path, an administrative or edit route goods Link | string,\n                    selector:selector\n                },\n                id:{\n                    value:Refer to the product no value from the link or an attribute or input value | string,\n                    selector:selector\n                }\n            }]"#.to_string()));
             fields.push(("sender_name".to_string(), r#"\n            sender_name:{\n                value:sender_name | string,\n                selector:selector\n            }"#.to_string()));
@@ -400,47 +400,32 @@ pub fn item2json(page_type: &str, href: &str, language: &str) -> Vec<(String, St
     fields.into_iter().collect()
 }
 
-pub fn list2json(language: &str) -> String {
-    let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation.
-    {
-        language: '{LANGUAGE}',
-        type:'order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | '',
-        item:type based item CSS1 selector excluding ads,
-        more:item URL includes a manage path, an administrative or edit route Link CSS1 selector,
-        node:item parent list CSS1 selector excluding ads,
-        next:list next button CSS1 selector,
-        text:summarize the contents of the items array in {LANGUAGE},
-        detail:is a detail page or a detail form | boolean,
-        items: [
-            if (type is 'tracking' | 'review') {
-                status:'start' | 'progress' | 'stop' | 'cancel' | 'return',
-                id:Refer to the ID value from the link | an attribute | string,
-                title:author and content | string, 
-                link:URL includes a manage path, an administrative | edit route Link | string,
-                registration_date:yyyy-MM-ddThh:mm:ss | string,
-            }
-            if (type is 'order' | 'goods') {
-                status:'show' | 'progress' | 'remove' | 'hide' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error',
-                link:URL includes a manage path, an administrative | edit route Link | string,
-                id:Refer to the ID value from the link | an attribute | string,
-                title:title | string, 
-                sale_price:sale price | number,
-                supply_price:supply price | number,
-                currency:ISO 4217 Currency Code | string,
-                quantity:item stock quantity | number,
-                tracking_number:Tracking Number | 운송장 번호 | 运单号 | 運單號 | 伝票番号 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string,
-                registration_date:yyyy-MM-ddThh:mm:ss | string,
-            }
-            if (type is 'coupon' | 'event') {
-                status:'show' | 'progress' | 'hide' | 'stop' | 'cancel' | 'expire' | 'complete' | 'error',
-                id:Refer to the ID value from the link | an attribute | string,
-                title:type based item title, 
-                started_at:yyyy-MM-ddThh:mm:ss,
-                expired_at:yyyy-MM-ddThh:mm:ss,
-                registration_date:yyyy-MM-ddThh:mm:ss | string,
-            }
-        ] 
-    } 
-    "###;
-    template.replace("{LANGUAGE}", language)
+pub fn list2json(language: &str) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    
+    // Core structure fields
+    fields.push(("language".to_string(), format!("'{}'", language)));
+    fields.push(("type".to_string(), "'order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | ''".to_string()));
+    fields.push(("item".to_string(), "type based item CSS1 selector excluding ads".to_string()));
+    fields.push(("more".to_string(), "item URL includes a manage path, an administrative or edit route Link CSS1 selector".to_string()));
+    fields.push(("node".to_string(), "item parent list CSS1 selector excluding ads".to_string()));
+    fields.push(("next".to_string(), "list next button CSS1 selector".to_string()));
+    fields.push(("text".to_string(), format!("summarize the contents of the items array in {}", language)));
+    fields.push(("detail".to_string(), "is a detail page or a detail form | boolean".to_string()));
+
+    // Item-level fields (Multilingual context preserved)
+    fields.push(("status".to_string(), "'show' | 'progress' | 'remove' | 'hide' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error' | 'start'".to_string()));
+    fields.push(("id".to_string(), "Refer to the ID value from the link | an attribute | string".to_string()));
+    fields.push(("title".to_string(), "title | author and content | string".to_string()));
+    fields.push(("link".to_string(), "URL includes a manage path, an administrative | edit route Link | string".to_string()));
+    fields.push(("sale_price".to_string(), "sale price | number".to_string()));
+    fields.push(("supply_price".to_string(), "supply price | number".to_string()));
+    fields.push(("currency".to_string(), "ISO 4217 Currency Code | string".to_string()));
+    fields.push(("quantity".to_string(), "item stock quantity | number".to_string()));
+    fields.push(("tracking_number".to_string(), "Tracking Number | 운송장 번호 | 运单号 | 運單號 | 伝票番号 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string".to_string()));
+    fields.push(("started_at".to_string(), "yyyy-MM-ddThh:mm:ss".to_string()));
+    fields.push(("expired_at".to_string(), "yyyy-MM-ddThh:mm:ss".to_string()));
+    fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
+
+    fields
 }
