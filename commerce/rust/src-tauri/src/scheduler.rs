@@ -375,7 +375,7 @@ Do NOT generate JSON yet. Summarize the detected structure in 3-5 keywords and s
 
             tokio::select!{
                 res = model.chat_with_spinner(
-                    "You are a helpful assistant specialized in trade document analysis.", 
+                    "", // System prompt: Empty to save attention and tokens
                     &prompt,
                     &app_handle_clone, 
                     "extraction-progress", 
