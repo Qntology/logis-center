@@ -812,23 +812,22 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
 
 pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
     if page_type == "tracking" {
-        let template = r###"
-[TASK]
-Convert the shipping label image content into a structured JSON format.
+        let template = r###"[TASK]
+Convert the shipping label image to fit the structured JSON format. 
 
 [CONTEXT]
 Region: {REGION}
 Recipient Address: {ADDRESS}
 Current Language: {LANGUAGE}
 
-[SCHEMA DEFINITIONS]
-- tracking_number: The unique tracking ID ( 운송장 번호, 송장 번호, 运单号, 伝표번호, Tracking No). Exclude phone numbers or order numbers.
-- recipient_match: Boolean. True if the shipping label's recipient address roughly matches the context address (ignore floor levels).
-- barcodes: Array of strings. Extract any barcode or QR code values visible.
-- text: A concise summary of the shipping label in {LANGUAGE}. MASK the address to District-level (do not reveal detailed street/house numbers). Do not mention that masking occurred.
+[INSTRUCTION]
+1. Extract the tracking_number. It should be selected from numbers matching barcodes or QR codes, filtered by region, excluding telephone formats or order numbers.
+2. Set recipient_match to true if the label address matches the context address (ignoring floor levels).
+3. Extract all visible barcodes into an array.
+4. Provide a text summary in {LANGUAGE}, masking the address to District-level and up. Do not mention masking.
 
 [OUTPUT FORMAT]
-Return valid JSON only. No markdown.
+Return valid JSON only. No explanation.
 {
     "tracking_number": "string",
     "recipient_match": boolean,

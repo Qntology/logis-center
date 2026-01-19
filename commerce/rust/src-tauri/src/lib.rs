@@ -201,119 +201,42 @@ fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 #[tauri::command]
 async fn summarize_image(
     state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
+    _app_handle: tauri::AppHandle,
     image_path: String,
 ) -> Result<String, String> {
-    println!("[INVOKE-01] summarize_image called with path: {}", image_path);
+    println!("[INVOKE-01] summarize_image (Queue Integration) for path: {}", image_path);
 
-    // 1. Initialize Model (Auto Device)
-    let mut model_guard = state.model.lock().await;
-    if model_guard.is_none() {
-        println!("[INIT-01] AppState model is None. Initializing LogisModel (Auto)...");
-        match LogisModel::new(None).await {
-            Ok(m) => {
-                println!("[INIT-02] LogisModel initialized successfully.");
-                *model_guard = Some(m);
-            },
-            Err(e) => {
-                let err_msg = format!("❌ [ERROR-INIT] Failed to load Vision model: {:?}", e);
-                println!("{}", err_msg);
-                return Err(err_msg);
-            }
-        }
-    }
-
-    // 2. Process Image (Slice & Extract) with Retry Logic for OOM
-    println!("[VISION-01] Starting process_image_full...");
-    
-    let mut extraction_result = {
-        let model = model_guard.as_ref().unwrap();
-        model.process_image_full(image_path.clone(), &app_handle, Some(state.cancellation_token.clone())).await
-    };
-
-    if let Err(e) = &extraction_result {
-        let err_str = e.to_string();
-        if err_str.contains("out of memory") || err_str.contains("CUDA_ERROR_OUT_OF_MEMORY") {
-            println!("⚠️ [WARNING] GPU Out of Memory detected. Switching to CPU fallback...");
-            
-            // Drop current model to free VRAM
-            *model_guard = None; 
-            
-            // Force Init on CPU
-            println!("[INIT-RETRY] Initializing LogisModel (CPU Force)...");
-            match LogisModel::new(Some("cpu")).await {
-                Ok(m) => {
-                    println!("[INIT-RETRY] CPU Model initialized.");
-                    *model_guard = Some(m);
-                    
-                    // Retry extraction
-                    if let Some(model) = model_guard.as_ref() {
-                        println!("[VISION-RETRY] Retrying process_image_full on CPU...");
-                        extraction_result = model.process_image_full(image_path.clone(), &app_handle, Some(state.cancellation_token.clone())).await;
-                    }
-                },
-                Err(init_err) => {
-                    return Err(format!("❌ [ERROR-RETRY] CPU Fallback Init Failed: {:?}", init_err));
-                }
-            }
-        }
-    }
-
-    let extracted_data: Value = match extraction_result {
-        Ok(data) => {
-            println!("[VISION-99] Image processing completed successfully.");
-            data
-        },
-        Err(e) => {
-            let err_msg = format!("❌ [ERROR-VISION] Extraction failed: {:?}", e);
-            println!("{}", err_msg);
-            return Err(err_msg);
-        }
-    };
-
-    // Re-acquire model reference as guard might have changed
-    let model = model_guard.as_ref().unwrap();
-
-    // 3. Generate Summary & Metadata
-    let doc_type = extracted_data.get("header")
-        .and_then(|h: &Value| h.get("doc_type"))
-        .and_then(|s: &Value| s.as_str())
-        .unwrap_or("Unknown");
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        let task_id = format!("img_{}", uuid::Uuid::new_v4().to_string());
+        let now = chrono::Utc::now().timestamp_millis();
         
-    let summary = generate_rich_summary(doc_type, &extracted_data);
-    
-    // 4. Generate Embedding (Using Gemma-300m via Model)
-    let embedding = match model.get_embedding(summary.clone()).await {
-        Ok(vec) => vec,
-        Err(e) => return Err(format!("Embedding failed: {}", e)),
-    };
+        let task_data = json!({
+            "image_path": image_path,
+            "id": task_id
+        });
 
-    // 5. Save to Vector Store
-    let mut store_guard = state.store.lock().await;
-    if store_guard.is_none() {
-        let db_path = "data/lancedb"; 
-        let _ = std::fs::create_dir_all(db_path);
-        match VectorStore::new(db_path).await {
-            Ok(s) => {
-                let _ = s.init_task_table().await;
-                let _ = s.init_all_tables().await;
-                *store_guard = Some(s);
-            },
-            Err(e) => println!("Warning: Failed to init Vector Store: {}", e), 
+        let task = crate::store::Task {
+            id: task_id.clone(),
+            r#type: "image_extraction".to_string(),
+            from_source: "manual_upload".to_string(),
+            to_dest: "local".to_string(),
+            cc: "".to_string(),
+            bcc: "".to_string(),
+            ref_id: "manual".to_string(),
+            data_json: task_data.to_string(),
+            created_at: now,
+            updated_at: now,
+            status: "pending".to_string(),
+        };
+
+        match db.add_task(task).await {
+            Ok(_) => Ok(format!("Task {} queued successfully.", task_id)),
+            Err(e) => Err(format!("Failed to queue image task: {}", e)),
         }
+    } else {
+        Err("Database not initialized.".to_string())
     }
-
-    if let Some(store) = store_guard.as_ref() {
-        let doc_uuid = uuid::Uuid::new_v4().to_string();
-        
-        // Use the generic upsert_item instead of specific TradeDocument logic for now
-        // or map extracted_data to TradeDocument if strict schema is needed.
-        // For flexibility, we use upsert_item with "image_summary" type.
-        
-        let _ = store.upsert_item("commerce_items", &doc_uuid, "image_summary", extracted_data.clone(), Some(embedding)).await;
-    }
-
-    Ok(serde_json::to_string_pretty(&extracted_data).unwrap_or(summary))
 }
 
 #[tauri::command]

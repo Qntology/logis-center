@@ -161,6 +161,10 @@ if (pillNav) {
 
 searchInput?.addEventListener("focus", () => {
     openWidget("list");
+    // Ensure list is populated when focusing
+    if (cachedDocs.length === 0) {
+        refreshList();
+    }
 });
 
 searchInput?.addEventListener("input", () => {
