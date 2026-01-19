@@ -641,30 +641,38 @@ impl LogisModel {
     pub async fn parse_query_structured(&self, query: String, language: &str) -> anyhow::Result<Value> {
         let current_time = chrono::Utc::now().to_rfc3339();
         
-        // Stage 1: Segment query (para2graph)
+        // Stage 1: Segment query (para2graph) - Using persistent session for schema caching
         let prompt1 = crate::parsing::para2graph(language);
-        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, None).await?;
+        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, Some("system_search_p2g".to_string())).await?;
         let segments = crate::scheduler::parse_json_from_llm(&res1);
         
-        // Stage 2: Extract conditions for each segment (graph2contexts)
+        // Stage 2: Extract conditions for each segment (graph2contexts) in ONE BATCH
         let mut final_contexts = Vec::new();
         if let Some(ctx_arr) = segments.get("context").and_then(|v| v.as_array()) {
-            for seg in ctx_arr {
+            // Combine all segments into one batch request
+            let mut combined_segments = String::new();
+            for (idx, seg) in ctx_arr.iter().enumerate() {
                 let seg_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                if seg_text.is_empty() { continue; }
-                
+                combined_segments.push_str(&format!("Segment #{}: {}\n", idx + 1, seg_text));
+            }
+
+            if !combined_segments.is_empty() {
                 let prompt2 = crate::parsing::graph2contexts(&current_time);
-                let res2 = self.chat("", &format!("{}\n\nContext Text: {}", prompt2, seg_text), None, None).await?;
-                let mut ctx_info = crate::scheduler::parse_json_from_llm(&res2);
+                // Using persistent session for schema caching
+                let res2 = self.chat("", &format!("{}\n\nInput Segments:\n{}", prompt2, combined_segments), None, Some("system_search_g2c".to_string())).await?;
+                let mut batch_info = crate::scheduler::parse_json_from_llm(&res2);
                 
-                // Merge type from stage 1 if missing in stage 2
-                if let Some(obj) = ctx_info.get_mut("context").and_then(|v| v.as_array_mut()) {
-                    for item in &mut *obj {
-                        if item.get("type").is_none() || item.get("type").and_then(|v| v.as_str()) == Some("") {
-                            item.as_object_mut().unwrap().insert("type".to_string(), seg.get("type").cloned().unwrap_or(json!("")));
+                // Process results and ensure type parity
+                if let Some(res_arr) = batch_info.get_mut("context").and_then(|v| v.as_array_mut()) {
+                    for (i, item) in res_arr.iter_mut().enumerate() {
+                        // Match with original segment types if LLM lost them in batch
+                        if let Some(original_seg) = ctx_arr.get(i) {
+                            if item.get("type").is_none() || item.get("type").and_then(|v| v.as_str()) == Some("") {
+                                item.as_object_mut().unwrap().insert("type".to_string(), original_seg.get("type").cloned().unwrap_or(json!("")));
+                            }
                         }
                     }
-                    final_contexts.extend(obj.clone());
+                    final_contexts.extend(res_arr.clone());
                 }
             }
         }

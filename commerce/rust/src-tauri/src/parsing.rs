@@ -236,11 +236,17 @@ pub fn graph2contexts(current: &str) -> String {
 	# #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
 	# #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
 	# #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
+    
+    [TASK]
+    Analyze EACH provided text segment and extract structured conditions.
+    
+    [OUTPUT FORMAT]
+    Return a JSON object containing a "context" array with one object per segment.
     {{
         "context": [
             {{
                 "type": "string",
-                "text": "string",
+                "text": "the_original_segment_text",
                 "status": "string or null",
                 "substantial": "string or null",
                 "find": "string or null",
