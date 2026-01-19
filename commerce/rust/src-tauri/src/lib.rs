@@ -523,9 +523,15 @@ pub fn run() {
 
 
 
-    let model_clone = model.clone();
+        let _model_clone = model.clone();
 
-    let store_clone = store.clone();
+
+
+        let _store_clone = store.clone();
+
+
+
+    
 
     let _store_server = store.clone();
 

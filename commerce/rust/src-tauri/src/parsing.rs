@@ -263,7 +263,7 @@ Return valid JSON only.
     template.replace("{CURRENT}", current)
 }
 
-pub fn item2json(page_type: &str, href: &str, language: &str) -> Vec<(String, String)> {
+pub fn item2json(page_type: &str, href: &str, _language: &str) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     match page_type {
         "tracking" => {

@@ -4,8 +4,6 @@ pub mod tensor_utils;
 use candle_core::{Device, DType};
 use anyhow::Result;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-
-pub fn get_logit_processor(
 use std::process::Command;
 use nvml_wrapper::Nvml;
 

@@ -815,7 +815,7 @@ Just say "ACKNOWLEDGED"."#,
     } else {
         let target_table = format!("commerce_{}", page_type);
         let store_guard = store_mutex.lock().await;
-        if let Some(db) = store_guard.as_ref() {
+        if let Some(_db) = store_guard.as_ref() {
                 let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
                 let text_to_embed = extracted_data.to_string();
                 drop(store_guard);

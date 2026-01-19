@@ -286,7 +286,7 @@ impl Qwen3VLGenerateModel {
 
         let generation_result: Result<Vec<u32>> = (|| {
             let mut generate = Vec::new();
-            for i in 0..sample_len {
+            for _i in 0..sample_len {
                 if let Some(flag) = &cancel_flag {
                     if flag.load(Ordering::Relaxed) {
                         return Err(anyhow!("Generation cancelled"));
