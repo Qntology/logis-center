@@ -464,7 +464,7 @@ Do NOT generate JSON yet. Summarize the detected structure in 3-5 keywords and s
         
         tokio::select!{
             res = model.chat_with_spinner(
-                "You are a helpful assistant.", 
+                "", // System prompt: Empty for maximum focus
                 &next_question,
                 &app_handle_clone, 
                 "extraction-progress", 
@@ -599,7 +599,7 @@ Just say "ACKNOWLEDGED"."#,
                 let app_handle_clone = app_handle.clone();
                 tokio::select!{
                     res = model.chat_with_spinner(
-                        "You are a helpful assistant. Read the context carefully.", 
+                        "", 
                         &prompt,
                         &app_handle_clone, 
                         "extraction-progress", 
@@ -733,7 +733,7 @@ Just say "ACKNOWLEDGED"."#,
                 let app_handle_clone = app_handle.clone();
                 tokio::select!{
                     res = model.chat_with_spinner(
-                        "You are a helpful assistant. Read the context carefully.", 
+                        "", 
                         &prompt,
                         &app_handle_clone, 
                         "extraction-progress", 
