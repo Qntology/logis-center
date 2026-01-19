@@ -306,36 +306,40 @@ async fn process_task(
     
     let mut page_type_res = String::new();
 
-    // Ingest chunks for Classification
+    // Step 1: Ingest chunks for Classification with full history
+    use crate::openai_types::{
+        ChatCompletionParameters, ChatCompletionRequestMessage, 
+        ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
+        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
+    };
+
+    let mut messages = vec![
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: parsing::page_type_prompt(language),
+            name: None,
+        })
+    ];
+
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
-        let system_text = parsing::page_type_prompt(language); // FIXED: Always use the same system prompt
         
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
             
-            // CACHE-STABLE PROMPT: 
-            // Avoid changing the beginning of the string. 
-            // We use a simpler instruction that is the same for all intermediate steps.
             let prompt = if is_last {
-                format!(
-r#"[DATA_PART]
-{}
-
-[INSTRUCTION]
-End of document. Based on all parts received, identify the primary category and return JSON."#, 
-                    chunk
-                )
+                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nEnd of document. Identify the primary category and return JSON.", chunk)
             } else {
-                format!(
-r#"[DATA_PART]
-{}
-
-[INSTRUCTION]
-Read and acknowledge by saying "READY"."#,
-                    chunk
-                )
+                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
             };
+
+            // Add current chunk to history
+            messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                ]),
+                name: None,
+            }));
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Classification Ingestion", 
@@ -343,25 +347,37 @@ Read and acknowledge by saying "READY"."#,
                 "spinner": "⠋"
             }));
 
-            let max_tokens = if is_last { 256 } else { 20 };
+            let max_tokens = if is_last { 256 } else { 32 };
+
+            let params = ChatCompletionParameters {
+                messages: messages.clone(), // Send full history
+                model: "qwen3vl".to_string(),
+                max_tokens: Some(max_tokens),
+                temperature: Some(0.1),
+                ..Default::default()
+            };
 
             tokio::select!{
-                res = model.chat_with_spinner(
-                    &system_text, // Always consistent
-                    &prompt,
+                res = model.chat_params_with_spinner(
+                    params,
                     &app_handle_clone, 
                     "extraction-progress", 
                     json!({ 
                         "category": "Classification Ingestion",
                         "summary": if is_last { "Identifying page type...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
                     }), 
-                    max_tokens,
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
                 ) => { 
                     let out = res?;
                     if is_last {
                         page_type_res = out;
+                    } else {
+                        // Add model's ACK to history to keep it in sync with cache
+                        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                            content: Some(out),
+                            ..Default::default()
+                        }));
                     }
                 },
                 _ = async {
@@ -403,20 +419,38 @@ Read and acknowledge by saying "READY"."#,
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let system_prompt = parsing::page_type_prompt(language);
         let next_question = parsing::page_selectors_prompt(&page_type, language); 
         let app_handle_clone = app_handle.clone();
         
+        // Add classification result and the new question to history
+        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content: Some(page_type_res.clone()),
+            ..Default::default()
+        }));
+        
+        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(vec![
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: next_question })
+            ]),
+            name: None,
+        }));
+
+        let params = ChatCompletionParameters {
+            messages: messages.clone(),
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(256),
+            temperature: Some(0.95),
+            ..Default::default()
+        };
+
         tokio::select!{
-            res = model.chat_with_spinner(
-                &system_prompt, 
-                &next_question,
+            res = model.chat_params_with_spinner(
+                params,
                 &app_handle_clone, 
                 "extraction-progress", 
                 json!({ 
                     "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type)
                 }), 
-                256, 
                 Some(cancellation_token.clone()), 
                 Some(task.id.clone())
             ) => res?,

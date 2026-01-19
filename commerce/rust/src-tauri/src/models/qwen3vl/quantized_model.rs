@@ -254,14 +254,17 @@ impl QuantizedQwen3VLTextAttention {
             let mut k = tensors.get("k").ok_or(anyhow!("Missing k in kv cache"))?.clone();
             let mut v = tensors.get("v").ok_or(anyhow!("Missing v in kv cache"))?.clone();
             
-            // SLICE to match the expected length if cache is longer
             let current_len = k.dim(2)?;
-            if current_len > expected_len {
+            if current_len >= expected_len {
+                // If cache is exactly same or longer, we slice it to match current state
                 k = k.narrow(2, 0, expected_len)?;
                 v = v.narrow(2, 0, expected_len)?;
+                self.kv_cache = Some((k, v));
+            } else {
+                // If cache is shorter than expected, it's useless for prefix matching
+                println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
+                self.kv_cache = None;
             }
-            
-            self.kv_cache = Some((k, v));
         }
         Ok(())
     }

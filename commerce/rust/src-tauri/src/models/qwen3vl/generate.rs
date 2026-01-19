@@ -185,15 +185,12 @@ impl Qwen3VLGenerateModel {
                                      if c == f { match_len += 1; } else { break; }
                                  }
 
-                                 if match_len > 0 {
-                                     println!("[KV-DISK] Longest Common Prefix: {} tokens. (Cached: {}, Input: {})", 
-                                        match_len, cached_tokens.len(), full_input_ids_vec.len());
+                                 if match_len > 100 {
+                                     println!("[KV-DISK] Cache Hit! Longest Common Prefix: {} tokens.", match_len);
                                      
+                                     // [OPTIMIZATION] Even if match_len is slightly less than cached_tokens.len(),
+                                     // we trust the cache up to match_len.
                                      if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
-                                         // If we matched less than what's on disk, we need the model to "forget" the trailing parts
-                                         // but since quantized_model handles its own cache, for now we assume 
-                                         // matching the prefix is enough for a hit if it's the SAME session.
-                                         
                                          seqlen_offset = match_len;
                                          loaded = true;
                                          
@@ -203,14 +200,16 @@ impl Qwen3VLGenerateModel {
                                              seq_len = remaining;
                                              println!("[KV-DISK] Processing only {} new tokens.", seq_len);
                                          } else {
-                                             println!("[KV-DISK] Warning: No new tokens to process. Re-processing last token.");
+                                             // If perfectly matched, we still need to process the very last token 
+                                             // to get the next distribution.
+                                             println!("[KV-DISK] Perfect match. Re-processing last token.");
                                              input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
                                              seqlen_offset = seq_len - 1;
                                              seq_len = 1;
                                          }
                                      }
                                  } else {
-                                     println!("[KV-DISK] Cache Mismatch. Starting fresh.");
+                                     println!("[KV-DISK] Cache Mismatch (Prefix only {}). Starting fresh.", match_len);
                                  }
                              }
                          }
