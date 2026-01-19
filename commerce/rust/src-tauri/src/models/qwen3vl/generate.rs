@@ -228,7 +228,7 @@ impl Qwen3VLGenerateModel {
             println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
             
             // Get newline token ID for this model (usually 198 or similar for Qwen)
-            let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n", &self.device) {
+            let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.device) {
                 ids.flatten_all()?.to_vec1::<u32>()?.get(0).cloned().unwrap_or(198)
             } else { 198 };
 
