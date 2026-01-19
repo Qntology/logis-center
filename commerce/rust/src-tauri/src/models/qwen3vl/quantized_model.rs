@@ -235,16 +235,22 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_cache = None
     }
 
-    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool) -> Result<()> {
         if let Some((k, v)) = &self.kv_cache {
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
             let mut map = HashMap::new();
             map.insert("k", k.clone());
             map.insert("v", v.clone());
             candle_core::safetensors::save(&map, &file)?;
-            self.kv_cache = None;
+            if clear {
+                self.kv_cache = None;
+            }
         }
         Ok(())
+    }
+
+    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+        self.save_kv_cache(path, true)
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
@@ -366,6 +372,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
     pub fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
+    }
+
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool) -> Result<()> {
+        self.self_attn.save_kv_cache(path, clear)
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
@@ -605,14 +615,18 @@ impl QuantizedQwen3VLTextModel {
         }
     }
 
-    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool) -> Result<()> {
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
         for layer in self.layers.iter_mut() {
-            layer.offload_kv_cache(path)?;
+            layer.save_kv_cache(path, clear)?;
         }
         Ok(())
+    }
+
+    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+        self.save_kv_cache(path, true)
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
@@ -869,6 +883,10 @@ impl QuantizedQwen3VLModel {
 
     pub fn clear_kv_cache(&mut self) {
         self.language_model.clear_kv_cache();
+    }
+
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool) -> Result<()> {
+        self.language_model.save_kv_cache(path, clear)
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {

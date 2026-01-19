@@ -146,16 +146,27 @@ impl Qwen3VLGenerateModel {
         println!("[GENERATE] Input Token Count: {}", seq_len);
         println!("[GENERATE] Input Shape: {:?}", input_ids.shape());
 
-        let full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
+        let mut full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
 
-        // HARD SAFETY CHECK: Truncate Input if it exceeds limit
+        // HARD SAFETY CHECK: Truncate Input if it exceeds limit (Smart Middle-Drop)
         if let Some(limit) = self.hard_token_limit {
             let max_input = if limit > 64 { limit - 64 } else { limit };
             
             if seq_len > max_input {
-                println!("⚠️ [WARN] Input too long ({} > {}). Truncating to prevent OOM.", seq_len, max_input);
-                input_ids = input_ids.narrow(1, 0, max_input)?;
+                println!("⚠️ [WARN] Input too long ({} > {}). Using System-Aware Truncation.", seq_len, max_input);
+                
+                // Keep System Prompt (approx first 200 tokens) and the Tail
+                let head_reserve = 200.min(max_input / 4);
+                let tail_reserve = max_input - head_reserve;
+                
+                let head_ids = input_ids.narrow(1, 0, head_reserve)?;
+                let tail_ids = input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?;
+                
+                input_ids = Tensor::cat(&[head_ids, tail_ids], 1)?;
                 seq_len = max_input;
+                
+                // Update full_input_ids_vec to match the new truncated content
+                full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?;
             }
         }
 
@@ -272,7 +283,7 @@ impl Qwen3VLGenerateModel {
             // [NEW] Intermediate Cache Save: Save context knowledge after heavy prefill
             if let Some(path) = &cache_path {
                 if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
-                    if m.offload_kv_cache(path).is_ok() {
+                    if m.save_kv_cache(path, false).is_ok() {
                         let token_path = path.join("tokens.json");
                         // We save only the part of full_input_ids_vec that corresponds to seqlen_offset
                         let ingested_tokens = &full_input_ids_vec[..seqlen_offset];

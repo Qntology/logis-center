@@ -406,7 +406,7 @@ async fn process_task(
     println!("[Scheduler] Classification Result: '{}'", page_type);
     
     if page_type.is_empty() || page_type == "unknown" {
-        println!("[Scheduler] Stopping: Unknown page type.");
+        println!("[Scheduler] Stopping: Unknown page type. Raw response: '{}'", page_type_res);
         drop(model_guard);
         return Ok(());
     }

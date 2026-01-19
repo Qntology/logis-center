@@ -58,6 +58,7 @@ nvml-wrapper = "0.9.0"
 default = ["cuda"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+flash-attn = []
 
 
 [profile.dev]
