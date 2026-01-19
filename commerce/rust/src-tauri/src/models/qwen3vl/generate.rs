@@ -79,8 +79,10 @@ impl Qwen3VLGenerateModel {
                 
                 // Calculate KV Cache Reservation
                 let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
-                // Heuristic: ~180KB per token for Qwen2-VL-2B (BF16)
-                let kv_reserve = max_tokens * 180_000;
+                // Heuristic: ~180KB per token. 
+                // Since we offload KV to CPU RAM, we only need to reserve VRAM for the active chunk (approx 1500 tokens).
+                // This prevents excessive reservation that forces layers to CPU.
+                let kv_reserve = std::cmp::min(max_tokens, 1500) * 180_000;
                 
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &device, dtype, kv_reserve)?;
                 println!("[DEBUG] QuantizedQwen3VLModel initialized.");
@@ -96,7 +98,7 @@ impl Qwen3VLGenerateModel {
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
                  let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
-                 let kv_reserve = max_tokens * 180_000;
+                 let kv_reserve = std::cmp::min(max_tokens, 1500) * 180_000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &device, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
@@ -187,48 +189,34 @@ impl Qwen3VLGenerateModel {
                      if token_path.exists() {
                          if let Ok(file) = fs::File::open(&token_path) {
                              let reader = std::io::BufReader::new(file);
-                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                 // --- Longest Common Prefix (LCP) Calculation ---
-                                 let min_len = std::cmp::min(cached_tokens.len(), full_input_ids_vec.len());
-                                 let mut match_len = 0;
-                                 for i in 0..min_len {
-                                     if cached_tokens[i] == full_input_ids_vec[i] {
-                                         match_len += 1;
-                                     } else {
-                                         break;
-                                     }
-                                 }
-
-                                 if match_len > 0 {
-                                     println!("[KV-DISK] Cache Hit (Partial)! Loading {} matching tokens from disk...", match_len);
+                             if let Ok(mut cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 // --- Append Mode (True Continuation) ---
+                                 // We assume the incoming `input_ids` is the NEXT chunk.
+                                 // We load the full previous state and append the new processing.
+                                 
+                                 println!("[KV-DISK] Append Mode: Loading {} history tokens...", cached_tokens.len());
+                                 
+                                 // Load full KV cache from RAM/Disk (No slicing limit needed, we want it all)
+                                 if m.load_kv_cache(path, &self.device, None).is_ok() {
+                                     seqlen_offset = cached_tokens.len();
+                                     loaded = true;
                                      
-                                     // Call with limit to slice cache
-                                     if m.load_kv_cache(path, &self.device, Some(match_len)).is_ok() {
-                                         seqlen_offset = match_len;
-                                         loaded = true;
-                                         
-                                         // Slice input_ids to process only NEW tokens
-                                         let remaining = seq_len.saturating_sub(seqlen_offset);
-                                         if remaining > 0 {
-                                             input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
-                                             seq_len = remaining;
-                                             println!("[KV-DISK] Processing only {} new tokens.", seq_len);
-                                         } else {
-                                             // No new tokens (unlikely in chat, but possible). 
-                                             println!("[KV-DISK] Warning: No new tokens to process. Re-processing last token.");
-                                             input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
-                                             seqlen_offset = seq_len - 1;
-                                             seq_len = 1;
-                                         }
-                                     }
-                                 } else {
-                                     println!("[KV-DISK] Cache Mismatch (No common prefix). Starting fresh.");
+                                     // Merge history with new input for saving later
+                                     cached_tokens.extend(full_input_ids_vec.iter());
+                                     // NOTE: We rely on the fact that `full_input_ids_vec` currently holds ONLY the new chunk
+                                     // We must update the `all_tokens` variable for the save step later.
+                                     // However, `full_input_ids_vec` is immutable here. 
+                                     // We will handle the merging in the Save step by reading `cached_tokens` again or logic below.
+                                     
+                                     // Actually, let's just use `seqlen_offset` to know where we are.
+                                     // The `generate` loop uses `seqlen_offset` correctly.
                                  }
                              }
                          }
                      }
                      
                      if !loaded {
+                         println!("[KV-DISK] No valid cache found. Starting fresh.");
                          // Ensure cache is clear if we are not loading
                          m.clear_kv_cache();
                      }
@@ -332,21 +320,34 @@ impl Qwen3VLGenerateModel {
         if let Some(path) = &cache_path {
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
-                     // OPTIMIZATION: Move KV Cache to CPU RAM instead of Disk.
-                     // This avoids slow SSD I/O while freeing up VRAM to prevent OOM.
-                     println!("[KV-MEMORY] Moving KV cache to System RAM...");
-                     if let Err(e) = m.move_kv_cache_to_cpu() {
-                         println!("[KV-MEMORY] Warning: Failed to move to CPU: {}", e);
+                     // 1. Offload KV Cache to Disk (.safetensors files)
+                     // This is the safest way to prevent OOM for long contexts.
+                     println!("[KV-DISK] Offloading KV cache to SSD...");
+                     if let Err(e) = m.offload_kv_cache(path) {
+                         println!("[KV-DISK] Warning: Failed to offload: {}", e);
                      }
 
-                     // Save tokens.json for Prefix Matching (LCP) in next turn
-                     let all_tokens = full_input_ids_vec;
+                     // 2. Save tokens.json for Append Mode in next turn
+                     let mut final_history = Vec::new();
                      let token_path = path.join("tokens.json");
+                     
+                     if token_path.exists() {
+                         if let Ok(file) = fs::File::open(&token_path) {
+                             let reader = std::io::BufReader::new(file);
+                             if let Ok(existing) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 final_history = existing;
+                             }
+                         }
+                     }
+                     final_history.extend(full_input_ids_vec.iter());
+                     
                      if let Ok(file) = fs::File::create(&token_path) {
-                         let _ = serde_json::to_writer(file, &all_tokens);
+                         let _ = serde_json::to_writer(file, &final_history);
                      }
                      
-                     // DO NOT call clear_kv_cache() here. We keep it in RAM.
+                     // 3. IMPORTANT: Clear memory cache after offloading to SSD.
+                     // This ensures we have maximum RAM/VRAM available for other parts of the system.
+                     m.clear_kv_cache();
                  },
                  ModelVariant::Standard(m) => m.clear_kv_cache(),
              }

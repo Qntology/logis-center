@@ -352,10 +352,11 @@ async fn process_task(
         let app_handle_clone = app_handle.clone();
 
         for (i, chunk) in classify_chunks.iter().enumerate() {
-            let _ = std::fs::write(format!("debug_scheduler_class_chunk_{}.txt", i), chunk); // DEBUG
+            let _ = std::fs::write(format!("debug_scheduler_class_chunk_{}.txt", i), chunk); 
 
             println!("[Classification-Loop] Ingesting structural part {}/{} to LLM (Session: {})", i + 1, classify_chunks_len, task.id);
             
+            // Append Mode: Send ONLY the new chunk. The model has the history in KV cache.
             let prompt = if i == 0 {
                 format!(
 r#"[CONTEXT]
@@ -380,7 +381,7 @@ Continue reading and memorizing. Just say "ACKNOWLEDGED"."#,
                 )
             };
             
-            let _ = std::fs::write(format!("debug_scheduler_class_prompt_{}.txt", i), &prompt); // DEBUG
+            let _ = std::fs::write(format!("debug_scheduler_class_prompt_{}.txt", i), &prompt); 
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Classification Ingestion", 
@@ -584,53 +585,51 @@ Continue reading and memorizing. Just say "ACKNOWLEDGED"."#,
             
             
             
-                            let fields_prompts = parsing::list2json(page_type, language);
-                            let list_session_id = format!("{}_list", task.id);
-                    
-                            for (i, item_pug) in item_pugs.iter().enumerate() {
-                                let is_last = i == total_items - 1;
-                                println!("[List-Loop] Ingesting item part {}/{} to LLM (Session: {})", i + 1, total_items, list_session_id);
-                                
-                                let prompt = if is_last {
-                                    println!("[List-FINAL] All items ingested. Requesting FINAL JSON list extraction.");
-                                    let mut schema_definitions = String::new();
-                                    for (name, schema) in &fields_prompts {
-                                        schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
-                                    }
-                    
-                                    let final_prompt = format!(
-                    r#"[FINAL PART]
-                    {}
-                    
-                    [EXTRACTION SCHEMA]
-                    Please extract all items and list-level metadata precisely according to these definitions:
-                    {}
-                    
-                    [FINAL INSTRUCTION]
-                    1. Based on ALL the parts I have sent you (previous and current), extract all items into an "items" array.
-                    2. Include list-level metadata like "type", "item", "node", etc.
-                    3. Return ONLY a single valid JSON object.
-                    4. No preamble, no explanation. Just raw JSON."#,
-                                        item_pug,
-                                        schema_definitions
-                                    );
-                                    let _ = std::fs::write("debug_scheduler_prompt_final_list.txt", &final_prompt); // DEBUG
-                                    final_prompt
-                                } else {
-                                    format!(
-                    r#"[ITEM PART]
-                    {}
-                    
-                    [INSTRUCTION]
-                    Read and memorize this item. Do NOT generate JSON yet. 
-                    Just say "ACKNOWLEDGED"."#,
-                                        item_pug
-                                    )
-                                };
-                    
-                                let max_tokens = if is_last { 4096 } else { 20 };            
-                        
-            
+                                            let fields_prompts = parsing::list2json(page_type, language);
+                                            let list_session_id = format!("{}_list", task.id);
+                                    
+                                            for (i, item_pug) in item_pugs.iter().enumerate() {
+                                                let is_last = i == total_items - 1;
+                                                println!("[List-Loop] Ingesting item part {}/{} to LLM (Session: {})", i + 1, total_items, list_session_id);
+                                                
+                                                let prompt = if is_last {
+                                                    println!("[List-FINAL] All items ingested. Requesting FINAL JSON list extraction.");
+                                                    let mut schema_definitions = String::new();
+                                                    for (name, schema) in &fields_prompts {
+                                                        schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
+                                                    }
+                                    
+                                                    let final_prompt = format!(
+                                    r#"[FINAL PART]
+                                    {}
+                                    
+                                    [EXTRACTION SCHEMA]
+                                    Please extract all items and list-level metadata precisely according to these definitions:
+                                    {}
+                                    
+                                    [FINAL INSTRUCTION]
+                                    1. Based on ALL the parts I have sent you (previous and current), extract all items into an "items" array.
+                                    2. Include list-level metadata like "type", "item", "node", etc.
+                                    3. Return ONLY a single valid JSON object.
+                                    4. No preamble, no explanation. Just raw JSON."#,
+                                                        item_pug,
+                                                        schema_definitions
+                                                    );
+                                                    let _ = std::fs::write("debug_scheduler_prompt_final_list.txt", &final_prompt); 
+                                                    final_prompt
+                                                } else {
+                                                    format!(
+                                    r#"[ITEM PART]
+                                    {}
+                                    
+                                    [INSTRUCTION]
+                                    Read and memorize this item. Do NOT generate JSON yet. 
+                                    Just say "ACKNOWLEDGED"."#,
+                                                        item_pug
+                                                    )
+                                                };
+                                    
+                                                let max_tokens = if is_last { 4096 } else { 20 };            
                         let _ = app_handle.emit("extraction-progress", json!({ 
             
                             "category": "List Ingestion", 
