@@ -282,12 +282,17 @@ impl EmbeddingModel {
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let tokens = self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?;
-        let token_ids = tokens.get_ids();
+        let mut token_ids = tokens.get_ids().to_vec();
         
         if token_ids.is_empty() { return Ok(vec![0.0; 768]); }
+
+        // Truncate to max_position_embeddings (2048 for gemma-300m)
+        if token_ids.len() > 2048 {
+            token_ids.truncate(2048);
+        }
         
         // Pass Rank 1 Tensor [seq_len]
-        let input_tensor = Tensor::new(token_ids, &self.device).map_err(anyhow::Error::msg)?;
+        let input_tensor = Tensor::new(token_ids.as_slice(), &self.device).map_err(anyhow::Error::msg)?;
         let hidden_states = self.model.forward(&input_tensor).map_err(anyhow::Error::msg)?;
         
         let (_b, s, _h) = hidden_states.dims3().map_err(anyhow::Error::msg)?;
