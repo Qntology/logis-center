@@ -79,6 +79,67 @@ Error: {}",
     Ok(sm_float)
 }
 
+#[derive(Clone, Debug)]
+pub struct DeviceConfig {
+    pub device: Device,
+    pub is_cpu: bool,
+    pub classify_chunk_size: usize,
+    pub extract_chunk_size: usize,
+    pub name: String,
+}
+
+pub fn get_optimal_device_config() -> DeviceConfig {
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(count) = nvml.device_count() {
+                let mut best_id = 0;
+                let mut max_free = 0;
+                
+                for i in 0..count {
+                    if let Ok(device) = nvml.device_by_index(i) {
+                        if let Ok(mem) = device.memory_info() {
+                            if mem.free > max_free {
+                                max_free = mem.free;
+                                best_id = i;
+                            }
+                        }
+                    }
+                }
+                
+                // Threshold: If free VRAM > 4GB, treat as High-End GPU
+                if max_free > 4_000_000_000 {
+                    return DeviceConfig {
+                        device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
+                        is_cpu: false,
+                        classify_chunk_size: 30_000, // Large chunk for speed
+                        extract_chunk_size: 30_000,
+                        name: format!("GPU-{}", best_id),
+                    };
+                } else if max_free > 0 {
+                    // Low VRAM GPU (e.g. 2GB~4GB) -> Safe Mode
+                     return DeviceConfig {
+                        device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
+                        is_cpu: false,
+                        classify_chunk_size: 15_000, 
+                        extract_chunk_size: 10_000,
+                        name: format!("GPU-{}-LowMem", best_id),
+                    };
+                }
+            }
+        }
+    }
+
+    // Fallback to CPU or if no CUDA
+    DeviceConfig {
+        device: Device::Cpu,
+        is_cpu: true,
+        classify_chunk_size: 8_000,  // ~2.5k tokens
+        extract_chunk_size: 6_000,   // ~1.8k tokens
+        name: "CPU".to_string(),
+    }
+}
+
 pub fn get_dtype(dtype: Option<DType>, cfg_dtype: &str) -> DType {
     match dtype {
         Some(d) => d,

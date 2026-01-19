@@ -3,6 +3,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use crate::store::{VectorStore, Task};
 use crate::logic;
+use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
 use serde_json::{Value, json};
@@ -283,9 +284,14 @@ async fn process_task(
     
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
+    // Determine optimal chunk sizes based on hardware
+    let device_config = utils::get_optimal_device_config();
+    println!("[Scheduler] Running on: {} (Classify Chunk: {}, Extract Chunk: {})", 
+        device_config.name, device_config.classify_chunk_size, device_config.extract_chunk_size);
+
     // Chunking Logic for Classification
     // Instead of truncating, we ingest the whole light_pug structure
-    let classify_chunks = chunk_text(&light_pug, 4000, 500);
+    let classify_chunks = chunk_text(&light_pug, device_config.classify_chunk_size, 500);
     let classify_chunks_len = classify_chunks.len();
 
     let mut model_guard = model_mutex.lock().await;
@@ -671,8 +677,8 @@ Extract data for {} items from the provided Pug snippets.
 
         let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
         
-        // CHUNKING: Split huge content into 3000-char chunks with 500-char overlap (CPU Optimized)
-        let chunks = chunk_text(&content_pug, 3000, 500); 
+        // CHUNKING: Split huge content into dynamic chunks with 500-char overlap (Device Optimized)
+        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 500); 
         let fields_prompts = parsing::item2json(page_type, &url, language);
 
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)

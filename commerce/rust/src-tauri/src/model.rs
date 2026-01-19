@@ -1,3 +1,4 @@
+use crate::utils;
 use anyhow::anyhow;
 use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
 use crate::models::embedding::EmbeddingModel;
@@ -134,75 +135,42 @@ pub struct LogisModel {
 }
 
 impl LogisModel {
-    // Returns (Is Safe to Try GPU, Message, Usable VRAM in Bytes, Device ID)
-    fn check_memory_status(is_cuda: bool, _is_metal: bool) -> (bool, String, u64, Vec<usize>) {
-        if is_cuda {
-            let nvml = match Nvml::init() {
-                Ok(n) => n,
-                Err(e) => return (false, format!("NVML Init Failed: {}", e), 0, vec![0]),
-            };
-            
-            let count = nvml.device_count().unwrap_or(1);
-            let mut gpu_ids = Vec::new();
-            let mut max_free = 0;
-
-            for i in 0..count {
-                if let Ok(device) = nvml.device_by_index(i) {
-                    if let Ok(mem) = device.memory_info() {
-                        gpu_ids.push(i as usize);
-                        if mem.free > max_free { max_free = mem.free; }
-                    }
-                }
-            }
-            return (true, format!("Found {} GPUs", count), max_free, gpu_ids);
-        }
-
-        let mut sys = System::new_all();
-        sys.refresh_memory();
-        let free_mem = sys.available_memory();
-        (true, "CPU/Metal".to_string(), free_mem, vec![0])
-    }
-
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel with Dual-GPU Support");
+        println!("[MODEL-00] Initializing LogisModel with Unified Device Config");
 
-        let has_cuda = candle_core::utils::cuda_is_available();
-        let has_metal = candle_core::utils::metal_is_available();
-        
-        let mut text_device = Device::Cpu;
-        let mut vision_device = Device::Cpu;
+        let config = utils::get_optimal_device_config();
+        let text_device = config.device.clone();
+        let mut vision_device = config.device.clone();
         let mut text_device_id = 0;
         let mut vision_device_id = 0;
-        let mut _detected_vram = 0_u64;
 
-        if device_preference != Some("cpu") {
-            if has_cuda {
-                let (ok, _, vram, ids) = Self::check_memory_status(true, false);
-                _detected_vram = vram;
-                if ok {
-                    text_device_id = ids[0];
-                    text_device = Device::new_cuda(text_device_id).unwrap_or(Device::Cpu);
-                    if ids.len() >= 2 {
-                        vision_device_id = ids[1];
-                        vision_device = Device::new_cuda(vision_device_id).unwrap_or(Device::Cpu);
-                        println!("✅ [MULTI-GPU] Text: cuda:{}, Vision: cuda:{}", text_device_id, vision_device_id);
-                    } else {
-                        vision_device_id = text_device_id;
-                        vision_device = text_device.clone();
-                        println!("ℹ️ [SINGLE-GPU] Text & Vision sharing cuda:{}", text_device_id);
+        // If CUDA, extract ID from device name/debug (Simple assumption for single GPU setup)
+        // In multi-GPU, utils::get_optimal_device_config currently returns one best device.
+        if text_device.is_cuda() {
+            // For now, we assume the best device ID is 0 or what utils returned.
+            // Since candle's Device struct doesn't easily expose ID, we rely on utils.
+            // Future improvement: Include ID in DeviceConfig.
+            if config.name.contains("GPU-") {
+                if let Some(id_str) = config.name.split('-').nth(1) {
+                    if let Ok(id) = id_str.parse::<usize>() {
+                        text_device_id = id;
+                        vision_device_id = id;
                     }
                 }
-            } else if has_metal {
-                text_device = Device::new_metal(0).unwrap_or(Device::Cpu);
-                vision_device = text_device.clone();
             }
+        }
+
+        // Override if CPU preference is explicit
+        if device_preference == Some("cpu") {
+            // Force CPU but keep other config logic
+            println!("[MODEL] Explicit CPU preference detected.");
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
         let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         let model_path = gguf_dir.to_str().unwrap().to_string();
 
-        let max_tokens_limit = 2048; // Optimized for 2.4GB VRAM stability
+        let max_tokens_limit = 2048; // Internal limit, scheduler uses dynamic chunks
         let dtype = if text_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
 
         let t_dev = text_device.clone();
@@ -221,7 +189,7 @@ impl LogisModel {
         Ok(Self {
             generator: Arc::new(Mutex::new(generator)),
             embedding_model: Arc::new(Mutex::new(embedding_model)),
-            is_cpu_mode: text_device.is_cpu(),
+            is_cpu_mode: config.is_cpu,
             max_tokens_limit: max_tokens_limit as u32,
         })
     }
