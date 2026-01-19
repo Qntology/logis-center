@@ -254,6 +254,16 @@ impl QuantizedQwen3VLTextAttention {
             let mut k = tensors.get("k").ok_or(anyhow!("Missing k in kv cache"))?.clone();
             let mut v = tensors.get("v").ok_or(anyhow!("Missing v in kv cache"))?.clone();
             
+            // FIX: Ensure loaded cache matches the layer's current dtype (e.g. BF16 -> F32 if offloaded to CPU)
+            let target_dtype = self.q_norm.weight().dtype();
+            if k.dtype() != target_dtype { k = k.to_dtype(target_dtype)?; }
+            if v.dtype() != target_dtype { v = v.to_dtype(target_dtype)?; }
+
+            // NEW FIX: Ensure loaded cache matches the layer's current DEVICE
+            let target_device = self.q_norm.weight().device();
+            if !k.device().same_device(target_device) { k = k.to_device(target_device)?; }
+            if !v.device().same_device(target_device) { v = v.to_device(target_device)?; }
+
             if let Some(len) = limit {
                 let current_len = k.dim(2)?;
                 if len < current_len {

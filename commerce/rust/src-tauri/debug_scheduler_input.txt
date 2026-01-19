@@ -1,0 +1,675 @@
+<!DOCTYPE html><html lang="ko"><head>
+<meta charset="utf-8">
+<title>관리자 페이지</title>
+<link rel="stylesheet" href="http://demofran.com/admin/css/admin.css?ver=20260119091639">
+<link type="text/css" href="//ajax.googleapis.com/ajax/libs/jqueryui/1.8.17/themes/base/jquery-ui.css" rel="stylesheet">
+<link type="text/css" href="http://demofran.com/plugin/jquery-ui/style.css?ver=20260119091639">
+<link rel="shortcut icon" href="http://demofran.com/data/banner/NH1d4b424pD9mLSHg13Z3mc3BS2NMw.ico" type="image/x-icon">
+
+
+
+
+
+</head>
+<body>
+
+<header id="hd">
+	<div id="hd_wrap">
+		<h1>행복을 주는 쇼핑몰!</h1>
+		<div id="logo"><a href="http://demofran.com/admin/"><img src="http://demofran.com/admin/img/logo.gif" alt="행복을 주는 쇼핑몰! 관리자"></a></div>
+		<div id="tnb">
+			<ul>
+				<li>분양몰 v2.4.2</li>
+				<li>오늘:166, 어제:337, 최대:1622, 전체:124450</li>
+				
+				<li><a href="http://demofran.com/admin/config.php?code=super">관리자정보</a></li>
+				<li><a href="http://demofran.com/admin/">관리자홈</a></li>
+				<li><a href="http://demofran.com" target="_blank">쇼핑몰</a></li>
+				<li id="tnb_logout"><a href="http://demofran.com/bbs/logout.php">로그아웃</a></li>
+			</ul>
+		</div>
+
+		<nav id="gnb">
+			<h2>관리자 주메뉴</h2>
+			<ul id="gnb_1dul">
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/member.php?code=list" class="gnb_1da">회원관리</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/partner.php?code=plist" class="gnb_1da">가맹점관리</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/seller.php?code=list" class="gnb_1da">공급사관리</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/category.php?code=list" class="gnb_1da">카테고리 관리</a>
+				</li>
+				<li class="gnb_1dli active">
+					<a href="http://demofran.com/admin/goods.php?code=list" class="gnb_1da">상품관리</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/order.php?code=list" class="gnb_1da">주문관리</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/visit.php?code=hour" class="gnb_1da">통계분석</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/help.php?code=qa" class="gnb_1da">고객지원</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/design.php?code=banner_list" class="gnb_1da">디자인관리</a>
+				</li>
+				<li class="gnb_1dli">
+					<a href="http://demofran.com/admin/config.php?code=default" class="gnb_1da">환경설정</a>
+				</li>
+			</ul>
+		</nav>
+	</div>
+</header>
+<div id="wrapper">
+	
+<div id="snb">
+	<div class="snb_header ico_config">
+		<h2><i class="ionicons ion-bag"></i>상품관리</h2>
+	</div>
+		<dl>
+		<dt class="g10 menu_toggle">상품관리</dt>		<dd class="g10 active"><a href="http://demofran.com/admin/goods.php?code=list">전체 상품관리</a></dd>		<dd class="g10"><a href="http://demofran.com/admin/goods.php?code=supply">공급사 대기상품<em>0</em></a></dd>		<dd class="g10"><a href="http://demofran.com/admin/goods.php?code=supply2">공급사 보류상품<em>0</em></a></dd>		<dd class="g10"><a href="http://demofran.com/admin/goods.php?code=userlist">가맹점 상품관리</a></dd>		<dd class="g10"><a href="http://demofran.com/admin/goods.php?code=type">상품 진열관리</a></dd>		<dd class="g10"><a href="http://demofran.com/admin/goods.php?code=brand_list">브랜드 관리</a></dd>		<dd class="g10"><a href="http://demofran.com/admin/goods.php?code=plan">기획전 관리</a></dd>		<dt class="g20 menu_toggle">재고관리</dt>		<dd class="g20"><a href="http://demofran.com/admin/goods.php?code=stock">상품 재고관리<em>0</em></a></dd>		<dd class="g20"><a href="http://demofran.com/admin/goods.php?code=optstock">상품 옵션재고관리<em>0</em></a></dd>		<dt class="g30 menu_toggle">일괄처리</dt>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=xls_reg">상품 엑셀일괄등록</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=xls_option_reg">옵션 엑셀일괄등록</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=xls_mod">상품 엑셀일괄수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getprice">빠른 판매가격 수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getpoint">빠른 적립포인트 수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getuse">빠른 판매여부 수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getmove">빠른 상품이동 수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getbrand">빠른 브랜드 수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getdelivery">빠른 배송비 수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getbuylevel">빠른 구매가능레벨 수정</a></dd>		<dd class="g30"><a href="http://demofran.com/admin/goods.php?code=getpartner">빠른 가맹점노출 수정</a></dd>		<dt class="g40 menu_toggle">문의 / 후기</dt>		<dd class="g40"><a href="http://demofran.com/admin/goods.php?code=qa">상품 문의관리<em>0</em></a></dd>		<dd class="g40"><a href="http://demofran.com/admin/goods.php?code=review">상품 후기관리</a></dd>		<dt class="g50 menu_toggle">쿠폰관리</dt>		<dd class="g50"><a href="http://demofran.com/admin/goods.php?code=gift">쿠폰관리 (인쇄용)</a></dd>		<dd class="g50"><a href="http://demofran.com/admin/goods.php?code=coupon">쿠폰관리 (온라인)</a></dd>		<dt class="g60 menu_toggle">기타관리</dt>		<dd class="g60"><a href="http://demofran.com/admin/goods.php?code=price">가격비교사이트 연동</a></dd>		<dd class="g60"><a href="http://demofran.com/admin/goods.php?code=popular_list">상품 검색어관리</a></dd>		<dd class="g60"><a href="http://demofran.com/admin/goods.php?code=popular_rank">상품 검색어순위</a></dd>	</dl>
+	</div>
+	<div id="content">
+		<div class="breadcrumb">
+			<span>HOME</span> <i class="ionicons ion-ios-arrow-right"></i> 상품관리 <i class="ionicons ion-ios-arrow-right"></i> 전체 상품관리		</div>
+	
+<div class="s_wrap">
+	<h1>전체 상품관리</h1>
+	
+
+
+<h2>기본검색</h2>
+<form name="fsearch" id="fsearch" method="get">
+<input type="hidden" name="code" value="list">
+<div class="tbl_frm01">
+	<table class="tablef">
+	<colgroup>
+		<col class="w100">
+		<col>
+		<col class="w100">
+		<col>
+	</colgroup>
+	<tbody>
+	<tr>
+		<th scope="row">검색어</th>
+		<td colspan="3">
+			<select name="sfl">
+				<option value="gname">상품명</option>
+				<option value="gcode">상품코드</option>
+				<option value="mb_id">업체코드</option>
+				<option value="maker">제조사</option>
+				<option value="origin">원산지</option>
+				<option value="model">모델명</option>
+				<option value="explan">짧은설명</option>
+			</select>
+			<input type="text" name="stx" value="" class="frm_input" size="30">
+		</td>
+	</tr>
+	<tr>
+		<th scope="row">카테고리</th>
+		<td colspan="3">
+			<select id="sel_ca1" name="sel_ca1">
+<option value="">=카테고리선택=</option>
+<option value="002">식품/생필품</option>
+<option value="001">패션의류/잡화/뷰티</option>
+<option value="003">출산/유아동</option>
+<option value="004">생활/건강</option>
+<option value="005">가구/인테리어</option>
+<option value="007">스포츠/레저/자동차/공구</option>
+<option value="006">가전/디지털/컴퓨터</option>
+<option value="008">도서/여행/e쿠폰/취미</option>
+</select>
+			<select id="sel_ca2" name="sel_ca2">
+<option value="">=카테고리선택=</option>
+</select>
+			<select id="sel_ca3" name="sel_ca3">
+<option value="">=카테고리선택=</option>
+</select>
+			<select id="sel_ca4" name="sel_ca4">
+<option value="">=카테고리선택=</option>
+</select>
+			<select id="sel_ca5" name="sel_ca5">
+<option value="">=카테고리선택=</option>
+</select>
+
+			
+		</td>
+	</tr>
+	<tr>
+		<th scope="row">기간검색</th>
+		<td colspan="3">
+			<select name="q_date_field" id="q_date_field">
+				<option value="update_time">최근수정일</option>
+				<option value="reg_time">최초등록일</option>
+			</select>
+			<label for="fr_date" class="sound_only">시작일</label>
+<input type="text" name="fr_date" value="" id="fr_date" class="frm_input w80 hasDatepicker" maxlength="10">
+ ~ 
+<label for="to_date" class="sound_only">종료일</label>
+<input type="text" name="to_date" value="" id="to_date" class="frm_input w80 hasDatepicker" maxlength="10">
+<span class="btn_group"><input type="button" onclick="search_date('fr_date','to_date',this.value);" class="btn_small white" value="오늘"><input type="button" onclick="search_date('fr_date','to_date',this.value);" class="btn_small white" value="어제"><input type="button" onclick="search_date('fr_date','to_date',this.value);" class="btn_small white" value="일주일"><input type="button" onclick="search_date('fr_date','to_date',this.value);" class="btn_small white" value="지난달"><input type="button" onclick="search_date('fr_date','to_date',this.value);" class="btn_small white" value="1개월"><input type="button" onclick="search_date('fr_date','to_date',this.value);" class="btn_small white" value="3개월"><input type="button" onclick="search_date('fr_date','to_date',this.value);" class="btn_small white" value="전체"></span>		</td>
+	</tr>
+	<tr>
+		<th scope="row">브랜드</th>
+		<td>
+			<select name="q_brand">
+				<option value="" selected="selected">전체</option>
+<option value="1">테스트 기업</option>
+<option value="2">테스트 기업</option>
+<option value="3">테스트 기업</option>
+<option value="4">테스트 기업</option>
+<option value="5">테스트 기업</option>
+<option value="6">테스트 기업</option>
+<option value="7">테스트 기업</option>
+<option value="8">테스트 기업</option>
+			</select>
+		</td>
+		<th scope="row">배송가능 지역</th>
+		<td>
+			<select name="q_zone">
+				<option value="" selected="selected">전체</option>
+				<option value="전국">전국</option>
+				<option value="강원도">강원도</option>
+				<option value="경기도">경기도</option>
+				<option value="경상도">경상도</option>
+				<option value="서울/경기도">서울/경기도</option>
+				<option value="서울특별시">서울특별시</option>
+				<option value="전라도">전라도</option>
+				<option value="제주도">제주도</option>
+				<option value="충청도">충청도</option>
+			</select>
+		</td>
+	</tr>
+	<tr>
+		<th scope="row">상품재고</th>
+		<td>
+			<select name="q_stock_field" id="q_stock_field">
+				<option value="stock_qty">재고수량</option>
+				<option value="noti_qty">통보수량</option>
+			</select>
+			<label for="fr_stock" class="sound_only">재고수량 시작</label>
+			<input type="text" name="fr_stock" value="" id="fr_stock" class="frm_input" size="6"> 개 이상 ~
+			<label for="to_stock" class="sound_only">재고수량 끝</label>
+			<input type="text" name="to_stock" value="" id="to_stock" class="frm_input" size="6"> 개 이하
+		</td>
+		<th scope="row">상품가격</th>
+		<td>
+			<select name="q_price_field" id="q_price_field">
+				<option value="goods_price">판매가격</option>
+				<option value="supply_price">공급가격</option>
+				<option value="normal_price">시중가격</option>
+				<option value="gpoint">포인트</option>
+			</select>
+			<label for="fr_price" class="sound_only">상품가격 시작</label>
+			<input type="text" name="fr_price" value="" id="fr_price" class="frm_input" size="6"> 원 이상 ~
+			<label for="to_price" class="sound_only">상품가격 끝</label>
+			<input type="text" name="to_price" value="" id="to_price" class="frm_input" size="6"> 원 이하
+		</td>
+	</tr>
+	<tr>
+		<th scope="row">판매여부</th>
+		<td>
+			<label><input type="radio" name="q_isopen" value="" checked="checked"> 전체</label>
+			<label><input type="radio" name="q_isopen" value="1"> 진열</label>
+			<label><input type="radio" name="q_isopen" value="2"> 품절</label>
+			<label><input type="radio" name="q_isopen" value="3"> 단종</label>
+			<label><input type="radio" name="q_isopen" value="4"> 중지</label>
+		</td>
+		<th scope="row">필수옵션</th>
+		<td>
+			<label><input type="radio" name="q_option" value="" checked="checked"> 전체</label>
+			<label><input type="radio" name="q_option" value="1"> 사용</label>
+			<label><input type="radio" name="q_option" value="0"> 미사용</label>
+		</td>
+	</tr>
+	<tr>
+		<th scope="row">과세유형</th>
+		<td>
+			<label><input type="radio" name="q_notax" value="" checked="checked"> 전체</label>
+			<label><input type="radio" name="q_notax" value="1"> 과세</label>
+			<label><input type="radio" name="q_notax" value="0"> 비과세</label>
+		</td>
+		<th scope="row">추가옵션</th>
+		<td>
+			<label><input type="radio" name="q_supply" value="" checked="checked"> 전체</label>
+			<label><input type="radio" name="q_supply" value="1"> 사용</label>
+			<label><input type="radio" name="q_supply" value="0"> 미사용</label>
+		</td>
+	</tr>
+	</tbody>
+	</table>
+</div>
+<div class="btn_confirm">
+	<input type="submit" value="검색" class="btn_medium">
+	<input type="button" value="초기화" id="frmRest" class="btn_medium grey">
+</div>
+</form>
+
+<form name="fgoodslist" id="fgoodslist" method="post" action="./goods/goods_list_update.php" onsubmit="return fgoodslist_submit(this);">
+<input type="hidden" name="q1" value="code=list">
+<input type="hidden" name="page" value="1">
+
+<div class="local_ov mart30">
+	전체 : <b class="fc_red">13</b> 건 조회
+	<span class="ov_a">
+		<select id="page_rows" onchange="location='/admin/goods.php?code=list&amp;page=1&amp;page_rows='+this.value;">
+			<option value="30" selected="selected">30줄 정렬</option>
+			<option value="50">50줄 정렬</option>
+			<option value="100">100줄 정렬</option>
+			<option value="150">150줄 정렬</option>
+		</select>
+	</span>
+</div>
+<div class="local_frm01">
+	<input type="submit" name="act_button" value="선택삭제" class="btn_lsmall bx-white" onclick="document.pressed=this.value">
+<input type="submit" name="act_button" value="선택순위수정" class="btn_lsmall bx-white" onclick="document.pressed=this.value">
+<input type="submit" name="act_button" value="선택상품복사" class="btn_lsmall bx-white" onclick="document.pressed=this.value">
+<a href="./goods/goods_list_excel.php?code=list" class="btn_lsmall bx-white"><i class="fa fa-file-excel-o"></i> 엑셀저장</a>
+<a href="./goods.php?code=form" class="fr btn_lsmall red"><i class="ionicons ion-android-add"></i> 상품등록</a></div>
+
+<div class="tbl_head02">
+	<table id="sodr_list" class="tablef">
+	<colgroup>
+		<col class="w50">
+		<col class="w50">
+		<col class="w60">
+		<col class="w120">
+		<col>
+		<col>
+		<col class="w80">
+		<col class="w80">
+		<col class="w90">
+		<col class="w90">
+		<col class="w90">
+		<col class="w90">
+		<col class="w60">
+		<col class="w60">
+	</colgroup>
+	<thead>
+	<tr>
+		<th scope="col" rowspan="2"><input type="checkbox" name="chkall" value="1" onclick="check_all(this.form);"></th>
+		<th scope="col" rowspan="2">번호</th>
+		<th scope="col" rowspan="2">이미지</th>
+		<th scope="col"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=gcode&amp;orderby=asc">상품코드</a></th>
+		<th scope="col" colspan="2"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=gname&amp;orderby=asc">상품명</a></th>
+		<th scope="col"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=reg_time&amp;orderby=asc">최초등록일</a></th>
+		<th scope="col"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=isopen&amp;orderby=asc">진열</a></th>
+		<th scope="col" colspan="4" class="th_bg">가격정보</th>
+		<th scope="col" rowspan="2"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=rank&amp;orderby=asc">순위</a></th>
+		<th scope="col" rowspan="2">관리</th>
+	</tr>
+	<tr class="rows">
+		<th scope="col"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=mb_id&amp;orderby=asc">업체코드</a></th>
+		<th scope="col">공급사명</th>
+		<th scope="col">카테고리</th>
+		<th scope="col"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=update_time&amp;orderby=asc">최근수정일</a></th>
+		<th scope="col"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=stock_qty&amp;orderby=asc">재고</a></th>
+		<th scope="col" class="th_bg"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=normal_price&amp;orderby=asc">시중가</a></th>
+		<th scope="col" class="th_bg"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=supply_price&amp;orderby=asc">공급가</a></th>
+		<th scope="col" class="th_bg"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=goods_price&amp;orderby=asc">판매가</a></th>
+		<th scope="col" class="th_bg"><a href="/admin/goods.php?code=list&amp;page=&amp;filed=gpoint&amp;orderby=asc">포인트</a></th>
+	</tr>
+	</thead>
+	<tbody>
+		<tr class="list0">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[0]" value="13">
+			<input type="checkbox" name="chk[]" value="0">
+		</td>
+		<td rowspan="2">13</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=13" target="_blank"><img src="http://demofran.com/data/goods/1735175576/thumb-L1HcL19cWvrb9W1DvdDN46aaTm9BTh_40x40.jpg" width="40" height="40"></a></td>
+		<td>1735175576</td>
+		<td colspan="2" class="tal">테스트 상품3</td>
+		<td>24-12-26</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[0]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=13&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list0 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">가전/디지털/컴퓨터 &gt; 노트북/PC</span></td>
+		<td class="fc_00f">24-12-26</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list1">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[1]" value="12">
+			<input type="checkbox" name="chk[]" value="1">
+		</td>
+		<td rowspan="2">12</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=12" target="_blank"><img src="http://demofran.com/data/goods/1726045860/thumb-12_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045860</td>
+		<td colspan="2" class="tal">테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">684,000</td>
+		<td rowspan="2" class="tar">492,480</td>
+		<td rowspan="2" class="tar">615,600</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[1]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=12&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list1 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span> 외 1건</td>
+		<td class="fc_00f">24-10-08</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list0">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[2]" value="11">
+			<input type="checkbox" name="chk[]" value="2">
+		</td>
+		<td rowspan="2">11</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=11" target="_blank"><img src="http://demofran.com/data/goods/1726045859/thumb-11_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045859</td>
+		<td colspan="2" class="tal">테스트 상품 스몰 체리 롱 슬리브 티셔츠</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">140,000</td>
+		<td rowspan="2" class="tar">71,200</td>
+		<td rowspan="2" class="tar">89,000</td>
+		<td rowspan="2" class="tar">4,450</td>
+		<td rowspan="2"><input type="text" name="rank[2]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=11&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list0 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-12-04</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list1">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[3]" value="10">
+			<input type="checkbox" name="chk[]" value="3">
+		</td>
+		<td rowspan="2">10</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=10" target="_blank"><img src="http://demofran.com/data/goods/1726045858/thumb-10_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045858</td>
+		<td colspan="2" class="tal">테스트 플랫 카라 골지 니트 (GBSKN045P)</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">70,000</td>
+		<td rowspan="2" class="tar">28,000</td>
+		<td rowspan="2" class="tar">35,000</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[3]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=10&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list1 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-12-04</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list0">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[4]" value="9">
+			<input type="checkbox" name="chk[]" value="4">
+		</td>
+		<td rowspan="2">9</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=9" target="_blank"><img src="http://demofran.com/data/goods/1726045857/thumb-9_4_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045857</td>
+		<td colspan="2" class="tal">테스트 플랫 카라 골지 니트 (GBSKN045P)</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">70,000</td>
+		<td rowspan="2" class="tar">28,000</td>
+		<td rowspan="2" class="tar">35,000</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[4]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=9&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list0 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list1">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[5]" value="8">
+			<input type="checkbox" name="chk[]" value="5">
+		</td>
+		<td rowspan="2">8</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=8" target="_blank"><img src="http://demofran.com/data/goods/1726045856/thumb-8_5_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045856</td>
+		<td colspan="2" class="tal">테스트 상품 스몰 체리 롱 슬리브 티셔츠</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">140,000</td>
+		<td rowspan="2" class="tar">71,200</td>
+		<td rowspan="2" class="tar">89,000</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[5]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=8&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list1 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list0">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[6]" value="7">
+			<input type="checkbox" name="chk[]" value="6">
+		</td>
+		<td rowspan="2">7</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=7" target="_blank"><img src="http://demofran.com/data/goods/1726045855/thumb-7_6_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045855</td>
+		<td colspan="2" class="tal">테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">684,000</td>
+		<td rowspan="2" class="tar">492,480</td>
+		<td rowspan="2" class="tar">615,600</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[6]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=7&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list0 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span> 외 1건</td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list1">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[7]" value="6">
+			<input type="checkbox" name="chk[]" value="7">
+		</td>
+		<td rowspan="2">6</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=6" target="_blank"><img src="http://demofran.com/data/goods/1726045851/thumb-6_Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045851</td>
+		<td colspan="2" class="tal">테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">684,000</td>
+		<td rowspan="2" class="tar">492,480</td>
+		<td rowspan="2" class="tar">615,600</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[7]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=6&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list1 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span> 외 1건</td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list0">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[8]" value="5">
+			<input type="checkbox" name="chk[]" value="8">
+		</td>
+		<td rowspan="2">5</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=5" target="_blank"><img src="http://demofran.com/data/goods/1726045850/thumb-5_SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045850</td>
+		<td colspan="2" class="tal">테스트 상품 스몰 체리 롱 슬리브 티셔츠</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">140,000</td>
+		<td rowspan="2" class="tar">71,200</td>
+		<td rowspan="2" class="tar">89,000</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[8]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=5&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list0 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list1">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[9]" value="4">
+			<input type="checkbox" name="chk[]" value="9">
+		</td>
+		<td rowspan="2">4</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=4" target="_blank"><img src="http://demofran.com/data/goods/1726045849/thumb-4_37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045849</td>
+		<td colspan="2" class="tal">테스트 플랫 카라 골지 니트 (GBSKN045P)</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">70,000</td>
+		<td rowspan="2" class="tar">28,000</td>
+		<td rowspan="2" class="tar">35,000</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[9]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=4&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list1 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list0">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[10]" value="3">
+			<input type="checkbox" name="chk[]" value="10">
+		</td>
+		<td rowspan="2">3</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=3" target="_blank"><img src="http://demofran.com/data/goods/1726045737/thumb-37tXzNudBWjLx9cZWEFbE3R5PSbZUm_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045737</td>
+		<td colspan="2" class="tal">테스트 플랫 카라 골지 니트 (GBSKN045P)</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">70,000</td>
+		<td rowspan="2" class="tar">28,000</td>
+		<td rowspan="2" class="tar">35,000</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[10]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=3&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list0 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list1">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[11]" value="2">
+			<input type="checkbox" name="chk[]" value="11">
+		</td>
+		<td rowspan="2">2</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=2" target="_blank"><img src="http://demofran.com/data/goods/1726045193/thumb-SRBXGgqj9P8AftNpfQyHedUUk4KzAf_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726045193</td>
+		<td colspan="2" class="tal">테스트 상품 스몰 체리 롱 슬리브 티셔츠</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">140,000</td>
+		<td rowspan="2" class="tar">71,200</td>
+		<td rowspan="2" class="tar">89,000</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[11]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=2&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list1 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span></td>
+		<td class="fc_00f">24-12-04</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		<tr class="list0">
+		<td rowspan="2">
+			<input type="hidden" name="gs_id[12]" value="1">
+			<input type="checkbox" name="chk[]" value="12">
+		</td>
+		<td rowspan="2">1</td>
+		<td rowspan="2"><a href="http://demofran.com/shop/view.php?index_no=1" target="_blank"><img src="http://demofran.com/data/goods/1726043335/thumb-Mldks366mBjnWJd2fh4qlnX491lr3K_40x40.jpg" width="40" height="40"></a></td>
+		<td>1726043335</td>
+		<td colspan="2" class="tal">테스트 상품 - 플라워 프린팅 플라운스 원피스 F7093  287</td>
+		<td>24-09-11</td>
+		<td>진열</td>
+		<td rowspan="2" class="tar">684,000</td>
+		<td rowspan="2" class="tar">492,480</td>
+		<td rowspan="2" class="tar">615,600</td>
+		<td rowspan="2" class="tar">0</td>
+		<td rowspan="2"><input type="text" name="rank[12]" value="0" class="frm_input"></td>
+		<td rowspan="2"><a href="./goods.php?code=form&amp;w=u&amp;gs_id=1&amp;page=1&amp;bak=list" class="btn_small">수정</a></td>
+	</tr>
+	<tr class="list0 rows">
+		<td class="fc_00f">admin</td>
+		<td class="tal txt_succeed">샘플샵</td>
+		<td class="tal txt_succeed"><span class="fsitem">패션의류/잡화/뷰티</span> 외 1건</td>
+		<td class="fc_00f">24-09-11</td>
+		<td><span class="txt_false">무제한</span></td>
+	</tr>
+		</tbody>
+	</table>
+</div>
+<div class="local_frm02">
+	<input type="submit" name="act_button" value="선택삭제" class="btn_lsmall bx-white" onclick="document.pressed=this.value">
+<input type="submit" name="act_button" value="선택순위수정" class="btn_lsmall bx-white" onclick="document.pressed=this.value">
+<input type="submit" name="act_button" value="선택상품복사" class="btn_lsmall bx-white" onclick="document.pressed=this.value">
+<a href="./goods/goods_list_excel.php?code=list" class="btn_lsmall bx-white"><i class="fa fa-file-excel-o"></i> 엑셀저장</a>
+<a href="./goods.php?code=form" class="fr btn_lsmall red"><i class="ionicons ion-android-add"></i> 상품등록</a></div>
+</form>
+
+
+
+</div>
+
+</div>
+</div>
+<div id="ft">
+	<p>Copyright © 행복을 주는 쇼핑몰!. All rights reserved.</p>
+</div>
+
+
+<div id="ajax-loading"><img src="http://demofran.com/img/ajax-loader.gif"></div>
+<div id="anc_header"><a href="#anc_hd"><span></span>TOP</a></div>
+
+
+
+
+
+
+<div id="ui-datepicker-div" class="ui-datepicker ui-widget ui-widget-content ui-helper-clearfix ui-corner-all"></div></body></html>
