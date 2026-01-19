@@ -11,13 +11,6 @@ use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 
-use crate::openai_types::{
-    ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-    ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestAssistantMessage
-};
-
 // Helper to chunk text with overlap, strictly respecting newlines and char boundaries for Pug
 fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     if text.len() <= chunk_size {
@@ -333,12 +326,27 @@ async fn process_task(
     // Instead of truncating, we ingest the whole light_pug structure
     let classify_chunks = chunk_text(&light_pug, 4000, 500);
     let classify_chunks_len = classify_chunks.len();
+
+    let mut model_guard = model_mutex.lock().await;
+    if model_guard.is_none() {
+        let _ = app_handle.emit("extraction-progress", json!({ 
+           "category": "Loading Model", "summary": "Loading Model for Analysis...", "spinner": "⠋"
+        }));
+        match LogisModel::new(None).await {
+            Ok(m) => *model_guard = Some(m),
+            Err(e) => {
+                let _ = app_handle.emit("extraction-progress", json!({ 
+                   "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
+                }));
+                return Ok(());
+            }
+        }
+    }
     
     // Ingest chunks for Classification
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         for (i, chunk) in classify_chunks.iter().enumerate() {
-            let is_last = i == classify_chunks_len - 1;
             
             // For the last chunk, we don't just "ingest", we ask the question (Step 1)
             // But actually, it's cleaner to ingest ALL, then ask.
@@ -374,7 +382,7 @@ Just say "ACKNOWLEDGED"."#,
                     20, // Minimal tokens
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
-                ) => res?,
+                ) => { res?; },
                 _ = async {
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
