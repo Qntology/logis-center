@@ -347,7 +347,7 @@ async fn process_task(
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         for (i, chunk) in classify_chunks.iter().enumerate() {
-            let is_last = i == classify_chunks_len - 1;
+            let _is_last = i == classify_chunks_len - 1;
             
             // For the last chunk, we don't just "ingest", we ask the question (Step 1)
             // But actually, it's cleaner to ingest ALL, then ask.
