@@ -859,7 +859,7 @@ Just say "ACKNOWLEDGED"."#,
                 }
             }
 
-            let text_to_embed = target_data.to_string();
+            let text_to_embed = json_to_natural_language(&target_data);
             drop(store_guard); 
             
             let mut model_guard = model_mutex.lock().await;
@@ -893,7 +893,7 @@ Just say "ACKNOWLEDGED"."#,
         let store_guard = store_mutex.lock().await;
         if let Some(_db) = store_guard.as_ref() {
                 let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
-                let text_to_embed = extracted_data.to_string();
+                let text_to_embed = json_to_natural_language(&extracted_data);
                 drop(store_guard);
 
                 let mut model_guard = model_mutex.lock().await;
@@ -962,4 +962,43 @@ pub fn parse_json_from_llm(text: &str) -> Value {
         }
     }
     json!({})
+}
+
+/// Converts a JSON Value into a human-readable natural language string for better embedding.
+pub fn json_to_natural_language(value: &Value) -> String {
+    let mut output = String::new();
+    
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                // Skip internal metadata or empty fields
+                if k == "type" || k == "id" || k == "index" || v.is_null() { continue; }
+                
+                let val_str = match v {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::Array(_) | Value::Object(_) => json_to_natural_language(v),
+                    _ => String::new(),
+                };
+                
+                if !val_str.trim().is_empty() {
+                    output.push_str(&format!("{}: {}. ", k.replace("_", " "), val_str));
+                }
+            }
+        },
+        Value::Array(arr) => {
+            for item in arr {
+                let item_str = json_to_natural_language(item);
+                if !item_str.trim().is_empty() {
+                    output.push_str(&format!("{}. ", item_str.trim_end_matches(". ")));
+                }
+            }
+        },
+        _ => {
+            output.push_str(&value.to_string());
+        }
+    }
+    
+    output.trim().to_string()
 }
