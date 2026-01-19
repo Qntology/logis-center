@@ -202,9 +202,6 @@ impl Qwen3VLGenerateModel {
                                              seq_len = remaining;
                                              println!("[KV-DISK] Processing only {} new tokens.", seq_len);
                                          } else {
-                                             // No new tokens (unlikely in chat, but possible). 
-                                             // Provide dummy input or handle gracefully? 
-                                             // Forward expects input. Let's assume there is always new input in this flow.
                                              println!("[KV-DISK] Warning: No new tokens to process. Re-processing last token.");
                                              input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
                                              seqlen_offset = seq_len - 1;
@@ -219,12 +216,61 @@ impl Qwen3VLGenerateModel {
                      }
                      
                      if !loaded {
-                         // Ensure cache is clear if we are not loading
                          m.clear_kv_cache();
                      }
                  },
                  _ => {} 
              }
+        }
+        
+        // [CHUNKED PREFILL] - Line Aware (512 tokens)
+        if seq_len > 512 {
+            println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
+            
+            // Get newline token ID for this model (usually 198 or similar for Qwen)
+            let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n", &self.device) {
+                ids.flatten_all()?.to_vec1::<u32>()?.get(0).cloned().unwrap_or(198)
+            } else { 198 };
+
+            let mut current_pos = 0;
+            let input_vec = full_input_ids_vec.clone();
+
+            while current_pos < seq_len - 1 {
+                let remaining = seq_len - current_pos;
+                if remaining <= 512 { break; } // Process the rest in the final generation step or last chunk
+
+                // Find the best split point within 512 tokens
+                let mut chunk_size = 512;
+                let lookback_range = 128; // Look back up to 128 tokens to find a newline
+                
+                let search_end = current_pos + 512;
+                let search_start = search_end.saturating_sub(lookback_range);
+                
+                for i in (search_start..search_end).rev() {
+                    if i < input_vec.len() && input_vec[i] == newline_token_id {
+                        chunk_size = i - current_pos + 1; // Include the newline
+                        break;
+                    }
+                }
+
+                let chunk_ids = input_ids.narrow(1, current_pos, chunk_size)?;
+                let start_pos = (seqlen_offset + current_pos) as u32;
+                let chunk_pos = Tensor::arange(start_pos, start_pos + chunk_size as u32, &self.device)?;
+                
+                let _logits = match &mut self.qwen3_vl {
+                    ModelVariant::Standard(m) => m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset + current_pos)?,
+                    ModelVariant::Quantized(m) => m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset + current_pos)?,
+                };
+                
+                current_pos += chunk_size;
+                print!(">"); use std::io::Write; std::io::stdout().flush().ok();
+            }
+            
+            // Sync current position back to generation logic
+            seqlen_offset += current_pos;
+            input_ids = input_ids.narrow(1, current_pos, seq_len - current_pos)?;
+            seq_len = seq_len - current_pos;
+            println!("\n[PREFILL] Ingested up to offset {}.", seqlen_offset);
         }
         
         // Take ownership of large tensors

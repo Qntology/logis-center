@@ -434,17 +434,13 @@ impl QuantizedQwen3VLTextModel {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
                          
-                         // DYNAMIC RESOURCE ALLOCATION:
-                         // 1. Minimum OS/Display Reserve: 5% of Total VRAM
-                         // 2. Variable Safety Margin: 10% of Current Free VRAM
-                         // 3. User Guaranteed KV Reserve
-                         let total_vram = mem.total;
-                         let os_reserve = (total_vram as f64 * 0.05) as u64; // 5% of total
-                         let fluid_margin = (mem.free as f64 * 0.10) as u64; // 10% of current free
-                         safety_floor = os_reserve.max(fluid_margin) + kv_reserve;
+                         // [ULTRA-DYNAMIC] Fixed OS Reserve instead of Percentage
+                         // We only need ~250MB for Windows/Display overhead in most cases.
+                         let os_reserve = 250_000_000; 
+                         safety_floor = os_reserve + kv_reserve;
 
-                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Dynamic Floor: {:.2} MB. Layer Cost: {:.2} MB", 
-                            total_vram as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
+                         println!("[VRAM-BUDGET] Live Free: {:.2} GB. Safety Buffer (OS+KV): {:.2} MB. Layer Cost: {:.2} MB", 
+                            mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
                      }
                  }
              }
@@ -452,18 +448,15 @@ impl QuantizedQwen3VLTextModel {
 
         let mut layers = vec![];
         for layer_idx in 0..config.num_hidden_layers {
-            // Organic Check
+            // Organic Check based on actual remaining bytes
             if current_device.is_cuda() && is_vram_checked {
-                 // Check if we have budget: Layer Cost + Safety Floor
-                 // We simulate the depletion of VRAM as we load layers.
+                 // Check if we have absolute space: Layer Cost + Safety Floor
                  if simulated_free_vram > (cost_per_layer + safety_floor) {
-                     // Allocating to GPU
                      simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                  } else {
-                     // Budget exhausted
-                     if current_device.is_cuda() { // Only print once when switching
-                        println!("[OFFLOAD] Budget Exhausted (Est. Free: {:.2} MB < Floor {:.2} MB + Layer {:.2} MB). Switching Layer {} and subsequent to CPU.", 
-                            simulated_free_vram as f64/1e6, safety_floor as f64/1e6, cost_per_layer as f64/1e6, layer_idx);
+                     if current_device.is_cuda() {
+                        println!("[OFFLOAD] VRAM Full. Layer {} and subsequent moved to CPU. (Remaining: {:.2} MB)", 
+                            layer_idx, simulated_free_vram as f64/1e6);
                      }
                      current_device = Device::Cpu;
                  }
@@ -706,18 +699,12 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         // [AGGRESSIVE] For Head, use minimal margins to avoid Split-Brain performance penalty
-                         let min_absolute_margin = 100_000_000; // 100MB
-                         let fluid_margin = (mem.free as f64 * 0.01) as u64; // 1%
-                         let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
+                         // [VERY AGGRESSIVE] Head is small but critical. 50MB margin is enough.
+                         let absolute_min_margin = 50_000_000;
                          
-                         if mem.free < (head_weight_size + safety_floor) {
-                             println!("[OFFLOAD] Head Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Head to CPU.", 
-                                mem.free as f64/1e9, head_weight_size as f64/1e9, safety_floor as f64/1e9);
+                         if mem.free < (head_weight_size + absolute_min_margin) {
+                             println!("[OFFLOAD] Head Budget Exhausted. Switching to CPU.");
                              head_device = Device::Cpu;
-                         } else {
-                             println!("[VRAM-BUDGET] Fitting Head on GPU. Free: {:.2} GB > Cost {:.2} GB + Safety {:.2} GB.", 
-                                mem.free as f64/1e9, head_weight_size as f64/1e9, safety_floor as f64/1e9);
                          }
                      }
                  }

@@ -162,8 +162,8 @@ impl LogisModel {
         let max_tokens_limit = if !force_cpu && detected_vram > 0 {
              let vram_mb = detected_vram as f64 / 1_000_000.0;
              
-             // 1. User Safety Margin: Reserve 5% of currently free VRAM (Optimized for 4GB Cards)
-             let fluid_safety_margin = vram_mb * 0.05;
+             // 1. User Safety Margin: Fixed 250MB for OS/Fluctuation
+             let fixed_safety_margin = 250.0; 
              
              // 2. Real Model Weight Calculation (File System Scan)
              let mut real_model_weights = 0.0;
@@ -176,37 +176,27 @@ impl LogisModel {
                      }
                  }
              }
-             if real_model_weights == 0.0 { real_model_weights = 2200.0; } // Fallback if scan fails
+             if real_model_weights == 0.0 { real_model_weights = 2200.0; } 
 
-             // 3. Estimated Runtime Overhead (CUDA Context + scratch buffers) ~ 250MB (Lowered from 500)
-             let runtime_overhead = 250.0;
+             // 3. Estimated Runtime Overhead
+             let runtime_overhead = 150.0;
 
-             let usable_fluid_vram = vram_mb - fluid_safety_margin - real_model_weights - runtime_overhead;
+             let usable_fluid_vram = vram_mb - fixed_safety_margin - real_model_weights - runtime_overhead;
 
-             println!("[VRAM-DEBUG] Free: {:.2} MB | Weights: {:.2} MB | Margin(5%): {:.2} MB | Overhead: {:.2} MB", 
-                vram_mb, real_model_weights, fluid_safety_margin, runtime_overhead);
-             println!("[VRAM-DEBUG] Usable for KV Cache: {:.2} MB", usable_fluid_vram);
+             println!("[VRAM-DEBUG] Live Free: {:.2} MB | Weights: {:.2} MB | OS Reserve: {:.2} MB", 
+                vram_mb, real_model_weights, fixed_safety_margin);
+             println!("[VRAM-DEBUG] Dynamic Space for KV Cache: {:.2} MB", usable_fluid_vram);
 
-             // 4. Calculate Context Limit
-             // KV Cache Cost per token (BF16) approx: 180KB
              let mb_per_1k_tokens = 180.0; 
 
              let limit = if usable_fluid_vram <= 0.0 {
-                 println!("⚠️ [CONFIG] VRAM very tight. Using Layer-wise Offloading to fit model.");
-                 2048 // Trust Offloading, use decent context
+                 2048 // Fallback to safe minimum
              } else {
                  let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
-                 
-                 // [Optimization] For < 6GB VRAM, cap context at 4096. 
-                 // Layer offloading handles the weight overflow.
-                 if detected_vram < 6_000_000_000 {
-                     capacity.clamp(2048.0, 4096.0) as u32
-                 } else {
-                     capacity.clamp(2048.0, 32768.0) as u32
-                 }
+                 capacity.clamp(2048.0, 32768.0) as u32
              };
              
-             println!("[CONFIG] Final Context Limit: {}", limit);
+             println!("[CONFIG] Fluid Context Limit: {}", limit);
              limit
         } else {
              // DYNAMIC RAM ALLOCATION (CPU Mode)
