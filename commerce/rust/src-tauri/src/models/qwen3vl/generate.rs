@@ -79,10 +79,8 @@ impl Qwen3VLGenerateModel {
                 
                 // Calculate KV Cache Reservation
                 let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
-                // DYNAMIC CALCULATION: Reserve 40% of total context for VRAM, max 3072 tokens.
-                // This ensures enough "Active Window" stays on GPU while letting 
-                // the rest of the history be managed by the Offloading system.
-                let kv_reserve = std::cmp::min(max_tokens * 4 / 10, 3072) * 180_000;
+                // Heuristic: ~180KB per token for Qwen2-VL-2B (BF16)
+                let kv_reserve = max_tokens * 180_000;
                 
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &device, dtype, kv_reserve)?;
                 println!("[DEBUG] QuantizedQwen3VLModel initialized.");
@@ -98,7 +96,7 @@ impl Qwen3VLGenerateModel {
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
                  let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
-                 let kv_reserve = std::cmp::min(max_tokens, 1500) * 180_000;
+                 let kv_reserve = max_tokens * 180_000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &device, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
@@ -171,103 +169,180 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut seqlen_offset = 0;
-        let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
 
         // KV Cache Disk Loading (Prefix Caching)
-        let cache_path = session_id.as_ref().map(|sid| {
-            let p = std::path::Path::new("tmp_kv").join(sid);
-            if !p.exists() { let _ = fs::create_dir_all(&p); }
-            p
-        });
+        let cache_path = if let Some(sid) = &session_id {
+             let p = std::path::Path::new("tmp_kv").join(sid);
+             if !p.exists() { let _ = fs::create_dir_all(&p); }
+             Some(p)
+        } else {
+             None
+        };
 
-        if let (Some(path), ModelVariant::Quantized(m)) = (&cache_path, &mut self.qwen3_vl) {
-            let token_path = path.join("tokens.json");
-            if token_path.exists() {
-                if let Ok(file) = fs::File::open(&token_path) {
-                    let reader = std::io::BufReader::new(file);
-                    if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                        println!("[KV-DISK] Append Mode: Loading {} history tokens...", cached_tokens.len());
-                        if m.load_kv_cache(path, &self.device, None).is_ok() {
-                            seqlen_offset = cached_tokens.len();
-                            cache_position = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.device)?;
-                        }
-                    }
-                }
-            } else {
-                m.clear_kv_cache();
-            }
+        if let Some(path) = &cache_path {
+             match &mut self.qwen3_vl {
+                 ModelVariant::Quantized(m) => {
+                     let token_path = path.join("tokens.json");
+                     let mut loaded = false;
+                     if token_path.exists() {
+                         if let Ok(file) = fs::File::open(&token_path) {
+                             let reader = std::io::BufReader::new(file);
+                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 // Check strict prefix match
+                                 if !cached_tokens.is_empty() && full_input_ids_vec.starts_with(&cached_tokens) {
+                                     println!("[KV-DISK] Cache Hit! Loading {} tokens from disk...", cached_tokens.len());
+                                     if m.load_kv_cache(path, &self.device).is_ok() {
+                                         seqlen_offset = cached_tokens.len();
+                                         loaded = true;
+                                         
+                                         // Slice input_ids to process only NEW tokens
+                                         let remaining = seq_len.saturating_sub(seqlen_offset);
+                                         if remaining > 0 {
+                                             input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
+                                             seq_len = remaining;
+                                             println!("[KV-DISK] Processing only {} new tokens.", seq_len);
+                                         } else {
+                                             // No new tokens (unlikely in chat, but possible). 
+                                             // Provide dummy input or handle gracefully? 
+                                             // Forward expects input. Let's assume there is always new input in this flow.
+                                             println!("[KV-DISK] Warning: No new tokens to process. Re-processing last token.");
+                                             input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
+                                             seqlen_offset = seq_len - 1;
+                                             seq_len = 1;
+                                         }
+                                     }
+                                 } else {
+                                     println!("[KV-DISK] Cache Mismatch. Starting fresh.");
+                                 }
+                             }
+                         }
+                     }
+                     
+                     if !loaded {
+                         // Ensure cache is clear if we are not loading
+                         m.clear_kv_cache();
+                     }
+                 },
+                 _ => {} 
+             }
         }
-        // Prepare Tensors
+        
+        // Take ownership of large tensors
         let mut pixel_values = input.pixel_values.take();
-        let image_grid_thw = input.image_grid_thw.take();
+        let image_grid_thw = input.image_grid_thw.take(); // Clone needed if reused? No, standard Qwen3VLModel usually expects Option<&Tensor> or Tensor.
+        // Wait, forward methods expect Option<&Tensor>. We need to own the Tensor and pass reference.
+        // But to drop it, we must own it in a mutable Option.
+        
+        // We'll keep image_grid_thw as Option<Tensor> to pass reference, but pixel_values is the big one.
+        // Let's redefine image_grid_thw variable.
+        let image_grid_thw_tensor = image_grid_thw; // Move ownership
+        
         let mut pixel_values_video = input.pixel_values_video.take();
-        let video_grid_thw = input.video_grid_thw.take();
+        let video_grid_thw_tensor = input.video_grid_thw.take();
+        
+        let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
         
         let requested_tokens = mes.max_tokens.unwrap_or(1024);
         let mut sample_len = requested_tokens;
         
         if let Some(limit) = self.hard_token_limit {
-            let current_usage = seq_len + seqlen_offset;
+            let current_usage = seq_len;
             if current_usage >= limit {
-                 println!("[WARN] Total Context {} exceeds limit {}. Truncating generation.", current_usage, limit);
+                 println!("[WARN] Input length {} exceeds hard limit {}. Truncating generation.", current_usage, limit);
                  sample_len = 16; 
             } else {
-                 let available = (limit - current_usage) as u32;
-                 sample_len = std::cmp::min(sample_len, available);
+                 let available = limit - current_usage;
+                 if (sample_len as usize) > available {
+                      println!("[CONFIG] Clamping generation: Requested {} -> Available {} (Total Limit: {})", sample_len, available, limit);
+                      sample_len = available as u32;
+                 }
             }
         }
 
-        // --- Generation Loop ---
+        // Wrap generation in a closure/block to ensure cleanup happens
         let generation_result: Result<Vec<u32>> = (|| {
             let mut generate = Vec::new();
-            for _ in 0..sample_len {
+            for i in 0..sample_len {
+                // Check cancellation
                 if let Some(flag) = &cancel_flag {
-                    if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
+                    if flag.load(Ordering::Relaxed) {
+                        return Err(anyhow!("Generation cancelled"));
+                    }
                 }
                 
+                // Alive signal
                 use std::io::Write;
-                print!("."); std::io::stdout().flush().ok();
+                print!(".");
+                std::io::stdout().flush().ok();
 
                 let logits = match &mut self.qwen3_vl {
-                    ModelVariant::Standard(m) => m.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), pixel_values_video.as_ref(), video_grid_thw.as_ref(), Some(&cache_position), seqlen_offset)?,
-                    ModelVariant::Quantized(m) => m.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), pixel_values_video.as_ref(), video_grid_thw.as_ref(), Some(&cache_position), seqlen_offset)?,
+                    ModelVariant::Standard(m) => m.forward(
+                        &input_ids,
+                        pixel_values.as_ref(),
+                        image_grid_thw_tensor.as_ref(),
+                        pixel_values_video.as_ref(),
+                        video_grid_thw_tensor.as_ref(),
+                        Some(&cache_position),
+                        seqlen_offset,
+                    )?,
+                    ModelVariant::Quantized(m) => m.forward(
+                        &input_ids,
+                        pixel_values.as_ref(),
+                        image_grid_thw_tensor.as_ref(),
+                        pixel_values_video.as_ref(),
+                        video_grid_thw_tensor.as_ref(),
+                        Some(&cache_position),
+                        seqlen_offset,
+                    )?,
                 };
-                
                 let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
                 let next_token = logit_processor.sample(&logits)?;
                 generate.push(next_token);
-                
-                if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 { break; }
-                
+                if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                    break;
+                }
                 seqlen_offset += seq_len;
                 seq_len = 1;
                 input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
                 cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
                 
-                if pixel_values.is_some() { pixel_values = None; pixel_values_video = None; }
+                // CRITICAL: Drop pixel_values immediately after first iteration (prefill)
+                // This frees the massive vision tensor from GPU memory.
+                if pixel_values.is_some() {
+                    pixel_values = None;
+                    pixel_values_video = None;
+                }
             }
             Ok(generate)
         })();
 
         let generate = generation_result?;
 
-        // --- KV Cache Offloading & History Saving ---
+        // KV Cache Disk Offloading or Clearing
         if let Some(path) = &cache_path {
-             if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
-                 println!("[KV-DISK] Offloading KV cache to SSD...");
-                 let _ = m.offload_kv_cache(path);
+             match &mut self.qwen3_vl {
+                 ModelVariant::Quantized(m) => {
+                     println!("[KV-DISK] Saving KV cache to {:?}", path);
+                     if m.offload_kv_cache(path).is_ok() {
+                         // Save tokens.json
+                         let mut all_tokens = full_input_ids_vec;
+                         all_tokens.extend(&generate);
+                         
+                         // CRITICAL FIX: The KV cache contains states for inputs PROCESSED so far.
+                         // The loop ends after generating a token, but that token hasn't been fed back into forward() yet.
+                         // So the KV cache size is (input + generated) - 1.
+                         // We must sync tokens.json to match the actual KV cache size.
+                         if !all_tokens.is_empty() {
+                             all_tokens.pop(); 
+                         }
 
-                 let mut final_history = Vec::new();
-                 let token_path = path.join("tokens.json");
-                 if let Ok(file) = fs::File::open(&token_path) {
-                     let reader = std::io::BufReader::new(file);
-                     if let Ok(existing) = serde_json::from_reader::<_, Vec<u32>>(reader) { final_history = existing; }
-                 }
-                 final_history.extend(full_input_ids_vec.iter());
-                 final_history.extend(generate.iter());
-                 
-                 if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &final_history); }
-                 m.clear_kv_cache();
+                         let token_path = path.join("tokens.json");
+                         if let Ok(file) = fs::File::create(&token_path) {
+                             let _ = serde_json::to_writer(file, &all_tokens);
+                         }
+                     }
+                 },
+                 ModelVariant::Standard(m) => m.clear_kv_cache(),
              }
         } else {
             match &mut self.qwen3_vl {

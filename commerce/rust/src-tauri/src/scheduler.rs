@@ -11,6 +11,13 @@ use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 
+use crate::openai_types::{
+    ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestAssistantMessage
+};
+
 // Helper to chunk text with overlap, strictly respecting newlines and char boundaries for Pug
 fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     if text.len() <= chunk_size {
@@ -23,12 +30,14 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     while start < text.len() {
         let mut target_end = (start + chunk_size).min(text.len());
         
+        // Ensure target_end is a valid char boundary
         while !text.is_char_boundary(target_end) {
             target_end -= 1;
         }
 
         let mut end = target_end;
         
+        // Find the NEXT newline after target_end to include the current line fully
         if target_end < text.len() {
             if let Some(next_newline_offset) = text[target_end..].find('\n') {
                 end = target_end + next_newline_offset + 1;
@@ -37,6 +46,7 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
             }
         }
         
+        // Safety check for end boundary
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -47,28 +57,34 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
             break;
         }
         
+        // Calculate next start with overlap
         let mut next_start = end.saturating_sub(overlap);
         
+        // Ensure next_start is a valid char boundary
         while !text.is_char_boundary(next_start) {
             next_start -= 1;
         }
         
+        // Align next_start to the START of a line (find the first newline in the overlap zone)
         if next_start > start && next_start < end {
              if let Some(line_start) = text[next_start..end].find('\n') {
                  next_start = next_start + line_start + 1;
              }
         }
         
+        // Final safety for next_start
         while !text.is_char_boundary(next_start) {
-            next_start += 1;
+            next_start += 1; // Move forward to find valid char
         }
 
+        // Prevent infinite loops or zero progress
         if next_start >= end {
             next_start = end; 
         }
         
+        // Absolute safety check to ensure progress
         if next_start <= start {
-             next_start = start + 1; 
+             next_start = start + 1; // Force progress by at least 1 byte (might panic on utf8, but better than loop)
              while !text.is_char_boundary(next_start) && next_start < text.len() {
                  next_start += 1;
              }
@@ -79,13 +95,16 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
     chunks
 }
 
+// Deep merge for JSON objects
 fn merge_json_results(target: &mut Value, source: &Value) {
     if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
         for (k, v) in source_obj {
+            // If value is null or empty string/array, ignore
             if v.is_null() { continue; }
             if let Some(s) = v.as_str() { if s.is_empty() { continue; } }
             if let Some(a) = v.as_array() { if a.is_empty() { continue; } }
             
+            // If target doesn't have it or target is empty, overwrite
             let should_update = match target_obj.get(k) {
                 None => true,
                 Some(tv) => {
@@ -98,9 +117,11 @@ fn merge_json_results(target: &mut Value, source: &Value) {
             if should_update {
                 target_obj.insert(k.clone(), v.clone());
             } else if let Some(target_inner) = target_obj.get_mut(k) {
+                // If both are objects, recurse
                 if target_inner.is_object() && v.is_object() {
                     merge_json_results(target_inner, v);
                 }
+                // Lists? Simply append for now (might duplicate, but safe for search)
                 else if let (Some(ta), Some(sa)) = (target_inner.as_array_mut(), v.as_array()) {
                     ta.extend(sa.clone());
                 }
@@ -116,14 +137,6 @@ pub async fn start_background_worker(
     app_handle: tauri::AppHandle,
 ) {
     println!("[Scheduler] Background worker started.");
-    
-    // Clean up stale KV cache on startup
-    let tmp_kv = std::path::Path::new("tmp_kv");
-    if tmp_kv.exists() {
-        println!("[Scheduler] Cleaning up stale tmp_kv directory...");
-        let _ = std::fs::remove_dir_all(tmp_kv);
-    }
-    let _ = std::fs::create_dir_all(tmp_kv);
     
     tokio::spawn(async move {
         let mut delay_secs = 1;
@@ -178,7 +191,7 @@ pub async fn start_background_worker(
                              let _ = app_handle.emit("extraction-progress", json!({ 
                                 "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
-                             break; 
+                             break; // Stop processing pending tasks batch to prevent immediate model reload
                         } else {
                             println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, e);
                             let store_guard = store.lock().await;
@@ -199,7 +212,8 @@ async fn process_task(
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle
-) -> Result<()> {
+) -> Result<()>
+{
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -210,6 +224,7 @@ async fn process_task(
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     let language = "english"; 
 
+    // --- Image Extraction Logic ---
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
         
@@ -231,9 +246,8 @@ async fn process_task(
                  match LogisModel::new(None).await {
                      Ok(m) => *model_guard = Some(m),
                      Err(e) => {
-                         let err_msg = format!("Model Load Failed: {}", e);
                          let _ = app_handle.emit("extraction-progress", json!({ 
-                            "category": "Error", "summary": err_msg, "spinner": "❌"
+                            "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
                          }));
                          return Ok(());
                      }
@@ -246,18 +260,17 @@ async fn process_task(
                  let prompt_clone = prompt.clone();
                  let app_handle_clone = app_handle.clone();
                  
-                 let res: Result<String> = tokio::select!{
+                 tokio::select!{
                      res = model.chat_with_image_spinner(prompt_clone, Some(dynamic_image), &app_handle_clone, "extraction-progress", json!({ 
                         "category": "Vision Analysis", "summary": "Analyzing image content..."
-                    }), 1024, Some(cancellation_token.clone()), Some(task.id.clone())) => res,
+                    }), 1024, Some(cancellation_token.clone()), Some(task.id.clone())) => res?,
                      _ = async {
                          loop {
                              if cancellation_token.load(Ordering::Relaxed) { break; }
                              tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                          }
                      } => { return Err(anyhow::anyhow!("Task cancelled")); }
-                 };
-                 res?
+                 }
              } else {
                  "{}".to_string()
              };
@@ -307,7 +320,6 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let clean_html = parsing::pre_clean_html(&raw_html_content);
-    let _ = std::fs::write("debug_scheduler_input.txt", &clean_html); // DEBUG
     drop(raw_html_content); 
     
     let light_pug = {
@@ -317,71 +329,34 @@ async fn process_task(
     
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
-    let mut model_guard = model_mutex.lock().await;
-    if model_guard.is_none() {
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "category": "Loading Model", "summary": "Loading AI Model...", "spinner": "⠋"
-        }));
-        match LogisModel::new(None).await {
-            Ok(m) => *model_guard = Some(m),
-            Err(e) => {
-                let err_msg = format!("Model Init Error: {}", e);
-                println!("[Scheduler] {}", err_msg);
-                let _ = app_handle.emit("extraction-progress", json!({ 
-                    "category": "Error", "summary": err_msg, "spinner": "❌"
-                }));
-                return Err(anyhow::anyhow!("Model initialization failed"));
-            }
-        }
-    }
-    
-    if let Some(model) = model_guard.as_ref() {
-        if model.is_cpu() {
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Warning", 
-                "summary": "Low RAM. Running on CPU (Slow)...", 
-                "spinner": "⚠️"
-            }));
-        }
-    }
-
-    let classify_chunks = chunk_text(&light_pug, 1500, 0); // No overlap
+    // Chunking Logic for Classification
+    // Instead of truncating, we ingest the whole light_pug structure
+    let classify_chunks = chunk_text(&light_pug, 4000, 500);
     let classify_chunks_len = classify_chunks.len();
     
+    // Ingest chunks for Classification
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
-
         for (i, chunk) in classify_chunks.iter().enumerate() {
-            let _ = std::fs::write(format!("debug_scheduler_class_chunk_{}.txt", i), chunk); 
-
-            println!("[Classification-Loop] Ingesting structural part {}/{} to LLM (Session: {})", i + 1, classify_chunks_len, task.id);
+            let is_last = i == classify_chunks_len - 1;
             
-            // Append Mode: Send ONLY the new chunk.
-            let prompt = if i == 0 {
-                format!(
+            // For the last chunk, we don't just "ingest", we ask the question (Step 1)
+            // But actually, it's cleaner to ingest ALL, then ask.
+            // Let's ingest all first.
+            
+            let prompt = format!(
 r#"[CONTEXT]
 You are reading the structural skeleton (Pug/Jade) of a webpage to understand its type and layout.
-I will provide the content in parts. Read each part and memorize it.
+Part {}/{}.
 
-[PART 1]
+[INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Read and memorize. Do NOT generate JSON yet. Just say \"ACKNOWLEDGED\"."#,
-                    chunk
-                )
-            } else {
-                format!(
-r#"[PART {}]
-{}
-
-[INSTRUCTION]
-Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
-                    i + 1, chunk
-                )
-            };
-            
-            let _ = std::fs::write(format!("debug_scheduler_class_prompt_{}.txt", i), &prompt); 
+Read and memorize this structure. Do NOT generate JSON yet.
+Just say "ACKNOWLEDGED"."#,
+                i + 1, classify_chunks_len, chunk
+            );
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Classification Ingestion", 
@@ -389,53 +364,48 @@ Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
                 "spinner": "⠋"
             }));
 
-            let res: Result<String> = tokio::select!{
+            tokio::select!{
                 res = model.chat_with_spinner(
-                    "Read and memorize the following webpage structure parts. Just say ACKNOWLEDGED for each part.", 
+                    "You are a helpful assistant.", 
                     &prompt,
                     &app_handle_clone, 
                     "extraction-progress", 
                     json!({ "category": "Classification Ingestion" }), 
-                    20, 
+                    20, // Minimal tokens
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
-                ) => res,
+                ) => res?,
                 _ = async {
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
-                } => { 
-                    drop(model_guard);
-                    cleanup_task_resources(&task.id);
-                    return Err(anyhow::anyhow!("Task cancelled")); 
-                }
-            };
-            res?;
+                } => { return Err(anyhow::anyhow!("Task cancelled")); }
+            }
         }
     }
 
-    println!("[Classification-FINAL] All parts ingested. Requesting FINAL category decision.");
+    println!("[Scheduler] Checkpoint: Classification Start");
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋"
     }));
     
-    if cancellation_token.load(Ordering::Relaxed) { 
-        drop(model_guard);
-        cleanup_task_resources(&task.id);
-        return Err(anyhow::anyhow!("Task cancelled")); 
-    }
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut final_page_info = json!({});
     
+    // Step 1: Identify Type (Now context is fully loaded in task.id session)
     let page_type_res = if let Some(model) = model_guard.as_ref() {
         let system_text = parsing::page_type_prompt(language);
         let app_handle_clone = app_handle.clone();
+
+        // We send the prompt as a new User message. The context is already in KV cache.
+        // We don't need to re-send the input.
         let prompt = "Now that you have read the full structure, analyze it and identify the primary category.";
 
-        let res: Result<String> = tokio::select!{
+        tokio::select!{
             res = model.chat_with_spinner(
-                &system_text, 
+                &system_text, // Use system prompt instruction
                 prompt,
                 &app_handle_clone, 
                 "extraction-progress", 
@@ -443,19 +413,14 @@ Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
                 256, 
                 Some(cancellation_token.clone()), 
                 Some(task.id.clone())
-            ) => res,
+            ) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-            } => { 
-                drop(model_guard);
-                cleanup_task_resources(&task.id);
-                return Err(anyhow::anyhow!("Task cancelled")); 
-            }
-        };
-        res?
+            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+        }
     } else { "{}".to_string() };
     
     println!("[Scheduler] Checkpoint: Classification End");
@@ -468,21 +433,21 @@ Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
         return Ok(());
     }
 
-    // OPTIMIZATION: Clear cache after Classification.
-    println!("[Scheduler] Classification done (Type: {}). Clearing cache for fresh start on Extraction.", page_type);
-    cleanup_task_resources(&task.id);
-
     final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
+    // Step 2: Identify Selectors (Building on History)
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type), "spinner": "⠋"
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type, language);
+        let next_question = parsing::page_selectors_prompt(&page_type, language); // This returns the prompt string
         let app_handle_clone = app_handle.clone();
+
+        // page_selectors_prompt returns the full prompt text including TASK/SCHEMA.
+        // We send it as user message.
         
-        let res: Result<String> = tokio::select!{
+        tokio::select!{
             res = model.chat_with_spinner(
                 "You are a helpful assistant.", 
                 &next_question,
@@ -494,31 +459,26 @@ Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
                 256, 
                 Some(cancellation_token.clone()), 
                 Some(task.id.clone())
-            ) => res,
+            ) => res?,
             _ = async {
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-            } => { 
-                drop(model_guard);
-                cleanup_task_resources(&task.id);
-                return Err(anyhow::anyhow!("Task cancelled")); 
-            }
-        };
-        res?
+            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+        }
     } else { "{}".to_string() };
-    
     drop(model_guard);
     
     let selector_info = parse_json_from_llm(&page_selectors_res);
+    // Merge selectors into final_page_info
     if let Some(obj) = selector_info.as_object() {
         for (k, v) in obj {
             final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone());
         }
     }
     
-    let page_info = final_page_info; 
+    let page_info = final_page_info; // Re-alias for original logic
     
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Classification", 
@@ -532,12 +492,11 @@ Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
     
     let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
     let is_detail = page_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-    let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("").trim();
-    let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("").trim();
-    
-    let _ = std::fs::write("debug_scheduler_selector.txt", format!("Node: '{}'\nItem: '{}'", node_selector, item_selector)); // DEBUG
+    let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
+    let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
 
-    if page_type == "" || page_type == "unknown" {            return Ok (());
+    if page_type == "" || page_type == "unknown" {
+        return Ok (());
     }
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -550,22 +509,10 @@ Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
             "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
         }));
 
-        let mut item_pugs = {
+        let item_pugs = {
             let document = scraper::Html::parse_document(&clean_html);
             parsing::split_doc_to_pug_list(&document, target_selector, PugMode::FullContent)
         }; 
-        
-        // Fallback: If selector failed, try 'body' to capture everything
-        if item_pugs.is_empty() {
-            println!("[Scheduler] List selector '{}' returned 0 items. Falling back to 'body'.", target_selector);
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Warning", "summary": format!("Selector '{}' failed. Using full body.", target_selector), "spinner": "⚠️"
-            }));
-            let document = scraper::Html::parse_document(&clean_html);
-            item_pugs = parsing::split_doc_to_pug_list(&document, "body", PugMode::FullContent);
-        }
-        
-        let _ = std::fs::write("debug_scheduler_pug_list.txt", item_pugs.join("\n---\n")); // DEBUG
         
         let total_items = item_pugs.len();
         let _ = app_handle.emit("extraction-progress", json!({ 
@@ -574,20 +521,26 @@ Continue reading and memorizing. Just say \"ACKNOWLEDGED\"."#,
 
         let fields_prompts = parsing::list2json(page_type, language);
         let list_session_id = format!("{}_list", task.id);
+        let mut full_context_accumulated = String::new();
 
         for (i, item_pug) in item_pugs.iter().enumerate() {
             let is_last = i == total_items - 1;
-            println!("[List-Loop] Ingesting item part {}/{} to LLM (Session: {})", i + 1, total_items, list_session_id);
-            
+            full_context_accumulated.push_str(&format!("--- ITEM {} ---\n", i + 1));
+            full_context_accumulated.push_str(item_pug);
+            full_context_accumulated.push('\n');
+
             let prompt = if is_last {
-                println!("[List-FINAL] All items ingested. Requesting FINAL JSON list extraction.");
                 let mut schema_definitions = String::new();
                 for (name, schema) in &fields_prompts {
                     schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
                 }
 
-                let final_prompt = format!(
-r#"[FINAL PART]
+                format!(
+r#"[CONTEXT]
+You have been reading a list of items from a webpage part by part. 
+Below is the COMPLETELY ACCUMULATED list of Pug (Jade) snippets.
+
+[FULL LIST CONTENT]
 {}
 
 [EXTRACTION SCHEMA]
@@ -595,28 +548,31 @@ Please extract all items and list-level metadata precisely according to these de
 {}
 
 [FINAL INSTRUCTION]
-1. Based on ALL the parts I have sent you (previous and current), extract all items into an \"items\" array.
-2. Include list-level metadata like \"type\", \"item\", \"node\", etc.
+1. Based on the FULL LIST CONTENT, extract all items into an "items" array.
+2. Include list-level metadata like "type", "item", "node", etc.
 3. Return ONLY a single valid JSON object.
 4. No preamble, no explanation. Just raw JSON."#,
-                    item_pug,
+                    full_context_accumulated,
                     schema_definitions
-                );
-                let _ = std::fs::write("debug_scheduler_prompt_final_list.txt", &final_prompt); 
-                final_prompt
+                )
             } else {
                 format!(
-r#"[ITEM PART]
+r#"[CONTEXT]
+You are reading a list of items from a webpage.
+Here is the accumulated item snippets so far:
+
+[INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Read and memorize this item. Do NOT generate JSON yet. 
-Just say \"ACKNOWLEDGED\"."#,
-                    item_pug
+Read and memorize these items. Do NOT generate JSON yet.
+Just say "ACKNOWLEDGED"."#,
+                    full_context_accumulated
                 )
             };
 
-            let max_tokens = if is_last { 4096 } else { 20 };            
+            let max_tokens = if is_last { 4096 } else { 20 };
+            
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "List Ingestion", 
                 "summary": format!("Reading Item {}/{}...", i + 1, total_items),
@@ -624,13 +580,19 @@ Just say \"ACKNOWLEDGED\"."#,
             }));
 
             let model_guard = model_mutex.lock().await;
-            let res: Result<String> = if let Some(model) = model_guard.as_ref() {
+            let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
                 tokio::select!{
-                                            res = model.chat_with_spinner(
-                                                "Read and memorize the list items. Do NOT generate JSON yet. Just say ACKNOWLEDGED.", 
-                                                &prompt,
-                                                &app_handle_clone, => res,
+                    res = model.chat_with_spinner(
+                        "You are a helpful assistant. Read the context carefully.", 
+                        &prompt,
+                        &app_handle_clone, 
+                        "extraction-progress", 
+                        json!({ "category": "List Ingestion" }), 
+                        max_tokens, 
+                        Some(cancellation_token.clone()), 
+                        Some(list_session_id.clone())
+                    ) => res?,
                     _ = async {
                         loop {
                             if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -642,32 +604,18 @@ Just say \"ACKNOWLEDGED\"."#,
                         return Err(anyhow::anyhow!("Task cancelled")); 
                     }
                 }
-            } else { Ok("{}".to_string()) };
+            } else { "{}".to_string() };
             drop(model_guard);
 
-            let response = res?;
-
             if is_last {
-                let _ = std::fs::write("debug_scheduler_response_list.txt", &response); // DEBUG
-                println!("[EXTRACT-FINAL] Result: {}", response);
                 extracted_data = parse_json_from_llm(&response);
             }
         }
     } else {
-        let mut content_pug = {
+        let content_pug = {
             let document = scraper::Html::parse_document(&clean_html);
             parsing::convert_doc_to_clean_pug_selector(&document, target_selector, PugMode::FullContent)
         }; 
-        
-        // Fallback: If selector failed, try 'body'
-        if content_pug.trim().is_empty() {
-            println!("[Scheduler] Detail selector '{}' returned empty. Falling back to 'body'.", target_selector);
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Warning", "summary": format!("Selector '{}' failed. Using full body.", target_selector), "spinner": "⚠️"
-            }));
-            let document = scraper::Html::parse_document(&clean_html);
-            content_pug = parsing::convert_doc_to_clean_pug_selector(&document, "body", PugMode::FullContent);
-        }
         
         if content_pug.trim().is_empty() {
             let _ = app_handle.emit("extraction-progress", json!({ 
@@ -680,26 +628,50 @@ Just say \"ACKNOWLEDGED\"."#,
         }
 
         let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
-        let _ = std::fs::write("debug_scheduler_pug_detail.txt", &content_pug); // DEBUG
         
-        let chunks = chunk_text(&content_pug, 1500, 0); // No overlap
+        // CHUNKING: Split huge content into 3000-char chunks with 500-char overlap (CPU Optimized)
+        let chunks = chunk_text(&content_pug, 3000, 500); 
         let fields_prompts = parsing::item2json(page_type, &url, language);
+
+        // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
         let detail_session_id = format!("{}_detail", task.id);
+        
+        // Phase 1: Ingest all chunks (Prefill)
+        // We feed chunks one by one to build up the KV cache context.
+        // We only ask for the result at the very end.
         let chunks_len = chunks.len();
+        let mut full_context_accumulated = String::new(); // Accumulate context here
         
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let is_last = chunk_idx == chunks_len - 1;
-            println!("[Detail-Loop] Ingesting content part {}/{} to LLM (Session: {})", chunk_idx + 1, chunks_len, detail_session_id);
             
+            // Append current chunk to accumulator
+            // Note: We don't just append the raw chunk, we append the *formatted* prompt content if possible,
+            // but since the prompt template changes (Instruction wrapper), simply appending raw text might confuse the model if we re-send full prompt.
+            // BETTER STRATEGY:
+            // The KV cache stores the *tokens* of the previous request. 
+            // If we send [Prompt_A + Chunk_1], cache has Tokens(Prompt_A + Chunk_1).
+            // Next request: [Prompt_A + Chunk_1 + Chunk_2].
+            // Cache Hit: Tokens(Prompt_A + Chunk_1). New input: Chunk_2.
+            
+            // So we MUST accumulate the content in the prompt.
+            full_context_accumulated.push_str(chunk);
+            full_context_accumulated.push('\n');
+
+            // Prepare prompt
             let prompt = if is_last {
-                println!("[Detail-FINAL] All content ingested. Requesting FINAL JSON extraction.");
+                // Final Chunk: Include the FULL SCHEMA for all fields
                 let mut schema_definitions = String::new();
                 for (name, schema) in &fields_prompts {
                     schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
                 }
 
-                let final_prompt = format!(
-r#"[FINAL PART]
+                format!(
+r#"[CONTEXT]
+You have been reading a Pug (Jade) template part by part. 
+Below is the COMPLETELY ACCUMULATED content of the template.
+
+[FULL CONTENT]
 {}
 
 [EXTRACTION SCHEMA]
@@ -707,42 +679,46 @@ Please extract the following data points precisely according to these definition
 {}
 
 [FINAL INSTRUCTION]
-1. Based on ALL the parts I have sent you (previous and current), extract all fields mentioned in the EXTRACTION SCHEMA.
+1. Based on the FULL CONTENT, extract all fields mentioned in the EXTRACTION SCHEMA.
 2. Return ONLY a single valid JSON object.
 3. No preamble, no explanation, no markdown code blocks. Just the raw JSON.
 4. If a value is missing, use null."#,
-                    chunk,
+                    full_context_accumulated,
                     schema_definitions
-                );
-                let _ = std::fs::write("debug_scheduler_prompt_final_detail.txt", &final_prompt); // DEBUG
-                final_prompt
+                )
             } else {
+                // Intermediate Chunk: Just read and remember
                 format!(
-r#"[CONTENT PART]
+r#"[CONTEXT]
+You are reading a Pug (Jade) template. 
+Here is the accumulated content so far:
+
+[INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
 Read and memorize this content. Do NOT generate JSON yet. 
-When all parts are sent, I will ask you to extract data into JSON. 
-Just say \"ACKNOWLEDGED\"."#,
-                    chunk
+When all parts are sent, I will ask you to extract data into JSON.
+Just say "ACKNOWLEDGED"."#,
+                    full_context_accumulated
                 )
             };
 
-            let max_tokens = if is_last { 2048 } else { 20 };
+            let max_tokens = if is_last { 2048 } else { 20 }; // Minimal tokens for acknowledgment
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Ingestion", 
-                "summary": format!("Reading part {}/{}...", chunk_idx + 1, chunks_len),
+                "summary": format!("Reading part {}/{} ({} chars)...", chunk_idx + 1, chunks_len, full_context_accumulated.len()),
                 "spinner": "⠋"
             }));
 
             let model_guard = model_mutex.lock().await;
-            let res: Result<String> = if let Some(model) = model_guard.as_ref() {
+            
+            let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
                 tokio::select!{
                     res = model.chat_with_spinner(
-                        "Read and memorize the following content parts. Just say ACKNOWLEDGED for each part.", 
+                        "You are a helpful assistant. Read the context carefully.", 
                         &prompt,
                         &app_handle_clone, 
                         "extraction-progress", 
@@ -750,7 +726,7 @@ Just say \"ACKNOWLEDGED\"."#,
                         max_tokens, 
                         Some(cancellation_token.clone()), 
                         Some(detail_session_id.clone())
-                    ) => res,
+                    ) => res?,
                     _ = async {
                         loop {
                             if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -762,25 +738,15 @@ Just say \"ACKNOWLEDGED\"."#,
                         return Err(anyhow::anyhow!("Task cancelled")); 
                     }
                 }
-            } else { Ok("{}".to_string()) };
+            } else {
+                "{}".to_string()
+            };
             drop(model_guard);
 
-            let response = res?;
-
             if is_last {
-                let _ = std::fs::write("debug_scheduler_response_detail.txt", &response); // DEBUG
                 println!("[EXTRACT-FINAL] Result: {}", response);
                 let full_data = parse_json_from_llm(&response);
-                
-                if let Some(obj) = extracted_data.as_object_mut() {
-                    if let Some(source_obj) = full_data.as_object() {
-                        for (k, v) in source_obj {
-                            obj.insert(k.clone(), v.clone());
-                        }
-                    }
-                } else {
-                    extracted_data = full_data;
-                }
+                extracted_data = full_data;
             }
         }
     }
@@ -824,12 +790,12 @@ Just say \"ACKNOWLEDGED\"."#,
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
             let mut target_data = extracted_data.clone();
-            let mut target_id = format!("{}_{{}}", page_type, chrono::Utc::now().timestamp_millis());
+            let mut target_id = format!("{}_{}", page_type, chrono::Utc::now().timestamp_millis());
             let mut found_existing = false;
-            let to_table = format!("commerce_{{}}", merge_info.to);
+            let to_table = format!("commerce_{}", merge_info.to);
 
             for query in queries {
-                let query_table = format!("commerce_{{}}", query.table);
+                let query_table = format!("commerce_{}", query.table);
                 if let Ok(Some((id, existing_data))) = db.find_item_by_property(&query_table, &query.column, &query.value).await {
                     println!("[Scheduler] Found existing item: {} in {}", id, query_table);
                     logic::merge_node(&mut target_data, &existing_data);
@@ -875,7 +841,7 @@ Just say \"ACKNOWLEDGED\"."#,
             }
         }
     } else {
-        let target_table = format!("commerce_{{}}", page_type);
+        let target_table = format!("commerce_{}", page_type);
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
                 let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
