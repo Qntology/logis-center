@@ -12,7 +12,6 @@ use crate::openai_types::{
     ChatCompletionRequestMessageContentPartImage,
     ImageURL,
 };
-use crate::utils::get_device;
 use candle_core::{Device, DType};
 use image::{DynamicImage, GenericImageView};
 use serde_json::{Value, json, Map};
@@ -48,236 +47,139 @@ pub struct LogisModel {
 
 impl LogisModel {
     // Returns (Is Safe to Try GPU, Message, Usable VRAM in Bytes, Device ID)
-    fn check_memory_status(is_cuda: bool, is_metal: bool) -> (bool, String, u64, usize) {
-        // 1. CUDA VRAM Check
+    fn check_memory_status(is_cuda: bool, _is_metal: bool) -> (bool, String, u64, Vec<usize>) {
         if is_cuda {
             let nvml = match Nvml::init() {
                 Ok(n) => n,
-                Err(e) => return (false, format!("NVML Init Failed: {}", e), 0, 0),
+                Err(e) => return (false, format!("NVML Init Failed: {}", e), 0, vec![0]),
             };
             
             let count = nvml.device_count().unwrap_or(1);
-            let mut best_id = 0;
+            let mut gpu_ids = Vec::new();
             let mut max_free = 0;
-            let mut total_vram_log = 0;
 
             for i in 0..count {
                 if let Ok(device) = nvml.device_by_index(i) {
                     if let Ok(mem) = device.memory_info() {
-                        if mem.free > max_free {
-                            max_free = mem.free;
-                            best_id = i;
-                            total_vram_log = mem.total;
-                        }
+                        gpu_ids.push(i as usize);
+                        if mem.free > max_free { max_free = mem.free; }
                     }
                 }
             }
-
-            // We will dynamically reserve 5% of the *current* free VRAM during allocation 
-            // to account for user activity fluctuation.
-            let usable_vram = max_free;
-            
-            println!("[VRAM-CHECK] Best CUDA GPU: ID {} | Total: {:.2} GB, Free: {:.2} GB.", 
-                best_id, total_vram_log as f64/1e9, max_free as f64/1e9);
-
-            return (true, format!("VRAM Check Passed. ID: {}, Free: {:.2} GB", best_id, usable_vram as f64/1e9), usable_vram, best_id as usize);
+            return (true, format!("Found {} GPUs", count), max_free, gpu_ids);
         }
 
-        // 2. Metal / CPU System RAM Check
         let mut sys = System::new_all();
         sys.refresh_memory();
-        
-        let total_mem = sys.total_memory();
         let free_mem = sys.available_memory();
-        let buffer_size = (total_mem as f64 * 0.10) as u64;
-        let usable_mem = if free_mem > buffer_size { free_mem - buffer_size } else { 0 };
-        
-        let mode = if is_metal { "Metal (Unified)" } else { "System RAM" };
-        println!("[MEM-CHECK] {} | Total: {:.2} GB, Available: {:.2} GB, Usable: {:.2} GB", 
-            mode, total_mem as f64/1e9, free_mem as f64/1e9, usable_mem as f64/1e9);
-
-        (true, format!("Sufficient {}", mode), usable_mem, 0)
+        (true, "CPU/Metal".to_string(), free_mem, vec![0])
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[DEBUG] LogisModel::new called. Preference: {:?}", device_preference);
-        println!("[MODEL-00] Starting LogisModel::new() - Aha (Qwen3-VL Local) Mode");
+        println!("[MODEL-00] Initializing LogisModel with Dual-GPU Support");
 
-        // Detect Capabilities
         let has_cuda = candle_core::utils::cuda_is_available();
         let has_metal = candle_core::utils::metal_is_available();
         
-        println!("[DEBUG] Device Capability: CUDA={}, Metal={}", has_cuda, has_metal);
+        let mut text_device = Device::Cpu;
+        let mut vision_device = Device::Cpu;
+        let mut _detected_vram = 0_u64;
 
-        // Select Device Logic
-        let mut target_device = Device::Cpu;
-        let mut force_cpu = false;
-        let mut detected_vram = 0_u64;
-
-        if device_preference == Some("cpu") {
-            println!("[CONFIG] User forced CPU.");
-            force_cpu = true;
-        } else {
-            // Priority: CUDA > Metal > CPU
+        if device_preference != Some("cpu") {
             if has_cuda {
-                let (ok, msg, vram, best_id) = Self::check_memory_status(true, false);
-                detected_vram = vram;
+                let (ok, _, vram, ids) = Self::check_memory_status(true, false);
+                _detected_vram = vram;
                 if ok {
-                    println!("✅ [DEVICE] Selecting CUDA: {}", msg);
-                    target_device = Device::new_cuda(best_id).unwrap_or(Device::Cpu);
-                } else {
-                    println!("⚠️ [DEVICE] CUDA available but skipped: {}", msg);
-                    force_cpu = true; 
+                    text_device = Device::new_cuda(ids[0]).unwrap_or(Device::Cpu);
+                    if ids.len() >= 2 {
+                        vision_device = Device::new_cuda(ids[1]).unwrap_or(Device::Cpu);
+                        println!("✅ [MULTI-GPU] Text: cuda:{}, Vision: cuda:{}", ids[0], ids[1]);
+                    } else {
+                        vision_device = text_device.clone();
+                        println!("ℹ️ [SINGLE-GPU] Text & Vision sharing cuda:{}", ids[0]);
+                    }
                 }
             } else if has_metal {
-                let (ok, msg, vram, _) = Self::check_memory_status(false, true);
-                detected_vram = vram;
-                if ok {
-                    println!("✅ [DEVICE] Selecting Metal: {}", msg);
-                    target_device = Device::new_metal(0).unwrap_or(Device::Cpu);
-                } else {
-                    println!("⚠️ [DEVICE] Metal available but skipped: {}", msg);
-                    force_cpu = true;
-                }
-            } else {
-                println!("[DEVICE] No GPU detected. Using CPU.");
-                force_cpu = true;
+                text_device = Device::new_metal(0).unwrap_or(Device::Cpu);
+                vision_device = text_device.clone();
             }
         }
 
-        if force_cpu {
-            target_device = Device::Cpu;
-            let (ok, msg, _, _) = Self::check_memory_status(false, false);
-            if !ok {
-                println!("⚠️ [WARNING] System RAM is also tight for CPU mode: {}", msg);
-            }
-        }
-
-        let base_path = std::fs::canonicalize("src-tauri/models")
-            .or_else(|_| std::fs::canonicalize("models"))?;
-        
+        let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
         let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
+        let model_path = gguf_dir.to_str().unwrap().to_string();
 
-        // Dynamic Context Tokens based on Fluid VRAM
-        let max_tokens_limit = if !force_cpu && detected_vram > 0 {
-             let vram_mb = detected_vram as f64 / 1_000_000.0;
-             
-             // 1. User Safety Margin: Fixed 250MB for OS/Fluctuation
-             let fixed_safety_margin = 250.0; 
-             
-             // 2. Real Model Weight Calculation (File System Scan)
-             let mut real_model_weights = 0.0;
-             if let Ok(entries) = std::fs::read_dir(&gguf_dir) {
-                 for entry in entries.flatten() {
-                     if let Ok(meta) = entry.metadata() {
-                         if entry.path().extension().map_or(false, |e| e == "gguf") {
-                             real_model_weights += meta.len() as f64 / 1_000_000.0;
-                         }
-                     }
-                 }
-             }
-             if real_model_weights == 0.0 { real_model_weights = 2200.0; } 
+        let max_tokens_limit = 4096; // Simplified for now
+        let dtype = if text_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
 
-             // 3. Estimated Runtime Overhead
-             let runtime_overhead = 150.0;
+        let t_dev = text_device.clone();
+        let v_dev = vision_device.clone();
+        let m_path = model_path.clone();
 
-             let usable_fluid_vram = vram_mb - fixed_safety_margin - real_model_weights - runtime_overhead;
+        let generator = tokio::task::spawn_blocking(move || {
+            Qwen3VLGenerateModel::init(&m_path, Some(&t_dev), Some(&v_dev), dtype, Some(max_tokens_limit as usize))
+        }).await??;
 
-             println!("[VRAM-DEBUG] Live Free: {:.2} MB | Weights: {:.2} MB | OS Reserve: {:.2} MB", 
-                vram_mb, real_model_weights, fixed_safety_margin);
-             println!("[VRAM-DEBUG] Dynamic Space for KV Cache: {:.2} MB", usable_fluid_vram);
-
-             let mb_per_1k_tokens = 180.0; 
-
-             let limit = if usable_fluid_vram <= 0.0 {
-                 2048 // Fallback to safe minimum
-             } else {
-                 let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
-                 capacity.clamp(2048.0, 32768.0) as u32
-             };
-             
-             println!("[CONFIG] Fluid Context Limit: {}", limit);
-             limit
-        } else {
-             // DYNAMIC RAM ALLOCATION (CPU Mode)
-             let mut sys = System::new_all();
-             sys.refresh_memory();
-             let total_ram = sys.total_memory() as f64;
-             let free_ram = sys.available_memory() as f64;
-             
-             // Reserve 15% of Total RAM for System Stability, then use 80% of remaining free RAM
-             let usable_ram_mb = (free_ram - (total_ram * 0.15)).max(0.0) / 1_000_000.0;
-             let mb_per_1k_tokens = 180.0;
-             
-             let limit = ((usable_ram_mb * 0.8) / mb_per_1k_tokens * 1000.0) as u32;
-             let limit = limit.clamp(2048, 16384); // Minimum 2k, Max 16k for CPU stability
-             
-             println!("[CONFIG] CPU Mode Dynamic Limit. Free: {:.2} GB, Usable: {:.2} GB, Result: {} tokens", 
-                free_ram/1e9, usable_ram_mb/1e3, limit);
-             limit
-        };
-        println!("[CONFIG] Final Token limit set to: {}", max_tokens_limit);
-        
-        // --- Init Embedding Model (Gemma-300m) ---
         let embedding_model_path = base_path.join("embeddinggemma-300m");
-        let model_dir = if gguf_dir.exists() { gguf_dir } else { base_path };
-        let model_path = model_dir.to_str().unwrap().to_string();
-
-        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
-        let device_for_task = target_device.clone();
-        let model_path_for_task = model_path.clone();
-
-        println!("[MODEL-01] Initializing on device: {:?}", target_device);
-
-        let init_result = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init(&model_path_for_task, Some(&device_for_task), dtype, Some(max_tokens_limit as usize))
-        }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))?;
-
-        let generator = match init_result {
-            Ok(gen) => gen,
-            Err(e) => {
-                let err_str = e.to_string();
-                // If failed on GPU/Metal, try fallback to CPU
-                if !target_device.is_cpu() {
-                    println!("⚠️ [FALLBACK] Init failed on {:?}: {}. Retrying on CPU...", target_device, err_str);
-                    let retry_device = Device::Cpu;
-                    let retry_path = model_path.clone();
-                    
-                    let fallback_gen = tokio::task::spawn_blocking(move || {
-                        Qwen3VLGenerateModel::init(&retry_path, Some(&retry_device), Some(DType::F32), Some(max_tokens_limit as usize))
-                    }).await.map_err(|e| anyhow!("Blocking task failed: {}", e))? 
-                      .map_err(|e| anyhow!("CPU Fallback failed: {}", e))?;
-                    
-                    fallback_gen
-                } else {
-                    return Err(anyhow!("Failed to init Qwen3VL: {}", e));
-                }
-            }
-        };
-
-        println!("[MODEL-02] Qwen3-VL Generator initialized successfully.");
-
-        // Restore Embedding Model Initialization
         let embedding_model = if embedding_model_path.exists() {
-            println!("[MODEL-01] Loading Embedding Model from: {:?}", embedding_model_path);
-            match EmbeddingModel::new(&embedding_model_path) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    println!("⚠️ [WARNING] Failed to load Embedding Model: {}", e);
-                    None
-                }
-            }
-        } else {
-            println!("⚠️ [WARNING] Embedding model path not found: {:?}", embedding_model_path);
-            None
-        };
+            EmbeddingModel::new(&embedding_model_path).ok()
+        } else { None };
 
         Ok(Self {
             generator: Arc::new(Mutex::new(generator)),
             embedding_model: Arc::new(Mutex::new(embedding_model)),
-            is_cpu_mode: target_device.is_cpu(),
-            max_tokens_limit,
+            is_cpu_mode: text_device.is_cpu(),
+            max_tokens_limit: max_tokens_limit as u32,
         })
+    }
+
+    pub async fn extract_from_image(
+        &self,
+        task_id: String,
+        image_path: String,
+        language: String,
+        app_handle: &tauri::AppHandle,
+        cancel_token: Option<Arc<AtomicBool>>,
+        store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
+    ) -> anyhow::Result<()> {
+        let _ = app_handle.emit("extraction-progress", json!({ 
+            "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
+        }));
+
+        if let Ok(img) = image::open(&image_path) {
+            let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
+            let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
+            
+            let result_str = self.chat_with_image_spinner(
+                prompt, 
+                Some(dynamic_image), 
+                app_handle, 
+                "extraction-progress", 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image content..." }), 
+                1024, 
+                cancel_token.clone(), 
+                Some(task_id.clone())
+            ).await?;
+
+            let extracted_data = crate::scheduler::parse_json_from_llm(&result_str);
+            
+            let store_guard = store_mutex.lock().await;
+            if let Some(db) = store_guard.as_ref() {
+                let id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id).to_string();
+                let _ = db.upsert_item("commerce_tracking", &id, "tracking", extracted_data.clone(), None).await;
+            }
+            
+            let _ = app_handle.emit("extraction-progress", json!({ 
+               "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
+            }));
+            
+            Ok(())
+        } else {
+            let _ = app_handle.emit("extraction-progress", json!({ 
+               "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
+            }));
+            Ok(())
+        }
     }
 
     pub fn is_cpu(&self) -> bool {
@@ -900,6 +802,37 @@ Output JSON: {"intent": "SEARCH|RESEARCH"}"###;
   
   "conditions.incoterms_code": { "desc": "Incoterms (FOB, CIF)", "type": "String" }
 }"###.to_string()
+    }
+}
+
+pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
+    if page_type == "tracking" {
+        let template = r###"
+[TASK]
+Convert the shipping label image content into a structured JSON format.
+
+[CONTEXT]
+Region: {REGION}
+Recipient Address: {ADDRESS}
+Current Language: {LANGUAGE}
+
+[SCHEMA DEFINITIONS]
+- tracking_number: The unique tracking ID ( 운송장 번호, 송장 번호, 运单号, 伝표번호, Tracking No). Exclude phone numbers or order numbers.
+- recipient_match: Boolean. True if the shipping label's recipient address roughly matches the context address (ignore floor levels).
+- barcodes: Array of strings. Extract any barcode or QR code values visible.
+- text: A concise summary of the shipping label in {LANGUAGE}. MASK the address to District-level (do not reveal detailed street/house numbers). Do not mention that masking occurred.
+
+[OUTPUT FORMAT]
+Return valid JSON only. No markdown.
+{
+    "tracking_number": "string",
+    "recipient_match": boolean,
+    "barcodes": ["string"],
+    "text": "string"
+}"###;
+        template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
+    } else {
+        String::new()
     }
 }
 

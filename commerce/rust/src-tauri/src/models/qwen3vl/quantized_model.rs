@@ -3,7 +3,7 @@ use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use nvml_wrapper::Nvml;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
 
@@ -619,6 +619,7 @@ pub struct QuantizedQwen3VLModel {
     language_model: QuantizedQwen3VLTextModel,
     lm_head: QLinear,
     rope_deltas: Option<Tensor>,
+    text_device: Device,
     vision_device: Device,
 }
 
@@ -629,9 +630,10 @@ impl QuantizedQwen3VLModel {
         reader_main: &mut R,
         ct_vision: &gguf_file::Content,
         reader_vision: &mut R2,
-        device: &Device,
+        text_device: &Device,
+        vision_device: &Device,
         dtype: DType,
-        kv_reserve: u64, // New param
+        kv_reserve: u64,
     ) -> Result<Self> {
         // Shared NVML instance for this scope
         let nvml = Nvml::init().ok();
@@ -643,42 +645,39 @@ impl QuantizedQwen3VLModel {
             let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
             vision_weight_size += size as u64;
         }
-        // Vision Runtime Overhead (Activation buffers ~ 300MB est. dynamically?)
-        // We'll use a dynamic activation buffer based on hidden size if possible, or a safe dynamic factor.
-        // For now, let's assume 30% of weight size as activation overhead for Vision.
         let vision_overhead = (vision_weight_size as f64 * 0.30) as u64;
         let vision_total_cost = vision_weight_size + vision_overhead;
 
         // 1. Vision Model - Dynamic Loading
-        let mut vision_device = device.clone();
-        if vision_device.is_cuda() {
+        let mut actual_vision_device = vision_device.clone();
+        if actual_vision_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
-                 if let Ok(dev) = nvml_inst.device_by_index(0) {
+                 // Check specific device if provided
+                 let dev_idx = if let Device::Cuda(cuda_dev) = &actual_vision_device { cuda_dev.ordinal() } else { 0 };
+                 
+                 if let Ok(dev) = nvml_inst.device_by_index(dev_idx as u32) {
                      if let Ok(mem) = dev.memory_info() {
-                         // DYNAMIC RESOURCE ALLOCATION (Vision):
-                         // Reserve 5% of Total VRAM for OS, then check if weights fit in 90% of current free space
                          let total_vram = mem.total;
                          let os_reserve = (total_vram as f64 * 0.05) as u64;
-                         let safety_floor = os_reserve + kv_reserve;
+                         let safety_floor = os_reserve;
                          
                          if mem.free < (vision_total_cost + safety_floor) {
-                             println!("[OFFLOAD] Vision Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Vision to CPU.", 
-                                mem.free as f64/1e9, vision_total_cost as f64/1e9, safety_floor as f64/1e9);
-                             vision_device = Device::Cpu;
+                             println!("[OFFLOAD] Vision Budget Exhausted on ID {}. Switching to CPU.", dev_idx);
+                             actual_vision_device = Device::Cpu;
                          }
                      }
                  }
              }
         }
         
-        let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
+        let vision_dtype = if actual_vision_device.is_cpu() { DType::F32 } else { dtype };
 
         // Load Vision from mmproj file
-        let vb_visual = from_gguf_content(config, ct_vision, reader_vision, &vision_device, vision_dtype)?;
+        let vb_visual = from_gguf_content(config, ct_vision, reader_vision, &actual_vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(config.vision_config.clone(), vb_visual.pp("visual"))?;
         
         // Load Language Model from main file
-        let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", device, dtype, kv_reserve)?;
+        let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", text_device, dtype, kv_reserve)?;
         
         // --- Organic Budget Calculation for Head ---
         let mut head_weight_size = 0_u64;
@@ -692,18 +691,15 @@ impl QuantizedQwen3VLModel {
             }
         }
 
-        // LM Head - Check VRAM again to decide device
-        let nvml = Nvml::init().ok();
-        let mut head_device = device.clone();
+        // LM Head - Same as Text Device
+        let mut head_device = text_device.clone();
         if head_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
-                 if let Ok(dev) = nvml_inst.device_by_index(0) {
+                 let dev_idx = if let Device::Cuda(cuda_dev) = &head_device { cuda_dev.ordinal() } else { 0 };
+                 if let Ok(dev) = nvml_inst.device_by_index(dev_idx as u32) {
                      if let Ok(mem) = dev.memory_info() {
-                         // [VERY AGGRESSIVE] Head is small but critical. 50MB margin is enough.
                          let absolute_min_margin = 50_000_000;
-                         
                          if mem.free < (head_weight_size + absolute_min_margin) {
-                             println!("[OFFLOAD] Head Budget Exhausted. Switching to CPU.");
                              head_device = Device::Cpu;
                          }
                      }
@@ -711,16 +707,13 @@ impl QuantizedQwen3VLModel {
              }
         }
 
-        // Determine head dtype: F32 if CPU, else inherit
         let head_dtype = if head_device.is_cpu() { DType::F32 } else { dtype };
 
-        // Try 'lm_head', then 'output', then fallback to 'token_embd' (tied weights)
         let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", &head_device, head_dtype) {
             l
         } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", &head_device, head_dtype) {
             l
         } else {
-            // Fallback for tied embeddings or GGUF specific naming 'token_embd'
             get_qlinear(ct_main, reader_main, "token_embd", &head_device, head_dtype)?
         };
 
@@ -730,7 +723,8 @@ impl QuantizedQwen3VLModel {
             language_model,
             lm_head,
             rope_deltas: None,
-            vision_device,
+            text_device: text_device.clone(),
+            vision_device: actual_vision_device,
         })
     }
     
@@ -760,9 +754,17 @@ impl QuantizedQwen3VLModel {
             .iter()
             .map(|&x| x as usize / self.config.vision_config.spatial_merge_size.pow(2))
             .collect();
+        
+        // Transfer results to text_device for language processing
+        let image_embeds = image_embeds.to_device(&self.text_device)?;
+        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter()
+            .map(|t| Ok(t.to_device(&self.text_device)?))
+            .collect();
+
         let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;
-        Ok((image_embeds, deepstack_image_embeds))
+        Ok((image_embeds, deepstack_image_embeds?))
     }
+
 
     fn get_placeholder_mask(&self, input_ids: &Tensor, is_image: bool) -> Result<Tensor> {
         let special_token = if is_image {

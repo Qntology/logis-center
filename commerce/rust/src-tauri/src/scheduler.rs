@@ -219,77 +219,38 @@ async fn process_task(
 
     // --- Image Extraction Logic ---
     if task.r#type == "image_extraction" {
-        let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("");
+        let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
-        }));
-
-        if let Ok(img) = image::open(image_path) {
-             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
-             let prompt = parsing::image2json("kr", language, "tracking", "");
-             
-             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-             let mut model_guard = model_mutex.lock().await;
-             if model_guard.is_none() {
-                 let _ = app_handle.emit("extraction-progress", json!({ 
-                    "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
-                 }));
-                 match LogisModel::new(None).await {
-                     Ok(m) => *model_guard = Some(m),
-                     Err(e) => {
-                         let _ = app_handle.emit("extraction-progress", json!({ 
-                            "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
-                         }));
-                         return Ok(());
-                     }
-                 }
-             }
-             
-             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-             let result_str = if let Some(model) = model_guard.as_ref() {
-                 let prompt_clone = prompt.clone();
-                 let app_handle_clone = app_handle.clone();
-                 
-                 tokio::select!{
-                     res = model.chat_with_image_spinner(prompt_clone, Some(dynamic_image), &app_handle_clone, "extraction-progress", json!({ 
-                        "category": "Vision Analysis", "summary": "Analyzing image content..."
-                    }), 1024, Some(cancellation_token.clone()), Some(task.id.clone())) => res?,
-                     _ = async {
-                         loop {
-                             if cancellation_token.load(Ordering::Relaxed) { break; }
-                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                         }
-                     } => { return Err(anyhow::anyhow!("Task cancelled")); }
-                 }
-             } else {
-                 "{}".to_string()
-             };
-             drop(model_guard); 
-             
-             let extracted_data = parse_json_from_llm(&result_str);
-             
-             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-             let store_guard = store_mutex.lock().await;
-             if let Some(db) = store_guard.as_ref() {
-                 let id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task.id).to_string();
-                 let _ = db.upsert_item("commerce_tracking", &id, "tracking", extracted_data.clone(), None).await;
-             }
-             
-             let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
-             }));
-             
-             return Ok(());
-        } else {
-             let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
-             }));
-             return Ok(());
+        let mut model_guard = model_mutex.lock().await;
+        if model_guard.is_none() {
+            let _ = app_handle.emit("extraction-progress", json!({ 
+               "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
+            }));
+            match LogisModel::new(None).await {
+                Ok(m) => *model_guard = Some(m),
+                Err(e) => {
+                    let _ = app_handle.emit("extraction-progress", json!({ 
+                       "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
+                    }));
+                    return Ok(());
+                }
+            }
         }
+        
+        if let Some(model) = model_guard.as_ref() {
+            let res = model.extract_from_image(
+                task.id.clone(),
+                image_path,
+                language.to_string(),
+                app_handle,
+                Some(cancellation_token.clone()),
+                store_mutex
+            ).await;
+            
+            drop(model_guard);
+            return res;
+        }
+        return Ok(());
     }
 
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
@@ -908,7 +869,7 @@ fn cleanup_task_resources(task_id: &str) {
     }
 }
 
-fn parse_json_from_llm(text: &str) -> Value {
+pub fn parse_json_from_llm(text: &str) -> Value {
     if let Ok(v) = serde_json::from_str(text) { return v; }
     if let Some(start) = text.find("{") {
         if let Some(end) = text.rfind("}") {

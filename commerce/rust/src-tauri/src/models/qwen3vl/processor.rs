@@ -3,14 +3,14 @@ use std::collections::HashMap;
 use crate::{
     models::qwen3vl::config::PreprocessorConfig,
     openai_types::{
-        ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionParameters, ChatCompletionRequestMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
     },
     utils::{
         img_utils::{get_image, img_smart_resize, img_transform},
     },
 };
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Shape, Tensor};
 use image::DynamicImage;
 use sysinfo::System;

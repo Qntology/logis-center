@@ -217,37 +217,6 @@ Language: {LANGUAGE}"###;
     template.replace("{TYPE}", page_type).replace("{LANGUAGE}", language)
 }
 
-pub fn image2json(region: &str, language: &str, page_type: &str, address: &str) -> String {
-    if page_type == "tracking" {
-        let template = r###"
-[TASK]
-Convert the shipping label image content into a structured JSON format.
-
-[CONTEXT]
-Region: {REGION}
-Recipient Address: {ADDRESS}
-Current Language: {LANGUAGE}
-
-[SCHEMA DEFINITIONS]
-- tracking_number: The unique tracking ID ( 운송장 번호, 송장 번호, 运单号, 伝표번호, Tracking No). Exclude phone numbers or order numbers.
-- recipient_match: Boolean. True if the shipping label's recipient address roughly matches the context address (ignore floor levels).
-- barcodes: Array of strings. Extract any barcode or QR code values visible.
-- text: A concise summary of the shipping label in {LANGUAGE}. MASK the address to District-level (do not reveal detailed street/house numbers). Do not mention that masking occurred.
-
-[OUTPUT FORMAT]
-Return valid JSON only. No markdown.
-{
-    "tracking_number": "string",
-    "recipient_match": boolean,
-    "barcodes": ["string"],
-    "text": "string"
-}"###;
-        template.replace("{REGION}", region).replace("{ADDRESS}", address).replace("{LANGUAGE}", language)
-    } else {
-        String::new()
-    }
-}
-
 pub fn para2graph(language: &str) -> String {
     let template = r###"
 [TASK]
