@@ -42,7 +42,7 @@ pub struct Qwen3VLGenerateModel {
 }
 
 impl Qwen3VLGenerateModel {
-    pub fn init(path: &str, text_device: Option<&Device>, vision_device: Option<&Device>, dtype: Option<DType>, hard_token_limit: Option<usize>) -> Result<Self> {
+    pub fn init(path: &str, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>) -> Result<Self> {
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
         let config_path = std::path::Path::new(path).join("config.json");
@@ -76,7 +76,7 @@ impl Qwen3VLGenerateModel {
                 let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
                 let kv_reserve = max_tokens * 180_000;
                 
-                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, &vision_dev, dtype, kv_reserve)?;
+                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::Quantized(model)
             } else if let Some(main) = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }) {
                  let mut file = std::fs::File::open(&main)?;
@@ -87,7 +87,7 @@ impl Qwen3VLGenerateModel {
                  let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
                  let kv_reserve = max_tokens * 180_000;
                  
-                 let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, &vision_dev, dtype, kv_reserve)?;
+                 let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
             } else {
                  return Err(anyhow!("No valid GGUF model found"));

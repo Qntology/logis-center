@@ -83,6 +83,8 @@ impl LogisModel {
         
         let mut text_device = Device::Cpu;
         let mut vision_device = Device::Cpu;
+        let mut text_device_id = 0;
+        let mut vision_device_id = 0;
         let mut _detected_vram = 0_u64;
 
         if device_preference != Some("cpu") {
@@ -90,13 +92,16 @@ impl LogisModel {
                 let (ok, _, vram, ids) = Self::check_memory_status(true, false);
                 _detected_vram = vram;
                 if ok {
-                    text_device = Device::new_cuda(ids[0]).unwrap_or(Device::Cpu);
+                    text_device_id = ids[0];
+                    text_device = Device::new_cuda(text_device_id).unwrap_or(Device::Cpu);
                     if ids.len() >= 2 {
-                        vision_device = Device::new_cuda(ids[1]).unwrap_or(Device::Cpu);
-                        println!("✅ [MULTI-GPU] Text: cuda:{}, Vision: cuda:{}", ids[0], ids[1]);
+                        vision_device_id = ids[1];
+                        vision_device = Device::new_cuda(vision_device_id).unwrap_or(Device::Cpu);
+                        println!("✅ [MULTI-GPU] Text: cuda:{}, Vision: cuda:{}", text_device_id, vision_device_id);
                     } else {
+                        vision_device_id = text_device_id;
                         vision_device = text_device.clone();
-                        println!("ℹ️ [SINGLE-GPU] Text & Vision sharing cuda:{}", ids[0]);
+                        println!("ℹ️ [SINGLE-GPU] Text & Vision sharing cuda:{}", text_device_id);
                     }
                 }
             } else if has_metal {
@@ -117,7 +122,7 @@ impl LogisModel {
         let m_path = model_path.clone();
 
         let generator = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init(&m_path, Some(&t_dev), Some(&v_dev), dtype, Some(max_tokens_limit as usize))
+            Qwen3VLGenerateModel::init(&m_path, Some(&t_dev), text_device_id, Some(&v_dev), vision_device_id, dtype, Some(max_tokens_limit as usize))
         }).await??;
 
         let embedding_model_path = base_path.join("embeddinggemma-300m");

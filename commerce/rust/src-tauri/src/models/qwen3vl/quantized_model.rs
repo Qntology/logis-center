@@ -381,6 +381,7 @@ impl QuantizedQwen3VLTextModel {
         reader: &mut R,
         base_name: &str,
         device: &Device,
+        device_id: usize,
         dtype: DType,
         kv_reserve: u64, // New param
     ) -> Result<Self> {
@@ -429,7 +430,7 @@ impl QuantizedQwen3VLTextModel {
         // 2. Get System VRAM & Set Dynamic Safety Floor (10% of Fluid Resource + KV Reserve)
         if current_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
-                 if let Ok(dev) = nvml_inst.device_by_index(0) {
+                 if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
@@ -631,7 +632,9 @@ impl QuantizedQwen3VLModel {
         ct_vision: &gguf_file::Content,
         reader_vision: &mut R2,
         text_device: &Device,
+        text_device_id: usize,
         vision_device: &Device,
+        vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
     ) -> Result<Self> {
@@ -652,17 +655,14 @@ impl QuantizedQwen3VLModel {
         let mut actual_vision_device = vision_device.clone();
         if actual_vision_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
-                 // Check specific device if provided
-                 let dev_idx = if let Device::Cuda(cuda_dev) = &actual_vision_device { cuda_dev.ordinal() } else { 0 };
-                 
-                 if let Ok(dev) = nvml_inst.device_by_index(dev_idx as u32) {
+                 if let Ok(dev) = nvml_inst.device_by_index(vision_device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
                          let total_vram = mem.total;
                          let os_reserve = (total_vram as f64 * 0.05) as u64;
                          let safety_floor = os_reserve;
                          
                          if mem.free < (vision_total_cost + safety_floor) {
-                             println!("[OFFLOAD] Vision Budget Exhausted on ID {}. Switching to CPU.", dev_idx);
+                             println!("[OFFLOAD] Vision Budget Exhausted on ID {}. Switching to CPU.", vision_device_id);
                              actual_vision_device = Device::Cpu;
                          }
                      }
@@ -677,7 +677,7 @@ impl QuantizedQwen3VLModel {
         let visual = Qwen3VLVisionModel::new(config.vision_config.clone(), vb_visual.pp("visual"))?;
         
         // Load Language Model from main file
-        let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", text_device, dtype, kv_reserve)?;
+        let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve)?;
         
         // --- Organic Budget Calculation for Head ---
         let mut head_weight_size = 0_u64;
@@ -695,8 +695,7 @@ impl QuantizedQwen3VLModel {
         let mut head_device = text_device.clone();
         if head_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
-                 let dev_idx = if let Device::Cuda(cuda_dev) = &head_device { cuda_dev.ordinal() } else { 0 };
-                 if let Ok(dev) = nvml_inst.device_by_index(dev_idx as u32) {
+                 if let Ok(dev) = nvml_inst.device_by_index(text_device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
                          let absolute_min_margin = 50_000_000;
                          if mem.free < (head_weight_size + absolute_min_margin) {
