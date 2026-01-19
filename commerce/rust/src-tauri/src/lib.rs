@@ -296,7 +296,6 @@ async fn check_query_intent(
             return Err("Failed to load model".to_string());
         }
     }
-    
     if let Some(model) = model_guard.as_ref() {
         model.parse_query_intent(query, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
     } else {

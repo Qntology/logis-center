@@ -214,8 +214,8 @@ impl VectorStore {
                 .execute()
                 .await?;
             
-            // Create FTS index on 'text' column
-            let _ = table.create_index(&["text"], lancedb::index::Index::FullText).execute().await;
+            // Create FTS index on 'text' column (Commented out due to API mismatch)
+            // let _ = table.create_index(&["text"], lancedb::index::Index::FullText).execute().await;
         }
         Ok(())
     }

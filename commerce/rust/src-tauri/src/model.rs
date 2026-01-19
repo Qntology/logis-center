@@ -38,6 +38,94 @@ impl Spinner {
     }
 }
 
+pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
+    let type_map = json!({
+        "CI": "Commercial Invoice", "PI": "Proforma Invoice", "PL": "Packing List",
+        "BL": "Bill of Lading", "AWB": "Air Waybill", "CO": "Certificate of Origin", "LC": "Letter of Credit",
+        "tracking": "Shipping Label / Tracking Info"
+    });
+    
+    let full_type = type_map.get(doc_type).and_then(|s| s.as_str()).unwrap_or(doc_type);
+    let mut parts = vec![format!("This is a {} document.", full_type)];
+
+    if let Some(h) = data.get("header") {
+        if let Some(no) = h.get("document_number").and_then(|s| s.as_str()) {
+            if no != "N/A" && !no.is_empty() {
+                parts.push(format!("Document number is {}.", no));
+            }
+        }
+        if let Some(date) = h.get("issue_date").and_then(|s| s.as_str()) {
+            if date != "N/A" && !date.is_empty() {
+                parts.push(format!("Issued on {}.", date));
+            }
+        }
+    }
+
+    if doc_type == "tracking" {
+        if let Some(tn) = data.get("tracking_number").and_then(|s| s.as_str()) {
+            parts.push(format!("The tracking number is {}.", tn));
+        }
+        if let Some(text) = data.get("text").and_then(|s| s.as_str()) {
+            parts.push(text.to_string());
+        }
+    }
+
+    if let Some(p) = data.get("parties") {
+        let sup = p.get("supplier_name").and_then(|s| s.as_str());
+        let buy = p.get("buyer_name").and_then(|s| s.as_str());
+        
+        let has_sup = sup.is_some() && sup.unwrap() != "N/A";
+        let has_buy = buy.is_some() && buy.unwrap() != "N/A";
+
+        if has_sup && has_buy {
+            parts.push(format!("Transaction involved {} as the supplier/shipper and {} as the buyer/consignee.", sup.unwrap(), buy.unwrap()));
+        } else if has_sup {
+            parts.push(format!("Supplier/Shipper is {}.", sup.unwrap()));
+        } else if has_buy {
+            parts.push(format!("Buyer/Consignee is {}.", buy.unwrap()));
+        }
+    }
+
+    if let Some(f) = data.get("financials") {
+        if let Some(amt) = f.get("amount_total") {
+             let amt_str = if amt.is_number() { amt.to_string() } else { amt.as_str().unwrap_or("0").to_string() };
+             let curr = f.get("currency_code").and_then(|s| s.as_str()).unwrap_or("USD");
+             if amt_str != "0" && amt_str != "0.0" {
+                 parts.push(format!("Total amount is {} {}.", amt_str, curr));
+             }
+        }
+    }
+
+    if let Some(l) = data.get("logistics") {
+        let pol = l.get("location_port_of_loading").and_then(|s| s.as_str());
+        let pod = l.get("location_port_of_discharge").and_then(|s| s.as_str());
+        
+        if let (Some(o), Some(d)) = (pol, pod) {
+            if o != "N/A" && d != "N/A" {
+                parts.push(format!("Shipped from {} to {}.", o, d));
+            }
+        }
+        
+        if let Some(mode) = l.get("transport_mode").and_then(|s| s.as_str()) {
+            parts.push(format!("Transport mode is {}.", mode));
+        }
+    }
+
+    if let Some(items) = data.get("line_items").and_then(|v| v.as_array()) {
+        let mut item_descs = Vec::new();
+        for item in items.iter().take(5) {
+            if let Some(d) = item.get("description").and_then(|s| s.as_str()) {
+                if d.len() > 3 { item_descs.push(d); }
+            }
+        }
+        if !item_descs.is_empty() {
+            parts.push(format!("Contains items: {}.", item_descs.join(", ")));
+        }
+    }
+    
+    parts.join(" ")
+}
+
 pub struct LogisModel {
     generator: Arc<Mutex<Qwen3VLGenerateModel>>,
     embedding_model: Arc<Mutex<Option<EmbeddingModel>>>,
@@ -659,6 +747,40 @@ impl LogisModel {
                 Ok(vec![0.0; 768])
             }
         }).await?
+    }
+
+    pub async fn parse_query_structured(&self, query: String, language: &str) -> anyhow::Result<Value> {
+        let current_time = chrono::Utc::now().to_rfc3339();
+        
+        // Stage 1: Segment query (para2graph)
+        let prompt1 = crate::parsing::para2graph(language);
+        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, None).await?;
+        let segments = crate::scheduler::parse_json_from_llm(&res1);
+        
+        // Stage 2: Extract conditions for each segment (graph2contexts)
+        let mut final_contexts = Vec::new();
+        if let Some(ctx_arr) = segments.get("context").and_then(|v| v.as_array()) {
+            for seg in ctx_arr {
+                let seg_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if seg_text.is_empty() { continue; }
+                
+                let prompt2 = crate::parsing::graph2contexts(&current_time);
+                let res2 = self.chat("", &format!("{}\n\nContext Text: {}", prompt2, seg_text), None, None).await?;
+                let mut ctx_info = crate::scheduler::parse_json_from_llm(&res2);
+                
+                // Merge type from stage 1 if missing in stage 2
+                if let Some(obj) = ctx_info.get_mut("context").and_then(|v| v.as_array_mut()) {
+                    for item in &mut *obj {
+                        if item.get("type").is_none() || item.get("type").and_then(|v| v.as_str()) == Some("") {
+                            item.as_object_mut().unwrap().insert("type".to_string(), seg.get("type").cloned().unwrap_or(json!("")));
+                        }
+                    }
+                    final_contexts.extend(obj.clone());
+                }
+            }
+        }
+        
+        Ok(json!({ "context": final_contexts }))
     }
 
     // --- Ported from Python (search_engine.py) ---
