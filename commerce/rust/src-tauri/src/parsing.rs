@@ -218,49 +218,40 @@ Language: {LANGUAGE}"###;
 }
 
 pub fn para2graph(language: &str) -> String {
-    let template = r###"
-[TASK]
-Segment the natural language text into typed contexts for a knowledge graph.
-
-[SCHEMA DEFINITIONS]
-- language: ISO code (e.g., '{LANGUAGE}')
-- type: One of ['sales', 'order', 'goods', 'tracking', 'view', 'review', 'coupon', 'event']. If unclear, use ''.
-- text: The segmented text content relevant to that type.
-
-[OUTPUT FORMAT]
-Return valid JSON only.
-{
-    "context": [
-        {
-            "language": "{LANGUAGE}",
-            "type": "string",
-            "text": "string"
-        }
-    ]
-}"###;
-    template.replace("{LANGUAGE}", language)
+    format!(r###"convert the natural language content to fit the dataset JSON structure. no explanation.
+	{{ 
+		"context" : [
+			{{
+				"language" : "{}",
+				"type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
+				"text": "Segment the natural language content into single-type contexts"
+			}}
+		]
+	}}"###, language)
 }
 
 pub fn graph2contexts(current: &str) -> String {
-    let template = r###"
-[TASK]
-Analyze the natural language content and extract structured context data.
-
-[SCHEMA DEFINITIONS]
-- #date: Extract date/time relative to current time ({CURRENT}) and region. Format: 'YYYY-MM-DDTHH:mm:ss'. Null if absent.
-- #status: One of ['progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'].
-- #substantial: Key attribute mentioned. One of ['size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per', ''].
-- #find: Quantity/Intensity. One of ['many', 'few', 'much', 'little', 'heavy', 'light', ''].
-
-[OUTPUT FORMAT]
-Return valid JSON only.
-{
-    "date": "string or null",
-    "status": "string",
-    "substantial": "string",
-    "find": "string"
-}"###;
-    template.replace("{CURRENT}", current)
+    format!(r###"convert the natural language content to fit the dataset JSON structure. no explanation.
+	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({}); it will be marked as null if a value is absent
+	# #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
+	# #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
+	# #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
+    {{
+        "context": [
+            {{
+                "type": "string",
+                "text": "string",
+                "status": "string or null",
+                "substantial": "string or null",
+                "find": "string or null",
+                "condition" : {{
+                    "date": {{ "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" }},
+                    "quantity": {{ "eq": number, "lte": number, "gte": number }},
+                    "price": {{ "currency": "string", "eq": number, "lte": number, "gte": number }}
+                }}
+            }}
+        ]
+    }}"###, current)
 }
 
 pub fn item2json(page_type: &str, href: &str, _language: &str) -> Vec<(String, String)> {

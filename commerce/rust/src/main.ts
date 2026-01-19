@@ -169,13 +169,43 @@ searchInput?.addEventListener("focus", () => {
 
 searchInput?.addEventListener("input", () => {
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
-    searchDebounceTimer = window.setTimeout(() => {
+    searchDebounceTimer = window.setTimeout(async () => {
         const keyword = searchInput.value.toLowerCase();
-        filterListLocally(keyword);
-    }, 1000);
+        if (!keyword) {
+            refreshList();
+            return;
+        }
+        
+        // --- REAL-TIME VECTOR FILTERING ---
+        try {
+            const results = await invoke<[string, string, number][]>("search_documents", { query: keyword });
+            // Update table with matches
+            if (docTableBody) {
+                docTableBody.innerHTML = "";
+                if (results.length === 0) {
+                    docTableBody.innerHTML = "<tr><td colspan='4' style='text-align:center; padding:20px;'>No AI matches.</td></tr>";
+                } else {
+                    // Try to find full doc info from cachedDocs or just render what we have
+                    results.forEach(([id, text, score]) => {
+                        const tr = document.createElement("tr");
+                        tr.style.cursor = "pointer";
+                        tr.innerHTML = `<td style='text-align:center;'>✨</td><td>Result</td><td title="${text}">${id.slice(0,8)}...</td><td>${score.toFixed(2)}</td>`;
+                        tr.addEventListener("click", () => showDetail(id));
+                        docTableBody.appendChild(tr);
+                    });
+                }
+            }
+        } catch (e) { console.error("Filter error:", e); }
+    }, 800);
 });
 
-// SUBMIT: Regular Search + AI
+searchInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+        btnSubmit?.click();
+    }
+});
+
+// SUBMIT: Complex AI Search (para2graph + graph2contexts)
 btnSubmit?.addEventListener("click", async () => {
     const query = searchInput.value;
     if (!query) return;
@@ -183,20 +213,45 @@ btnSubmit?.addEventListener("click", async () => {
     openWidget("list"); 
     if (aiResultsArea && aiResultsContent) {
         aiResultsArea.style.display = "block";
-        aiResultsTitle.innerText = "🔍 AI Search Results";
-        aiResultsContent.innerHTML = "🔍 AI Searching documents...";
+        aiResultsTitle.innerText = "🧠 AI Deep Analysis";
+        aiResultsContent.innerHTML = "<div class='spinner'></div> 🤖 Thinking and analyzing your query...";
+        
         try {
-            const results = await invoke<[string, string, number][]>("search_documents", { query: query });
-            if(results.length === 0) aiResultsContent.innerHTML = "No AI matches found.";
-            else {
-                aiResultsContent.innerHTML = results.map(([_, text, score]) => 
-                    `<div style="border-bottom:1px solid #444; padding:6px 0;">
-                       <strong style="color:var(--primary)">${score.toFixed(2)}</strong> ${text}
+            const response = await invoke<any>("ai_search_complex", { query: query, language: "korean" });
+            
+            // Render Structured Context
+            let html = `<div style="margin-bottom:15px; padding:10px; background:#222; border-left:3px solid var(--primary); font-size:0.75rem;">
+                <strong style="display:block; margin-bottom:5px; color:#aaa;">Query Intent:</strong>`;
+            
+            if (response.structured && response.structured.context) {
+                response.structured.context.forEach((ctx: any) => {
+                    html += `<div style="margin-bottom:5px;">• ${ctx.text} <span style="color:var(--primary)">[${ctx.type}]</span></div>`;
+                });
+            }
+            html += `</div>`;
+
+            // Render Results
+            if(response.results.length === 0) {
+                html += "No matching data found for these contexts.";
+            } else {
+                html += response.results.map((res: any) => 
+                    `<div style="border-bottom:1px solid #333; padding:8px 0;">
+                       <div style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                         <strong style="color:var(--primary)">${res.context_type} (Score: ${res.score.toFixed(2)})</strong>
+                         <button class="link-btn" onclick="document.dispatchEvent(new CustomEvent('show-doc', {detail:'${res.id}'}))">View Detail</button>
+                       </div>
+                       <div style="color:#ddd; line-height:1.4;">${res.text}</div>
                      </div>`
                 ).join("");
             }
-        } catch(e) { aiResultsContent.innerHTML = "Error: " + e; }
+            aiResultsContent.innerHTML = html;
+        } catch(e) { aiResultsContent.innerHTML = "<div style='color:#ef4444;'>AI Analysis Error: " + e + "</div>"; }
     }
+});
+
+// Add global listener for View Detail button in AI results
+document.addEventListener('show-doc', (e: any) => {
+    showDetail(e.detail);
 });
 
 // EXTRACT: Image or Browser Task

@@ -116,87 +116,7 @@ async fn check_available_browsers() -> Vec<automation::BrowserStatus> {
     automation::get_available_browsers()
 }
 
-// --- Helper to Generate Rich Summary (Fully Ported from logic.py) ---
-fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
-    let type_map = json!({
-        "CI": "Commercial Invoice", "PI": "Proforma Invoice", "PL": "Packing List",
-        "BL": "Bill of Lading", "AWB": "Air Waybill", "CO": "Certificate of Origin", "LC": "Letter of Credit"
-    });
-    
-    let full_type = type_map.get(doc_type).and_then(|s| s.as_str()).unwrap_or(doc_type);
-    let mut parts = vec![format!("This is a {} document.", full_type)];
-
-    if let Some(h) = data.get("header") {
-        if let Some(no) = h.get("document_number").and_then(|s| s.as_str()) {
-            if no != "N/A" && !no.is_empty() {
-                parts.push(format!("Document number is {}.", no));
-            }
-        }
-        if let Some(date) = h.get("issue_date").and_then(|s| s.as_str()) {
-            if date != "N/A" && !date.is_empty() {
-                parts.push(format!("Issued on {}.", date));
-            }
-        }
-    }
-
-    if let Some(p) = data.get("parties") {
-        let sup = p.get("supplier_name").and_then(|s| s.as_str());
-        let buy = p.get("buyer_name").and_then(|s| s.as_str());
-        
-        // Clean check
-        let has_sup = sup.is_some() && sup.unwrap() != "N/A";
-        let has_buy = buy.is_some() && buy.unwrap() != "N/A";
-
-        if has_sup && has_buy {
-            parts.push(format!("Transaction involved {} as the supplier/shipper and {} as the buyer/consignee.", sup.unwrap(), buy.unwrap()));
-        } else if has_sup {
-            parts.push(format!("Supplier/Shipper is {}.", sup.unwrap()));
-        } else if has_buy {
-            parts.push(format!("Buyer/Consignee is {}.", buy.unwrap()));
-        }
-    }
-
-    if let Some(f) = data.get("financials") {
-        if let Some(amt) = f.get("amount_total") {
-             // Handle number or string
-             let amt_str = if amt.is_number() { amt.to_string() } else { amt.as_str().unwrap_or("0").to_string() };
-             let curr = f.get("currency_code").and_then(|s| s.as_str()).unwrap_or("USD");
-             if amt_str != "0" && amt_str != "0.0" {
-                 parts.push(format!("Total amount is {} {}.", amt_str, curr));
-             }
-        }
-    }
-
-    if let Some(l) = data.get("logistics") {
-        let pol = l.get("location_port_of_loading").and_then(|s| s.as_str());
-        let pod = l.get("location_port_of_discharge").and_then(|s| s.as_str());
-        
-        if let (Some(o), Some(d)) = (pol, pod) {
-            if o != "N/A" && d != "N/A" {
-                parts.push(format!("Shipped from {} to {}.", o, d));
-            }
-        }
-        
-        if let Some(mode) = l.get("transport_mode").and_then(|s| s.as_str()) {
-            parts.push(format!("Transport mode is {}.", mode));
-        }
-    }
-
-    // Items summary (First 5 items)
-    if let Some(items) = data.get("line_items").and_then(|v| v.as_array()) {
-        let mut item_descs = Vec::new();
-        for item in items.iter().take(5) {
-            if let Some(d) = item.get("description").and_then(|s| s.as_str()) {
-                if d.len() > 3 { item_descs.push(d); }
-            }
-        }
-        if !item_descs.is_empty() {
-            parts.push(format!("Contains items: {}.", item_descs.join(", ")));
-        }
-    }
-    
-    parts.join(" ")
-}
+// --- Helper to Generate Rich Summary (Moved to model.rs) ---
 
 #[tauri::command]
 async fn summarize_image(
@@ -247,30 +167,21 @@ async fn search_documents(
     let mut store_guard = state.store.lock().await;
     if store_guard.is_none() {
         let db_path = "data/lancedb";
-        let _ = std::fs::create_dir_all(db_path);
         match VectorStore::new(db_path).await {
-            Ok(s) => {
-                let _ = s.init_task_table().await;
-                let _ = s.init_all_tables().await;
-                *store_guard = Some(s);
-            },
+            Ok(s) => { *store_guard = Some(s); },
             Err(e) => return Err(format!("Failed to load DB: {}", e)),
         }
     }
     
-    // 1. Get Model Access
     let model_guard = state.model.lock().await;
-    
-    // Get Embedding for Query
     let query_vec = if let Some(model) = model_guard.as_ref() {
         model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768])
     } else {
         vec![0.0; 768]
     };
 
-    // Search
     if let Some(store) = store_guard.as_ref() {
-        store.search_items("commerce_items", query_vec, 10).await.map_err(|e| e.to_string())
+        store.search_items("commerce_items", &query, query_vec, 10).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }
@@ -318,6 +229,58 @@ async fn delete_documents(
     _uuids: Vec<String>,
 ) -> Result<String, String> {
     Ok("Not implemented".to_string())
+}
+
+#[tauri::command]
+async fn ai_search_complex(
+    state: State<'_, AppState>,
+    query: String,
+    language: String,
+) -> Result<Value, String> {
+    let mut model_guard = state.model.lock().await;
+    if model_guard.is_none() {
+        if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
+        else { return Err("Failed to load model".to_string()); }
+    }
+    let model = model_guard.as_ref().unwrap();
+
+    // 1. Structured Parse (Para2Graph -> Graph2Contexts)
+    let structured_query = model.parse_query_structured(query.clone(), &language).await.map_err(|e| e.to_string())?;
+    
+    // 2. Perform searches for each segment
+    let mut all_results = Vec::new();
+    let mut store_guard = state.store.lock().await;
+    if store_guard.is_none() {
+        let db_path = "data/lancedb";
+        if let Ok(s) = VectorStore::new(db_path).await {
+            let _ = s.init_all_tables().await;
+            *store_guard = Some(s);
+        }
+    }
+
+    if let (Some(store), Some(ctx_arr)) = (store_guard.as_ref(), structured_query.get("context").and_then(|v| v.as_array())) {
+        for ctx in ctx_arr {
+            let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() { continue; }
+            
+            let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
+            if let Ok(results) = store.search_items("commerce_items", text, emb, 5).await {
+                for (id, content, score) in results {
+                    all_results.push(json!({
+                        "id": id,
+                        "text": content,
+                        "score": score,
+                        "context_type": ctx.get("type")
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "structured": structured_query,
+        "results": all_results
+    }))
 }
 
 #[tauri::command]
@@ -587,6 +550,8 @@ pub fn run() {
             check_query_intent,
 
             deep_research_command,
+
+            ai_search_complex,
 
             launch_browser,
 

@@ -210,9 +210,12 @@ impl VectorStore {
 
         for table_name in tables {
             let batches = RecordBatchIterator::new(vec![], schema.clone());
-            let _ = self.conn.create_table(table_name, batches)
+            let table = self.conn.create_table(table_name, batches)
                 .execute()
-                .await;
+                .await?;
+            
+            // Create FTS index on 'text' column
+            let _ = table.create_index(&["text"], lancedb::index::Index::FullText).execute().await;
         }
         Ok(())
     }
@@ -254,11 +257,35 @@ impl VectorStore {
          Ok(())
     }
     
-    pub async fn search_items(&self, table_name: &str, query_vec: Vec<f32>, limit: usize) -> Result<Vec<(String, String, f32)>> {
+    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize) -> Result<Vec<(String, String, f32)>> {
          let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
          let table = self.conn.open_table(target_table).execute().await?;
          
-         let results = table.query()
+         let mut combined_results = std::collections::HashMap::new();
+
+         // 1. FULL TEXT SEARCH (Keyword Match)
+         if !query_text.is_empty() {
+             // Handle basic sanitization for MATCH query (replace quotes)
+             let clean_query = query_text.replace("'", "''");
+             if let Ok(fts_results) = table.query()
+                .only_if(format!("text MATCH '{}'", clean_query))
+                .limit(limit)
+                .execute()
+                .await {
+                    if let Ok(batches) = fts_results.try_collect::<Vec<_>>().await {
+                        for batch in batches {
+                            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                            let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+                            for i in 0..batch.num_rows() {
+                                combined_results.insert(ids.value(i).to_string(), (texts.value(i).to_string(), 1.0)); // High score for FTS hit
+                            }
+                        }
+                    }
+                }
+         }
+
+         // 2. VECTOR SEARCH (Semantic Match)
+         let vector_results = table.query()
             .limit(limit)
             .nearest_to(query_vec)?
             .execute()
@@ -266,17 +293,25 @@ impl VectorStore {
             .try_collect::<Vec<_>>()
             .await?;
             
-         let mut items = Vec::new();
-         for batch in results {
+         for batch in vector_results {
              let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
              let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-             
              for i in 0..batch.num_rows() {
-                 items.push((ids.value(i).to_string(), texts.value(i).to_string(), 0.0));
+                 let id = ids.value(i).to_string();
+                 // If already in FTS, maybe add score, otherwise insert
+                 if let Some((_, score)) = combined_results.get_mut(&id) {
+                     *score += 0.5; // Boost if both match
+                 } else {
+                     combined_results.insert(id, (texts.value(i).to_string(), 0.5));
+                 }
              }
          }
          
-         Ok(items)
+         let mut final_list: Vec<_> = combined_results.into_iter().map(|(id, (txt, score))| (id, txt, score)).collect();
+         // Sort by score descending
+         final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+         
+         Ok(final_list)
     }
 
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
