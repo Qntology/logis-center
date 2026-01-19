@@ -285,22 +285,10 @@ async fn ai_search_complex(
 
 #[tauri::command]
 async fn check_query_intent(
-    state: State<'_, AppState>,
-    query: String,
+    _state: State<'_, AppState>,
+    _query: String,
 ) -> Result<String, String> {
-    let mut model_guard = state.model.lock().await;
-    if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(None).await {
-            *model_guard = Some(m);
-        } else {
-            return Err("Failed to load model".to_string());
-        }
-    }
-    if let Some(model) = model_guard.as_ref() {
-        model.parse_query_intent(query, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
-    } else {
-        Err("Model not initialized".to_string())
-    }
+    Ok("SEARCH".to_string())
 }
 
 #[tauri::command]
@@ -338,7 +326,7 @@ async fn deep_research_command(
     if let Some(store) = store_guard.as_ref() {
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
-        if let Ok(results) = store.search_items("commerce_items", emb, 3).await {
+        if let Ok(results) = store.search_items("commerce_items", &query, emb, 3).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
