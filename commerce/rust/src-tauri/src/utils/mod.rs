@@ -112,8 +112,8 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                     return DeviceConfig {
                         device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
                         is_cpu: false,
-                        classify_chunk_size: 30_000, // Large chunk for speed
-                        extract_chunk_size: 30_000,
+                        classify_chunk_size: 28_000, // Maximized for ~8000 tokens (4x base)
+                        extract_chunk_size: 28_000,
                         name: format!("GPU-{}", best_id),
                     };
                 } else if max_free > 0 {
@@ -121,8 +121,8 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                      return DeviceConfig {
                         device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
                         is_cpu: false,
-                        classify_chunk_size: 15_000, 
-                        extract_chunk_size: 10_000,
+                        classify_chunk_size: 14_000, // Maximized for ~4000 tokens (2x base)
+                        extract_chunk_size: 14_000,  
                         name: format!("GPU-{}-LowMem", best_id),
                     };
                 }
@@ -134,8 +134,8 @@ pub fn get_optimal_device_config() -> DeviceConfig {
     DeviceConfig {
         device: Device::Cpu,
         is_cpu: true,
-        classify_chunk_size: 8_000,  // ~2.5k tokens
-        extract_chunk_size: 6_000,   // ~1.8k tokens
+        classify_chunk_size: 7_000,  // Maximized for ~2000 tokens (limit)
+        extract_chunk_size: 7_000,   
         name: "CPU".to_string(),
     }
 }

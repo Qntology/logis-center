@@ -282,27 +282,55 @@ impl EmbeddingModel {
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let tokens = self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?;
-        let mut token_ids = tokens.get_ids().to_vec();
+        let token_ids = tokens.get_ids();
         
         if token_ids.is_empty() { return Ok(vec![0.0; 768]); }
 
-        // Truncate to max_position_embeddings (2048 for gemma-300m)
-        if token_ids.len() > 2048 {
-            token_ids.truncate(2048);
+        // Use a safe chunk size (e.g., 2000) slightly less than 2048 to allow for potential overhead
+        let chunk_size = 2000;
+        let chunks: Vec<&[u32]> = token_ids.chunks(chunk_size).collect();
+        
+        let mut accumulated_vector = vec![0.0; 768];
+        let mut total_chunks = 0.0;
+
+        for chunk in chunks {
+            // Pass Rank 1 Tensor [seq_len]
+            let input_tensor = Tensor::new(chunk, &self.device).map_err(anyhow::Error::msg)?;
+            let hidden_states = self.model.forward(&input_tensor).map_err(anyhow::Error::msg)?;
+            
+            let (_b, s, _h) = hidden_states.dims3().map_err(anyhow::Error::msg)?;
+            let sum = hidden_states.sum(1).map_err(anyhow::Error::msg)?; 
+            let mean = (sum / (s as f64)).map_err(anyhow::Error::msg)?;
+            
+            // Normalize the chunk vector
+            let norm = mean.sqr().map_err(anyhow::Error::msg)?.sum_all().map_err(anyhow::Error::msg)?.sqrt().map_err(anyhow::Error::msg)?;
+            let normalized = mean.broadcast_div(&norm).map_err(anyhow::Error::msg)?;
+            
+            let vec: Vec<f32> = normalized.flatten_all().map_err(anyhow::Error::msg)?.to_vec1().map_err(anyhow::Error::msg)?;
+            
+            // Accumulate
+            for (i, val) in vec.iter().enumerate() {
+                accumulated_vector[i] += val;
+            }
+            total_chunks += 1.0;
         }
-        
-        // Pass Rank 1 Tensor [seq_len]
-        let input_tensor = Tensor::new(token_ids.as_slice(), &self.device).map_err(anyhow::Error::msg)?;
-        let hidden_states = self.model.forward(&input_tensor).map_err(anyhow::Error::msg)?;
-        
-        let (_b, s, _h) = hidden_states.dims3().map_err(anyhow::Error::msg)?;
-        let sum = hidden_states.sum(1).map_err(anyhow::Error::msg)?; 
-        let mean = (sum / (s as f64)).map_err(anyhow::Error::msg)?;
-        
-        let norm = mean.sqr().map_err(anyhow::Error::msg)?.sum_all().map_err(anyhow::Error::msg)?.sqrt().map_err(anyhow::Error::msg)?;
-        let normalized = mean.broadcast_div(&norm).map_err(anyhow::Error::msg)?;
-        
-        let vec: Vec<f32> = normalized.flatten_all().map_err(anyhow::Error::msg)?.to_vec1().map_err(anyhow::Error::msg)?;
-        Ok(vec)
+
+        // Average Pooling
+        if total_chunks > 0.0 {
+            for val in accumulated_vector.iter_mut() {
+                *val /= total_chunks;
+            }
+            
+            // Re-normalize the final averaged vector (Optional but recommended for cosine similarity)
+            let sum_sq: f32 = accumulated_vector.iter().map(|v| v * v).sum();
+            let norm = sum_sq.sqrt();
+            if norm > 1e-6 {
+                for val in accumulated_vector.iter_mut() {
+                    *val /= norm;
+                }
+            }
+        }
+
+        Ok(accumulated_vector)
     }
 }
