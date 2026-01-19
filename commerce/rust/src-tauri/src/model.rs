@@ -202,21 +202,22 @@ impl LogisModel {
                  if detected_vram < 6_000_000_000 {
                      let mut sys = System::new_all();
                      sys.refresh_memory();
-                     let avail_ram = sys.available_memory(); // Bytes
+                     let total_ram = sys.total_memory();
+                     let avail_ram = sys.available_memory(); 
                      
-                     // Reserve 1GB for OS + 1GB for other apps = 2GB total safe buffer
-                     let safe_buffer = 2_000_000_000; 
+                     // Dynamic Safe Buffer: 10% of TOTAL RAM
+                     let safe_buffer = total_ram / 10; 
                      let usable_for_kv = avail_ram.saturating_sub(safe_buffer) as f64;
                      
                      // 180KB per token estimate
                      let ram_based_limit = usable_for_kv / 180_000.0;
                      
-                     // Minimum 4096 for Pug context, Max 32k
+                     // Ensure at least 4096 context, Max 32k
                      let final_limit = ram_based_limit.clamp(4096.0, 32768.0); 
                      
-                     println!("[CONFIG] Low VRAM (<6GB). Using System RAM Strategy.");
-                     println!("[CONFIG] Sys RAM: Available {:.2} GB | Usable(minus 2GB): {:.2} GB | Calc Limit: {}", 
-                        avail_ram as f64/1e9, usable_for_kv/1e9, final_limit);
+                     println!("[CONFIG] Low VRAM (<6GB). Using Dynamic System RAM Strategy.");
+                     println!("[CONFIG] Total RAM: {:.2} GB | Avail: {:.2} GB | Buffer(10%): {:.2} MB | Limit: {}", 
+                        total_ram as f64/1e9, avail_ram as f64/1e9, safe_buffer as f64/1e6, final_limit);
                         
                      final_limit as u32
                  } else {

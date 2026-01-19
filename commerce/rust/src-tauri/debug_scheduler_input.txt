@@ -1,9 +1,9 @@
 <!DOCTYPE html><html lang="ko"><head>
 <meta charset="utf-8">
 <title>관리자 페이지</title>
-<link rel="stylesheet" href="http://demofran.com/admin/css/admin.css?ver=20260119100058">
+<link rel="stylesheet" href="http://demofran.com/admin/css/admin.css?ver=20260119104109">
 <link type="text/css" href="//ajax.googleapis.com/ajax/libs/jqueryui/1.8.17/themes/base/jquery-ui.css" rel="stylesheet">
-<link type="text/css" href="http://demofran.com/plugin/jquery-ui/style.css?ver=20260119100058">
+<link type="text/css" href="http://demofran.com/plugin/jquery-ui/style.css?ver=20260119104109">
 <link rel="shortcut icon" href="http://demofran.com/data/banner/NH1d4b424pD9mLSHg13Z3mc3BS2NMw.ico" type="image/x-icon">
 
 
@@ -20,7 +20,7 @@
 		<div id="tnb">
 			<ul>
 				<li>분양몰 v2.4.2</li>
-				<li>오늘:178, 어제:337, 최대:1622, 전체:124462</li>
+				<li>오늘:192, 어제:337, 최대:1622, 전체:124476</li>
 				
 				<li><a href="http://demofran.com/admin/config.php?code=super">관리자정보</a></li>
 				<li><a href="http://demofran.com/admin/">관리자홈</a></li>

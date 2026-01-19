@@ -1,0 +1,36 @@
+[PART 8]
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                    th
+                                    td
+                                        select
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                tr
+                                    th
+                                    td
+                                        select#q_stock_field
+                                            option
+                                            option
+                                        label.sound_only
+                                        input#fr_stock.frm_input
+                                        label.sound_only
+                                        input#to_stock.frm_input
+                                    th
+                                    td
+                                        select#q_price_field
+
+
+[INSTRUCTION]
+Continue reading and memorizing. Just say "ACKNOWLEDGED".

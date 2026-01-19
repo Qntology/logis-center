@@ -1,0 +1,36 @@
+[PART 16]
+                                    td.tal.txt_succeed
+                                        span.fsitem
+                                    td.fc_00f
+                                    td
+                                        span.txt_false
+                                tr.list0
+                                    td
+                                        input
+                                        input
+                                    td
+                                    td
+                                        a(href='http://demofran.com/shop/view.php?index_no=11')
+                                            img
+                                    td
+                                    td.tal
+                                    td
+                                    td
+                                    td.tar
+                                    td.tar
+                                    td.tar
+                                    td.tar
+                                    td
+                                        input.frm_input
+                                    td
+                                        a.btn_small(href='./goods.php?code=form&w=u&gs_id=11&page=1&bak=list')
+                                tr.list0.rows
+                                    td.fc_00f
+                                    td.tal.txt_succeed
+                                    td.tal.txt_succeed
+                                        span.fsitem
+                                    td.fc_00f
+
+
+[INSTRUCTION]
+Continue reading and memorizing. Just say "ACKNOWLEDGED".

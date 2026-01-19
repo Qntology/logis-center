@@ -1,0 +1,35 @@
+[PART 6]
+                                tr
+                                    th
+                                    td
+                                        select#sel_ca1
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                        select#sel_ca2
+                                            option
+                                        select#sel_ca3
+                                            option
+                                        select#sel_ca4
+                                            option
+                                        select#sel_ca5
+                                            option
+                                tr
+                                    th
+                                    td
+                                        select#q_date_field
+                                            option
+                                            option
+                                        label.sound_only
+                                        input#fr_date.frm_input.hasDatepicker.w80
+                                        label.sound_only
+
+
+[INSTRUCTION]
+Continue reading and memorizing. Just say "ACKNOWLEDGED".

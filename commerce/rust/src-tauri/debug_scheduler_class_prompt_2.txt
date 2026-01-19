@@ -1,0 +1,36 @@
+[PART 3]
+                    a(href='http://demofran.com/admin/goods.php?code=type')
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=brand_list')
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=plan')
+                dt.g20.menu_toggle
+                dd.g20
+                    a(href='http://demofran.com/admin/goods.php?code=stock')
+                        em
+                dd.g20
+                    a(href='http://demofran.com/admin/goods.php?code=optstock')
+                        em
+                dt.g30.menu_toggle
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=xls_reg')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=xls_option_reg')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=xls_mod')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=getprice')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=getpoint')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=getuse')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=getmove')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=getbrand')
+                dd.g30
+                    a(href='http://demofran.com/admin/goods.php?code=getdelivery')
+
+
+[INSTRUCTION]
+Continue reading and memorizing. Just say "ACKNOWLEDGED".

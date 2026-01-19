@@ -1,0 +1,38 @@
+[PART 2]
+                    li.gnb_1dli
+                        a.gnb_1da(href='http://demofran.com/admin/order.php?code=list')
+                    li.gnb_1dli
+                        a.gnb_1da(href='http://demofran.com/admin/visit.php?code=hour')
+                    li.gnb_1dli
+                        a.gnb_1da(href='http://demofran.com/admin/help.php?code=qa')
+                    li.gnb_1dli
+                        a.gnb_1da(href='http://demofran.com/admin/design.php?code=banner_list')
+                    li.gnb_1dli
+                        a.gnb_1da(href='http://demofran.com/admin/config.php?code=default')
+    div#wrapper
+        div#snb
+            div.ico_config.snb_header
+                h2
+                    i.ion-bag.ionicons
+            dl
+                dt.g10.menu_toggle
+                dd.active.g10
+                    a(href='http://demofran.com/admin/goods.php?code=list')
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=supply')
+                        em
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=supply2')
+                        em
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=userlist')
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=type')
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=brand_list')
+                dd.g10
+                    a(href='http://demofran.com/admin/goods.php?code=plan')
+
+
+[INSTRUCTION]
+Continue reading and memorizing. Just say "ACKNOWLEDGED".

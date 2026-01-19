@@ -1,0 +1,32 @@
+[PART 7]
+                                            option
+                                            option
+                                        label.sound_only
+                                        input#fr_date.frm_input.hasDatepicker.w80
+                                        label.sound_only
+                                        input#to_date.frm_input.hasDatepicker.w80
+                                        span.btn_group
+                                            input.btn_small.white
+                                            input.btn_small.white
+                                            input.btn_small.white
+                                            input.btn_small.white
+                                            input.btn_small.white
+                                            input.btn_small.white
+                                            input.btn_small.white
+                                tr
+                                    th
+                                    td
+                                        select
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+                                            option
+
+
+[INSTRUCTION]
+Continue reading and memorizing. Just say "ACKNOWLEDGED".
