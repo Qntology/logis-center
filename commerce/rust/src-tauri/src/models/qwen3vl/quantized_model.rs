@@ -745,8 +745,8 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         // [AGGRESSIVE] For Head, use minimal margins to avoid Split-Brain performance penalty
-                         let min_absolute_margin = 100_000_000; // 100MB
+                         // [AGGRESSIVE] For Head, use very minimal margins to avoid Split-Brain performance penalty
+                         let min_absolute_margin = 50_000_000; // 50MB (Lowered from 100MB)
                          let fluid_margin = (mem.free as f64 * 0.01) as u64; // 1%
                          let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
                          

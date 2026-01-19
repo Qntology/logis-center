@@ -345,7 +345,7 @@ async fn process_task(
         }
     }
 
-    let classify_chunks = chunk_text(&light_pug, 4000, 500);
+    let classify_chunks = chunk_text(&light_pug, 1500, 300);
     let classify_chunks_len = classify_chunks.len();
     
     if let Some(model) = model_guard.as_ref() {
@@ -743,7 +743,7 @@ Continue reading and memorizing. Just say "ACKNOWLEDGED"."#,
         let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
         let _ = std::fs::write("debug_scheduler_pug_detail.txt", &content_pug); // DEBUG
         
-        let chunks = chunk_text(&content_pug, 3000, 500); 
+        let chunks = chunk_text(&content_pug, 1500, 300); 
         let fields_prompts = parsing::item2json(page_type, &url, language);
         let detail_session_id = format!("{}_detail", task.id);
         let chunks_len = chunks.len();

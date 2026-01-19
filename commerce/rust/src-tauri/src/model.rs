@@ -204,8 +204,8 @@ impl LogisModel {
                      sys.refresh_memory();
                      let avail_ram = sys.available_memory(); // Bytes
                      
-                     // Reserve 2GB for OS/App + 2GB for Model Weights (Fallback)
-                     let safe_buffer = 4_000_000_000; 
+                     // Reserve 1GB for OS + 1GB for other apps = 2GB total safe buffer
+                     let safe_buffer = 2_000_000_000; 
                      let usable_for_kv = avail_ram.saturating_sub(safe_buffer) as f64;
                      
                      // 180KB per token estimate
@@ -215,7 +215,7 @@ impl LogisModel {
                      let final_limit = ram_based_limit.clamp(4096.0, 32768.0); 
                      
                      println!("[CONFIG] Low VRAM (<6GB). Using System RAM Strategy.");
-                     println!("[CONFIG] Sys RAM: Available {:.2} GB | Usable(minus 4GB): {:.2} GB | Calc Limit: {}", 
+                     println!("[CONFIG] Sys RAM: Available {:.2} GB | Usable(minus 2GB): {:.2} GB | Calc Limit: {}", 
                         avail_ram as f64/1e9, usable_for_kv/1e9, final_limit);
                         
                      final_limit as u32
