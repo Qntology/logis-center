@@ -378,8 +378,11 @@ Just say "ACKNOWLEDGED"."#,
                     &prompt,
                     &app_handle_clone, 
                     "extraction-progress", 
-                    json!({ "category": "Classification Ingestion" }), 
-                    20, // Minimal tokens
+                    json!({ 
+                        "category": "Classification Ingestion",
+                        "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len)
+                    }), 
+                    16, // Reduced from 20 to 16 for even faster ACKs
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
                 ) => { res?; },

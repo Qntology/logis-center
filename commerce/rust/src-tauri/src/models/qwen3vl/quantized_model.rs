@@ -67,14 +67,15 @@ impl QLinear {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // Auto-move input to this layer's device
+        // [OPTIMIZATION] Seamless Device Transfer
+        // If input tensor is on a different device than this layer, move it.
+        // This is the core of Layer-wise Offloading.
         let xs = if !xs.device().same_device(&self.device) {
             xs.to_device(&self.device)?
         } else {
-            xs.clone() // QMatMul likely needs owned or cow, but here we clone for safety
+            xs.clone()
         };
 
-        // QMatMul typically expects F32 input and 2D shape [tokens, hidden]
         let xs_f32 = xs.to_dtype(DType::F32)?;
         let (b, s, h) = xs_f32.dims3()?;
         let xs_f32_flat = xs_f32.reshape((b * s, h))?;
@@ -82,7 +83,6 @@ impl QLinear {
         let out = self.inner.forward(&xs_f32_flat)?;
         let out = out.reshape((b, s, ()))?;
         
-        // Cast back to target dtype (from bias if available, else xs dtype)
         let target_dtype = self.bias.as_ref().map(|b| b.dtype()).unwrap_or(xs.dtype());
         let out = out.to_dtype(target_dtype)?;
 
@@ -434,15 +434,17 @@ impl QuantizedQwen3VLTextModel {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
                          
-                         // USER REQUIREMENT: Reserve 10% of *currently available* fluid resources
-                         // OR a minimum of 300MB (System/Display overhead) to prevent runtime OOM.
-                         // PLUS the guaranteed space for KV Cache (calculated from max_tokens)
-                         let min_absolute_margin = 300_000_000;
-                         let fluid_margin = (mem.free as f64 * 0.10) as u64;
-                         safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
+                         // DYNAMIC RESOURCE ALLOCATION:
+                         // 1. Minimum OS/Display Reserve: 5% of Total VRAM
+                         // 2. Variable Safety Margin: 10% of Current Free VRAM
+                         // 3. User Guaranteed KV Reserve
+                         let total_vram = mem.total;
+                         let os_reserve = (total_vram as f64 * 0.05) as u64; // 5% of total
+                         let fluid_margin = (mem.free as f64 * 0.10) as u64; // 10% of current free
+                         safety_floor = os_reserve.max(fluid_margin) + kv_reserve;
 
-                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Floor(Max(10%,300MB)+KV): {:.2} MB. Cost/Layer: {:.2} MB", 
-                            mem.total as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
+                         println!("[VRAM-BUDGET] Total: {:.2} GB, Free: {:.2} GB. Dynamic Floor: {:.2} MB. Layer Cost: {:.2} MB", 
+                            total_vram as f64/1e9, mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
                      }
                  }
              }
@@ -660,10 +662,11 @@ impl QuantizedQwen3VLModel {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(0) {
                      if let Ok(mem) = dev.memory_info() {
-                         // Fluid Safety Floor: 10% of Current Free OR 300MB min + KV Reserve
-                         let min_absolute_margin = 300_000_000;
-                         let fluid_margin = (mem.free as f64 * 0.10) as u64;
-                         let safety_floor = fluid_margin.max(min_absolute_margin) + kv_reserve;
+                         // DYNAMIC RESOURCE ALLOCATION (Vision):
+                         // Reserve 5% of Total VRAM for OS, then check if weights fit in 90% of current free space
+                         let total_vram = mem.total;
+                         let os_reserve = (total_vram as f64 * 0.05) as u64;
+                         let safety_floor = os_reserve + kv_reserve;
                          
                          if mem.free < (vision_total_cost + safety_floor) {
                              println!("[OFFLOAD] Vision Budget Exhausted. Free: {:.2} GB < Cost {:.2} GB + Safety {:.2} GB. Switching Vision to CPU.", 

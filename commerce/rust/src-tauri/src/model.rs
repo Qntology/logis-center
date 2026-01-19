@@ -192,26 +192,39 @@ impl LogisModel {
              let mb_per_1k_tokens = 180.0; 
 
              let limit = if usable_fluid_vram <= 0.0 {
-                 println!("⚠️ [CONFIG] VRAM very tight. Forcing minimal context (1024) to try GPU.");
-                 1024 // Try 1024 anyway instead of 512, trusting chunking
+                 println!("⚠️ [CONFIG] VRAM very tight. Using Layer-wise Offloading to fit model.");
+                 2048 // Trust Offloading, use decent context
              } else {
                  let capacity = (usable_fluid_vram / mb_per_1k_tokens) * 1000.0;
                  
-                 // [Optimization] For < 6GB VRAM, cap context at 2048 to prioritize Layer Offloading to GPU.
-                 // 4096 was causing split-brain (CPU/GPU) slowdown. 2048 ensures full GPU offload.
+                 // [Optimization] For < 6GB VRAM, cap context at 4096. 
+                 // Layer offloading handles the weight overflow.
                  if detected_vram < 6_000_000_000 {
-                     println!("[CONFIG] Low VRAM (<6GB) detected. Capping context to 2048 to force ALL layers onto GPU.");
-                     capacity.clamp(1024.0, 2048.0) as u32
+                     capacity.clamp(2048.0, 4096.0) as u32
                  } else {
-                     capacity.clamp(1024.0, 32768.0) as u32
+                     capacity.clamp(2048.0, 32768.0) as u32
                  }
              };
              
              println!("[CONFIG] Final Context Limit: {}", limit);
              limit
         } else {
-             println!("[CONFIG] CPU Mode or Unknown VRAM. Defaulting to 2048 tokens.");
-             2048
+             // DYNAMIC RAM ALLOCATION (CPU Mode)
+             let mut sys = System::new_all();
+             sys.refresh_memory();
+             let total_ram = sys.total_memory() as f64;
+             let free_ram = sys.available_memory() as f64;
+             
+             // Reserve 15% of Total RAM for System Stability, then use 80% of remaining free RAM
+             let usable_ram_mb = (free_ram - (total_ram * 0.15)).max(0.0) / 1_000_000.0;
+             let mb_per_1k_tokens = 180.0;
+             
+             let limit = ((usable_ram_mb * 0.8) / mb_per_1k_tokens * 1000.0) as u32;
+             let limit = limit.clamp(2048, 16384); // Minimum 2k, Max 16k for CPU stability
+             
+             println!("[CONFIG] CPU Mode Dynamic Limit. Free: {:.2} GB, Usable: {:.2} GB, Result: {} tokens", 
+                free_ram/1e9, usable_ram_mb/1e3, limit);
+             limit
         };
         println!("[CONFIG] Final Token limit set to: {}", max_tokens_limit);
         
