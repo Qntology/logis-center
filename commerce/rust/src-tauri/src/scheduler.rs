@@ -343,29 +343,50 @@ async fn process_task(
         }
     }
     
+    let mut page_type_res = String::new();
+
     // Ingest chunks for Classification
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         for (i, chunk) in classify_chunks.iter().enumerate() {
-            let _is_last = i == classify_chunks_len - 1;
+            let is_last = i == classify_chunks_len - 1;
             
-            // For the last chunk, we don't just "ingest", we ask the question (Step 1)
-            // But actually, it's cleaner to ingest ALL, then ask.
-            // Let's ingest all first.
-            
-            let prompt = format!(
-r#"[CONTEXT]
-You are analyzing the structural skeleton (Pug/Jade) of a trade document to identify its type.
-This is Part {}/{} of the page layout.
+            // Branch prompt based on whether this is the last chunk
+            let (system_text, prompt, max_tokens) = if is_last {
+                (
+                    parsing::page_type_prompt(language),
+                    format!(
+r#"[FINAL CONTEXT]
+This is the last part of the page structure.
+Part {}/{}.
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Identify and memorize the key structural elements (e.g., table headers, titles, logos).
-Do NOT generate JSON yet. Summarize the detected structure in 3-5 keywords and say "READY" for the next part."#,
-                i + 1, classify_chunks_len, chunk
-            );
+Analyze the full structure you have read so far and identify the primary category.
+Return the result in the specified JSON format."#, 
+                        i + 1, classify_chunks_len, chunk
+                    ),
+                    256 // More tokens for the JSON response
+                )
+            } else {
+                (
+                    "".to_string(),
+                    format!(
+r#"[CONTEXT]
+Reading Part {}/{} of the layout.
+
+[INPUT SNIPPET]
+{}
+
+[INSTRUCTION]
+Memorize this structure. Summarize in 3 keywords and say "READY"."#,
+                        i + 1, classify_chunks_len, chunk
+                    ),
+                    32 // Minimal tokens for ACKs
+                )
+            };
             
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Classification Ingestion", 
@@ -375,20 +396,24 @@ Do NOT generate JSON yet. Summarize the detected structure in 3-5 keywords and s
 
             tokio::select!{
                 res = model.chat_with_spinner(
-                    "", // System prompt: Empty to save attention and tokens
+                    &system_text, 
                     &prompt,
                     &app_handle_clone, 
                     "extraction-progress", 
                     json!({ 
                         "category": "Classification Ingestion",
-                        "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len)
+                        "summary": if is_last { "Identifying page type...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
                     }), 
-                    32, // Allow a bit more tokens for structural keywords
+                    max_tokens,
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
                 ) => { 
-                    let res_text = res?; 
-                    println!("[Ingestion Log] Part {}: {}", i + 1, res_text);
+                    let out = res?;
+                    if is_last {
+                        page_type_res = out;
+                    } else {
+                        println!("[Ingestion Log] Part {}: {}", i + 1, out);
+                    }
                 },
                 _ = async {
                     loop {
@@ -401,42 +426,13 @@ Do NOT generate JSON yet. Summarize the detected structure in 3-5 keywords and s
     }
 
     println!("[Scheduler] Checkpoint: Classification Start");
-    let _ = app_handle.emit("extraction-progress", json!({ 
-        "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋"
-    }));
+    if page_type_res.is_empty() {
+        return Ok(());
+    }
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut final_page_info = json!({});
-    
-    // Step 1: Identify Type (Now context is fully loaded in task.id session)
-    let page_type_res = if let Some(model) = model_guard.as_ref() {
-        let system_text = parsing::page_type_prompt(language);
-        let app_handle_clone = app_handle.clone();
-
-        // We send the prompt as a new User message. The context is already in KV cache.
-        // We don't need to re-send the input.
-        let prompt = "Now that you have read the full structure, analyze it and identify the primary category.";
-
-        tokio::select!{
-            res = model.chat_with_spinner(
-                &system_text, // Use system prompt instruction
-                prompt,
-                &app_handle_clone, 
-                "extraction-progress", 
-                json!({ "category": "Classification", "summary": "Identifying page type..." }), 
-                256, 
-                Some(cancellation_token.clone()), 
-                Some(task.id.clone())
-            ) => res?,
-            _ = async {
-                loop {
-                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            } => { return Err(anyhow::anyhow!("Task cancelled")); }
-        }
-    } else { "{}".to_string() };
     
     println!("[Scheduler] Checkpoint: Classification End");
     
