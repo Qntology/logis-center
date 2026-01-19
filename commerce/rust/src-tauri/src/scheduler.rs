@@ -535,37 +535,67 @@ async fn process_task(
         let fields_prompts = parsing::list2json(page_type, language);
         let mut all_extracted_items = Vec::new();
 
-        for (i, item_pug) in item_pugs.iter().enumerate() {
+        // [BATCH OPTIMIZATION] Process 5 items at a time to improve speed and context awareness
+        for chunk in item_pugs.chunks(5) {
             if cancellation_token.load(Ordering::Relaxed) { break; }
             
+            let current_start = all_extracted_items.len() + 1;
+            let current_end = current_start + chunk.len() - 1;
+
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Item Extraction", 
-                "summary": format!("Extracting Item {}/{}...", i + 1, total_items),
+                "summary": format!("Extracting Items {}~{}/{}...", current_start, current_end, total_items),
                 "spinner": "⠋"
             }));
 
-            // Prepare a prompt for a SINGLE item
-            let mut schema_definitions = String::new();
-            for (name, schema) in &fields_prompts {
-                schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
+            // Combine multiple pugs into one prompt
+            let mut combined_pugs = String::new();
+            for (idx, pug) in chunk.iter().enumerate() {
+                combined_pugs.push_str(&format!("\n### ITEM #{} ###\n{}\n", idx + 1, pug));
             }
+
+            // [OPTIMIZATION] Group columns to prevent conflicts (e.g. sale_price vs supply_price)
+            let mut grouped_schema = String::new();
+            let mut identity_fields = Vec::new(); 
+            let mut finance_fields = Vec::new();  
+            let mut logistic_fields = Vec::new(); 
+
+            for (name, schema) in &fields_prompts {
+                let n_lower = name.to_lowercase();
+                if n_lower.contains("price") || n_lower.contains("amount") || n_lower.contains("quantity") || n_lower.contains("currency") {
+                    finance_fields.push((name, schema));
+                } else if n_lower.contains("status") || n_lower.contains("tracking") || n_lower.contains("date") || n_lower.contains("at") {
+                    logistic_fields.push((name, schema));
+                } else {
+                    identity_fields.push((name, schema));
+                }
+            }
+
+            grouped_schema.push_str("GROUP 1: Identity & General\n");
+            for (n, s) in identity_fields { grouped_schema.push_str(&format!("- {}: {}\n", n, s)); }
+            grouped_schema.push_str("\nGROUP 2: Financial & Amounts (Distinguish prices carefully)\n");
+            for (n, s) in finance_fields { grouped_schema.push_str(&format!("- {}: {}\n", n, s)); }
+            grouped_schema.push_str("\nGROUP 3: Status & Dates\n");
+            for (n, s) in logistic_fields { grouped_schema.push_str(&format!("- {}: {}\n", n, s)); }
 
             let prompt = format!(
 r#"[TASK]
-Extract data from the following Pug (Jade) snippet representing ONE item in a list.
+Extract data for {} items from the provided Pug snippets.
 
-[INPUT SNIPPET]
+[INPUT SNIPPETS]
 {}
 
-[EXTRACTION SCHEMA]
+[EXTRACTION SCHEMA (Grouped to avoid conflicts)]
 {}
 
 [INSTRUCTION]
-1. Extract all relevant fields into a single JSON object.
-2. Return ONLY valid JSON. No preamble, no explanation.
-3. If a field is missing, use null."#,
-                item_pug,
-                schema_definitions
+1. Return a JSON ARRAY containing exactly {} objects.
+2. Carefully distinguish between similar fields (e.g., sale_price vs supply_price).
+3. Return ONLY the JSON array. No preamble, no explanation."#,
+                chunk.len(),
+                combined_pugs,
+                grouped_schema,
+                chunk.len()
             );
 
             let mut model_guard = model_mutex.lock().await;
@@ -573,14 +603,18 @@ Extract data from the following Pug (Jade) snippet representing ONE item in a li
             
             let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
+                let summary_text = format!("Processing {}~{}/{}...", current_start, current_end, total_items);
                 tokio::select!{
                     res = model.chat_with_spinner(
                         "", 
                         &prompt,
                         &app_handle_clone, 
                         "extraction-progress", 
-                        json!({ "category": "Item Extraction" }), 
-                        1024, 
+                        json!({ 
+                            "category": "Item Extraction",
+                            "summary": summary_text
+                        }), 
+                        2048, // Increased max_tokens for batch
                         Some(cancellation_token.clone()), 
                         None 
                     ) => res?,
@@ -595,12 +629,19 @@ Extract data from the following Pug (Jade) snippet representing ONE item in a li
                         return Err(anyhow::anyhow!("Task cancelled")); 
                     }
                 }
-            } else { "{}".to_string() };
+            } else { "[]".to_string() };
             drop(model_guard);
 
-            let item_json = parse_json_from_llm(&response);
-            if !item_json.is_null() && item_json.is_object() {
-                all_extracted_items.push(item_json);
+            let batch_results = parse_json_from_llm(&response);
+            if let Some(arr) = batch_results.as_array() {
+                for item_json in arr {
+                    if !item_json.is_null() && item_json.is_object() {
+                        all_extracted_items.push(item_json.clone());
+                    }
+                }
+            } else if batch_results.is_object() {
+                // Fallback for single object response
+                all_extracted_items.push(batch_results);
             }
         }
         
