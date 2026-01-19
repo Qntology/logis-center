@@ -276,6 +276,18 @@ impl QuantizedQwen3VLTextAttention {
         }
         Ok(())
     }
+
+    pub fn move_kv_cache_to_cpu(&mut self) -> Result<()> {
+        if let Some((k, v)) = &self.kv_cache {
+            let cpu = Device::Cpu;
+            if !k.device().is_cpu() {
+                let k_cpu = k.to_device(&cpu)?;
+                let v_cpu = v.to_device(&cpu)?;
+                self.kv_cache = Some((k_cpu, v_cpu));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct QuantizedQwen3VLTextDecoderLayer {
@@ -382,6 +394,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, limit: Option<usize>) -> Result<()> {
         self.self_attn.load_kv_cache(path, device, limit)
+    }
+
+    pub fn move_kv_cache_to_cpu(&mut self) -> Result<()> {
+        self.self_attn.move_kv_cache_to_cpu()
     }
 }
 
@@ -632,6 +648,13 @@ impl QuantizedQwen3VLTextModel {
             for layer in self.layers.iter_mut() {
                 layer.load_kv_cache(path, device, limit)?;
             }
+        }
+        Ok(())
+    }
+
+    pub fn move_kv_cache_to_cpu(&mut self) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.move_kv_cache_to_cpu()?;
         }
         Ok(())
     }
@@ -893,6 +916,10 @@ impl QuantizedQwen3VLModel {
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, limit: Option<usize>) -> Result<()> {
         self.language_model.load_kv_cache(path, device, limit)
+    }
+
+    pub fn move_kv_cache_to_cpu(&mut self) -> Result<()> {
+        self.language_model.move_kv_cache_to_cpu()
     }
 }
 

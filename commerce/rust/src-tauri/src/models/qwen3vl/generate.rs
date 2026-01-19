@@ -332,25 +332,21 @@ impl Qwen3VLGenerateModel {
         if let Some(path) = &cache_path {
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
-                     println!("[KV-DISK] Saving KV cache to {:?}", path);
-                     if m.offload_kv_cache(path).is_ok() {
-                         // Save tokens.json
-                         let all_tokens = full_input_ids_vec;
-                         // all_tokens.extend(&generate); 
-                         
-                         // CRITICAL FIX: The KV cache contains states for inputs PROCESSED so far.
-                         // The loop ends after generating a token, but that token hasn't been fed back into forward() yet.
-                         // So the KV cache size is (input + generated) - 1.
-                         // We must sync tokens.json to match the actual KV cache size.
-                         // if !all_tokens.is_empty() {
-                         //    all_tokens.pop(); 
-                         // }
-
-                         let token_path = path.join("tokens.json");
-                         if let Ok(file) = fs::File::create(&token_path) {
-                             let _ = serde_json::to_writer(file, &all_tokens);
-                         }
+                     // OPTIMIZATION: Move KV Cache to CPU RAM instead of Disk.
+                     // This avoids slow SSD I/O while freeing up VRAM to prevent OOM.
+                     println!("[KV-MEMORY] Moving KV cache to System RAM...");
+                     if let Err(e) = m.move_kv_cache_to_cpu() {
+                         println!("[KV-MEMORY] Warning: Failed to move to CPU: {}", e);
                      }
+
+                     // Save tokens.json for Prefix Matching (LCP) in next turn
+                     let all_tokens = full_input_ids_vec;
+                     let token_path = path.join("tokens.json");
+                     if let Ok(file) = fs::File::create(&token_path) {
+                         let _ = serde_json::to_writer(file, &all_tokens);
+                     }
+                     
+                     // DO NOT call clear_kv_cache() here. We keep it in RAM.
                  },
                  ModelVariant::Standard(m) => m.clear_kv_cache(),
              }

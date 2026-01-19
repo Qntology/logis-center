@@ -117,6 +117,14 @@ pub async fn start_background_worker(
 ) {
     println!("[Scheduler] Background worker started.");
     
+    // Clean up stale KV cache on startup
+    let tmp_kv = std::path::Path::new("tmp_kv");
+    if tmp_kv.exists() {
+        println!("[Scheduler] Cleaning up stale tmp_kv directory...");
+        let _ = std::fs::remove_dir_all(tmp_kv);
+    }
+    let _ = std::fs::create_dir_all(tmp_kv);
+    
     tokio::spawn(async move {
         let mut delay_secs = 1;
         
