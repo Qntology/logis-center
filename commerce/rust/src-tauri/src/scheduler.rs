@@ -473,7 +473,7 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let target_selector = if !node_selector.is_empty() { node_selector } else if !item_selector.is_empty() { item_selector } else { "body" };
+    let target_selector = if !item_selector.is_empty() { item_selector } else if !node_selector.is_empty() { node_selector } else { "body" };
     let mut extracted_data = json!({});
 
     if !is_detail {
@@ -495,66 +495,44 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
         }
 
         let fields_prompts = parsing::list2json(page_type, language);
-        let list_session_id = format!("{}_list", task.id);
-        let mut full_context_accumulated = String::new();
+        let mut all_extracted_items = Vec::new();
 
         for (i, item_pug) in item_pugs.iter().enumerate() {
-            let is_last = i == total_items - 1;
-            full_context_accumulated.push_str(&format!("--- ITEM {} ---\n", i + 1));
-            full_context_accumulated.push_str(item_pug);
-            full_context_accumulated.push('\n');
+            if cancellation_token.load(Ordering::Relaxed) { break; }
+            
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Item Extraction", 
+                "summary": format!("Extracting Item {}/{}...", i + 1, total_items),
+                "spinner": "⠋"
+            }));
 
-            let prompt = if is_last {
-                let mut schema_definitions = String::new();
-                for (name, schema) in &fields_prompts {
-                    schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
-                }
+            // Prepare a prompt for a SINGLE item
+            let mut schema_definitions = String::new();
+            for (name, schema) in &fields_prompts {
+                schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
+            }
 
-                format!(
-r#"[CONTEXT]
-You have been reading a list of items from a webpage part by part. 
-Below is the COMPLETELY ACCUMULATED list of Pug (Jade) snippets.
-
-[FULL LIST CONTENT]
-{}
-
-[EXTRACTION SCHEMA]
-Please extract all items and list-level metadata precisely according to these definitions:
-{}
-
-[FINAL INSTRUCTION]
-1. Based on the FULL LIST CONTENT, extract all items into an "items" array.
-2. Include list-level metadata like "type", "item", "node", etc.
-3. Return ONLY a single valid JSON object.
-4. No preamble, no explanation. Just raw JSON."#,
-                    full_context_accumulated,
-                    schema_definitions
-                )
-            } else {
-                format!(
-r#"[CONTEXT]
-You are reading a list of items from a webpage.
-Here is the accumulated item snippets so far:
+            let prompt = format!(
+r#"[TASK]
+Extract data from the following Pug (Jade) snippet representing ONE item in a list.
 
 [INPUT SNIPPET]
 {}
 
+[EXTRACTION SCHEMA]
+{}
+
 [INSTRUCTION]
-Read and memorize these items. Do NOT generate JSON yet.
-Just say "ACKNOWLEDGED"."#,
-                    full_context_accumulated
-                )
-            };
+1. Extract all relevant fields into a single JSON object.
+2. Return ONLY valid JSON. No preamble, no explanation.
+3. If a field is missing, use null."#,
+                item_pug,
+                schema_definitions
+            );
 
-            let max_tokens = if is_last { 4096 } else { 20 };
+            let mut model_guard = model_mutex.lock().await;
+            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
             
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "List Ingestion", 
-                "summary": format!("Reading Item {}/{}...", i + 1, total_items),
-                "spinner": "⠋"
-            }));
-
-            let model_guard = model_mutex.lock().await;
             let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
                 tokio::select!{
@@ -563,10 +541,10 @@ Just say "ACKNOWLEDGED"."#,
                         &prompt,
                         &app_handle_clone, 
                         "extraction-progress", 
-                        json!({ "category": "List Ingestion" }), 
-                        max_tokens, 
+                        json!({ "category": "Item Extraction" }), 
+                        1024, 
                         Some(cancellation_token.clone()), 
-                        Some(list_session_id.clone())
+                        None 
                     ) => res?,
                     _ = async {
                         loop {
@@ -582,10 +560,19 @@ Just say "ACKNOWLEDGED"."#,
             } else { "{}".to_string() };
             drop(model_guard);
 
-            if is_last {
-                extracted_data = parse_json_from_llm(&response);
+            let item_json = parse_json_from_llm(&response);
+            if !item_json.is_null() && item_json.is_object() {
+                all_extracted_items.push(item_json);
             }
         }
+        
+        extracted_data = json!({
+            "items": all_extracted_items,
+            "type": page_type,
+            "item": item_selector,
+            "node": node_selector,
+            "detail": false
+        });
     } else {
         let content_pug = {
             let document = scraper::Html::parse_document(&clean_html);

@@ -114,7 +114,7 @@ impl LogisModel {
         let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         let model_path = gguf_dir.to_str().unwrap().to_string();
 
-        let max_tokens_limit = 2048; // Optimized for commerce extraction to save VRAM
+        let max_tokens_limit = 3072; // Increased to 3072 for better handling of larger snippets
         let dtype = if text_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
 
         let t_dev = text_device.clone();
