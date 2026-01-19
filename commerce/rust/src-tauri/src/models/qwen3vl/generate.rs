@@ -240,7 +240,9 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values_video = input.pixel_values_video.take();
         let video_grid_thw_tensor = input.video_grid_thw.take();
         
-        let mut cache_position = Tensor::arange(0u32, seq_len as u32, &self.device)?;
+        // [FIX] Position IDs must start from seqlen_offset to maintain correct RoPE context
+        let start_pos = seqlen_offset as u32;
+        let mut cache_position = Tensor::arange(start_pos, start_pos + seq_len as u32, &self.device)?;
         
         let requested_tokens = mes.max_tokens.unwrap_or(1024);
         let mut sample_len = requested_tokens;
@@ -295,18 +297,21 @@ impl Qwen3VLGenerateModel {
                         seqlen_offset,
                     )?,
                 };
-                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-                let next_token = logit_processor.sample(&logits)?;
-                generate.push(next_token);
-                if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
-                    break;
-                }
-                seqlen_offset += seq_len;
-                seq_len = 1;
-                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
-                cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
-                
-                // CRITICAL: Drop pixel_values immediately after first iteration (prefill)
+                                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                                let next_token = logit_processor.sample(&logits)?;
+                                generate.push(next_token);
+                                
+                                if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                                    break;
+                                }
+                                
+                                // Update offset and position for the next generated token
+                                seqlen_offset += seq_len;
+                                seq_len = 1;
+                                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+                                cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
+                                
+                                // CRITICAL: Drop pixel_values immediately after first iteration (prefill)
                 // This frees the massive vision tensor from GPU memory.
                 if pixel_values.is_some() {
                     pixel_values = None;

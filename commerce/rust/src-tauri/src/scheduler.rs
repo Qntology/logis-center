@@ -347,6 +347,7 @@ async fn process_task(
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         for (i, chunk) in classify_chunks.iter().enumerate() {
+            let is_last = i == classify_chunks_len - 1;
             
             // For the last chunk, we don't just "ingest", we ask the question (Step 1)
             // But actually, it's cleaner to ingest ALL, then ask.
@@ -354,15 +355,15 @@ async fn process_task(
             
             let prompt = format!(
 r#"[CONTEXT]
-You are reading the structural skeleton (Pug/Jade) of a webpage to understand its type and layout.
-Part {}/{}.
+You are analyzing the structural skeleton (Pug/Jade) of a trade document to identify its type.
+This is Part {}/{} of the page layout.
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Read and memorize this structure. Do NOT generate JSON yet.
-Just say "ACKNOWLEDGED"."#,
+Identify and memorize the key structural elements (e.g., table headers, titles, logos).
+Do NOT generate JSON yet. Summarize the detected structure in 3-5 keywords and say "READY" for the next part."#,
                 i + 1, classify_chunks_len, chunk
             );
             
@@ -374,7 +375,7 @@ Just say "ACKNOWLEDGED"."#,
 
             tokio::select!{
                 res = model.chat_with_spinner(
-                    "You are a helpful assistant.", 
+                    "You are a helpful assistant specialized in trade document analysis.", 
                     &prompt,
                     &app_handle_clone, 
                     "extraction-progress", 
@@ -382,10 +383,13 @@ Just say "ACKNOWLEDGED"."#,
                         "category": "Classification Ingestion",
                         "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len)
                     }), 
-                    16, // Reduced from 20 to 16 for even faster ACKs
+                    32, // Allow a bit more tokens for structural keywords
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
-                ) => { res?; },
+                ) => { 
+                    let res_text = res?; 
+                    println!("[Ingestion Log] Part {}: {}", i + 1, res_text);
+                },
                 _ = async {
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
