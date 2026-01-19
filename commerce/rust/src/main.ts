@@ -482,8 +482,14 @@ listen("extraction-progress", (event: any) => {
                  btnStopTask.innerText = "🛑"; 
              }
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+             
+             // Hide Extract Button if no image selected
+             if (!currentImage && btnExtract) {
+                 btnExtract.style.display = "none";
+             }
 
-             const isCancelled = payload.summary && payload.summary.includes("Cancelled");
+             const summary = payload.summary || "";
+             const isCancelled = summary.includes("Cancelled");
              const successText = isCancelled ? "Task Cancelled" : "Extraction Complete";
              
              p.innerHTML = `<span style="margin-right:8px;">${isCancelled ? "🛑" : "✅"}</span> <span>${successText}</span>`;
@@ -503,13 +509,15 @@ listen("extraction-progress", (event: any) => {
          else if (payload.category === "Error") {
              isExtracting = false;
              if (btnStopTask) btnStopTask.style.display = "none";
-             p.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary}</span>`;
+             if (!currentImage && btnExtract) btnExtract.style.display = "none";
+             
+             p.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary || "Unknown Error"}</span>`;
              p.style.color = "#ef4444";
          } 
          // 3. Progress State (including intermediate items)
          else {
              // Progress
-             p.innerHTML = `<span style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner}</span> <span>${payload.summary}</span>`;
+             p.innerHTML = `<span style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner || "⠋"}</span> <span>${payload.summary || ""}</span>`;
              
              // Render Intermediate Data
              if(payload.data) {
