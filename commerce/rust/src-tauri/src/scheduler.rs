@@ -311,11 +311,11 @@ async fn process_task(
         let app_handle_clone = app_handle.clone();
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
+            let system_text = parsing::page_type_prompt(language); // Consistent system text
             
             // Branch prompt based on whether this is the last chunk
-            let (system_text, prompt, max_tokens) = if is_last {
+            let (prompt, max_tokens) = if is_last {
                 (
-                    parsing::page_type_prompt(language),
                     format!(
 r#"[FINAL CONTEXT]
 This is the last part of the page structure.
@@ -333,7 +333,6 @@ Return the result in the specified JSON format."#,
                 )
             } else {
                 (
-                    "".to_string(),
                     format!(
 r#"[CONTEXT]
 Reading Part {}/{} of the layout.
@@ -399,8 +398,10 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
     
     let type_info = parse_json_from_llm(&page_type_res);
     let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    println!("[Scheduler] Classification Result: '{}'", page_type);
     
     if page_type.is_empty() || page_type == "unknown" {
+        println!("[Scheduler] Stopping: Unknown page type.");
         drop(model_guard);
         return Ok(());
     }
@@ -413,15 +414,13 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type, language); // This returns the prompt string
+        let system_prompt = parsing::page_type_prompt(language);
+        let next_question = parsing::page_selectors_prompt(&page_type, language); 
         let app_handle_clone = app_handle.clone();
-
-        // page_selectors_prompt returns the full prompt text including TASK/SCHEMA.
-        // We send it as user message.
         
         tokio::select!{
             res = model.chat_with_spinner(
-                "", // System prompt: Empty for maximum focus
+                &system_prompt, 
                 &next_question,
                 &app_handle_clone, 
                 "extraction-progress", 
@@ -443,6 +442,7 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
     drop(model_guard);
     
     let selector_info = parse_json_from_llm(&page_selectors_res);
+    println!("[Scheduler] Selectors Found: {}", selector_info);
     // Merge selectors into final_page_info
     if let Some(obj) = selector_info.as_object() {
         for (k, v) in obj {
@@ -487,9 +487,12 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
         }; 
         
         let total_items = item_pugs.len();
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "category": "List Processing", "summary": format!("Found {} items to extract.", total_items), "spinner": "✅"
-        }));
+        println!("[Scheduler] List Processing: Found {} items using selector '{}'", total_items, target_selector);
+        
+        if total_items == 0 {
+            println!("[Scheduler] Stopping: No items found with the specified selector.");
+            return Ok(());
+        }
 
         let fields_prompts = parsing::list2json(page_type, language);
         let list_session_id = format!("{}_list", task.id);
@@ -590,6 +593,7 @@ Just say "ACKNOWLEDGED"."#,
         }; 
         
         if content_pug.trim().is_empty() {
+            println!("[Scheduler] Error: No content found with selector '{}'", target_selector);
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Error", "summary": format!("Selector '{}' not found.", target_selector), "spinner": "❌"
             }));
