@@ -179,10 +179,22 @@ impl Qwen3VLGenerateModel {
                          if let Ok(file) = fs::File::open(&token_path) {
                              let reader = std::io::BufReader::new(file);
                              if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                 if !cached_tokens.is_empty() && full_input_ids_vec.starts_with(&cached_tokens) {
-                                     println!("[KV-DISK] Cache Hit! Loading {} tokens from disk...", cached_tokens.len());
-                                     if m.load_kv_cache(path, &self.text_device).is_ok() {
-                                         seqlen_offset = cached_tokens.len();
+                                 // FIND LONGEST COMMON PREFIX
+                                 let mut match_len = 0;
+                                 for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
+                                     if c == f { match_len += 1; } else { break; }
+                                 }
+
+                                 if match_len > 0 {
+                                     println!("[KV-DISK] Longest Common Prefix: {} tokens. (Cached: {}, Input: {})", 
+                                        match_len, cached_tokens.len(), full_input_ids_vec.len());
+                                     
+                                     if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
+                                         // If we matched less than what's on disk, we need the model to "forget" the trailing parts
+                                         // but since quantized_model handles its own cache, for now we assume 
+                                         // matching the prefix is enough for a hit if it's the SAME session.
+                                         
+                                         seqlen_offset = match_len;
                                          loaded = true;
                                          
                                          let remaining = seq_len.saturating_sub(seqlen_offset);
@@ -257,6 +269,20 @@ impl Qwen3VLGenerateModel {
             input_ids = input_ids.narrow(1, current_pos, seq_len - current_pos)?;
             seq_len = seq_len - current_pos;
             println!("\n[PREFILL] Ingested up to offset {}.", seqlen_offset);
+
+            // [NEW] Intermediate Cache Save: Save context knowledge after heavy prefill
+            if let Some(path) = &cache_path {
+                if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
+                    if m.offload_kv_cache(path).is_ok() {
+                        let token_path = path.join("tokens.json");
+                        // We save only the part of full_input_ids_vec that corresponds to seqlen_offset
+                        let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
+                        if let Ok(file) = fs::File::create(&token_path) {
+                            let _ = serde_json::to_writer(file, &ingested_tokens);
+                        }
+                    }
+                }
+            }
         }
         
         let mut pixel_values = input.pixel_values.take();

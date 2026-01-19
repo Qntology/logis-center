@@ -309,42 +309,31 @@ async fn process_task(
     // Ingest chunks for Classification
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
+        let system_text = parsing::page_type_prompt(language); // FIXED: Always use the same system prompt
+        
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
-            let system_text = parsing::page_type_prompt(language); // Consistent system text
             
-            // Branch prompt based on whether this is the last chunk
-            let (prompt, max_tokens) = if is_last {
-                (
-                    format!(
-r#"[FINAL CONTEXT]
-This is the last part of the page structure.
-Part {}/{}.
-
-[INPUT SNIPPET]
+            // CACHE-STABLE PROMPT: 
+            // Avoid changing the beginning of the string. 
+            // We use a simpler instruction that is the same for all intermediate steps.
+            let prompt = if is_last {
+                format!(
+r#"[DATA_PART]
 {}
 
 [INSTRUCTION]
-Analyze the full structure you have read so far and identify the primary category.
-Return the result in the specified JSON format."#, 
-                        i + 1, classify_chunks_len, chunk
-                    ),
-                    256 // More tokens for the JSON response
+End of document. Based on all parts received, identify the primary category and return JSON."#, 
+                    chunk
                 )
             } else {
-                (
-                    format!(
-r#"[CONTEXT]
-Reading Part {}/{} of the layout.
-
-[INPUT SNIPPET]
+                format!(
+r#"[DATA_PART]
 {}
 
 [INSTRUCTION]
-Memorize this structure. Summarize in 3 keywords and say "READY"."#,
-                        i + 1, classify_chunks_len, chunk
-                    ),
-                    32 // Minimal tokens for ACKs
+Read and acknowledge by saying "READY"."#,
+                    chunk
                 )
             };
             
@@ -354,9 +343,11 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
                 "spinner": "⠋"
             }));
 
+            let max_tokens = if is_last { 256 } else { 20 };
+
             tokio::select!{
                 res = model.chat_with_spinner(
-                    &system_text, 
+                    &system_text, // Always consistent
                     &prompt,
                     &app_handle_clone, 
                     "extraction-progress", 
@@ -371,8 +362,6 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
                     let out = res?;
                     if is_last {
                         page_type_res = out;
-                    } else {
-                        println!("[Ingestion Log] Part {}: {}", i + 1, out);
                     }
                 },
                 _ = async {
@@ -481,16 +470,31 @@ Memorize this structure. Summarize in 3 keywords and say "READY"."#,
             "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
         }));
 
-        let item_pugs = {
+        let mut current_selector = if !item_selector.is_empty() { item_selector.to_string() } else if !node_selector.is_empty() { node_selector.to_string() } else { "body".to_string() };
+        
+        let mut item_pugs = {
             let document = scraper::Html::parse_document(&clean_html);
-            parsing::split_doc_to_pug_list(&document, target_selector, PugMode::FullContent)
+            parsing::split_doc_to_pug_list(&document, &current_selector, PugMode::FullContent)
         }; 
+
+        // FALLBACK LOGIC: If primary selector fails, try the alternative
+        if item_pugs.is_empty() && current_selector != "body" {
+            let fallback = if current_selector == item_selector && !node_selector.is_empty() { node_selector.to_string() } else { "body".to_string() };
+            if fallback != current_selector {
+                println!("[Scheduler] Selector '{}' failed, trying fallback '{}'", current_selector, fallback);
+                current_selector = fallback;
+                item_pugs = {
+                    let document = scraper::Html::parse_document(&clean_html);
+                    parsing::split_doc_to_pug_list(&document, &current_selector, PugMode::FullContent)
+                };
+            }
+        }
         
         let total_items = item_pugs.len();
-        println!("[Scheduler] List Processing: Found {} items using selector '{}'", total_items, target_selector);
+        println!("[Scheduler] List Processing: Found {} items using selector '{}'", total_items, current_selector);
         
         if total_items == 0 {
-            println!("[Scheduler] Stopping: No items found with the specified selector.");
+            println!("[Scheduler] Stopping: No items found even with fallback.");
             return Ok(());
         }
 
