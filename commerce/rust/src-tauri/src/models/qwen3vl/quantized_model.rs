@@ -435,9 +435,9 @@ impl QuantizedQwen3VLTextModel {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
                          
-                         // [ULTRA-DYNAMIC] Fixed OS Reserve instead of Percentage
-                         // We only need ~250MB for Windows/Display overhead in most cases.
-                         let os_reserve = 250_000_000; 
+                         // [OPTIMIZATION] Dynamic OS Reserve
+                         // 150MB is usually enough for basic display/system overhead on top of what's already used.
+                         let os_reserve = 150_000_000; 
                          safety_floor = os_reserve + kv_reserve;
 
                          println!("[VRAM-BUDGET] Live Free: {:.2} GB. Safety Buffer (OS+KV): {:.2} MB. Layer Cost: {:.2} MB", 
@@ -658,10 +658,11 @@ impl QuantizedQwen3VLModel {
                  if let Ok(dev) = nvml_inst.device_by_index(vision_device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
                          let total_vram = mem.total;
-                         let os_reserve = (total_vram as f64 * 0.05) as u64;
-                         let safety_floor = os_reserve;
+                         // Vision only needs a small system reserve, not the KV reserve.
+                         let os_reserve = (total_vram as f64 * 0.02) as u64; // 2% for system
+                         let vision_safety_floor = os_reserve.max(100_000_000); // at least 100MB
                          
-                         if mem.free < (vision_total_cost + safety_floor) {
+                         if mem.free < (vision_total_cost + vision_safety_floor) {
                              println!("[OFFLOAD] Vision Budget Exhausted on ID {}. Switching to CPU.", vision_device_id);
                              actual_vision_device = Device::Cpu;
                          }
