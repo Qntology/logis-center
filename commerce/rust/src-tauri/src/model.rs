@@ -131,15 +131,15 @@ pub struct LogisModel {
     generator: Arc<Mutex<Option<Qwen3VLGenerateModel>>>,
     embedding_model: Arc<Mutex<Option<EmbeddingModel>>>,
     
+    pub is_cpu_mode: bool, // Moved up
+    
     // Config for Lazy Reloading
     model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
-    pub is_cpu_mode: bool, 
     max_tokens_limit: u32,
     dtype: Option<DType>, 
 }
-
 impl LogisModel {
     pub fn unload_generator(&self) {
         let mut gen = self.generator.lock().unwrap();
@@ -259,10 +259,10 @@ impl LogisModel {
         Ok(Self {
             generator: Arc::new(Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
+            is_cpu_mode: config.is_cpu, // Moved up
             model_path,
             embedding_path,
-            is_cpu_mode: config.is_cpu, // Correctly map from config
-            device_config: config,
+            device_config: config.clone(),
             max_tokens_limit: max_tokens_limit as u32,
             dtype: None, 
         })

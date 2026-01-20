@@ -376,6 +376,7 @@ async fn process_task(
                     Some(task.id.clone())
                 ) => { 
                     let out = res?;
+                    println!("[Scheduler] DEBUG: chunk {}/{} -> out length: {}", i + 1, classify_chunks_len, out.len());
                     if is_last {
                         page_type_res = out;
                     } else {
@@ -397,8 +398,10 @@ async fn process_task(
     }
 
     println!("[Scheduler] Checkpoint: Classification Start");
+    println!("[Scheduler] DEBUG: page_type_res length: {}, content: '{:?}'", page_type_res.len(), page_type_res);
     if page_type_res.is_empty() {
-        return Ok(());
+        println!("[Scheduler] Error: page_type_res is empty. Model returned nothing.");
+        return Err(anyhow::anyhow!("Model returned empty classification response"));
     }
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
