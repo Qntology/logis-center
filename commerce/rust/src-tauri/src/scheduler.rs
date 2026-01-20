@@ -285,15 +285,14 @@ async fn process_task(
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
     // Determine optimal chunk sizes based on hardware
-    let device_config = utils::get_optimal_device_config();
-    println!("[Scheduler] Running on: {} (Classify Chunk: {}, Extract Chunk: {})", 
-        device_config.name, device_config.classify_chunk_size, device_config.extract_chunk_size);
+    // [ADAPTIVE] Reduced size to account for multilingual token overhead (Korean/Chinese/etc.)
+    let mut device_config = utils::get_optimal_device_config();
+    device_config.classify_chunk_size = 4000; // Lowered from 7000 to avoid token explosion
+    device_config.extract_chunk_size = 4000;
 
-    // Chunking Logic for Classification
-    // Instead of truncating, we ingest the whole light_pug structure
-    let classify_chunks = chunk_text(&light_pug, device_config.classify_chunk_size, 500);
-    let classify_chunks_len = classify_chunks.len();
-
+    // [REVISED] Since light_pug is now structurally compressed in parsing.rs, 
+    // we send it in a SINGLE request for classification to ensure the model sees the WHOLE structure.
+    
     let mut model_guard = model_mutex.lock().await;
     if model_guard.is_none() {
         let _ = app_handle.emit("extraction-progress", json!({ 
@@ -312,7 +311,7 @@ async fn process_task(
     
     let mut page_type_res = String::new();
 
-    // Step 1: Ingest chunks for Classification with full history
+    // Step 1: Single-shot Classification
     use crate::openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage, 
         ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
@@ -330,70 +329,21 @@ async fn process_task(
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         
-        for (i, chunk) in classify_chunks.iter().enumerate() {
-            let is_last = i == classify_chunks_len - 1;
-            
-            let prompt = format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk);
+        let prompt = format!("[FULL_STRUCTURE]\n{}\n\n[INSTRUCTION]\nIdentify the primary category of this page based on the full structure above. Return valid JSON only.", light_pug);
 
-            // Add current chunk to history
-            messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
-                ]),
-                name: None,
-            }));
-            
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Classification Ingestion", 
-                "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
-                "spinner": "⠋"
-            }));
-
-            let params = ChatCompletionParameters {
-                messages: messages.clone(), // Send full history
-                model: "qwen3vl".to_string(),
-                max_tokens: Some(32),
-                temperature: Some(0.1),
-                ..Default::default()
-            };
-
-            tokio::select!{
-                res = model.chat_params_with_spinner(
-                    params,
-                    &app_handle_clone, 
-                    "extraction-progress", 
-                    json!({ 
-                        "category": "Classification Ingestion",
-                        "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len)
-                    }), 
-                    Some(cancellation_token.clone()), 
-                    Some(task.id.clone())
-                ) => { 
-                    let out = res?;
-                    // Add model's ACK to history to keep it in sync with cache
-                    messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                        content: Some(out),
-                        ..Default::default()
-                    }));
-                },
-                _ = async {
-                    loop {
-                        if cancellation_token.load(Ordering::Relaxed) { break; }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                } => { return Err(anyhow::anyhow!("Task cancelled")); }
-            }
-        }
-        
-        // Step 1.5: Final Classification Question (Separate Turn to break repetition)
-        let final_prompt = "End of document. Identify the primary category (Invoice, BOL, Packing List, etc) and return JSON.";
         messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: final_prompt.to_string() })
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
             ]),
             name: None,
         }));
         
+        let _ = app_handle.emit("extraction-progress", json!({ 
+            "category": "Classification", 
+            "summary": "Analyzing page structure...",
+            "spinner": "⠋"
+        }));
+
         let params = ChatCompletionParameters {
             messages: messages.clone(),
             model: "qwen3vl".to_string(),
@@ -401,21 +351,28 @@ async fn process_task(
             temperature: Some(0.1),
             ..Default::default()
         };
-        
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "category": "Classification Ingestion", 
-            "summary": "Generating final classification...", 
-            "spinner": "⠋"
-        }));
 
-        page_type_res = model.chat_params_with_spinner(
-            params, 
-            &app_handle_clone,
-            "extraction-progress",
-            json!({ "category": "Classification Ingestion", "summary": "Generating final classification..." }),
-            Some(cancellation_token.clone()),
-            Some(task.id.clone())
-        ).await?;
+        tokio::select!{
+            res = model.chat_params_with_spinner(
+                params,
+                &app_handle_clone, 
+                "extraction-progress", 
+                json!({ 
+                    "category": "Classification",
+                    "summary": "Identifying page type..."
+                }), 
+                Some(cancellation_token.clone()), 
+                Some(task.id.clone())
+            ) => { 
+                page_type_res = res?;
+            },
+            _ = async {
+                loop {
+                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+        }
     }
 
     println!("[Scheduler] Checkpoint: Classification Start");
@@ -762,17 +719,16 @@ Please extract the following data points precisely according to these definition
                 // Intermediate Chunk: Just read and remember
                 format!(
 r#"[CONTEXT]
-You are reading a Pug (Jade) template. 
-Here is the accumulated content so far:
+You are reading a detailed Pug (Jade) template snippet.
+Part {} of {}.
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Read and memorize this content. Do NOT generate JSON yet. 
-When all parts are sent, I will ask you to extract data into JSON.
-Just say "ACKNOWLEDGED"."#,
-                    full_context_accumulated
+Read and internalize this content. Briefly summarize the primary technical structures or data fields you see in this specific snippet (e.g., 'invoice header section', 'shipping address block'). Do NOT output JSON yet."#,
+                    chunk_idx + 1, chunks_len,
+                    chunk
                 )
             };
 
@@ -856,25 +812,6 @@ Just say "ACKNOWLEDGED"."#,
         "category": "Saving", "summary": "Saving to database...", "spinner": "⠋"
     }));
 
-    // [SPINNER-FIX] Start a background spinner task for DB saving duration
-    let saving_flag = Arc::new(AtomicBool::new(true));
-    let spinner_flag = saving_flag.clone();
-    let spinner_handle = app_handle.clone();
-    
-    tokio::spawn(async move {
-        let frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let mut i = 0;
-        while spinner_flag.load(Ordering::Relaxed) {
-            let _ = spinner_handle.emit("extraction-progress", json!({ 
-                "category": "Saving", 
-                "summary": "Saving to database...", 
-                "spinner": frames[i % frames.len()]
-            }));
-            i += 1;
-            sleep(Duration::from_millis(100)).await;
-        }
-    });
-
     if let Some((queries, merge_info)) = logic::relay(page_type, &extracted_data) {
         println!("[Scheduler] Relay logic triggered. Queries: {}", queries.len());
         
@@ -902,14 +839,20 @@ Just say "ACKNOWLEDGED"."#,
                 }
             }
 
-            let text_to_embed = json_to_natural_language(&target_data);
+            let mut text_to_embed = json_to_natural_language(&target_data);
+            
+            // [FIX] Ensure text doesn't exceed embedding model limit (~2048 tokens)
+            // Conservative estimate: 1 char ~= 0.5 to 1 token in multilingual context
+            if text_to_embed.chars().count() > 3000 {
+                text_to_embed = text_to_embed.chars().take(3000).collect();
+            }
+            
             drop(store_guard); 
             
             let mut model_guard = model_mutex.lock().await;
             if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
             
             if cancellation_token.load(Ordering::Relaxed) { 
-                saving_flag.store(false, Ordering::Relaxed); // Stop spinner
                 return Err(anyhow::anyhow!("Task cancelled")); 
             }
 
@@ -924,7 +867,6 @@ Just say "ACKNOWLEDGED"."#,
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     } => { 
-                        saving_flag.store(false, Ordering::Relaxed);
                         return Err(anyhow::anyhow!("Task cancelled")); 
                     }
                 }
@@ -944,7 +886,12 @@ Just say "ACKNOWLEDGED"."#,
         let store_guard = store_mutex.lock().await;
         if let Some(_db) = store_guard.as_ref() {
                 let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
-                let text_to_embed = json_to_natural_language(&extracted_data);
+                let mut text_to_embed = json_to_natural_language(&extracted_data);
+                
+                if text_to_embed.chars().count() > 3000 {
+                    text_to_embed = text_to_embed.chars().take(3000).collect();
+                }
+                
                 drop(store_guard);
 
                 let mut model_guard = model_mutex.lock().await;
@@ -961,7 +908,6 @@ Just say "ACKNOWLEDGED"."#,
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         } => { 
-                            saving_flag.store(false, Ordering::Relaxed);
                             return Err(anyhow::anyhow!("Task cancelled")); 
                         }
                     }
@@ -977,9 +923,6 @@ Just say "ACKNOWLEDGED"."#,
         }
     }    
     
-    // Stop the spinner
-    saving_flag.store(false, Ordering::Relaxed);
-
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
     }));
@@ -1030,40 +973,105 @@ pub fn parse_json_from_llm(text: &str) -> Value {
     json!({})
 }
 
-/// Converts a JSON Value into a human-readable natural language string for better embedding.
+/// Converts a JSON Value into a human-readable natural language narrative.
+/// [STRICT ALIGNMENT] This logic perfectly synchronizes with every column in `parsing.rs`.
 pub fn json_to_natural_language(value: &Value) -> String {
     let mut output = String::new();
     
-    match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                // Skip internal metadata or empty fields
-                if k == "type" || k == "id" || k == "index" || v.is_null() { continue; }
-                
-                let val_str = match v {
-                    Value::String(s) => s.clone(),
-                    Value::Number(n) => n.to_string(),
-                    Value::Bool(b) => b.to_string(),
-                    Value::Array(_) | Value::Object(_) => json_to_natural_language(v),
-                    _ => String::new(),
-                };
-                
-                if !val_str.trim().is_empty() {
-                    output.push_str(&format!("{}: {}. ", k.replace("_", " "), val_str));
-                }
-            }
-        },
-        Value::Array(arr) => {
-            for item in arr {
-                let item_str = json_to_natural_language(item);
-                if !item_str.trim().is_empty() {
-                    output.push_str(&format!("{}. ", item_str.trim_end_matches(". ")));
-                }
-            }
-        },
-        _ => {
-            output.push_str(&value.to_string());
+    // Recursive handling for nested structures like { "value": "..." }
+    if let Some(obj) = value.as_object() {
+        if obj.len() == 1 && obj.contains_key("value") {
+            return obj.get("value").unwrap().as_str().unwrap_or(&obj.get("value").unwrap().to_string()).to_string();
         }
+    }
+
+    if let Value::Object(map) = value {
+        let page_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let is_detail = map.get("detail").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        // Define EXACT columns from parsing.rs
+        let keys: Vec<&str> = match page_type {
+            "tracking" => {
+                if is_detail {
+                    vec!["status", "id", "title", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "package_width", "package_height", "package_length", "package_weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "shipping_date", "registration_date"]
+                } else {
+                    vec!["status", "id", "title", "link", "registration_date"]
+                }
+            },
+            "goods" => {
+                if is_detail {
+                    vec!["code", "link", "id", "status", "payment_method", "bank", "card", "model_name", "brand_name", "condition", "description", "short_description", "tags", "origin_country", "manufacturer", "release_date", "manufacture_date", "expiration_date", "gtin", "mpn", "barcode", "sale_price", "supply_price", "currency", "compare_at_price", "quantity", "stock_keeping_unit", "low_stock_threshold", "unit", "tax_included", "tax_code", "main_image_url", "additional_image_url", "video_url", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "product_width", "product_height", "product_length", "product_weight", "options", "additional_goods", "title", "registration_date"]
+                } else {
+                    vec!["status", "link", "id", "title", "sale_price", "supply_price", "currency", "quantity", "tracking_number", "registration_date"]
+                }
+            },
+            "order" => {
+                if is_detail {
+                    vec!["link", "id", "tracking_number", "status", "goods", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "bank", "card", "order_date", "payment_date", "payment_method", "payment_origin", "registration_date"]
+                } else {
+                    vec!["status", "link", "id", "title", "sale_price", "supply_price", "currency", "quantity", "tracking_number", "registration_date"]
+                }
+            },
+            "coupon" | "event" => {
+                if is_detail {
+                    vec!["link", "id", "type", "status", "title", "started_at", "expired_at", "code", "discount", "quantity", "usage_limit", "usage_per", "new_customer_only", "min_order_amount", "max_discount_amount", "region_restrictions", "registration_date"]
+                } else {
+                    vec!["status", "id", "title", "started_at", "expired_at", "registration_date"]
+                }
+            },
+            "review" => {
+                if is_detail {
+                    vec!["link", "id", "status", "name", "title", "completed", "registration_date"]
+                } else {
+                    vec!["status", "id", "title", "link", "registration_date"]
+                }
+            },
+            _ => map.keys().map(|s| s.as_str()).collect()
+        };
+
+        for key in keys {
+            if let Some(v) = map.get(key) {
+                if v.is_null() { continue; }
+                let key_name = key.replace("_", " ");
+                if v.is_array() {
+                    let arr = v.as_array().unwrap();
+                    let mut items = Vec::new();
+                    for item in arr.iter().take(5) {
+                        let sub = json_to_natural_language(item);
+                        if !sub.is_empty() { items.push(sub); }
+                    }
+                    if !items.is_empty() {
+                        output.push_str(&format!("{}: [{}]. ", key_name, items.join(", ")));
+                    }
+                } else if v.is_object() {
+                    let sub = json_to_natural_language(v);
+                    if !sub.is_empty() {
+                        output.push_str(&format!("{}: {}. ", key_name, sub));
+                    }
+                } else {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => String::new(),
+                    };
+                    if !s.is_empty() && s != "null" {
+                        let s_clean = if s.len() > 400 { format!("{}...", &s[..400]) } else { s };
+                        output.push_str(&format!("{}: {}. ", key_name, s_clean));
+                    }
+                }
+            }
+        }
+    } else if let Value::Array(arr) = value {
+        for item in arr.iter().take(10) {
+            let sub = json_to_natural_language(item);
+            if !sub.is_empty() {
+                output.push_str(&sub);
+                output.push_str(" ");
+            }
+        }
+    } else {
+        output.push_str(&value.as_str().unwrap_or(&value.to_string()));
     }
     
     output.trim().to_string()

@@ -118,7 +118,45 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             }
             output.push_str(&line);
             output.push('\n');
-            for child in node.children() { generate_pug_lines(child, indent_level + 1, output, mode); }
+
+            // --- Structural Compression for Classification (StructureOnly mode) ---
+            let children: Vec<_> = node.children().collect();
+            if *mode == PugMode::StructureOnly && children.len() > 5 {
+                let mut last_tag = "";
+                let mut last_classes = String::new();
+                let mut repeat_count = 0;
+                
+                for (idx, child) in children.iter().enumerate() {
+                    let is_repetitive = if let Some(el) = child.value().as_element() {
+                        let current_classes = el.classes().collect::<Vec<_>>().join(".");
+                        if el.name() == last_tag && current_classes == last_classes {
+                            true
+                        } else {
+                            last_tag = el.name();
+                            last_classes = current_classes;
+                            false
+                        }
+                    } else { false };
+
+                    if is_repetitive {
+                        repeat_count += 1;
+                    } else {
+                        repeat_count = 0;
+                    }
+
+                    // Keep first 2 of a repetitive sequence, and the very last child
+                    if repeat_count > 1 && idx < children.len() - 1 {
+                        if repeat_count == 2 {
+                            output.push_str(&indent);
+                            output.push_str("    | ... (repetitive items compressed)\n");
+                        }
+                        continue; 
+                    }
+                    generate_pug_lines(*child, indent_level + 1, output, mode);
+                }
+            } else {
+                for child in node.children() { generate_pug_lines(child, indent_level + 1, output, mode); }
+            }
         },
         Node::Text(text) => {
             if *mode == PugMode::FullContent {

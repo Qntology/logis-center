@@ -22,8 +22,6 @@ use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
-use sysinfo::System;
-use nvml_wrapper::Nvml;
 
 pub struct Spinner {
     pub frames: Vec<&'static str>,
@@ -412,14 +410,17 @@ impl LogisModel {
     pub async fn chat_params_with_spinner(
         &self, 
         params: ChatCompletionParameters,
-        _app_handle: &tauri::AppHandle,
-        _event_name: &str,
-        _base_payload: Value,
+        app_handle: &tauri::AppHandle,
+        event_name: &str,
+        base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator().await?;
+
+        // Emit initial status once (Frontend will handle continuous spinner animation via .active-spinner class)
+        let _ = app_handle.emit(event_name, base_payload);
 
         let self_clone = self.generator.clone();
         
@@ -429,23 +430,25 @@ impl LogisModel {
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
-        // Simply await the result without any spinner loop
-        task.await?
+        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
     }
 
     pub async fn chat_with_image_spinner(
         &self, 
         prompt: String, 
         image: Option<DynamicImage>,
-        _app_handle: &tauri::AppHandle,
-        _event_name: &str,
-        _base_payload: Value,
+        app_handle: &tauri::AppHandle,
+        event_name: &str,
+        base_payload: Value,
         max_tokens: usize,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator().await?;
+
+        // Emit initial status once
+        let _ = app_handle.emit(event_name, base_payload);
 
         let self_clone = self.generator.clone();
         
@@ -489,8 +492,7 @@ impl LogisModel {
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
-        // Simply await the result
-        task.await?
+        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
@@ -539,14 +541,17 @@ impl LogisModel {
         &self, 
         prompt: String, 
         image: Option<DynamicImage>, 
-        _app_handle: &tauri::AppHandle,
-        _event_name: &str,
-        _base_payload: Value,
+        app_handle: &tauri::AppHandle,
+        event_name: &str,
+        base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator().await?;
+
+        // Emit initial status once
+        let _ = app_handle.emit(event_name, base_payload);
 
         let generator_arc = self.generator.clone();
         let max_tok = self.max_tokens_limit;
@@ -591,8 +596,7 @@ impl LogisModel {
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
         
-        // Simply await the result
-        task.await?
+        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {

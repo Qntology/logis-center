@@ -175,10 +175,7 @@ body
                                         span.btn_group
                                             input.btn_small.white
                                             input.btn_small.white
-                                            input.btn_small.white
-                                            input.btn_small.white
-                                            input.btn_small.white
-                                            input.btn_small.white
+                                            | ... (repetitive items compressed)
                                             input.btn_small.white
                                 tr
                                     th

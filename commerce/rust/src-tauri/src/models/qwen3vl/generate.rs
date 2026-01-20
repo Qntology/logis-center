@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use candle_transformers::utils::apply_repeat_penalty;
 
 use crate::{
     chat_template::ChatTemplate,
@@ -73,8 +74,8 @@ impl Qwen3VLGenerateModel {
                 let mut main_file = std::fs::File::open(&main)?;
                 let main_content = gguf_file::Content::read(&mut main_file)?;
                 
-                let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
-                let kv_reserve = max_tokens * 180_000;
+                let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+                let kv_reserve = max_tokens * 200_000;
                 
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::Quantized(model)
@@ -84,8 +85,8 @@ impl Qwen3VLGenerateModel {
                  let mut file2 = std::fs::File::open(&main)?; 
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
-                 let max_tokens = hard_token_limit.unwrap_or(1024) as u64;
-                 let kv_reserve = max_tokens * 180_000;
+                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+                 let kv_reserve = max_tokens * 200_000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
@@ -135,6 +136,8 @@ impl Qwen3VLGenerateModel {
         };
         let mut logit_processor =
             get_logit_processor(Some(temperature), Some(top_p), Some(top_k), seed);
+        let repetition_penalty = self.generation_config.repetition_penalty;
+        
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         // Make input mutable to take ownership of fields
         let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
@@ -148,21 +151,33 @@ impl Qwen3VLGenerateModel {
 
         let mut full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
 
-        // HARD SAFETY CHECK: Truncate Input if it exceeds limit (Smart Middle-Drop)
+        // HARD SAFETY CHECK: Truncate Input if it exceeds limit (Smart Head-Heavy Drop)
+        // [ADAPTIVE] For structural analysis, we allow larger contexts.
+        // For standard extraction, we aim for ~2048 tokens to stay within the embedding model's optimal range.
         if let Some(limit) = self.hard_token_limit {
-            let max_input = if limit > 64 { limit - 64 } else { limit };
+            let is_classification = input.replace_text.contains("[FULL_STRUCTURE]");
+            let effective_limit = if is_classification { 8192 } else { limit.max(2048) };
+            let max_input = if effective_limit > 128 { effective_limit - 128 } else { effective_limit };
             
             if seq_len > max_input {
-                println!("⚠️ [WARN] Input too long ({} > {}). Using System-Aware Truncation.", seq_len, max_input);
+                println!("⚠️ [WARN] Input too long ({} > {}). Using Structural Truncation (Classify={}).", seq_len, max_input, is_classification);
                 
-                // Keep System Prompt (approx first 200 tokens) and the Tail
-                let head_reserve = 200.min(max_input / 4);
+                // Keep 90% from the Head (where structure and instructions usually reside)
+                let head_reserve = (max_input * 9 / 10).min(seq_len);
                 let tail_reserve = max_input - head_reserve;
                 
                 let head_ids = input_ids.narrow(1, 0, head_reserve)?;
-                let tail_ids = input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?;
+                let tail_ids = if tail_reserve > 0 {
+                    input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?
+                } else {
+                    Tensor::zeros((1, 0), input_ids.dtype(), input_ids.device())?
+                };
                 
-                input_ids = Tensor::cat(&[head_ids, tail_ids], 1)?;
+                input_ids = if tail_reserve > 0 {
+                    Tensor::cat(&[head_ids, tail_ids], 1)?
+                } else {
+                    head_ids
+                };
                 seq_len = max_input;
                 
                 // Update full_input_ids_vec to match the new truncated content
@@ -353,8 +368,25 @@ impl Qwen3VLGenerateModel {
                         seqlen_offset,
                     )?,
                 };
-                                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-                                let next_token = logit_processor.sample(&logits)?;
+                let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                
+                // [FIX] Apply Repetition Penalty to prevent loops
+                if repetition_penalty != 1.0 {
+                    // Combine prompt tokens and generated tokens for context
+                    let mut context = full_input_ids_vec.clone();
+                    context.extend(&generate);
+                    
+                    // Only use the last N tokens for penalty to keep performance
+                    let penalty_context = if context.len() > 512 {
+                        &context[context.len()-512..]
+                    } else {
+                        &context[..]
+                    };
+                    
+                    logits = apply_repeat_penalty(&logits, repetition_penalty, penalty_context)?;
+                }
+
+                let next_token = logit_processor.sample(&logits)?;
                                 generate.push(next_token);
                                 
                                 if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
