@@ -398,11 +398,13 @@ listen("extraction-progress", (event: any) => {
     }
 
     if (payload.task_id) {
-        if (payload.category === "Done") {
-            renderMessage({ id: payload.task_id, role: "system_task", content: payload.summary, status: "done", created_at: Date.now() });
-        } else if (payload.category === "Error") {
-            renderMessage({ id: payload.task_id, role: "system_task", content: payload.summary, status: "error", created_at: Date.now() });
-        }
+        // Map category to a status code for renderMessage
+        let statusCode = 1; // Default processing
+        if (payload.category === "Done") statusCode = 9;
+        else if (payload.category === "Error") statusCode = 6;
+        else if (payload.summary?.toLowerCase().includes("cancelled")) statusCode = 3;
+
+        renderMessage({ id: payload.task_id, role: "system_task", content: payload.summary, status: statusCode, created_at: Date.now() });
     }
 
     if (extractionLog && detailView.style.display !== "none") {
@@ -418,6 +420,10 @@ listen("extraction-progress", (event: any) => {
              extractionLog.appendChild(p);
          }
          
+         const summary = p.querySelector(".summary-text") as HTMLElement;
+         const spinner = p.querySelector(".active-spinner") as HTMLElement;
+         const resultsContainer = p.querySelector(".results-container");
+
          if (payload.category === "Done") {
              isExtracting = false;
              if (btnStopTask) btnStopTask.style.display = "none";
@@ -429,19 +435,16 @@ listen("extraction-progress", (event: any) => {
              const row = p.querySelector(".progress-row");
              if (row) { row.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary || "Error"}</span>`; (row as HTMLElement).style.color = "#ef4444"; }
          } else {
-             const spinner = p.querySelector(".active-spinner") as HTMLElement;
-             const summary = p.querySelector(".summary-text") as HTMLElement;
              if (spinner) spinner.innerText = payload.spinner || "⠋";
              if (summary) summary.innerText = payload.summary || "";
-             if(payload.display_text || payload.data) {
-                  const resultsContainer = p.querySelector(".results-container");
-                  if (resultsContainer) {
-                      const pre = document.createElement("pre");
-                      pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.7rem"; pre.style.color = "#aaa"; pre.style.background = "#252525"; pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px"; pre.style.borderLeft = "2px solid var(--primary)";
-                      pre.innerText = payload.display_text || JSON.stringify(payload.data, null, 2);
-                      resultsContainer.appendChild(pre);
-                      detailContent.scrollTop = detailContent.scrollHeight;
-                  }
+             
+             if((payload.display_text || payload.data) && resultsContainer) {
+                  resultsContainer.innerHTML = ""; // Clear old intermediate results
+                  const pre = document.createElement("pre");
+                  pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.7rem"; pre.style.color = "#aaa"; pre.style.background = "#252525"; pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px"; pre.style.borderLeft = "2px solid var(--primary)";
+                  pre.innerText = payload.display_text || JSON.stringify(payload.data, null, 2);
+                  resultsContainer.appendChild(pre);
+                  detailContent.scrollTop = detailContent.scrollHeight;
              }
          }
     }
@@ -636,60 +639,94 @@ listen("browser-match-found", (event: any) => {
 // --- 6. Auth & Chat Helpers ---
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
-
 const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
-async function buildServerUrl(query: any = {}) {
-    const created_at = Date.now() - timezoneOffset;
-    let url = `${API_HOST}/task?created_at=${created_at}`;
-    
-    if (currentDetectedUrl) {
-        try {
-            const urlObj = new URL(currentDetectedUrl);
-            url += `&origin=${encodeURIComponent(urlObj.origin)}`;
-            
-            // [FIXED IDENTITY] Use ZeroAddress based logic
-            if (!query.from) query.from = currentSession.address || ZERO_ADDRESS;
-            if (!query.to) query.to = currentSession.team || await hashId(ZERO_ADDRESS);
-            
-            if (!query.id) {
-                const cc = currentSession.cc || "logis.center";
-                query.id = await hashId(cc + urlObj.pathname);
-            }
-            query.href = urlObj.href;
-        } catch(e) {}
-    }
+function updateAuthUI() {
+    const authStatus = document.getElementById("auth-status");
+    const qrContainer = document.getElementById("qr-container");
+    const userEmail = document.getElementById("user-email");
+    const btnLogout = document.getElementById("btn-logout");
+    const btnQrAuth = document.getElementById("btn-qr-auth");
 
-    for (const key in query) { if (query[key]) url += `&${key}=${encodeURIComponent(query[key])}`; }
-    return url.toLowerCase();
+    if (currentSession.email) {
+        if (authStatus) authStatus.innerText = "Authenticated";
+        if (qrContainer) qrContainer.style.display = "none";
+        if (userEmail) userEmail.innerText = currentSession.email;
+        if (btnLogout) btnLogout.style.display = "block";
+        if (btnQrAuth) btnQrAuth.style.display = "none";
+    } else {
+        if (authStatus) authStatus.innerText = "Waiting for Auth...";
+        if (qrContainer) qrContainer.style.display = "block";
+        if (userEmail) userEmail.innerText = "Not Signed In";
+        if (btnLogout) btnLogout.style.display = "none";
+        if (btnQrAuth) btnQrAuth.style.display = "block";
+    }
 }
 
-async function fetchChatHistory() {
-    if (!chatTalks) return;
-    try {
-        const localTasks = await invoke<any[]>("get_chat_messages");
-        let cloudMessages: any[] = [];
-        if (currentSession.email) {
-            try {
-                const res = await invoke<any>("proxy_fetch", {
-                    url: `${API_HOST}/talks`,
-                    method: "GET",
-                    headers: { "Authorization": `Bearer ${currentSession.token}` },
-                    session_params: {
-                        hash: currentSession.hash,
-                        token: currentSession.token,
-                        cc: currentSession.cc
-                    }
-                });
-                cloudMessages = res.results || [];
-            } catch (e) { console.warn("Cloud sync failed:", e); }
+async function performQrAuth() {
+    const qrContainer = document.getElementById("qr-code");
+    if (!qrContainer || !currentSession.hash) return;
+    
+    qrContainer.innerHTML = "";
+    new (window as any).QRCode(qrContainer, {
+        text: `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`,
+        width: 200,
+        height: 200,
+        colorDark: "#ffffff",
+        colorLight: "#000000",
+        correctLevel: (window as any).QRCode.CorrectLevel.H
+    });
+}
+
+function startPolling() {
+    if (chatPollInterval) clearInterval(chatPollInterval);
+    chatPollInterval = window.setInterval(() => {
+        if (!currentSession.email) {
+            checkAuthStatus();
+        } else {
+            fetchChatHistory();
         }
-        const allMessages = [...localTasks, ...cloudMessages].sort((a, b) => (a.created_at || a.time || 0) - (b.created_at || b.time || 0));
-        chatTalks.innerHTML = "";
-        allMessages.forEach(msg => renderMessage(msg));
-        const chatScroll = document.getElementById("chat-scroll");
-        if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
-    } catch (err) {}
+    }, 3000);
+}
+
+function renderMessage(msg: any) {
+    if (!chatTalks) return;
+    
+    let msgId = `msg-${msg.id}`;
+    let existing = document.getElementById(msgId);
+    
+    const roleClass = msg.role === "user" ? "user-msg" : "system-msg";
+    
+    // [STRICT MAPPING] Map numeric codes to labels and icons
+    const statusMap: any = {
+        1: { icon: "⏳", text: "processing" },
+        2: { icon: "🛑", text: "stopped" },
+        3: { icon: "🚫", text: "cancelled" },
+        6: { icon: "❌", text: "error" },
+        9: { icon: "✅", text: "done" },
+        10: { icon: "📥", text: "pending" }
+    };
+
+    const currentStatus = statusMap[msg.status] || { icon: "⏳", text: msg.status || "processing" };
+    const timeStr = new Date(msg.created_at || Date.now()).toLocaleTimeString();
+
+    const html = `
+        <div class="message-bubble ${roleClass}" id="${msgId}">
+            <div class="msg-header">
+                <span>${msg.role === "user" ? "@You" : "🤖 System"}</span>
+                <span class="msg-time">${timeStr}</span>
+            </div>
+            <div class="msg-content">${msg.content}</div>
+            ${msg.status ? `<div class="msg-status">${currentStatus.icon} ${currentStatus.text}</div>` : ""}
+        </div>
+    `;
+
+    if (existing) {
+        existing.outerHTML = html;
+    } else {
+        chatTalks.innerHTML += html;
+    }
+    chatTalks.scrollTop = chatTalks.scrollHeight;
 }
 
 async function checkAuthStatus() {
@@ -708,6 +745,14 @@ async function checkAuthStatus() {
             currentSession.token = data.token;
             currentSession.name = data.name;
             currentSession.address = data.address;
+            
+            // [NEW] Initialize Rust Hub with new profile info
+            await invoke("initialize_hub", { 
+                address: data.address, 
+                email: data.email, 
+                flag: "kr" // Default to kr for now
+            });
+
             updateAuthUI();
             fetchChatHistory();
         }

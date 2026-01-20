@@ -181,8 +181,10 @@ pub async fn start_background_worker(
                              let store_guard = store.lock().await;
                              if let Some(db) = store_guard.as_ref() {
                                  let _ = db.update_task_status(&task.id, crate::logic::parse_status("cancel")).await;
+                                 let _ = db.update_message_status(&task.id, crate::logic::parse_status("cancel"), Some("Cancelled by user")).await;
                              }
                              let _ = app_handle.emit("extraction-progress", json!({ 
+                                "task_id": task.id,
                                 "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
                              break; // Stop processing pending tasks batch to prevent immediate model reload
