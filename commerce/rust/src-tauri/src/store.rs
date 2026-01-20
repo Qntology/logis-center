@@ -106,7 +106,7 @@ impl VectorStore {
     }
 
     pub async fn add_message(&self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<i32>) -> Result<()> {
-        let table = self.conn.open_table("commerce_talks").execute().await?;
+        let table = self.conn.open_table("talks").execute().await?;
         let schema = table.schema().await?;
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -124,7 +124,7 @@ impl VectorStore {
     }
 
     pub async fn get_all_messages(&self, limit: usize) -> Result<Vec<Value>> {
-        let table = self.conn.open_table("commerce_talks").execute().await?;
+        let table = self.conn.open_table("talks").execute().await?;
         let results = table.query().limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut msgs = Vec::new();
         for batch in results {
@@ -194,7 +194,7 @@ impl VectorStore {
     }
 
     pub async fn update_message_status(&self, task_id: &str, status: i32, content: Option<&str>) -> Result<()> {
-        let table = self.conn.open_table("commerce_talks").execute().await?;
+        let table = self.conn.open_table("talks").execute().await?;
         table.delete(&format!("task_id = '{}'", task_id)).await?;
         if let Some(c) = content {
             self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status)).await?;
@@ -221,18 +221,33 @@ impl VectorStore {
             Field::new("bcc", DataType::Utf8, true),
             Field::new("ref", DataType::Utf8, true),
             Field::new("digest", DataType::Utf8, true),
-            Field::new("status", DataType::Int32, true), // Renamed from status_code
+            Field::new("status", DataType::Int32, true), 
             Field::new("amount", DataType::Float32, true),
             Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 768), true),
             Field::new("text", DataType::Utf8, false),
             Field::new("data", DataType::Utf8, false),
-            Field::new("created_at", DataType::Int64, false), // Now primary date column
+            Field::new("created_at", DataType::Int64, false), 
             Field::new("updated_at", DataType::Int64, false),
         ]));
 
         let existing = self.conn.table_names().execute().await?;
         for name in tables {
-            if existing.contains(&name.to_string()) { continue; }
+            // [STRICT] If table exists, verify its schema or recreate to avoid type mismatch
+            if existing.contains(&name.to_string()) {
+                let table = self.conn.open_table(name).execute().await?;
+                let current_schema = table.schema().await?;
+                // Check if 'status' is still Utf8 (index 8 based on schema)
+                let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
+                    field.data_type() == &DataType::Utf8
+                } else { true };
+
+                if needs_recreate {
+                    println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
+                    let _ = self.conn.drop_table(name, &[]).await;
+                } else {
+                    continue;
+                }
+            }
             let table = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await?;
             let _ = table.create_index(&["text"], lancedb::index::Index::Auto).execute().await;
             let _ = table.create_index(&["data"], lancedb::index::Index::Auto).execute().await;
@@ -405,7 +420,7 @@ impl VectorStore {
     }
     
     pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
-         let target = if table_name.is_empty() { "commerce_items" } else { table_name };
+         let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
          let mut combined = std::collections::HashMap::new();
          if !query_text.is_empty() {
@@ -440,7 +455,7 @@ impl VectorStore {
     }
 
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
-        let target = if table_name.is_empty() { "commerce_items" } else { table_name };
+        let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
         let table = self.conn.open_table(target).execute().await?;
         let results = table.query().limit(1000).execute().await?.try_collect::<Vec<_>>().await?;
         let target_str = match value { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => value.to_string() };
