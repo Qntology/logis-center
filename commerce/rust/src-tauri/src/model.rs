@@ -128,13 +128,19 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 }
 
 pub struct LogisModel {
-    generator: Arc<Mutex<Qwen3VLGenerateModel>>,
+    generator: Arc<Mutex<Option<Qwen3VLGenerateModel>>>,
     embedding_model: Arc<Mutex<Option<EmbeddingModel>>>,
     is_cpu_mode: bool,
     max_tokens_limit: u32,
 }
 
 impl LogisModel {
+    pub fn unload_generator(&self) {
+        let mut gen = self.generator.lock().unwrap();
+        *gen = None;
+        println!("[MODEL] Generator (Qwen) unloaded to free VRAM.");
+    }
+
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
         println!("[MODEL-00] Initializing LogisModel with Unified Device Config");
 
@@ -187,7 +193,7 @@ impl LogisModel {
         } else { None };
 
         Ok(Self {
-            generator: Arc::new(Mutex::new(generator)),
+            generator: Arc::new(Mutex::new(Some(generator))),
             embedding_model: Arc::new(Mutex::new(embedding_model)),
             is_cpu_mode: config.is_cpu,
             max_tokens_limit: max_tokens_limit as u32,
@@ -256,7 +262,8 @@ impl LogisModel {
         println!("[MODEL-CHAT] Sending Chat Request...");
         
         tokio::task::spawn_blocking(move || {
-            let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let mut gen_guard = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                 content: system_text,
@@ -340,7 +347,8 @@ impl LogisModel {
         let self_clone = self.generator.clone();
         
         let task = tokio::task::spawn_blocking(move || {
-            let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let mut gen_guard = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
@@ -383,7 +391,8 @@ impl LogisModel {
         let self_clone = self.generator.clone();
         
         let task = tokio::task::spawn_blocking(move || {
-            let mut gen = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let mut gen_guard = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let mut content_parts = Vec::new();
             
@@ -447,7 +456,8 @@ impl LogisModel {
     }
 
     fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
-        let mut gen = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+        let mut gen_guard = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
         
         let mut content_parts = Vec::new();
         
@@ -500,7 +510,8 @@ impl LogisModel {
         
         // Spawn the heavy task using Tokio directly for standard behavior
         let task = tokio::task::spawn_blocking(move || {
-            let mut gen = generator_arc.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let mut gen_guard = generator_arc.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let mut content_parts = Vec::new();
             if let Some(img) = image {

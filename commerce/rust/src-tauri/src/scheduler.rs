@@ -832,6 +832,25 @@ Just say "ACKNOWLEDGED"."#,
         "category": "Saving", "summary": "Saving to database...", "spinner": "⠋"
     }));
 
+    // [SPINNER-FIX] Start a background spinner task for DB saving duration
+    let saving_flag = Arc::new(AtomicBool::new(true));
+    let spinner_flag = saving_flag.clone();
+    let spinner_handle = app_handle.clone();
+    
+    tokio::spawn(async move {
+        let frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut i = 0;
+        while spinner_flag.load(Ordering::Relaxed) {
+            let _ = spinner_handle.emit("extraction-progress", json!({ 
+                "category": "Saving", 
+                "summary": "Saving to database...", 
+                "spinner": frames[i % frames.len()]
+            }));
+            i += 1;
+            sleep(Duration::from_millis(100)).await;
+        }
+    });
+
     if let Some((queries, merge_info)) = logic::relay(page_type, &extracted_data) {
         println!("[Scheduler] Relay logic triggered. Queries: {}", queries.len());
         
@@ -865,7 +884,15 @@ Just say "ACKNOWLEDGED"."#,
             let mut model_guard = model_mutex.lock().await;
             if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
             
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            // [VRAM-OPTIMIZATION] Unload Generator (Qwen) before Embedding (Gemma) starts
+            if let Some(model) = model_guard.as_ref() {
+                model.unload_generator();
+            }
+            
+            if cancellation_token.load(Ordering::Relaxed) { 
+                saving_flag.store(false, Ordering::Relaxed); // Stop spinner
+                return Err(anyhow::anyhow!("Task cancelled")); 
+            }
 
             println!("[Scheduler] Checkpoint: Embedding Start (Relay)");
             let vector = if let Some(model) = model_guard.as_ref() {
@@ -877,7 +904,10 @@ Just say "ACKNOWLEDGED"."#,
                             if cancellation_token.load(Ordering::Relaxed) { break; }
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                    } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                    } => { 
+                        saving_flag.store(false, Ordering::Relaxed);
+                        return Err(anyhow::anyhow!("Task cancelled")); 
+                    }
                 }
             } else { None };
             drop(model_guard);
@@ -899,6 +929,11 @@ Just say "ACKNOWLEDGED"."#,
                 let mut model_guard = model_mutex.lock().await;
                 if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
                 
+                // [VRAM-OPTIMIZATION] Unload Generator (Qwen) before Embedding (Gemma) starts
+                if let Some(model) = model_guard.as_ref() {
+                    model.unload_generator();
+                }
+                
                 println!("[Scheduler] Checkpoint: Embedding Start (Direct)");
                 let vector = if let Some(model) = model_guard.as_ref() {
                     let text_clone = text_to_embed.clone();
@@ -909,7 +944,10 @@ Just say "ACKNOWLEDGED"."#,
                                 if cancellation_token.load(Ordering::Relaxed) { break; }
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
-                        } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                        } => { 
+                            saving_flag.store(false, Ordering::Relaxed);
+                            return Err(anyhow::anyhow!("Task cancelled")); 
+                        }
                     }
                 } else { None };
                 drop(model_guard);
@@ -921,12 +959,22 @@ Just say "ACKNOWLEDGED"."#,
         }
     }    
     
+    // Stop the spinner
+    saving_flag.store(false, Ordering::Relaxed);
+
     let _ = app_handle.emit("extraction-progress", json!({ 
         "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
     }));
 
     // Cleanup all KV Cache subdirectories for this task
     cleanup_task_resources(&task.id);
+
+    // [RESOURCE-RELEASE] Explicitly drop the model to free VRAM/RAM after task completion
+    {
+        let mut model_guard = model_mutex.lock().await;
+        *model_guard = None;
+        println!("[Scheduler] Model resources released.");
+    }
 
     Ok(())
 }
