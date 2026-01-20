@@ -229,7 +229,21 @@ impl VectorStore {
          let _ = table.delete(&format!("id = '{}'", id)).await;
          
          let json_str = data.to_string();
-         let text_content = data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
+         
+         // [FIX] Ensure text column is populated for FTS search
+         let mut text_content = data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
+         if text_content.is_empty() {
+             // Generate a simple summary if text is missing
+             if let Some(obj) = data.as_object() {
+                 let fields: Vec<String> = obj.iter()
+                    .filter(|(k, _)| !["type", "detail", "node", "item"].contains(&k.as_str()))
+                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .take(10)
+                    .collect();
+                 text_content = fields.join(". ");
+             }
+         }
+
          let vec_data = vector.unwrap_or(vec![0.0; 768]);
          let now = chrono::Utc::now().timestamp_millis();
          
@@ -256,6 +270,64 @@ impl VectorStore {
          table.add(batches).execute().await?;
          
          Ok(())
+    }
+
+    pub async fn get_all_items(&self, table_name: &str, limit: usize, offset: usize) -> Result<Vec<TradeDocument>> {
+        let table = self.conn.open_table(table_name).execute().await?;
+        let results = table.query()
+            .limit(limit)
+            .offset(offset)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut docs = Vec::new();
+        for batch in results {
+            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let jsons = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+
+            for i in 0..batch.num_rows() {
+                docs.push(TradeDocument {
+                    uuid: ids.value(i).to_string(),
+                    doc_type: types.value(i).to_string(),
+                    text: texts.value(i).to_string(),
+                    json_data: jsons.value(i).to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(docs)
+    }
+
+    pub async fn get_item_by_id(&self, table_name: &str, id: &str) -> Result<Option<TradeDocument>> {
+        let table = self.conn.open_table(table_name).execute().await?;
+        let results = table.query()
+            .only_if(format!("id = '{}'", id))
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        if results.is_empty() { return Ok(None); }
+        let batch = &results[0];
+        if batch.num_rows() == 0 { return Ok(None); }
+
+        let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        let jsons = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+
+        Ok(Some(TradeDocument {
+            uuid: ids.value(0).to_string(),
+            doc_type: types.value(0).to_string(),
+            text: texts.value(0).to_string(),
+            json_data: jsons.value(0).to_string(),
+            ..Default::default()
+        }))
     }
     
     pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize) -> Result<Vec<(String, String, f32)>> {

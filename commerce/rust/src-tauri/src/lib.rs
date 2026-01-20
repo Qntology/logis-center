@@ -187,23 +187,33 @@ async fn search_documents(
     }
 }
 
-// Placeholder for missing CRUD - to be implemented in store.rs if needed
 #[tauri::command]
 async fn get_all_documents(
-    _state: State<'_, AppState>,
-    _limit: usize,
-    _offset: usize,
+    state: State<'_, AppState>,
+    limit: usize,
+    offset: usize,
 ) -> Result<Vec<TradeDocument>, String> {
-    // Not implemented in VectorStore yet
-    Ok(vec![])
+    let store_guard = state.store.lock().await;
+    if let Some(store) = store_guard.as_ref() {
+        let results = store.get_all_items("commerce_items", limit, offset).await.map_err(|e| e.to_string())?;
+        Ok(results)
+    } else {
+        Err("DB not initialized".to_string())
+    }
 }
 
 #[tauri::command]
 async fn get_document(
-    _state: State<'_, AppState>,
-    _uuid: String,
+    state: State<'_, AppState>,
+    uuid: String,
 ) -> Result<Option<TradeDocument>, String> {
-    Ok(None)
+    let store_guard = state.store.lock().await;
+    if let Some(store) = store_guard.as_ref() {
+        let doc = store.get_item_by_id("commerce_items", &uuid).await.map_err(|e| e.to_string())?;
+        Ok(doc)
+    } else {
+        Err("DB not initialized".to_string())
+    }
 }
 
 #[tauri::command]
