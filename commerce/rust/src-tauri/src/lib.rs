@@ -684,14 +684,19 @@ pub fn run() {
                                     let now = chrono::Utc::now().timestamp_millis();
                                     
                                     // Map JSON payload to Task struct
+                                    let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
+                                    let team_id = payload_val.get("to").and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| crate::utils::hash::hash_id(&from_addr));
+
                                     let task = crate::store::Task {
                                         id: payload_val.get("id")
                                             .and_then(|v| v.as_str())
                                             .map(|s| s.to_string())
                                             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                         r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                                        from_source: payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string(),
-                                        to_dest: payload_val.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        from_source: from_addr,
+                                        to_dest: team_id,
                                         cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                         bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                         ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),

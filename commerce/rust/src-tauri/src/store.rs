@@ -78,6 +78,23 @@ impl VectorStore {
         ]));
 
         let existing = self.conn.table_names().execute().await?;
+        
+        // Check and fix 'tasks' table
+        if existing.contains(&"tasks".to_string()) {
+            let table = self.conn.open_table("tasks").execute().await?;
+            let current_schema = table.schema().await?;
+            let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
+                field.data_type() == &DataType::Utf8
+            } else { true };
+
+            if needs_recreate {
+                println!("[Store] Schema mismatch for tasks. Dropping and recreating...");
+                let _ = self.conn.drop_table("tasks", &[]).await;
+            }
+        }
+        
+        // Re-check existence after potential drop
+        let existing = self.conn.table_names().execute().await?;
         if !existing.contains(&"tasks".to_string()) {
             let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
         }
@@ -91,8 +108,23 @@ impl VectorStore {
             Field::new("created_at", DataType::Int64, false),
         ]));
 
-        if !existing.contains(&"commerce_talks".to_string()) {
-            let _ = self.conn.create_table("commerce_talks", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
+        // Check and fix 'talks' table
+        if existing.contains(&"talks".to_string()) {
+            let table = self.conn.open_table("talks").execute().await?;
+            let current_schema = table.schema().await?;
+            let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
+                field.data_type() == &DataType::Utf8
+            } else { true };
+
+            if needs_recreate {
+                println!("[Store] Schema mismatch for talks. Dropping and recreating...");
+                let _ = self.conn.drop_table("talks", &[]).await;
+            }
+        }
+
+        let existing = self.conn.table_names().execute().await?;
+        if !existing.contains(&"talks".to_string()) {
+            let _ = self.conn.create_table("talks", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
         }
         Ok(())
     }
@@ -398,10 +430,25 @@ impl VectorStore {
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            let texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
-            let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+            let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
+            let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
+            let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+            let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+            let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
+
             for i in 0..batch.num_rows() {
-                docs.push(TradeDocument { uuid: ids.value(i).to_string(), doc_type: types.value(i).to_string(), text: texts.value(i).to_string(), json_data: jsons.value(i).to_string(), ..Default::default() });
+                docs.push(TradeDocument { 
+                    uuid: ids.value(i).to_string(), 
+                    doc_type: types.value(i).to_string(), 
+                    text: texts.value(i).to_string(), 
+                    json_data: jsons.value(i).to_string(),
+                    digest: digests.value(i).to_string(),
+                    total_amount: amounts.value(i),
+                    doc_status: statuses.value(i).to_string(),
+                    created_at_ts: createds.value(i),
+                    ..Default::default() 
+                });
             }
         }
         Ok(docs)
@@ -414,9 +461,24 @@ impl VectorStore {
         let batch = &results[0];
         let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
-        let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
-        Ok(Some(TradeDocument { uuid: ids.value(0).to_string(), doc_type: types.value(0).to_string(), text: texts.value(0).to_string(), json_data: jsons.value(0).to_string(), ..Default::default() }))
+        let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
+        let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
+        let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+        let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+        let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
+
+        Ok(Some(TradeDocument { 
+            uuid: ids.value(0).to_string(), 
+            doc_type: types.value(0).to_string(), 
+            text: texts.value(0).to_string(), 
+            json_data: jsons.value(0).to_string(), 
+            digest: digests.value(0).to_string(),
+            total_amount: amounts.value(0),
+            doc_status: statuses.value(0).to_string(),
+            created_at_ts: createds.value(0),
+            ..Default::default() 
+        }))
     }
     
     pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
@@ -484,6 +546,7 @@ pub struct TradeDocument {
     pub json_data: String,
     pub digest: String,
     pub vector: Vec<f32>,
+    pub created_at_ts: i64, // Added field
     pub item_descriptions: Vec<String>, 
     pub item_hs_codes: Vec<String>,
     pub item_sku_numbers: Vec<String>,
