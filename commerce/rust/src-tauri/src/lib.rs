@@ -147,7 +147,7 @@ async fn summarize_image(
             data_json: task_data.to_string(),
             created_at: now,
             updated_at: now,
-            status: "pending".to_string(),
+            status: crate::logic::parse_status("pending"),
         };
 
         match db.add_task(task).await {
@@ -181,7 +181,7 @@ async fn search_documents(
     };
 
     if let Some(store) = store_guard.as_ref() {
-        store.search_items("commerce_items", &query, query_vec, 10, None).await.map_err(|e| e.to_string())
+        store.search_items("items", &query, query_vec, 10, None).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }
@@ -215,7 +215,7 @@ async fn get_all_documents(
 ) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let mut results = store.get_all_items("commerce_items", limit, offset).await.map_err(|e| e.to_string())?;
+        let mut results = store.get_all_items("items", limit, offset).await.map_err(|e| e.to_string())?;
         
         // [DYNAMIC] Convert JSON to Natural Language for UI display only
         for doc in results.iter_mut() {
@@ -237,7 +237,7 @@ async fn get_document(
 ) -> Result<Option<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let mut doc_opt = store.get_item_by_id("commerce_items", &uuid).await.map_err(|e| e.to_string())?;
+        let mut doc_opt = store.get_item_by_id("items", &uuid).await.map_err(|e| e.to_string())?;
         
         // [DYNAMIC] Convert JSON to Natural Language for UI display only
         if let Some(ref mut doc) = doc_opt {
@@ -314,7 +314,7 @@ async fn ai_search_complex(
             
             let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
             // Now passing the filter to search_items
-            if let Ok(results) = store.search_items("commerce_items", text, emb, 5, sql_filter).await {
+            if let Ok(results) = store.search_items("items", text, emb, 5, sql_filter).await {
                 for (id, content, score) in results {
                     all_results.push(json!({
                         "id": id,
@@ -376,7 +376,7 @@ async fn deep_research_command(
     if let Some(store) = store_guard.as_ref() {
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
-        if let Ok(results) = store.search_items("commerce_items", &query, emb, 3, None).await {
+        if let Ok(results) = store.search_items("items", &query, emb, 3, None).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
@@ -505,6 +505,24 @@ async fn check_active_task(state: State<'_, AppState>, ref_id: String) -> Result
 
 
 #[tauri::command]
+async fn initialize_hub(
+    state: State<'_, AppState>,
+    address: String,
+    email: String,
+    flag: String,
+) -> Result<String, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(store) = store_guard.as_ref() {
+        match store.initialize_user_profiles(&address, &email, &flag).await {
+            Ok(_) => Ok(format!("Hub initialized for address: {}", address)),
+            Err(e) => Err(format!("Initialization failed: {}", e)),
+        }
+    } else {
+        Err("Store not initialized".to_string())
+    }
+}
+
+#[tauri::command]
 async fn get_chat_messages(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
@@ -518,7 +536,7 @@ async fn get_chat_messages(state: State<'_, AppState>) -> Result<Vec<Value>, Str
 async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("commerce_pages", 20, 0).await.map_err(|e| e.to_string())
+        store.get_all_items("pages", 20, 0).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -526,7 +544,7 @@ async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument
 async fn get_known_users(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("commerce_users", 20, 0).await.map_err(|e| e.to_string())
+        store.get_all_items("users", 20, 0).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -633,7 +651,7 @@ pub fn run() {
                                     eprintln!("[Setup] Failed to init task table: {}", e);
                                 }
                                 if let Err(e) = s.init_all_tables().await {
-                                    eprintln!("[Setup] Failed to init commerce tables: {}", e);
+                                    eprintln!("[Setup] Failed to init tables: {}", e);
                                 }
                                 *store_guard = Some(s);
                             },
@@ -757,7 +775,9 @@ pub fn run() {
 
             get_known_pages,
 
-            get_known_users
+            get_known_users,
+
+            initialize_hub
 
         ])
 

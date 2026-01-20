@@ -5,6 +5,22 @@ use once_cell::sync::Lazy;
 
 static PUNCTUATION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{P}\p{S}\p{Z}]").unwrap());
 
+/// JS의 crc32(s)와 동일한 결과값을 반환합니다.
+pub fn crc32(text: &str) -> u32 {
+    let mut crc = 0xFFFFFFFFu32;
+    for b in text.bytes() {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
 /// JS의 ethers.computeAddress(ethers.hashMessage(text))와 100% 동일한 결과값을 반환합니다.
 pub fn hash_id(text: &str) -> String {
     // 1. Ethereum Signed Message 프리픽스를 붙여 Keccak256 해싱

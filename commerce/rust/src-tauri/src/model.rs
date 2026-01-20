@@ -304,26 +304,37 @@ impl LogisModel {
 
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
-                // [STRICT PARITY] Use stable hashing for image results
-                let raw_id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
-                let hashed_id = crate::utils::hash::hash_id(raw_id);
-                
                 // Fixed identities for parity
                 let from_addr = "0x0000000000000000000000000000000000000000";
-                let to_addr = crate::utils::hash::hash_id(from_addr);
+                let team_id = crate::utils::hash::hash_id(from_addr); // Default team
                 let hashed_cc = crate::utils::hash::hash_id("local.image");
-                let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", to_addr, hashed_cc, raw_id));
+
+                // [STRICT PARITY] Use stable hashing for image results
+                let raw_no = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
+                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
+                
+                // index = crc32(hashId(type + team + no))
+                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_no)));
+                // id = hashId(team + index)
+                let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
+                
+                // ref = hashId(team + cc + no)
+                let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
+
+                let mut final_data = extracted_data.clone();
+                final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
+                final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
 
                 let _ = db.upsert_item(
                     "commerce_tracking", 
                     &hashed_id, 
                     "tracking", 
-                    extracted_data.clone(), 
+                    final_data, 
                     None,
                     Some(from_addr),
-                    Some(&to_addr),
+                    Some(&team_id),
                     Some(&hashed_cc),
-                    None, // bcc
+                    Some(&crate::utils::hash::hash_id(&format!("tracking{}", hashed_cc))), // bcc
                     Some(&ref_val),
                     Some(&item_digest)
                 ).await;
