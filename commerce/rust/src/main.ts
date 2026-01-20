@@ -575,7 +575,24 @@ listen("extraction-progress", (event: any) => {
              p.style.padding = "6px 0";
              p.style.fontSize = "0.75rem";
              p.style.display = "flex";
-             p.style.alignItems = "center";
+             p.style.flexDirection = "column"; // Stack text and results
+             p.style.alignItems = "flex-start";
+             
+             // Container for the row (spinner + text)
+             const row = document.createElement("div");
+             row.className = "progress-row";
+             row.style.display = "flex";
+             row.style.alignItems = "center";
+             row.innerHTML = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner || "⠋"}</span> 
+                              <span class="summary-text">${payload.summary || ""}</span>`;
+             p.appendChild(row);
+             
+             // Container for data/results
+             const results = document.createElement("div");
+             results.className = "results-container";
+             results.style.width = "100%";
+             p.appendChild(results);
+             
              extractionLog.appendChild(p);
          }
          
@@ -599,8 +616,11 @@ listen("extraction-progress", (event: any) => {
              const isCancelled = summary.includes("Cancelled");
              const successText = isCancelled ? "Task Cancelled" : "Extraction Complete";
              
-             p.innerHTML = `<span style="margin-right:8px;">${isCancelled ? "🛑" : "✅"}</span> <span>${successText}</span>`;
-             p.style.color = isCancelled ? "#ef4444" : "#4ade80"; 
+             const row = p.querySelector(".progress-row");
+             if (row) {
+                 row.innerHTML = `<span style="margin-right:8px;">${isCancelled ? "🛑" : "✅"}</span> <span>${successText}</span>`;
+                 (row as HTMLElement).style.color = isCancelled ? "#ef4444" : "#4ade80"; 
+             }
              
              if(payload.data) {
                   const pretty = JSON.stringify(payload.data, null, 2);
@@ -609,7 +629,7 @@ listen("extraction-progress", (event: any) => {
                   pre.style.color = "#e5e5e5"; pre.style.background = "#1e1e1e";
                   pre.style.padding = "10px"; pre.style.borderRadius = "5px"; pre.style.marginTop = "10px";
                   pre.innerText = pretty;
-                  extractionLog.appendChild(pre);
+                  p.appendChild(pre);
              }
          } 
          // 2. Error State
@@ -618,25 +638,36 @@ listen("extraction-progress", (event: any) => {
              if (btnStopTask) btnStopTask.style.display = "none";
              if (!currentImage && btnExtract) btnExtract.style.display = "none";
              
-             p.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary || "Unknown Error"}</span>`;
-             p.style.color = "#ef4444";
+             const row = p.querySelector(".progress-row");
+             if (row) {
+                 row.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary || "Unknown Error"}</span>`;
+                 (row as HTMLElement).style.color = "#ef4444";
+             }
          } 
          // 3. Progress State (including intermediate items)
          else {
-             // Progress
-             p.innerHTML = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner || "⠋"}</span> <span>${payload.summary || ""}</span>`;
+             // Update Summary
+             const spinner = p.querySelector(".active-spinner") as HTMLElement;
+             const summary = p.querySelector(".summary-text") as HTMLElement;
+             if (spinner) spinner.innerText = payload.spinner || "⠋";
+             if (summary) summary.innerText = payload.summary || "";
              
-             // Render Intermediate Data
+             // Append Intermediate Data (if not already appended or just keep adding)
              if(payload.data) {
-                  const pretty = JSON.stringify(payload.data, null, 2);
-                  const pre = document.createElement("pre");
-                  pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.75rem";
-                  pre.style.color = "#aaa"; pre.style.background = "#252525";
-                  pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px";
-                  pre.innerText = pretty;
-                  p.appendChild(pre); // Append to the current progress line container
-                  p.style.flexDirection = "column"; // Stack text and code
-                  p.style.alignItems = "flex-start";
+                  const resultsContainer = p.querySelector(".results-container");
+                  if (resultsContainer) {
+                      const pretty = JSON.stringify(payload.data, null, 2);
+                      const pre = document.createElement("pre");
+                      pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.7rem";
+                      pre.style.color = "#aaa"; pre.style.background = "#252525";
+                      pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px";
+                      pre.style.borderLeft = "2px solid var(--primary)";
+                      pre.innerText = pretty;
+                      resultsContainer.appendChild(pre);
+                      
+                      // Auto-scroll to latest result in detail view
+                      detailContent.scrollTop = detailContent.scrollHeight;
+                  }
              }
          }
     }

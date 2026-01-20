@@ -542,8 +542,8 @@ async fn process_task(
         let extraction_instruction = parsing::list2json(page_type, language);
         let mut all_extracted_items = Vec::new();
 
-        // [BATCH OPTIMIZATION] Process 5 items at a time
-        for chunk in item_pugs.chunks(5) {
+        // [BATCH OPTIMIZATION] Process 4 items at a time to improve stability
+        for chunk in item_pugs.chunks(4) {
             if cancellation_token.load(Ordering::Relaxed) { break; }
             
             let current_start = all_extracted_items.len() + 1;
@@ -613,8 +613,16 @@ r#"{instruction}
                 }
             } else if batch_results.is_object() {
                 // Fallback for single object response
-                all_extracted_items.push(batch_results);
+                all_extracted_items.push(batch_results.clone());
             }
+
+            // [NEW] Emit intermediate results for this batch immediately
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Item Extraction", 
+                "summary": format!("Extracted {}/{} items...", all_extracted_items.len(), total_items),
+                "data": batch_results, // Current batch data
+                "spinner": "⠋"
+            }));
         }
         
         extracted_data = json!({
