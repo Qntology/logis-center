@@ -5,7 +5,7 @@ use arrow_array::{RecordBatch, StringArray, Int64Array, Float32Array, FixedSizeL
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use futures::TryStreamExt;
 
 const DB_URI: &str = "data/lancedb";
@@ -69,7 +69,7 @@ impl VectorStore {
 
     /// Task 테이블이 없으면 생성합니다.
     pub async fn init_task_table(&self) -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
+        let task_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("type", DataType::Utf8, false),
             Field::new("from_source", DataType::Utf8, false),
@@ -83,14 +83,91 @@ impl VectorStore {
             Field::new("status", DataType::Utf8, false),
         ]));
 
-        // RecordBatchIterator is required for create_table
-        let batches = RecordBatchIterator::new(vec![], schema.clone());
-        
-        let _ = self.conn.create_table("tasks", batches)
-            .execute()
-            .await;
+        // Using create_table with .execute() will fail if it exists. 
+        // We catch the error or list tables first. 
+        if !self.conn.table_names().execute().await?.contains(&"tasks".to_string()) {
+            let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
+        }
+
+        let msg_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("role", DataType::Utf8, false), // 'user', 'assistant', 'system_task'
+            Field::new("content", DataType::Utf8, false),
+            Field::new("task_id", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, true), // 'processing', 'done', 'error'
+            Field::new("created_at", DataType::Int64, false),
+        ]));
+
+        if !self.conn.table_names().execute().await?.contains(&"messages".to_string()) {
+            let _ = self.conn.create_table("messages", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
+        }
             
         Ok(())
+    }
+
+    pub async fn has_active_task(&self, ref_id: &str) -> Result<bool> {
+        let table = self.conn.open_table("tasks").execute().await?;
+        let results = table.query()
+            .only_if(format!("ref_id = '{}' AND (status = 'pending' OR status = 'processing')", ref_id))
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(!results.is_empty())
+    }
+
+    pub async fn add_message(&self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<&str>) -> Result<()> {
+        let table = self.conn.open_table("messages").execute().await?;
+        let schema = table.schema().await?;
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![id.to_string()])),
+                Arc::new(StringArray::from(vec![role.to_string()])),
+                Arc::new(StringArray::from(vec![content.to_string()])),
+                Arc::new(StringArray::from(vec![task_id.unwrap_or("").to_string()])),
+                Arc::new(StringArray::from(vec![status.unwrap_or("").to_string()])),
+                Arc::new(Int64Array::from(vec![now])),
+            ],
+        )?;
+
+        table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
+        Ok(())
+    }
+
+    pub async fn get_all_messages(&self, limit: usize) -> Result<Vec<Value>> {
+        let table = self.conn.open_table("messages").execute().await?;
+        let results = table.query()
+            .limit(limit)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut msgs = Vec::new();
+        for batch in results {
+            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let roles = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let contents = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let task_ids = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let statuses = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+            let createds = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
+
+            for i in 0..batch.num_rows() {
+                msgs.push(json!({
+                    "id": ids.value(i),
+                    "role": roles.value(i),
+                    "content": contents.value(i),
+                    "task_id": task_ids.value(i),
+                    "status": statuses.value(i),
+                    "created_at": createds.value(i),
+                }));
+            }
+        }
+        Ok(msgs)
     }
 
     pub async fn add_task(&self, task: Task) -> Result<()> {
@@ -167,6 +244,20 @@ impl VectorStore {
         Ok(tasks)
     }
 
+    pub async fn update_message_status(&self, task_id: &str, status: &str, content: Option<&str>) -> Result<()> {
+        let table = self.conn.open_table("messages").execute().await?;
+        
+        let results = table.query().only_if(format!("task_id = '{}'", task_id)).limit(1).execute().await?.try_collect::<Vec<_>>().await?;
+        if results.is_empty() { return Ok(()); }
+        
+        table.delete(&format!("task_id = '{}'", task_id)).await?;
+        
+        if let Some(c) = content {
+            self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status)).await?;
+        }
+        Ok(())
+    }
+
     pub async fn update_task_status(&self, id: &str, _status: &str) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
         
@@ -208,14 +299,17 @@ impl VectorStore {
             Field::new("updated_at", DataType::Int64, false),
         ]));
 
+        let existing_tables = self.conn.table_names().execute().await?;
+
         for table_name in tables {
+            if existing_tables.contains(&table_name.to_string()) { continue; }
+
             let batches = RecordBatchIterator::new(vec![], schema.clone());
             let table = self.conn.create_table(table_name, batches)
                 .execute()
                 .await?;
             
             // Create index on 'text' column for keyword searching
-            // Using Index::Auto for best compatibility across library versions
             let _ = table.create_index(&["text"], lancedb::index::Index::Auto).execute().await;
         }
         Ok(())

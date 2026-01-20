@@ -390,14 +390,35 @@ async fn deep_research_command(
 
 #[tauri::command]
 
+async fn check_active_task(state: State<'_, AppState>, ref_id: String) -> Result<bool, String> {
+
+    let store_guard = state.store.lock().await;
+
+    if let Some(db) = store_guard.as_ref() {
+
+        db.has_active_task(&ref_id).await.map_err(|e| e.to_string())
+
+    } else { Ok(false) }
+
+}
+
+
+
+#[tauri::command]
+async fn get_chat_messages(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        db.get_all_messages(50).await.map_err(|e| e.to_string())
+    } else { Ok(vec![]) }
+}
+
+
+
+#[tauri::command]
 async fn set_login_state(
-
     state: State<'_, AppState>,
-
     is_logged_in: bool,
-
     token: Option<String>,
-
 ) -> Result<String, String> {
 
     let store_guard = state.store.lock().await;
@@ -546,6 +567,10 @@ pub fn run() {
                                         status: "pending".to_string(),
                                     };
         
+                                    // [NEW] Also save as a chat message for the dashboard
+                                    let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
+                                    let _ = db.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", &msg_content, Some(&task.id), Some("processing")).await;
+
                                     match db.add_task(task).await {
                                         Ok(_) => println!("[Event] Task saved to DB successfully."),
                                         Err(e) => eprintln!("[Event] Failed to save task: {}", e),
@@ -606,7 +631,11 @@ pub fn run() {
 
             move_to_top_center,
 
-            set_login_state
+            set_login_state,
+
+            check_active_task,
+
+            get_chat_messages
 
         ])
 

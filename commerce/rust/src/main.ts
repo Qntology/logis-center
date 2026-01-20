@@ -284,6 +284,18 @@ document.addEventListener('show-doc', (e: any) => {
 
 // EXTRACT: Image or Browser Task
 btnExtract?.addEventListener("click", async () => {
+    // [PREVENTION] Check for existing task first
+    if (currentDetectedUrl) {
+        try {
+            const isActive = await invoke<boolean>("check_active_task", { ref_id: currentDetectedUrl });
+            if (isActive) {
+                alert("An extraction for this URL is already in progress. Check the dashboard (Config).");
+                openWidget("settings");
+                return;
+            }
+        } catch(e) {}
+    }
+
     openWidget("list");
     
     // Switch to Detail View for Progress
@@ -295,40 +307,32 @@ btnExtract?.addEventListener("click", async () => {
     if (btnStopTask) btnStopTask.style.display = "flex";
 
     // Block re-execution if already running (just show view)
-    if (isExtracting) {
-        return;
-    }
+    if (isExtracting) return;
 
-    // [UI-UPDATE] Set initial spinner text and start animation
-    if (btnExtract) {
-        btnExtract.innerText = "⠋";
-        startSpinner();
-    }
+    // [UI-UPDATE] Separate Spinner from Button
+    // We now keep the ⚡ button as is, and the animation happens in the chat/log
+    startSpinner();
     
     if (currentImage) {
-        // --- 1. Image Extraction ---
         isExtracting = true;
         detailTitle.innerText = "⚡ Analyzing Image...";
         detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;"></div>`;
         try {
-            // Generate Task ID
             const taskId = `img_${Date.now()}`;
-            
-            // Send to Backend Scheduler
             await emit("new-task-from-browser", {
                 id: taskId,
                 type: "image_extraction",
                 image_path: currentImage, 
-                ref_id: currentSession.hash || "manual"
+                ref_id: currentImage, // Using path as unique ref
+                link: "Local Image"
             });
-            
+            // Show in chat too
+            addChatMessage({ id: taskId, role: "system_task", content: `Task Started: Image Analysis`, status: "processing" });
         } catch (e) { 
             isExtracting = false;
             detailTitle.innerText = "Error";
-            detailContent.innerHTML = `<div style="color:red;">Failed to queue: ${e}</div>`; 
         }
     } else {
-        // --- 2. Browser Extraction ---
         isExtracting = true;
         detailTitle.innerText = "⚡ Browser Extraction...";
         detailContent.innerHTML = `<div id="extraction-log" style="display:flex; flex-direction:column; gap:5px; padding-bottom:20px;">
@@ -337,35 +341,97 @@ btnExtract?.addEventListener("click", async () => {
         
         try {
             const html = await invoke<string>("extract_html_from_current_tab");
-            
-            // Generate Task ID
             let taskId = `task_${Date.now()}`;
-            if (currentDetectedUrl) {
-                try {
-                    const urlObj = new URL(currentDetectedUrl);
-                    const link = urlObj.pathname + urlObj.search;
-                    const cc = currentSession.cc || "logis.center";
-                    taskId = await hashId(cc + link);
-                } catch (e) {}
-            }
-
-            // Send to Backend
+            
             await emit("new-task-from-browser", {
                 id: taskId,
                 type: "html_extraction",
                 html: html, 
                 link: currentDetectedUrl, 
-                ref_id: currentSession.hash || "manual"
+                ref_id: currentDetectedUrl
             });
             
-            // Note: The 'extraction-progress' listener below will handle UI updates
+            // Show in chat dashboard
+            addChatMessage({ id: taskId, role: "system_task", content: `Task Started: ${new URL(currentDetectedUrl).hostname}`, status: "processing", url: currentDetectedUrl });
             
         } catch (e) {
             detailTitle.innerText = "Error";
-            detailContent.innerHTML = `<div style="color:red;">Browser Error: ${e}</div>`;
         }
     }
 });
+
+function addChatMessage(msg: { id: string, role: string, content: string, status?: string, url?: string }) {
+    if (!chatTalks) return;
+    
+    let el = document.getElementById(`msg-${msg.id}`);
+    if (!el) {
+        el = document.createElement("div");
+        el.id = `msg-${msg.id}`;
+        el.className = `talk ${msg.role === 'user' ? 'me' : 'ai'}`;
+        chatTalks.appendChild(el);
+    }
+
+    if (msg.role === "system_task") {
+        const isDone = msg.status === "done";
+        const isError = msg.status === "error";
+        
+        el.style.borderLeft = `3px solid ${isDone ? '#4ade80' : (isError ? '#ef4444' : 'var(--primary)')}`;
+        el.style.padding = "10px";
+        el.style.background = "#222";
+        el.style.marginBottom = "10px";
+        el.style.borderRadius = "5px";
+        el.style.fontSize = "0.8rem";
+
+        el.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                <div style="flex:1;">
+                    <div style="color:#aaa; font-size:0.7rem; margin-bottom:4px;">EXTRACTION TASK</div>
+                    <div style="font-weight:bold; margin-bottom:4px;">${msg.content}</div>
+                    ${msg.url ? `<div style="color:#666; font-size:0.7rem; word-break:break-all;">${msg.url}</div>` : ''}
+                </div>
+                <div style="margin-left:10px;">
+                    ${isDone ? '✅' : (isError ? '❌' : '<span class="active-spinner">⠋</span>')}
+                </div>
+            </div>
+            <div style="margin-top:10px; display:flex; gap:8px;">
+                ${!isDone && !isError ? `<button class="stop-btn" style="background:#ef4444; border:none; color:white; padding:4px 8px; border-radius:3px; cursor:pointer; font-size:0.7rem;">Stop 🛑</button>` : `<span style="color:#4ade80;">Completed</span>`}
+            </div>
+        `;
+
+        const stopBtn = el.querySelector(".stop-btn");
+        if (stopBtn) {
+            stopBtn.addEventListener("click", async () => {
+                if (confirm("Stop this task?")) {
+                    await invoke("stop_current_extraction");
+                    msg.status = "error";
+                    msg.content = "Task Stopped by User";
+                    addChatMessage(msg); // Re-render
+                }
+            });
+        }
+    } else {
+        // Normal Chat Message
+        el.innerText = msg.content;
+    }
+
+    // Scroll to bottom
+    const chatScroll = document.getElementById("chat-scroll");
+    if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
+}
+
+// Update chat from background events
+listen("extraction-progress", (event: any) => {
+    const payload = event.payload;
+    if (payload.task_id) {
+        // Find existing message or create summary
+        const msgId = payload.task_id;
+        if (payload.category === "Done") {
+            addChatMessage({ id: msgId, role: "system_task", content: payload.summary, status: "done" });
+        } else if (payload.category === "Error") {
+            addChatMessage({ id: msgId, role: "system_task", content: payload.summary, status: "error" });
+        }
+    }
+    // ... existing progress log logic ...
 
 // Stop Task
 btnStopTask?.addEventListener("click", async () => {
@@ -718,6 +784,112 @@ autoBtn?.addEventListener("click", async () => {
 });
 
 // --- 6. Auth & Chat Helpers ---
+
+async function fetchChatHistory() {
+    if (!chatTalks) return;
+
+    try {
+        // 1. Fetch from Local LanceDB (Tasks)
+        const localTasks = await invoke<any[]>("get_chat_messages");
+        
+        // 2. Fetch from Cloud Server (if logged in)
+        let cloudMessages: any[] = [];
+        if (currentSession.email && currentSession.token) {
+            try {
+                const response = await fetch(`${API_HOST}/talks?hash=${currentSession.hash}`, {
+                    headers: { "Authorization": `Bearer ${currentSession.token}` }
+                });
+                if (response.ok) {
+                    const json = await response.ok ? await response.json() : { results: [] };
+                    cloudMessages = json.results || [];
+                }
+            } catch (e) { console.warn("Cloud sync failed, using local only."); }
+        }
+
+        // 3. Merge and Sort by Date
+        const allMessages = [...localTasks, ...cloudMessages].sort((a, b) => {
+            const timeA = a.created_at || a.time || 0;
+            const timeB = b.created_at || b.time || 0;
+            return timeA - timeB;
+        });
+
+        // 4. Render All
+        chatTalks.innerHTML = "";
+        allMessages.forEach(msg => renderMessage(msg));
+        
+        // Scroll to bottom
+        const chatScroll = document.getElementById("chat-scroll");
+        if (chatScroll) chatScroll.scrollTop = chatScroll.scrollHeight;
+
+    } catch (err) {
+        console.error("Chat history error:", err);
+    }
+}
+
+function renderMessage(msg: any) {
+    if (!chatTalks) return;
+
+    const role = msg.role || (msg.is_ai ? "assistant" : "user");
+    const content = msg.content || msg.text || "";
+    const id = msg.id || msg.uuid || `msg-${Date.now()}-${Math.random()}`;
+
+    let el = document.getElementById(`msg-${id}`);
+    if (!el) {
+        el = document.createElement("div");
+        el.id = `msg-${id}`;
+        el.className = `talk ${role === 'user' ? 'me' : 'ai'}`;
+        chatTalks.appendChild(el);
+    }
+
+    if (role === "system_task") {
+        const isDone = msg.status === "done";
+        const isError = msg.status === "error";
+        
+        el.className = "talk ai task-card";
+        el.style.borderLeft = `3px solid ${isDone ? '#4ade80' : (isError ? '#ef4444' : 'var(--primary)')}`;
+        el.style.background = "#1a1a1a";
+        el.style.padding = "12px";
+        el.style.marginBottom = "12px";
+        el.style.borderRadius = "8px";
+
+        el.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                <div style="flex:1;">
+                    <div style="color:var(--primary); font-size:0.65rem; font-weight:bold; margin-bottom:4px; letter-spacing:1px;">WEB EXTRACTION</div>
+                    <div style="font-weight:bold; margin-bottom:4px; font-size:0.85rem; color:#fff;">${content}</div>
+                    ${msg.url ? `<div style="color:#666; font-size:0.7rem; word-break:break-all; font-family:monospace;">${msg.url}</div>` : ''}
+                </div>
+                <div style="margin-left:10px; font-size:1.2rem;">
+                    ${isDone ? '✅' : (isError ? '❌' : '<span class="active-spinner">⠋</span>')}
+                </div>
+            </div>
+            <div style="margin-top:12px; display:flex; align-items:center; gap:10px;">
+                ${!isDone && !isError 
+                    ? `<button class="stop-btn" data-task="${msg.task_id}" style="background:#331111; border:1px solid #ef4444; color:#ef4444; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:0.7rem; font-weight:bold;">STOP TASK 🛑</button>` 
+                    : `<span style="color:#4ade80; font-size:0.7rem; font-weight:bold;">${isDone ? 'COMPLETED' : 'STOPPED'}</span>`
+                }
+                <div style="flex:1;"></div>
+                <span style="font-size:0.65rem; color:#444;">${new Date(msg.created_at).toLocaleTimeString()}</span>
+            </div>
+        `;
+
+        const stopBtn = el.querySelector(".stop-btn") as HTMLElement;
+        if (stopBtn) {
+            stopBtn.onclick = async (e) => {
+                e.stopPropagation();
+                if (await ask("Stop this extraction task?", { title: "Logis AI", kind: "warning" })) {
+                    await invoke("stop_current_extraction");
+                    // Local UI update will happen via polling or immediate re-fetch
+                    fetchChatHistory();
+                }
+            };
+        }
+    } else {
+        // Standard Chat Bubble
+        el.innerHTML = `<div class="content">${marked.parse(content)}</div>
+                        <div class="meta">${new Date(msg.created_at || msg.time).toLocaleTimeString()}</div>`;
+    }
+}
 
 async function hashId(text?: string): Promise<string> {
     if (!ethers) return "";

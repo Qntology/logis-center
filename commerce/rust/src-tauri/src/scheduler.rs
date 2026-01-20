@@ -909,7 +909,16 @@ Just say "READY"."#,
         "Extraction Complete".to_string()
     };
 
+    // [NEW] Update Chat Message in DB
+    {
+        let store_guard = store_mutex.lock().await;
+        if let Some(db) = store_guard.as_ref() {
+            let _ = db.update_message_status(&task.id, "done", Some(&final_summary)).await;
+        }
+    }
+
     let _ = app_handle.emit("extraction-progress", json!({ 
+        "task_id": task.id,
         "category": "Done", 
         "summary": final_summary, 
         "spinner": "✅", 
