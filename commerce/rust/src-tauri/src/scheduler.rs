@@ -480,6 +480,31 @@ async fn process_task(
     
     let selector_info = parse_json_from_llm(&page_selectors_res);
     println!("[Scheduler] Selectors Found: {}", selector_info);
+    
+    // [NEW] Learning Phase: Save page selectors to 'commerce_pages' for future parity
+    {
+        let store_guard = store_mutex.lock().await;
+        if let Some(db) = store_guard.as_ref() {
+            let hashed_cc = crate::utils::hash::hash_id(&task.cc);
+            // pageId follows server logic: hashId(hashed_cc + pathname)
+            let page_id = crate::utils::hash::hash_id(&format!("{}{}", hashed_cc, task.ref_id)); 
+            
+            let _ = db.upsert_item(
+                "commerce_pages", 
+                &page_id, 
+                "pages", 
+                selector_info.clone(), 
+                None,
+                Some(&task.from_source),
+                Some(&task.to_dest),
+                Some(&hashed_cc),
+                Some(&task.bcc),
+                Some(&task.ref_id)
+            ).await;
+            println!("[Scheduler] Page learned and saved: {}", page_id);
+        }
+    }
+
     // Merge selectors into final_page_info
     if let Some(obj) = selector_info.as_object() {
         for (k, v) in obj {
@@ -613,12 +638,64 @@ r#"{instruction}
 
             let batch_results = parse_json_from_llm(&response);
             if let Some(arr) = batch_results.as_array() {
-                for item_json in arr {
+                for mut item_json in arr.iter().cloned() {
                     if !item_json.is_null() && item_json.is_object() {
-                        all_extracted_items.push(item_json.clone());
+                        // [STRICT INTEGRITY] Mirror server hashing and metadata
+                        let hashed_cc = crate::utils::hash::hash_id(&task.cc);
+                        let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
+                        let to_addr = if task.to_dest.is_empty() { 
+                            crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
+                        } else { task.to_dest.clone() };
+
+                        let link = item_json.get("link").and_then(|v| v.as_str()).unwrap_or("");
+                        let item_id = crate::utils::hash::hash_id(&format!("{}{}", hashed_cc, link));
+                        item_json.as_object_mut().unwrap().insert("id".to_string(), json!(item_id));
+                        
+                        // [STRICT PARITY] Generate BCC and REF exactly as server does
+                        let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, hashed_cc));
+                        let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", to_addr, hashed_cc, link));
+
+                        if !item_id.is_empty() {
+                            let mut model_guard = model_mutex.lock().await;
+                            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
+                            
+                            let nl = parsing::json_to_natural_language(&item_json);
+                            let item_digest = crate::utils::hash::digest(&nl);
+
+                            let vector = if let Some(model) = model_guard.as_ref() {
+                                Some(model.get_embedding(nl).await.unwrap_or_default())
+                            } else { None };
+                            drop(model_guard);
+
+                            let store_guard = store_mutex.lock().await;
+                            if let Some(db) = store_guard.as_ref() {
+                                let _ = db.upsert_item(
+                                    "commerce_items", 
+                                    &item_id, 
+                                    page_type, 
+                                    item_json.clone(), 
+                                    vector,
+                                    Some(from_addr),
+                                    Some(&to_addr),
+                                    Some(&hashed_cc),
+                                    Some(&bcc),
+                                    Some(&ref_val),
+                                    Some(&item_digest)
+                                ).await;
+                            }
+                        }
+                        all_extracted_items.push(item_json);
                     }
                 }
-            } else if batch_results.is_object() {
+            }
+
+                                                
+
+                                    
+
+                        
+
+             else if batch_results.is_object() {
                 // Fallback for single object response
                 all_extracted_items.push(batch_results.clone());
             }
@@ -790,7 +867,14 @@ Just say "READY"."#,
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
             let mut target_data = extracted_data.clone();
-            let mut target_id = format!("{}_{}", page_type, chrono::Utc::now().timestamp_millis());
+            
+            // [NEW] Generate stable target_id based on link if possible, fallback to task hash
+            let mut target_id = if let Some(link) = target_data.get("link").and_then(|v| v.as_str()) {
+                crate::utils::hash::hash_id(&format!("{}{}", task.cc, link))
+            } else {
+                task.id.clone() // Already a hash of cc + link from main.ts
+            };
+
             let mut found_existing = false;
             let to_table = format!("commerce_{}", merge_info.to);
 
@@ -812,9 +896,9 @@ Just say "READY"."#,
             }
 
             let mut text_to_embed = parsing::json_to_natural_language(&target_data);
+            let item_digest = crate::utils::hash::digest(&text_to_embed); // Generate Digest
             
-            // [FIX] Ensure text doesn't exceed embedding model limit (~2048 tokens)
-            // Conservative estimate: 1 char ~= 0.5 to 1 token in multilingual context
+            // [FIX] Ensure text doesn't exceed embedding model limit
             if text_to_embed.chars().count() > 3000 {
                 text_to_embed = text_to_embed.chars().take(3000).collect();
             }
@@ -828,7 +912,6 @@ Just say "READY"."#,
                 return Err(anyhow::anyhow!("Task cancelled")); 
             }
 
-            println!("[Scheduler] Checkpoint: Embedding Start (Relay)");
             let vector = if let Some(model) = model_guard.as_ref() {
                 let text_clone = text_to_embed.clone();
                 tokio::select!{
@@ -838,9 +921,7 @@ Just say "READY"."#,
                             if cancellation_token.load(Ordering::Relaxed) { break; }
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                    } => { 
-                        return Err(anyhow::anyhow!("Task cancelled")); 
-                    }
+                    } => { return Err(anyhow::anyhow!("Task cancelled")); }
                 }
             } else { None };
             drop(model_guard);
@@ -848,59 +929,123 @@ Just say "READY"."#,
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
                 println!("[Scheduler] Saving item: {} to {}", target_id, to_table);
-                let _ = db.upsert_item(&to_table, &target_id, page_type, target_data.clone(), vector.clone()).await;
-                // [GLOBAL-SEARCH-FIX] Also save to 'commerce_items' for global search visibility
-                let _ = db.upsert_item("commerce_items", &target_id, page_type, target_data, vector).await;
+                
+                // [STRICT INTEGRITY] Pre-hash metadata
+                let hashed_cc = crate::utils::hash::hash_id(&task.cc);
+                let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
+                let to_addr = if task.to_dest.is_empty() { 
+                    crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
+                } else { task.to_dest.clone() };
+
+                // [STRICT PARITY] Re-generate BCC and REF for the target
+                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, hashed_cc));
+                let link = target_data.get("link").and_then(|v| v.as_str()).unwrap_or("");
+                let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", to_addr, hashed_cc, link));
+
+                let _ = db.upsert_item(
+                    &to_table, 
+                    &target_id, 
+                    page_type, 
+                    target_data.clone(), 
+                    vector.clone(),
+                    Some(from_addr),
+                    Some(&to_addr),
+                    Some(&hashed_cc),
+                    Some(&bcc),
+                    Some(&ref_val),
+                    Some(&item_digest)
+                ).await;
+                
+                let _ = db.upsert_item(
+                    "commerce_items", 
+                    &target_id, 
+                    page_type, 
+                    target_data, 
+                    vector,
+                    Some(from_addr),
+                    Some(&to_addr),
+                    Some(&hashed_cc),
+                    Some(&bcc),
+                    Some(&ref_val),
+                    Some(&item_digest)
+                ).await;
             }
         }
-        } else {
-            let target_table = format!("commerce_{}", page_type);
-            let store_guard = store_mutex.lock().await;
-            if let Some(_db) = store_guard.as_ref() {
-                    let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
-                    let mut text_to_embed = parsing::json_to_natural_language(&extracted_data);
-                    
-                    if text_to_embed.chars().count() > 3000 {
-                        text_to_embed = text_to_embed.chars().take(3000).collect();
-                    }
-                    
-                    drop(store_guard);
-    
-                    let mut model_guard = model_mutex.lock().await;
-                    if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-                    
-                    println!("[Scheduler] Checkpoint: Embedding Start (Direct)");
-                    let vector = if let Some(model) = model_guard.as_ref() {
-                        let text_clone = text_to_embed.clone();
-                        tokio::select!{
-                            res = model.get_embedding(text_clone) => Some(res?),
-                            _ = async {
-                                loop {
-                                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            } => { 
-                                return Err(anyhow::anyhow!("Task cancelled")); 
+    } else {
+        let target_table = format!("commerce_{}", page_type);
+        let store_guard = store_mutex.lock().await;
+        if let Some(_db) = store_guard.as_ref() {
+                let mut text_to_embed = parsing::json_to_natural_language(&extracted_data);
+                let item_digest = crate::utils::hash::digest(&text_to_embed); // Generate Digest
+
+                if text_to_embed.chars().count() > 3000 {
+                    text_to_embed = text_to_embed.chars().take(3000).collect();
+                }
+                
+                drop(store_guard);
+
+                let mut model_guard = model_mutex.lock().await;
+                if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
+                
+                let vector = if let Some(model) = model_guard.as_ref() {
+                    let text_clone = text_to_embed.clone();
+                    tokio::select!{
+                        res = model.get_embedding(text_clone) => Some(res?),
+                        _ = async {
+                            loop {
+                                if cancellation_token.load(Ordering::Relaxed) { break; }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
-                        }
-                    } else { None };
-                    drop(model_guard);
-    
-                                    let store_guard = store_mutex.lock().await;
-    
-                                    if let Some(db) = store_guard.as_ref() {
-    
-                                        let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), vector.clone()).await;
-    
-                                        // [GLOBAL-SEARCH-FIX] Also save to 'commerce_items' for global search visibility
-    
-                                        let _ = db.upsert_item("commerce_items", &id, page_type, extracted_data.clone(), vector).await;
-    
-                                    }
-    
+                        } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                    }
+                } else { None };
+                drop(model_guard);
+
+                let store_guard = store_mutex.lock().await;
+                if let Some(db) = store_guard.as_ref() {
+                    let hashed_cc = crate::utils::hash::hash_id(&task.cc);
+                    let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
+                    let to_addr = if task.to_dest.is_empty() { 
+                        crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
+                    } else { task.to_dest.clone() };
+
+                    // [STRICT PARITY] Re-generate BCC and REF exactly as server does
+                    let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, hashed_cc));
+                    let link = extracted_data.get("link").and_then(|v| v.as_str()).unwrap_or("");
+                    let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", to_addr, hashed_cc, link));
                     
-            }
+                    let target_id = crate::utils::hash::hash_id(&format!("{}{}", hashed_cc, task.ref_id)); 
+
+                    let _ = db.upsert_item(
+                        &target_table, 
+                        &target_id, 
+                        page_type, 
+                        extracted_data.clone(), 
+                        vector.clone(),
+                        Some(from_addr),
+                        Some(&to_addr),
+                        Some(&hashed_cc),
+                        Some(&bcc),
+                        Some(&ref_val),
+                        Some(&item_digest)
+                    ).await;
+                    
+                    let _ = db.upsert_item(
+                        "commerce_items", 
+                        &target_id, 
+                        page_type, 
+                        extracted_data.clone(), 
+                        vector,
+                        Some(from_addr),
+                        Some(&to_addr),
+                        Some(&hashed_cc),
+                        Some(&bcc),
+                        Some(&ref_val),
+                        Some(&item_digest)
+                    ).await;
+                }
         }
+    }
         // Final Done Emission
     let final_summary = if !is_detail {
         let count = extracted_data.get("items").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
@@ -909,11 +1054,12 @@ Just say "READY"."#,
         "Extraction Complete".to_string()
     };
 
-    // [NEW] Update Chat Message in DB
+    // [STRICT PARITY] Update Chat Message in DB using integer status
     {
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
-            let _ = db.update_message_status(&task.id, "done", Some(&final_summary)).await;
+            let status_code = logic::parse_status("complete");
+            let _ = db.update_message_status(&task.id, status_code, Some(&final_summary)).await;
         }
     }
 

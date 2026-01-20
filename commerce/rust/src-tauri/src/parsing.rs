@@ -119,6 +119,18 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             output.push_str(&line);
             output.push('\n');
 
+            // --- [STRICT PARITY] Special Textarea Handling ---
+            if tag_name == "textarea" {
+                if let Some(val) = element.attr("value") {
+                    for line in val.lines() {
+                        output.push_str(&indent);
+                        output.push_str("    | ");
+                        output.push_str(line.trim());
+                        output.push('\n');
+                    }
+                }
+            }
+
             // --- Structural Compression for Classification ---
             let children: Vec<_> = node.children().collect();
             if *mode == PugMode::StructureOnly && children.len() > 5 {

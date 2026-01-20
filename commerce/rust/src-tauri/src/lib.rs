@@ -199,8 +199,8 @@ fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
     // 2. Condition Filters (Price, Date, etc.)
     if let Some(cond) = ctx.get("condition") {
         if let Some(price) = cond.get("price") {
-            if let Some(gte) = price.get("gte").and_then(|v| v.as_f64()) { filters.push(format!("total_amount >= {}", gte)); }
-            if let Some(lte) = price.get("lte").and_then(|v| v.as_f64()) { filters.push(format!("total_amount <= {}", lte)); }
+            if let Some(gte) = price.get("gte").and_then(|v| v.as_f64()) { filters.push(format!("amount >= {}", gte)); }
+            if let Some(lte) = price.get("lte").and_then(|v| v.as_f64()) { filters.push(format!("amount <= {}", lte)); }
         }
     }
 
@@ -515,6 +515,22 @@ async fn get_chat_messages(state: State<'_, AppState>) -> Result<Vec<Value>, Str
 
 
 #[tauri::command]
+async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(store) = store_guard.as_ref() {
+        store.get_all_items("commerce_pages", 20, 0).await.map_err(|e| e.to_string())
+    } else { Ok(vec![]) }
+}
+
+#[tauri::command]
+async fn get_known_users(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(store) = store_guard.as_ref() {
+        store.get_all_items("commerce_users", 20, 0).await.map_err(|e| e.to_string())
+    } else { Ok(vec![]) }
+}
+
+#[tauri::command]
 async fn set_login_state(
     state: State<'_, AppState>,
     is_logged_in: bool,
@@ -656,20 +672,20 @@ pub fn run() {
                                             .map(|s| s.to_string())
                                             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                         r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                                        from_source: "injected_script".to_string(),
-                                        to_dest: "local".to_string(),
+                                        from_source: payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string(),
+                                        to_dest: payload_val.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                         cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                        bcc: "".to_string(),
+                                        bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                         ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                         data_json: payload_val.to_string(),
                                         created_at: now,
                                         updated_at: now,
-                                        status: "pending".to_string(),
+                                        status: 10, // 10: pending (i32)
                                     };
         
                                     // [NEW] Also save as a chat message for the dashboard
                                     let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
-                                    let _ = db.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", &msg_content, Some(&task.id), Some("processing")).await;
+                                    let _ = db.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", &msg_content, Some(&task.id), Some(1)).await; // 1: processing (i32)
 
                                     match db.add_task(task).await {
                                         Ok(_) => println!("[Event] Task saved to DB successfully."),
@@ -737,7 +753,11 @@ pub fn run() {
 
             get_chat_messages,
 
-            proxy_fetch
+            proxy_fetch,
+
+            get_known_pages,
+
+            get_known_users
 
         ])
 

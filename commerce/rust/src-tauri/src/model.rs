@@ -299,13 +299,34 @@ impl LogisModel {
 
             let extracted_data = crate::scheduler::parse_json_from_llm(&result_str);
             
-            // [NEW] Generate natural language summary for image extraction
-            let _summary_text = crate::parsing::json_to_natural_language(&extracted_data);
+            let nl = crate::parsing::json_to_natural_language(&extracted_data);
+            let item_digest = crate::utils::hash::digest(&nl);
 
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
-                let id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id).to_string();
-                let _ = db.upsert_item("commerce_tracking", &id, "tracking", extracted_data.clone(), None).await;
+                // [STRICT PARITY] Use stable hashing for image results
+                let raw_id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
+                let hashed_id = crate::utils::hash::hash_id(raw_id);
+                
+                // Fixed identities for parity
+                let from_addr = "0x0000000000000000000000000000000000000000";
+                let to_addr = crate::utils::hash::hash_id(from_addr);
+                let hashed_cc = crate::utils::hash::hash_id("local.image");
+                let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", to_addr, hashed_cc, raw_id));
+
+                let _ = db.upsert_item(
+                    "commerce_tracking", 
+                    &hashed_id, 
+                    "tracking", 
+                    extracted_data.clone(), 
+                    None,
+                    Some(from_addr),
+                    Some(&to_addr),
+                    Some(&hashed_cc),
+                    None, // bcc
+                    Some(&ref_val),
+                    Some(&item_digest)
+                ).await;
             }
             
             let _ = app_handle.emit("extraction-progress", json!({ 

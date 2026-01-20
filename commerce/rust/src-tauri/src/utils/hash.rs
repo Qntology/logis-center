@@ -1,5 +1,9 @@
 use ethers_core::utils::hash_message;
 use ethers_signers::{LocalWallet, Signer};
+use regex::Regex;
+use once_cell::sync::Lazy;
+
+static PUNCTUATION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{P}\p{S}\p{Z}]").unwrap());
 
 /// JS의 ethers.computeAddress(ethers.hashMessage(text))와 100% 동일한 결과값을 반환합니다.
 pub fn hash_id(text: &str) -> String {
@@ -10,11 +14,39 @@ pub fn hash_id(text: &str) -> String {
     let bytes = message_hash.as_bytes();
     if let Ok(wallet) = LocalWallet::from_bytes(bytes) {
         // 3. 주소 추출 및 소문자 변환
-        // format!("{:?}", address) results in "0x..."
         return format!("{:?}", wallet.address()).to_lowercase();
     }
     
     String::new()
+}
+
+/// 서버의 normalizeNumericHomoglyphs 로직을 이식하여 시각적으로 유사한 문자를 숫자로 교정합니다.
+pub fn normalize_numeric_homoglyphs(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for c in text.chars() {
+        let normalized = match c {
+            'O' | 'o' | 'Ο' | '○' | '〇' | '０' | 'Ｏ' => '0',
+            'I' | 'l' | '１' | 'Ｉ' | 'ｌ' | 'Ι' | '|' | 'ᛁ' => '1',
+            'Z' | 'z' | '２' | 'Ƨ' | 'ᒿ' => '2',
+            'Ɛ' | 'ɜ' | 'З' | 'з' | '３' => '3',
+            'Ꮞ' | '４' => '4',
+            'S' | 's' | '５' | 'ƽ' => '5',
+            'b' | 'Ꮾ' | '６' => '6',
+            'T' | '７' => '7',
+            'Β' | 'ß' | '８' => '8',
+            'g' | '９' | 'ǵ' | 'ɡ' => '9',
+            _ => c,
+        };
+        result.push(normalized);
+    }
+    result
+}
+
+/// 서버의 Digest(text)와 동일하게 문장 부호 및 공백을 제거한 후 hash_id를 생성합니다.
+pub fn digest(text: &str) -> String {
+    let normalized = normalize_numeric_homoglyphs(text);
+    let clean_text = PUNCTUATION_REGEX.replace_all(&normalized, "").to_string().to_lowercase();
+    hash_id(&clean_text)
 }
 
 #[cfg(test)]

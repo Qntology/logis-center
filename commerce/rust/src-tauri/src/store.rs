@@ -14,15 +14,16 @@ const DB_URI: &str = "data/lancedb";
 pub struct Task {
     pub id: String,
     pub r#type: String,
-    pub from_source: String, // 'from' is reserved
-    pub to_dest: String,     // 'to' is reserved
+    pub from_source: String, 
+    pub to_dest: String,     
     pub cc: String,
     pub bcc: String,
     pub ref_id: String,
-    pub data_json: String,   // Store JSON as string
+    #[serde(rename = "data")]
+    pub data_json: String,   
     pub created_at: i64,
     pub updated_at: i64,
-    pub status: String,      // 'pending', 'processing', 'done', 'error'
+    pub status: i32,      
 }
 
 #[derive(Clone)]
@@ -44,30 +45,23 @@ impl VectorStore {
         Ok(Self { conn, base_path: base_path.to_string() })
     }
 
-    pub fn get_config_path(&self) -> std::path::PathBuf {
-        std::path::Path::new(&self.base_path).join("settings.json")
-    }
-
     pub fn load_config(&self) -> AppConfig {
-        let path = self.get_config_path();
+        let path = std::path::Path::new(&self.base_path).join("settings.json");
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(config) = serde_json::from_str(&content) {
-                    return config;
-                }
+                if let Ok(config) = serde_json::from_str(&content) { return config; }
             }
         }
         AppConfig::default()
     }
 
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
-        let path = self.get_config_path();
+        let path = std::path::Path::new(&self.base_path).join("settings.json");
         let json = serde_json::to_string_pretty(config)?;
         std::fs::write(path, json)?;
         Ok(())
     }
 
-    /// Task 테이블이 없으면 생성합니다.
     pub async fn init_task_table(&self) -> Result<()> {
         let task_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -77,51 +71,43 @@ impl VectorStore {
             Field::new("cc", DataType::Utf8, false),
             Field::new("bcc", DataType::Utf8, false),
             Field::new("ref_id", DataType::Utf8, false),
-            Field::new("data_json", DataType::Utf8, false),
+            Field::new("data", DataType::Utf8, false), 
             Field::new("created_at", DataType::Int64, false),
             Field::new("updated_at", DataType::Int64, false),
-            Field::new("status", DataType::Utf8, false),
+            Field::new("status", DataType::Int32, false), 
         ]));
 
-        // Using create_table with .execute() will fail if it exists. 
-        // We catch the error or list tables first. 
-        if !self.conn.table_names().execute().await?.contains(&"tasks".to_string()) {
+        let existing = self.conn.table_names().execute().await?;
+        if !existing.contains(&"tasks".to_string()) {
             let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
         }
 
         let msg_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
-            Field::new("role", DataType::Utf8, false), // 'user', 'assistant', 'system_task'
+            Field::new("role", DataType::Utf8, false), 
             Field::new("content", DataType::Utf8, false),
             Field::new("task_id", DataType::Utf8, true),
-            Field::new("status", DataType::Utf8, true), // 'processing', 'done', 'error'
+            Field::new("status", DataType::Int32, true), 
             Field::new("created_at", DataType::Int64, false),
         ]));
 
-        if !self.conn.table_names().execute().await?.contains(&"messages".to_string()) {
-            let _ = self.conn.create_table("messages", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
+        if !existing.contains(&"commerce_talks".to_string()) {
+            let _ = self.conn.create_table("commerce_talks", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
         }
-            
         Ok(())
     }
 
     pub async fn has_active_task(&self, ref_id: &str) -> Result<bool> {
         let table = self.conn.open_table("tasks").execute().await?;
         let results = table.query()
-            .only_if(format!("ref_id = '{}' AND (status = 'pending' OR status = 'processing')", ref_id))
-            .limit(1)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+            .only_if(format!("ref_id = '{}' AND (status = 10 OR status = 1)", ref_id))
+            .limit(1).execute().await?.try_collect::<Vec<_>>().await?;
         Ok(!results.is_empty())
     }
 
-    pub async fn add_message(&self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<&str>) -> Result<()> {
-        let table = self.conn.open_table("messages").execute().await?;
+    pub async fn add_message(&self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<i32>) -> Result<()> {
+        let table = self.conn.open_table("commerce_talks").execute().await?;
         let schema = table.schema().await?;
-        let now = chrono::Utc::now().timestamp_millis();
-
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -129,42 +115,27 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![role.to_string()])),
                 Arc::new(StringArray::from(vec![content.to_string()])),
                 Arc::new(StringArray::from(vec![task_id.unwrap_or("").to_string()])),
-                Arc::new(StringArray::from(vec![status.unwrap_or("").to_string()])),
-                Arc::new(Int64Array::from(vec![now])),
+                Arc::new(arrow_array::Int32Array::from(vec![status.unwrap_or(0)])),
+                Arc::new(Int64Array::from(vec![chrono::Utc::now().timestamp_millis()])),
             ],
         )?;
-
         table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
         Ok(())
     }
 
     pub async fn get_all_messages(&self, limit: usize) -> Result<Vec<Value>> {
-        let table = self.conn.open_table("messages").execute().await?;
-        let results = table.query()
-            .limit(limit)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
+        let table = self.conn.open_table("commerce_talks").execute().await?;
+        let results = table.query().limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let roles = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
             let contents = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
             let task_ids = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-            let statuses = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+            let statuses = batch.column(4).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             let createds = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
-
             for i in 0..batch.num_rows() {
-                msgs.push(json!({
-                    "id": ids.value(i),
-                    "role": roles.value(i),
-                    "content": contents.value(i),
-                    "task_id": task_ids.value(i),
-                    "status": statuses.value(i),
-                    "created_at": createds.value(i),
-                }));
+                msgs.push(json!({"id": ids.value(i), "role": roles.value(i), "content": contents.value(i), "task_id": task_ids.value(i), "status": statuses.value(i), "created_at": createds.value(i)}));
             }
         }
         Ok(msgs)
@@ -172,9 +143,7 @@ impl VectorStore {
 
     pub async fn add_task(&self, task: Task) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
-        
         let schema = table.schema().await?;
-        
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -188,210 +157,145 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![task.data_json])),
                 Arc::new(Int64Array::from(vec![task.created_at])),
                 Arc::new(Int64Array::from(vec![task.updated_at])),
-                Arc::new(StringArray::from(vec![task.status])),
+                Arc::new(arrow_array::Int32Array::from(vec![task.status])),
             ],
         )?;
-
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        table.add(batches).execute().await?;
+        table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
         Ok(())
     }
 
-    /// 대기 중인 작업을 가져옵니다.
     pub async fn get_pending_tasks(&self, limit: usize) -> Result<Vec<Task>> {
         let table = self.conn.open_table("tasks").execute().await?;
-        
-        let results = table.query()
-            .only_if("status = 'pending'")
-            .limit(limit)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
+        let results = table.query().only_if("status = 10").limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut tasks = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            let froms = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-            let tos = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let f_src = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let t_dst = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
             let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
             let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
             let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
             let datas = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
-            let createds = batch.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
-            let updateds = batch.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
-            let statuses = batch.column(10).as_any().downcast_ref::<StringArray>().unwrap();
-
+            let crs = batch.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
+            let ups = batch.column(9).as_any().downcast_ref::<Int64Array>().unwrap();
+            let sts = batch.column(10).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             for i in 0..batch.num_rows() {
                 tasks.push(Task {
-                    id: ids.value(i).to_string(),
-                    r#type: types.value(i).to_string(),
-                    from_source: froms.value(i).to_string(),
-                    to_dest: tos.value(i).to_string(),
-                    cc: ccs.value(i).to_string(),
-                    bcc: bccs.value(i).to_string(),
-                    ref_id: refs.value(i).to_string(),
-                    data_json: datas.value(i).to_string(),
-                    created_at: createds.value(i),
-                    updated_at: updateds.value(i),
-                    status: statuses.value(i).to_string(),
+                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from_source: f_src.value(i).to_string(), 
+                    to_dest: t_dst.value(i).to_string(), cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(), 
+                    ref_id: refs.value(i).to_string(), data_json: datas.value(i).to_string(), 
+                    created_at: crs.value(i), updated_at: ups.value(i), status: sts.value(i),
                 });
             }
         }
-        
         tasks.sort_by_key(|t| t.created_at);
         Ok(tasks)
     }
 
-    pub async fn update_message_status(&self, task_id: &str, status: &str, content: Option<&str>) -> Result<()> {
-        let table = self.conn.open_table("messages").execute().await?;
-        
-        let results = table.query().only_if(format!("task_id = '{}'", task_id)).limit(1).execute().await?.try_collect::<Vec<_>>().await?;
-        if results.is_empty() { return Ok(()); }
-        
+    pub async fn update_message_status(&self, task_id: &str, status: i32, content: Option<&str>) -> Result<()> {
+        let table = self.conn.open_table("commerce_talks").execute().await?;
         table.delete(&format!("task_id = '{}'", task_id)).await?;
-        
         if let Some(c) = content {
             self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status)).await?;
         }
         Ok(())
     }
 
-    pub async fn update_task_status(&self, id: &str, _status: &str) -> Result<()> {
+    pub async fn update_task_status(&self, id: &str, _status: i32) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
-        
-        let results = table.query()
-            .only_if(format!("id = '{}'", id))
-            .limit(1)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        if results.is_empty() { return Ok(()); }
-        
-        // Delete old (Simple update via delete-insert)
         table.delete(&format!("id = '{}'", id)).await?;
-        
-        // Note: For a proper update, we should re-insert. 
-        // But if 'done', we might just keep it deleted or archive it.
-        // For now, if status is 'done', we just leave it deleted (queue behavior).
-        
         Ok(())
     }
     
-    // --- Commerce Items (Sales, Goods, etc.) ---
-    
     pub async fn init_all_tables(&self) -> Result<()> {
-        let tables = vec![
-            "commerce_items", "commerce_sales", "commerce_tracking", "commerce_event", 
-            "commerce_users", "commerce_talks"
-        ];
+        let tables = vec!["commerce_items", "commerce_sales", "commerce_tracking", "commerce_event", "commerce_users", "commerce_talks"];
         let item_field = Field::new("item", DataType::Float32, true);
         
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("type", DataType::Utf8, false),
+            Field::new("from", DataType::Utf8, true),
+            Field::new("to", DataType::Utf8, true),
+            Field::new("cc", DataType::Utf8, true),
+            Field::new("bcc", DataType::Utf8, true),
+            Field::new("ref", DataType::Utf8, true),
+            Field::new("digest", DataType::Utf8, true),
+            Field::new("status_code", DataType::Int32, true),
+            Field::new("amount", DataType::Float32, true),
+            Field::new("doc_date", DataType::Utf8, true),
             Field::new("vector", DataType::FixedSizeList(Arc::new(item_field), 768), true),
             Field::new("text", DataType::Utf8, false),
-            Field::new("data_json", DataType::Utf8, false),
+            Field::new("data", DataType::Utf8, false),
             Field::new("updated_at", DataType::Int64, false),
         ]));
 
-        let existing_tables = self.conn.table_names().execute().await?;
-
-        for table_name in tables {
-            if existing_tables.contains(&table_name.to_string()) { continue; }
-
-            let batches = RecordBatchIterator::new(vec![], schema.clone());
-            let table = self.conn.create_table(table_name, batches)
-                .execute()
-                .await?;
-            
-            // Create index on 'text' column for keyword searching
+        let existing = self.conn.table_names().execute().await?;
+        for name in tables {
+            if existing.contains(&name.to_string()) { continue; }
+            let table = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await?;
             let _ = table.create_index(&["text"], lancedb::index::Index::Auto).execute().await;
+            let _ = table.create_index(&["data"], lancedb::index::Index::Auto).execute().await;
         }
         Ok(())
     }
     
-    pub async fn upsert_item(&self, table_name: &str, id: &str, type_: &str, data: Value, vector: Option<Vec<f32>>) -> Result<()> {
-         // Default to commerce_items if not specified or specific logic needed
-         let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
-         
-         let table = self.conn.open_table(target_table).execute().await?;
+    pub async fn upsert_item(
+        &self, 
+        table_name: &str, 
+        id: &str, 
+        type_: &str, 
+        data_val: Value, 
+        vector: Option<Vec<f32>>,
+        from: Option<&str>,
+        to: Option<&str>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+        ref_id: Option<&str>,
+        digest: Option<&str>
+    ) -> Result<()> {
+         let target = if table_name.is_empty() { "commerce_items" } else { table_name };
+         let table = self.conn.open_table(target).execute().await?;
          let _ = table.delete(&format!("id = '{}'", id)).await;
          
-         let json_str = data.to_string();
-         
-         // [FIXED] Derive text from JSON or fallback, don't force external narrative
-         let mut text_content = data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
+         let json_str = data_val.to_string();
+         let text_content = data_val.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
-         if text_content.is_empty() {
-             // Generate a simple summary if text is missing
-             if let Some(obj) = data.as_object() {
-                 let fields: Vec<String> = obj.iter()
-                    .filter(|(k, _)| !["type", "detail", "node", "item"].contains(&k.as_str()))
-                    .map(|(k, v)| format!("{}: {}", k, v))
-                    .take(10)
-                    .collect();
-                 text_content = fields.join(". ");
-             }
-         }
+         let status_code = data_val.get("status").and_then(|v| v.as_str()).map(|s| crate::logic::parse_status(s)).unwrap_or(0);
+         let amount = data_val.get("total_amount").or_else(|| data_val.get("sale_price")).or_else(|| data_val.get("supply_price")).or_else(|| data_val.get("shipping_fee")).or_else(|| data_val.get("discount")).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))).unwrap_or(0.0) as f32;
+         let doc_date = data_val.get("order_date").or_else(|| data_val.get("registration_date")).or_else(|| data_val.get("shipping_date")).or_else(|| data_val.get("started_at")).or_else(|| data_val.get("expired_at")).or_else(|| data_val.get("payment_date")).and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-         let vec_data = vector.unwrap_or(vec![0.0; 768]);
-         let now = chrono::Utc::now().timestamp_millis();
-         
          let schema = table.schema().await?;
-         
-         // Helper to build FixedSizeList
-         let values_builder = Float32Array::from(vec_data);
+         let values_builder = Float32Array::from(vector.unwrap_or(vec![0.0; 768]));
          let list_field = Field::new("item", DataType::Float32, true);
          let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 768, Arc::new(values_builder), None)?;
 
-         let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![id])),
-                Arc::new(StringArray::from(vec![type_])),
-                Arc::new(list_array),
-                Arc::new(StringArray::from(vec![text_content])),
-                Arc::new(StringArray::from(vec![json_str])),
-                Arc::new(Int64Array::from(vec![now])),
-            ],
-         )?;
+         let batch = RecordBatch::try_new(schema.clone(), vec![
+                Arc::new(StringArray::from(vec![id])), Arc::new(StringArray::from(vec![type_])),
+                Arc::new(StringArray::from(vec![from.unwrap_or("")])), Arc::new(StringArray::from(vec![to.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![cc.unwrap_or("")])), Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![ref_id.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
+                Arc::new(arrow_array::Int32Array::from(vec![status_code])), Arc::new(arrow_array::Float32Array::from(vec![amount])),
+                Arc::new(StringArray::from(vec![doc_date])), Arc::new(list_array),
+                Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![json_str])),
+                Arc::new(Int64Array::from(vec![chrono::Utc::now().timestamp_millis()])),
+         ])?;
          
-         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-         table.add(batches).execute().await?;
-         
+         table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
          Ok(())
     }
 
     pub async fn get_all_items(&self, table_name: &str, limit: usize, offset: usize) -> Result<Vec<TradeDocument>> {
         let table = self.conn.open_table(table_name).execute().await?;
-        let results = table.query()
-            .limit(limit)
-            .offset(offset)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
+        let results = table.query().limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-            let jsons = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
-
+            let texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+            let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
             for i in 0..batch.num_rows() {
-                docs.push(TradeDocument {
-                    uuid: ids.value(i).to_string(),
-                    doc_type: types.value(i).to_string(),
-                    text: texts.value(i).to_string(),
-                    json_data: jsons.value(i).to_string(),
-                    ..Default::default()
-                });
+                docs.push(TradeDocument { uuid: ids.value(i).to_string(), doc_type: types.value(i).to_string(), text: texts.value(i).to_string(), json_data: jsons.value(i).to_string(), ..Default::default() });
             }
         }
         Ok(docs)
@@ -399,136 +303,73 @@ impl VectorStore {
 
     pub async fn get_item_by_id(&self, table_name: &str, id: &str) -> Result<Option<TradeDocument>> {
         let table = self.conn.open_table(table_name).execute().await?;
-        let results = table.query()
-            .only_if(format!("id = '{}'", id))
-            .limit(1)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        if results.is_empty() { return Ok(None); }
+        let results = table.query().only_if(format!("id = '{}'", id)).limit(1).execute().await?.try_collect::<Vec<_>>().await?;
+        if results.is_empty() || results[0].num_rows() == 0 { return Ok(None); }
         let batch = &results[0];
-        if batch.num_rows() == 0 { return Ok(None); }
-
         let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-        let jsons = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
-
-        Ok(Some(TradeDocument {
-            uuid: ids.value(0).to_string(),
-            doc_type: types.value(0).to_string(),
-            text: texts.value(0).to_string(),
-            json_data: jsons.value(0).to_string(),
-            ..Default::default()
-        }))
+        let texts = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+        let jsons = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+        Ok(Some(TradeDocument { uuid: ids.value(0).to_string(), doc_type: types.value(0).to_string(), text: texts.value(0).to_string(), json_data: jsons.value(0).to_string(), ..Default::default() }))
     }
     
     pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
-         let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
-         let table = self.conn.open_table(target_table).execute().await?;
-         
-         let mut combined_results = std::collections::HashMap::new();
-
-         // 1. FULL TEXT SEARCH (Keyword Match)
+         let target = if table_name.is_empty() { "commerce_items" } else { table_name };
+         let table = self.conn.open_table(target).execute().await?;
+         let mut combined = std::collections::HashMap::new();
          if !query_text.is_empty() {
-             let clean_query = query_text.replace("'", "''");
-             let mut fts_query = table.query();
-             if let Some(ref f) = filter { fts_query = fts_query.only_if(f); }
-             
-             if let Ok(fts_results) = fts_query
-                .only_if(format!("text MATCH '{}'", clean_query))
-                .limit(limit)
-                .execute()
-                .await {
-                    if let Ok(batches) = fts_results.try_collect::<Vec<_>>().await {
-                        for batch in batches {
-                            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                            let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-                            for i in 0..batch.num_rows() {
-                                combined_results.insert(ids.value(i).to_string(), (texts.value(i).to_string(), 1.0));
-                            }
-                        }
+             let clean = query_text.replace("'", "''");
+             let mut q = table.query();
+             if let Some(ref f) = filter { q = q.only_if(f); }
+             if let Ok(res) = q.only_if(format!("text MATCH '{0}' OR data MATCH '{0}'", clean)).limit(limit).execute().await {
+                if let Ok(batches) = res.try_collect::<Vec<_>>().await {
+                    for b in batches {
+                        let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+                        let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+                        for i in 0..b.num_rows() { combined.insert(ids.value(i).to_string(), (txs.value(i).to_string(), 1.0)); }
                     }
                 }
-         }
-
-         // 2. VECTOR SEARCH (Semantic Match)
-         let mut vector_query = table.query();
-         if let Some(ref f) = filter { vector_query = vector_query.only_if(f); }
-
-         let vector_results = vector_query
-            .limit(limit)
-            .nearest_to(query_vec)?
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-            
-         for batch in vector_results {
-             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-             let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-             for i in 0..batch.num_rows() {
-                 let id = ids.value(i).to_string();
-                 if let Some((_, score)) = combined_results.get_mut(&id) {
-                     *score += 0.5;
-                 } else {
-                     combined_results.insert(id, (texts.value(i).to_string(), 0.5));
-                 }
              }
          }
-         
-         let mut final_list: Vec<_> = combined_results.into_iter().map(|(id, (txt, score))| (id, txt, score)).collect();
+         let mut vq = table.query();
+         if let Some(ref f) = filter { vq = vq.only_if(f); }
+         let vres = vq.limit(limit).nearest_to(query_vec)?.execute().await?.try_collect::<Vec<_>>().await?;
+         for b in vres {
+             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+             let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
+             for i in 0..b.num_rows() {
+                 let id = ids.value(i).to_string();
+                 if let Some((_, s)) = combined.get_mut(&id) { *s += 0.5; } 
+                 else { combined.insert(id, (txs.value(i).to_string(), 0.5)); }
+             }
+         }
+         let mut final_list: Vec<_> = combined.into_iter().map(|(id, (txt, s))| (id, txt, s)).collect();
          final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-         
          Ok(final_list)
     }
 
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
-        let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
-        let table = self.conn.open_table(target_table).execute().await?;
-        
-        let results = table.query()
-            .limit(1000) 
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let target_val_str = match value {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            _ => value.to_string(),
-        };
-
+        let target = if table_name.is_empty() { "commerce_items" } else { table_name };
+        let table = self.conn.open_table(target).execute().await?;
+        let results = table.query().limit(1000).execute().await?.try_collect::<Vec<_>>().await?;
+        let target_str = match value { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => value.to_string() };
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let jsons = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
-
+            let datas = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
             for i in 0..batch.num_rows() {
-                let json_str = jsons.value(i);
+                let json_str = datas.value(i);
                 if let Ok(data) = serde_json::from_str::<Value>(json_str) {
-                    if let Some(field_val) = data.get(property) {
-                        let field_val_str = match field_val {
-                            Value::String(s) => s.clone(),
-                            Value::Number(n) => n.to_string(),
-                            _ => field_val.to_string(),
-                        };
-                        
-                        if field_val_str == target_val_str {
-                            return Ok(Some((ids.value(i).to_string(), data)));
-                        }
+                    if let Some(f_val) = data.get(property) {
+                        let f_val_str = match f_val { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => f_val.to_string() };
+                        if f_val_str == target_str { return Ok(Some((ids.value(i).to_string(), data))); }
                     }
                 }
             }
         }
-
         Ok(None)
     }
 }
 
-// Full TradeDocument Struct restored for frontend compatibility and detailed schema support.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TradeDocument {
     pub uuid: String,

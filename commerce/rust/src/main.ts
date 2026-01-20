@@ -186,8 +186,85 @@ if (pillNav) {
 // --- 2. Search & Main Nav ---
 searchInput?.addEventListener("focus", () => {
     openWidget("list");
+    
+    // [NEW] Show Navigation Overlay and render learned pages
+    const navOverlay = document.getElementById("nav-categories");
+    if (navOverlay) {
+        navOverlay.classList.remove("hidden");
+        renderNavigation();
+    }
+
     if (cachedDocs.length === 0) refreshList();
 });
+
+// Helper to hide navigation when clicking away or selecting something
+function hideNavigation() {
+    document.getElementById("nav-categories")?.classList.add("hidden");
+}
+
+async function renderNavigation() {
+    const pageList = document.getElementById("nav-list-pages");
+    const userList = document.getElementById("nav-list-users");
+    if (!pageList || !userList) return;
+
+    try {
+        // 1. Fetch and Render Pages
+        const pages = await invoke<any[]>("get_known_pages");
+        pageList.innerHTML = "";
+        if (pages.length === 0) {
+            pageList.innerHTML = "<div style='color:#666; padding:10px; font-size:0.75rem;'>No pages learned yet.</div>";
+        } else {
+            pages.forEach(p => {
+                const data = JSON.parse(p.json_data);
+                const div = document.createElement("div");
+                div.className = "scroll-item";
+                div.style.padding = "10px";
+                div.style.borderBottom = "1px solid #222";
+                div.style.cursor = "pointer";
+                
+                div.innerHTML = `
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                        <strong style="color:var(--primary); font-size:0.75rem; background:#331111; padding:2px 6px; border-radius:3px;">${p.doc_type.toUpperCase()}</strong>
+                        <span style="font-size:0.65rem; color:#555;">${data.detail ? 'DETAIL' : 'LIST'}</span>
+                    </div>
+                    <div style="font-size:0.75rem; color:#eee; font-weight:bold;">${p.text || 'Unknown Site'}</div>
+                    <div style="font-size:0.65rem; color:#444; font-family:monospace; margin-top:2px; word-break:break-all;">ID: ${p.uuid.slice(0,12)}...</div>
+                `;
+                
+                div.onclick = () => {
+                    hideNavigation();
+                    searchInput.value = `type:${p.doc_type}`;
+                    btnSubmit.click();
+                };
+                pageList.appendChild(div);
+            });
+        }
+
+        // 2. Fetch and Render Users
+        const users = await invoke<any[]>("get_known_users");
+        userList.innerHTML = "";
+        if (users.length === 0) {
+            userList.innerHTML = "<div style='color:#666; padding:10px; font-size:0.75rem;'>No team members found.</div>";
+        } else {
+            users.forEach(u => {
+                const div = document.createElement("div");
+                div.className = "scroll-item";
+                div.style.padding = "8px 10px";
+                div.style.borderBottom = "1px solid #222";
+                div.innerHTML = `
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <div style="width:24px; height:24px; border-radius:50%; background:#333; display:flex; align-items:center; justify-content:center; font-size:0.6rem; color:var(--primary); border:1px solid var(--primary);">U</div>
+                        <div>
+                            <div style="font-size:0.75rem; font-weight:bold; color:#fff;">${u.uuid.slice(0,8)}</div>
+                            <div style="font-size:0.65rem; color:#555;">${u.doc_type || 'Active Member'}</div>
+                        </div>
+                    </div>
+                `;
+                userList.appendChild(div);
+            });
+        }
+    } catch (e) { console.error("Nav error:", e); }
+}
 
 searchInput?.addEventListener("input", () => {
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
@@ -252,9 +329,13 @@ btnSubmit?.addEventListener("click", async () => {
 document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
 
 btnExtract?.addEventListener("click", async () => {
+    let pathname = "/";
     if (currentDetectedUrl) {
         try {
-            const isActive = await invoke<boolean>("check_active_task", { ref_id: currentDetectedUrl });
+            const urlObj = new URL(currentDetectedUrl);
+            pathname = urlObj.pathname;
+            
+            const isActive = await invoke<boolean>("check_active_task", { ref_id: pathname });
             if (isActive) {
                 alert("This page is already in the queue or being processed.");
                 openWidget("settings");
@@ -290,7 +371,13 @@ btnExtract?.addEventListener("click", async () => {
         let taskId = `task_${Date.now()}`;
         try {
             const html = await invoke<string>("extract_html_from_current_tab");
-            await emit("new-task-from-browser", { id: taskId, type: "html_extraction", html: html, link: currentDetectedUrl, ref_id: currentDetectedUrl });
+            await emit("new-task-from-browser", { 
+                id: taskId, 
+                type: "html_extraction", 
+                html: html, 
+                link: currentDetectedUrl, 
+                ref_id: pathname // [STRICT PARITY] Use pathname only
+            });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${new URL(currentDetectedUrl).hostname}`, status: "processing", url: currentDetectedUrl, created_at: Date.now() });
             
             // Switch to chat dashboard to show queueing
@@ -548,22 +635,31 @@ listen("browser-match-found", (event: any) => {
 
 // --- 6. Auth & Chat Helpers ---
 
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
 const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
 async function buildServerUrl(query: any = {}) {
     const created_at = Date.now() - timezoneOffset;
     let url = `${API_HOST}/task?created_at=${created_at}`;
+    
     if (currentDetectedUrl) {
         try {
             const urlObj = new URL(currentDetectedUrl);
             url += `&origin=${encodeURIComponent(urlObj.origin)}`;
-            if (!query.to) {
+            
+            // [FIXED IDENTITY] Use ZeroAddress based logic
+            if (!query.from) query.from = currentSession.address || ZERO_ADDRESS;
+            if (!query.to) query.to = currentSession.team || await hashId(ZERO_ADDRESS);
+            
+            if (!query.id) {
                 const cc = currentSession.cc || "logis.center";
-                query.to = await hashId(cc + urlObj.pathname);
+                query.id = await hashId(cc + urlObj.pathname);
             }
             query.href = urlObj.href;
         } catch(e) {}
     }
+
     for (const key in query) { if (query[key]) url += `&${key}=${encodeURIComponent(query[key])}`; }
     return url.toLowerCase();
 }
@@ -620,8 +716,17 @@ async function checkAuthStatus() {
 
 async function initSession() {
     let hash = localStorage.getItem("device_hash");
-    if (!hash && ethers) { const w = ethers.Wallet.createRandom(); hash = w.address.toLowerCase().replace("0x", ""); localStorage.setItem("device_hash", hash); }
+    if (!hash && ethers) {
+        const w = ethers.Wallet.createRandom();
+        hash = w.address.toLowerCase().replace("0x", "");
+        localStorage.setItem("device_hash", hash);
+    }
     currentSession.hash = hash || "";
+
+    // [FIXED IDENTITY] Apply ZeroAddress and its Hash
+    currentSession.address = ZERO_ADDRESS;
+    currentSession.team = await hashId(ZERO_ADDRESS);
+
     updateAuthUI();
     startPolling();
 }
