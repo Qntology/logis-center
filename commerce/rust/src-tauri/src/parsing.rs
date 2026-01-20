@@ -2,7 +2,7 @@ use scraper::{Html, Node, Selector};
 use ego_tree::NodeRef;
 use regex::Regex;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum PugMode {
     StructureOnly,
     FullContent,
@@ -119,7 +119,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             output.push_str(&line);
             output.push('\n');
 
-            // --- Structural Compression for Classification (StructureOnly mode) ---
+            // --- Structural Compression for Classification ---
             let children: Vec<_> = node.children().collect();
             if *mode == PugMode::StructureOnly && children.len() > 5 {
                 let mut last_tag = "";
@@ -138,13 +138,8 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                         }
                     } else { false };
 
-                    if is_repetitive {
-                        repeat_count += 1;
-                    } else {
-                        repeat_count = 0;
-                    }
+                    if is_repetitive { repeat_count += 1; } else { repeat_count = 0; }
 
-                    // Keep first 2 of a repetitive sequence, and the very last child
                     if repeat_count > 1 && idx < children.len() - 1 {
                         if repeat_count == 2 {
                             output.push_str(&indent);
@@ -222,9 +217,9 @@ Analyze the provided Pug template snippet and identify the primary category of t
 
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.
-{
+{{
     "type": "category_string"
-}
+}}
 
 [CONTEXT]
 Language: {LANGUAGE}"###;
@@ -244,11 +239,11 @@ Analyze the provided Pug template snippet and identify the structural CSS1 selec
 
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.
-{
+{{
     "item": "css_selector_string",
     "node": "css_selector_string",
     "detail": boolean
-}
+}}
 
 [CONTEXT]
 Language: {LANGUAGE}"###;
@@ -257,7 +252,7 @@ Language: {LANGUAGE}"###;
 
 pub fn para2graph(language: &str) -> String {
     format!(r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-	{{ 
+	{{
 		"context" : [
 			{{
 				"language" : "{}",
@@ -276,7 +271,7 @@ pub fn graph2contexts(current: &str) -> String {
 	# #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
     
     [TASK]
-    Analyze EACH provided text segment and extract structured conditions.
+    Analyze EACH provided text segment and extract structured conditions. 
     
     [OUTPUT FORMAT]
     Return a JSON object containing a "context" array with one object per segment.
@@ -298,176 +293,216 @@ pub fn graph2contexts(current: &str) -> String {
     }}"###, current)
 }
 
-pub fn item2json(page_type: &str, href: &str, _language: &str) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    match page_type {
-        "tracking" => {
-            fields.push(("status".to_string(), "'draft' | 'progress' | 'return' | 'complete' | 'error'".to_string()));
-            fields.push(("id".to_string(), "tracking number | string".to_string()));
-            fields.push(("title".to_string(), "tracking goods title | string".to_string()));
-            fields.push(("sender_name".to_string(), "sender_name | string".to_string()));
-            fields.push(("sender_address".to_string(), "sender_address | string".to_string()));
-            fields.push(("sender_phone".to_string(), "sender_phone | string".to_string()));
-            fields.push(("recipient_name".to_string(), "recipient_name | string".to_string()));
-            fields.push(("recipient_address".to_string(), "recipient_address | string".to_string()));
-            fields.push(("recipient_phone".to_string(), "recipient_phone | string".to_string()));
-            fields.push(("package_width".to_string(), "Package width | number".to_string()));
-            fields.push(("package_height".to_string(), "Package height | number".to_string()));
-            fields.push(("package_length".to_string(), "Package length | number".to_string()));
-            fields.push(("package_weight".to_string(), "Package weight | number".to_string()));
-            fields.push(("carrier".to_string(), "carrier name translated into English | string".to_string()));
-            fields.push(("shipping_fee".to_string(), "Shipping cost | number".to_string()));
-            fields.push(("shipping_method".to_string(), "'standard' | 'express' | 'same_day' | 'pick_up' | 'freight' | 'prepaid'".to_string()));
-            fields.push(("shipping_duration".to_string(), "Estimated delivery days | number".to_string()));
-            fields.push(("bundle_shipping".to_string(), "Allow combined shipping | string".to_string()));
-            fields.push(("shipping_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        "goods" => {
-            fields.push(("node".to_string(), "goods form container CSS1 selector".to_string()));
-            fields.push(("code".to_string(), "product constant code | string".to_string()));
-            fields.push(("link".to_string(), format!("'{}'", href)));
-            fields.push(("id".to_string(), "Refer to the ID value from the link or an attribute or input value | string".to_string()));
-            fields.push(("status".to_string(), "'draft' | 'show' | 'hide' | 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'".to_string()));
-            fields.push(("payment_method".to_string(), "payment method | string".to_string()));
-            fields.push(("bank".to_string(), "bank company name | '' | string".to_string()));
-            fields.push(("card".to_string(), "card company name | '' | string".to_string()));
-            fields.push(("model_name".to_string(), "product Model name | string".to_string()));
-            fields.push(("brand_name".to_string(), "product Brand name | string".to_string()));
-            fields.push(("condition".to_string(), "['new' | 'used' | 'lease' | 'rental' | 'refurbish']".to_string()));
-            fields.push(("description".to_string(), "product Full description (HTML allowed) | string".to_string()));
-            fields.push(("short_description".to_string(), "product short description | string".to_string()));
-            fields.push(("tags".to_string(), "[{ tag : product keyword or tag | string }]".to_string()));
-            fields.push(("origin_country".to_string(), "product Country of origin/manufacture | string".to_string()));
-            fields.push(("manufacturer".to_string(), "product Manufacturer name | string".to_string()));
-            fields.push(("release_date".to_string(), "Product release date(yyyy-MM-ddThh:mm:ss) | string".to_string()));
-            fields.push(("manufacture_date".to_string(), "product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string".to_string()));
-            fields.push(("expiration_date".to_string(), "product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string".to_string()));
-            fields.push(("gtin".to_string(), "product Global Trade Item Number | string".to_string()));
-            fields.push(("mpn".to_string(), "product Manufacturer Part Number | string".to_string()));
-            fields.push(("barcode".to_string(), "product Barcode value | string".to_string()));
-            fields.push(("sale_price".to_string(), "product sale price | number".to_string()));
-            fields.push(("supply_price".to_string(), "product supply price | number".to_string()));
-            fields.push(("currency".to_string(), "ISO 4217 Currency Code | string".to_string()));
-            fields.push(("compare_at_price".to_string(), "product Original price for showing discounts | number".to_string()));
-            fields.push(("quantity".to_string(), "product Inventory quantity | number".to_string()));
-            fields.push(("stock_keeping_unit".to_string(), "Stock Keeping Unit | string".to_string()));
-            fields.push(("low_stock_threshold".to_string(), "product Low stock alert threshold | number".to_string()));
-            fields.push(("unit".to_string(), "product Selling unit | string".to_string()));
-            fields.push(("tax_included".to_string(), "product Whether tax | number".to_string()));
-            fields.push(("tax_code".to_string(), "product Tax code for region-specific rules | string".to_string()));
-            fields.push(("main_image_url".to_string(), "Main product image URL | string".to_string()));
-            fields.push(("additional_image_url".to_string(), "additional product image URL | string".to_string()));
-            fields.push(("video_url".to_string(), "product Promotional video URL | string".to_string()));
-            fields.push(("carrier".to_string(), "product carrier name translated into English | string".to_string()));
-            fields.push(("shipping_fee".to_string(), "product Shipping cost | number".to_string()));
-            fields.push(("shipping_method".to_string(), "'standard' | 'express' | 'same_day' | 'pick_up' | 'freight' | 'prepaid'".to_string()));
-            fields.push(("shipping_duration".to_string(), "product Estimated delivery days | number".to_string()));
-            fields.push(("bundle_shipping".to_string(), "product Allow combined shipping | string".to_string()));
-            fields.push(("product_width".to_string(), "Package width(cm) | number".to_string()));
-            fields.push(("product_height".to_string(), "Package height(cm) | number".to_string()));
-            fields.push(("product_length".to_string(), "Package length(cm) | number".to_string()));
-            fields.push(("product_weight".to_string(), "Package weight(kg) | number".to_string()));
-            fields.push(("options".to_string(), "[{ value:option name, inputs:[{ value:option input value }] }]".to_string()));
-            fields.push(("additional_goods".to_string(), "[{ value:product Link }]".to_string()));
-            fields.push(("title".to_string(), "product based title | string".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        "order" => {
-            fields.push(("node".to_string(), "order form container CSS1 selector".to_string()));
-            fields.push(("link".to_string(), format!("'{}'", href)));
-            fields.push(("id".to_string(), "Refer to the ID value from the link or an attribute or input value | string".to_string()));
-            fields.push(("tracking_number".to_string(), r#"Tracking Number | 운송장 번호 | 运单号 | 運單號 | 伝票번호 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string"#.to_string()));
-            fields.push(("status".to_string(), "'draft' | 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'".to_string()));
-            fields.push(("goods".to_string(), "[{ title:{ value:goods title }, link:{ value:goods Link }, id:{ value:product no } }]".to_string()));
-            fields.push(("sender_name".to_string(), "sender_name | string".to_string()));
-            fields.push(("sender_address".to_string(), "sender_address, Filter the addresses to District-level and up | string".to_string()));
-            fields.push(("sender_phone".to_string(), "sender_phone | string".to_string()));
-            fields.push(("recipient_name".to_string(), "recipient_name | string".to_string()));
-            fields.push(("recipient_address".to_string(), "recipient_address, Filter the addresses to District-level and up | string".to_string()));
-            fields.push(("recipient_phone".to_string(), "recipient_phone | string".to_string()));
-            fields.push(("bank".to_string(), "bank company name | string".to_string()));
-            fields.push(("card".to_string(), "card company name | string".to_string()));
-            fields.push(("order_date".to_string(), "order date | string".to_string()));
-            fields.push(("payment_date".to_string(), "payment date or '' | string".to_string()));
-            fields.push(("payment_method".to_string(), "'C.O.D.' | 'CARD' | 'BANK' | '' | string".to_string()));
-            fields.push(("payment_origin".to_string(), "Payment Gateway Service Name | '' | string".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        "coupon" | "event" => {
-            fields.push(("node".to_string(), format!("{} container CSS1 selector", page_type)));
-            fields.push(("link".to_string(), format!("'{}'", href)));
-            fields.push(("id".to_string(), "Refer to the ID value from the link or an attribute or input value | string".to_string()));
-            fields.push(("type".to_string(), "'percentage' | 'fixed_amount' | 'free_shipping' | ''".to_string()));
-            fields.push(("status".to_string(), "'draft' | 'progress' | 'stop' | 'cancel' | 'expire' | 'complete' | 'error'".to_string()));
-            fields.push(("title".to_string(), format!("{} title | string", page_type)));
-            fields.push(("started_at".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-            fields.push(("expired_at".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-            fields.push(("code".to_string(), format!("{} code used at checkout | string", page_type)));
-            fields.push(("discount".to_string(), "Discount value | number".to_string()));
-            fields.push(("quantity".to_string(), format!("{} quantity | number", page_type)));
-            fields.push(("usage_limit".to_string(), "Total usage limit for the coupon | number".to_string()));
-            fields.push(("usage_per".to_string(), "Usage limit per customer | number".to_string()));
-            fields.push(("new_customer_only".to_string(), "new customer only | boolean".to_string()));
-            fields.push(("min_order_amount".to_string(), "Minimum order amount required to apply coupon | number".to_string()));
-            fields.push(("max_discount_amount".to_string(), "Maximum discount limit allowed for the coupon | number".to_string()));
-            fields.push(("region_restrictions".to_string(), "region restrictions | boolean".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        "review" => {
-            fields.push(("node".to_string(), "review container CSS1 selector".to_string()));
-            fields.push(("link".to_string(), format!("'{}'", href)));
-            fields.push(("id".to_string(), "Refer to the ID value from the link or an attribute or input value | string".to_string()));
-            fields.push(("status".to_string(), "'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'".to_string()));
-            fields.push(("name".to_string(), "reviewer name | string".to_string()));
-            fields.push(("title".to_string(), "reviewer item title | string".to_string()));
-            fields.push(("completed".to_string(), "order complete | boolean".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        _ => {} 
-    }
-    fields
+pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
+    let schema = match page_type {
+        "tracking" => r###"- status: 'draft' | 'progress' | 'return' | 'complete' | 'error'
+- id: tracking number | string
+- title: tracking goods title | string
+- sender_name: sender_name | string
+- sender_address: sender_address | string
+- sender_phone: sender_phone | string
+- recipient_name: recipient_name | string
+- recipient_address: recipient_address | string
+- recipient_phone: recipient_phone | string
+- package_width: Package width | number
+- package_height: Package height | number
+- package_length: Package length | number
+- package_weight: Package weight | number
+- carrier: carrier name translated into English | string
+- shipping_fee: Shipping cost | number
+- shipping_method: 'standard' | 'express' | 'same_day' | 'pick_up' | 'freight' | 'prepaid'
+- shipping_duration: Estimated delivery days | number
+- bundle_shipping: Allow combined shipping | string
+- shipping_date: yyyy-MM-ddThh:mm:ss | string
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "goods" => r###"- node: goods form container CSS1 selector
+- code: product constant code | string
+- link: '{HREF}'
+- id: Refer to the ID value from the link or an attribute or input value | string
+- status: 'draft' | 'show' | 'hide' | 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
+- payment_method: payment method | string
+- bank: bank company name | '' | string
+- card: card company name | '' | string
+- model_name: product Model name | string
+- brand_name: product Brand name | string
+- condition: ['new' | 'used' | 'lease' | 'rental' | 'refurbish']
+- description: product Full description (HTML allowed) | string
+- short_description: product short description | string
+- tags: [{ tag : product keyword or tag | string }]
+- origin_country: product Country of origin/manufacture | string
+- manufacturer: product Manufacturer name | string
+- release_date: Product release date(yyyy-MM-ddThh:mm:ss) | string
+- manufacture_date: product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string
+- expiration_date: product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string
+- gtin: product Global Trade Item Number | string
+- mpn: product Manufacturer Part Number | string
+- barcode: product Barcode value | string
+- sale_price: product sale price | number
+- supply_price: product supply price | number
+- currency: ISO 4217 Currency Code | string
+- compare_at_price: product Original price for showing discounts | number
+- quantity: product Inventory quantity | number
+- stock_keeping_unit: Stock Keeping Unit | string
+- low_stock_threshold: product Low stock alert threshold | number
+- unit: product Selling unit | string
+- tax_included: product Whether tax | number
+- tax_code: product Tax code for region-specific rules | string
+- main_image_url: Main product image URL | string
+- additional_image_url: additional product image URL | string
+- video_url: product Promotional video URL | string
+- carrier: product carrier name translated into English | string
+- shipping_fee: product Shipping cost | number
+- shipping_method: 'standard' | 'express' | 'same_day' | 'pick_up' | 'freight' | 'prepaid'
+- shipping_duration: product Estimated delivery days | number
+- bundle_shipping: product Allow combined shipping | string
+- product_width: Package width(cm) | number
+- product_height: Package height(cm) | number
+- product_length: Package length(cm) | number
+- product_weight: Package weight(kg) | number
+- options: [{ value:option name, inputs:[{ value:option input value }] }]
+- additional_goods: [{ value:product Link }]
+- title: product based title | string
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "order" => r###"- node: order form container CSS1 selector
+- link: '{HREF}'
+- id: Refer to the ID value from the link or an attribute or input value | string
+- tracking_number: Tracking Number | 운송장 번호 | 运单호 | 運單號 | 伝표번호 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string
+- status: 'draft' | 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
+- goods: [{ title:{ value:goods title }, link:{ value:goods Link }, id:{ value:product no } }]
+- sender_name: sender_name | string
+- sender_address: sender_address, Filter the addresses to District-level and up | string
+- sender_phone: sender_phone | string
+- recipient_name: recipient_name | string
+- recipient_address: recipient_address, Filter the addresses to District-level and up | string
+- recipient_phone: recipient_phone | string
+- bank: bank company name | string
+- card: card company name | string
+- order_date: order date | string
+- payment_date: payment date or '' | string
+- payment_method: 'C.O.D.' | 'CARD' | 'BANK' | '' | string
+- payment_origin: Payment Gateway Service Name | '' | string
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "coupon" | "event" => r###"- node: {TYPE} container CSS1 selector
+- link: '{HREF}'
+- id: Refer to the ID value from the link or an attribute or input value | string
+- type: 'percentage' | 'fixed_amount' | 'free_shipping' | ''
+- status: 'draft' | 'progress' | 'stop' | 'cancel' | 'expire' | 'complete' | 'error'
+- title: {TYPE} title | string
+- started_at: yyyy-MM-ddThh:mm:ss | string
+- expired_at: yyyy-MM-ddThh:mm:ss | string
+- code: {TYPE} code used at checkout | string
+- discount: Discount value | number
+- quantity: {TYPE} quantity | number
+- usage_limit: Total usage limit for the coupon | number
+- usage_per: Usage limit per customer | number
+- new_customer_only: new customer only | boolean
+- min_order_amount: Minimum order amount required to apply coupon | number
+- max_discount_amount: Maximum discount limit allowed for the coupon | number
+- region_restrictions: region restrictions | boolean
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "review" => r###"- node: review container CSS1 selector
+- link: '{HREF}'
+- id: Refer to the ID value from the link or an attribute or input value | string
+- status: 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
+- name: reviewer name | string
+- title: reviewer item title | string
+- completed: order complete | boolean
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        _ => "- id: Unique identifier.\n- title: General name or title.\n- status: Current state."
+    };
+
+    let template = r###" 
+[TASK]
+Extract detailed information from the provided Pug template into a single structured JSON object.
+
+[CONTEXT]
+Page Type: {TYPE}
+Source URL: {HREF}
+Language: {LANGUAGE}
+
+[SCHEMA DEFINITIONS]
+{SCHEMA}
+
+[EXTRACTION RULES]
+1. Return ONLY valid JSON. No preamble, no postscript.
+2. If a field is missing in the data, use null.
+3. Normalize all dates to 'yyyy-MM-ddThh:mm:ss'.
+4. Extract only numeric values for price, amount, weight, and dimensions.
+5. Do NOT make up data. Only extract what is present in the Pug structure.
+
+[OUTPUT FORMAT]
+{{ 
+    "field_name": "extracted_value"
+}}"###;
+
+    template.replace("{TYPE}", page_type)
+            .replace("{HREF}", href)
+            .replace("{LANGUAGE}", language)
+            .replace("{SCHEMA}", schema)
 }
 
-pub fn list2json(page_type: &str, language: &str) -> Vec<(String, String)> {
-    let mut fields = Vec::new();
-    fields.push(("language".to_string(), format!("'{}'", language)));
-    fields.push(("type".to_string(), format!("'{}'", page_type)));
-    fields.push(("item".to_string(), "type based item CSS1 selector excluding ads".to_string()));
-    fields.push(("more".to_string(), "item URL includes a manage path, an administrative or edit route Link CSS1 selector".to_string()));
-    fields.push(("node".to_string(), "item parent list CSS1 selector excluding ads".to_string()));
-    fields.push(("next".to_string(), "list next button CSS1 selector".to_string()));
-    fields.push(("text".to_string(), format!("summarize the contents of the items array in {}", language)));
-    fields.push(("detail".to_string(), "is a detail page or a detail form | boolean".to_string()));
-    match page_type {
-        "tracking" | "review" => {
-            fields.push(("status".to_string(), "'start' | 'progress' | 'stop' | 'cancel' | 'return'".to_string()));
-            fields.push(("id".to_string(), "Refer to the ID value from the link | an attribute | string".to_string()));
-            fields.push(("title".to_string(), "author and content | string".to_string()));
-            fields.push(("link".to_string(), "URL includes a manage path, an administrative | edit route Link | string".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        "order" | "goods" => {
-            fields.push(("status".to_string(), "'show' | 'progress' | 'remove' | 'hide' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'".to_string()));
-            fields.push(("link".to_string(), "URL includes a manage path, an administrative | edit route Link | string".to_string()));
-            fields.push(("id".to_string(), "Refer to the ID value from the link | an attribute | string".to_string()));
-            fields.push(("title".to_string(), "title | string".to_string()));
-            fields.push(("sale_price".to_string(), "sale price | number".to_string()));
-            fields.push(("supply_price".to_string(), "supply price | number".to_string()));
-            fields.push(("currency".to_string(), "ISO 4217 Currency Code | string".to_string()));
-            fields.push(("quantity".to_string(), "item stock quantity | number".to_string()));
-            fields.push(("tracking_number".to_string(), "Tracking Number | 운송장 번호 | 运单号 | 運單號 | 伝票번호 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        "coupon" | "event" => {
-            fields.push(("status".to_string(), "'show' | 'progress' | 'hide' | 'stop' | 'cancel' | 'expire' | 'complete' | 'error'".to_string()));
-            fields.push(("id".to_string(), "Refer to the ID value from the link | an attribute | string".to_string()));
-            fields.push(("title".to_string(), "type based item title".to_string()));
-            fields.push(("started_at".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-            fields.push(("expired_at".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-            fields.push(("registration_date".to_string(), "yyyy-MM-ddThh:mm:ss | string".to_string()));
-        },
-        _ => {} 
-    }
-    fields
+pub fn list2json(page_type: &str, language: &str) -> String {
+    let schema = match page_type {
+        "order" | "goods" => r###"- item: type based item CSS1 selector excluding ads
+- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
+- node: item parent list CSS1 selector excluding ads
+- next: list next button CSS1 selector
+- status: 'show' | 'progress' | 'remove' | 'hide' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
+- id: Refer to the ID value from the link | an attribute | string
+- title: title | string
+- sale_price: sale price | number
+- supply_price: supply price | number
+- currency: ISO 4217 Currency Code | string
+- quantity: item stock quantity | number
+- tracking_number: Tracking Number | 운송장 번호 | 运单호 | 運單號 | 伝표번호 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string
+- link: URL includes a manage path, an administrative | edit route Link | string
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "tracking" | "review" => r###"- item: type based item CSS1 selector excluding ads
+- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
+- node: item parent list CSS1 selector excluding ads
+- next: list next button CSS1 selector
+- status: 'start' | 'progress' | 'stop' | 'cancel' | 'return'
+- id: Refer to the ID value from the link | an attribute | string
+- title: author and content | string
+- link: URL includes a manage path, an administrative | edit route Link | string
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "coupon" | "event" => r###"- item: type based item CSS1 selector excluding ads
+- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
+- node: item parent list CSS1 selector excluding ads
+- next: list next button CSS1 selector
+- status: 'show' | 'progress' | 'hide' | 'stop' | 'cancel' | 'expire' | 'complete' | 'error'
+- id: Refer to the ID value from the link | an attribute | string
+- title: type based item title
+- started_at: yyyy-MM-ddThh:mm:ss | string
+- expired_at: yyyy-MM-ddThh:mm:ss | string
+- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        _ => "- id: ID\n- title: Title\n- status: Status"
+    };
+
+    let template = r###" 
+[TASK]
+Extract a list of items from the provided Pug snippets into a JSON ARRAY.
+
+[CONTEXT]
+Category: {TYPE}
+Language: {LANGUAGE}
+
+[SCHEMA DEFINITIONS]
+{SCHEMA}
+
+[EXTRACTION RULES]
+1. Return a JSON ARRAY [ {{...}}, {{...}} ] containing objects for each item found.
+2. Ensure every object in the array follows the [SCHEMA DEFINITIONS].
+3. If data for a field is missing for an item, use null.
+4. Extract only numeric values for prices and quantities.
+5. Return ONLY the JSON array. No explanation.
+
+[OUTPUT FORMAT]
+[
+    {{ "id": "...", "title": "...", "status": "..." }}
+]"###;
+
+    template.replace("{TYPE}", page_type)
+            .replace("{LANGUAGE}", language)
+            .replace("{SCHEMA}", schema)
 }

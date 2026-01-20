@@ -539,10 +539,10 @@ async fn process_task(
             return Ok(());
         }
 
-        let fields_prompts = parsing::list2json(page_type, language);
+        let extraction_instruction = parsing::list2json(page_type, language);
         let mut all_extracted_items = Vec::new();
 
-        // [BATCH OPTIMIZATION] Process 5 items at a time to improve speed and context awareness
+        // [BATCH OPTIMIZATION] Process 5 items at a time
         for chunk in item_pugs.chunks(5) {
             if cancellation_token.load(Ordering::Relaxed) { break; }
             
@@ -561,48 +561,13 @@ async fn process_task(
                 combined_pugs.push_str(&format!("\n### ITEM #{} ###\n{}\n", idx + 1, pug));
             }
 
-            // [OPTIMIZATION] Group columns to prevent conflicts (e.g. sale_price vs supply_price)
-            let mut grouped_schema = String::new();
-            let mut identity_fields = Vec::new(); 
-            let mut finance_fields = Vec::new();  
-            let mut logistic_fields = Vec::new(); 
-
-            for (name, schema) in &fields_prompts {
-                let n_lower = name.to_lowercase();
-                if n_lower.contains("price") || n_lower.contains("amount") || n_lower.contains("quantity") || n_lower.contains("currency") {
-                    finance_fields.push((name, schema));
-                } else if n_lower.contains("status") || n_lower.contains("tracking") || n_lower.contains("date") || n_lower.contains("at") {
-                    logistic_fields.push((name, schema));
-                } else {
-                    identity_fields.push((name, schema));
-                }
-            }
-
-            grouped_schema.push_str("GROUP 1: Identity & General\n");
-            for (n, s) in identity_fields { grouped_schema.push_str(&format!("- {}: {}\n", n, s)); }
-            grouped_schema.push_str("\nGROUP 2: Financial & Amounts (Distinguish prices carefully)\n");
-            for (n, s) in finance_fields { grouped_schema.push_str(&format!("- {}: {}\n", n, s)); }
-            grouped_schema.push_str("\nGROUP 3: Status & Dates\n");
-            for (n, s) in logistic_fields { grouped_schema.push_str(&format!("- {}: {}\n", n, s)); }
-
             let prompt = format!(
-r#"[TASK]
-Extract data for {} items from the provided Pug snippets.
+r#"{instruction}
 
 [INPUT SNIPPETS]
-{}
-
-[EXTRACTION SCHEMA (Grouped to avoid conflicts)]
-{}
-
-[INSTRUCTION]
-1. Return a JSON ARRAY containing exactly {} objects.
-2. Carefully distinguish between similar fields (e.g., sale_price vs supply_price).
-3. Return ONLY the JSON array. No preamble, no explanation."#,
-                chunk.len(),
-                combined_pugs,
-                grouped_schema,
-                chunk.len()
+{data}"#,
+                instruction = extraction_instruction,
+                data = combined_pugs
             );
 
             let mut model_guard = model_mutex.lock().await;
@@ -621,7 +586,7 @@ Extract data for {} items from the provided Pug snippets.
                             "category": "Item Extraction",
                             "summary": summary_text
                         }), 
-                        2048, // Increased max_tokens for batch
+                        2048, 
                         Some(cancellation_token.clone()), 
                         None 
                     ) => res?,
@@ -680,60 +645,29 @@ Extract data for {} items from the provided Pug snippets.
         
         // CHUNKING: Split huge content into dynamic chunks with 500-char overlap (Device Optimized)
         let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 500); 
-        let fields_prompts = parsing::item2json(page_type, &url, language);
+        let extraction_instruction = parsing::item2json(page_type, &url, language);
 
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
         let detail_session_id = format!("{}_detail", task.id);
         
         // Phase 1: Ingest all chunks (Prefill)
-        // We feed chunks one by one to build up the KV cache context.
-        // We only ask for the result at the very end.
         let chunks_len = chunks.len();
         let mut full_context_accumulated = String::new(); // Accumulate context here
         
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             let is_last = chunk_idx == chunks_len - 1;
-            
-            // Append current chunk to accumulator
-            // Note: We don't just append the raw chunk, we append the *formatted* prompt content if possible,
-            // but since the prompt template changes (Instruction wrapper), simply appending raw text might confuse the model if we re-send full prompt.
-            // BETTER STRATEGY:
-            // The KV cache stores the *tokens* of the previous request. 
-            // If we send [Prompt_A + Chunk_1], cache has Tokens(Prompt_A + Chunk_1).
-            // Next request: [Prompt_A + Chunk_1 + Chunk_2].
-            // Cache Hit: Tokens(Prompt_A + Chunk_1). New input: Chunk_2.
-            
-            // So we MUST accumulate the content in the prompt.
             full_context_accumulated.push_str(chunk);
             full_context_accumulated.push('\n');
 
             // Prepare prompt
             let prompt = if is_last {
-                // Final Chunk: Include the FULL SCHEMA for all fields
-                let mut schema_definitions = String::new();
-                for (name, schema) in &fields_prompts {
-                    schema_definitions.push_str(&format!("### Field: {}\nSchema/Definition: {}\n\n", name, schema));
-                }
-
                 format!(
-r#"[CONTEXT]
-You have been reading a Pug (Jade) template part by part. 
-Below is the COMPLETELY ACCUMULATED content of the template.
+r#"{instruction}
 
-[FULL CONTENT]
-{}
-
-[EXTRACTION SCHEMA]
-Please extract the following data points precisely according to these definitions:
-{}
-
-[FINAL INSTRUCTION]
-1. Based on the FULL CONTENT, extract all fields mentioned in the EXTRACTION SCHEMA.
-2. Return ONLY a single valid JSON object.
-3. No preamble, no explanation, no markdown code blocks. Just the raw JSON.
-4. If a value is missing, use null."#,
-                    full_context_accumulated,
-                    schema_definitions
+[INPUT CONTENT]
+{data}"#,
+                    instruction = extraction_instruction,
+                    data = full_context_accumulated
                 )
             } else {
                 // Intermediate Chunk: Just read and remember
