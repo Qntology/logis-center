@@ -622,3 +622,22 @@ pub fn json_to_natural_language(value: &serde_json::Value) -> String {
 
     output.trim().to_string()
 }
+
+pub fn parse_json_from_llm(text: &str) -> serde_json::Value {
+    if let Ok(v) = serde_json::from_str(text) { return v; }
+    if let Some(start) = text.find("{") {
+        if let Some(end) = text.rfind("}") {
+            if start < end {
+                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
+            }
+        }
+    }
+    if let Some(start) = text.find("[") {
+        if let Some(end) = text.rfind("]") {
+            if start < end {
+                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
+            }
+        }
+    }
+    serde_json::json!({})
+}

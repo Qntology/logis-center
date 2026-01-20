@@ -239,10 +239,12 @@ async fn get_document(
     if let Some(store) = store_guard.as_ref() {
         let mut doc_opt = store.get_item_by_id("items", &uuid).await.map_err(|e| e.to_string())?;
         
-        // [DYNAMIC] Convert JSON to Natural Language for UI display only
+        // [OPTIMIZED] Preserve high-quality summary from DB if available
         if let Some(ref mut doc) = doc_opt {
-            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
-                doc.text = parsing::json_to_natural_language(&json_val);
+            if doc.text.is_empty() {
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
+                    doc.text = parsing::json_to_natural_language(&json_val);
+                }
             }
         }
         

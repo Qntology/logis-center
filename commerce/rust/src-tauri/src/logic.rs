@@ -1,21 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Task {
-    pub id: String,
-    pub r#type: String,
-    pub from: String,
-    pub to: String,
-    pub cc: String,
-    pub bcc: String,
-    pub ref_id: String,
-    pub data: Value,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct QueryInfo {
     pub table: String,

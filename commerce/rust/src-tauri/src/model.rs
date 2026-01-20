@@ -17,7 +17,6 @@ use candle_core::{Device, DType};
 use image::DynamicImage;
 use serde_json::{Value, json, Map};
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
-use regex::Regex;
 use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::BASE64_STANDARD;
@@ -297,7 +296,7 @@ impl LogisModel {
                 Some(task_id.clone())
             ).await?;
 
-            let extracted_data = crate::scheduler::parse_json_from_llm(&result_str);
+            let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
             
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
             let item_digest = crate::utils::hash::digest(&nl);
@@ -656,7 +655,7 @@ impl LogisModel {
         ).await?;
 
         println!("[PROCESS] Raw Response: {}", response);
-        let extracted_data = crate::scheduler::parse_json_from_llm(&response);
+        let extracted_data = crate::parsing::parse_json_from_llm(&response);
         
         Ok(extracted_data)
     }
@@ -684,15 +683,15 @@ impl LogisModel {
         // Stage 1: Segment query (para2graph) - Using persistent session for schema caching
         let prompt1 = crate::parsing::para2graph(language);
         let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, Some("system_search_p2g".to_string())).await?;
-        let segments = crate::scheduler::parse_json_from_llm(&res1);
+        let segments = crate::parsing::parse_json_from_llm(&res1);
         
         // Stage 2: Extract conditions for each segment (graph2contexts) in ONE BATCH
         let mut final_contexts = Vec::new();
-        if let Some(ctx_arr) = segments.get("context").and_then(|v| v.as_array()) {
+        if let Some(ctx_arr) = segments.get("context").and_then(|v: &Value| v.as_array()) {
             // Combine all segments into one batch request
             let mut combined_segments = String::new();
             for (idx, seg) in ctx_arr.iter().enumerate() {
-                let seg_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let seg_text = seg.get("text").and_then(|v: &Value| v.as_str()).unwrap_or("");
                 combined_segments.push_str(&format!("Segment #{}: {}\n", idx + 1, seg_text));
             }
 
@@ -700,15 +699,17 @@ impl LogisModel {
                 let prompt2 = crate::parsing::graph2contexts(&current_time);
                 // Using persistent session for schema caching
                 let res2 = self.chat("", &format!("{}\n\nInput Segments:\n{}", prompt2, combined_segments), None, Some("system_search_g2c".to_string())).await?;
-                let mut batch_info = crate::scheduler::parse_json_from_llm(&res2);
+                let mut batch_info = crate::parsing::parse_json_from_llm(&res2);
                 
                 // Process results and ensure type parity
-                if let Some(res_arr) = batch_info.get_mut("context").and_then(|v| v.as_array_mut()) {
+                if let Some(res_arr) = batch_info.get_mut("context").and_then(|v: &mut Value| v.as_array_mut()) {
                     for (i, item) in res_arr.iter_mut().enumerate() {
                         // Match with original segment types if LLM lost them in batch
                         if let Some(original_seg) = ctx_arr.get(i) {
-                            if item.get("type").is_none() || item.get("type").and_then(|v| v.as_str()) == Some("") {
-                                item.as_object_mut().unwrap().insert("type".to_string(), original_seg.get("type").cloned().unwrap_or(json!("")));
+                            if item.get("type").is_none() || item.get("type").and_then(|v: &Value| v.as_str()) == Some("") {
+                                if let Some(item_obj) = item.as_object_mut() {
+                                    item_obj.insert("type".to_string(), original_seg.get("type").cloned().unwrap_or(json!("")));
+                                }
                             }
                         }
                     }
@@ -821,19 +822,6 @@ Return valid JSON only. No explanation.
     } else {
         String::new()
     }
-}
-
-fn extract_json_from_text(text: &str) -> Option<Value> {
-    let re = Regex::new(r"(?s)(\[.*\]|\{.*\})").ok()?;
-    let caps = re.captures(text)?;
-    let raw = caps.get(1)?.as_str();
-    let clean = raw.replace("```json", "").replace("```", "").trim().to_string();
-    serde_json::from_str(&clean).ok()
-}
-
-fn extract_json_field(text: &str, field_name: &str) -> Option<String> {
-    let val = extract_json_from_text(text)?;
-    val.get(field_name).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) {

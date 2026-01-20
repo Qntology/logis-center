@@ -417,7 +417,7 @@ async fn process_task(
     
     println!("[Scheduler] Checkpoint: Classification End");
     
-    let type_info = parse_json_from_llm(&page_type_res);
+    let type_info = parsing::parse_json_from_llm(&page_type_res);
     let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
     println!("[Scheduler] Classification Result: '{}'", page_type);
     
@@ -480,9 +480,8 @@ async fn process_task(
     } else { "{}".to_string() };
         drop(model_guard);
         
-        let selector_info = parse_json_from_llm(&page_selectors_res);
-        println!("[Scheduler] Selectors Found: {}", selector_info);
-        
+            let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
+            println!("[Scheduler] Selectors Found: {}", selector_info);        
         let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
     
         // [NEW] Learning Phase: Save page selectors to 'pages' for future parity
@@ -645,7 +644,7 @@ r#"{instruction}
             } else { "[]".to_string() };
             drop(model_guard);
 
-            let batch_results = parse_json_from_llm(&response);
+            let batch_results = parsing::parse_json_from_llm(&response);
             if let Some(arr) = batch_results.as_array() {
                 for mut item_json in arr.iter().cloned() {
                     if !item_json.is_null() && item_json.is_object() {
@@ -835,7 +834,7 @@ Just say "READY"."#,
 
             if is_last {
                 println!("[EXTRACT-FINAL] Result: {}", response);
-                let full_data = parse_json_from_llm(&response);
+                let full_data = parsing::parse_json_from_llm(&response);
                 extracted_data = full_data;
             }
         }
@@ -1174,125 +1173,5 @@ fn cleanup_task_resources(task_id: &str) {
     }
 }
 
-pub fn parse_json_from_llm(text: &str) -> Value {
-    if let Ok(v) = serde_json::from_str(text) { return v; }
-    if let Some(start) = text.find("{") {
-        if let Some(end) = text.rfind("}") {
-            if start < end {
-                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
-            }
-        }
-    }
-    if let Some(start) = text.find("[") {
-        if let Some(end) = text.rfind("]") {
-            if start < end {
-                if let Ok(v) = serde_json::from_str(&text[start..=end]) { return v; }
-            }
-        }
-    }
-    json!({})
-}
 
-/// Converts a JSON Value into a human-readable natural language narrative.
-/// [STRICT ALIGNMENT] This logic perfectly synchronizes with every column in `parsing.rs`.
-pub fn json_to_natural_language(value: &Value) -> String {
-    let mut output = String::new();
-    
-    // Recursive handling for nested structures like { "value": "..." }
-    if let Some(obj) = value.as_object() {
-        if obj.len() == 1 && obj.contains_key("value") {
-            return obj.get("value").unwrap().as_str().unwrap_or(&obj.get("value").unwrap().to_string()).to_string();
-        }
-    }
 
-    if let Value::Object(map) = value {
-        let page_type = map.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let is_detail = map.get("detail").and_then(|v| v.as_bool()).unwrap_or(true);
-
-        // Define EXACT columns from parsing.rs
-        let keys: Vec<&str> = match page_type {
-            "tracking" => {
-                if is_detail {
-                    vec!["status", "id", "title", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "package_width", "package_height", "package_length", "package_weight", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "shipping_date", "registration_date"]
-                } else {
-                    vec!["status", "id", "title", "link", "registration_date"]
-                }
-            },
-            "goods" => {
-                if is_detail {
-                    vec!["code", "link", "id", "status", "payment_method", "bank", "card", "model_name", "brand_name", "condition", "description", "short_description", "tags", "origin_country", "manufacturer", "release_date", "manufacture_date", "expiration_date", "gtin", "mpn", "barcode", "sale_price", "supply_price", "currency", "compare_at_price", "quantity", "stock_keeping_unit", "low_stock_threshold", "unit", "tax_included", "tax_code", "main_image_url", "additional_image_url", "video_url", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "bundle_shipping", "product_width", "product_height", "product_length", "product_weight", "options", "additional_goods", "title", "registration_date"]
-                } else {
-                    vec!["status", "link", "id", "title", "sale_price", "supply_price", "currency", "quantity", "tracking_number", "registration_date"]
-                }
-            },
-            "order" => {
-                if is_detail {
-                    vec!["link", "id", "tracking_number", "status", "goods", "sender_name", "sender_address", "sender_phone", "recipient_name", "recipient_address", "recipient_phone", "bank", "card", "order_date", "payment_date", "payment_method", "payment_origin", "registration_date"]
-                } else {
-                    vec!["status", "link", "id", "title", "sale_price", "supply_price", "currency", "quantity", "tracking_number", "registration_date"]
-                }
-            },
-            "coupon" | "event" => {
-                if is_detail {
-                    vec!["link", "id", "type", "status", "title", "started_at", "expired_at", "code", "discount", "quantity", "usage_limit", "usage_per", "new_customer_only", "min_order_amount", "max_discount_amount", "region_restrictions", "registration_date"]
-                } else {
-                    vec!["status", "id", "title", "started_at", "expired_at", "registration_date"]
-                }
-            },
-            "review" => {
-                if is_detail {
-                    vec!["link", "id", "status", "name", "title", "completed", "registration_date"]
-                } else {
-                    vec!["status", "id", "title", "link", "registration_date"]
-                }
-            },
-            _ => map.keys().map(|s| s.as_str()).collect()
-        };
-
-        for key in keys {
-            if let Some(v) = map.get(key) {
-                if v.is_null() { continue; }
-                let key_name = key.replace("_", " ");
-                if v.is_array() {
-                    let arr = v.as_array().unwrap();
-                    let mut items = Vec::new();
-                    for item in arr.iter().take(5) {
-                        let sub = json_to_natural_language(item);
-                        if !sub.is_empty() { items.push(sub); }
-                    }
-                    if !items.is_empty() {
-                        output.push_str(&format!("{}: [{}]. ", key_name, items.join(", ")));
-                    }
-                } else if v.is_object() {
-                    let sub = json_to_natural_language(v);
-                    if !sub.is_empty() {
-                        output.push_str(&format!("{}: {}. ", key_name, sub));
-                    }
-                } else {
-                    let s = match v {
-                        Value::String(s) => s.clone(),
-                        Value::Number(n) => n.to_string(),
-                        Value::Bool(b) => b.to_string(),
-                        _ => String::new(),
-                    };
-                    if !s.is_empty() && s != "null" {
-                        let s_clean = if s.len() > 400 { format!("{}...", &s[..400]) } else { s };
-                        output.push_str(&format!("{}: {}. ", key_name, s_clean));
-                    }
-                }
-            }
-        }
-    } else if let Value::Array(arr) = value {
-        for item in arr.iter().take(10) {
-            let sub = json_to_natural_language(item);
-            if !sub.is_empty() {
-                output.push_str(&sub);
-                output.push_str(" ");
-            }
-        }
-    } else {
-        output.push_str(&value.as_str().unwrap_or(&value.to_string()));
-    }
-    
-    output.trim().to_string()
-}
