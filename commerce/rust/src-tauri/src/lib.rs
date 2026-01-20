@@ -181,10 +181,30 @@ async fn search_documents(
     };
 
     if let Some(store) = store_guard.as_ref() {
-        store.search_items("commerce_items", &query, query_vec, 10).await.map_err(|e| e.to_string())
+        store.search_items("commerce_items", &query, query_vec, 10, None).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }
+}
+
+// Helper to convert structured LLM conditions to SQL filter strings
+fn convert_conditions_to_sql(ctx: &Value) -> Option<String> {
+    let mut filters = Vec::new();
+    
+    // 1. Type Filter
+    if let Some(t) = ctx.get("type").and_then(|v| v.as_str()) {
+        if !t.is_empty() { filters.push(format!("type = '{}'", t)); }
+    }
+
+    // 2. Condition Filters (Price, Date, etc.)
+    if let Some(cond) = ctx.get("condition") {
+        if let Some(price) = cond.get("price") {
+            if let Some(gte) = price.get("gte").and_then(|v| v.as_f64()) { filters.push(format!("total_amount >= {}", gte)); }
+            if let Some(lte) = price.get("lte").and_then(|v| v.as_f64()) { filters.push(format!("total_amount <= {}", lte)); }
+        }
+    }
+
+    if filters.is_empty() { None } else { Some(filters.join(" AND ")) }
 }
 
 #[tauri::command]
@@ -195,7 +215,15 @@ async fn get_all_documents(
 ) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let results = store.get_all_items("commerce_items", limit, offset).await.map_err(|e| e.to_string())?;
+        let mut results = store.get_all_items("commerce_items", limit, offset).await.map_err(|e| e.to_string())?;
+        
+        // [DYNAMIC] Convert JSON to Natural Language for UI display only
+        for doc in results.iter_mut() {
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
+                doc.text = parsing::json_to_natural_language(&json_val);
+            }
+        }
+        
         Ok(results)
     } else {
         Err("DB not initialized".to_string())
@@ -209,8 +237,16 @@ async fn get_document(
 ) -> Result<Option<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let doc = store.get_item_by_id("commerce_items", &uuid).await.map_err(|e| e.to_string())?;
-        Ok(doc)
+        let mut doc_opt = store.get_item_by_id("commerce_items", &uuid).await.map_err(|e| e.to_string())?;
+        
+        // [DYNAMIC] Convert JSON to Natural Language for UI display only
+        if let Some(ref mut doc) = doc_opt {
+            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
+                doc.text = parsing::json_to_natural_language(&json_val);
+            }
+        }
+        
+        Ok(doc_opt)
     } else {
         Err("DB not initialized".to_string())
     }
@@ -273,8 +309,12 @@ async fn ai_search_complex(
             let text = ctx.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if text.is_empty() { continue; }
             
+            // [FIX] Convert extracted conditions to SQL filter
+            let sql_filter = convert_conditions_to_sql(ctx);
+            
             let emb = model.get_embedding(text.to_string()).await.unwrap_or(vec![0.0; 768]);
-            if let Ok(results) = store.search_items("commerce_items", text, emb, 5).await {
+            // Now passing the filter to search_items
+            if let Ok(results) = store.search_items("commerce_items", text, emb, 5, sql_filter).await {
                 for (id, content, score) in results {
                     all_results.push(json!({
                         "id": id,
@@ -336,7 +376,7 @@ async fn deep_research_command(
     if let Some(store) = store_guard.as_ref() {
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 768]);
-        if let Ok(results) = store.search_items("commerce_items", &query, emb, 3).await {
+        if let Ok(results) = store.search_items("commerce_items", &query, emb, 3, None).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();

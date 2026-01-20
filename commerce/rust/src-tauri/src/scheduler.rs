@@ -376,7 +376,14 @@ async fn process_task(
                 ) => { 
                     let out = res?;
                     if is_last {
-                        page_type_res = out;
+                        page_type_res = out.clone();
+                        // [NEW] Emit raw classification text result
+                        let _ = app_handle.emit("extraction-progress", json!({ 
+                            "category": "Classification Ingestion",
+                            "summary": "Page type identified.",
+                            "data": out,
+                            "spinner": "✅"
+                        }));
                     } else {
                         // Add model's ACK to history to keep it in sync with cache
                         messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
@@ -617,10 +624,12 @@ r#"{instruction}
             }
 
             // [NEW] Emit intermediate results for this batch immediately
+            let display_text = parsing::json_to_natural_language(&batch_results);
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "category": "Item Extraction", 
                 "summary": format!("Extracted {}/{} items...", all_extracted_items.len(), total_items),
-                "data": batch_results, // Current batch data
+                "data": batch_results, // Original JSON data
+                "display_text": display_text, // Human-readable narrative for UI
                 "spinner": "⠋"
             }));
         }
@@ -802,7 +811,7 @@ Just say "READY"."#,
                 }
             }
 
-            let mut text_to_embed = json_to_natural_language(&target_data);
+            let mut text_to_embed = parsing::json_to_natural_language(&target_data);
             
             // [FIX] Ensure text doesn't exceed embedding model limit (~2048 tokens)
             // Conservative estimate: 1 char ~= 0.5 to 1 token in multilingual context
@@ -844,50 +853,67 @@ Just say "READY"."#,
                 let _ = db.upsert_item("commerce_items", &target_id, page_type, target_data, vector).await;
             }
         }
-    } else {
-        let target_table = format!("commerce_{}", page_type);
-        let store_guard = store_mutex.lock().await;
-        if let Some(_db) = store_guard.as_ref() {
-                let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
-                let mut text_to_embed = json_to_natural_language(&extracted_data);
-                
-                if text_to_embed.chars().count() > 3000 {
-                    text_to_embed = text_to_embed.chars().take(3000).collect();
-                }
-                
-                drop(store_guard);
-
-                let mut model_guard = model_mutex.lock().await;
-                if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-                
-                println!("[Scheduler] Checkpoint: Embedding Start (Direct)");
-                let vector = if let Some(model) = model_guard.as_ref() {
-                    let text_clone = text_to_embed.clone();
-                    tokio::select!{
-                        res = model.get_embedding(text_clone) => Some(res?),
-                        _ = async {
-                            loop {
-                                if cancellation_token.load(Ordering::Relaxed) { break; }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                        } => { 
-                            return Err(anyhow::anyhow!("Task cancelled")); 
-                        }
+        } else {
+            let target_table = format!("commerce_{}", page_type);
+            let store_guard = store_mutex.lock().await;
+            if let Some(_db) = store_guard.as_ref() {
+                    let id = extracted_data.get("id").and_then(|s| s.as_str()).unwrap_or_else(|| task.id.as_str()).to_string();
+                    let mut text_to_embed = parsing::json_to_natural_language(&extracted_data);
+                    
+                    if text_to_embed.chars().count() > 3000 {
+                        text_to_embed = text_to_embed.chars().take(3000).collect();
                     }
-                } else { None };
-                drop(model_guard);
-
-                let store_guard = store_mutex.lock().await;
-                if let Some(db) = store_guard.as_ref() {
-                    let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), vector.clone()).await;
-                    // [GLOBAL-SEARCH-FIX] Also save to 'commerce_items' for global search visibility
-                    let _ = db.upsert_item("commerce_items", &id, page_type, extracted_data.clone(), vector).await;
-                }
-        }
-    }    
+                    
+                    drop(store_guard);
     
+                    let mut model_guard = model_mutex.lock().await;
+                    if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
+                    
+                    println!("[Scheduler] Checkpoint: Embedding Start (Direct)");
+                    let vector = if let Some(model) = model_guard.as_ref() {
+                        let text_clone = text_to_embed.clone();
+                        tokio::select!{
+                            res = model.get_embedding(text_clone) => Some(res?),
+                            _ = async {
+                                loop {
+                                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            } => { 
+                                return Err(anyhow::anyhow!("Task cancelled")); 
+                            }
+                        }
+                    } else { None };
+                    drop(model_guard);
+    
+                                    let store_guard = store_mutex.lock().await;
+    
+                                    if let Some(db) = store_guard.as_ref() {
+    
+                                        let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), vector.clone()).await;
+    
+                                        // [GLOBAL-SEARCH-FIX] Also save to 'commerce_items' for global search visibility
+    
+                                        let _ = db.upsert_item("commerce_items", &id, page_type, extracted_data.clone(), vector).await;
+    
+                                    }
+    
+                    
+            }
+        }
+        // Final Done Emission
+    let final_summary = if !is_detail {
+        let count = extracted_data.get("items").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        format!("Extraction Complete ({} items saved)", count)
+    } else {
+        "Extraction Complete".to_string()
+    };
+
     let _ = app_handle.emit("extraction-progress", json!({ 
-        "category": "Done", "summary": "Extraction Complete", "spinner": "✅", "data": extracted_data
+        "category": "Done", 
+        "summary": final_summary, 
+        "spinner": "✅", 
+        "data": if !is_detail { json!(null) } else { extracted_data }
     }));
 
     // Cleanup all KV Cache subdirectories for this task

@@ -299,6 +299,9 @@ impl LogisModel {
 
             let extracted_data = crate::scheduler::parse_json_from_llm(&result_str);
             
+            // [NEW] Generate natural language summary for image extraction
+            let summary_text = crate::parsing::json_to_natural_language(&extracted_data);
+
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
                 let id = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id).to_string();

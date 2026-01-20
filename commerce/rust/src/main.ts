@@ -653,16 +653,19 @@ listen("extraction-progress", (event: any) => {
              if (summary) summary.innerText = payload.summary || "";
              
              // Append Intermediate Data (if not already appended or just keep adding)
-             if(payload.data) {
+             if(payload.display_text || payload.data) {
                   const resultsContainer = p.querySelector(".results-container");
                   if (resultsContainer) {
-                      const pretty = JSON.stringify(payload.data, null, 2);
                       const pre = document.createElement("pre");
                       pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.7rem";
                       pre.style.color = "#aaa"; pre.style.background = "#252525";
                       pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px";
                       pre.style.borderLeft = "2px solid var(--primary)";
-                      pre.innerText = pretty;
+                      
+                      // Use display_text (narrative) if available, otherwise use raw data (JSON)
+                      const content = payload.display_text || JSON.stringify(payload.data, null, 2);
+                      pre.innerText = content;
+                      
                       resultsContainer.appendChild(pre);
                       
                       // Auto-scroll to latest result in detail view

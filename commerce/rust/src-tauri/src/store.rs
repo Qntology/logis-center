@@ -230,8 +230,9 @@ impl VectorStore {
          
          let json_str = data.to_string();
          
-         // [FIX] Ensure text column is populated for FTS search
+         // [FIXED] Derive text from JSON or fallback, don't force external narrative
          let mut text_content = data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
+
          if text_content.is_empty() {
              // Generate a simple summary if text is missing
              if let Some(obj) = data.as_object() {
@@ -330,7 +331,7 @@ impl VectorStore {
         }))
     }
     
-    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize) -> Result<Vec<(String, String, f32)>> {
+    pub async fn search_items(&self, table_name: &str, query_text: &str, query_vec: Vec<f32>, limit: usize, filter: Option<String>) -> Result<Vec<(String, String, f32)>> {
          let target_table = if table_name.is_empty() { "commerce_items" } else { table_name };
          let table = self.conn.open_table(target_table).execute().await?;
          
@@ -338,9 +339,11 @@ impl VectorStore {
 
          // 1. FULL TEXT SEARCH (Keyword Match)
          if !query_text.is_empty() {
-             // Handle basic sanitization for MATCH query (replace quotes)
              let clean_query = query_text.replace("'", "''");
-             if let Ok(fts_results) = table.query()
+             let mut fts_query = table.query();
+             if let Some(ref f) = filter { fts_query = fts_query.only_if(f); }
+             
+             if let Ok(fts_results) = fts_query
                 .only_if(format!("text MATCH '{}'", clean_query))
                 .limit(limit)
                 .execute()
@@ -350,7 +353,7 @@ impl VectorStore {
                             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
                             let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
                             for i in 0..batch.num_rows() {
-                                combined_results.insert(ids.value(i).to_string(), (texts.value(i).to_string(), 1.0)); // High score for FTS hit
+                                combined_results.insert(ids.value(i).to_string(), (texts.value(i).to_string(), 1.0));
                             }
                         }
                     }
@@ -358,7 +361,10 @@ impl VectorStore {
          }
 
          // 2. VECTOR SEARCH (Semantic Match)
-         let vector_results = table.query()
+         let mut vector_query = table.query();
+         if let Some(ref f) = filter { vector_query = vector_query.only_if(f); }
+
+         let vector_results = vector_query
             .limit(limit)
             .nearest_to(query_vec)?
             .execute()
@@ -371,9 +377,8 @@ impl VectorStore {
              let texts = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
              for i in 0..batch.num_rows() {
                  let id = ids.value(i).to_string();
-                 // If already in FTS, maybe add score, otherwise insert
                  if let Some((_, score)) = combined_results.get_mut(&id) {
-                     *score += 0.5; // Boost if both match
+                     *score += 0.5;
                  } else {
                      combined_results.insert(id, (texts.value(i).to_string(), 0.5));
                  }
@@ -381,7 +386,6 @@ impl VectorStore {
          }
          
          let mut final_list: Vec<_> = combined_results.into_iter().map(|(id, (txt, score))| (id, txt, score)).collect();
-         // Sort by score descending
          final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
          
          Ok(final_list)
