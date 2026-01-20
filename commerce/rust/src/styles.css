@@ -628,3 +628,14 @@ tr:hover { background: rgba(0,0,0,0.05); }
 
 /* Hidden Utility */
 .hidden { display: none !important; }
+
+/* Spinner Animation */
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.spinner-anim {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+}

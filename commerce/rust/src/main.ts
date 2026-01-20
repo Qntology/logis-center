@@ -45,6 +45,7 @@ let hasMore = true;
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
 let isExtracting = false; // Track any extraction task
+let spinnerInterval: number | null = null; // UI Spinner Animation Timer
 
 // --- UI Elements ---
 const contentPanel = document.getElementById("content-panel") as HTMLElement;
@@ -88,6 +89,33 @@ const aiResultsContent = document.getElementById("ai-results-content") as HTMLEl
 const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
 const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormElement;
 const chatInput = chatForm?.querySelector('input[name="talk"]') as HTMLInputElement;
+
+// --- Spinner Logic ---
+const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+function startSpinner() {
+    if (spinnerInterval) clearInterval(spinnerInterval);
+    let i = 0;
+    spinnerInterval = window.setInterval(() => {
+        const char = spinnerFrames[i % spinnerFrames.length];
+        
+        // 1. Animate Main Button
+        if (btnExtract) btnExtract.innerText = char;
+        
+        // 2. Animate All Active Log Spinners
+        document.querySelectorAll('.active-spinner').forEach(el => {
+            (el as HTMLElement).innerText = char;
+        });
+        
+        i++;
+    }, 80);
+}
+
+function stopSpinner() {
+    if (spinnerInterval) {
+        clearInterval(spinnerInterval);
+        spinnerInterval = null;
+    }
+}
 
 // --- 1. Layout & Window Logic ---
 
@@ -270,6 +298,12 @@ btnExtract?.addEventListener("click", async () => {
     if (isExtracting) {
         return;
     }
+
+    // [UI-UPDATE] Set initial spinner text and start animation
+    if (btnExtract) {
+        btnExtract.innerText = "⠋";
+        startSpinner();
+    }
     
     if (currentImage) {
         // --- 1. Image Extraction ---
@@ -343,14 +377,27 @@ btnStopTask?.addEventListener("click", async () => {
     // 2. Update UI immediately to show feedback
     btnStopTask.innerText = "Stopping...";
     if (detailTitle) detailTitle.innerText = "🛑 Stopping...";
-    isExtracting = false; // Prevent further UI updates from blocking logic
     
     try {
         // 3. Send command
         await invoke("stop_current_extraction");
+        
+        // 4. Force UI Reset 
+        isExtracting = false;
+        stopSpinner();
+        if (btnStopTask) btnStopTask.style.display = "none"; 
+        
+        // [UI-FIX] Hide delete button if interrupted, as there might not be a valid document to delete
+        if (btnDetailDelete) btnDetailDelete.style.display = "none";
+        
+        // Reset Extract Button
+        if (btnExtract) {
+            btnExtract.innerText = "⚡";
+        }
+
     } catch(e) { 
         console.error(e); 
-        btnStopTask.innerText = "Error";
+        if (btnStopTask) btnStopTask.innerText = "Error";
     }
 });
 
@@ -495,11 +542,11 @@ listen("extraction-progress", (event: any) => {
     const extractionLog = document.getElementById("extraction-log");
     
     // Update the button spinner
+    // Note: Button animation is now handled by startSpinner() / stopSpinner() independent of payload
     if (btnExtract) {
-        if (payload.spinner) btnExtract.innerText = payload.spinner;
-        
-        // If the task ended (Done or Error), reset the button after a delay
+        // If the task ended (Done or Error), stop spinner and reset
         if (payload.category === "Done" || payload.category === "Error") {
+            stopSpinner();
             setTimeout(() => { 
                 if (btnExtract) btnExtract.innerText = "⚡"; 
             }, 2000);
@@ -515,6 +562,7 @@ listen("extraction-progress", (event: any) => {
              if (child.id.startsWith("progress-") && child.id !== elementId && !child.innerHTML.includes("✅")) {
                  const textSpan = child.querySelector("span:last-child");
                  const text = textSpan ? textSpan.innerText : "Completed";
+                 // Remove active-spinner class and set to checkmark
                  child.innerHTML = `<span style="margin-right:8px; color:#666;">✅</span> <span style="color:#888;">${text}</span>`;
              }
          });
@@ -576,7 +624,7 @@ listen("extraction-progress", (event: any) => {
          // 3. Progress State (including intermediate items)
          else {
              // Progress
-             p.innerHTML = `<span style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner || "⠋"}</span> <span>${payload.summary || ""}</span>`;
+             p.innerHTML = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">${payload.spinner || "⠋"}</span> <span>${payload.summary || ""}</span>`;
              
              // Render Intermediate Data
              if(payload.data) {

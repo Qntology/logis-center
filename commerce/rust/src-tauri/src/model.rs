@@ -135,9 +135,9 @@ pub struct LogisModel {
     model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
-    is_cpu_mode: bool, // Added field
+    pub is_cpu_mode: bool, 
     max_tokens_limit: u32,
-    dtype: Option<DType>, // Store preferred dtype if needed
+    dtype: Option<DType>, 
 }
 
 impl LogisModel {
