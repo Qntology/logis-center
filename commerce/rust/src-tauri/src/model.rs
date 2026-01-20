@@ -412,9 +412,9 @@ impl LogisModel {
     pub async fn chat_params_with_spinner(
         &self, 
         params: ChatCompletionParameters,
-        app_handle: &tauri::AppHandle,
-        event_name: &str,
-        base_payload: Value,
+        _app_handle: &tauri::AppHandle,
+        _event_name: &str,
+        _base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
@@ -429,38 +429,17 @@ impl LogisModel {
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
-        let spinner = Spinner::dots();
-        let mut idx = 0;
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(spinner.interval));
-        
-        tokio::pin!(task);
-
-        loop {
-            tokio::select! {
-                res = &mut task => {
-                    return res.map_err(|e| anyhow!("Task join error: {}", e))?;
-                }
-                _ = interval.tick() => {
-                    let frame = spinner.frames[idx % spinner.frames.len()];
-                    idx += 1;
-                    
-                    let mut payload = base_payload.clone();
-                    if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("spinner".to_string(), json!(frame));
-                    }
-                    let _ = app_handle.emit(event_name, payload);
-                }
-            }
-        }
+        // Simply await the result without any spinner loop
+        task.await?
     }
 
     pub async fn chat_with_image_spinner(
         &self, 
         prompt: String, 
         image: Option<DynamicImage>,
-        app_handle: &tauri::AppHandle,
-        event_name: &str,
-        base_payload: Value,
+        _app_handle: &tauri::AppHandle,
+        _event_name: &str,
+        _base_payload: Value,
         max_tokens: usize,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
@@ -510,29 +489,8 @@ impl LogisModel {
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
-        let spinner = Spinner::dots();
-        let mut idx = 0;
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(spinner.interval));
-        
-        tokio::pin!(task);
-
-        loop {
-            tokio::select! {
-                res = &mut task => {
-                    return res.map_err(|e| anyhow!("Task join error: {}", e))?;
-                }
-                _ = interval.tick() => {
-                    let frame = spinner.frames[idx % spinner.frames.len()];
-                    idx += 1;
-                    
-                    let mut payload = base_payload.clone();
-                    if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("spinner".to_string(), json!(frame));
-                    }
-                    let _ = app_handle.emit(event_name, payload);
-                }
-            }
-        }
+        // Simply await the result
+        task.await?
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
@@ -581,9 +539,9 @@ impl LogisModel {
         &self, 
         prompt: String, 
         image: Option<DynamicImage>, 
-        app_handle: &tauri::AppHandle,
-        event_name: &str,
-        base_payload: Value,
+        _app_handle: &tauri::AppHandle,
+        _event_name: &str,
+        _base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
@@ -633,32 +591,8 @@ impl LogisModel {
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
         
-        let spinner = Spinner::dots();
-        let mut idx = 0;
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(spinner.interval));
-        
-        // Pin the task to poll it in select!
-        tokio::pin!(task);
-
-        loop {
-            tokio::select! {
-                res = &mut task => {
-                    // Task finished
-                    return res.map_err(|e| anyhow!("Task join error: {}", e))?;
-                }
-                _ = interval.tick() => {
-                    // Update spinner
-                    let frame = spinner.frames[idx % spinner.frames.len()];
-                    idx += 1;
-                    
-                    let mut payload = base_payload.clone();
-                    if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("spinner".to_string(), json!(frame));
-                    }
-                    let _ = app_handle.emit(event_name, payload);
-                }
-            }
-        }
+        // Simply await the result
+        task.await?
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {

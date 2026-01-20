@@ -333,11 +333,7 @@ async fn process_task(
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
             
-            let prompt = if is_last {
-                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nEnd of document. Identify the primary category and return JSON.", chunk)
-            } else {
-                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
-            };
+            let prompt = format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk);
 
             // Add current chunk to history
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -353,12 +349,10 @@ async fn process_task(
                 "spinner": "⠋"
             }));
 
-            let max_tokens = if is_last { 256 } else { 32 };
-
             let params = ChatCompletionParameters {
                 messages: messages.clone(), // Send full history
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(max_tokens),
+                max_tokens: Some(32),
                 temperature: Some(0.1),
                 ..Default::default()
             };
@@ -370,22 +364,17 @@ async fn process_task(
                     "extraction-progress", 
                     json!({ 
                         "category": "Classification Ingestion",
-                        "summary": if is_last { "Identifying page type...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
+                        "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len)
                     }), 
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
                 ) => { 
                     let out = res?;
-                    println!("[Scheduler] DEBUG: chunk {}/{} -> out length: {}", i + 1, classify_chunks_len, out.len());
-                    if is_last {
-                        page_type_res = out;
-                    } else {
-                        // Add model's ACK to history to keep it in sync with cache
-                        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                            content: Some(out),
-                            ..Default::default()
-                        }));
-                    }
+                    // Add model's ACK to history to keep it in sync with cache
+                    messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                        content: Some(out),
+                        ..Default::default()
+                    }));
                 },
                 _ = async {
                     loop {
@@ -395,6 +384,38 @@ async fn process_task(
                 } => { return Err(anyhow::anyhow!("Task cancelled")); }
             }
         }
+        
+        // Step 1.5: Final Classification Question (Separate Turn to break repetition)
+        let final_prompt = "End of document. Identify the primary category (Invoice, BOL, Packing List, etc) and return JSON.";
+        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(vec![
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: final_prompt.to_string() })
+            ]),
+            name: None,
+        }));
+        
+        let params = ChatCompletionParameters {
+            messages: messages.clone(),
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(256),
+            temperature: Some(0.1),
+            ..Default::default()
+        };
+        
+        let _ = app_handle.emit("extraction-progress", json!({ 
+            "category": "Classification Ingestion", 
+            "summary": "Generating final classification...", 
+            "spinner": "⠋"
+        }));
+
+        page_type_res = model.chat_params_with_spinner(
+            params, 
+            &app_handle_clone,
+            "extraction-progress",
+            json!({ "category": "Classification Ingestion", "summary": "Generating final classification..." }),
+            Some(cancellation_token.clone()),
+            Some(task.id.clone())
+        ).await?;
     }
 
     println!("[Scheduler] Checkpoint: Classification Start");
