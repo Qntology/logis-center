@@ -130,8 +130,13 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 pub struct LogisModel {
     generator: Arc<Mutex<Option<Qwen3VLGenerateModel>>>,
     embedding_model: Arc<Mutex<Option<EmbeddingModel>>>,
-    is_cpu_mode: bool,
+    
+    // Config for Lazy Reloading
+    model_path: String,
+    embedding_path: std::path::PathBuf,
+    device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
+    dtype: Option<DType>, // Store preferred dtype if needed
 }
 
 impl LogisModel {
@@ -141,62 +146,115 @@ impl LogisModel {
         println!("[MODEL] Generator (Qwen) unloaded to free VRAM.");
     }
 
-    pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel with Unified Device Config");
+    pub fn unload_embedding(&self) {
+        let mut emb = self.embedding_model.lock().unwrap();
+        *emb = None;
+        println!("[MODEL] Embedding Model unloaded to free VRAM.");
+    }
 
-        let config = utils::get_optimal_device_config();
-        let text_device = config.device.clone();
-        let mut vision_device = config.device.clone();
-        let mut text_device_id = 0;
-        let mut vision_device_id = 0;
-
-        // If CUDA, extract ID from device name/debug (Simple assumption for single GPU setup)
-        // In multi-GPU, utils::get_optimal_device_config currently returns one best device.
-        if text_device.is_cuda() {
-            // For now, we assume the best device ID is 0 or what utils returned.
-            // Since candle's Device struct doesn't easily expose ID, we rely on utils.
-            // Future improvement: Include ID in DeviceConfig.
-            if config.name.contains("GPU-") {
-                if let Some(id_str) = config.name.split('-').nth(1) {
-                    if let Ok(id) = id_str.parse::<usize>() {
-                        text_device_id = id;
-                        vision_device_id = id;
-                    }
-                }
-            }
+    async fn load_generator_internal(&self) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator (Qwen)...");
+        let m_path = self.model_path.clone();
+        let dev = self.device_config.device.clone();
+        
+        // Extract device ID if possible (simplified)
+        let mut dev_id = 0;
+        if let Some(id_str) = self.device_config.name.split('-').nth(1) {
+             if let Ok(id) = id_str.parse::<usize>() { dev_id = id; }
         }
 
+        let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
+        let limit = self.max_tokens_limit;
+
+        let generator = tokio::task::spawn_blocking(move || {
+            Qwen3VLGenerateModel::init(&m_path, Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize))
+        }).await??;
+        
+        Ok(generator)
+    }
+
+    fn load_embedding_internal(&self) -> anyhow::Result<EmbeddingModel> {
+        println!("[MODEL] Loading Embedding Model (Gemma)...");
+        // Embedding model is forced to CPU in original logic, or we can follow config.
+        // Original logic forced CPU to save VRAM. With exclusive loading, we *could* use GPU if we wanted,
+        // but keeping it on CPU is safer for now or we can use the device config.
+        // Let's stick to the device config to be consistent, or CPU if preferred.
+        // For now, let's follow the device config but maybe force CPU if VRAM is tight?
+        // Actually, exclusive loading allows us to use GPU for embedding too!
+        
+        // However, EmbeddingModel implementation in this codebase might be CPU optimized or
+        // the `new` method in embedding.rs might have hardcoded CPU. 
+        // Let's check embedding.rs... It says "Forcing CPU". 
+        // So we just call new.
+        
+        EmbeddingModel::new(&self.embedding_path)
+    }
+
+    pub async fn ensure_generator(&self) -> anyhow::Result<()> {
+        // 1. Unload Embedding if loaded
+        self.unload_embedding();
+
+        // 2. Load Generator if not loaded
+        let mut gen_guard = self.generator.lock().unwrap();
+        if gen_guard.is_none() {
+            let gen = self.load_generator_internal().await?;
+            *gen_guard = Some(gen);
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
+        // 1. Unload Generator if loaded
+        self.unload_generator();
+
+        // 2. Load Embedding if not loaded
+        let mut emb_guard = self.embedding_model.lock().unwrap();
+        if emb_guard.is_none() {
+            // Embedding load is fast/sync usually, but let's wrap if needed.
+            // EmbeddingModel::new is blocking IO.
+            let self_clone = self.embedding_path.clone(); // PathBuf is cheap
+            let emb = tokio::task::spawn_blocking(move || {
+                EmbeddingModel::new(&self_clone)
+            }).await??;
+            *emb_guard = Some(emb);
+        }
+        Ok(())
+    }
+
+    pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
+        println!("[MODEL-00] Initializing LogisModel with Lazy Loading Configuration");
+
+        let mut config = utils::get_optimal_device_config();
+        
         // Override if CPU preference is explicit
         if device_preference == Some("cpu") {
-            // Force CPU but keep other config logic
             println!("[MODEL] Explicit CPU preference detected.");
+            config = utils::DeviceConfig {
+                device: Device::Cpu,
+                is_cpu: true,
+                classify_chunk_size: 7000,
+                extract_chunk_size: 7000,
+                name: "CPU-Forced".to_string(),
+            };
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
         let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         let model_path = gguf_dir.to_str().unwrap().to_string();
+        let embedding_path = base_path.join("embeddinggemma-300m");
 
-        let max_tokens_limit = 2048; // Internal limit, scheduler uses dynamic chunks
-        let dtype = if text_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+        let max_tokens_limit = 2048; 
 
-        let t_dev = text_device.clone();
-        let v_dev = vision_device.clone();
-        let m_path = model_path.clone();
-
-        let generator = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init(&m_path, Some(&t_dev), text_device_id, Some(&v_dev), vision_device_id, dtype, Some(max_tokens_limit as usize))
-        }).await??;
-
-        let embedding_model_path = base_path.join("embeddinggemma-300m");
-        let embedding_model = if embedding_model_path.exists() {
-            EmbeddingModel::new(&embedding_model_path).ok()
-        } else { None };
-
+        // DO NOT LOAD MODELS HERE. Just return the config.
         Ok(Self {
-            generator: Arc::new(Mutex::new(Some(generator))),
-            embedding_model: Arc::new(Mutex::new(embedding_model)),
+            generator: Arc::new(Mutex::new(None)),
+            embedding_model: Arc::new(Mutex::new(None)),
+            model_path,
+            embedding_path,
+            device_config: config.clone(),
             is_cpu_mode: config.is_cpu,
             max_tokens_limit: max_tokens_limit as u32,
+            dtype: None, 
         })
     }
 
@@ -212,6 +270,9 @@ impl LogisModel {
         let _ = app_handle.emit("extraction-progress", json!({ 
             "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
         }));
+
+        // Ensure generator is loaded (and embedding is unloaded)
+        self.ensure_generator().await?;
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
@@ -254,6 +315,9 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
+        // Ensure generator is loaded
+        self.ensure_generator().await?;
+        
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
         let user_text = user_input.to_string();
@@ -344,6 +408,9 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
+        // Ensure generator is loaded
+        self.ensure_generator().await?;
+
         let self_clone = self.generator.clone();
         
         let task = tokio::task::spawn_blocking(move || {
@@ -388,6 +455,9 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
+        // Ensure generator is loaded
+        self.ensure_generator().await?;
+
         let self_clone = self.generator.clone();
         
         let task = tokio::task::spawn_blocking(move || {
@@ -455,7 +525,9 @@ impl LogisModel {
         }
     }
 
-    fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
+    async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
+        self.ensure_generator().await?;
+        
         let mut gen_guard = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
         
@@ -505,6 +577,9 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
+        // Ensure generator is loaded
+        self.ensure_generator().await?;
+
         let generator_arc = self.generator.clone();
         let max_tok = self.max_tokens_limit;
         
@@ -604,6 +679,9 @@ impl LogisModel {
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
+        // Ensure embedding model is loaded (and generator is unloaded)
+        self.ensure_embedding().await?;
+
         let embedding_model_arc = self.embedding_model.clone();
         
         tokio::task::spawn_blocking(move || {
@@ -684,7 +762,7 @@ impl LogisModel {
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
             // In a real implementation, we might want to stream this too, but for now we wait for the step result
-            let step_result = self.run_inference_text(prompt, None, cancel_token.clone(), None)?;
+            let step_result = self.run_inference_text(prompt, None, cancel_token.clone(), None).await?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
@@ -695,7 +773,7 @@ impl LogisModel {
         status_history.push_str("### 📊 Final Research Report\n\n");
         let final_prompt = format!("CONTEXT: {}\nQUERY: {}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
         
-        let report = self.run_inference_text(final_prompt, None, cancel_token, None)?;
+        let report = self.run_inference_text(final_prompt, None, cancel_token, None).await?;
         status_history.push_str(&report);
         
         let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));

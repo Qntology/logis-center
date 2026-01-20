@@ -884,11 +884,6 @@ Just say "ACKNOWLEDGED"."#,
             let mut model_guard = model_mutex.lock().await;
             if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
             
-            // [VRAM-OPTIMIZATION] Unload Generator (Qwen) before Embedding (Gemma) starts
-            if let Some(model) = model_guard.as_ref() {
-                model.unload_generator();
-            }
-            
             if cancellation_token.load(Ordering::Relaxed) { 
                 saving_flag.store(false, Ordering::Relaxed); // Stop spinner
                 return Err(anyhow::anyhow!("Task cancelled")); 
@@ -928,11 +923,6 @@ Just say "ACKNOWLEDGED"."#,
 
                 let mut model_guard = model_mutex.lock().await;
                 if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-                
-                // [VRAM-OPTIMIZATION] Unload Generator (Qwen) before Embedding (Gemma) starts
-                if let Some(model) = model_guard.as_ref() {
-                    model.unload_generator();
-                }
                 
                 println!("[Scheduler] Checkpoint: Embedding Start (Direct)");
                 let vector = if let Some(model) = model_guard.as_ref() {
