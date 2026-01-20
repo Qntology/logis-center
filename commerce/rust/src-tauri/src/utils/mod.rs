@@ -1,5 +1,6 @@
 pub mod img_utils;
 pub mod tensor_utils;
+pub mod hash;
 
 use candle_core::{Device, DType};
 use anyhow::Result;

@@ -390,7 +390,107 @@ async fn deep_research_command(
 
 #[tauri::command]
 
+async fn proxy_fetch(
+
+    url: String,
+
+    method: String,
+
+    headers: std::collections::HashMap<String, String>,
+
+    body: Option<Value>,
+
+    session_params: Option<Value>, // { hash, token, cc }
+
+) -> Result<Value, String> {
+
+    let client = reqwest::Client::builder()
+
+        .use_native_tls()
+
+        .build()
+
+        .map_err(|e| e.to_string())?;
+
+
+
+    let mut target_url = url::Url::parse(&url).map_err(|e| e.to_string())?;
+
+
+
+    // [DETAIL 1] Inject Session into Query Params (Content.js logic)
+
+    if let Some(sp) = session_params {
+
+        let mut query = target_url.query_pairs_mut();
+
+        if let Some(hash) = sp.get("hash").and_then(|v| v.as_str()) { query.append_pair("hash", hash); }
+
+        if let Some(token) = sp.get("token").and_then(|v| v.as_str()) { query.append_pair("token", token); }
+
+        if let Some(cc) = sp.get("cc").and_then(|v| v.as_str()) { query.append_pair("cc", cc); }
+
+    }
+
+
+
+    let mut req_builder = match method.to_uppercase().as_str() {
+
+        "POST" => client.post(target_url),
+
+        "PUT" => client.put(target_url),
+
+        "DELETE" => client.delete(target_url),
+
+        _ => client.get(target_url),
+
+    };
+
+
+
+    for (k, v) in headers { req_builder = req_builder.header(k, v); }
+
+    if let Some(b) = body { req_builder = req_builder.json(&b); }
+
+
+
+    let response = req_builder.send().await.map_err(|e| e.to_string())?;
+
+    let status = response.status();
+
+    let json_res: Value = response.json().await.map_err(|e| e.to_string())?;
+
+
+
+    // [DETAIL 3] Response Handling & LanceDB Sync
+
+    // If server returns items, we should sync them to local LanceDB in 'before_server' style
+
+    // (This part will be handled by a dedicated background sync function or here)
+
+
+
+    if !status.is_success() {
+
+        return Err(format!("Server returned {}: {}", status, json_res));
+
+    }
+
+
+
+    Ok(json_res)
+
+}
+
+
+
+
+
+#[tauri::command]
+
 async fn check_active_task(state: State<'_, AppState>, ref_id: String) -> Result<bool, String> {
+
+
 
     let store_guard = state.store.lock().await;
 
@@ -635,7 +735,9 @@ pub fn run() {
 
             check_active_task,
 
-            get_chat_messages
+            get_chat_messages,
+
+            proxy_fetch
 
         ])
 
