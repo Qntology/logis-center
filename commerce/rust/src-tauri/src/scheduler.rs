@@ -290,9 +290,11 @@ async fn process_task(
     device_config.classify_chunk_size = 4000; // Lowered from 7000 to avoid token explosion
     device_config.extract_chunk_size = 4000;
 
-    // [REVISED] Since light_pug is now structurally compressed in parsing.rs, 
-    // we send it in a SINGLE request for classification to ensure the model sees the WHOLE structure.
-    
+    // [REVISED] Restore turn-based chunked ingestion for classification.
+    // This is the original stable logic.
+    let classify_chunks = chunk_text(&light_pug, 4000, 500);
+    let classify_chunks_len = classify_chunks.len();
+
     let mut model_guard = model_mutex.lock().await;
     if model_guard.is_none() {
         let _ = app_handle.emit("extraction-progress", json!({ 
@@ -311,7 +313,7 @@ async fn process_task(
     
     let mut page_type_res = String::new();
 
-    // Step 1: Single-shot Classification
+    // Step 1: Ingest chunks for Classification with full history
     use crate::openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage, 
         ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
@@ -329,49 +331,67 @@ async fn process_task(
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         
-        let prompt = format!("[FULL_STRUCTURE]\n{}\n\n[INSTRUCTION]\nIdentify the primary category of this page based on the full structure above. Return valid JSON only.", light_pug);
+        for (i, chunk) in classify_chunks.iter().enumerate() {
+            let is_last = i == classify_chunks_len - 1;
+            
+            let prompt = if is_last {
+                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nEnd of document. Identify the primary category and return JSON.", chunk)
+            } else {
+                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
+            };
 
-        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
-            ]),
-            name: None,
-        }));
-        
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "category": "Classification", 
-            "summary": "Analyzing page structure...",
-            "spinner": "⠋"
-        }));
+            // Add current chunk to history
+            messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                ]),
+                name: None,
+            }));
+            
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "category": "Classification Ingestion", 
+                "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
+                "spinner": "⠋"
+            }));
 
-        let params = ChatCompletionParameters {
-            messages: messages.clone(),
-            model: "qwen3vl".to_string(),
-            max_tokens: Some(256),
-            temperature: Some(0.1),
-            ..Default::default()
-        };
+            let params = ChatCompletionParameters {
+                messages: messages.clone(), // Send full history
+                model: "qwen3vl".to_string(),
+                max_tokens: Some(if is_last { 256 } else { 32 }),
+                temperature: Some(0.1),
+                ..Default::default()
+            };
 
-        tokio::select!{
-            res = model.chat_params_with_spinner(
-                params,
-                &app_handle_clone, 
-                "extraction-progress", 
-                json!({ 
-                    "category": "Classification",
-                    "summary": "Identifying page type..."
-                }), 
-                Some(cancellation_token.clone()), 
-                Some(task.id.clone())
-            ) => { 
-                page_type_res = res?;
-            },
-            _ = async {
-                loop {
-                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+            tokio::select!{
+                res = model.chat_params_with_spinner(
+                    params,
+                    &app_handle_clone, 
+                    "extraction-progress", 
+                    json!({ 
+                        "category": "Classification Ingestion",
+                        "summary": if is_last { "Identifying page type...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
+                    }), 
+                    Some(cancellation_token.clone()), 
+                    Some(task.id.clone())
+                ) => { 
+                    let out = res?;
+                    if is_last {
+                        page_type_res = out;
+                    } else {
+                        // Add model's ACK to history to keep it in sync with cache
+                        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                            content: Some(out),
+                            ..Default::default()
+                        }));
+                    }
+                },
+                _ = async {
+                    loop {
+                        if cancellation_token.load(Ordering::Relaxed) { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                } => { return Err(anyhow::anyhow!("Task cancelled")); }
+            }
         }
     }
 
@@ -719,16 +739,17 @@ Please extract the following data points precisely according to these definition
                 // Intermediate Chunk: Just read and remember
                 format!(
 r#"[CONTEXT]
-You are reading a detailed Pug (Jade) template snippet.
-Part {} of {}.
+You are reading a Pug (Jade) template. 
+Here is the accumulated content so far:
 
 [INPUT SNIPPET]
 {}
 
 [INSTRUCTION]
-Read and internalize this content. Briefly summarize the primary technical structures or data fields you see in this specific snippet (e.g., 'invoice header section', 'shipping address block'). Do NOT output JSON yet."#,
-                    chunk_idx + 1, chunks_len,
-                    chunk
+Read and memorize this content. Do NOT generate JSON yet. 
+When all parts are sent, I will ask you to extract data into JSON.
+Just say "READY"."#,
+                    full_context_accumulated
                 )
             };
 

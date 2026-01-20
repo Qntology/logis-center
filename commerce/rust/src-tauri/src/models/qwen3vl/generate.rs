@@ -151,33 +151,24 @@ impl Qwen3VLGenerateModel {
 
         let mut full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
 
-        // HARD SAFETY CHECK: Truncate Input if it exceeds limit (Smart Head-Heavy Drop)
-        // [ADAPTIVE] For structural analysis, we allow larger contexts.
-        // For standard extraction, we aim for ~2048 tokens to stay within the embedding model's optimal range.
+        // HARD SAFETY CHECK: Truncate Input if it exceeds limit (Smart Tail-Heavy Drop)
+        // [ADAPTIVE] For ingestion/classification, we must not drop document structure.
         if let Some(limit) = self.hard_token_limit {
-            let is_classification = input.replace_text.contains("[FULL_STRUCTURE]");
-            let effective_limit = if is_classification { 8192 } else { limit.max(2048) };
+            let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
+            let effective_limit = if is_critical { 16384 } else { limit.max(2048) };
             let max_input = if effective_limit > 128 { effective_limit - 128 } else { effective_limit };
             
             if seq_len > max_input {
-                println!("⚠️ [WARN] Input too long ({} > {}). Using Structural Truncation (Classify={}).", seq_len, max_input, is_classification);
+                println!("⚠️ [WARN] Input too long ({} > {}). Using System-Aware Truncation (Critical={}).", seq_len, max_input, is_critical);
                 
-                // Keep 90% from the Head (where structure and instructions usually reside)
-                let head_reserve = (max_input * 9 / 10).min(seq_len);
+                // Keep System Prompt (approx first 200 tokens) and the Tail (Most important)
+                let head_reserve = 200.min(max_input / 4);
                 let tail_reserve = max_input - head_reserve;
                 
                 let head_ids = input_ids.narrow(1, 0, head_reserve)?;
-                let tail_ids = if tail_reserve > 0 {
-                    input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?
-                } else {
-                    Tensor::zeros((1, 0), input_ids.dtype(), input_ids.device())?
-                };
+                let tail_ids = input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?;
                 
-                input_ids = if tail_reserve > 0 {
-                    Tensor::cat(&[head_ids, tail_ids], 1)?
-                } else {
-                    head_ids
-                };
+                input_ids = Tensor::cat(&[head_ids, tail_ids], 1)?;
                 seq_len = max_input;
                 
                 // Update full_input_ids_vec to match the new truncated content
@@ -188,10 +179,14 @@ impl Qwen3VLGenerateModel {
         let mut seqlen_offset = 0;
 
         // KV Cache Disk Loading (Prefix Caching)
+        // [ADAPTIVE] Disable disk cache for critical ingestion to ensure in-memory consistency
+        let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
         let cache_path = if let Some(sid) = &session_id {
-             let p = std::path::Path::new("tmp_kv").join(sid);
-             if !p.exists() { let _ = fs::create_dir_all(&p); }
-             Some(p)
+             if is_critical { None } else {
+                 let p = std::path::Path::new("tmp_kv").join(sid);
+                 if !p.exists() { let _ = fs::create_dir_all(&p); }
+                 Some(p)
+             }
         } else {
              None
         };
