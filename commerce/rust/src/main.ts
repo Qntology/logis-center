@@ -684,6 +684,19 @@ listen("browser-match-found", (event: any) => {
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
+/**
+ * Generates a stable Ethereum-style address hash from text.
+ * Matches logic in before_client and Rust backend.
+ */
+async function hashId(text?: string): Promise<string> {
+    if (!text) {
+        const wallet = ethers.Wallet.createRandom();
+        text = wallet.privateKey;
+    }
+    const msgHash = ethers.hashMessage(text);
+    return ethers.computeAddress(msgHash).toLowerCase();
+}
+
 function updateAuthUI() {
     const authStatus = document.getElementById("auth-status");
     const qrContainer = document.getElementById("qr-container");

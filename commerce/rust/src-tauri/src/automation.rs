@@ -118,7 +118,9 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
                 "--no-default-browser-check",
                 "--disable-session-crashed-bubble",
                 "--disable-features=Translate",
-                "--remote-debugging-port=0"
+                "--remote-debugging-port=0",
+                "--remote-allow-origins=*",
+                "--disable-extensions"
             ];
 
             let mut builder = BrowserConfig::builder()
@@ -131,8 +133,14 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
             let _ = std::fs::create_dir_all(&profile_dir);
             let abs_profile_dir = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir);
             
-            println!("[AUTO] Using isolated app profile at: {:?}", abs_profile_dir);
-            builder = builder.user_data_dir(abs_profile_dir);
+            let mut profile_path_str = abs_profile_dir.to_string_lossy().to_string();
+            // [FIX] Strip UNC prefix (\\?\) on Windows which causes Chrome to fail
+            if profile_path_str.starts_with(r"\\?\") {
+                profile_path_str = profile_path_str[4..].to_string();
+            }
+            
+            println!("[AUTO] Using isolated app profile at: {}", profile_path_str);
+            builder = builder.user_data_dir(std::path::PathBuf::from(profile_path_str));
 
             builder.args(args).build().map_err(|e| anyhow!("Failed to build config: {}", e))
         };
