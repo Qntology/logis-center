@@ -910,7 +910,9 @@ Just say "ACKNOWLEDGED"."#,
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
                 println!("[Scheduler] Saving item: {} to {}", target_id, to_table);
-                let _ = db.upsert_item(&to_table, &target_id, page_type, target_data, vector).await;
+                let _ = db.upsert_item(&to_table, &target_id, page_type, target_data.clone(), vector.clone()).await;
+                // [GLOBAL-SEARCH-FIX] Also save to 'commerce_items' for global search visibility
+                let _ = db.upsert_item("commerce_items", &target_id, page_type, target_data, vector).await;
             }
         }
     } else {
@@ -944,7 +946,9 @@ Just say "ACKNOWLEDGED"."#,
 
                 let store_guard = store_mutex.lock().await;
                 if let Some(db) = store_guard.as_ref() {
-                    let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), vector).await;
+                    let _ = db.upsert_item(&target_table, &id, page_type, extracted_data.clone(), vector.clone()).await;
+                    // [GLOBAL-SEARCH-FIX] Also save to 'commerce_items' for global search visibility
+                    let _ = db.upsert_item("commerce_items", &id, page_type, extracted_data.clone(), vector).await;
                 }
         }
     }    

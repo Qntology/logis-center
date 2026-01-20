@@ -135,6 +135,7 @@ pub struct LogisModel {
     model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
+    is_cpu_mode: bool, // Added field
     max_tokens_limit: u32,
     dtype: Option<DType>, // Store preferred dtype if needed
 }
@@ -194,10 +195,15 @@ impl LogisModel {
         // 1. Unload Embedding if loaded
         self.unload_embedding();
 
-        // 2. Load Generator if not loaded
-        let mut gen_guard = self.generator.lock().unwrap();
-        if gen_guard.is_none() {
+        // 2. Load Generator if not loaded (Check-Load-Store pattern)
+        let need_load = {
+            let gen_guard = self.generator.lock().unwrap();
+            gen_guard.is_none()
+        };
+
+        if need_load {
             let gen = self.load_generator_internal().await?;
+            let mut gen_guard = self.generator.lock().unwrap();
             *gen_guard = Some(gen);
         }
         Ok(())
@@ -207,15 +213,19 @@ impl LogisModel {
         // 1. Unload Generator if loaded
         self.unload_generator();
 
-        // 2. Load Embedding if not loaded
-        let mut emb_guard = self.embedding_model.lock().unwrap();
-        if emb_guard.is_none() {
-            // Embedding load is fast/sync usually, but let's wrap if needed.
-            // EmbeddingModel::new is blocking IO.
-            let self_clone = self.embedding_path.clone(); // PathBuf is cheap
+        // 2. Load Embedding if not loaded (Check-Load-Store pattern)
+        let need_load = {
+            let emb_guard = self.embedding_model.lock().unwrap();
+            emb_guard.is_none()
+        };
+
+        if need_load {
+            let self_clone = self.embedding_path.clone();
             let emb = tokio::task::spawn_blocking(move || {
                 EmbeddingModel::new(&self_clone)
             }).await??;
+            
+            let mut emb_guard = self.embedding_model.lock().unwrap();
             *emb_guard = Some(emb);
         }
         Ok(())
@@ -251,8 +261,8 @@ impl LogisModel {
             embedding_model: Arc::new(Mutex::new(None)),
             model_path,
             embedding_path,
-            device_config: config.clone(),
-            is_cpu_mode: config.is_cpu,
+            is_cpu_mode: config.is_cpu, // Correctly map from config
+            device_config: config,
             max_tokens_limit: max_tokens_limit as u32,
             dtype: None, 
         })
