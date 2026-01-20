@@ -398,8 +398,7 @@ listen("extraction-progress", (event: any) => {
     }
 
     if (payload.task_id) {
-        // Map category to a status code for renderMessage
-        let statusCode = 1; // Default processing
+        let statusCode = 1; 
         if (payload.category === "Done") statusCode = 9;
         else if (payload.category === "Error") statusCode = 6;
         else if (payload.summary?.toLowerCase().includes("cancelled")) statusCode = 3;
@@ -408,6 +407,18 @@ listen("extraction-progress", (event: any) => {
     }
 
     if (extractionLog && detailView.style.display !== "none") {
+         // [NEW] Transition previous active steps to 'Done'
+         if (payload.category !== "Done" && payload.category !== "Error") {
+             const previousActive = extractionLog.querySelectorAll(".progress-row .active-spinner");
+             previousActive.forEach(el => {
+                 const row = el.closest(".progress-row");
+                 const parent = el.parentElement;
+                 if (parent && row && !parent.id.includes(catId)) {
+                     parent.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span style="color:#888;">${row.querySelector(".summary-text")?.textContent || ""}</span>`;
+                 }
+             });
+         }
+
          let p = document.getElementById(elementId);
          if (!p) {
              p = document.createElement("div"); p.id = elementId;
@@ -428,8 +439,10 @@ listen("extraction-progress", (event: any) => {
              isExtracting = false;
              if (btnStopTask) btnStopTask.style.display = "none";
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
-             const row = p.querySelector(".progress-row");
-             if (row) { row.innerHTML = `<span style="margin-right:8px;">✅</span> <span>${payload.summary || "Complete"}</span>`; (row as HTMLElement).style.color = "#4ade80"; }
+             extractionLog.querySelectorAll(".progress-row").forEach(row => {
+                 const s = row.querySelector(".active-spinner");
+                 if (s) row.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span>${row.querySelector(".summary-text")?.textContent || "Complete"}</span>`;
+             });
          } else if (payload.category === "Error") {
              isExtracting = false;
              const row = p.querySelector(".progress-row");
@@ -439,7 +452,7 @@ listen("extraction-progress", (event: any) => {
              if (summary) summary.innerText = payload.summary || "";
              
              if((payload.display_text || payload.data) && resultsContainer) {
-                  resultsContainer.innerHTML = ""; // Clear old intermediate results
+                  resultsContainer.innerHTML = ""; 
                   const pre = document.createElement("pre");
                   pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.7rem"; pre.style.color = "#aaa"; pre.style.background = "#252525"; pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px"; pre.style.borderLeft = "2px solid var(--primary)";
                   pre.innerText = payload.display_text || JSON.stringify(payload.data, null, 2);
