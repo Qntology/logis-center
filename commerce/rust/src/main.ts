@@ -89,9 +89,26 @@ const chatInput = chatForm?.querySelector('input[name="talk"]') as HTMLInputElem
 const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const globalNavSpinner = document.getElementById("global-nav-spinner") as HTMLElement;
 
+const btnSpinnerAction = document.getElementById("btn-spinner-action") as HTMLButtonElement;
+
 function startSpinner() {
     if (spinnerInterval) clearInterval(spinnerInterval);
-    if (globalNavSpinner) globalNavSpinner.style.display = "inline-block";
+    if (globalNavSpinner) {
+        globalNavSpinner.style.display = "inline-block";
+        globalNavSpinner.onclick = () => {
+            openWidget("list");
+            listView.style.display = "none";
+            detailView.style.display = "flex";
+        };
+    }
+    if (btnSpinnerAction) {
+        btnSpinnerAction.style.display = "inline-block";
+        btnSpinnerAction.onclick = () => {
+            openWidget("list");
+            listView.style.display = "none";
+            detailView.style.display = "flex";
+        };
+    }
     
     let i = 0;
     spinnerInterval = window.setInterval(() => {
@@ -115,6 +132,7 @@ function stopSpinner() {
         spinnerInterval = null;
     }
     if (globalNavSpinner) globalNavSpinner.style.display = "none";
+    if (btnSpinnerAction) btnSpinnerAction.style.display = "none";
 }
 
 // --- Layout & Window Logic ---
@@ -328,6 +346,12 @@ btnSubmit?.addEventListener("click", async () => {
 
 document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
 
+document.addEventListener('view-task-log', () => {
+    openWidget("list");
+    listView.style.display = "none";
+    detailView.style.display = "flex";
+});
+
 btnExtract?.addEventListener("click", async () => {
     let pathname = "/";
     if (currentDetectedUrl) {
@@ -346,6 +370,11 @@ btnExtract?.addEventListener("click", async () => {
 
     // [NEW] Visual feedback: pulse the button
     btnExtract.style.opacity = "0.5";
+    
+    // [NEW] Clear logs
+    const logArea = document.getElementById("extraction-log");
+    if (logArea) logArea.innerHTML = "";
+
     setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
 
     // Initial View setup (only for the first task or to see progress)
@@ -407,14 +436,15 @@ listen("extraction-progress", (event: any) => {
     }
 
     if (extractionLog && detailView.style.display !== "none") {
-         // [NEW] Transition previous active steps to 'Done'
+         // [FIXED] Transition ONLY previous categories to 'Done'
          if (payload.category !== "Done" && payload.category !== "Error") {
-             const previousActive = extractionLog.querySelectorAll(".progress-row .active-spinner");
-             previousActive.forEach(el => {
-                 const row = el.closest(".progress-row");
-                 const parent = el.parentElement;
-                 if (parent && row && !parent.id.includes(catId)) {
-                     parent.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span style="color:#888;">${row.querySelector(".summary-text")?.textContent || ""}</span>`;
+             const allRows = extractionLog.querySelectorAll(".progress-row");
+             allRows.forEach(row => {
+                 const container = row.closest('[id^="progress-"]');
+                 const spinner = row.querySelector(".active-spinner");
+                 // If this is an old category container, mark it as done
+                 if (container && container.id !== elementId && spinner) {
+                     row.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span style="color:#888;">${row.querySelector(".summary-text")?.textContent || ""}</span>`;
                  }
              });
          }
@@ -724,7 +754,7 @@ function renderMessage(msg: any) {
     const timeStr = new Date(msg.created_at || Date.now()).toLocaleTimeString();
 
     const html = `
-        <div class="message-bubble ${roleClass}" id="${msgId}">
+        <div class="message-bubble ${roleClass}" id="${msgId}" ${msg.role === 'system_task' ? `style="cursor:pointer;" onclick="document.dispatchEvent(new CustomEvent('view-task-log'))"` : ''}>
             <div class="msg-header">
                 <span>${msg.role === "user" ? "@You" : "🤖 System"}</span>
                 <span class="msg-time">${timeStr}</span>

@@ -31,9 +31,12 @@
 
         <input type="text" id="global-search" class="search-input" placeholder="Search or Ask Prompt" />
         
-        <div class="nav-icons" style="gap: 8px;">
+        <div class="nav-icons" style="display: flex; align-items: center; gap: 8px;">
           <button id="btn-submit" class="nav-btn" title="AI Search">🔍</button>
-          <span id="global-nav-spinner" style="display:none; color:var(--primary); font-family:monospace; font-size:1.1rem; min-width:20px; text-align:center;">⠋</span>
+          <div id="spinner-container" style="display: flex; align-items: center; gap: 4px;">
+            <span id="global-nav-spinner" style="display:none; color:var(--primary); font-family:monospace; font-size:1.1rem; min-width:20px; text-align:center;">⠋</span>
+            <button id="btn-spinner-action" class="nav-btn" style="display:none; font-size: 0.8rem; padding: 2px 4px; border: 1px solid var(--primary); color: var(--primary); border-radius: 4px;">ACT</button>
+          </div>
           <button id="btn-extract" class="nav-btn" style="display:none; color: var(--primary);" title="Start Extraction">⚡</button>
           <button id="btn-auto-launch" class="nav-btn" title="Open Browser">🌐</button>
           <button id="btn-settings" class="nav-btn" data-tab="settings" title="Config"></button>
