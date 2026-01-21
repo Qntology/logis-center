@@ -100,6 +100,9 @@ function startSpinner() {
             openWidget("list");
             listView.style.display = "none";
             detailView.style.display = "flex";
+            detailTitle.innerText = "Task Progress";
+            if (btnStopTask) btnStopTask.style.display = "flex";
+            if (btnDetailDelete) btnDetailDelete.style.display = "none";
         };
     }
     if (btnSpinnerAction) {
@@ -108,6 +111,9 @@ function startSpinner() {
             openWidget("list");
             listView.style.display = "none";
             detailView.style.display = "flex";
+            detailTitle.innerText = "Task Progress";
+            if (btnStopTask) btnStopTask.style.display = "flex";
+            if (btnDetailDelete) btnDetailDelete.style.display = "none";
         };
     }
     
@@ -259,12 +265,14 @@ listen("browser-match-found", async (event: any) => {
     await updateExtractButtonVisibility();
 });
 
-searchInput?.addEventListener("focus", () => {
+const handleSearchInteraction = () => {
     openWidget("list");
     
     const navOverlay = document.getElementById("nav-categories");
     if (navOverlay) {
         navOverlay.classList.remove("hidden");
+        // [FIX] Add 'visible' class to trigger opacity and pointer-events
+        navOverlay.classList.add("visible");
         renderNavigation();
         
         // [FIX] Scroll to the very top to make sure Tree/Accordion is visible
@@ -273,110 +281,148 @@ searchInput?.addEventListener("focus", () => {
         }
     }
 
-    if (cachedDocs.length === 0) refreshList();
-});
+    // [STRICT] Before search, the results area should be empty.
+    // Only show navigation tree (users/pages).
+    if (!searchInput.value) {
+        if (docTableBody) docTableBody.innerHTML = "";
+        cachedDocs = [];
+        currentPage = 0;
+        hasMore = true;
+    }
+};
+
+searchInput?.addEventListener("focus", handleSearchInteraction);
+searchInput?.addEventListener("click", handleSearchInteraction);
 
 // Helper to hide navigation when clicking away or selecting something
 function hideNavigation() {
-    document.getElementById("nav-categories")?.classList.add("hidden");
+    const navOverlay = document.getElementById("nav-categories");
+    if (navOverlay) {
+        navOverlay.classList.add("hidden");
+        navOverlay.classList.remove("visible");
+    }
 }
 
 async function renderNavigation() {
     const pageList = document.getElementById("nav-list-pages");
     const userList = document.getElementById("nav-list-users");
+    const profileName = document.getElementById("nav-profile-name");
+    const profileFavicon = document.getElementById("nav-profile-favicon");
+    const btnSignin = document.getElementById("nav-signin");
+    const btnSignout = document.getElementById("nav-signout");
+
     if (!pageList || !userList) return;
 
+    // 0. Update Profile Section (Mirror content.js)
+    if (currentSession.email) {
+        if (profileName) profileName.innerText = currentSession.email.split('@')[0];
+        if (btnSignin) btnSignin.classList.add("hidden");
+        if (btnSignout) btnSignout.classList.remove("hidden");
+        
+        if (profileFavicon && blockies) {
+            const icon = blockies.create({ seed: currentSession.email, size: 8, scale: 4 });
+            profileFavicon.innerHTML = "";
+            profileFavicon.appendChild(icon);
+            icon.style.borderRadius = "4px";
+            icon.style.width = "100%";
+            icon.style.height = "100%";
+        }
+    } else {
+        if (profileName) profileName.innerText = "Sign In";
+        if (btnSignin) btnSignin.classList.remove("hidden");
+        if (btnSignout) btnSignout.classList.add("hidden");
+        if (profileFavicon) profileFavicon.innerHTML = "";
+    }
+
     try {
-        // 1. Fetch Pages and Build Tree (Strict Legacy Parity)
+        // 1. Fetch Pages and Build Accordion Tree
         const pages = await invoke<any[]>("get_known_pages");
         pageList.innerHTML = "";
         
         if (pages.length === 0) {
-            pageList.innerHTML = "<div style='color:#666; padding:10px; font-size:0.75rem;'>No pages learned.</div>";
+            pageList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No shared pages found.</div>";
         } else {
-            const branchs: any = {};
+            const groups: Record<string, any> = {};
             pages.forEach(p => {
                 let data: any = {};
-                try { 
-                    data = typeof p.json_data === 'string' ? JSON.parse(p.json_data) : p.json_data; 
-                } catch(e) {
-                    data = { origin: "Unknown Site", type: p.doc_type };
-                }
+                try { data = JSON.parse(p.json_data); } catch(e) { data = { origin: "unknown", type: p.doc_type }; }
                 
-                // Fallback for origin if missing
-                const origin = data.origin || "learned-pages.center";
-                const docType = p.doc_type || "general";
-                const groupKey = `${origin}#${docType}`;
+                const origin = data.origin || "learned-pages";
+                const docType = (p.doc_type || "general").toUpperCase();
+                const key = `${origin}#${docType}`;
                 
-                if (!branchs[groupKey]) {
-                    branchs[groupKey] = { 
-                        id: groupKey, 
-                        text: origin.replace("https://", "").replace("http://", ""), 
+                if (!groups[key]) {
+                    groups[key] = { 
+                        origin: origin.replace(/^https?:\/\//, ""), 
                         type: docType, 
-                        children: [] 
+                        items: [] 
                     };
                 }
-                branchs[groupKey].children.push({ ...p, data });
+                groups[key].items.push({ uuid: p.uuid, link: data.link || "/" });
             });
 
-            Object.values(branchs).forEach((branch: any) => {
+            Object.values(groups).forEach(group => {
                 const section = document.createElement("div");
-                section.className = "nav-accordion-section";
+                section.className = "nav-accordion";
+                section.style.marginBottom = "5px";
                 section.innerHTML = `
-                    <div class="nav-accordion-header" style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; cursor:pointer; background:#1a1a1a; border-bottom:1px solid #222;">
-                        <span style="font-size:0.75rem; font-weight:bold; color:var(--primary);">${branch.type.toUpperCase()} <small style="color:#666; font-weight:normal;">${branch.text}</small></span>
-                        <span class="toggle-icon">▼</span>
+                    <div class="nav-header" style="display:flex; justify-content:space-between; padding:8px 10px; background:#f5f5f5; border-radius:6px; cursor:pointer; border:1px solid #eee;">
+                        <span style="font-size:0.7rem; font-weight:bold; color:#333;">${group.type} <small style="color:#999; font-weight:normal;">${group.origin}</small></span>
+                        <span class="arrow">▼</span>
                     </div>
-                    <div class="nav-accordion-content hidden" style="background:#111;">
-                        ${branch.children.map((c: any) => `
-                            <div class="nav-child-item" data-id="${c.uuid}" style="padding:6px 20px; font-size:0.7rem; color:#aaa; cursor:pointer; border-bottom:1px solid #1a1a1a;">
-                                • ${c.text || 'Untitled Page'}
-                            </div>
+                    <div class="nav-content hidden" style="padding:5px 0 5px 15px;">
+                        ${group.items.map((it: any) => `
+                            <div class="nav-link" data-id="${it.uuid}" style="padding:6px; font-size:0.75rem; color:#666; cursor:pointer;">• ${it.link}</div>
                         `).join("")}
                     </div>
                 `;
-
-                const header = section.querySelector(".nav-accordion-header") as HTMLElement;
-                const content = section.querySelector(".nav-accordion-content") as HTMLElement;
-                const icon = section.querySelector(".toggle-icon") as HTMLElement;
-
+                
+                const header = section.querySelector(".nav-header") as HTMLElement;
+                const content = section.querySelector(".nav-content") as HTMLElement;
                 header.onclick = () => {
                     content.classList.toggle("hidden");
-                    icon.innerText = content.classList.contains("hidden") ? "▼" : "▲";
+                    header.querySelector(".arrow")!.innerHTML = content.classList.contains("hidden") ? "▼" : "▲";
                 };
-
-                section.querySelectorAll(".nav-child-item").forEach((item: any) => {
-                    item.onclick = (e: Event) => {
-                        e.stopPropagation();
+                
+                section.querySelectorAll(".nav-link").forEach((link: any) => {
+                    link.onclick = () => {
                         hideNavigation();
-                        searchInput.value = `type:${branch.type}`; 
-                        btnSubmit?.click();
+                        searchInput.value = `type:${group.type.toLowerCase()} path:${link.innerText.replace("• ", "")}`;
+                        btnSubmit.click();
                     };
                 });
-
                 pageList.appendChild(section);
             });
         }
 
-        // 2. Fetch and Render Users (Tree/Accordion for Team)
+        // 2. Fetch and Render Users (Team Members)
         const users = await invoke<any[]>("get_known_users");
         userList.innerHTML = "";
-        if (users.length > 0) {
+        
+        if (users.length === 0) {
+            userList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No members found.</div>";
+        } else {
             users.forEach(u => {
-                const div = document.createElement("div");
-                div.className = "scroll-item";
-                div.style.padding = "8px 10px";
-                div.style.borderBottom = "1px solid #222";
-                div.innerHTML = `
-                    <div style="display:flex; align-items:center; gap:10px;">
-                        <div style="width:24px; height:24px; border-radius:50%; background:#333; display:flex; align-items:center; justify-content:center; font-size:0.6rem; color:var(--primary); border:1px solid var(--primary);">U</div>
-                        <div>
-                            <div style="font-size:0.75rem; font-weight:bold; color:#fff;">${u.uuid.slice(0,8)}</div>
-                            <div style="font-size:0.65rem; color:#555;">${u.doc_type || 'Member'}</div>
-                        </div>
-                    </div>
+                if (u.doc_type === "team") return; // Skip team object itself
+                const item = document.createElement("div");
+                item.className = "member-item";
+                item.style.display = "flex";
+                item.style.alignItems = "center";
+                item.style.gap = "10px";
+                item.style.padding = "8px";
+                item.style.borderRadius = "8px";
+                item.style.cursor = "pointer";
+                
+                const icon = blockies.create({ seed: u.uuid, size: 8, scale: 3 });
+                icon.style.borderRadius = "50%";
+                
+                item.innerHTML = `
+                    <div class="avatar" style="width:24px; height:24px;"></div>
+                    <div style="font-size:0.75rem; color:#333; font-weight:500;">${u.uuid.slice(0,10)}...</div>
                 `;
-                userList.appendChild(div);
+                item.querySelector(".avatar")!.appendChild(icon);
+                item.onclick = () => { hideNavigation(); openWidget("settings"); };
+                userList.appendChild(item);
             });
         }
     } catch (e) { console.error("Nav error:", e); }
@@ -721,13 +767,7 @@ async function loadMoreDocs() {
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
     try {
-        // [NEW] On first page, fetch active tasks to show at the top
-        if (currentPage === 0) {
-            const activeTasks = await invoke<any[]>("get_active_tasks");
-            if (activeTasks && activeTasks.length > 0) {
-                renderTaskRows(activeTasks);
-            }
-        }
+        // [REMOVED] renderTaskRows call here. Active tasks now only appear in Settings (Chat).
 
         const docs = await invoke<any[]>("get_all_documents", { limit: pageSize, offset: currentPage * pageSize });
         if (docs.length < pageSize) hasMore = false;
@@ -780,6 +820,9 @@ async function showDetail(uuid: string) {
     currentDetailUuid = uuid;
     listView.style.display = "none";
     detailView.style.display = "flex";
+    if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+    if (btnStopTask) btnStopTask.style.display = "none";
+
     detailTitle.innerText = "Loading...";
     detailContent.innerHTML = "Fetching details...";
     try {
@@ -980,6 +1023,7 @@ function renderMessage(msg: any) {
                     logArea.dataset.activeTaskId = taskId;
                 }
                 if (btnStopTask) btnStopTask.style.display = "flex";
+                if (btnDetailDelete) btnDetailDelete.style.display = "none";
             }
         };
     }
