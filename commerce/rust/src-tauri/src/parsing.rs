@@ -13,22 +13,14 @@ pub fn pre_clean_html(html: &str) -> String {
     let re_comm = Regex::new(r"(?s)<!--.*?-->").unwrap();
     let html = re_comm.replace_all(html, "");
 
-    // 2. 분류/추출에 전혀 필요 없는 태그들 통째로 제거 (Proxy 로직 반영)
-    // 역참조(\1)를 지원하지 않으므로 각 태그를 명시적으로 처리하거나 합쳐서 처리
-    let re_tags = Regex::new(r"(?is)<(script|style|svg|noscript|iframe|head|meta|link|canvas)\b[^>]*>.*?</(script|style|svg|noscript|iframe|head|meta|link|canvas)>").unwrap();
+    // 2. 분류/추출에 전혀 필요 없는 태그들 통째로 제거
+    // Discovery 단계에서 노이즈가 될 수 있는 대형 영역(header, footer, nav 등) 추가 제거 가능성 고려
+    let re_tags = Regex::new(r"(?is)<(script|style|svg|noscript|iframe|head|meta|link|canvas|video|audio|button|input|select|label|header|footer|nav|aside)\b[^>]*>.*?</(script|style|svg|noscript|iframe|head|meta|link|canvas|video|audio|button|input|select|label|header|footer|nav|aside)>").unwrap();
     let html = re_tags.replace_all(&html, "");
 
     // 3. 닫는 태그가 없는 단일 태그들 정리
-    let re_single = Regex::new(r"(?is)<(meta|link|br|hr|img)\b[^>]*>").unwrap();
-    // 분류 단계에서 img는 맥락을 해칠 수 있으므로 제거하거나 최소화
-    let clean = re_single.replace_all(&html, |caps: &regex::Captures| {
-        let tag = caps.get(1).map(|m| m.as_str().to_lowercase()).unwrap_or_default();
-        if tag == "img" { 
-            String::new() 
-        } else { 
-            caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default()
-        }
-    });
+    let re_single = Regex::new(r"(?is)<(meta|link|br|hr|img|input|source)\b[^>]*>").unwrap();
+    let clean = re_single.replace_all(&html, "");
 
     // 4. 연속된 줄바꿈 및 불필요한 공백 제거 (토큰 절약)
     let re_whitespace = Regex::new(r"(?m)^\s*\n").unwrap();
@@ -40,6 +32,8 @@ pub fn pre_clean_html(html: &str) -> String {
 pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
     let mut pug_output = String::new();
     pug_output.reserve(1024 * 10); 
+    
+    // Discovery 모드(StructureOnly)인 경우 body 내부만 집중
     let mut found_body = false;
     for child in document.tree.root().children() {
         if let Some(element) = child.value().as_element() {
@@ -95,12 +89,30 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
     match node.value() {
         Node::Element(element) => {
             let tag_name = element.name();
-            if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use"].contains(&tag_name) { return; }
+            
+            // [STRICT FILTER] 광고 및 불필요 태그 원천 차단
+            let ad_patterns = ["ad", "banner", "popup", "modal", "floating", "wing", "sidebar", "aside", "header", "footer", "nav"];
+            
+            if mode == &PugMode::StructureOnly {
+                // 1. 태그명 기반 필터링
+                if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use", "button", "input", "select", "label"].contains(&tag_name) { return; }
+                
+                // 2. ID/Class 기반 광고 필터링
+                let id = element.id().unwrap_or("").to_lowercase();
+                if ad_patterns.iter().any(|&p| id.contains(p)) { return; }
+                
+                let classes = element.classes().collect::<Vec<_>>().join(" ").to_lowercase();
+                if ad_patterns.iter().any(|&p| classes.contains(p)) { return; }
+            } else {
+                if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use"].contains(&tag_name) { return; }
+            }
+
             if tag_name == "img" {
                 if let Some(src) = element.attr("src") {
                     if src.len() > 1000 || src.contains("base64") { return; }
                 }
             }
+
             let mut line = String::with_capacity(64);
             line.push_str(&indent);
             line.push_str(tag_name);
@@ -115,9 +127,12 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             let mut attrs = Vec::new();
             match mode {
                 PugMode::StructureOnly => {
+                    // Discovery 단계: href만 유지하여 링크 구조 파악
                     if let Some(val) = element.attr("href") { 
-                         let val = if val.len() > 200 { &val[..200] } else { val };
-                         attrs.push(format!("href='{}'", val)); 
+                         let val = if val.len() > 150 { &val[..150] } else { val };
+                         if !val.starts_with("javascript:") && !val.starts_with('#') {
+                             attrs.push(format!("href='{}'", val.replace("\"", "'"))); 
+                         }
                     }
                 },
                 PugMode::FullContent => {
@@ -144,7 +159,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             output.push('\n');
 
             // --- [STRICT PARITY] Special Textarea Handling ---
-            if tag_name == "textarea" {
+            if tag_name == "textarea" && mode == &PugMode::FullContent {
                 if let Some(val) = element.attr("value") {
                     for line in val.lines() {
                         output.push_str(&indent);
@@ -157,7 +172,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
             // --- Structural Compression for Classification ---
             let children: Vec<_> = node.children().collect();
-            if *mode == PugMode::StructureOnly && children.len() > 5 {
+            if *mode == PugMode::StructureOnly && children.len() > 3 {
                 let mut last_tag = "";
                 let mut last_classes = String::new();
                 let mut repeat_count = 0;
@@ -176,6 +191,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
                     if is_repetitive { repeat_count += 1; } else { repeat_count = 0; }
 
+                    // 반복되는 구조는 2개까지만 보여주고 나머지는 압축
                     if repeat_count > 1 && idx < children.len() - 1 {
                         if repeat_count == 2 {
                             output.push_str(&indent);
@@ -236,62 +252,39 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
     split_doc_to_pug_list(&document, selector_str, mode)
 }
 
-pub fn page_type_prompt(language: &str) -> String {
+pub fn page_type_prompt() -> String {
     let template = r###"
-[STRICT ROLE]
-You are a web structure classifier. Your ONLY job is to output a JSON object.
-
-[CATEGORIES]
-type:'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
-
-[OUTPUT RULE]
-- No conversation. No repetition of input. 
-- Output ONLY: {"type": "category"}
-
-[LANGUAGE]
-{LANGUAGE}"###;
-    template.replace("{LANGUAGE}", language)
+Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+{"type": 'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or ''}"###;
 }
 
 pub fn page_selectors_prompt(page_type: &str, language: &str) -> String {
     let template = r###"
-[TASK]
-The page has been classified as '{TYPE}'.
-Analyze the provided Pug template snippet and identify the structural CSS1 selectors required for data extraction.
-
-[SCHEMA DEFINITIONS]
-- item: type based item CSS1 selector excluding ads
-- node: item parent list CSS1 selector excluding ads
-- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
-- next: list next button CSS1 selector
-- detail: is a detail page or a detail form
-
-[OUTPUT FORMAT]
-Return valid JSON only. No explanation.
-{{
-    "item": "",
-    "node": "",
-    "more": "",
-    "next": "",
-    "detail": boolean
-}}
-
-[CONTEXT]
-Language: {LANGUAGE}"###;
+Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+{
+    "type":'{TYPE}',
+    "item":type based item CSS1 selector excluding ads,
+    "more":item URL includes a manage path, an administrative or edit route Link CSS1 selector,
+    "node":item parent list CSS1 selector excluding ads,
+    "next":list next button CSS1 selector,
+    "text":summarize the contents of the items array in {language},
+    "detail":is a detail page or a detail form | boolean,
+}
+"###;
     template.replace("{TYPE}", page_type).replace("{LANGUAGE}", language)
 }
 
 pub fn para2graph(language: &str) -> String {
     format!(r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-	{{
+	{
 		"context" : [
-			{{
+			{
 				"language" : "{}",
 				"type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
 				"text": "Segment the natural language content into single-type contexts"
-			}}
+			}
 		]
-	}}"###, language)
+	}"###, language)
 }
 
 pub fn graph2contexts(current: &str) -> String {
@@ -306,25 +299,25 @@ pub fn graph2contexts(current: &str) -> String {
     
     [OUTPUT FORMAT]
     Return a JSON object containing a "context" array with one object per segment.
-    {{
+    {
         "context": [
-            {{
+            {
                 "type": "string",
                 "text": "the_original_segment_text",
                 "status": "string or null",
                 "substantial": "string or null",
                 "find": "string or null",
-                "condition" : {{
-                    "date": {{ "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" }},
-                    "quantity": {{ "eq": number, "lte": number, "gte": number }},
-                    "price": {{ "currency": "string", "eq": number, "lte": number, "gte": number }}
-                }}
-            }}
+                "condition" : {
+                    "date": { "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" },
+                    "quantity": { "eq": number, "lte": number, "gte": number },
+                    "price": { "currency": "string", "eq": number, "lte": number, "gte": number }
+                }
+            }
         ]
-    }}"###, current)
+    }"###, current)
 }
 
-pub fn item2json(page_type: &str, href: &str, _language: &str) -> String {
+pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
         "tracking" => r###"node:tracking form container CSS1 selector,
 status:{
@@ -408,369 +401,369 @@ registration_date:{
     selector:selector
 },"###.to_string(),
         "goods" => format!(r###"node:goods form container CSS1 selector,
-code:{{
+code:{
     value:product constant code | string,
     selector:selector
-}},
+},
 link:'{}',
-id:{{
+id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
-}},
-status:{{
+},
+status:{
     value:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
     selector:selector
-}},
-payment_method:{{
+},
+payment_method:{
     value:payment method | string,
     selector:selector
-}},
-bank:{{
+},
+bank:{
     value:bank company name or '' | string,
     selector:selector
-}},
-card:{{
+},
+card:{
     value:card company name or '' | string,
     selector:selector
-}},
-model_name:{{
+},
+model_name:{
     value:product Model name | string,
     selector:selector
-}},
-brand_name:{{
+},
+brand_name:{
     value:product Brand name | string,
     selector:selector
-}},
-condition:{{
+},
+condition:{
     value:['new' or 'used' or 'lease' or 'rental' or 'refurbish'],
     selector:selector
-}},
-description:{{
+},
+description:{
     value:product Full description (HTML allowed) | string,
     selector:selector
-}},
-short_description:{{
+},
+short_description:{
     value:product short description | string,
     selector:selector
-}},
-tags:{{
-    value:[{{ tag : product keyword or tag | string }}],
+},
+tags:{
+    value:[{ tag : product keyword or tag | string }],
     selector:selector
-}},
-origin_country:{{
+},
+origin_country:{
     value:product Country of origin/manufacture | string,
     selector:selector
-}},
-manufacturer:{{
+},
+manufacturer:{
     value:product Manufacturer name | string,
     selector:selector
-}},
-release_date:{{
+},
+release_date:{
     value:Product release date(yyyy-MM-ddThh:mm:ss) | string,
     selector:selector
-}},
-manufacture_date:{{
+},
+manufacture_date:{
     value:product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string,
     selector:selector
-}},
-expiration_date:{{
+},
+expiration_date:{
     value:product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string,
     selector:selector
-}},
-gtin:{{
+},
+gtin:{
     value:product Global Trade Item Number | string,
     selector:selector
-}},
-mpn:{{
+},
+mpn:{
     value:product Manufacturer Part Number | string,
     selector:selector
-}},
-barcode:{{
+},
+barcode:{
     value:product Barcode value | string,
     selector:selector
-}},
-sale_price:{{
+},
+sale_price:{
     value:product sale price | number,
     selector:selector
-}},
-supply_price:{{
+},
+supply_price:{
     value:product supply price | number,
     selector:selector
-}},
-currency:{{
+},
+currency:{
     value:ISO 4217 Currency Code | string,
     selector:selector
-}},
-compare_at_price:{{
+},
+compare_at_price:{
     value:product Original price for showing discounts | number,
     selector:selector
-}},
-quantity:{{
+},
+quantity:{
     value:product Inventory quantity | number,
     selector:selector
-}},
-stock_keeping_unit:{{
+},
+stock_keeping_unit:{
     value:Stock Keeping Unit | string,
     selector:selector
-}},
-low_stock_threshold:{{
+},
+low_stock_threshold:{
     value:product Low stock alert threshold | number,
     selector:selector
-}},
-unit:{{
+},
+unit:{
     value:product Selling unit | string,
     selector:selector
-}},
-tax_included:{{
+},
+tax_included:{
     value:product Whether tax | number,
     selector:selector
-}},
-tax_code:{{
+},
+tax_code:{
     value:product Tax code for region-specific rules | string,
     selector:selector
-}},
-main_image_url:{{
+},
+main_image_url:{
     value:Main product image URL | string,
     selector:selector
-}},
-additional_image_url:{{
+},
+additional_image_url:{
     value:additional product image URL | string,
     selector:selector
-}},
-video_url:{{
+},
+video_url:{
     value:product Promotional video URL | string,
     selector:selector
-}},
-carrier:{{
+},
+carrier:{
     value:product carrier name translated into English | string,
     selector:selector
-}},
-shipping_fee:{{
+},
+shipping_fee:{
     value:product Shipping cost | number,
     selector:selector
-}},
-shipping_method:{{
+},
+shipping_method:{
     value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
     selector:selector
-}},
-shipping_duration:{{
+},
+shipping_duration:{
     value:product Estimated delivery days | number,
     selector:selector
-}},
-bundle_shipping:{{
+},
+bundle_shipping:{
     value:product Allow combined shipping | string,
     selector:selector
-}},
-product_width:{{
+},
+product_width:{
     value:Package width(cm) | number,
     selector:selector
-}},
-product_height:{{
+},
+product_height:{
     value:Package height(cm) | number,
     selector:selector
-}},
-product_length:{{
+},
+product_length:{
     value : Package length(cm) | number,
     selector:selector
-}},
-product_weight:{{
+},
+product_weight:{
     value : Package weight(kg) | number,
     selector:selector
-}},
+},
 options:[
-    {{
+    {
         value:option name | string,
         selector:selector,
-        inputs:[{{
+        inputs:[{
             value:option input value | string,
             selector:selector
-        }}]
-    }}
+        }]
+    }
 ],
 additional_goods:[
-    {{
+    {
         value:URL includes a manage path, an administrative or edit route product Link | string,
         selector:selector
-    }}
+    }
 ],
-title:{{
+title:{
     value:product based title | string,
     selector:selector
-}},
-registration_date:{{
+},
+registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-}},"###, href),
+},"###, href),
         "order" => format!(r###"node:order form container CSS1 selector,
 link : '{}',
-id:{{
+id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
-}},
-tracking_number:{{
+},
+tracking_number:{
     value:tracking number | string,
     selector:selector
-}},
-status:{{
+},
+status:{
     value:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
     selector:selector
-}},
-goods:[{{
-    title:{{
+},
+goods:[{
+    title:{
         value:goods title | string,
         selector:selector
-    }},
-    link:{{
+    },
+    link:{
         value:URL includes a manage path, an administrative or edit route goods Link | string,
         selector:selector
-    }},
-    id:{{
+    },
+    id:{
         value:Refer to the product no value from the link or an attribute or input value | string,
         selector:selector
-    }}
-}}],
-sender_name:{{
+    }
+}],
+sender_name:{
     value:sender_name | string,
     selector:selector
-}},
-sender_address:{{
+},
+sender_address:{
     value:sender_address, Filter the addresses to District-level and up | string,
     selector:selector
-}},
-sender_phone:{{
+},
+sender_phone:{
     value:sender_phone | string,
     selector:selector
-}},
-recipient_name:{{
+},
+recipient_name:{
     value:recipient_name | string,
     selector:selector
-}},
-recipient_address:{{
+},
+recipient_address:{
     value:recipient_address, Filter the addresses to District-level and up | string,
     selector:selector
-}},
-recipient_phone:{{
+},
+recipient_phone:{
     value:recipient_phone | string,
     selector:selector
-}},
-bank:{{
+},
+bank:{
     value:bank company name | string,
     selector:selector
-}},
-card:{{
+},
+card:{
     value:card company name | string,
     selector:selector
-}},
-order_date:{{
+},
+order_date:{
     value:order date | string,
     selector:selector
-}},
-payment_date:{{
+},
+payment_date:{
     value:payment date or '' | string,
     selector:selector
-}},
-payment_method:{{
+},
+payment_method:{
     value:'C.O.D.' or 'CARD' or 'BANK' or '' | string,
     selector:selector
-}},
-payment_origin:{{
+},
+payment_origin:{
     value:Payment Gateway Service Name or '' | string,
     selector:selector
-}},
-registration_date:{{
+},
+registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-}},"###, href),
+},"###, href),
         "coupon" | "event" => format!(r###"node:{} container CSS1 selector,
 link : '{}',
-id:{{
+id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
-}},
-type:{{
+},
+type:{
     value:'percentage' or 'fixed_amount' or 'free_shipping' or '',
     selector:selector
-}},
-status:{{
+},
+status:{
     value:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
     selector:selector
-}},
-title:{{
+},
+title:{
     value:{} title | string, 
     selector:selector
-}},
-started_at:{{
+},
+started_at:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-}},
-expired_at:{{
+},
+expired_at:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-}},
-code:{{
+},
+code:{
     value:{} code used at checkout | string,
     selector:selector
-}},
-discount:{{
+},
+discount:{
     value:Discount value | number,
     selector:selector
-}},
-quantity:{{
+},
+quantity:{
     value:{} quantity | number
     selector:selector
-}},
-usage_limit:{{
+},
+usage_limit:{
     value:Total usage limit for the coupon | number,
     selector:selector
-}},
-usage_per:{{
+},
+usage_per:{
     value:Usage limit per customer | number,
     selector:selector
-}},
-new_customer_only:{{
+},
+new_customer_only:{
     value:new customer only | boolean
     selector:selector
-}},
-min_order_amount:{{
+},
+min_order_amount:{
     value:Minimum order amount required to apply coupon | number,
     selector:selector
-}},
-max_discount_amount:{{
+},
+max_discount_amount:{
     value:Maximum discount limit allowed for the coupon | number,
     selector:selector
-}},
-region_restrictions:{{
+},
+region_restrictions:{
     value:region restrictions | boolean,
     selector:selector
-}},
-registration_date:{{
+},
+registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-}},"###, page_type, href, page_type, page_type, page_type),
+},"###, page_type, href, page_type, page_type, page_type),
         "review" => format!(r###"node:review container CSS1 selector,
 link : '{}',
 id:Refer to the ID value from the link or an attribute or input value | string,,
-status:{{
+status:{
     value:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
     selector:selector
-}},
-name:{{
+},
+name:{
     value:reviewer name | string,
     selector:selector
-}},
-title:{{
+},
+title:{
     value:reviewer item title | string, 
     selector:selector
-}},
-completed:{{
+},
+completed:{
     value:order complete | boolean,
     selector:selector
-}},
-registration_date:{{
+},
+registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-}},"###, href),
-        _ => "- id: Unique identifier.\n- title: General name or title.\n- status: Current state."
+},"###, href),
+        _ => "- id: Unique identifier.\n- title: General name or title.\n- status: Current state.".to_string()
     };
 
     let template = r###" 
@@ -799,7 +792,7 @@ Source URL: {HREF}
     template.replace("{TYPE}", page_type)
             .replace("{HREF}", href)
             .replace("{LANGUAGE}", language)
-            .replace("{SCHEMA}", schema)
+            .replace("{SCHEMA}", &schema)
 }
 
 pub fn list2json(page_type: &str, language: &str) -> String {
@@ -813,19 +806,19 @@ supply_price:supply price | number,
 currency:ISO 4217 Currency Code | string,
 quantity:item stock quantity | number,
 tracking_number:Tracking Number or 운송장 번호 or 运단호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Но머 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
-registration_date:yyyy-MM-ddThh:mm:ss | string,"###,
+registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
         "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
 id:Refer to the ID value from the link or an attribute | string,
 title:author and content | string, 
 link:URL includes a manage path, an administrative or edit route Link | string,
-registration_date:yyyy-MM-ddThh:mm:ss | string,"###,
+registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
         "coupon" | "event" => r###"status:'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
 id:Refer to the ID value from the link or an attribute | string,
 title:type based item title, 
 started_at:yyyy-MM-ddThh:mm:ss,
 expired_at:yyyy-MM-ddThh:mm:ss,
-registration_date:yyyy-MM-ddThh:mm:ss | string,"###,
-        _ => "id: ID\ntitle: Title\nstatus: Status"
+registration_date:yyyy-MM-ddThh:mm:ss | string,"###.to_string(),
+        _ => "id: ID\ntitle: Title\nstatus: Status".to_string()
     };
 
     let template = r###" 
@@ -856,7 +849,7 @@ Language: {LANGUAGE}
 
     template.replace("{TYPE}", page_type)
             .replace("{LANGUAGE}", language)
-            .replace("{SCHEMA}", schema)
+            .replace("{SCHEMA}", &schema)
 }
 
 /// Converts a JSON Value into a human-readable natural language narrative.
