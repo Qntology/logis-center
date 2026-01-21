@@ -173,17 +173,19 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
 
     match (f_type, primary_type) {
 
-        // --- Order as Primary ---
+                // --- Order as Primary ---
 
-        ("goods", "order") => {
+                ("goods", "order") => {
 
-            if let Some(tracking) = get_val("tracking") {
+                    if let Some(tracking) = get_val("tracking").or_else(|| get_val("tracking_number")) {
 
-                queries.push(QueryInfo { r#type: primary_type.to_string(), table: "sales".to_string(), column: "tracking".to_string(), value: tracking, status: None });
+                        queries.push(QueryInfo { r#type: primary_type.to_string(), table: "sales".to_string(), column: "tracking".to_string(), value: tracking, status: None });
 
-                return Some((queries, MergeInfo { update: None, upsert: Some(UpsertMerge { includes: sales_includes, from: merge_from.clone(), to: merge_to.clone() }), from: merge_from, to: merge_to }));
+                        return Some((queries, MergeInfo { update: None, upsert: Some(UpsertMerge { includes: sales_includes, from: merge_from.clone(), to: merge_to.clone() }), from: merge_from, to: merge_to }));
 
-            } else {
+                    } else {
+
+        
 
                 let index_val = get_val("index")?;
 
@@ -195,13 +197,15 @@ pub fn relay(foreign_type: &str, primary_item: &Value) -> Option<(Vec<QueryInfo>
 
         },
 
-        ("tracking", "order") => {
+                ("tracking", "order") => {
 
-            let index_val = get_val("index")?;
+                    let index_val = get_val("index")?;
 
-            if get_val("tracking").is_some() {
+                    if get_val("tracking").is_some() || get_val("tracking_number").is_some() {
 
-                queries.push(QueryInfo { r#type: f_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: index_val.clone(), status: None });
+                        queries.push(QueryInfo { r#type: f_type.to_string(), table: "tracking".to_string(), column: primary_type.to_string(), value: index_val.clone(), status: None });
+
+        
 
                 return Some((queries, MergeInfo { upsert: None, update: Some(UpdateMerge { 
 

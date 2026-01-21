@@ -332,11 +332,22 @@ impl VectorStore {
          let text_content = data_val.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
          let status = data_val.get("status").and_then(|v| v.as_str()).map(|s| crate::logic::parse_status(s)).unwrap_or(0);
-         let amount = data_val.get("total_amount").or_else(|| data_val.get("sale_price")).or_else(|| data_val.get("supply_price")).or_else(|| data_val.get("shipping_fee")).or_else(|| data_val.get("discount")).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))).unwrap_or(0.0) as f32;
          
-         // [NEW] doc_date -> created_at logic
+         // [STRICT] Multi-field mapping for 'amount'
+         let amount = data_val.get("total_amount")
+            .or_else(|| data_val.get("sale_price"))
+            .or_else(|| data_val.get("supply_price"))
+            .or_else(|| data_val.get("price"))
+            .or_else(|| data_val.get("shipping_fee"))
+            .or_else(|| data_val.get("discount"))
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok())))
+            .unwrap_or(0.0) as f32;
+         
+         // [NEW] Expanded doc_date -> created_at logic
          let doc_date_str = data_val.get("order_date")
             .or_else(|| data_val.get("registration_date"))
+            .or_else(|| data_val.get("release_date"))
+            .or_else(|| data_val.get("manufacture_date"))
             .or_else(|| data_val.get("shipping_date"))
             .or_else(|| data_val.get("started_at"))
             .or_else(|| data_val.get("expired_at"))
