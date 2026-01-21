@@ -235,118 +235,257 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_cache = None
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool) -> Result<()> {
-        if let Some((k, v)) = &self.kv_cache {
+        pub fn save_kv_cache(&mut self, path: &Path, clear: bool) -> Result<()> {
+
+            if let Some((k, v)) = &self.kv_cache {
+
+                let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+
+                if self.layer_idx == 0 {
+
+                    println!("[KV-SAVE] Starting 1/8 compressed storage for all layers...");
+
+                }
+
+                
+
+                let mut map = HashMap::new();
+
+                
+
+                let process_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, layer_idx: usize| -> Result<()> {
+
+                    let shape = t.shape();
+
+                    let dims = shape.dims();
+
+                    let flat_t = t.contiguous()?.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+
+                    let data = flat_t.to_vec1::<f32>()?;
+
+                    let original_size = data.len() * 4; 
+
+                    
+
+                    let block_size = 32;
+
+                    let num_blocks = (data.len() + block_size - 1) / block_size;
+
+                    
+
+                    let mut scales = Vec::with_capacity(num_blocks);
+
+                    let mut packed = Vec::with_capacity(num_blocks * 16);
+
+                    
+
+                    for i in 0..num_blocks {
+
+                        let start = i * block_size;
+
+                        let end = (start + block_size).min(data.len());
+
+                        let block_len = end - start;
+
+                        
+
+                        let mut max_abs = 0.0f32;
+
+                        for j in 0..block_len { 
+
+                            let val = data[start + j];
+
+                            if val.abs() > max_abs { max_abs = val.abs(); } 
+
+                        }
+
+                        
+
+                        let scale = max_abs / 8.0;
+
+                        scales.push(scale);
+
+                        
+
+                        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+                        
+
+                        for j in 0..16 {
+
+                            let idx1 = j;
+
+                            let idx2 = j + 16;
+
+                            let v1 = if idx1 < block_len { ((data[start + idx1] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+
+                            let v2 = if idx2 < block_len { ((data[start + idx2] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+
+                            packed.push(v1 | (v2 << 4));
+
+                        }
+
+                    }
+
+                    
+
+                    let compressed_size = (num_blocks * 2) + (num_blocks * 16);
+
+                    let ratio = (compressed_size as f64 / original_size as f64) * 100.0;
+
+                    
+
+                    // [STRICT ONCE] Only log for Layer 0 and only for the 'k' tensor
+
+                    if layer_idx == 0 && prefix == "k" {
+
+                        println!("╔════════════ KV CACHE COMPRESSION STATS (Layer 0) ════════════╗");
+
+                        println!("║  - Legacy F32 Storage Size: {:>10} bytes (100.0%)   ║", original_size);
+
+                        println!("║  - New 4-bit Packed Size  : {:>10} bytes ({:>5.1}%)    ║", compressed_size, ratio);
+
+                        println!("║  - Space Saved            : {:>10} bytes ({:>5.1}%)    ║", original_size - compressed_size, 100.0 - ratio);
+
+                        println!("╚══════════════════════════════════════════════════════════════╝");
+
+                    }
+
+    
+
+                    map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?.to_dtype(DType::F16)?);
+
+                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(packed, (num_blocks * 16,), &Device::Cpu)?);
+
+                    map.insert(format!("{}_shape", prefix), Tensor::new(dims.iter().map(|&x| x as u32).collect::<Vec<u32>>().as_slice(), &Device::Cpu)?);
+
+                    Ok(())
+
+                };
+
+    
+
+                process_tensor(k, "k", &mut map, self.layer_idx)?;
+
+                process_tensor(v, "v", &mut map, self.layer_idx)?;
+
+                
+
+                candle_core::safetensors::save(&map, &file)?;
+
+                
+
+                if clear {
+
+                    self.kv_cache = None;
+
+                }
+
+            }
+
+            Ok(())
+
+        }
+
+    
+
+        pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
+
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-            println!("[KV-SAVE] Layer {}: Starting 1/8 compression... (Device: {:?})", self.layer_idx, k.device());
-            
-            let mut map = HashMap::new();
-            
-            let process_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>| -> Result<()> {
-                let shape = t.shape();
-                let dims = shape.dims();
-                // Move to CPU for packing logic
-                let flat_t = t.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-                let data = flat_t.to_vec1::<f32>()?;
-                
-                let block_size = 32;
-                let num_blocks = (data.len() + block_size - 1) / block_size;
-                
-                let mut scales = Vec::with_capacity(num_blocks);
-                let mut packed = Vec::with_capacity(num_blocks * 16);
-                
-                for i in 0..num_blocks {
-                    let start = i * block_size;
-                    let end = (start + block_size).min(data.len());
-                    let block = &data[start..end];
-                    
-                    let mut max_abs = 0.0f32;
-                    for &val in block { if val.abs() > max_abs { max_abs = val.abs(); } }
-                    
-                    let scale = max_abs / 8.0;
-                    scales.push(scale);
-                    
-                    let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-                    
-                    for j in 0..16 {
-                        let idx1 = start + j;
-                        let idx2 = start + j + 16;
-                        
-                        let v1 = if idx1 < end { ((block[j] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
-                        let v2 = if idx2 < end { ((block[j+16] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
-                        
-                        packed.push(v1 | (v2 << 4));
-                    }
+
+            if file.exists() {
+
+                if self.layer_idx == 0 {
+
+                    println!("[KV-LOAD] Restoring compressed cache for all layers...");
+
                 }
-                
-                map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?.to_dtype(DType::F16)?);
-                map.insert(format!("{}_packed", prefix), Tensor::from_vec(packed, (num_blocks * 16,), &Device::Cpu)?);
-                map.insert(format!("{}_shape", prefix), Tensor::new(dims.iter().map(|&x| x as u32).collect::<Vec<u32>>().as_slice(), &Device::Cpu)?);
-                Ok(())
-            };
 
-            process_tensor(k, "k", &mut map)?;
-            process_tensor(v, "v", &mut map)?;
-            
-            candle_core::safetensors::save(&map, &file)?;
-            println!("[KV-SAVE] Layer {}: Completed.", self.layer_idx);
-            
-            if clear {
-                self.kv_cache = None;
-            }
-        }
-        Ok(())
-    }
+                let tensors = candle_core::safetensors::load(&file, &Device::Cpu)?;
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
-        let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-        if file.exists() {
-            println!("[KV-LOAD] Layer {}: Loading from disk...", self.layer_idx);
-            let tensors = candle_core::safetensors::load(&file, &Device::Cpu)?;
-            
-            let unpack_tensor = |prefix: &str| -> Result<Tensor> {
-                let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("no scales"))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-                let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("no packed"))?.to_vec1::<u8>()?;
-                let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("no shape"))?.to_vec1::<u32>()?;
-                let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
                 
-                let num_blocks = scales.len();
-                let mut unpacked = Vec::with_capacity(num_blocks * 32);
-                
-                for i in 0..num_blocks {
-                    let scale = scales[i];
-                    for j in 0..16 {
-                        let byte = packed[i * 16 + j];
-                        let v1 = (byte & 0x0F) as f32;
-                        let v2 = (byte >> 4) as f32;
-                        unpacked.push((v1 - 8.0) * scale);
-                        unpacked.push((v2 - 8.0) * scale);
+
+                let unpack_tensor = |prefix: &str| -> Result<Tensor> {
+
+                    let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("no scales"))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+
+                    let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("no packed"))?.to_vec1::<u8>()?;
+
+                    let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("no shape"))?.to_vec1::<u32>()?;
+
+                    let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
+
+                    
+
+                    let num_blocks = scales.len();
+
+                    let mut unpacked = Vec::with_capacity(num_blocks * 32);
+
+                    
+
+                    for i in 0..num_blocks {
+
+                        let scale = scales[i];
+
+                        for j in 0..16 {
+
+                            let byte = packed[i * 16 + j];
+
+                            let v1 = (byte & 0x0F) as f32;
+
+                            let v2 = (byte >> 4) as f32;
+
+                            unpacked.push((v1 - 8.0) * scale);
+
+                            unpacked.push((v2 - 8.0) * scale);
+
+                        }
+
                     }
-                }
-                
-                unpacked.truncate(shape.iter().product());
-                
-                // [FIX] Use the LayerNorm weight's dtype as the reliable target (always BF16 on GPU)
-                let target_dtype = self.q_norm.weight().dtype();
-                Ok(Tensor::from_vec(unpacked, shape, &Device::Cpu)?.to_device(device)?.to_dtype(target_dtype)?)
-            };
 
-            let k = unpack_tensor("k")?;
-            let v = unpack_tensor("v")?;
-            println!("[KV-LOAD] Layer {}: Unpacked and moved to {:?}", self.layer_idx, device);
-            
-            let current_len = k.dim(2)?;
-            if current_len >= expected_len {
-                let k = k.narrow(2, 0, expected_len)?;
-                let v = v.narrow(2, 0, expected_len)?;
-                self.kv_cache = Some((k, v));
-            } else {
-                println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
-                self.kv_cache = None;
+                    
+
+                    unpacked.truncate(shape.iter().product());
+
+                    
+
+                    let target_dtype = self.q_norm.weight().dtype();
+
+                    Ok(Tensor::from_vec(unpacked, shape, &Device::Cpu)?.to_device(device)?.to_dtype(target_dtype)?)
+
+                };
+
+    
+
+                let k = unpack_tensor("k")?;
+
+                let v = unpack_tensor("v")?;
+
+                
+
+                let current_len = k.dim(2)?;
+
+                if current_len >= expected_len {
+
+                    let k = k.narrow(2, 0, expected_len)?;
+
+                    let v = v.narrow(2, 0, expected_len)?;
+
+                    self.kv_cache = Some((k, v));
+
+                } else {
+
+                    println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
+
+                    self.kv_cache = None;
+
+                }
+
             }
+
+            Ok(())
+
         }
-        Ok(())
-    }
 
     pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
         self.save_kv_cache(path, true)
