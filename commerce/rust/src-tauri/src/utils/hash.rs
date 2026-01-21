@@ -4,6 +4,22 @@ use regex::Regex;
 use once_cell::sync::Lazy;
 
 static PUNCTUATION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\p{P}\p{S}\p{Z}]").unwrap());
+static TWO_PART_DOMAINS: &[&str] = &["co.kr","co.uk","co.jp","com.cn","co.in","com.mx","co.id","com.my","com.sg","com.ph","com.vn"];
+
+pub fn get_base_domain(hostname: &str) -> String {
+    let host = hostname.to_lowercase();
+    let parts: Vec<&str> = host.split('.').collect();
+    
+    let is_two_part = TWO_PART_DOMAINS.iter().any(|&d| host.ends_with(d));
+    
+    if is_two_part && parts.len() >= 3 {
+        return parts[parts.len()-3..].join(".");
+    }
+    if parts.len() >= 2 {
+        return parts[parts.len()-2..].join(".");
+    }
+    host
+}
 
 /// JS의 crc32(s)와 동일한 결과값을 반환합니다.
 pub fn crc32(text: &str) -> u32 {

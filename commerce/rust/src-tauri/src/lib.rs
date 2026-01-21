@@ -600,212 +600,92 @@ async fn get_browser_status() -> Result<String, String> {
     Ok("stopped".to_string())
 }
 
+#[tauri::command]
+async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        // Fetch tasks with status 10 (pending) or 1 (progress)
+        db.get_pending_tasks(10).await.map_err(|e| e.to_string())
+    } else {
+        Ok(vec![])
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-
 pub fn run() {
-
     let model = Arc::new(Mutex::new(None));
-
     let store = Arc::new(Mutex::new(None));
     let cancellation_token = Arc::new(AtomicBool::new(false));
 
-
-
-        let _model_clone = model.clone();
-
-
-
-        let _store_clone = store.clone();
-
-
-
-    
-
-    let _store_server = store.clone();
-
-
-        tauri::Builder::default()
-
-
-
-    
-
+    tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
-
         .plugin(tauri_plugin_shell::init())
+        .manage(AppState {
+            model: model.clone(),
+            store: store.clone(),
+            cancellation_token: cancellation_token.clone(),
+        })
+        .setup(|app| {
+            let setup_store = app.state::<AppState>().store.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut store_guard = setup_store.lock().await;
+                let db_path = "data/lancedb";
+                let _ = std::fs::create_dir_all(db_path);
+                if let Ok(s) = VectorStore::new(db_path).await {
+                    println!("[Setup] VectorStore initialized.");
+                    let _ = s.init_task_table().await;
+                    let _ = s.init_all_tables().await;
+                    *store_guard = Some(s);
+                }
+            });
 
-                .manage(AppState {
+            let scheduler_store = app.state::<AppState>().store.clone();
+            let scheduler_model = app.state::<AppState>().model.clone();
+            let scheduler_cancel = app.state::<AppState>().cancellation_token.clone();
+            let scheduler_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_cancel, scheduler_handle).await;
+            });
 
-                    model: model,
+            let auto_reconnect_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = automation::try_reconnect_existing_browser(auto_reconnect_handle).await;
+            });
 
-                    store: store,
-                    cancellation_token: cancellation_token.clone(),
-
-                })
-
-                .setup(|app| {
-                    let store = app.state::<AppState>().store.clone();
-                    let _app_handle = app.handle().clone();
-
-                    // Initialize Store on Startup
+            let event_store = app.state::<AppState>().store.clone();
+            app.listen("new-task-from-browser", move |event| {
+                if let Ok(payload_val) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+                    let store_clone = event_store.clone();
                     tauri::async_runtime::spawn(async move {
-                        let mut store_guard = store.lock().await;
-                        let db_path = "data/lancedb";
-                        let _ = std::fs::create_dir_all(db_path);
-                        
-                        match VectorStore::new(db_path).await {
-                            Ok(s) => {
-                                println!("[Setup] VectorStore initialized.");
-                                // Ensure tables exist
-                                if let Err(e) = s.init_task_table().await {
-                                    eprintln!("[Setup] Failed to init task table: {}", e);
-                                }
-                                if let Err(e) = s.init_all_tables().await {
-                                    eprintln!("[Setup] Failed to init tables: {}", e);
-                                }
-                                *store_guard = Some(s);
-                            },
-                            Err(e) => eprintln!("[Setup] Failed to init Vector Store: {}", e), 
+                        let store_guard = store_clone.lock().await;
+                        if let Some(db) = store_guard.as_ref() {
+                            let now = chrono::Utc::now().timestamp_millis();
+                            let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
+                            let team_id = payload_val.get("to").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| crate::utils::hash::hash_id(&from_addr));
+                            let task = crate::store::Task {
+                                id: payload_val.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                                r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                                from_source: from_addr, to_dest: team_id,
+                                cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                data_json: payload_val.to_string(), created_at: now, updated_at: now, status: 10,
+                            };
+                            let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
+                            let _ = db.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", &msg_content, Some(&task.id), Some(1)).await;
+                            let _ = db.add_task(task).await;
                         }
                     });
-                    
-                    // Start Background Scheduler
-                    let scheduler_store = app.state::<AppState>().store.clone();
-                    let scheduler_model = app.state::<AppState>().model.clone();
-                    let scheduler_cancel = app.state::<AppState>().cancellation_token.clone();
-                    let scheduler_handle = app.handle().clone();
-
-                    tauri::async_runtime::spawn(async move {
-                        scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_cancel, scheduler_handle).await;
-                    });
-                    
-                    // [NEW] Auto-Reconnect to existing browser on startup
-                    let auto_reconnect_handle = app.handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = automation::try_reconnect_existing_browser(auto_reconnect_handle).await;
-                    });
-                    
-                    let store_for_event = app.state::<AppState>().store.clone();
-
-                    // Listen for events from the injected browser script
-                    app.listen("new-task-from-browser", move |event| {
-                        println!("[Event] Received 'new-task-from-browser'");
-                        
-                        if let Ok(payload_val) = serde_json::from_str::<serde_json::Value>(event.payload()) {
-                            let store_clone = store_for_event.clone();
-                            
-                            tauri::async_runtime::spawn(async move {
-                                let store_guard = store_clone.lock().await;
-                                if let Some(db) = store_guard.as_ref() {
-                                    let now = chrono::Utc::now().timestamp_millis();
-                                    
-                                    // Map JSON payload to Task struct
-                                    let from_addr = payload_val.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
-                                    let team_id = payload_val.get("to").and_then(|v| v.as_str())
-                                        .map(|s| s.to_string())
-                                        .unwrap_or_else(|| crate::utils::hash::hash_id(&from_addr));
-
-                                    let task = crate::store::Task {
-                                        id: payload_val.get("id")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string())
-                                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                                        r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                                        from_source: from_addr,
-                                        to_dest: team_id,
-                                        cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                        bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                        ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                        data_json: payload_val.to_string(),
-                                        created_at: now,
-                                        updated_at: now,
-                                        status: 10, // 10: pending (i32)
-                                    };
-        
-                                    // [NEW] Also save as a chat message for the dashboard
-                                    let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
-                                    let _ = db.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", &msg_content, Some(&task.id), Some(1)).await; // 1: processing (i32)
-
-                                    match db.add_task(task).await {
-                                        Ok(_) => println!("[Event] Task saved to DB successfully."),
-                                        Err(e) => eprintln!("[Event] Failed to save task: {}", e),
-                                    }
-                                } else {
-                                    eprintln!("[Event] Database not initialized.");
-                                }
-                            });
-                        } else {
-                            eprintln!("[Event] Failed to parse payload: {}", event.payload());
-                        }
-                    });
-
-                    Ok(())
-                })
-
-                .plugin(tauri_plugin_opener::init())
-
-        
-
-        .plugin(tauri_plugin_dialog::init())
-
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-
-            summarize_image, 
-
-            search_documents, 
-
-            get_all_documents,
-
-            get_document,
-
-            update_document,
-
-            delete_document,
-
-            delete_documents,
-
-            check_query_intent,
-
-            deep_research_command,
-
-            ai_search_complex,
-
-            launch_browser,
-
-            launch_best_browser,
-
-            extract_html_from_current_tab,
-            
-            stop_current_extraction,
-
-            check_available_browsers,
-
-            resize_window,
-
-            start_drag,
-
-            move_to_top_center,
-
-            set_login_state,
-
-            check_active_task,
-
-            get_chat_messages,
-
-            proxy_fetch,
-
-            get_known_pages,
-
-            get_known_users,
-
-            initialize_hub,
-
-            get_browser_status
-
+            summarize_image, search_documents, get_all_documents, get_document, check_query_intent, deep_research_command, ai_search_complex,
+            launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
+            resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
+            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks
         ])
-
         .run(tauri::generate_context!())
-
         .expect("error while running tauri application");
-
 }

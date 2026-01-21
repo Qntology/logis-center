@@ -238,16 +238,15 @@ impl VectorStore {
     pub async fn update_task_status(&self, id: &str, status: i32) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
         
-        // [FIX] If status is 'complete' (9) or 'error' (6), delete it. 
-        // Otherwise (progress=1, pending=10), we keep it to hide the ⚡ button.
+        // [FIX] Crucial: Only delete if the task is finished (9=complete, 6=error, 3=cancel)
+        // If it's in progress (1), we KEEP it in the table so that 'check_active_task' finds it.
         if status == 9 || status == 6 || status == 3 {
+            println!("[Store] Task {} finished with status {}, removing from tasks table.", id, status);
             table.delete(&format!("id = '{}'", id)).await?;
         } else {
-            // Note: LanceDB update is complex with arrow, for simplicity in this specific task tracking table, 
-            // we check if it exists and keep it. A better way would be a true update, 
-            // but keeping it in the table is what matters for 'has_active_task'.
-            // For now, let's just NOT delete it if it's in progress.
-            println!("[Store] Task {} status updated to {}, keeping in active list.", id, status);
+            // Since LanceDB update is complex, we just ensure it exists.
+            // In a more robust system, we would perform a true SQL UPDATE here.
+            println!("[Store] Task {} is now in status {}, keeping record for visibility check.", id, status);
         }
         Ok(())
     }

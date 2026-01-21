@@ -206,9 +206,10 @@ if (pillNav) {
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
 
-    if (currentImage || isExtracting) {
-        btnExtract.style.display = (isExtracting && !currentImage) ? "none" : "flex";
-        if (currentImage) btnExtract.title = "Extract from Image";
+    // If an image is selected, we always show the button for image extraction
+    if (currentImage) {
+        btnExtract.style.display = "flex";
+        btnExtract.title = "Extract from Image";
         return;
     }
 
@@ -218,7 +219,6 @@ async function updateExtractButtonVisibility() {
     }
 
     try {
-        // [STRICT PARITY] CC and Link must match Backend's stored task info
         const urlObj = new URL(currentDetectedUrl.toLowerCase());
         const hostname = urlObj.hostname; 
         const link = (urlObj.pathname + urlObj.search).toLowerCase();
@@ -226,14 +226,15 @@ async function updateExtractButtonVisibility() {
         const ccHash = await hashId(hostname); 
         const hashedRefId = await hashId(ccHash + link);
         
-        // [FIX] Pass as a single payload object to match the new Rust ActiveTaskQuery struct
+        // Always query backend for tasks related to THIS specific URL
         const isActive = await invoke<boolean>("check_active_task", { 
             payload: { cc: ccHash, refId: hashedRefId } 
         });
         
-        console.log(`[WIDGET] Visibility Check: cc=${ccHash}, ref_id=${hashedRefId}, isActive=${isActive}`);
+        console.log(`[WIDGET] URL Check: cc=${ccHash}, ref_id=${hashedRefId}, isActive=${isActive}`);
 
         if (isActive === true) {
+            // [STRICT] If a task is pending or in progress for this URL, hide the button
             btnExtract.style.display = "none";
         } else {
             btnExtract.style.display = "flex";
@@ -241,9 +242,22 @@ async function updateExtractButtonVisibility() {
         }
     } catch (e) {
         console.error("[WIDGET] Visibility check failed:", e);
-        btnExtract.style.display = "flex"; // Default to show on error
+        // Fallback to showing button if we can't verify, to avoid getting stuck
+        btnExtract.style.display = "flex";
     }
 }
+
+// Update the listener to be more responsive
+listen("browser-match-found", async (event: any) => {
+    const payload = event.payload;
+    if (payload.is_client || payload.is_admin) {
+        currentDetectedUrl = payload.url;
+    } else {
+        currentDetectedUrl = "";
+    }
+    // Immediately check if we should show or hide the ⚡ button for this new tab
+    await updateExtractButtonVisibility();
+});
 
 searchInput?.addEventListener("focus", () => {
     openWidget("list");
@@ -666,6 +680,14 @@ async function loadMoreDocs() {
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
     try {
+        // [NEW] On first page, fetch active tasks to show at the top
+        if (currentPage === 0) {
+            const activeTasks = await invoke<any[]>("get_active_tasks");
+            if (activeTasks && activeTasks.length > 0) {
+                renderTaskRows(activeTasks);
+            }
+        }
+
         const docs = await invoke<any[]>("get_all_documents", { limit: pageSize, offset: currentPage * pageSize });
         if (docs.length < pageSize) hasMore = false;
         if (docs.length > 0) {
@@ -677,6 +699,21 @@ async function loadMoreDocs() {
         }
     } catch (e) { console.error(e); } 
     finally { isLoading = false; if (loadingIndicator) loadingIndicator.style.display = "none"; }
+}
+
+function renderTaskRows(tasks: any[]) {
+    if (!docTableBody) return;
+    tasks.forEach(task => {
+        const tr = document.createElement("tr");
+        tr.style.cursor = "default";
+        tr.style.backgroundColor = "rgba(var(--primary-rgb), 0.05)";
+        tr.innerHTML = `
+            <td style="text-align:center;">⏳</td>
+            <td style="color:var(--primary); font-weight:bold;">${task.type.toUpperCase()}</td>
+            <td colspan="2">Preprocessing... (${task.id.slice(0,8)})</td>
+        `;
+        docTableBody.prepend(tr); // Put at the absolute top
+    });
 }
 
 function renderDocRows(docs: any[]) {

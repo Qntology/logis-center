@@ -214,6 +214,7 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let _ = app_handle.emit("extraction-progress", json!({ 
+        "task_id": task.id,
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
     }));
 
@@ -227,12 +228,14 @@ async fn process_task(
         let mut model_guard = model_mutex.lock().await;
         if model_guard.is_none() {
             let _ = app_handle.emit("extraction-progress", json!({ 
+               "task_id": task.id,
                "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
             }));
             match LogisModel::new(None).await {
                 Ok(m) => *model_guard = Some(m),
                 Err(e) => {
                     let _ = app_handle.emit("extraction-progress", json!({ 
+                       "task_id": task.id,
                        "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
                     }));
                     return Ok(());
@@ -351,6 +354,7 @@ async fn process_task(
             }));
             
             let _ = app_handle.emit("extraction-progress", json!({ 
+                "task_id": task.id,
                 "category": "Classification Ingestion", 
                 "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
                 "spinner": "⠋"
@@ -370,6 +374,7 @@ async fn process_task(
                     &app_handle_clone, 
                     "extraction-progress", 
                     json!({ 
+                        "task_id": task.id,
                         "category": "Classification Ingestion",
                         "summary": if is_last { "Identifying page type...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
                     }), 
@@ -381,6 +386,7 @@ async fn process_task(
                         page_type_res = out.clone();
                         // [NEW] Emit raw classification text result
                         let _ = app_handle.emit("extraction-progress", json!({ 
+                            "task_id": task.id,
                             "category": "Classification Ingestion",
                             "summary": "Page type identified.",
                             "data": out,
@@ -600,6 +606,8 @@ async fn process_task(
             for (idx, pug) in chunk.iter().enumerate() {
                 combined_pugs.push_str(&format!("\n### ITEM #{} ###\n{}\n", idx + 1, pug));
             }
+
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let prompt = format!(
 r#"{instruction}
@@ -1084,9 +1092,8 @@ Just say "READY"."#,
 
                     // [STRICT PARITY] Re-generate BCC and REF exactly as server does
                     let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
-                    let link = extracted_data.get("link").and_then(|v| v.as_str()).unwrap_or("");
-                    // [FIX] Use consistent criteria: hashId(cc_hash + link)
-                    let ref_val = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
+                    // [FIX] Use the pre-calculated hashed ref_id from the task to match frontend criteria
+                    let ref_val = task.ref_id.clone(); 
                     
                     // target_id is already set to task.ref_id above 
 
