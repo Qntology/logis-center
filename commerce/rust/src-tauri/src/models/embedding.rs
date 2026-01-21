@@ -286,8 +286,8 @@ impl EmbeddingModel {
         
         if token_ids.is_empty() { return Ok(vec![0.0; 768]); }
 
-        // Use a safe chunk size (e.g., 2000) slightly less than 2048 to allow for potential overhead
-        let chunk_size = 2000;
+        // [FIX] Use 1024 to stay within safe VRAM/RAM limits
+        let chunk_size = 1024;
         let chunks: Vec<&[u32]> = token_ids.chunks(chunk_size).collect();
         
         let mut accumulated_vector = vec![0.0; 768];

@@ -617,7 +617,7 @@ listen("extraction-progress", async (event: any) => {
          let p = document.getElementById(elementId);
          if (!p) {
              p = document.createElement("div"); p.id = elementId;
-             p.style.borderBottom = "1px solid #333"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
+             p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
              p.style.display = "flex"; p.style.flexDirection = "column"; 
              const row = document.createElement("div"); row.className = "progress-row"; row.style.display = "flex"; row.style.alignItems = "center";
              row.innerHTML = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span><span class="summary-text">${payload.summary || ""}</span>`;
@@ -952,8 +952,8 @@ async function performQrAuth() {
 
     const html = `
         <div class="chat-talk system" id="msg-qr-auth">
-            <div class="chat-message" style="text-align: center; background: #fff; color: #000; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);">
-                <div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;">Scan the QR code</div>
+            <div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;">
+                <div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" style="margin-right:5px; font-family:monospace; color:var(--primary); font-weight:bold;">⠋</span>Scan the QR code</div>
                 <div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div>
             </div>
         </div>
@@ -1077,33 +1077,32 @@ function renderMessage(msg: any) {
     }
 }
 
+function saveSession() {
+    localStorage.setItem("chat_session", JSON.stringify(currentSession));
+}
+
+let qrSpinnerIdx = 0;
+
 async function checkAuthStatus() {
-    // If we don't even have a device hash, we can't poll.
     if (!currentSession.hash) return;
     
-    // [STRICT PARITY] Logic from before_client/content.js
     const origin = "https://commerce.logis.center"; 
     const now = Date.now();
     const createdAt = now - timezoneOffset; 
     
     try {
-        // [FIX] Initial query params matching content.js's reqUrl call
         const queryParams: Record<string, string> = {
             origin: origin,
             created_at: createdAt.toString(),
             hash: currentSession.hash,
-            href: window.location.href, // content.js passes this in the query object
+            href: window.location.href,
         };
 
-        // [STRICT PARITY] Only add token if it exists. 
-        // If missing, the server expects it to be absent from the URL, not empty.
         if (currentSession.token && currentSession.token !== "") {
             queryParams.token = currentSession.token;
         }
 
         const params = new URLSearchParams(queryParams);
-        
-        // [STRICT PARITY] content.js: url.toLowerCase()
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
 
         const data = await invoke<any>("proxy_fetch", {
@@ -1117,25 +1116,40 @@ async function checkAuthStatus() {
                 token: currentSession.token,
             }
         });
+
+        // [NEW] Update QR Spinner feedback on every request return
+        const qrAuthSpinner = document.getElementById("qr-auth-spinner");
+        if (qrAuthSpinner) {
+            qrSpinnerIdx = (qrSpinnerIdx + 1) % spinnerFrames.length;
+            qrAuthSpinner.innerText = spinnerFrames[qrSpinnerIdx];
+        }
         
         let session = data.session || data; 
 
-        if (session && session.email) {
-            currentSession.email = session.email;
-            currentSession.token = session.token;
-            currentSession.name = session.name;
-            currentSession.address = session.address;
-            currentSession.team = session.team;
+        if (session && session.hash) {
+            // [FIX] Detect hash change and trigger QR refresh
+            const hashChanged = session.hash !== currentSession.hash;
             
-            // [NEW] Initialize Rust Hub with new profile info
-            await invoke("initialize_hub", { 
-                address: session.address, 
-                email: session.email, 
-                flag: session.flag || "kr"
-            });
+            // Merge session data (Strict Parity with content.js)
+            currentSession = { ...currentSession, ...session };
+            saveSession();
 
-            updateAuthUI();
-            fetchChatHistory();
+            if (hashChanged && !currentSession.email && currentTab === "settings") {
+                console.log("[WIDGET] Hash changed by server, refreshing QR...");
+                performQrAuth();
+            }
+
+            if (currentSession.email) {
+                // Initialize Rust Hub if authenticated
+                await invoke("initialize_hub", { 
+                    address: currentSession.address, 
+                    email: currentSession.email, 
+                    flag: session.flag || "kr"
+                });
+
+                updateAuthUI();
+                fetchChatHistory();
+            }
         }
     } catch (e) {
         console.warn("Auth check failed:", e);
@@ -1143,17 +1157,32 @@ async function checkAuthStatus() {
 }
 
 async function initSession() {
-    let hash = localStorage.getItem("device_hash");
-    if (!hash && ethers) {
-        const w = ethers.Wallet.createRandom();
-        hash = w.address.toLowerCase().replace("0x", "");
-        localStorage.setItem("device_hash", hash);
+    // [FIX] Load existing session with fallback to legacy keys
+    const saved = localStorage.getItem("chat_session");
+    if (saved) {
+        try {
+            const parsed = JSON.parse(saved);
+            currentSession = { ...currentSession, ...parsed };
+        } catch (e) { console.error("Session restore failed", e); }
+    } else {
+        // Fallback to legacy device_hash if chat_session doesn't exist
+        const legacyHash = localStorage.getItem("device_hash");
+        if (legacyHash) currentSession.hash = legacyHash;
     }
-    currentSession.hash = hash || "";
+
+    // Only generate a new hash if we still don't have one
+    if (!currentSession.hash && ethers) {
+        const w = ethers.Wallet.createRandom();
+        currentSession.hash = w.address.toLowerCase().replace("0x", "");
+        saveSession();
+    }
+
+    // Ensure session is pinned to localStorage
+    saveSession();
 
     // [FIXED IDENTITY] Apply ZeroAddress and its Hash
-    currentSession.address = ZERO_ADDRESS;
-    currentSession.team = await hashId(ZERO_ADDRESS);
+    currentSession.address = currentSession.address || ZERO_ADDRESS;
+    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS);
 
     updateAuthUI();
     startPolling();
@@ -1179,6 +1208,15 @@ listScrollContainer?.addEventListener("scroll", () => {
 
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
+
+document.getElementById("unload-btn")?.addEventListener("click", async () => {
+    try {
+        await invoke("unload_model");
+        alert("Memory cleared (Models unloaded).");
+    } catch (e) {
+        console.error("Unload failed:", e);
+    }
+});
 
 // [NEW] Synchronize initial browser status
 async function syncBrowserStatus() {

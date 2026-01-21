@@ -252,10 +252,9 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding-bottom: 0.5rem;
   border-bottom: 1px solid var(--glass-border);
 }
-.header-row>div{margin-left: 5px;}
+.header-row>div{margin: 0 0.5rem;}
 
 h2 { margin: 0; font-size: 1.1rem; }
 

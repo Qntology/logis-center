@@ -30,25 +30,40 @@ pub struct AppState {
 async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, String> {
     state.cancellation_token.store(true, Ordering::SeqCst);
     
-    // 1. Force drop model to release VRAM/RAM immediately
-    let mut model_guard = state.model.lock().await;
-    *model_guard = None;
-    
-    // 2. Immediately update DB to clear active tasks so they disappear from UI
-    let store_guard = state.store.lock().await;
-    if let Some(db) = store_guard.as_ref() {
-        // We find any tasks that were pending/progress and mark as cancelled
-        // This is a simplified bulk update for local parity
-        if let Ok(active_tasks) = db.get_pending_tasks(50).await {
-            for task in active_tasks {
-                let _ = db.update_task_status(&task.id, 3).await; // 3 = Cancelled
-                let _ = db.update_message_status(&task.id, 3, Some("Force stopped by user")).await;
+    // 1. Update DB to clear active tasks so they reflect as 'Cancelled' in UI
+    {
+        let store_guard = state.store.lock().await;
+        if let Some(db) = store_guard.as_ref() {
+            if let Ok(active_tasks) = db.get_pending_tasks(50).await {
+                for task in active_tasks {
+                    let _ = db.update_task_status(&task.id, 3).await; // 3 = Cancelled
+                    let _ = db.update_message_status(&task.id, 3, Some("Force stopped by user")).await;
+                }
             }
         }
     }
+
+    // 2. Force drop model and store to release VRAM/RAM immediately
+    let mut model_guard = state.model.lock().await;
+    *model_guard = None;
     
-    println!("[STOP] Cancellation signal sent, model dropped, and DB tasks marked as cancelled.");
+    let mut store_guard = state.store.lock().await;
+    *store_guard = None;
+
+    println!("[STOP] Cancellation signal sent, DB updated, and model/store dropped.");
     Ok("Stop signal sent and resources released.".to_string())
+}
+
+#[tauri::command]
+async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
+    let mut model_guard = state.model.lock().await;
+    *model_guard = None;
+    
+    let mut store_guard = state.store.lock().await;
+    *store_guard = None;
+
+    println!("[UNLOAD] Model and Store explicitly dropped from memory.");
+    Ok("Memory cleared.".to_string())
 }
 
 #[tauri::command]
@@ -689,7 +704,7 @@ pub fn run() {
             summarize_image, search_documents, get_all_documents, get_document, check_query_intent, deep_research_command, ai_search_complex,
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
-            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks
+            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -378,12 +378,12 @@ async fn process_task(
     // Determine optimal chunk sizes based on hardware
     // [ADAPTIVE] Reduced size to account for multilingual token overhead (Korean/Chinese/etc.)
     let mut device_config = utils::get_optimal_device_config();
-    device_config.classify_chunk_size = 4000; // Lowered from 7000 to avoid token explosion
-    device_config.extract_chunk_size = 4000;
+    device_config.classify_chunk_size = 1024; // [FIX] Lowered from 4000 to prevent OOM
+    device_config.extract_chunk_size = 1024;
 
     // [REVISED] Restore turn-based chunked ingestion for classification.
     // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 4000, 500);
+    let classify_chunks = chunk_text(&light_pug, 1024, 200); // [FIX] Lowered from 4000/500
     let classify_chunks_len = classify_chunks.len();
 
     let mut model_guard = model_mutex.lock().await;
@@ -515,7 +515,11 @@ async fn process_task(
     
     if page_type.is_empty() || page_type == "unknown" {
         println!("[Scheduler] Stopping: Unknown page type. Raw response: '{}'", page_type_res);
-        drop(model_guard);
+        // [FIX] Explicitly drop model before early return
+        {
+            let mut model_guard = model_mutex.lock().await;
+            *model_guard = None;
+        }
         return Ok(());
     }
 

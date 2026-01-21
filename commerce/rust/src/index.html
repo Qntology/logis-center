@@ -123,7 +123,7 @@
                         <button id="btn-detail-delete" class="nav-btn" style="color: #ef4444;" title="Delete Document">🗑️</button>
                    </div>
                </div>
-               <div id="detail-content" class="markdown-body" style="overflow-y:auto; flex:1; font-size: 0.85rem; padding-right:5px; padding-bottom: 20px;">
+               <div id="detail-content" class="markdown-body" style="overflow-y:auto; flex:1; font-size: 0.85rem; padding-right:5px;">
                    <!-- Extraction Logs or Details injected here -->
                    <div id="extraction-log" style="display:flex; flex-direction:column; gap:5px;"></div>
                </div>
@@ -154,16 +154,6 @@
                 
                 <!-- Chat Interface (Always Visible for Logs) -->
                 <div id="chat-interface" class="chat-interface" style="display:flex; flex-direction:column; height:100%;">
-                    
-                    <!-- Auth Header -->
-                    <div id="auth-header" style="padding: 0 10px 10px; border-bottom: 1px solid #eee; display:flex; justify-content:space-between; align-items:center;">
-                        <span id="auth-status-text" style="font-size: 0.8rem; color: #666;">Waiting for Auth...</span>
-                        <div style="display:flex; gap:5px;">
-                            <button id="btn-qr-auth" class="action-btn" style="width:auto; padding: 4px 8px; font-size:0.75rem; margin:0;">QR Verify</button>
-                            <button id="btn-logout" class="hidden" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:0.8rem;">Sign out</button>
-                        </div>
-                    </div>
-
                     <!-- System Toggle (Hidden Checkbox Logic) -->
                     <input type="checkbox" id="system-toggle" checked style="display:none;">
                     
