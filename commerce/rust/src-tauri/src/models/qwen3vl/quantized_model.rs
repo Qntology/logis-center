@@ -253,85 +253,167 @@ impl QuantizedQwen3VLTextAttention {
 
                 
 
-                let process_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, layer_idx: usize| -> Result<()> {
+                                let process_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, _layer_idx: usize| -> Result<()> {
 
-                    let shape = t.shape();
+                
 
-                    let dims = shape.dims();
+                                    let shape = t.shape();
 
-                    let flat_t = t.contiguous()?.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                
 
-                    let data = flat_t.to_vec1::<f32>()?;
+                                    let dims = shape.dims();
 
-                    let original_size = data.len() * 4; 
+                
 
-                    
+                                    let flat_t = t.contiguous()?.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
 
-                    let block_size = 32;
+                
 
-                    let num_blocks = (data.len() + block_size - 1) / block_size;
+                                    let data = flat_t.to_vec1::<f32>()?;
 
-                    
+                
 
-                    let mut scales = Vec::with_capacity(num_blocks);
+                                    let original_size = data.len() * 4; 
 
-                    let mut packed = Vec::with_capacity(num_blocks * 16);
+                
 
-                    
+                                    
 
-                    for i in 0..num_blocks {
+                
 
-                        let start = i * block_size;
+                                    let block_size = 32;
 
-                        let end = (start + block_size).min(data.len());
+                
 
-                        let block_len = end - start;
+                                    let num_blocks = (data.len() + block_size - 1) / block_size;
 
-                        
+                
 
-                        let mut max_abs = 0.0f32;
+                                    
 
-                        for j in 0..block_len { 
+                
 
-                            let val = data[start + j];
+                                    let mut scales = Vec::with_capacity(num_blocks);
 
-                            if val.abs() > max_abs { max_abs = val.abs(); } 
+                
 
-                        }
+                                    let mut packed = Vec::with_capacity(num_blocks * 16);
 
-                        
+                
 
-                        let scale = max_abs / 8.0;
+                                    
 
-                        scales.push(scale);
+                
 
-                        
+                                    for i in 0..num_blocks {
 
-                        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                
 
-                        
+                                        let start = i * block_size;
 
-                        for j in 0..16 {
+                
 
-                            let idx1 = j;
+                                        let end = (start + block_size).min(data.len());
 
-                            let idx2 = j + 16;
+                
 
-                            let v1 = if idx1 < block_len { ((data[start + idx1] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+                                        let block_len = end - start;
 
-                            let v2 = if idx2 < block_len { ((data[start + idx2] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+                
 
-                            packed.push(v1 | (v2 << 4));
+                                        
 
-                        }
+                
 
-                    }
+                                        let mut max_abs = 0.0f32;
 
-                    
+                
 
-                    let compressed_size = (num_blocks * 2) + (num_blocks * 16);
+                                        for j in 0..block_len { 
 
-                    let ratio = (compressed_size as f64 / original_size as f64) * 100.0;
+                
+
+                                            let val = data[start + j];
+
+                
+
+                                            if val.abs() > max_abs { max_abs = val.abs(); } 
+
+                
+
+                                        }
+
+                
+
+                                        
+
+                
+
+                                        let scale = max_abs / 8.0;
+
+                
+
+                                        scales.push(scale);
+
+                
+
+                                        
+
+                
+
+                                        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+                
+
+                                        
+
+                
+
+                                        for j in 0..16 {
+
+                
+
+                                            let idx1 = j;
+
+                
+
+                                            let idx2 = j + 16;
+
+                
+
+                                            let v1 = if idx1 < block_len { ((data[start + idx1] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+
+                
+
+                                            let v2 = if idx2 < block_len { ((data[start + idx2] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+
+                
+
+                                            packed.push(v1 | (v2 << 4));
+
+                
+
+                                        }
+
+                
+
+                                    }
+
+                
+
+                                    
+
+                
+
+                                    let compressed_size = (num_blocks * 2) + (num_blocks * 16);
+
+                
+
+                                    let _ratio = (compressed_size as f64 / original_size as f64) * 100.0;
+
+                
+
+                
 
                     
 
