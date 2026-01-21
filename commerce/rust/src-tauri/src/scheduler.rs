@@ -11,6 +11,53 @@ use anyhow::Result;
 use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
+use std::path::PathBuf;
+
+// --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
+// Handles offloading of large text data to disk to prevent RAM/VRAM bloating.
+// Automatically cleans up files when the task scope ends.
+struct TaskDataManager {
+    task_id: String,
+    created_files: Vec<PathBuf>,
+}
+
+impl TaskDataManager {
+    fn new(task_id: &str) -> Self {
+        Self {
+            task_id: task_id.to_string(),
+            created_files: Vec::new(),
+        }
+    }
+
+    fn offload(&mut self, content: &str, suffix: &str) -> Result<PathBuf> {
+        let dir = std::path::Path::new("tmp_task_data");
+        if !dir.exists() {
+            fs::create_dir_all(dir)?;
+        }
+        // Simple unique filename
+        let filename = format!("{}_{}_{}.txt", self.task_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_micros(), suffix);
+        let path = dir.join(filename);
+        fs::write(&path, content)?;
+        self.created_files.push(path.clone());
+        Ok(path)
+    }
+
+    fn load(&self, path: &std::path::Path) -> Result<String> {
+        Ok(fs::read_to_string(path)?)
+    }
+}
+
+impl Drop for TaskDataManager {
+    fn drop(&mut self) {
+        for path in &self.created_files {
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
+        }
+        // Try to remove dir if empty (ignore errors)
+        let _ = fs::remove_dir("tmp_task_data");
+    }
+}
 
 // Helper to chunk text with overlap, strictly respecting newlines and char boundaries for Pug
 fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
@@ -244,6 +291,9 @@ async fn process_task(
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
     }));
 
+    // [MEMORY] Initialize Data Manager for this task scope
+    let mut data_manager = TaskDataManager::new(&task.id);
+
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     let language = "english"; 
 
@@ -291,26 +341,36 @@ async fn process_task(
         return Ok (());
     }
 
-    let raw_html_content = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
-        let content = raw_html.to_string();
+    // [MEMORY] Fetch and immediately offload Raw HTML
+    let raw_html_path = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+        let p = data_manager.offload(raw_html, "raw_html")?;
         if let Some(obj) = task_data.as_object_mut() {
-            obj.remove("html");
+            obj.remove("html"); // Clear from JSON object in memory
         }
-        content
+        p
     } else if !url.is_empty() {
-        reqwest::get(&url).await?.text().await?
+        let content = reqwest::get(&url).await?.text().await?;
+        data_manager.offload(&content, "raw_html")?
     } else {
         return Ok (());
     };
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let clean_html = parsing::pre_clean_html(&raw_html_content);
-    drop(raw_html_content); 
+    // [MEMORY] Load Raw -> Clean -> Offload Clean -> Drop Raw
+    let clean_html_path = {
+        let raw_content = data_manager.load(&raw_html_path)?;
+        let clean = parsing::pre_clean_html(&raw_content);
+        drop(raw_content); // Free Raw RAM
+        data_manager.offload(&clean, "clean_html")?
+    };
     
+    // [MEMORY] Load Clean -> Parse Pug -> Drop Clean
     let light_pug = {
-        let document = scraper::Html::parse_document(&clean_html);
+        let clean_content = data_manager.load(&clean_html_path)?;
+        let document = scraper::Html::parse_document(&clean_content);
         parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly)
+        // clean_content dropped here
     }; 
     
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
@@ -595,8 +655,10 @@ async fn process_task(
 
         let mut current_selector = if !item_selector.is_empty() { item_selector.to_string() } else if !node_selector.is_empty() { node_selector.to_string() } else { "body".to_string() };
         
+        // [MEMORY] Load clean HTML from disk only when needed
         let mut item_pugs = {
-            let document = scraper::Html::parse_document(&clean_html);
+            let clean_content = data_manager.load(&clean_html_path)?;
+            let document = scraper::Html::parse_document(&clean_content);
             parsing::split_doc_to_pug_list(&document, &current_selector, PugMode::FullContent)
         }; 
 
@@ -606,8 +668,10 @@ async fn process_task(
             if fallback != current_selector {
                 println!("[Scheduler] Selector '{}' failed, trying fallback '{}'", current_selector, fallback);
                 current_selector = fallback;
+                // [MEMORY] Reload clean HTML again for fallback
                 item_pugs = {
-                    let document = scraper::Html::parse_document(&clean_html);
+                    let clean_content = data_manager.load(&clean_html_path)?;
+                    let document = scraper::Html::parse_document(&clean_content);
                     parsing::split_doc_to_pug_list(&document, &current_selector, PugMode::FullContent)
                 };
             }
@@ -776,7 +840,8 @@ r#"{instruction}
         });
     } else {
         let content_pug = {
-            let document = scraper::Html::parse_document(&clean_html);
+            let clean_content = data_manager.load(&clean_html_path)?;
+            let document = scraper::Html::parse_document(&clean_content);
             parsing::convert_doc_to_clean_pug_selector(&document, target_selector, PugMode::FullContent)
         }; 
         
