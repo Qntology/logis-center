@@ -965,8 +965,8 @@ async function performQrAuth() {
         qrTarget.innerHTML = "";
         new (window as any).QRCode(qrTarget, {
             text: `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`,
-            width: 160,
-            height: 160,
+            width: 300,
+            height: 300,
             colorDark: "#000000",
             colorLight: "#ffffff",
             correctLevel: (window as any).QRCode.CorrectLevel.M
@@ -1211,6 +1211,21 @@ window.addEventListener('focus', () => {
 
 // 2. Trigger once on initial load
 refreshAppState();
+
+/**
+ * [STRICT PARITY] Scroll logic from before_client/content.js
+ * Since .chat-scroll is rotated 180deg, we must manually handle the mouse wheel
+ * to scroll in the correct intuitive direction.
+ */
+const talksScroll = document.getElementById("chat-scroll");
+if (talksScroll) {
+    talksScroll.addEventListener('wheel', (e: WheelEvent) => {
+        // Manually scroll in the inverted direction
+        talksScroll.scrollTop -= e.deltaY;
+        // Prevent default browser scroll behavior to avoid jitter
+        e.preventDefault();
+    }, { passive: false });
+}
 
 async function fetchChatHistory() {
     try {

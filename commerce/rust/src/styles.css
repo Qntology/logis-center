@@ -195,7 +195,7 @@ body {
 }
 
 #tab-settings{overflow: hidden;}
-#qr-code-target img{min-width: 220px}
+#qr-code-target img{min-width: 220px; max-width: 100%;}
 
 /* --- 2. Content Panel (Expandable) --- */
 .content-panel {
@@ -323,7 +323,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
 .chat-scroll {
     flex: 1;
     overflow-y: auto;
-    padding: 0.5em;
+    padding: 100px 0.5em 0.5em 0.5em;
     display: flex;
     flex-direction: column;
     justify-content: flex-start;
