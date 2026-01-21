@@ -489,19 +489,11 @@ async fn proxy_fetch(
 
 
 #[tauri::command]
-
-async fn check_active_task(state: State<'_, AppState>, ref_id: String) -> Result<bool, String> {
-
-
-
+async fn check_active_task(state: State<'_, AppState>, cc: String, ref_id: String) -> Result<bool, String> {
     let store_guard = state.store.lock().await;
-
     if let Some(db) = store_guard.as_ref() {
-
-        db.has_active_task(&ref_id).await.map_err(|e| e.to_string())
-
+        db.has_active_task(&cc, &ref_id).await.map_err(|e| e.to_string())
     } else { Ok(false) }
-
 }
 
 
@@ -669,6 +661,12 @@ pub fn run() {
 
                     tauri::async_runtime::spawn(async move {
                         scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_cancel, scheduler_handle).await;
+                    });
+                    
+                    // [NEW] Auto-Reconnect to existing browser on startup
+                    let auto_reconnect_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = automation::try_reconnect_existing_browser(auto_reconnect_handle).await;
                     });
                     
                     let store_for_event = app.state::<AppState>().store.clone();

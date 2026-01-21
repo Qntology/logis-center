@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use chromiumoxide::{Browser, BrowserConfig, Handler};
+use chromiumoxide::{Browser, BrowserConfig};
 use fantoccini::ClientBuilder;
 use futures::StreamExt;
 use std::process::{Command, Stdio};
@@ -19,6 +19,7 @@ static GLOBAL_BROWSER: Lazy<Arc<tokio::sync::Mutex<Option<Arc<Browser>>>>> = Laz
 
 // Driver Port (Only for Firefox/Safari)
 const DRIVER_PORT: u16 = 4444;
+const CHROME_DEBUG_PORT: u16 = 9222;
 
 #[derive(serde::Serialize)]
 pub struct BrowserStatus {
@@ -35,8 +36,7 @@ const CLIENT_PATTERNS: &[&str] = &[
     "sell.smartstore.naver.com", "wing.coupang.com", "soffice.11st.co.kr", "scm.gmarket.co.kr",
     "scm.auction.co.kr", "seller.interpark.com", "seller.wemakeprice.com", "sell.ssg.com",
     "marketplus.co.kr", "admin.shopby.co.kr", "creators.kakaomakers.com", "sell.storefarm.naver.com",
-    "partner.wemakeprice.com", "activeitzone.com", "demofran.com",
-    // Add exact matches for root domains often used with wildcards
+    "partner.wemakeprice.com", "activeitzone.com", "demofran.com", "*.demofran.com",
     "cafe24.com", "makeshop.co.kr", "godo.co.kr", "firstmall.kr", "myshopify.com"
 ];
 
@@ -50,36 +50,36 @@ const ADMIN_PATTERNS: &[&str] = &[
 ];
 
 fn is_shop(url: &str, patterns: &[&str]) -> bool {
-    if let Ok(parsed_url) = Url::parse(url) {
-        let host = parsed_url.host_str().unwrap_or("");
-        for pattern in patterns {
-            let regex_str = format!("^{}$", pattern.replace(".", "\\.").replace("*", ".*"));
-            if let Ok(re) = Regex::new(&regex_str) {
-                if re.is_match(host) {
-                    return true;
-                }
-            }
-        }
+    let host = if let Ok(parsed_url) = Url::parse(url) {
+        parsed_url.host_str().unwrap_or("").to_lowercase()
     } else {
-        // Fallback: If URL parsing fails, check if pattern exists in the string directly
-        for pattern in patterns {
-            let clean_pattern = pattern.replace("*.", "");
-            if url.contains(&clean_pattern) {
-                return true;
-            }
+        url.to_lowercase()
+    };
+
+    if host.is_empty() { return false; }
+
+    for pattern in patterns {
+        let clean_pattern = pattern.to_lowercase();
+        let regex_str = format!("^{}$", clean_pattern.replace(".", "\\.").replace("*", ".*"));
+        if let Ok(re) = Regex::new(&regex_str) {
+            if re.is_match(&host) { return true; }
+        }
+        
+        let root = clean_pattern.replace("*.", "");
+        if host == root || host.ends_with(&format!(".{}", root)) {
+            return true;
         }
     }
     false
 }
 
-// Removed #[tauri::command] to avoid conflict with lib.rs
+// --- Entry Point ---
 pub async fn run_browser_automation(
     browser_type: String,
     url: String,
     script: String,
     app_handle: tauri::AppHandle,
 ) -> anyhow::Result<String> {
-    
     match browser_type.as_str() {
         "chrome" | "edge" => run_driverless_automation(&browser_type, &url, &script, app_handle).await,
         "firefox" | "safari" => run_driver_automation(&browser_type, &url, &script).await,
@@ -87,18 +87,126 @@ pub async fn run_browser_automation(
     }
 }
 
-// --- Driverless Automation (Chrome/Edge) ---
-async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_handle: tauri::AppHandle) -> anyhow::Result<String> {
-    println!("[AUTO] Starting Driverless Automation for {}", browser);
+// --- Reconnection Logic ---
+pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> anyhow::Result<()> {
+    println!("[AUTO] Attempting to reconnect to existing browser on port {}...", CHROME_DEBUG_PORT);
+    
+    if tokio::net::TcpStream::connect(format!("127.0.0.1:{}", CHROME_DEBUG_PORT)).await.is_err() {
+        println!("[AUTO] No existing browser detected on port {}.", CHROME_DEBUG_PORT);
+        return Ok(())
+    }
 
-    // 0. Check for existing global browser instance
-    let existing_browser = {
-        let global = GLOBAL_BROWSER.lock().await;
+    let addr = format!("http://127.0.0.1:{}", CHROME_DEBUG_PORT);
+    match Browser::connect(addr).await {
+        Ok((browser, mut handler)) => {
+            println!("[AUTO] Successfully reconnected to existing browser.");
+            let browser_arc = Arc::new(browser);
+            {
+                let mut global = GLOBAL_BROWSER.lock().await;
+                *global = Some(browser_arc.clone());
+            }
+            let _ = app_handle.emit("browser-status", "running");
+            spawn_browser_monitor(browser_arc.clone(), app_handle.clone());
+            tokio::spawn(async move {
+                while let Some(h) = handler.next().await {
+                    if let Err(_) = h { break; }
+                }
+                let mut global = GLOBAL_BROWSER.lock().await; 
+                *global = None; 
+                let _ = app_handle.emit("browser-status", "stopped");
+            });
+            Ok(())
+        },
+        Err(e) => {
+            println!("[AUTO] Reconnection failed: {}", e);
+            Ok(())
+        }
+    }
+}
+
+fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
+    tokio::spawn(async move {
+        let mut last_detected_url = String::new();
+        loop {
+            let pages = match browser.pages().await {
+                Ok(p) => p,
+                Err(_) => break, 
+            };
+
+            let mut active_page = None;
+            for page in pages.iter() {
+                let is_visible = match page.evaluate("document.visibilityState").await {
+                    Ok(res) => res.into_value::<String>().unwrap_or_default() == "visible",
+                    Err(_) => false,
+                };
+                if is_visible {
+                    active_page = Some(page);
+                    break;
+                }
+            }
+
+            // Fallback: If no tab is strictly 'visible', use the last one in the list
+            let page_to_check = active_page.or(pages.last());
+
+            if let Some(page) = page_to_check {
+                if let Ok(val) = page.evaluate("window.location.href").await {
+                    let current_url = val.into_value::<String>().unwrap_or_default();
+                    if !current_url.is_empty() && current_url != last_detected_url {
+                        let is_client = is_shop(&current_url, CLIENT_PATTERNS);
+                        let is_admin = is_shop(&current_url, ADMIN_PATTERNS);
+                        
+                        // Always notify frontend of URL change so it can toggle button visibility
+                        let payload = json!({
+                            "url": current_url.clone(),
+                            "is_client": is_client,
+                            "is_admin": is_admin
+                        });
+                        let _ = app_handle.emit("browser-match-found", &payload);
+                        
+                        if is_client || is_admin {
+                            println!("[AUTO] Target Site Detected: {} (Client={}, Admin={})", current_url, is_client, is_admin);
+                        }
+                        last_detected_url = current_url;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1000)).await; 
+        }
+        // When loop breaks (browser closed), clear detected URL in frontend
+        let _ = app_handle.emit("browser-match-found", json!({ "url": "", "is_client": false, "is_admin": false }));
+        println!("[AUTO] Browser monitor exited.");
+    });
+}
+
+async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_handle: tauri::AppHandle) -> anyhow::Result<String> {
+    println!("[AUTO] Request: Driverless Automation for {} (URL: {})", browser, url);
+    
+    // 0. Proactively try to reconnect or reuse if global exists
+    let browser_arc = {
+        let mut global = GLOBAL_BROWSER.lock().await;
+        if global.is_none() {
+            // Try to connect to 9222 before launching
+            if tokio::net::TcpStream::connect(format!("127.0.0.1:{}", CHROME_DEBUG_PORT)).await.is_ok() {
+                println!("[AUTO] Found existing browser on port {}. Connecting...", CHROME_DEBUG_PORT);
+                if let Ok((b, mut handler)) = Browser::connect(format!("http://127.0.0.1:{}", CHROME_DEBUG_PORT)).await {
+                    let b_arc = Arc::new(b);
+                    *global = Some(b_arc.clone());
+                    spawn_browser_monitor(b_arc.clone(), app_handle.clone());
+                    
+                    let app_handle_clone = app_handle.clone();
+                    tokio::spawn(async move {
+                        while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
+                        let mut g = GLOBAL_BROWSER.lock().await; *g = None; 
+                        let _ = app_handle_clone.emit("browser-status", "stopped");
+                    });
+                }
+            }
+        }
         global.as_ref().cloned()
     };
 
-    let browser_arc = if let Some(b) = existing_browser {
-        println!("[AUTO] Reusing existing browser instance.");
+    let browser_arc = if let Some(b) = browser_arc {
+        println!("[AUTO] Reusing/Connected browser instance.");
         let _ = app_handle.emit("browser-status", "running");
         b
     } else {
@@ -106,192 +214,101 @@ async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_h
         let exec_path = find_browser_path(browser)
             .ok_or_else(|| anyhow!("Browser executable not found for {}", browser))?;
         
-        println!("[AUTO] Using executable: {:?}", exec_path);
-
-        // Function to build config
-        let build_config = |_: bool| -> anyhow::Result<BrowserConfig> {
+        // 2. Build Config
+        let build_config = || -> anyhow::Result<BrowserConfig> {
+            let port_arg = format!("--remote-debugging-port={}", CHROME_DEBUG_PORT);
             let args = vec![
-                "--start-maximized", 
-                "--disable-gpu", 
-                "--disable-infobars",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-session-crashed-bubble",
-                "--disable-features=Translate",
-                "--remote-debugging-port=0",
-                "--remote-allow-origins=*",
-                "--disable-extensions"
+                "--start-maximized", "--disable-gpu", "--no-first-run",
+                &port_arg,
+                "--remote-allow-origins=*", "--disable-extensions"
             ];
-
-            let mut builder = BrowserConfig::builder()
-                .chrome_executable(&exec_path) 
-                .with_head() 
-                .no_sandbox()
-                .viewport(None);
-            
+            let mut builder = BrowserConfig::builder().chrome_executable(&exec_path).with_head().no_sandbox().viewport(None);
             let profile_dir = std::path::Path::new("browser_profiles").join(browser);
             let _ = std::fs::create_dir_all(&profile_dir);
-            let abs_profile_dir = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir);
-            
-            let mut profile_path_str = abs_profile_dir.to_string_lossy().to_string();
-            // [FIX] Strip UNC prefix (\\?\) on Windows which causes Chrome to fail
-            if profile_path_str.starts_with(r"\\?\") {
-                profile_path_str = profile_path_str[4..].to_string();
-            }
-            
-            println!("[AUTO] Using isolated app profile at: {}", profile_path_str);
-            builder = builder.user_data_dir(std::path::PathBuf::from(profile_path_str));
-
-            builder.args(args).build().map_err(|e| anyhow!("Failed to build config: {}", e))
+            let mut p_str = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir).to_string_lossy().to_string();
+            if p_str.starts_with(r"\\?\") { p_str = p_str[4..].to_string(); }
+            builder = builder.user_data_dir(std::path::PathBuf::from(p_str));
+            builder.args(args).build().map_err(|e| anyhow!("Config error: {}", e))
         };
 
-        // 2. Launch Strategy
-        let launch_result: anyhow::Result<(Browser, Handler)> = async {
-            let config = build_config(true)?;
-            println!("[AUTO] Launching browser... (Timeout: 60s)");
-            
-            let launch_attempt = tokio::time::timeout(
-                Duration::from_secs(60), 
-                Browser::launch(config)
-            ).await;
+        // 3. Launch
+        let (browser_manager, mut handler) = Browser::launch(build_config()?).await
+            .map_err(|e| anyhow!("Launch failed: {}", e))?;
 
-            match launch_attempt {
-                Ok(Ok(res)) => Ok(res),
-                Ok(Err(e)) => Err(anyhow!("Launch Error: {}", e)),
-                Err(_) => Err(anyhow!("Launch Timeout. Check if a dialog is blocking it.")),
-            }
-        }.await;
-
-        let (browser_manager, mut handler) = launch_result?;
         let new_arc = Arc::new(browser_manager);
-
-        // Store Globally
         {
             let mut global = GLOBAL_BROWSER.lock().await;
             *global = Some(new_arc.clone());
         }
-        
         let _ = app_handle.emit("browser-status", "running");
-
-        // Spawn Handler
+        spawn_browser_monitor(new_arc.clone(), app_handle.clone());
         let app_handle_clone = app_handle.clone();
         tokio::spawn(async move {
-            while let Some(h) = handler.next().await {
-                if let Err(e) = h {
-                    println!("[AUTO-DEBUG] Browser Handler Event: {:?}", e);
-                    break;
-                }
-            }
-            println!("[AUTO] Browser Handler Exited.");
-            let mut global = GLOBAL_BROWSER.lock().await; 
-            *global = None; 
+            while let Some(h) = handler.next().await { if let Err(_) = h { break; } }
+            let mut global = GLOBAL_BROWSER.lock().await; *global = None; 
             let _ = app_handle_clone.emit("browser-status", "stopped");
         });
-
         new_arc
     };
 
-    println!("[AUTO] Setting up page...");
-    
-    // 3. Create Page & Navigate
-    let page = browser_arc.new_page(url).await
-        .map_err(|e| anyhow!("Failed to create page: {}", e))?;
-
-    // 4. Inject Persistent Script (Pako + Content.js)
+    println!("[AUTO] Navigating to {}...", url);
+    let page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
     let pako_lib = include_str!("assets/scripts/pako.min.js");
     let content_logic = include_str!("assets/scripts/content.js");
-    let final_script = if script.is_empty() {
-        format!("{};\n{};", pako_lib, content_logic)
-    } else {
-        format!("{};\n{};\n{}", pako_lib, content_logic, script)
-    };
-
-    // Inject on new document creation (navigation)
+    let final_script = format!("{};\n{};\n", pako_lib, content_logic); // Removed extra script arg if empty
     let _ = page.evaluate(final_script).await;
-
-
-    // 5. Start Background Monitoring Loop
-    // Improved loop to detect the ACTUAL active/visible tab
-    let monitor_browser = browser_arc.clone();
-    let monitor_handle = app_handle.clone();
-    
-    tokio::spawn(async move {
-        let mut last_detected_url = String::new();
-
-        loop {
-            let pages = match monitor_browser.pages().await {
-                Ok(p) => p,
-                Err(_) => break, 
-            };
-
-            let mut _active_tab_found = false;
-
-            for (_i, page) in pages.iter().enumerate() {
-                // Check if this tab is the active one (visible)
-                let is_visible = match page.evaluate("document.visibilityState").await {
-                    Ok(res) => {
-                        res.into_value::<String>().unwrap_or_default() == "visible"
-                    },
-                    Err(_) => false,
-                };
-                
-                if is_visible {
-                     // println!("[AUTO-DEBUG] Found visible tab: {:?}", page.url().await);
-                } else {
-                     // println!("[AUTO-DEBUG] Tab {} is hidden", _i);
-                }
-
-                if is_visible {
-                    _active_tab_found = true;
-                    
-                    // Use JS evaluation for reliable URL detection (fixes bookmark/stale state issues)
-                    let current_url_res = page.evaluate("window.location.href").await;
-                    
-                    if let Ok(val) = current_url_res {
-                        let current_url = val.into_value::<String>().unwrap_or_default();
-                        
-                        // Only emit if the URL implies a change in state or it's a new URL
-                        if current_url != last_detected_url {
-                            let is_client = is_shop(&current_url, CLIENT_PATTERNS);
-                            let is_admin = is_shop(&current_url, ADMIN_PATTERNS);
-                            
-                            let _ = monitor_handle.emit("browser-match-found", json!({
-                                "url": current_url.clone(),
-                                "is_client": is_client,
-                                "is_admin": is_admin
-                            }));
-                            last_detected_url = current_url;
-                        }
-                    }
-                    // Found the active tab, no need to check others
-                    break;
-                }
-            }
-
-            // Optional: If no tab is visible (e.g. browser minimized or separate issue), 
-            // we might want to retain the last state or do nothing. 
-            // Currently, we just wait for the next poll.
-
-            tokio::time::sleep(Duration::from_millis(500)).await; 
-        }
-    });
-
-    Ok(format!("Automation Started. Monitoring for target sites..."))
+    Ok(format!("Automation Started."))
 }
 
-// --- HTML Extraction Command ---
-// Removed #[tauri::command] to avoid conflict
+async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow::Result<String> {
+    let (driver_binary, port, capabilities) = match browser {
+        "firefox" => {
+            let name = if cfg!(target_os = "windows") { "geckodriver.exe" } 
+                       else if cfg!(target_os = "macos") { "geckodriver_mac" } 
+                       else { "geckodriver" };
+             (name.to_string(), DRIVER_PORT, serde_json::json!({ "browserName": "firefox" }))
+        },
+        "safari" => {
+             if cfg!(target_os = "macos") { ("/usr/bin/safaridriver".to_string(), DRIVER_PORT, serde_json::json!({ "browserName": "safari" })) } 
+             else { return Err(anyhow!("Safari is only supported on macOS")); }
+        },
+        _ => return Err(anyhow!("Unsupported browser for driver mode")),
+    };
+
+    if !cfg!(target_os = "windows") {
+        let _ = Command::new("pkill").arg("-f").arg(&driver_binary).output();
+    }
+
+    let mut child = Command::new(&driver_binary)
+        .arg(format!("--port={}", port)).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        .map_err(|e| anyhow!("Driver '{}' start failed: {}", driver_binary, e))?;
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut caps_map = serde_json::map::Map::new();
+    if let Some(obj) = capabilities.as_object() { caps_map.clone_from(obj); }
+    
+    let client = ClientBuilder::native().capabilities(caps_map).connect(&format!("http://localhost:{}", port)).await;
+    if let Err(e) = client { let _ = child.kill(); return Err(anyhow!("Failed to connect to driver: {}", e)); }
+    let client = client.unwrap();
+
+    let res = async {
+        client.goto(url).await?;
+        let result = client.execute(script, vec![]).await?;
+        Ok(format!("Driver Success ({}). Result: {}", browser, serde_json::to_string_pretty(&result).unwrap_or_default()))
+    }.await;
+
+    let _ = child.kill();
+    res
+}
+
 pub async fn extract_html_from_current_tab() -> Result<String, String> {
     let browser_opt = {
         let global = GLOBAL_BROWSER.lock().await;
         global.as_ref().cloned()
     };
-
     if let Some(browser) = browser_opt {
         let pages = browser.pages().await.map_err(|e| e.to_string())?;
-        // Use the last page as the active one
         if let Some(page) = pages.last() {
-            // content() returns the full HTML of the page
             let html = page.content().await.map_err(|e| e.to_string())?;
             return Ok(html);
         }
@@ -301,85 +318,12 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
     }
 }
 
-
-// --- Legacy Driver Automation (Firefox/Safari) ---
-async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow::Result<String> {
-    let (driver_binary, port, capabilities) = match browser {
-        "firefox" => {
-            let name = if cfg!(target_os = "windows") { 
-                "geckodriver.exe" 
-            } else if cfg!(target_os = "macos") {
-                "geckodriver_mac"
-            } else { 
-                "geckodriver" // Linux & others
-            };
-             (name.to_string(), DRIVER_PORT, serde_json::json!({ "browserName": "firefox" }))
-        },
-        "safari" => {
-             if cfg!(target_os = "macos") {
-                 ("/usr/bin/safaridriver".to_string(), DRIVER_PORT, serde_json::json!({ "browserName": "safari" }))
-             } else {
-                 return Err(anyhow!("Safari is only supported on macOS"));
-             }
-        },
-        _ => return Err(anyhow!("Unsupported browser for driver mode")),
-    };
-
-    println!("[AUTO] Legacy Mode: {} requires driver {}", browser, driver_binary);
-    
-    // Attempt to kill existing driver instances on port (Linux/Mac mostly)
-    if !cfg!(target_os = "windows") {
-        let _ = Command::new("pkill").arg("-f").arg(&driver_binary).output();
-    }
-
-    let mut child = Command::new(&driver_binary)
-        .arg(format!("--port={}", port))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow!("Driver '{}' start failed. Ensure it is installed. Error: {}", driver_binary, e))?;
-
-    // Give driver time to start
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let mut caps_map = serde_json::map::Map::new();
-    if let Some(obj) = capabilities.as_object() {
-        caps_map.clone_from(obj);
-    }
-    
-    let client = ClientBuilder::native()
-        .capabilities(caps_map)
-        .connect(&format!("http://localhost:{}", port))
-        .await;
-        
-    if let Err(e) = client {
-        let _ = child.kill();
-        return Err(anyhow!("Failed to connect to driver: {}", e));
-    }
-    let client = client.unwrap();
-
-    let res = async {
-        client.goto(url).await?;
-        let result = client.execute(script, vec![]).await?;
-        let result_str = serde_json::to_string_pretty(&result).unwrap_or_default();
-        Ok(format!("Driver Success ({}). Result: {}", browser, result_str))
-    }.await;
-
-    let _ = child.kill(); // Ensure driver is killed after execution
-    res
-}
-
-// --- Helper Functions ---
-
 fn is_in_path(cmd: &str) -> bool {
     let check_cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
-    Command::new(check_cmd).arg(cmd).stdout(Stdio::null()).stderr(Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false)
+    Command::new(check_cmd).arg(cmd).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }
 
-fn check_file_exists(path: &str) -> bool {
-    std::path::Path::new(path).exists()
-}
+fn check_file_exists(path: &str) -> bool { std::path::Path::new(path).exists() }
 
 #[cfg(target_os = "windows")]
 fn find_path_in_registry(exe_name: &str) -> Option<String> {
@@ -387,15 +331,12 @@ fn find_path_in_registry(exe_name: &str) -> Option<String> {
         format!(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{}", exe_name),
         format!(r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{}", exe_name),
     ];
-    
     for q in queries {
         if let Ok(output) = Command::new("reg").args(["query", &q, "/ve"]).output() {
              if output.status.success() {
                  let s = String::from_utf8_lossy(&output.stdout);
                  if let Some(line) = s.lines().find(|l| l.contains("REG_SZ")) {
-                     if let Some(path_part) = line.split("REG_SZ").nth(1) {
-                         return Some(path_part.trim().to_string());
-                     }
+                     if let Some(path_part) = line.split("REG_SZ").nth(1) { return Some(path_part.trim().to_string()); }
                  }
              }
         }
@@ -411,16 +352,9 @@ fn find_app_bundle(bundle_id: &str) -> Option<String> {
     if let Ok(o) = output {
         let s = String::from_utf8_lossy(&o.stdout);
         if !s.trim().is_empty() {
-             let app_path = s.lines().next()?.trim();
-             let binary_name = if bundle_id.contains("Chrome") { "Google Chrome" } 
-                               else if bundle_id.contains("Edge") { "Microsoft Edge" }
-                               else if bundle_id.contains("Firefox") { "firefox" }
-                               else { return None };
-             
-             // Firefox bundle binary location is slightly different often
-             if binary_name == "firefox" {
-                 return Some(format!("{}/Contents/MacOS/firefox", app_path));
-             }
+             let app_path = s.lines().next().unwrap().trim();
+             let binary_name = if bundle_id.contains("Chrome") { "Google Chrome" } else if bundle_id.contains("Edge") { "Microsoft Edge" } else if bundle_id.contains("Firefox") { "firefox" } else { return None };
+             if binary_name == "firefox" { return Some(format!("{}/Contents/MacOS/firefox", app_path)); }
              return Some(format!("{}/Contents/MacOS/{}", app_path, binary_name));
         }
     }
@@ -429,49 +363,8 @@ fn find_app_bundle(bundle_id: &str) -> Option<String> {
 #[cfg(not(target_os = "macos"))]
 fn find_app_bundle(_: &str) -> Option<String> { None }
 
-#[allow(dead_code)]
-fn find_profile_root(browser: &str) -> Option<PathBuf> {
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
-    let path_str = match (cfg!(target_os = "windows"), cfg!(target_os = "macos"), browser) {
-        (true, _, "chrome") => format!(r"{}\AppData\Local\Google\Chrome\User Data", home),
-        (true, _, "edge") => format!(r"{}\AppData\Local\Microsoft\Edge\User Data", home),
-        (_, true, "chrome") => format!("{}/Library/Application Support/Google/Chrome", home),
-        (_, true, "edge") => format!("{}/Library/Application Support/Microsoft Edge", home),
-        _ => match browser {
-            "chrome" => format!("{}/.config/google-chrome", home),
-            "edge" => format!("{}/.config/microsoft-edge", home),
-            _ => return None,
-        }
-    };
-
-    let path = PathBuf::from(path_str);
-    if path.exists() { Some(path) } else { None }
-}
-
-#[allow(dead_code)]
-fn get_first_profile_name(root: &PathBuf) -> String {
-    if root.join("Default").exists() {
-        return "Default".to_string();
-    }
-    if let Ok(entries) = std::fs::read_dir(root) {
-        let mut profiles: Vec<String> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|name| name.starts_with("Profile "))
-            .collect();
-        profiles.sort();
-        if let Some(first) = profiles.first() {
-            return first.clone();
-        }
-    }
-    "Default".to_string()
-}
-
-// Find browser binary path across Windows, Mac, and Linux
 fn find_browser_path(browser: &str) -> Option<PathBuf> {
     let mut potential_paths = Vec::new();
-
     match browser {
         "chrome" => {
             if cfg!(target_os = "windows") {
@@ -482,26 +375,21 @@ fn find_browser_path(browser: &str) -> Option<PathBuf> {
                 potential_paths.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string());
                 if let Some(p) = find_app_bundle("com.google.Chrome") { potential_paths.push(p); }
             } else {
-                // Linux / Unix
                 if let Ok(p) = which::which("google-chrome") { return Some(p); }
                 if let Ok(p) = which::which("google-chrome-stable") { return Some(p); }
                 if let Ok(p) = which::which("chromium") { return Some(p); }
-                if let Ok(p) = which::which("chromium-browser") { return Some(p); }
                 if let Ok(p) = which::which("chrome") { return Some(p); }
             }
         },
         "edge" => {
             if cfg!(target_os = "windows") {
                 potential_paths.push(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_string());
-                potential_paths.push(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".to_string());
                 if let Some(p) = find_path_in_registry("msedge.exe") { potential_paths.push(p); }
             } else if cfg!(target_os = "macos") {
                 potential_paths.push("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".to_string());
                 if let Some(p) = find_app_bundle("com.microsoft.edgemac") { potential_paths.push(p); }
             } else {
-                // Linux / Unix
                 if let Ok(p) = which::which("microsoft-edge") { return Some(p); }
-                if let Ok(p) = which::which("microsoft-edge-stable") { return Some(p); }
                 if let Ok(p) = which::which("edge") { return Some(p); }
             }
         },
@@ -512,21 +400,14 @@ fn find_browser_path(browser: &str) -> Option<PathBuf> {
              } else if cfg!(target_os = "macos") {
                  potential_paths.push("/Applications/Firefox.app/Contents/MacOS/firefox".to_string());
                  if let Some(p) = find_app_bundle("org.mozilla.firefox") { potential_paths.push(p); }
-             } else {
-                 // Linux / Unix
-                 if let Ok(p) = which::which("firefox") { return Some(p); }
-             }
+             } else { if let Ok(p) = which::which("firefox") { return Some(p); } }
         },
         _ => return None,
     };
-
-    // Check hardcoded/detected paths
     for p in potential_paths {
         let path = PathBuf::from(&p);
         if path.exists() { return Some(path); }
     }
-
-    // Fallback: simple command check
     match browser {
         "chrome" => which::which("chrome").ok(),
         "edge" => which::which("msedge").ok(),
@@ -537,48 +418,19 @@ fn find_browser_path(browser: &str) -> Option<PathBuf> {
 
 pub fn get_available_browsers() -> Vec<BrowserStatus> {
     let mut browsers = Vec::new();
-    
-    // Check Chrome
     if find_browser_path("chrome").is_some() {
-        browsers.push(BrowserStatus {
-            name: "chrome".to_string(),
-            is_supported: true,
-            is_installed: true,
-            needs_driver: false,
-        });
+        browsers.push(BrowserStatus { name: "chrome".to_string(), is_supported: true, is_installed: true, needs_driver: false });
     }
-    
-    // Check Edge
     if find_browser_path("edge").is_some() {
-         browsers.push(BrowserStatus {
-            name: "edge".to_string(),
-            is_supported: true,
-            is_installed: true,
-            needs_driver: false,
-        });
+         browsers.push(BrowserStatus { name: "edge".to_string(), is_supported: true, is_installed: true, needs_driver: false });
     }
-    
-    // Check Firefox
     if find_browser_path("firefox").is_some() {
         let driver_name = if cfg!(target_os = "windows") { "geckodriver.exe" } else { "geckodriver" };
         let has_driver = is_in_path(driver_name) || check_file_exists(driver_name);
-        browsers.push(BrowserStatus {
-            name: "firefox".to_string(),
-            is_supported: true,
-            is_installed: true,
-            needs_driver: !has_driver,
-        });
+        browsers.push(BrowserStatus { name: "firefox".to_string(), is_supported: true, is_installed: true, needs_driver: !has_driver });
     }
-    
-    // Check Safari (Mac Only)
     if cfg!(target_os = "macos") {
-        browsers.push(BrowserStatus {
-            name: "safari".to_string(),
-            is_supported: true,
-            is_installed: true,
-            needs_driver: true, // Always needs driver mode
-        });
+        browsers.push(BrowserStatus { name: "safari".to_string(), is_supported: true, is_installed: true, needs_driver: true });
     }
-    
     browsers
 }

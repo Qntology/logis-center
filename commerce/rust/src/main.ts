@@ -1,3 +1,4 @@
+console.log("%c[WIDGET] MAIN.TS LOADED", "color: #00ff00; font-weight: bold; font-size: 1.2rem;");
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open, ask } from '@tauri-apps/plugin-dialog';
 import { listen, emit } from '@tauri-apps/api/event';
@@ -202,6 +203,44 @@ if (pillNav) {
 }
 
 // --- 2. Search & Main Nav ---
+async function updateExtractButtonVisibility() {
+    if (!btnExtract) return;
+
+    if (currentImage) {
+        btnExtract.style.display = "flex";
+        btnExtract.title = "Extract from Image";
+        return;
+    }
+
+    if (!currentDetectedUrl) {
+        btnExtract.style.display = "none";
+        return;
+    }
+
+    try {
+        const urlObj = new URL(currentDetectedUrl);
+        const pathname = urlObj.pathname;
+        const hostname = urlObj.hostname;
+        
+        // [RESTORED] Use hashed hostname for 'cc' to match DB records
+        const cc = await hashId(hostname); 
+        
+        const isActive = await invoke<boolean>("check_active_task", { cc: cc, refId: pathname });
+        
+        console.log(`[WIDGET] Visibility Check: host=${hostname}, cc=${cc}, path=${pathname}, isActive=${isActive}`);
+
+        if (isActive || isExtracting) {
+            btnExtract.style.display = "none";
+        } else {
+            btnExtract.style.display = "flex";
+            btnExtract.title = `Extract from ${hostname}`;
+        }
+    } catch (e) {
+        console.error("[WIDGET] Visibility error:", e);
+        btnExtract.style.display = "none";
+    }
+}
+
 searchInput?.addEventListener("focus", () => {
     openWidget("list");
     
@@ -354,15 +393,18 @@ document.addEventListener('view-task-log', () => {
 
 btnExtract?.addEventListener("click", async () => {
     let pathname = "/";
+    let cc = "";
     if (currentDetectedUrl) {
         try {
             const urlObj = new URL(currentDetectedUrl);
             pathname = urlObj.pathname;
+            cc = await hashId(urlObj.hostname);
             
-            const isActive = await invoke<boolean>("check_active_task", { ref_id: pathname });
+            const isActive = await invoke<boolean>("check_active_task", { cc: cc, refId: pathname });
             if (isActive) {
                 alert("This page is already in the queue or being processed.");
                 openWidget("settings");
+                await updateExtractButtonVisibility();
                 return;
             }
         } catch(e) {}
@@ -394,28 +436,33 @@ btnExtract?.addEventListener("click", async () => {
         try {
             await emit("new-task-from-browser", { id: taskId, type: "image_extraction", image_path: currentImage, ref_id: currentImage, link: "Local Image" });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: Image Analysis`, status: "processing", created_at: Date.now() });
-        } catch (e) { isExtracting = false; }
+            await updateExtractButtonVisibility();
+        } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
     } else {
         isExtracting = true;
         let taskId = `task_${Date.now()}`;
         try {
             const html = await invoke<string>("extract_html_from_current_tab");
+            const urlObj = new URL(currentDetectedUrl);
+            const cc = await hashId(urlObj.hostname);
+            
             await emit("new-task-from-browser", { 
                 id: taskId, 
                 type: "html_extraction", 
                 html: html, 
                 link: currentDetectedUrl, 
-                ref_id: pathname // [STRICT PARITY] Use pathname only
+                cc: cc, // Use hashed hostname
+                ref_id: urlObj.pathname 
             });
-            renderMessage({ id: taskId, role: "system_task", content: `Queued: ${new URL(currentDetectedUrl).hostname}`, status: "processing", url: currentDetectedUrl, created_at: Date.now() });
+            renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: "processing", url: currentDetectedUrl, created_at: Date.now() });
             
-            // Switch to chat dashboard to show queueing
             openWidget("settings");
-        } catch (e) { isExtracting = false; }
+            await updateExtractButtonVisibility();
+        } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
     }
 });
 
-listen("extraction-progress", (event: any) => {
+listen("extraction-progress", async (event: any) => {
     const payload = event.payload;
     const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "general";
     const elementId = `progress-${catId}`;
@@ -423,7 +470,10 @@ listen("extraction-progress", (event: any) => {
     
     if (payload.category === "Done" || payload.category === "Error") {
         stopSpinner();
+        isExtracting = false;
         if (btnExtract) setTimeout(() => { btnExtract.innerText = "⚡"; }, 2000);
+        // [NEW] Refresh button visibility once task is finished
+        await updateExtractButtonVisibility();
     }
 
     if (payload.task_id) {
@@ -536,10 +586,14 @@ autoBtn?.addEventListener("click", async () => {
 });
 
 // Browser Status Listener
-listen("browser-status", (event: any) => {
+listen("browser-status", async (event: any) => {
     const status = event.payload; // "running" or "stopped"
     if (btnAutoLaunch) {
         btnAutoLaunch.style.display = (status === "running") ? "none" : "flex";
+    }
+    if (status === "stopped") {
+        currentDetectedUrl = "";
+        await updateExtractButtonVisibility();
     }
 });
 
@@ -658,9 +712,10 @@ async function handleImageUpload(path: string) {
     }
 }
 
-navImgClear?.addEventListener("click", () => {
+navImgClear?.addEventListener("click", async () => {
     currentImage = null; navPreviewContainer.classList.add("hidden"); navUploadBtn?.classList.remove("active-emoji");
-    searchInput.disabled = false; btnSubmit.style.display = "flex"; btnExtract.style.display = "none";
+    searchInput.disabled = false; btnSubmit.style.display = "flex"; 
+    await updateExtractButtonVisibility();
 });
 
 navUploadBtn?.addEventListener("click", async () => {
@@ -669,15 +724,21 @@ navUploadBtn?.addEventListener("click", async () => {
 });
 
 // --- 5. Browser Events ---
-listen("browser-match-found", (event: any) => {
+console.log("[WIDGET] Registering browser-match-found listener...");
+listen("browser-match-found", async (event: any) => {
     const payload = event.payload;
+    console.log("[WIDGET] Event Received:", payload);
     if (payload.is_client || payload.is_admin) {
         currentDetectedUrl = payload.url;
-        if (btnExtract) { btnExtract.style.display = "flex"; btnExtract.title = `Extract from ${new URL(payload.url).hostname}`; }
-    } else if (!currentImage && !isExtracting) {
-        if (btnExtract) btnExtract.style.display = "none";
+    } else {
+        currentDetectedUrl = "";
     }
+    await updateExtractButtonVisibility();
 });
+
+// Auth Actions
+document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
+
 
 // --- 6. Auth & Chat Helpers ---
 
@@ -686,15 +747,14 @@ const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
 /**
  * Generates a stable Ethereum-style address hash from text.
- * Matches logic in before_client and Rust backend.
+ * [STRICT PARITY] Matches Keccak256 implementation in Rust utils/hash.rs
  */
-async function hashId(text?: string): Promise<string> {
-    if (!text) {
-        const wallet = ethers.Wallet.createRandom();
-        text = wallet.privateKey;
-    }
-    const msgHash = ethers.hashMessage(text);
-    return ethers.computeAddress(msgHash).toLowerCase();
+async function hashId(text: string): Promise<string> {
+    if (!text) return ZERO_ADDRESS;
+    // Standard Keccak256 hash of the UTF-8 bytes of the string
+    const keccak = ethers.keccak256(ethers.toUtf8Bytes(text));
+    // Take the last 20 bytes (last 40 characters) to match Rust's address style
+    return "0x" + keccak.slice(-40).toLowerCase();
 }
 
 function updateAuthUI() {
@@ -855,3 +915,9 @@ document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTa
 
 initSession();
 setWindowSize(false);
+
+// [NEW] Trigger visibility update after a short delay to catch reconnected browser
+setTimeout(async () => {
+    console.log("[WIDGET] Performing initial visibility check...");
+    await updateExtractButtonVisibility().catch(console.error);
+}, 1500);

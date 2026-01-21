@@ -129,10 +129,10 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn has_active_task(&self, ref_id: &str) -> Result<bool> {
+    pub async fn has_active_task(&self, cc: &str, ref_id: &str) -> Result<bool> {
         let table = self.conn.open_table("tasks").execute().await?;
         let results = table.query()
-            .only_if(format!("ref_id = '{}' AND (status = 10 OR status = 1)", ref_id))
+            .only_if(format!("cc = '{}' AND ref_id = '{}' AND (status = 10 OR status = 1)", cc, ref_id))
             .limit(1).execute().await?.try_collect::<Vec<_>>().await?;
         Ok(!results.is_empty())
     }

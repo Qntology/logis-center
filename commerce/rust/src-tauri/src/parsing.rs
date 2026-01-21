@@ -245,15 +245,15 @@ The page has been classified as '{TYPE}'.
 Analyze the provided Pug template snippet and identify the structural CSS1 selectors required for data extraction.
 
 [SCHEMA DEFINITIONS]
-- item: CSS1 selector for individual items in a list (e.g., `tr`, `li`, `div.product-item`). Exclude header rows, ads, or pagination.
-- node: CSS1 selector for the parent container that holds the list of items (e.g., `tbody`, `ul`, `div.grid`).
-- detail: Boolean. Set to `true` if this is a single item detail page (e.g., order detail, product detail). Set to `false` if it is a list page.
+- item: type based item CSS1 selector excluding ads
+- node: item parent list CSS1 selector excluding ads
+- detail: is a detail page or a detail form
 
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.
 {{
-    "item": "css_selector_string",
-    "node": "css_selector_string",
+    "item": "",
+    "node": "",
     "detail": boolean
 }}
 
