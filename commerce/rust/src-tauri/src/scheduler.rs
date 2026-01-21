@@ -502,46 +502,47 @@ async fn process_task(
             println!("[Scheduler] Selectors Found: {}", selector_info);        
         let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
     
-        // [NEW] Learning Phase: Save page selectors to 'pages' for future parity
-        {
-            let store_guard = store_mutex.lock().await;
-            if let Some(db) = store_guard.as_ref() {
-                let team_id = if task.to_dest.is_empty() { 
-                    crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-                } else { task.to_dest.clone() };
-                
-                // [FIX] Enrich selector_info with origin/link for the Tree UI
-                let mut page_data = selector_info.clone();
-                if let Some(obj) = page_data.as_object_mut() {
-                    let url_obj = url::Url::parse(&url).unwrap();
-                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                    obj.insert("link".to_string(), json!(url_obj.path()));
-                    obj.insert("type".to_string(), json!(page_type));
-                }
-
-                // pageId follows server logic: hashId(cc + pathname)
-                let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, task.ref_id)); 
-                let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
-    
-                let _ = db.upsert_item(
-                    "pages", 
-                    &page_id, 
-                    "pages", 
-                    page_data, 
-                    None,
-                    Some(&task.from_source),
-                    Some(&team_id),
-                    Some(&task.cc),
-                    Some(&bcc),
-                    Some(&task.ref_id),
-                    None
-                ).await;
-                println!("[Scheduler] Page learned and saved: {}", page_id);
-            }
-        }
-    
-        // Merge selectors into final_page_info
+                                // [STRICT PARITY] Ported from proxy/src/index.ts mechanism
+                                {
+                                    let store_guard = store_mutex.lock().await;
+                                    if let Some(db) = store_guard.as_ref() {
+                                        let team_id = if task.to_dest.is_empty() { 
+                                            crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
+                                        } else { task.to_dest.clone() };
+                        
+                                        // 1. page_id = hashId(cc + pathname) - Stripping search params to prevent duplicate schemas for same route
+                                        let clean_path = if let Some(pos) = task.ref_id.find('?') { &task.ref_id[..pos] } else { &task.ref_id };
+                                        let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, clean_path)); 
+                                        
+                                        // 2. bcc = hashId(type + (isDetail ? cc.toUpperCase() : cc)) - Crucial for Tree grouping
+                                        let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+                                        let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+                            
+                                        // 3. Prepare data exactly as proxy does
+                                        let mut page_data = selector_info.clone();
+                                        if let Some(obj) = page_data.as_object_mut() {
+                                            let url_obj = url::Url::parse(&url).unwrap();
+                                            obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                                            obj.insert("link".to_string(), json!(clean_path));
+                                            obj.insert("type".to_string(), json!(page_type));
+                                        }
+                        
+                                        let _ = db.upsert_item(
+                                            "pages", 
+                                            &page_id, 
+                                            "pages", 
+                                            page_data, 
+                                            None,
+                                            Some(&task.from_source),
+                                            Some(&team_id),
+                                            Some(&task.cc),
+                                            Some(&bcc),
+                                            Some(clean_path), // ref_id stored as clean path
+                                            None
+                                        ).await;
+                                        println!("[Scheduler] Page learned with Proxy parity: {}", page_id);
+                                    }
+                                }        // Merge selectors into final_page_info
         if let Some(obj) = selector_info.as_object() {
             for (k, v) in obj {
                 final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone());
@@ -886,9 +887,12 @@ Just say "READY"."#,
     }
     
     let id_val_raw = normalized_data.get("id").or_else(|| normalized_data.get("index")).cloned();
-    let team_id = if task.to_dest.is_empty() { 
+    // [STRICT PARITY] Use the task's existing destination (respecting login status)
+    let team_id = if !task.to_dest.is_empty() { 
+        task.to_dest.clone() 
+    } else { 
         crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-    } else { task.to_dest.clone() };
+    };
 
     // [STRICT PARITY] Generate numeric index using CRC32: crc32(hashId(type + team + no))
     let item_no = id_val_raw.as_ref().and_then(|v| v.as_str()).unwrap_or("").to_string();

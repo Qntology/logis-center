@@ -313,113 +313,118 @@ async function renderNavigation() {
 
     if (!pageList || !userList) return;
 
-    // 0. Update Profile Section (Mirror content.js)
+    // 0. Update Profile Section
     if (currentSession.email) {
         if (profileName) profileName.innerText = currentSession.email.split('@')[0];
         if (btnSignin) btnSignin.classList.add("hidden");
         if (btnSignout) btnSignout.classList.remove("hidden");
-        
         if (profileFavicon && blockies) {
             const icon = blockies.create({ seed: currentSession.email, size: 8, scale: 4 });
-            profileFavicon.innerHTML = "";
-            profileFavicon.appendChild(icon);
-            icon.style.borderRadius = "4px";
-            icon.style.width = "100%";
-            icon.style.height = "100%";
+            profileFavicon.innerHTML = ""; profileFavicon.appendChild(icon);
+            icon.style.borderRadius = "4px"; icon.style.width = "100%"; icon.style.height = "100%";
         }
-    } else {
-        if (profileName) profileName.innerText = "Sign In";
-        if (btnSignin) btnSignin.classList.remove("hidden");
-        if (btnSignout) btnSignout.classList.add("hidden");
-        if (profileFavicon) profileFavicon.innerHTML = "";
     }
 
     try {
-        // 1. Fetch Pages and Build Accordion Tree
         const pages = await invoke<any[]>("get_known_pages");
         pageList.innerHTML = "";
         
         if (pages.length === 0) {
             pageList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No shared pages found.</div>";
         } else {
-            const groups: Record<string, any> = {};
+            // [STRICT PARITY] Grouping: Domain -> Type -> (List or Detail)
+            const tree: Record<string, any> = {};
+            
             pages.forEach(p => {
                 let data: any = {};
                 try { data = JSON.parse(p.json_data); } catch(e) { data = { origin: "unknown", type: p.doc_type }; }
                 
-                const origin = data.origin || "learned-pages";
-                const docType = (p.doc_type || "general").toUpperCase();
-                const key = `${origin}#${docType}`;
+                const domain = (data.origin || "unknown").replace(/^https?:\/\//, "");
+                const type = (p.doc_type || "general").toUpperCase();
+                const isDetail = data.detail === true; // From before_server schema
                 
-                if (!groups[key]) {
-                    groups[key] = { 
-                        origin: origin.replace(/^https?:\/\//, ""), 
-                        type: docType, 
-                        items: [] 
-                    };
-                }
-                groups[key].items.push({ uuid: p.uuid, link: data.link || "/" });
+                if (!tree[domain]) tree[domain] = {};
+                if (!tree[domain][type]) tree[domain][type] = { lists: [], details: [] };
+                
+                const item = { uuid: p.uuid, link: data.link || "/", text: data.text || "Untitled" };
+                if (isDetail) tree[domain][type].details.push(item);
+                else tree[domain][type].lists.push(item);
             });
 
-            Object.values(groups).forEach(group => {
-                const section = document.createElement("div");
-                section.className = "nav-accordion";
-                section.style.marginBottom = "5px";
-                section.innerHTML = `
-                    <div class="nav-header" style="display:flex; justify-content:space-between; padding:8px 10px; background:#f5f5f5; border-radius:6px; cursor:pointer; border:1px solid #eee;">
-                        <span style="font-size:0.7rem; font-weight:bold; color:#333;">${group.type} <small style="color:#999; font-weight:normal;">${group.origin}</small></span>
-                        <span class="arrow">▼</span>
-                    </div>
-                    <div class="nav-content hidden" style="padding:5px 0 5px 15px;">
-                        ${group.items.map((it: any) => `
-                            <div class="nav-link" data-id="${it.uuid}" style="padding:6px; font-size:0.75rem; color:#666; cursor:pointer;">• ${it.link}</div>
-                        `).join("")}
-                    </div>
-                `;
+            for (const [domain, types] of Object.entries(tree)) {
+                const domainDiv = document.createElement("div");
+                domainDiv.className = "nav-domain-group";
+                domainDiv.style.marginBottom = "10px";
+                domainDiv.innerHTML = `<div style="font-size:0.65rem; color:#999; padding:0 5px 5px; font-weight:bold; border-bottom:1px solid #eee; margin-bottom:5px;">${domain}</div>`;
                 
-                const header = section.querySelector(".nav-header") as HTMLElement;
-                const content = section.querySelector(".nav-content") as HTMLElement;
-                header.onclick = () => {
-                    content.classList.toggle("hidden");
-                    header.querySelector(".arrow")!.innerHTML = content.classList.contains("hidden") ? "▼" : "▲";
-                };
-                
-                section.querySelectorAll(".nav-link").forEach((link: any) => {
-                    link.onclick = () => {
-                        hideNavigation();
-                        searchInput.value = `type:${group.type.toLowerCase()} path:${link.innerText.replace("• ", "")}`;
-                        btnSubmit.click();
+                for (const [type, categories] of Object.entries<any>(types)) {
+                    const typeSection = document.createElement("div");
+                    typeSection.className = "nav-accordion";
+                    
+                    // Combined content for the accordion: List items then Detail items
+                    const buildItemsHtml = (items: any[], label: string, color: string) => {
+                        if (items.length === 0) return "";
+                        return `
+                            <div style="font-size:0.6rem; color:${color}; padding:4px 10px; text-transform:uppercase; letter-spacing:1px; opacity:0.6;">${label}</div>
+                            ${items.map(it => `
+                                <div class="nav-link" data-id="${it.uuid}" style="padding:6px 20px; font-size:0.75rem; color:#555; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${it.link}">
+                                    • ${it.link}
+                                </div>
+                            `).join("")}
+                        `;
                     };
-                });
-                pageList.appendChild(section);
-            });
+
+                    typeSection.innerHTML = `
+                        <div class="nav-header" style="display:flex; justify-content:space-between; padding:8px 10px; background:#fafafa; border-radius:6px; cursor:pointer; border:1px solid #f0f0f0; margin-bottom:2px;">
+                            <span style="font-size:0.7rem; font-weight:bold; color:var(--primary);">${type}</span>
+                            <span class="arrow" style="font-size:0.6rem; color:#ccc;">▼</span>
+                        </div>
+                        <div class="nav-content hidden" style="padding:5px 0;">
+                            ${buildItemsHtml(categories.lists, "Lists", "#2563eb")}
+                            ${buildItemsHtml(categories.details, "Details", "#db2777")}
+                        </div>
+                    `;
+                    
+                    const header = typeSection.querySelector(".nav-header") as HTMLElement;
+                    const content = typeSection.querySelector(".nav-content") as HTMLElement;
+                    header.onclick = () => {
+                        content.classList.toggle("hidden");
+                        header.querySelector(".arrow")!.innerHTML = content.classList.contains("hidden") ? "▼" : "▲";
+                    };
+                    
+                    typeSection.querySelectorAll(".nav-link").forEach((link: any) => {
+                        link.onclick = (e: Event) => {
+                            e.stopPropagation();
+                            hideNavigation();
+                            // Logic parity: If List item, show list. If Detail item, show detail.
+                            const uuid = (e.currentTarget as HTMLElement).dataset.id;
+                            if (uuid) {
+                                // If it's a detail link, we could potentially go straight to showDetail
+                                // but for search consistency, we'll filter first.
+                                searchInput.value = `type:${type.toLowerCase()} path:${link.innerText.replace("• ", "").trim()}`;
+                                btnSubmit.click();
+                            }
+                        };
+                    });
+                    domainDiv.appendChild(typeSection);
+                }
+                pageList.appendChild(domainDiv);
+            }
         }
 
-        // 2. Fetch and Render Users (Team Members)
+        // 2. Render Users (Team Members)
         const users = await invoke<any[]>("get_known_users");
         userList.innerHTML = "";
-        
-        if (users.length === 0) {
-            userList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No members found.</div>";
-        } else {
+        if (users.length > 0) {
             users.forEach(u => {
-                if (u.doc_type === "team") return; // Skip team object itself
+                if (u.doc_type === "team") return;
                 const item = document.createElement("div");
                 item.className = "member-item";
-                item.style.display = "flex";
-                item.style.alignItems = "center";
-                item.style.gap = "10px";
-                item.style.padding = "8px";
-                item.style.borderRadius = "8px";
-                item.style.cursor = "pointer";
-                
+                item.style.display = "flex"; item.style.alignItems = "center"; item.style.gap = "10px";
+                item.style.padding = "8px"; item.style.borderRadius = "8px"; item.style.cursor = "pointer";
                 const icon = blockies.create({ seed: u.uuid, size: 8, scale: 3 });
                 icon.style.borderRadius = "50%";
-                
-                item.innerHTML = `
-                    <div class="avatar" style="width:24px; height:24px;"></div>
-                    <div style="font-size:0.75rem; color:#333; font-weight:500;">${u.uuid.slice(0,10)}...</div>
-                `;
+                item.innerHTML = `<div class="avatar" style="width:24px; height:24px;"></div><div style="font-size:0.75rem; color:#333; font-weight:500;">${u.uuid.slice(0,10)}...</div>`;
                 item.querySelector(".avatar")!.appendChild(icon);
                 item.onclick = () => { hideNavigation(); openWidget("settings"); };
                 userList.appendChild(item);
@@ -561,7 +566,9 @@ btnExtract?.addEventListener("click", async () => {
                 html: html, 
                 link: currentDetectedUrl, 
                 cc: cc, 
-                ref_id: hashedRefId 
+                ref_id: hashedRefId,
+                from: currentSession.address,
+                to: currentSession.team
             });
             // Task ID and hashedRefId are both important: taskId for Task, hashedRefId for Result Document
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: 10, task_id: hashedRefId, created_at: Date.now() });
@@ -960,39 +967,42 @@ function startPolling() {
 function renderMessage(msg: any) {
     if (!chatTalks) return;
     
-    let msgId = `msg-${msg.id}`;
+    const msgId = `msg-${msg.id}`;
     let existing = document.getElementById(msgId);
     
     const isSystemTask = msg.role === "system_task";
-    const roleClass = msg.role === "user" ? "user-msg" : "system-msg";
+    const roleClass = msg.role === "user" ? "user" : "system";
     
-    // Ensure we have a valid task identifier for interaction
-    const activeTaskId = msg.task_id || msg.id;
-    
-    const statusMap: any = {
-        1: { icon: "⏳", text: "processing" },
-        2: { icon: "🛑", text: "stopped" },
-        3: { icon: "🚫", text: "cancelled" },
-        6: { icon: "❌", text: "error" },
-        9: { icon: "✅", text: "done" },
-        10: { icon: "📥", text: "pending" }
+    // Status Logic (before_server parity)
+    const statusMap: Record<number, { icon: string, text: string, color: string }> = {
+        1: { icon: "⏳", text: "processing", color: "var(--primary)" },
+        2: { icon: "🛑", text: "stopped", color: "#ef4444" },
+        3: { icon: "🚫", text: "cancelled", color: "#666" },
+        6: { icon: "❌", text: "error", color: "#ef4444" },
+        9: { icon: "✅", text: "done", color: "#22c55e" },
+        10: { icon: "📥", text: "pending", color: "#999" }
     };
 
-    const currentStatus = statusMap[msg.status] || { icon: "⏳", text: "processing" };
-    const timeStr = new Date(msg.created_at || Date.now()).toLocaleTimeString();
+    const currentStatus = statusMap[msg.status] || statusMap[1];
+    const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
     const html = `
-        <div class="message-bubble ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" 
-             id="${msgId}" 
-             data-task-id="${activeTaskId}" 
+        <div class="chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" id="${msgId}" 
+             data-task-id="${msg.task_id || msg.id}" 
              data-status="${msg.status}"
-             style="${isSystemTask ? 'cursor:pointer; border-left: 3px solid var(--primary); padding: 10px; margin-bottom: 8px;' : ''}">
-            <div class="msg-header" style="display:flex; justify-content:space-between; margin-bottom:4px;">
-                <span style="font-size:0.7rem; opacity:0.7;">${msg.role === "user" ? "@You" : "🤖 System"}</span>
-                <span class="msg-time" style="font-size:0.6rem; opacity:0.5;">${timeStr}</span>
+             style="cursor: ${isSystemTask ? 'pointer' : 'default'};">
+            <div class="chat-message">
+                <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
+                    <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
+                    <span>${timeStr}</span>
+                </div>
+                <div class="content">${msg.content}</div>
+                ${isSystemTask ? `
+                    <div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(0,0,0,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};">
+                        ${currentStatus.icon} ${currentStatus.text.toUpperCase()}
+                    </div>
+                ` : ""}
             </div>
-            <div class="msg-content" style="font-size:0.85rem; line-height:1.4;">${msg.content}</div>
-            ${msg.status ? `<div class="msg-status" style="margin-top:6px; font-size:0.65rem; font-weight:bold; color:var(--primary);">${currentStatus.icon} ${currentStatus.text.toUpperCase()}</div>` : ""}
         </div>
     `;
 
@@ -1002,33 +1012,44 @@ function renderMessage(msg: any) {
         chatTalks.insertAdjacentHTML('beforeend', html);
     }
 
-    // Bind Click Logic to the newly rendered bubble
+    // Bind Parity Click Logic
     const newEl = document.getElementById(msgId);
     if (newEl && isSystemTask) {
-        newEl.onclick = () => {
+        newEl.onclick = async () => {
             const taskId = newEl.getAttribute("data-task-id");
             const status = parseInt(newEl.getAttribute("data-status") || "0");
             
+            openWidget("list"); 
+            listView.style.display = "none";
+            detailView.style.display = "flex";
+
             if (status === 9 && taskId) {
-                showDetail(taskId); 
-            } else if (taskId) {
-                openWidget("list"); 
-                listView.style.display = "none";
-                detailView.style.display = "flex";
+                detailTitle.innerText = "Processing Result";
+                detailContent.innerHTML = "Loading result...";
+                if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+                if (btnStopTask) btnStopTask.style.display = "none";
                 
+                try {
+                    const doc = await invoke<any>("get_document", { uuid: taskId });
+                    if (doc) {
+                        detailTitle.innerText = `${doc.doc_type.toUpperCase()} Result`;
+                        detailContent.innerHTML = `<pre style="background:#111; color:#0f0; padding:10px; border-radius:5px; font-size:0.75rem; overflow-x:auto;">${JSON.stringify(JSON.parse(doc.json_data), null, 2)}</pre>`;
+                    }
+                } catch (e) { detailContent.innerHTML = "Error loading result: " + e; }
+            } else if (taskId) {
                 detailTitle.innerText = "Task Progress";
                 const logArea = document.getElementById("extraction-log");
-                if (logArea && logArea.dataset.activeTaskId !== taskId) {
-                    logArea.innerHTML = `<div style='color:var(--primary); padding:10px;'>📡 Monitoring Task: ${taskId.slice(0,8)}...</div>`;
-                    logArea.dataset.activeTaskId = taskId;
+                if (logArea) {
+                    if (logArea.dataset.activeTaskId !== taskId) {
+                        logArea.innerHTML = `<div style='color:var(--primary); padding:10px;'>📡 Monitoring Task: ${taskId.slice(0,8)}...</div>`;
+                        logArea.dataset.activeTaskId = taskId;
+                    }
                 }
                 if (btnStopTask) btnStopTask.style.display = "flex";
                 if (btnDetailDelete) btnDetailDelete.style.display = "none";
             }
         };
     }
-
-    chatTalks.scrollTop = chatTalks.scrollHeight;
 }
 
 async function checkAuthStatus() {
@@ -1138,15 +1159,15 @@ refreshAppState();
 async function fetchChatHistory() {
     try {
         const messages = await invoke<any[]>("get_chat_messages");
-        if (messages && messages.length > 0) {
-            // Sort by creation time
-            messages.sort((a, b) => a.created_at - b.created_at);
-            
-            // Clear and re-render only if needed or just append
-            // For simplicity, we can clear and re-render the last batch
-            if (chatTalks) {
-                // If you want to keep it simple, just render each
+        
+        if (chatTalks) {
+            chatTalks.innerHTML = ""; 
+            if (messages && messages.length > 0) {
+                // Sort by creation time (ascending for the 180deg scroll trick)
+                messages.sort((a, b) => a.created_at - b.created_at);
                 messages.forEach(msg => renderMessage(msg));
+            } else {
+                chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>";
             }
         }
     } catch (e) {

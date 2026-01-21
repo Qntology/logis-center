@@ -158,7 +158,7 @@ impl VectorStore {
     pub async fn get_all_messages(&self, limit: usize) -> Result<Vec<Value>> {
         let table = self.conn.open_table("talks").execute().await?;
         // Query and then sort by created_at in Rust since LanceDB sorting can be complex on small batches
-        let mut results = table.query().limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
+        let results = table.query().limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
