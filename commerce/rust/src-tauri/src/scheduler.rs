@@ -335,15 +335,14 @@ async fn process_task(
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
     // Determine optimal chunk sizes based on hardware
-    // [ADAPTIVE] Reduced size to account for multilingual token overhead (Korean/Chinese/etc.)
+    // [ADAPTIVE] Using larger context (2048) with quantization efficiency
     let mut device_config = utils::get_optimal_device_config();
-    device_config.classify_chunk_size = 1024; // [FIX] Lowered from 4000 to prevent OOM
-    device_config.extract_chunk_size = 1024;
+    device_config.classify_chunk_size = 2048; 
+    device_config.extract_chunk_size = 2048;
 
     // [REVISED] Restore turn-based chunked ingestion for classification.
     // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 1024, 0); // [FIX] Overlap removed (0)
-    let classify_chunks_len = classify_chunks.len();
+    let classify_chunks = chunk_text(&light_pug, 2048, 0); // [REVERT] Back to 2048, 0 overlap
 
     let mut model_guard = model_mutex.lock().await;
     if model_guard.is_none() {
@@ -822,7 +821,7 @@ r#"{instruction}
         let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
         
         // CHUNKING: Split huge content into dynamic chunks with 0-char overlap (Device Optimized)
-        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 0); 
+        let chunks = chunk_text(&content_pug, 2048, 0); 
         let extraction_instruction = parsing::item2json(page_type, &url, language);
 
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)

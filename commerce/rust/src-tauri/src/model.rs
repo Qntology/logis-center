@@ -250,7 +250,7 @@ impl LogisModel {
         let model_path = gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
-        let max_tokens_limit = 1024; // [FIX] Lowered from 2048 to prevent CUDA OOM
+        let max_tokens_limit = 2048; // [REVERT] Back to 2048 now that we use quantization
 
         // DO NOT LOAD MODELS HERE. Just return the config.
         Ok(Self {
