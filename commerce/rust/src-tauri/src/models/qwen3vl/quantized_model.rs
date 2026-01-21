@@ -239,14 +239,56 @@ impl QuantizedQwen3VLTextAttention {
         if let Some((k, v)) = &self.kv_cache {
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
             
-            // [FIX] Quantize KV cache to 4-bit (Q4_0) before saving to disk
-            let k_q = candle_core::quantized::QTensor::quantize(k, candle_core::quantized::GgmlDType::Q4_0)?;
-            let v_q = candle_core::quantized::QTensor::quantize(v, candle_core::quantized::GgmlDType::Q4_0)?;
-
+            // [GGUF-STYLE 1/8 COMPRESSION] 
+            // We use Q4_0 logic: 32 elements per block.
+            // Each block = 1 F16 scale + 16 U8 bytes (32 * 4 bits).
+            
             let mut map = HashMap::new();
-            // dequantize() must be called on the QTensor itself after successful quantization
-            map.insert("k_data", k_q.dequantize(&Device::Cpu)?); 
-            map.insert("v_data", v_q.dequantize(&Device::Cpu)?);
+            
+            let process_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>| -> Result<()> {
+                let shape = t.shape();
+                let dims = shape.dims();
+                let flat_t = t.flatten_all()?.to_dtype(DType::F32)?;
+                let data = flat_t.to_vec1::<f32>()?;
+                
+                let block_size = 32;
+                let num_blocks = (data.len() + block_size - 1) / block_size;
+                
+                let mut scales = Vec::with_capacity(num_blocks);
+                let mut packed = Vec::with_capacity(num_blocks * 16);
+                
+                for i in 0..num_blocks {
+                    let start = i * block_size;
+                    let end = (start + block_size).min(data.len());
+                    let block = &data[start..end];
+                    
+                    let mut max_abs = 0.0f32;
+                    for &val in block { if val.abs() > max_abs { max_abs = val.abs(); } }
+                    
+                    let scale = max_abs / 8.0; // Q4_0 range is -8 to 7
+                    scales.push(scale);
+                    
+                    let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                    
+                    for j in 0..16 {
+                        let idx1 = start + j;
+                        let idx2 = start + j + 16;
+                        
+                        let v1 = if idx1 < end { ((block[j] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+                        let v2 = if idx2 < end { ((block[j+16] * inv_scale + 8.5).floor().clamp(0.0, 15.0) as u8) & 0x0F } else { 0 };
+                        
+                        packed.push(v1 | (v2 << 4));
+                    }
+                }
+                
+                map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?.to_dtype(DType::F16)?);
+                map.insert(format!("{}_packed", prefix), Tensor::from_vec(packed, (num_blocks * 16,), &Device::Cpu)?);
+                map.insert(format!("{}_shape", prefix), Tensor::new(dims.iter().map(|&x| x as u32).collect::<Vec<u32>>().as_slice(), &Device::Cpu)?);
+                Ok(())
+            };
+
+            process_tensor(k, "k", &mut map)?;
+            process_tensor(v, "v", &mut map)?;
             
             candle_core::safetensors::save(&map, &file)?;
             
@@ -257,19 +299,41 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
-        self.save_kv_cache(path, true)
-    }
-
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         if file.exists() {
-            let tensors = candle_core::safetensors::load(&file, device)?;
+            let tensors = candle_core::safetensors::load(&file, &Device::Cpu)?;
             
-            // [FIX] In a production environment, we'd handle the blocks/scales properly.
-            // For this implementation, we ensure the tensors are restored to the target device.
-            let k = tensors.get("k_data").ok_or(anyhow!("Missing k in kv cache"))?.clone();
-            let v = tensors.get("v_data").ok_or(anyhow!("Missing v in kv cache"))?.clone();
+            let unpack_tensor = |prefix: &str| -> Result<Tensor> {
+                let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("no scales"))?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("no packed"))?.to_vec1::<u8>()?;
+                let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("no shape"))?.to_vec1::<u32>()?;
+                let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
+                
+                let num_blocks = scales.len();
+                let mut unpacked = Vec::with_capacity(num_blocks * 32);
+                
+                for i in 0..num_blocks {
+                    let scale = scales[i];
+                    for j in 0..16 {
+                        let byte = packed[i * 16 + j];
+                        let v1 = (byte & 0x0F) as f32;
+                        let v2 = (byte >> 4) as f32;
+                        unpacked.push((v1 - 8.0) * scale);
+                        unpacked.push((v2 - 8.0) * scale);
+                    }
+                }
+                
+                // Truncate to exact shape if padding was added
+                let total_elements: usize = shape.iter().product();
+                unpacked.truncate(total_elements);
+                
+                let target_dtype = self.q_proj.bias.as_ref().map(|b| b.dtype()).unwrap_or(DType::F32);
+                Tensor::from_vec(unpacked, shape, &Device::Cpu)?.to_device(device)?.to_dtype(target_dtype)
+            };
+
+            let k = unpack_tensor("k")?;
+            let v = unpack_tensor("v")?;
             
             let current_len = k.dim(2)?;
             if current_len >= expected_len {

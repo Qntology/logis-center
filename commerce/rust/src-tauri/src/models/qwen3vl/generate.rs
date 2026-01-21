@@ -182,11 +182,13 @@ impl Qwen3VLGenerateModel {
         // [ADAPTIVE] Disable disk cache for critical ingestion to ensure in-memory consistency
         let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
         let cache_path = if let Some(sid) = &session_id {
-             if is_critical { None } else {
-                 let p = std::path::Path::new("tmp_kv").join(sid);
-                 if !p.exists() { let _ = fs::create_dir_all(&p); }
-                 Some(p)
+             // [MODIFIED] Force cache creation even for critical tasks to support Pug preprocessing
+             if is_critical {
+                 println!("[CONFIG] Critical task detected ([DATA_PART]/[FULL_STRUCTURE]), but forcing KV cache creation.");
              }
+             let p = std::path::Path::new("tmp_kv").join(sid);
+             if !p.exists() { let _ = fs::create_dir_all(&p); }
+             Some(p)
         } else {
              None
         };

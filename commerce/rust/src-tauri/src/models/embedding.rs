@@ -99,19 +99,10 @@ impl QAttention {
         dev: &Device,
         rotary: Arc<RotaryEmbedding>,
     ) -> Result<Self> {
-        let mut find_weight = |suffix1: &str, suffix2: &str| -> Result<QMatMul> {
-            let name1 = format!("{}.{}.weight", prefix, suffix1);
-            let name2 = format!("{}.{}.weight", prefix, suffix2);
-            let tensor = if let Ok(t) = ct.tensor(reader, &name1, dev) { t }
-                         else if let Ok(t) = ct.tensor(reader, &name2, dev) { t }
-                         else { ct.tensor(reader, &format!("{}.weight", prefix), dev)? }; // Fallback for some GGUFs
-            Ok(QMatMul::from_qtensor(tensor)?)
-        };
-
-        let q_proj = find_weight("q_proj", "attn_q")?;
-        let k_proj = find_weight("k_proj", "attn_k")?;
-        let v_proj = find_weight("v_proj", "attn_v")?;
-        let o_proj = find_weight("o_proj", "attn_output")?;
+        let q_proj = load_linear_fallback(ct, reader, prefix, "q_proj", "attn_q", dev)?;
+        let k_proj = load_linear_fallback(ct, reader, prefix, "k_proj", "attn_k", dev)?;
+        let v_proj = load_linear_fallback(ct, reader, prefix, "v_proj", "attn_v", dev)?;
+        let o_proj = load_linear_fallback(ct, reader, prefix, "o_proj", "attn_output", dev)?;
 
         Ok(Self {
             q_proj,
@@ -163,17 +154,9 @@ impl QMlp {
         prefix: &str,
         dev: &Device,
     ) -> Result<Self> {
-        let mut find_weight = |suffix1: &str, suffix2: &str| -> Result<QMatMul> {
-            let name1 = format!("{}.{}.weight", prefix, suffix1);
-            let name2 = format!("{}.{}.weight", prefix, suffix2);
-            let tensor = if let Ok(t) = ct.tensor(reader, &name1, dev) { t }
-                         else { ct.tensor(reader, &name2, dev)? };
-            Ok(QMatMul::from_qtensor(tensor)?)
-        };
-
-        let gate_proj = find_weight("gate_proj", "ffn_gate")?;
-        let up_proj = find_weight("up_proj", "ffn_up")?;
-        let down_proj = find_weight("down_proj", "ffn_down")?;
+        let gate_proj = load_linear(ct, reader, prefix, "gate_proj", "ffn_gate", dev)?;
+        let up_proj = load_linear(ct, reader, prefix, "up_proj", "ffn_up", dev)?;
+        let down_proj = load_linear(ct, reader, prefix, "down_proj", "ffn_down", dev)?;
         
         Ok(Self { gate_proj, up_proj, down_proj })
     }
@@ -359,4 +342,37 @@ impl EmbeddingModel {
 
         Ok(accumulated_vector)
     }
+}
+
+// --- Helper Functions to Avoid Borrow Checker Conflicts ---
+
+fn load_linear_fallback<R: std::io::Seek + std::io::Read>(
+    ct: &gguf_file::Content,
+    reader: &mut R,
+    prefix: &str,
+    suffix1: &str,
+    suffix2: &str,
+    device: &Device
+) -> Result<QMatMul> {
+    let name1 = format!("{}.{}.weight", prefix, suffix1);
+    let name2 = format!("{}.{}.weight", prefix, suffix2);
+    let tensor = if let Ok(t) = ct.tensor(reader, &name1, device) { t }
+                 else if let Ok(t) = ct.tensor(reader, &name2, device) { t }
+                 else { ct.tensor(reader, &format!("{}.weight", prefix), device)? };
+    Ok(QMatMul::from_qtensor(tensor)?)
+}
+
+fn load_linear<R: std::io::Seek + std::io::Read>(
+    ct: &gguf_file::Content,
+    reader: &mut R,
+    prefix: &str,
+    suffix1: &str,
+    suffix2: &str,
+    device: &Device
+) -> Result<QMatMul> {
+    let name1 = format!("{}.{}.weight", prefix, suffix1);
+    let name2 = format!("{}.{}.weight", prefix, suffix2);
+    let tensor = if let Ok(t) = ct.tensor(reader, &name1, device) { t }
+                 else { ct.tensor(reader, &name2, device)? };
+    Ok(QMatMul::from_qtensor(tensor)?)
 }
