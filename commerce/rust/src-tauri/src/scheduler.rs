@@ -49,13 +49,26 @@ impl TaskDataManager {
 
 impl Drop for TaskDataManager {
     fn drop(&mut self) {
+        println!("[Cleanup] TaskDataManager dropping. Cleaning up files for task: {}", self.task_id);
         for path in &self.created_files {
             if path.exists() {
                 let _ = fs::remove_file(path);
             }
         }
-        // Try to remove dir if empty (ignore errors)
+        // Try to remove task data dir if empty
         let _ = fs::remove_dir("tmp_task_data");
+
+        // [STRICT PARITY] Also clean up KV cache subdirectories for this task
+        let base_path = std::path::Path::new("tmp_kv");
+        if let Ok(entries) = fs::read_dir(base_path) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&self.task_id) {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -137,6 +150,9 @@ pub async fn start_background_worker(
     app_handle: tauri::AppHandle,
 ) {
     println!("[Scheduler] Background worker started.");
+    
+    // [NEW] Clear ALL temporary data directories at startup for a clean slate
+    clear_all_temp_data();
     
     tokio::spawn(async move {
         let mut delay_secs = 1;
@@ -235,14 +251,29 @@ pub async fn start_background_worker(
 }
 
 async fn process_task(
-    task: Task, 
+
+    task: Task,
+
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
+
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
+
     cancellation_token: &Arc<AtomicBool>,
+
     app_handle: &tauri::AppHandle
-) -> Result<()>
+
+)
+
+-> Result<()>
+
 {
-    
+
+    // [NEW] Clear any leftover resources from previous failed attempts at the START
+
+    cleanup_task_resources(&task.id);
+
+
+
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let _ = app_handle.emit("extraction-progress", json!({ 
@@ -335,18 +366,21 @@ async fn process_task(
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
     // Determine optimal chunk sizes based on hardware
-    // [ADAPTIVE] Using 1500 chars: Optimized for English + Multi-language mixed content.
+    // [ADAPTIVE] Using 1000 chars: Optimized for English + Multi-language mixed content.
     // Fits safely within 2048 token embedding limit due to token density dilution.
     let mut device_config = utils::get_optimal_device_config();
-    device_config.classify_chunk_size = 1500; 
-    device_config.extract_chunk_size = 1500;
+    device_config.classify_chunk_size = 1000; 
+    device_config.extract_chunk_size = 1000;
 
     // [REVISED] Restore turn-based chunked ingestion for classification.
     // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 1500, 0); // [FIX] Mixed-language optimized size
+    let classify_chunks = chunk_text(&light_pug, 1000, 0); // [FIX] Mixed-language optimized size
     let classify_chunks_len = classify_chunks.len(); 
+    println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);
 
     let mut model_guard = model_mutex.lock().await;
+    println!("[Scheduler] Model lock acquired.");
+    
     if model_guard.is_none() {
         let _ = app_handle.emit("extraction-progress", json!({ 
            "category": "Loading Model", "summary": "Loading Model for Analysis...", "spinner": "⠋"
@@ -384,6 +418,7 @@ async fn process_task(
         
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
+            println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
             let prompt = if is_last {
                 format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nEnd of document. Identify the primary category and return JSON.", chunk)
@@ -823,7 +858,7 @@ r#"{instruction}
         let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
         
         // CHUNKING: Split huge content into dynamic chunks with 0-char overlap (Device Optimized)
-        let chunks = chunk_text(&content_pug, 1500, 0); 
+        let chunks = chunk_text(&content_pug, 1000, 0); 
         let extraction_instruction = parsing::item2json(page_type, &url, language);
 
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
@@ -1113,7 +1148,7 @@ Just say "READY"."#,
                 let mut text_to_embed = parsing::json_to_natural_language(&extracted_data);
                 let item_digest = crate::utils::hash::digest(&text_to_embed); 
 
-                let target_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, task.ref_id)); 
+                let _target_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, task.ref_id)); 
                 let mut existing_vector = None;
                 // [FIX] Use task.ref_id directly as the target_id to match parity with frontend
                 let target_id = task.ref_id.clone(); 
@@ -1220,8 +1255,7 @@ Just say "READY"."#,
         "data": if !is_detail { json!(null) } else { extracted_data }
     }));
 
-    // Cleanup all KV Cache subdirectories for this task
-    cleanup_task_resources(&task.id);
+    // [REMOVED] Manual cleanup call (Now handled by DataManager drop)
 
     // [RESOURCE-RELEASE] Explicitly drop the model to free VRAM/RAM after task completion
     {
@@ -1245,6 +1279,15 @@ fn cleanup_task_resources(task_id: &str) {
             }
         }
     }
+}
+
+fn clear_all_temp_data() {
+    println!("[Cleanup] Clearing all temporary data directories...");
+    let _ = fs::remove_dir_all("tmp_task_data");
+    let _ = fs::remove_dir_all("tmp_kv");
+    // Re-create them as empty
+    let _ = fs::create_dir_all("tmp_task_data");
+    let _ = fs::create_dir_all("tmp_kv");
 }
 
 

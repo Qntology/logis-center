@@ -301,8 +301,8 @@ impl EmbeddingModel {
         
         if token_ids.is_empty() { return Ok(vec![0.0; 768]); }
 
-        // [REVERT] Back to 2048 (using 2000 for safe margin) now that we use 4-bit
-        let chunk_size = 2000;
+        // [REVISED] Set to exactly 1000 as requested
+        let chunk_size = 1000;
         let chunks: Vec<&[u32]> = token_ids.chunks(chunk_size).collect();
         
         let mut accumulated_vector = vec![0.0; 768];

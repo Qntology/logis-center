@@ -208,7 +208,7 @@ impl Qwen3VLGenerateModel {
                                      if c == f { match_len += 1; } else { break; }
                                  }
 
-                                 if match_len > 100 {
+                                 if match_len > 50 {
                                      println!("[KV-DISK] Cache Hit! Longest Common Prefix: {} tokens.", match_len);
                                      
                                      // [OPTIMIZATION] Even if match_len is slightly less than cached_tokens.len(),
@@ -246,8 +246,9 @@ impl Qwen3VLGenerateModel {
              }
         }
         
-        // [CHUNKED PREFILL] - Line Aware (512 tokens)
-        if seq_len > 512 {
+        // [CHUNKED PREFILL] - Line Aware (256 tokens)
+        // [ADAPTIVE] Lowered from 512 to 256 to match 1000-char chunking strategy
+        if seq_len > 256 {
             println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
             
             let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.text_device) {
@@ -259,12 +260,12 @@ impl Qwen3VLGenerateModel {
 
             while current_pos < seq_len - 1 {
                 let remaining = seq_len - current_pos;
-                if remaining <= 512 { break; } 
+                if remaining <= 256 { break; } 
 
-                let mut chunk_size = 512;
-                let lookback_range = 128; 
+                let mut chunk_size = 256;
+                let lookback_range = 64; 
                 
-                let search_end = current_pos + 512;
+                let search_end = current_pos + 256;
                 let search_start = search_end.saturating_sub(lookback_range);
                 
                 for i in (search_start..search_end).rev() {

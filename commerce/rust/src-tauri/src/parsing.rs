@@ -169,7 +169,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             if *mode == PugMode::FullContent {
                 let content = text.trim();
                 if !content.is_empty() {
-                    let content_trunc = if content.len() > 2000 { &content[..2000] } else { content };
+                    let content_trunc = if content.len() > 1000 { &content[..1000] } else { content };
                     for line in content_trunc.lines() {
                         let trimmed_line = line.trim();
                         if !trimmed_line.is_empty() {

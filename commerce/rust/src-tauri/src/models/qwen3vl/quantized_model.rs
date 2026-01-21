@@ -238,17 +238,15 @@ impl QuantizedQwen3VLTextAttention {
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool) -> Result<()> {
         if let Some((k, v)) = &self.kv_cache {
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-            
-            // [GGUF-STYLE 1/8 COMPRESSION] 
-            // We use Q4_0 logic: 32 elements per block.
-            // Each block = 1 F16 scale + 16 U8 bytes (32 * 4 bits).
+            println!("[KV-SAVE] Layer {}: Starting 1/8 compression... (Device: {:?})", self.layer_idx, k.device());
             
             let mut map = HashMap::new();
             
             let process_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>| -> Result<()> {
                 let shape = t.shape();
                 let dims = shape.dims();
-                let flat_t = t.flatten_all()?.to_dtype(DType::F32)?;
+                // Move to CPU for packing logic
+                let flat_t = t.flatten_all()?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                 let data = flat_t.to_vec1::<f32>()?;
                 
                 let block_size = 32;
@@ -265,7 +263,7 @@ impl QuantizedQwen3VLTextAttention {
                     let mut max_abs = 0.0f32;
                     for &val in block { if val.abs() > max_abs { max_abs = val.abs(); } }
                     
-                    let scale = max_abs / 8.0; // Q4_0 range is -8 to 7
+                    let scale = max_abs / 8.0;
                     scales.push(scale);
                     
                     let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
@@ -291,6 +289,7 @@ impl QuantizedQwen3VLTextAttention {
             process_tensor(v, "v", &mut map)?;
             
             candle_core::safetensors::save(&map, &file)?;
+            println!("[KV-SAVE] Layer {}: Completed.", self.layer_idx);
             
             if clear {
                 self.kv_cache = None;
@@ -302,6 +301,7 @@ impl QuantizedQwen3VLTextAttention {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         if file.exists() {
+            println!("[KV-LOAD] Layer {}: Loading from disk...", self.layer_idx);
             let tensors = candle_core::safetensors::load(&file, &Device::Cpu)?;
             
             let unpack_tensor = |prefix: &str| -> Result<Tensor> {
@@ -324,16 +324,16 @@ impl QuantizedQwen3VLTextAttention {
                     }
                 }
                 
-                // Truncate to exact shape if padding was added
-                let total_elements: usize = shape.iter().product();
-                unpacked.truncate(total_elements);
+                unpacked.truncate(shape.iter().product());
                 
-                let target_dtype = self.q_proj.bias.as_ref().map(|b| b.dtype()).unwrap_or(DType::F32);
-                Tensor::from_vec(unpacked, shape, &Device::Cpu)?.to_device(device)?.to_dtype(target_dtype)
+                // [FIX] Use the LayerNorm weight's dtype as the reliable target (always BF16 on GPU)
+                let target_dtype = self.q_norm.weight().dtype();
+                Ok(Tensor::from_vec(unpacked, shape, &Device::Cpu)?.to_device(device)?.to_dtype(target_dtype)?)
             };
 
             let k = unpack_tensor("k")?;
             let v = unpack_tensor("v")?;
+            println!("[KV-LOAD] Layer {}: Unpacked and moved to {:?}", self.layer_idx, device);
             
             let current_len = k.dim(2)?;
             if current_len >= expected_len {
@@ -346,6 +346,10 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
         Ok(())
+    }
+
+    pub fn offload_kv_cache(&mut self, path: &Path) -> Result<()> {
+        self.save_kv_cache(path, true)
     }
 }
 
