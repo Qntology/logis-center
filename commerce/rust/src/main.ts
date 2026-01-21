@@ -918,39 +918,69 @@ async function hashId(text: string): Promise<string> {
 
 function updateAuthUI() {
     const authStatus = document.getElementById("auth-status");
-    const qrContainer = document.getElementById("qr-container");
-    const userEmail = document.getElementById("user-email");
     const btnLogout = document.getElementById("btn-logout");
     const btnQrAuth = document.getElementById("btn-qr-auth");
+    const chatForm = document.querySelector(".chat-form") as HTMLElement;
 
     if (currentSession.email) {
         if (authStatus) authStatus.innerText = "Authenticated";
-        if (qrContainer) qrContainer.style.display = "none";
-        if (userEmail) userEmail.innerText = currentSession.email;
         if (btnLogout) btnLogout.style.display = "block";
         if (btnQrAuth) btnQrAuth.style.display = "none";
+        if (chatForm) chatForm.classList.remove("hidden");
+        
+        // Remove QR from chat list if it exists
+        const qrMsg = document.getElementById("msg-qr-auth");
+        if (qrMsg) qrMsg.remove();
     } else {
         if (authStatus) authStatus.innerText = "Waiting for Auth...";
-        if (qrContainer) qrContainer.style.display = "block";
-        if (userEmail) userEmail.innerText = "Not Signed In";
         if (btnLogout) btnLogout.style.display = "none";
         if (btnQrAuth) btnQrAuth.style.display = "block";
+        if (chatForm) chatForm.classList.add("hidden");
+        
+        // Ensure QR is rendered in the chat flow
+        if (currentTab === "settings") {
+            performQrAuth();
+        }
     }
 }
 
 async function performQrAuth() {
-    const qrContainer = document.getElementById("qr-code");
-    if (!qrContainer || !currentSession.hash) return;
+    if (!chatTalks || !currentSession.hash) return;
     
-    qrContainer.innerHTML = "";
-    new (window as any).QRCode(qrContainer, {
-        text: `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`,
-        width: 200,
-        height: 200,
-        colorDark: "#ffffff",
-        colorLight: "#000000",
-        correctLevel: (window as any).QRCode.CorrectLevel.H
-    });
+    // Check if QR message already exists in chat
+    let qrMsg = document.getElementById("msg-qr-auth");
+    if (!qrMsg) {
+        const html = `
+            <div class="chat-talk system" id="msg-qr-auth">
+                <div class="chat-message" style="text-align: center; background: #fff; color: #000; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin: 10px;">
+                    <div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;">Verification Required</div>
+                    <div id="qr-code-target" style="display: inline-block; padding: 10px; background: #fff; border-radius: 8px;"></div>
+                    <div style="margin-top:15px; font-size:0.7rem; color:#666; line-height: 1.4;">
+                        Scan the QR code with your mobile<br>to sync your account.
+                    </div>
+                </div>
+            </div>
+        `;
+        chatTalks.insertAdjacentHTML('beforeend', html);
+        qrMsg = document.getElementById("msg-qr-auth");
+    }
+
+    const qrTarget = document.getElementById("qr-code-target");
+    if (qrTarget) {
+        qrTarget.innerHTML = "";
+        new (window as any).QRCode(qrTarget, {
+            text: `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`,
+            width: 160,
+            height: 160,
+            colorDark: "#000000",
+            colorLight: "#ffffff",
+            correctLevel: (window as any).QRCode.CorrectLevel.M
+        });
+        
+        // Scroll to bottom to show QR
+        const scroll = document.getElementById("chat-scroll");
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    }
 }
 
 function startPolling() {
@@ -1055,16 +1085,13 @@ function renderMessage(msg: any) {
 async function checkAuthStatus() {
     if (!currentSession.hash) return;
     
-    const origin = "https://commerce.logis.center"; // Parity origin
+    const origin = "https://commerce.logis.center"; 
     const createdAt = Date.now();
     
     try {
-        // [STRICT PARITY] Use /task endpoint with specific query params matches before_client
         const params = new URLSearchParams({
             origin: origin,
             created_at: createdAt.toString(),
-            // 'to' parameter is typically hashId(cc + pathname) in client, 
-            // here we simulate the handshake
         });
 
         const data = await invoke<any>("proxy_fetch", {
@@ -1075,16 +1102,9 @@ async function checkAuthStatus() {
             },
             session_params: {
                 hash: currentSession.hash,
-                // token and cc are handled by proxy logic or can be added here
             }
         });
         
-        // In the /task response structure (before_server), 'session' usually contains the cookies/auth info
-        // But proxy_fetch might return the body directly.
-        // before_client: var { results, session } = await app.fetch(...)
-        // If the server returns { results: [], session: { ... } }
-        
-        // We check if the response *is* the session object or contains it
         let session = data.session || data; 
 
         if (session && session.email) {
@@ -1098,7 +1118,7 @@ async function checkAuthStatus() {
             await invoke("initialize_hub", { 
                 address: session.address, 
                 email: session.email, 
-                flag: "kr" // Default to kr for now
+                flag: session.flag || "kr"
             });
 
             updateAuthUI();
