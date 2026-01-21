@@ -417,35 +417,71 @@ impl QuantizedQwen3VLTextAttention {
 
                     
 
-                    let num_blocks = scales.len();
-
-                    let mut unpacked = Vec::with_capacity(num_blocks * 32);
+                                    let num_blocks = scales.len();
 
                     
 
-                    for i in 0..num_blocks {
-
-                        let scale = scales[i];
-
-                        for j in 0..16 {
-
-                            let byte = packed[i * 16 + j];
-
-                            let v1 = (byte & 0x0F) as f32;
-
-                            let v2 = (byte >> 4) as f32;
-
-                            unpacked.push((v1 - 8.0) * scale);
-
-                            unpacked.push((v2 - 8.0) * scale);
-
-                        }
-
-                    }
+                                    let mut unpacked = vec![0.0f32; num_blocks * 32];
 
                     
 
-                    unpacked.truncate(shape.iter().product());
+                                    
+
+                    
+
+                                    for i in 0..num_blocks {
+
+                    
+
+                                        let scale = scales[i];
+
+                    
+
+                                        for j in 0..16 {
+
+                    
+
+                                            let byte = packed[i * 16 + j];
+
+                    
+
+                                            let v1 = (byte & 0x0F) as f32;
+
+                    
+
+                                            let v2 = (byte >> 4) as f32;
+
+                    
+
+                                            
+
+                    
+
+                                            // [CRITICAL FIX] Place elements back in correct block positions (not interleaved)
+
+                    
+
+                                            unpacked[i * 32 + j] = (v1 - 8.0) * scale;
+
+                    
+
+                                            unpacked[i * 32 + j + 16] = (v2 - 8.0) * scale;
+
+                    
+
+                                        }
+
+                    
+
+                                    }
+
+                    
+
+                                    
+
+                    
+
+                                    unpacked.truncate(shape.iter().product());
 
                     
 
