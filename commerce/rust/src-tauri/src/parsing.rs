@@ -326,74 +326,281 @@ pub fn graph2contexts(current: &str) -> String {
 
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
-        "tracking" => r###"- status: 'draft' | 'progress' | 'return' | 'complete' | 'error'
-- id: tracking number | string
-- title: tracking goods title | string
-- sender_name: sender_name | string
-- sender_address: sender_address | string
-- sender_phone: sender_phone | string
-- recipient_name: recipient_name | string
-- recipient_address: recipient_address | string
-- recipient_phone: recipient_phone | string
-- package_width: Package width | number
-- package_height: Package height | number
-- package_length: Package length | number
-- package_weight: Package weight | number
-- carrier: carrier name translated into English | string
-- shipping_fee: Shipping cost | number
-- shipping_method: 'standard' | 'express' | 'same_day' | 'pick_up' | 'freight' | 'prepaid'
-- shipping_duration: Estimated delivery days | number
-- bundle_shipping: Allow combined shipping | string
-- shipping_date: yyyy-MM-ddThh:mm:ss | string
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
-        "goods" => r###"- node: goods form container CSS1 selector
-- code: product constant code | string
-- link: '{HREF}'
-- id: Refer to the ID value from the link or an attribute or input value | string
-- status: 'draft' | 'show' | 'hide' | 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-- payment_method: payment method | string
-- bank: bank company name | '' | string
-- card: card company name | '' | string
-- model_name: product Model name | string
-- brand_name: product Brand name | string
-- condition: ['new' | 'used' | 'lease' | 'rental' | 'refurbish']
-- description: product Full description (HTML allowed) | string
-- short_description: product short description | string
-- tags: [{ tag : product keyword or tag | string }]
-- origin_country: product Country of origin/manufacture | string
-- manufacturer: product Manufacturer name | string
-- release_date: Product release date(yyyy-MM-ddThh:mm:ss) | string
-- manufacture_date: product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string
-- expiration_date: product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string
-- gtin: product Global Trade Item Number | string
-- mpn: product Manufacturer Part Number | string
-- barcode: product Barcode value | string
-- sale_price: product sale price | number
-- supply_price: product supply price | number
-- currency: ISO 4217 Currency Code | string
-- compare_at_price: product Original price for showing discounts | number
-- quantity: product Inventory quantity | number
-- stock_keeping_unit: Stock Keeping Unit | string
-- low_stock_threshold: product Low stock alert threshold | number
-- unit: product Selling unit | string
-- tax_included: product Whether tax | number
-- tax_code: product Tax code for region-specific rules | string
-- main_image_url: Main product image URL | string
-- additional_image_url: additional product image URL | string
-- video_url: product Promotional video URL | string
-- carrier: product carrier name translated into English | string
-- shipping_fee: product Shipping cost | number
-- shipping_method: 'standard' | 'express' | 'same_day' | 'pick_up' | 'freight' | 'prepaid'
-- shipping_duration: product Estimated delivery days | number
-- bundle_shipping: product Allow combined shipping | string
-- product_width: Package width(cm) | number
-- product_height: Package height(cm) | number
-- product_length: Package length(cm) | number
-- product_weight: Package weight(kg) | number
-- options: [{ value:option name, inputs:[{ value:option input value }] }]
-- additional_goods: [{ value:product Link }]
-- title: product based title | string
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "tracking" => r###"node:tracking form container CSS1 selector,
+status:{
+    value:'draft' or 'progress' or 'return' or 'complete' or 'error',
+    selector:selector
+},
+id:{
+    value:tracking number | string,
+    selector:selector
+},
+title:{
+    value:tracking goods title | string,
+    selector:selector
+} 
+sender_name:{
+    value:sender_name | string,
+    selector:selector
+},
+sender_address:{
+    value:sender_address | string,
+    selector:selector
+},
+sender_phone:{
+    value:sender_phone | string,
+    selector:selector
+},
+recipient_name:{
+    value:recipient_name | string,
+    selector:selector
+},
+recipient_address:{
+    value:recipient_address | string,
+    selector:selector
+},
+recipient_phone:{
+    value:recipient_phone | string,
+    selector:selector
+},
+package_width:{
+    value:Package width | number,
+    selector:selector
+},
+package_height:{
+    value:Package height | number,
+    selector:selector
+},
+package_length:{
+    value:Package length | number,
+    selector:selector
+},
+package_weight:{
+    value:Package weight | number,
+    selector:selector
+},
+carrier:{
+    value:carrier name translated into English | string,
+    selector:selector
+},
+shipping_fee:{
+    value:Shipping cost | number,
+    selector:selector
+},
+shipping_method:{
+    value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
+    selector:selector
+},
+shipping_duration:{
+    value:Estimated delivery days | number,
+    selector:selector
+},
+bundle_shipping:{
+    value:Allow combined shipping | string,
+    selector:selector
+},
+shipping_date:{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+},
+registration_date:{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+},"###,
+        "goods" => r###"node:goods form container CSS1 selector,
+code:{
+    value:product constant code | string,
+    selector:selector
+},
+link:'{HREF}',
+id:{
+    value:Refer to the ID value from the link or an attribute or input value | string,
+    selector:selector
+},
+status:{
+    value:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+    selector:selector
+},
+payment_method:{
+    value:payment method | string,
+    selector:selector
+},
+bank:{
+    value:bank company name or '' | string,
+    selector:selector
+},
+card:{
+    value:card company name or '' | string,
+    selector:selector
+},
+model_name:{
+    value:product Model name | string,
+    selector:selector
+},
+brand_name:{
+    value:product Brand name | string,
+    selector:selector
+},
+condition:{
+    value:['new' or 'used' or 'lease' or 'rental' or 'refurbish'],
+    selector:selector
+},
+description:{
+    value:product Full description (HTML allowed) | string,
+    selector:selector
+},
+short_description:{
+    value:product short description | string,
+    selector:selector
+},
+tags:{
+    value:[{ tag : product keyword or tag | string }],
+    selector:selector
+},
+origin_country:{
+    value:product Country of origin/manufacture | string,
+    selector:selector
+},
+manufacturer:{
+    value:product Manufacturer name | string,
+    selector:selector
+},
+release_date:{
+    value:Product release date(yyyy-MM-ddThh:mm:ss) | string,
+    selector:selector
+},
+manufacture_date:{
+    value:product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string,
+    selector:selector
+},
+expiration_date:{
+    value:product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string,
+    selector:selector
+},
+gtin:{
+    value:product Global Trade Item Number | string,
+    selector:selector
+},
+mpn:{
+    value:product Manufacturer Part Number | string,
+    selector:selector
+},
+barcode:{
+    value:product Barcode value | string,
+    selector:selector
+},
+sale_price:{
+    value:product sale price | number,
+    selector:selector
+},
+supply_price:{
+    value:product supply price | number,
+    selector:selector
+},
+currency:{
+    value:ISO 4217 Currency Code | string,
+    selector:selector
+},
+compare_at_price:{
+    value:product Original price for showing discounts | number,
+    selector:selector
+},
+quantity:{
+    value:product Inventory quantity | number,
+    selector:selector
+},
+stock_keeping_unit:{
+    value:Stock Keeping Unit | string,
+    selector:selector
+},
+low_stock_threshold:{
+    value:product Low stock alert threshold | number,
+    selector:selector
+},
+unit:{
+    value:product Selling unit | string,
+    selector:selector
+},
+tax_included:{
+    value:product Whether tax | number,
+    selector:selector
+},
+tax_code:{
+    value:product Tax code for region-specific rules | string,
+    selector:selector
+},
+main_image_url:{
+    value:Main product image URL | string,
+    selector:selector
+},
+additional_image_url:{
+    value:additional product image URL | string,
+    selector:selector
+},
+video_url:{
+    value:product Promotional video URL | string,
+    selector:selector
+},
+carrier:{
+    value:product carrier name translated into English | string,
+    selector:selector
+},
+shipping_fee:{
+    value:product Shipping cost | number,
+    selector:selector
+},
+shipping_method:{
+    value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
+    selector:selector
+},
+shipping_duration:{
+    value:product Estimated delivery days | number,
+    selector:selector
+},
+bundle_shipping:{
+    value:product Allow combined shipping | string,
+    selector:selector
+},
+product_width:{
+    value:Package width(cm) | number,
+    selector:selector
+},
+product_height:{
+    value:Package height(cm) | number,
+    selector:selector
+},
+product_length:{
+    value : Package length(cm) | number,
+    selector:selector
+},
+product_weight:{
+    value : Package weight(kg) | number,
+    selector:selector
+},
+options:[
+    {
+        value:option name | string,
+        selector:selector,
+        inputs:[{
+            value:option input value | string,
+            selector:selector
+        }]
+    }
+],
+additional_goods:[
+    {
+        value:URL includes a manage path, an administrative or edit route product Link | string,
+        selector:selector
+    }
+],
+title:{
+    value:product based title | string,
+    selector:selector
+},
+registration_date:{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+},"###,
         "order" => r###"- node: order form container CSS1 selector
 - link: '{HREF}'
 - id: Refer to the ID value from the link or an attribute or input value | string
@@ -474,45 +681,33 @@ Language: {LANGUAGE}
 
 pub fn list2json(page_type: &str, language: &str) -> String {
     let schema = match page_type {
-        "order" | "goods" => r###"- item: type based item CSS1 selector excluding ads
-- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
-- node: item parent list CSS1 selector excluding ads
-- next: list next button CSS1 selector
-- status: 'show' | 'progress' | 'remove' | 'hide' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-- id: Refer to the ID value from the link | an attribute | string
-- title: title | string
-- sale_price: sale price | number
-- supply_price: supply price | number
-- currency: ISO 4217 Currency Code | string
-- quantity: item stock quantity | number
-- tracking_number: Tracking Number | 운송장 번호 | 运单호 | 運單號 | 伝표번호 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string
-- link: URL includes a manage path, an administrative | edit route Link | string
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
-        "tracking" | "review" => r###"- item: type based item CSS1 selector excluding ads
-- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
-- node: item parent list CSS1 selector excluding ads
-- next: list next button CSS1 selector
-- status: 'start' | 'progress' | 'stop' | 'cancel' | 'return'
-- id: Refer to the ID value from the link | an attribute | string
-- title: author and content | string
-- link: URL includes a manage path, an administrative | edit route Link | string
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
-        "coupon" | "event" => r###"- item: type based item CSS1 selector excluding ads
-- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
-- node: item parent list CSS1 selector excluding ads
-- next: list next button CSS1 selector
-- status: 'show' | 'progress' | 'hide' | 'stop' | 'cancel' | 'expire' | 'complete' | 'error'
-- id: Refer to the ID value from the link | an attribute | string
-- title: type based item title
-- started_at: yyyy-MM-ddThh:mm:ss | string
-- expired_at: yyyy-MM-ddThh:mm:ss | string
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
-        _ => "- id: ID\n- title: Title\n- status: Status"
+        "order" | "goods" => r###"status:'show' or 'progress' or 'remove' or 'hide' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+link:URL includes a manage path, an administrative or edit route Link | string,
+id:Refer to the ID value from the link or an attribute | string,
+title:title | string, 
+sale_price:sale price | number,
+supply_price:supply price | number,
+currency:ISO 4217 Currency Code | string,
+quantity:item stock quantity | number,
+tracking_number:Tracking Number or 운송장 번호 or 运단호 or 運單號 or 伝표번호 or Número de seguimiento or Numéro de suivi or Sendungsnummer or Но머 나кладной or Número de rastreamento or Numero di tracciamento or رقم التتبع or Số vận đơn or Nomor resi or หมายเลขติดตามพัสดุ | string,
+registration_date:yyyy-MM-ddThh:mm:ss | string,"###,
+        "tracking" | "review" => r###"status:'start' or 'progress' or 'stop' or 'cancel' or 'return',
+id:Refer to the ID value from the link or an attribute | string,
+title:author and content | string, 
+link:URL includes a manage path, an administrative or edit route Link | string,
+registration_date:yyyy-MM-ddThh:mm:ss | string,"###,
+        "coupon" | "event" => r###"status:'show' or 'progress' or 'hide' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
+id:Refer to the ID value from the link or an attribute | string,
+title:type based item title, 
+started_at:yyyy-MM-ddThh:mm:ss,
+expired_at:yyyy-MM-ddThh:mm:ss,
+registration_date:yyyy-MM-ddThh:mm:ss | string,"###,
+        _ => "id: ID\ntitle: Title\nstatus: Status"
     };
 
     let template = r###" 
 [TASK]
-Extract a list of items from the provided Pug snippets into a JSON ARRAY.
+Extract a list of items from the provided Pug snippets into a JSON object matching the schema.
 
 [CONTEXT]
 Category: {TYPE}
@@ -522,16 +717,19 @@ Language: {LANGUAGE}
 {SCHEMA}
 
 [EXTRACTION RULES]
-1. Return a JSON ARRAY [ {{...}}, {{...}} ] containing objects for each item found.
-2. Ensure every object in the array follows the [SCHEMA DEFINITIONS].
-3. If data for a field is missing for an item, use null.
+1. Return a JSON object containing the fields defined in [SCHEMA DEFINITIONS].
+2. The "items" field must be an array of objects.
+3. If data for a field is missing, use null.
 4. Extract only numeric values for prices and quantities.
-5. Return ONLY the JSON array. No explanation.
+5. Return ONLY valid JSON. No explanation.
 
 [OUTPUT FORMAT]
-[
-    {{ "id": "...", "title": "...", "status": "..." }}
-]"###;
+{
+    "type": "...",
+    "items": [
+        { "id": "...", "title": "...", "status": "..." }
+    ]
+}"###;
 
     template.replace("{TYPE}", page_type)
             .replace("{LANGUAGE}", language)
