@@ -106,6 +106,10 @@
 
 				session = session ? session : {}
 
+				if(!session.cc && window.location.hostname) {
+					session.cc = hashId(window.location.hostname.toLowerCase());
+				}
+
 				await app.storage.set({'cookies' : session})
 
 				return { results, session }
@@ -1794,6 +1798,21 @@
 
 				try{
 					var { cookies } = await app.storage.get('cookies')
+
+					if(cookies.cc){
+						var link = window.location.pathname + window.location.search
+						var scanId = hashId(cookies.cc + link)
+						
+						var isActive = await app.request({
+							body: { check_active: "tasks", ref: scanId, cc: cookies.cc }
+						})
+
+						if (isActive && (isActive.results && isActive.results.length > 0 || isActive === true)) {
+							$app.classList.add(selector.scanning)
+						} else {
+							$app.classList.remove(selector.scanning)
+						}
+					}
 
 					if(!window[cookies.hash]){
 						window[cookies.hash] = setTimeout(timeout.fn, timeout.ms)
@@ -4878,9 +4897,8 @@
 				if(app.chrome){
 					e.preventDefault()
 			
-					var pageId = hashId(cookies.team+cookies.cc+window.location.pathname)
-
-					var scanId = hashId(cookies.team+cookies.cc+window.location.pathname+window.location.search)
+					var link = window.location.pathname + window.location.search
+					var scanId = hashId(cookies.cc + link)
 
 					var crons = await Select['crons']({
 						key : 'ref',
@@ -4933,15 +4951,10 @@
 							cleanStates()
 
 							
-							app.filters.scan = hashId(cookies.team+cookies.cc+body)
-
-
-
-							
-							console.log('{ from: cookies.address, to : cookies.team }',{ from: cookies.address, to : cookies.team });
+							app.filters.scan = scanId
 
 							var { results } = await app.fetch({
-								url : reqUrl( cookies, app.filters, { from: cookies.address, to : cookies.team, href : window.location.href } ),
+								url : reqUrl( cookies, app.filters, { from: cookies.address, to : cookies.team, href : window.location.href, ref : scanId } ),
 								method: 'POST',
 								headers: {
 									'Content-Type': 'application/octet-stream',
@@ -5077,9 +5090,8 @@
 					}
 				
 
-					var pageId = hashId(cookies.team+cookies.cc+window.location.pathname)
-
-					var scanId = hashId(cookies.team+cookies.cc+window.location.pathname+window.location.search)
+					var link = window.location.pathname + window.location.search
+					var scanId = hashId(cookies.cc + link)
 
 					var crons = await Select['crons']({
 						key : 'ref',
@@ -5132,39 +5144,12 @@
 							cleanStates()
 
 							
-							app.filters.scan = hashId(cookies.team+cookies.cc+body)
-
-							console.log('app.filters.scan',app.filters.scan);
-
-
-							var url = new URL(window.location.href)
-
-							var filters = {}
-
-
-							if(Object.keys(app.filters.page).length){
-								var _link = url.pathname + url.search
-								if(
-									url.origin == app.filters.page.data.origin && 
-									_link == app.filters.page.data.link
-									){
-									filters = app.filters
-								}
-								
-							}
-							
-							console.log('{ from: cookies.address, to : cookies.team }',{ from: cookies.address, to : cookies.team });
-
-
-							$app.classList.add(selector.scanning)
-
-							$app.classList.add(selector.loading)
-
-							// console.log('body',body);
-							// return
+							var link = window.location.pathname + window.location.search
+							var scanId = hashId(cookies.cc + link)
+							app.filters.scan = scanId
 
 							var { results } = await app.fetch({
-								url : reqUrl( cookies, filters, { from: cookies.address, to : cookies.team, href : url.href, format : 'text/html' } ),
+								url : reqUrl( cookies, filters, { from: cookies.address, to : cookies.team, href : url.href, format : 'text/html', ref : scanId } ),
 								method: 'POST',
 								headers: {
 									'Content-Type': 'application/octet-stream',

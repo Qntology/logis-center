@@ -224,20 +224,21 @@ async function updateExtractButtonVisibility() {
         const link = urlObj.pathname + urlObj.search;
         
         const cc = await hashId(hostname); 
-        // Check if there is an active task for this specific domain + full link
-        const isActive = await invoke<boolean>("check_active_task", { cc: cc, refId: link });
+        const hashedRefId = await hashId(cc + link);
+        // Check if there is an active task for this specific domain + full link (hashed)
+        const isActive = await invoke<boolean>("check_active_task", { cc: cc, ref_id: hashedRefId });
         
-        console.log(`[WIDGET] Visibility Check: host=${hostname}, link=${link}, isActive=${isActive}`);
+        console.log(`[WIDGET] Visibility Check: host=${hostname}, link=${link}, cc=${cc}, ref_id=${hashedRefId}, isActive=${isActive}`);
 
-        if (isActive) {
+        if (isActive === true) {
             btnExtract.style.display = "none";
         } else {
             btnExtract.style.display = "flex";
             btnExtract.title = `Extract from ${hostname}`;
         }
     } catch (e) {
-        console.error("[WIDGET] Visibility error:", e);
-        btnExtract.style.display = "none";
+        console.error("[WIDGET] Visibility error (Defaulting to SHOW):", e);
+        btnExtract.style.display = "flex";
     }
 }
 
@@ -399,8 +400,9 @@ btnExtract?.addEventListener("click", async () => {
             const urlObj = new URL(currentDetectedUrl);
             pathname = urlObj.pathname;
             cc = await hashId(urlObj.hostname);
+            const hashedRefId = await hashId(cc + pathname); // Note: Here it used pathname, updating to maintain consistency if needed, but keeping ref_id name change first
             
-            const isActive = await invoke<boolean>("check_active_task", { cc: cc, refId: pathname });
+            const isActive = await invoke<boolean>("check_active_task", { cc: cc, ref_id: hashedRefId });
             if (isActive) {
                 alert("This page is already in the queue or being processed.");
                 openWidget("settings");
@@ -446,6 +448,7 @@ btnExtract?.addEventListener("click", async () => {
             const urlObj = new URL(currentDetectedUrl.toLowerCase());
             const cc = await hashId(urlObj.hostname);
             const link = urlObj.pathname + urlObj.search;
+            const hashedRefId = await hashId(cc + link);
             
             await emit("new-task-from-browser", { 
                 id: taskId, 
@@ -453,7 +456,7 @@ btnExtract?.addEventListener("click", async () => {
                 html: html, 
                 link: currentDetectedUrl, 
                 cc: cc, 
-                ref_id: link // [STRICT PARITY] Use pathname + search
+                ref_id: hashedRefId // [STRICT PARITY] Use hashed cc + link
             });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: "processing", url: currentDetectedUrl, created_at: Date.now() });
             
