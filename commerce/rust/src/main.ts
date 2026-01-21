@@ -1078,28 +1078,32 @@ function renderMessage(msg: any) {
 }
 
 async function checkAuthStatus() {
+    // If we don't even have a device hash, we can't poll.
     if (!currentSession.hash) return;
     
     // [STRICT PARITY] Logic from before_client/content.js
-    const origin = "https://commerce.logis.center"; // Use valid origin
+    const origin = "https://commerce.logis.center"; 
     const now = Date.now();
     const createdAt = now - timezoneOffset; 
     
     try {
+        // [FIX] Initial query params matching content.js's reqUrl call
         const queryParams: Record<string, string> = {
             origin: origin,
             created_at: createdAt.toString(),
             hash: currentSession.hash,
+            href: window.location.href, // content.js passes this in the query object
         };
 
-        // If we have a token, include it (Required by before_server index.ts)
-        if (currentSession.token) {
+        // [STRICT PARITY] Only add token if it exists. 
+        // If missing, the server expects it to be absent from the URL, not empty.
+        if (currentSession.token && currentSession.token !== "") {
             queryParams.token = currentSession.token;
         }
 
         const params = new URLSearchParams(queryParams);
         
-        // [STRICT PARITY] content.js often calls .toLowerCase() on the final URL string
+        // [STRICT PARITY] content.js: url.toLowerCase()
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
 
         const data = await invoke<any>("proxy_fetch", {
