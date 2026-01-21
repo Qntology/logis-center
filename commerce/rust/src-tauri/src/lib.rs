@@ -30,11 +30,24 @@ pub struct AppState {
 async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, String> {
     state.cancellation_token.store(true, Ordering::SeqCst);
     
-    // Force drop model to release VRAM/RAM
+    // 1. Force drop model to release VRAM/RAM immediately
     let mut model_guard = state.model.lock().await;
     *model_guard = None;
-    println!("[STOP] Model dropped and resources released.");
-
+    
+    // 2. Immediately update DB to clear active tasks so they disappear from UI
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        // We find any tasks that were pending/progress and mark as cancelled
+        // This is a simplified bulk update for local parity
+        if let Ok(active_tasks) = db.get_pending_tasks(50).await {
+            for task in active_tasks {
+                let _ = db.update_task_status(&task.id, 3).await; // 3 = Cancelled
+                let _ = db.update_message_status(&task.id, 3, Some("Force stopped by user")).await;
+            }
+        }
+    }
+    
+    println!("[STOP] Cancellation signal sent, model dropped, and DB tasks marked as cancelled.");
     Ok("Stop signal sent and resources released.".to_string())
 }
 

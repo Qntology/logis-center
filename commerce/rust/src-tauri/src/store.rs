@@ -207,7 +207,9 @@ impl VectorStore {
 
     pub async fn get_pending_tasks(&self, limit: usize) -> Result<Vec<Task>> {
         let table = self.conn.open_table("tasks").execute().await?;
-        let results = table.query().only_if("status = 10").limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
+        // [FIX] Include both pending (10) and in-progress (1) tasks
+        let filter = "status = 10 OR status = 1";
+        let results = table.query().only_if(filter).limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut tasks = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
