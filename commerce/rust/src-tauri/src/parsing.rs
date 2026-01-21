@@ -14,11 +14,11 @@ pub fn pre_clean_html(html: &str) -> String {
     let html = re_comm.replace_all(html, "");
 
     // 2. 분류/추출에 전혀 필요 없는 태그들 통째로 제거 (Proxy 로직 반영)
-    // script, style, svg, noscript, iframe, head, meta, link, canvas
-    let re_tags = Regex::new(r"(?is)<(script|style|svg|noscript|iframe|head|meta|link|canvas)\b[^>]*>.*?</\1>").unwrap();
+    // 역참조(\1)를 지원하지 않으므로 각 태그를 명시적으로 처리하거나 합쳐서 처리
+    let re_tags = Regex::new(r"(?is)<(script|style|svg|noscript|iframe|head|meta|link|canvas)\b[^>]*>.*?</(script|style|svg|noscript|iframe|head|meta|link|canvas)>").unwrap();
     let html = re_tags.replace_all(&html, "");
 
-    // 3. 닫는 태그가 없는 단일 태그들 정리 (link, meta 등은 위에서 처리됨)
+    // 3. 닫는 태그가 없는 단일 태그들 정리
     let re_single = Regex::new(r"(?is)<(meta|link|br|hr|img)\b[^>]*>").unwrap();
     // 분류 단계에서 img는 맥락을 해칠 수 있으므로 제거하거나 최소화
     let clean = re_single.replace_all(&html, |caps: &regex::Captures| {

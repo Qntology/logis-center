@@ -81,6 +81,13 @@ async fn start_drag(app_handle: tauri::AppHandle) {
 }
 
 #[tauri::command]
+async fn move_to_center(app_handle: tauri::AppHandle) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.center();
+    }
+}
+
+#[tauri::command]
 async fn move_to_top_center(app_handle: tauri::AppHandle) {
     if let Some(window) = app_handle.get_webview_window("main") {
         if let Ok(Some(monitor)) = window.current_monitor() {
