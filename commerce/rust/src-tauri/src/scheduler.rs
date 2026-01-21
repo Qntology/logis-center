@@ -157,8 +157,16 @@ pub async fn start_background_worker(
             }
 
             for task in pending_tasks {
+                // [FIX] Do NOT reset the cancellation token here. 
+                // It should only be reset at the start of the entire loop iteration if needed,
+                // or managed by the command that starts the extraction.
+                
+                if cancellation_token.load(Ordering::Relaxed) {
+                    println!("[Scheduler] Cancellation detected before starting task {}, skipping batch.", task.id);
+                    break;
+                }
+
                 println!("[Scheduler] Processing task: {}", task.id);
-                cancellation_token.store(false, Ordering::SeqCst);
                 
                 {
                     let store_guard = store.lock().await;
@@ -187,7 +195,8 @@ pub async fn start_background_worker(
                                 "task_id": task.id,
                                 "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
-                             break; // Stop processing pending tasks batch to prevent immediate model reload
+                             // [STRICT] Break the for-loop to stop the entire batch
+                             break; 
                         } else {
                             println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, e);
                             let store_guard = store.lock().await;
@@ -198,6 +207,9 @@ pub async fn start_background_worker(
                     }
                 }
             }
+            
+            // Reset token after batch is done or broken, for the next poll
+            cancellation_token.store(false, Ordering::SeqCst);
         }
     });
 }
@@ -498,6 +510,15 @@ async fn process_task(
                     crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
                 } else { task.to_dest.clone() };
                 
+                // [FIX] Enrich selector_info with origin/link for the Tree UI
+                let mut page_data = selector_info.clone();
+                if let Some(obj) = page_data.as_object_mut() {
+                    let url_obj = url::Url::parse(&url).unwrap();
+                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                    obj.insert("link".to_string(), json!(url_obj.path()));
+                    obj.insert("type".to_string(), json!(page_type));
+                }
+
                 // pageId follows server logic: hashId(cc + pathname)
                 let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, task.ref_id)); 
                 let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
@@ -507,7 +528,7 @@ async fn process_task(
                     "pages", 
                     &page_id, 
                     "pages", 
-                    selector_info.clone(), 
+                    page_data, 
                     None,
                     Some(&task.from_source),
                     Some(&team_id),

@@ -262,11 +262,15 @@ listen("browser-match-found", async (event: any) => {
 searchInput?.addEventListener("focus", () => {
     openWidget("list");
     
-    // [NEW] Show Navigation Overlay and render learned pages
     const navOverlay = document.getElementById("nav-categories");
     if (navOverlay) {
         navOverlay.classList.remove("hidden");
         renderNavigation();
+        
+        // [FIX] Scroll to the very top to make sure Tree/Accordion is visible
+        if (listScrollContainer) {
+            listScrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
+        }
     }
 
     if (cachedDocs.length === 0) refreshList();
@@ -283,44 +287,81 @@ async function renderNavigation() {
     if (!pageList || !userList) return;
 
     try {
-        // 1. Fetch and Render Pages
+        // 1. Fetch Pages and Build Tree (Strict Legacy Parity)
         const pages = await invoke<any[]>("get_known_pages");
         pageList.innerHTML = "";
+        
         if (pages.length === 0) {
-            pageList.innerHTML = "<div style='color:#666; padding:10px; font-size:0.75rem;'>No pages learned yet.</div>";
+            pageList.innerHTML = "<div style='color:#666; padding:10px; font-size:0.75rem;'>No pages learned.</div>";
         } else {
+            const branchs: any = {};
             pages.forEach(p => {
-                const data = JSON.parse(p.json_data);
-                const div = document.createElement("div");
-                div.className = "scroll-item";
-                div.style.padding = "10px";
-                div.style.borderBottom = "1px solid #222";
-                div.style.cursor = "pointer";
+                let data: any = {};
+                try { 
+                    data = typeof p.json_data === 'string' ? JSON.parse(p.json_data) : p.json_data; 
+                } catch(e) {
+                    data = { origin: "Unknown Site", type: p.doc_type };
+                }
                 
-                div.innerHTML = `
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                        <strong style="color:var(--primary); font-size:0.75rem; background:#331111; padding:2px 6px; border-radius:3px;">${p.doc_type.toUpperCase()}</strong>
-                        <span style="font-size:0.65rem; color:#555;">${data.detail ? 'DETAIL' : 'LIST'}</span>
+                // Fallback for origin if missing
+                const origin = data.origin || "learned-pages.center";
+                const docType = p.doc_type || "general";
+                const groupKey = `${origin}#${docType}`;
+                
+                if (!branchs[groupKey]) {
+                    branchs[groupKey] = { 
+                        id: groupKey, 
+                        text: origin.replace("https://", "").replace("http://", ""), 
+                        type: docType, 
+                        children: [] 
+                    };
+                }
+                branchs[groupKey].children.push({ ...p, data });
+            });
+
+            Object.values(branchs).forEach((branch: any) => {
+                const section = document.createElement("div");
+                section.className = "nav-accordion-section";
+                section.innerHTML = `
+                    <div class="nav-accordion-header" style="display:flex; justify-content:space-between; align-items:center; padding:8px 10px; cursor:pointer; background:#1a1a1a; border-bottom:1px solid #222;">
+                        <span style="font-size:0.75rem; font-weight:bold; color:var(--primary);">${branch.type.toUpperCase()} <small style="color:#666; font-weight:normal;">${branch.text}</small></span>
+                        <span class="toggle-icon">▼</span>
                     </div>
-                    <div style="font-size:0.75rem; color:#eee; font-weight:bold;">${p.text || 'Unknown Site'}</div>
-                    <div style="font-size:0.65rem; color:#444; font-family:monospace; margin-top:2px; word-break:break-all;">ID: ${p.uuid.slice(0,12)}...</div>
+                    <div class="nav-accordion-content hidden" style="background:#111;">
+                        ${branch.children.map((c: any) => `
+                            <div class="nav-child-item" data-id="${c.uuid}" style="padding:6px 20px; font-size:0.7rem; color:#aaa; cursor:pointer; border-bottom:1px solid #1a1a1a;">
+                                • ${c.text || 'Untitled Page'}
+                            </div>
+                        `).join("")}
+                    </div>
                 `;
-                
-                div.onclick = () => {
-                    hideNavigation();
-                    searchInput.value = `type:${p.doc_type}`;
-                    btnSubmit.click();
+
+                const header = section.querySelector(".nav-accordion-header") as HTMLElement;
+                const content = section.querySelector(".nav-accordion-content") as HTMLElement;
+                const icon = section.querySelector(".toggle-icon") as HTMLElement;
+
+                header.onclick = () => {
+                    content.classList.toggle("hidden");
+                    icon.innerText = content.classList.contains("hidden") ? "▼" : "▲";
                 };
-                pageList.appendChild(div);
+
+                section.querySelectorAll(".nav-child-item").forEach((item: any) => {
+                    item.onclick = (e: Event) => {
+                        e.stopPropagation();
+                        hideNavigation();
+                        searchInput.value = `type:${branch.type}`; 
+                        btnSubmit?.click();
+                    };
+                });
+
+                pageList.appendChild(section);
             });
         }
 
-        // 2. Fetch and Render Users
+        // 2. Fetch and Render Users (Tree/Accordion for Team)
         const users = await invoke<any[]>("get_known_users");
         userList.innerHTML = "";
-        if (users.length === 0) {
-            userList.innerHTML = "<div style='color:#666; padding:10px; font-size:0.75rem;'>No team members found.</div>";
-        } else {
+        if (users.length > 0) {
             users.forEach(u => {
                 const div = document.createElement("div");
                 div.className = "scroll-item";
@@ -331,7 +372,7 @@ async function renderNavigation() {
                         <div style="width:24px; height:24px; border-radius:50%; background:#333; display:flex; align-items:center; justify-content:center; font-size:0.6rem; color:var(--primary); border:1px solid var(--primary);">U</div>
                         <div>
                             <div style="font-size:0.75rem; font-weight:bold; color:#fff;">${u.uuid.slice(0,8)}</div>
-                            <div style="font-size:0.65rem; color:#555;">${u.doc_type || 'Active Member'}</div>
+                            <div style="font-size:0.65rem; color:#555;">${u.doc_type || 'Member'}</div>
                         </div>
                     </div>
                 `;
@@ -445,15 +486,8 @@ btnExtract?.addEventListener("click", async () => {
 
     setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
 
-    // Initial View setup (only for the first task or to see progress)
-    if (!isExtracting) {
-        openWidget("list");
-        listView.style.display = "none";
-        detailView.style.display = "flex";
-        if (btnDetailDelete) btnDetailDelete.style.display = "none";
-        if (btnStopTask) btnStopTask.style.display = "flex";
-    }
-
+    // Initial View setup: Go to Settings (Chat) to see history
+    openWidget("settings");
     startSpinner();
     
     if (currentImage) {
@@ -461,28 +495,20 @@ btnExtract?.addEventListener("click", async () => {
         const taskId = `img_${Date.now()}`;
         try {
             await emit("new-task-from-browser", { id: taskId, type: "image_extraction", image_path: currentImage, ref_id: currentImage, link: "Local Image" });
-            renderMessage({ id: taskId, role: "system_task", content: `Queued: Image Analysis`, status: "processing", created_at: Date.now() });
+            renderMessage({ id: taskId, role: "system_task", content: `Queued: Image Analysis`, status: 10, task_id: taskId, created_at: Date.now() });
             await updateExtractButtonVisibility();
         } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
     } else {
         isExtracting = true;
         let taskId = `task_${Date.now()}`;
         try {
-            // Normalize current URL to lowercase for consistent ID generation
+            const html = await invoke<string>("extract_html_from_current_tab");
             const normalizedUrl = currentDetectedUrl.toLowerCase();
             const urlObj = new URL(normalizedUrl);
             const cc = await hashId(urlObj.hostname);
             const link = urlObj.pathname + urlObj.search;
             const hashedRefId = await hashId(cc + link);
             
-            const isActive = await invoke<boolean>("check_active_task", { cc: cc, ref_id: hashedRefId });
-            if (isActive) {
-                alert("This page is already in the queue or being processed.");
-                openWidget("settings");
-                await updateExtractButtonVisibility();
-                return;
-            }
-
             await emit("new-task-from-browser", { 
                 id: taskId, 
                 type: "html_extraction", 
@@ -491,9 +517,9 @@ btnExtract?.addEventListener("click", async () => {
                 cc: cc, 
                 ref_id: hashedRefId 
             });
-            renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: "processing", url: currentDetectedUrl, created_at: Date.now() });
+            // Task ID and hashedRefId are both important: taskId for Task, hashedRefId for Result Document
+            renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: 10, task_id: hashedRefId, created_at: Date.now() });
             
-            openWidget("settings");
             await updateExtractButtonVisibility();
         } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
     }
@@ -581,11 +607,26 @@ listen("extraction-progress", async (event: any) => {
 });
 
 btnStopTask?.addEventListener("click", async () => {
-    if (await ask("Stop current extraction?", { title: "Logis AI", kind: "warning" })) {
-        await invoke("stop_current_extraction");
-        isExtracting = false; stopSpinner();
-        if (btnStopTask) btnStopTask.style.display = "none";
-        if (btnExtract) btnExtract.innerText = "⚡";
+    let confirmed = false;
+    try {
+        confirmed = await ask("Stop the current extraction?", { title: "Stop Task", kind: "warning" });
+    } catch (e) {
+        console.warn("Dialog plugin not available, using fallback confirm.");
+        confirmed = window.confirm("Stop the current extraction?");
+    }
+
+    if (confirmed) {
+        try {
+            const res = await invoke<string>("stop_current_extraction");
+            isExtracting = false;
+            stopSpinner();
+            if (btnStopTask) btnStopTask.style.display = "none";
+            detailTitle.innerText = "Stopped";
+            detailContent.innerHTML = "<div style='color:#ef4444; padding:20px;'>Extraction stopped by user.</div>";
+            await updateExtractButtonVisibility();
+        } catch (e) {
+            console.error("Stop failed:", e);
+        }
     }
 });
 
@@ -753,7 +794,14 @@ async function showDetail(uuid: string) {
 }
 
 btnDetailBack?.addEventListener("click", () => { detailView.style.display = "none"; listView.style.display = "block"; });
+document.getElementById("btn-settings-back")?.addEventListener("click", collapseWidget);
 btnListBack?.addEventListener("click", collapseWidget);
+
+// [NEW] Tree Profile Actions
+document.getElementById("nav-signin")?.addEventListener("click", () => openWidget("settings"));
+document.getElementById("nav-signout")?.addEventListener("click", () => {
+    document.getElementById("btn-logout")?.click();
+});
 
 // --- 4. Image Logic ---
 async function handleImageUpload(path: string) {
@@ -872,9 +920,12 @@ function renderMessage(msg: any) {
     let msgId = `msg-${msg.id}`;
     let existing = document.getElementById(msgId);
     
+    const isSystemTask = msg.role === "system_task";
     const roleClass = msg.role === "user" ? "user-msg" : "system-msg";
     
-    // [STRICT MAPPING] Map numeric codes to labels and icons
+    // Ensure we have a valid task identifier for interaction
+    const activeTaskId = msg.task_id || msg.id;
+    
     const statusMap: any = {
         1: { icon: "⏳", text: "processing" },
         2: { icon: "🛑", text: "stopped" },
@@ -884,25 +935,55 @@ function renderMessage(msg: any) {
         10: { icon: "📥", text: "pending" }
     };
 
-    const currentStatus = statusMap[msg.status] || { icon: "⏳", text: msg.status || "processing" };
+    const currentStatus = statusMap[msg.status] || { icon: "⏳", text: "processing" };
     const timeStr = new Date(msg.created_at || Date.now()).toLocaleTimeString();
 
     const html = `
-        <div class="message-bubble ${roleClass}" id="${msgId}" ${msg.role === 'system_task' ? `style="cursor:pointer;" onclick="document.dispatchEvent(new CustomEvent('view-task-log'))"` : ''}>
-            <div class="msg-header">
-                <span>${msg.role === "user" ? "@You" : "🤖 System"}</span>
-                <span class="msg-time">${timeStr}</span>
+        <div class="message-bubble ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" 
+             id="${msgId}" 
+             data-task-id="${activeTaskId}" 
+             data-status="${msg.status}"
+             style="${isSystemTask ? 'cursor:pointer; border-left: 3px solid var(--primary); padding: 10px; margin-bottom: 8px;' : ''}">
+            <div class="msg-header" style="display:flex; justify-content:space-between; margin-bottom:4px;">
+                <span style="font-size:0.7rem; opacity:0.7;">${msg.role === "user" ? "@You" : "🤖 System"}</span>
+                <span class="msg-time" style="font-size:0.6rem; opacity:0.5;">${timeStr}</span>
             </div>
-            <div class="msg-content">${msg.content}</div>
-            ${msg.status ? `<div class="msg-status">${currentStatus.icon} ${currentStatus.text}</div>` : ""}
+            <div class="msg-content" style="font-size:0.85rem; line-height:1.4;">${msg.content}</div>
+            ${msg.status ? `<div class="msg-status" style="margin-top:6px; font-size:0.65rem; font-weight:bold; color:var(--primary);">${currentStatus.icon} ${currentStatus.text.toUpperCase()}</div>` : ""}
         </div>
     `;
 
     if (existing) {
         existing.outerHTML = html;
     } else {
-        chatTalks.innerHTML += html;
+        chatTalks.insertAdjacentHTML('beforeend', html);
     }
+
+    // Bind Click Logic to the newly rendered bubble
+    const newEl = document.getElementById(msgId);
+    if (newEl && isSystemTask) {
+        newEl.onclick = () => {
+            const taskId = newEl.getAttribute("data-task-id");
+            const status = parseInt(newEl.getAttribute("data-status") || "0");
+            
+            if (status === 9 && taskId) {
+                showDetail(taskId); 
+            } else if (taskId) {
+                openWidget("list"); 
+                listView.style.display = "none";
+                detailView.style.display = "flex";
+                
+                detailTitle.innerText = "Task Progress";
+                const logArea = document.getElementById("extraction-log");
+                if (logArea && logArea.dataset.activeTaskId !== taskId) {
+                    logArea.innerHTML = `<div style='color:var(--primary); padding:10px;'>📡 Monitoring Task: ${taskId.slice(0,8)}...</div>`;
+                    logArea.dataset.activeTaskId = taskId;
+                }
+                if (btnStopTask) btnStopTask.style.display = "flex";
+            }
+        };
+    }
+
     chatTalks.scrollTop = chatTalks.scrollHeight;
 }
 

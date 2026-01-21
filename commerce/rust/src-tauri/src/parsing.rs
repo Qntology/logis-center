@@ -247,6 +247,8 @@ Analyze the provided Pug template snippet and identify the structural CSS1 selec
 [SCHEMA DEFINITIONS]
 - item: type based item CSS1 selector excluding ads
 - node: item parent list CSS1 selector excluding ads
+- more: item URL includes a manage path, an administrative or edit route Link CSS1 selector
+- next: list next button CSS1 selector
 - detail: is a detail page or a detail form
 
 [OUTPUT FORMAT]
@@ -254,6 +256,8 @@ Return valid JSON only. No explanation.
 {{
     "item": "",
     "node": "",
+    "more": "",
+    "next": "",
     "detail": boolean
 }}
 

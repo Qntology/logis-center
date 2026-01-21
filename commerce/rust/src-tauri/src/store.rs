@@ -157,7 +157,8 @@ impl VectorStore {
 
     pub async fn get_all_messages(&self, limit: usize) -> Result<Vec<Value>> {
         let table = self.conn.open_table("talks").execute().await?;
-        let results = table.query().limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
+        // Query and then sort by created_at in Rust since LanceDB sorting can be complex on small batches
+        let mut results = table.query().limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -167,9 +168,17 @@ impl VectorStore {
             let statuses = batch.column(4).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             let createds = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..batch.num_rows() {
-                msgs.push(json!({"id": ids.value(i), "role": roles.value(i), "content": contents.value(i), "task_id": task_ids.value(i), "status": statuses.value(i), "created_at": createds.value(i)}));
+                msgs.push(json!({
+                    "id": ids.value(i), 
+                    "role": roles.value(i), 
+                    "content": contents.value(i), 
+                    "task_id": task_ids.value(i), 
+                    "status": statuses.value(i), 
+                    "created_at": createds.value(i)
+                }));
             }
         }
+        msgs.sort_by_key(|m| m["created_at"].as_i64().unwrap_or(0));
         Ok(msgs)
     }
 
