@@ -852,13 +852,11 @@ async fn process_task(
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
         let detail_session_id = format!("{}_detail", task.id);
         
-        // Phase 1: Ingest all chunks (Prefill)
-        let chunks_len = chunks.len();
-        let mut full_context_accumulated = String::new(); // Accumulate context here
-        
-                                for (chunk_idx, chunk) in chunks.iter().enumerate() {
-        
-                                    let is_last = chunk_idx == chunks_len - 1;
+                // Phase 1: Ingest all chunks (Prefill)
+                let chunks_len = chunks.len();
+                
+                for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                                            let is_last = chunk_idx == chunks_len - 1;
         
                                     
         

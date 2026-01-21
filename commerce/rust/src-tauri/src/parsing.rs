@@ -324,7 +324,7 @@ pub fn graph2contexts(current: &str) -> String {
     }}"###, current)
 }
 
-pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
+pub fn item2json(page_type: &str, href: &str, _language: &str) -> String {
     let schema = match page_type {
         "tracking" => r###"node:tracking form container CSS1 selector,
 status:{
@@ -406,281 +406,281 @@ shipping_date:{
 registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-},"###,
-        "goods" => r###"node:goods form container CSS1 selector,
-code:{
+},"###.to_string(),
+        "goods" => format!(r###"node:goods form container CSS1 selector,
+code:{{
     value:product constant code | string,
     selector:selector
-},
-link:'{HREF}',
-id:{
+}},
+link:'{}',
+id:{{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
-},
-status:{
+}},
+status:{{
     value:'draft' or 'show' or 'hide' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
     selector:selector
-},
-payment_method:{
+}},
+payment_method:{{
     value:payment method | string,
     selector:selector
-},
-bank:{
+}},
+bank:{{
     value:bank company name or '' | string,
     selector:selector
-},
-card:{
+}},
+card:{{
     value:card company name or '' | string,
     selector:selector
-},
-model_name:{
+}},
+model_name:{{
     value:product Model name | string,
     selector:selector
-},
-brand_name:{
+}},
+brand_name:{{
     value:product Brand name | string,
     selector:selector
-},
-condition:{
+}},
+condition:{{
     value:['new' or 'used' or 'lease' or 'rental' or 'refurbish'],
     selector:selector
-},
-description:{
+}},
+description:{{
     value:product Full description (HTML allowed) | string,
     selector:selector
-},
-short_description:{
+}},
+short_description:{{
     value:product short description | string,
     selector:selector
-},
-tags:{
-    value:[{ tag : product keyword or tag | string }],
+}},
+tags:{{
+    value:[{{ tag : product keyword or tag | string }}],
     selector:selector
-},
-origin_country:{
+}},
+origin_country:{{
     value:product Country of origin/manufacture | string,
     selector:selector
-},
-manufacturer:{
+}},
+manufacturer:{{
     value:product Manufacturer name | string,
     selector:selector
-},
-release_date:{
+}},
+release_date:{{
     value:Product release date(yyyy-MM-ddThh:mm:ss) | string,
     selector:selector
-},
-manufacture_date:{
+}},
+manufacture_date:{{
     value:product Date(yyyy-MM-ddThh:mm:ss) of manufacture | string,
     selector:selector
-},
-expiration_date:{
+}},
+expiration_date:{{
     value:product Expiration or use-by date(yyyy-MM-ddThh:mm:ss) | string,
     selector:selector
-},
-gtin:{
+}},
+gtin:{{
     value:product Global Trade Item Number | string,
     selector:selector
-},
-mpn:{
+}},
+mpn:{{
     value:product Manufacturer Part Number | string,
     selector:selector
-},
-barcode:{
+}},
+barcode:{{
     value:product Barcode value | string,
     selector:selector
-},
-sale_price:{
+}},
+sale_price:{{
     value:product sale price | number,
     selector:selector
-},
-supply_price:{
+}},
+supply_price:{{
     value:product supply price | number,
     selector:selector
-},
-currency:{
+}},
+currency:{{
     value:ISO 4217 Currency Code | string,
     selector:selector
-},
-compare_at_price:{
+}},
+compare_at_price:{{
     value:product Original price for showing discounts | number,
     selector:selector
-},
-quantity:{
+}},
+quantity:{{
     value:product Inventory quantity | number,
     selector:selector
-},
-stock_keeping_unit:{
+}},
+stock_keeping_unit:{{
     value:Stock Keeping Unit | string,
     selector:selector
-},
-low_stock_threshold:{
+}},
+low_stock_threshold:{{
     value:product Low stock alert threshold | number,
     selector:selector
-},
-unit:{
+}},
+unit:{{
     value:product Selling unit | string,
     selector:selector
-},
-tax_included:{
+}},
+tax_included:{{
     value:product Whether tax | number,
     selector:selector
-},
-tax_code:{
+}},
+tax_code:{{
     value:product Tax code for region-specific rules | string,
     selector:selector
-},
-main_image_url:{
+}},
+main_image_url:{{
     value:Main product image URL | string,
     selector:selector
-},
-additional_image_url:{
+}},
+additional_image_url:{{
     value:additional product image URL | string,
     selector:selector
-},
-video_url:{
+}},
+video_url:{{
     value:product Promotional video URL | string,
     selector:selector
-},
-carrier:{
+}},
+carrier:{{
     value:product carrier name translated into English | string,
     selector:selector
-},
-shipping_fee:{
+}},
+shipping_fee:{{
     value:product Shipping cost | number,
     selector:selector
-},
-shipping_method:{
+}},
+shipping_method:{{
     value:'standard' or 'express' or 'same_day' or 'pick_up' or 'freight' or 'prepaid',
     selector:selector
-},
-shipping_duration:{
+}},
+shipping_duration:{{
     value:product Estimated delivery days | number,
     selector:selector
-},
-bundle_shipping:{
+}},
+bundle_shipping:{{
     value:product Allow combined shipping | string,
     selector:selector
-},
-product_width:{
+}},
+product_width:{{
     value:Package width(cm) | number,
     selector:selector
-},
-product_height:{
+}},
+product_height:{{
     value:Package height(cm) | number,
     selector:selector
-},
-product_length:{
+}},
+product_length:{{
     value : Package length(cm) | number,
     selector:selector
-},
-product_weight:{
+}},
+product_weight:{{
     value : Package weight(kg) | number,
     selector:selector
-},
+}},
 options:[
-    {
+    {{
         value:option name | string,
         selector:selector,
-        inputs:[{
+        inputs:[{{
             value:option input value | string,
             selector:selector
-        }]
-    }
+        }}]
+    }}
 ],
 additional_goods:[
-    {
+    {{
         value:URL includes a manage path, an administrative or edit route product Link | string,
         selector:selector
-    }
+    }}
 ],
-title:{
+title:{{
     value:product based title | string,
     selector:selector
-},
-registration_date:{
+}},
+registration_date:{{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-},"###,
-        "order" => r###"node:order form container CSS1 selector,
-link : '{HREF}',
-id:{
+}},"###, href),
+        "order" => format!(r###"node:order form container CSS1 selector,
+link : '{}',
+id:{{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
-},
-tracking_number:{
+}},
+tracking_number:{{
     value:tracking number | string,
     selector:selector
-},
-status:{
+}},
+status:{{
     value:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
     selector:selector
-},
-goods:[{
-    title:{
+}},
+goods:[{{
+    title:{{
         value:goods title | string,
         selector:selector
-    },
-    link:{
+    }},
+    link:{{
         value:URL includes a manage path, an administrative or edit route goods Link | string,
         selector:selector
-    },
-    id:{
+    }},
+    id:{{
         value:Refer to the product no value from the link or an attribute or input value | string,
         selector:selector
-    }
-}],
-sender_name:{
+    }}
+}}],
+sender_name:{{
     value:sender_name | string,
     selector:selector
-},
-sender_address:{
+}},
+sender_address:{{
     value:sender_address, Filter the addresses to District-level and up | string,
     selector:selector
-},
-sender_phone:{
+}},
+sender_phone:{{
     value:sender_phone | string,
     selector:selector
-},
-recipient_name:{
+}},
+recipient_name:{{
     value:recipient_name | string,
     selector:selector
-},
-recipient_address:{
+}},
+recipient_address:{{
     value:recipient_address, Filter the addresses to District-level and up | string,
     selector:selector
-},
-recipient_phone:{
+}},
+recipient_phone:{{
     value:recipient_phone | string,
     selector:selector
-},
-bank:{
+}},
+bank:{{
     value:bank company name | string,
     selector:selector
-},
-card:{
+}},
+card:{{
     value:card company name | string,
     selector:selector
-},
-order_date:{
+}},
+order_date:{{
     value:order date | string,
     selector:selector
-},
-payment_date:{
+}},
+payment_date:{{
     value:payment date or '' | string,
     selector:selector
-},
-payment_method:{
+}},
+payment_method:{{
     value:'C.O.D.' or 'CARD' or 'BANK' or '' | string,
     selector:selector
-},
-payment_origin:{
+}},
+payment_origin:{{
     value:Payment Gateway Service Name or '' | string,
     selector:selector
-},
-registration_date:{
+}},
+registration_date:{{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-},"###,
+}},"###, href),
         "coupon" | "event" => format!(r###"node:{} container CSS1 selector,
 link : '{}',
 id:{{
