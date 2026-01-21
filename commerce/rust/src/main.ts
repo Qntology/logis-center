@@ -157,7 +157,6 @@ function switchTab(tabName: string) {
     if (tabName === "settings") {
         settingsBtn?.classList.add("active-emoji", "active");
         fetchChatHistory();
-        if (!currentSession.email) performQrAuth();
     } else {
         settingsBtn?.classList.remove("active-emoji", "active");
     }
@@ -917,7 +916,7 @@ async function hashId(text: string): Promise<string> {
 }
 
 function updateAuthUI() {
-    const authStatus = document.getElementById("auth-status");
+    const authStatus = document.getElementById("auth-status-text");
     const btnLogout = document.getElementById("btn-logout");
     const btnQrAuth = document.getElementById("btn-qr-auth");
     const chatForm = document.querySelector(".chat-form") as HTMLElement;
@@ -937,9 +936,9 @@ function updateAuthUI() {
         if (btnQrAuth) btnQrAuth.style.display = "block";
         if (chatForm) chatForm.classList.add("hidden");
         
-        // Ensure QR is rendered in the chat flow
+        // Refresh history which will safely append QR at the end if needed
         if (currentTab === "settings") {
-            performQrAuth();
+            fetchChatHistory();
         }
     }
 }
@@ -947,23 +946,19 @@ function updateAuthUI() {
 async function performQrAuth() {
     if (!chatTalks || !currentSession.hash) return;
     
-    // Check if QR message already exists in chat
-    let qrMsg = document.getElementById("msg-qr-auth");
-    if (!qrMsg) {
-        const html = `
-            <div class="chat-talk system" id="msg-qr-auth">
-                <div class="chat-message" style="text-align: center; background: #fff; color: #000; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); margin: 10px;">
-                    <div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;">Verification Required</div>
-                    <div id="qr-code-target" style="display: inline-block; padding: 10px; background: #fff; border-radius: 8px;"></div>
-                    <div style="margin-top:15px; font-size:0.7rem; color:#666; line-height: 1.4;">
-                        Scan the QR code with your mobile<br>to sync your account.
-                    </div>
-                </div>
+    // Always remove existing QR message to ensure it appears at the very bottom
+    const existing = document.getElementById("msg-qr-auth");
+    if (existing) existing.remove();
+
+    const html = `
+        <div class="chat-talk system" id="msg-qr-auth">
+            <div class="chat-message" style="text-align: center; background: #fff; color: #000; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);">
+                <div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;">Scan the QR code</div>
+                <div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div>
             </div>
-        `;
-        chatTalks.insertAdjacentHTML('beforeend', html);
-        qrMsg = document.getElementById("msg-qr-auth");
-    }
+        </div>
+    `;
+    chatTalks.insertAdjacentHTML('beforeend', html);
 
     const qrTarget = document.getElementById("qr-code-target");
     if (qrTarget) {
@@ -1085,23 +1080,37 @@ function renderMessage(msg: any) {
 async function checkAuthStatus() {
     if (!currentSession.hash) return;
     
-    const origin = "https://commerce.logis.center"; 
-    const createdAt = Date.now();
+    // [STRICT PARITY] Logic from before_client/content.js
+    const origin = "https://commerce.logis.center"; // Use valid origin
+    const now = Date.now();
+    const createdAt = now - timezoneOffset; 
     
     try {
-        const params = new URLSearchParams({
+        const queryParams: Record<string, string> = {
             origin: origin,
             created_at: createdAt.toString(),
-        });
+            hash: currentSession.hash,
+        };
+
+        // If we have a token, include it (Required by before_server index.ts)
+        if (currentSession.token) {
+            queryParams.token = currentSession.token;
+        }
+
+        const params = new URLSearchParams(queryParams);
+        
+        // [STRICT PARITY] content.js often calls .toLowerCase() on the final URL string
+        const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
 
         const data = await invoke<any>("proxy_fetch", {
-            url: `${API_HOST}/?${params.toString()}`,
+            url: finalUrl,
             method: "GET",
             headers: {
                 "Content-Type": "application/json"
             },
             session_params: {
                 hash: currentSession.hash,
+                token: currentSession.token,
             }
         });
         
@@ -1210,11 +1219,16 @@ async function fetchChatHistory() {
         if (chatTalks) {
             chatTalks.innerHTML = ""; 
             if (messages && messages.length > 0) {
-                // Sort by creation time (ascending for the 180deg scroll trick)
+                // Sort by creation time (ascending)
                 messages.sort((a, b) => a.created_at - b.created_at);
                 messages.forEach(msg => renderMessage(msg));
             } else {
                 chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>";
+            }
+
+            // [FIX] After loading history, if still not logged in, show QR at the bottom
+            if (!currentSession.email && currentTab === "settings") {
+                performQrAuth();
             }
         }
     } catch (e) {

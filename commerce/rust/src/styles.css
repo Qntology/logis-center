@@ -194,6 +194,8 @@ body {
   color: #000;
 }
 
+#qr-code-target img{min-width: 220px}
+
 /* --- 2. Content Panel (Expandable) --- */
 .content-panel {
   width: 100%;

@@ -420,11 +420,9 @@ async fn proxy_fetch(
 ) -> Result<Value, String> {
 
     let client = reqwest::Client::builder()
-
         .use_native_tls()
-
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
-
         .map_err(|e| e.to_string())?;
 
 
@@ -464,37 +462,31 @@ async fn proxy_fetch(
 
 
     for (k, v) in headers { req_builder = req_builder.header(k, v); }
-
     if let Some(b) = body { req_builder = req_builder.json(&b); }
 
-
-
     let response = req_builder.send().await.map_err(|e| e.to_string())?;
-
     let status = response.status();
+    
+    // Read response as text first to handle non-JSON cases (HTML, error pages, etc.)
+    let text_res = response.text().await.map_err(|e| e.to_string())?;
 
-    let json_res: Value = response.json().await.map_err(|e| e.to_string())?;
-
-
-
-    // [DETAIL 3] Response Handling & LanceDB Sync
-
-    // If server returns items, we should sync them to local LanceDB in 'before_server' style
-
-    // (This part will be handled by a dedicated background sync function or here)
-
-
+    let json_res: Value = match serde_json::from_str(&text_res) {
+        Ok(v) => v,
+        Err(_) => {
+            // If it's not JSON but request was successful, wrap it or return as text
+            if status.is_success() {
+                json!({ "text": text_res })
+            } else {
+                return Err(format!("Server error {} (Not JSON): {}", status, text_res));
+            }
+        }
+    };
 
     if !status.is_success() {
-
         return Err(format!("Server returned {}: {}", status, json_res));
-
     }
 
-
-
     Ok(json_res)
-
 }
 
 
