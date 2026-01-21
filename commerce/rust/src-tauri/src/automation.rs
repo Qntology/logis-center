@@ -220,9 +220,14 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
         let build_config = || -> anyhow::Result<BrowserConfig> {
             let port_arg = format!("--remote-debugging-port={}", CHROME_DEBUG_PORT);
             let args = vec![
-                "--start-maximized", "--disable-gpu", "--no-first-run",
+                "--start-maximized", 
+                "--disable-gpu", 
+                "--disable-software-rasterizer",
+                "--disable-gpu-compositing",
+                "--no-first-run",
                 &port_arg,
-                "--remote-allow-origins=*", "--disable-extensions"
+                "--remote-allow-origins=*", 
+                "--disable-extensions"
             ];
             let mut builder = BrowserConfig::builder().chrome_executable(&exec_path).with_head().no_sandbox().viewport(None);
             let profile_dir = std::path::Path::new("browser_profiles").join(browser);
