@@ -171,11 +171,16 @@
                         <label for="system-toggle" class="system-label">System Message <i class="count"></i></label>
                         
                         <div class="chat-scroll" id="chat-scroll">
-                            <div class="qrcode"></div>
                             <div class="chat-talks"></div>
                             <div class="chat-bottom"></div>
                         </div>
                         
+                        <!-- QR Code Area (Visible only when NOT Authed) -->
+                        <div id="qr-code-container" style="display:none; padding: 20px; text-align: center; background: #fff; border-top: 1px solid #eee;">
+                            <div id="qr-code"></div>
+                            <p style="margin-top:10px; font-size:0.75rem; color:#333;">Scan to Login</p>
+                        </div>
+
                         <!-- Chat Input (Hidden until Authed) -->
                         <form name="chat-form" class="chat-form hidden">
                             <input type="text" name="talk" placeholder="Message..." required autocomplete="off">

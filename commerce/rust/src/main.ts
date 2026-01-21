@@ -1054,32 +1054,59 @@ function renderMessage(msg: any) {
 
 async function checkAuthStatus() {
     if (!currentSession.hash) return;
+    
+    const origin = "https://commerce.logis.center"; // Parity origin
+    const createdAt = Date.now();
+    
     try {
+        // [STRICT PARITY] Use /task endpoint with specific query params matches before_client
+        const params = new URLSearchParams({
+            origin: origin,
+            created_at: createdAt.toString(),
+            // 'to' parameter is typically hashId(cc + pathname) in client, 
+            // here we simulate the handshake
+        });
+
         const data = await invoke<any>("proxy_fetch", {
-            url: `${API_HOST}/auth/status`,
+            url: `${API_HOST}/?${params.toString()}`,
             method: "GET",
-            headers: {},
+            headers: {
+                "Content-Type": "application/json"
+            },
             session_params: {
-                hash: currentSession.hash
+                hash: currentSession.hash,
+                // token and cc are handled by proxy logic or can be added here
             }
         });
-        if (data && data.email) {
-            currentSession.email = data.email;
-            currentSession.token = data.token;
-            currentSession.name = data.name;
-            currentSession.address = data.address;
+        
+        // In the /task response structure (before_server), 'session' usually contains the cookies/auth info
+        // But proxy_fetch might return the body directly.
+        // before_client: var { results, session } = await app.fetch(...)
+        // If the server returns { results: [], session: { ... } }
+        
+        // We check if the response *is* the session object or contains it
+        let session = data.session || data; 
+
+        if (session && session.email) {
+            currentSession.email = session.email;
+            currentSession.token = session.token;
+            currentSession.name = session.name;
+            currentSession.address = session.address;
+            currentSession.team = session.team;
             
             // [NEW] Initialize Rust Hub with new profile info
             await invoke("initialize_hub", { 
-                address: data.address, 
-                email: data.email, 
+                address: session.address, 
+                email: session.email, 
                 flag: "kr" // Default to kr for now
             });
 
             updateAuthUI();
             fetchChatHistory();
         }
-    } catch (e) {}
+    } catch (e) {
+        console.warn("Auth check failed:", e);
+    }
 }
 
 async function initSession() {
