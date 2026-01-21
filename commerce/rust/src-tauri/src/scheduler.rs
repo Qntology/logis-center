@@ -366,15 +366,14 @@ async fn process_task(
     let _ = std::fs::write("debug_light_pug.txt", &light_pug);
     
     // Determine optimal chunk sizes based on hardware
-    // [ADAPTIVE] Using 1000 chars: Optimized for English + Multi-language mixed content.
-    // Fits safely within 2048 token embedding limit due to token density dilution.
+    // [ADAPTIVE] Increased to 4000 chars to speed up ingestion.
     let mut device_config = utils::get_optimal_device_config();
-    device_config.classify_chunk_size = 1000; 
-    device_config.extract_chunk_size = 1000;
+    device_config.classify_chunk_size = 4000; 
+    device_config.extract_chunk_size = 4000;
 
     // [REVISED] Restore turn-based chunked ingestion for classification.
     // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 1000, 0); // [FIX] Mixed-language optimized size
+    let classify_chunks = chunk_text(&light_pug, 4000, 0); // [SPEED-UP] Larger chunks for fewer parts
     let classify_chunks_len = classify_chunks.len(); 
     println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);
 
@@ -426,7 +425,7 @@ async fn process_task(
                 format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
             };
 
-            // Add current chunk to history
+            // [OPTIMIZATION] Don't add Assistant's "READY" to history, only User data
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
                     ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
@@ -442,10 +441,10 @@ async fn process_task(
             }));
 
             let params = ChatCompletionParameters {
-                messages: messages.clone(), // Send full history
+                messages: messages.clone(), 
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(if is_last { 256 } else { 32 }),
-                temperature: Some(0.1),
+                max_tokens: Some(if is_last { 1024 } else { 32 }), // Doubled for safety
+                temperature: Some(0.1), // Very deterministic for classification
                 ..Default::default()
             };
 
@@ -465,7 +464,6 @@ async fn process_task(
                     let out = res?;
                     if is_last {
                         page_type_res = out.clone();
-                        // [NEW] Emit raw classification text result
                         let _ = app_handle.emit("extraction-progress", json!({ 
                             "task_id": task.id,
                             "category": "Classification Ingestion",
@@ -473,13 +471,8 @@ async fn process_task(
                             "data": out,
                             "spinner": "✅"
                         }));
-                    } else {
-                        // Add model's ACK to history to keep it in sync with cache
-                        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                            content: Some(out),
-                            ..Default::default()
-                        }));
-                    }
+                    } 
+                    // [MODIFIED] Do not push Assistant message back to history here
                 },
                 _ = async {
                     loop {
