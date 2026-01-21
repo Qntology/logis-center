@@ -488,11 +488,18 @@ async fn proxy_fetch(
 
 
 
+#[derive(serde::Deserialize)]
+struct ActiveTaskQuery {
+    cc: String,
+    #[serde(alias = "refId")]
+    ref_id: String,
+}
+
 #[tauri::command]
-async fn check_active_task(state: State<'_, AppState>, cc: String, ref_id: String) -> Result<bool, String> {
+async fn check_active_task(state: State<'_, AppState>, payload: ActiveTaskQuery) -> Result<bool, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
-        db.has_active_task(&cc, &ref_id).await.map_err(|e| e.to_string())
+        db.has_active_task(&payload.cc, &payload.ref_id).await.map_err(|e| e.to_string())
     } else { Ok(false) }
 }
 

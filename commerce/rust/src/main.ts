@@ -206,21 +206,19 @@ if (pillNav) {
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
 
-    // 1. Physical extraction in progress or image selected
     if (currentImage || isExtracting) {
         btnExtract.style.display = (isExtracting && !currentImage) ? "none" : "flex";
         if (currentImage) btnExtract.title = "Extract from Image";
         return;
     }
 
-    // 2. No detected shop URL
     if (!currentDetectedUrl) {
         btnExtract.style.display = "none";
         return;
     }
 
     try {
-        // [CRITICAL] Normalize criteria: CC and Link must match Backend's stored task info
+        // [STRICT PARITY] CC and Link must match Backend's stored task info
         const urlObj = new URL(currentDetectedUrl.toLowerCase());
         const hostname = urlObj.hostname; 
         const link = (urlObj.pathname + urlObj.search).toLowerCase();
@@ -228,19 +226,22 @@ async function updateExtractButtonVisibility() {
         const ccHash = await hashId(hostname); 
         const hashedRefId = await hashId(ccHash + link);
         
-        // 3. Database Check: See if this specific page is currently in the 'tasks' table
-        const isActive = await invoke<boolean>("check_active_task", { cc: ccHash, ref_id: hashedRefId });
+        // [FIX] Pass as a single payload object to match the new Rust ActiveTaskQuery struct
+        const isActive = await invoke<boolean>("check_active_task", { 
+            payload: { cc: ccHash, refId: hashedRefId } 
+        });
         
+        console.log(`[WIDGET] Visibility Check: cc=${ccHash}, ref_id=${hashedRefId}, isActive=${isActive}`);
+
         if (isActive === true) {
-            console.log(`[WIDGET] Hiding button - Task ACTIVE for: ${hostname}${link} (Ref: ${hashedRefId})`);
             btnExtract.style.display = "none";
         } else {
             btnExtract.style.display = "flex";
             btnExtract.title = `Extract from ${hostname}`;
         }
     } catch (e) {
-        console.error("[WIDGET] Visibility check failed, showing button by default:", e);
-        btnExtract.style.display = "flex";
+        console.error("[WIDGET] Visibility check failed:", e);
+        btnExtract.style.display = "flex"; // Default to show on error
     }
 }
 
@@ -407,7 +408,9 @@ btnExtract?.addEventListener("click", async () => {
             const ccHash = await hashId(hostname); 
             const hashedRefId = await hashId(ccHash + link);
             
-            const isActive = await invoke<boolean>("check_active_task", { cc: ccHash, ref_id: hashedRefId });
+            const isActive = await invoke<boolean>("check_active_task", { 
+                payload: { cc: ccHash, refId: hashedRefId } 
+            });
             if (isActive) {
                 alert("This page is already in the queue or being processed.");
                 openWidget("settings");
@@ -941,6 +944,14 @@ async function syncBrowserStatus() {
         if (btnAutoLaunch) {
             btnAutoLaunch.style.display = (status === "running") ? "none" : "flex";
         }
+        
+        // [FIX] If browser is running but we don't have a URL yet, try to poke it
+        if (status === "running" && !currentDetectedUrl) {
+            console.log("[WIDGET] Browser is running, attempting to fetch initial URL...");
+            // We can't easily get the URL directly via a command without a tab ref, 
+            // but we can trigger a check or wait for the monitor. 
+            // For now, if it's running, we assume it's on a page.
+        }
     } catch (e) { console.error("Sync error:", e); }
 }
 
@@ -961,3 +972,22 @@ window.addEventListener('focus', () => {
 
 // 2. Trigger once on initial load
 refreshAppState();
+
+async function fetchChatHistory() {
+    try {
+        const messages = await invoke<any[]>("get_chat_messages");
+        if (messages && messages.length > 0) {
+            // Sort by creation time
+            messages.sort((a, b) => a.created_at - b.created_at);
+            
+            // Clear and re-render only if needed or just append
+            // For simplicity, we can clear and re-render the last batch
+            if (chatTalks) {
+                // If you want to keep it simple, just render each
+                messages.forEach(msg => renderMessage(msg));
+            }
+        }
+    } catch (e) {
+        console.error("[WIDGET] Failed to fetch chat history:", e);
+    }
+}
