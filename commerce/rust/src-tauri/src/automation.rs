@@ -13,7 +13,7 @@ use regex::Regex;
 use reqwest::Url;
 
 // Global storage to keep browser alive
-static GLOBAL_BROWSER: Lazy<Arc<tokio::sync::Mutex<Option<Arc<Browser>>>>> = Lazy::new(|| {
+pub(crate) static GLOBAL_BROWSER: Lazy<Arc<tokio::sync::Mutex<Option<Arc<Browser>>>>> = Lazy::new(|| {
     Arc::new(tokio::sync::Mutex::new(None))
 });
 
@@ -93,7 +93,8 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
     
     if tokio::net::TcpStream::connect(format!("127.0.0.1:{}", CHROME_DEBUG_PORT)).await.is_err() {
         println!("[AUTO] No existing browser detected on port {}.", CHROME_DEBUG_PORT);
-        return Ok(())
+        let _ = app_handle.emit("browser-status", "stopped");
+        return Ok(());
     }
 
     let addr = format!("http://127.0.0.1:{}", CHROME_DEBUG_PORT);
@@ -119,6 +120,7 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
         },
         Err(e) => {
             println!("[AUTO] Reconnection failed: {}", e);
+            let _ = app_handle.emit("browser-status", "stopped");
             Ok(())
         }
     }
@@ -178,7 +180,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
     });
 }
 
-async fn run_driverless_automation(browser: &str, url: &str, script: &str, app_handle: tauri::AppHandle) -> anyhow::Result<String> {
+async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_handle: tauri::AppHandle) -> anyhow::Result<String> {
     println!("[AUTO] Request: Driverless Automation for {} (URL: {})", browser, url);
     
     // 0. Proactively try to reconnect or reuse if global exists

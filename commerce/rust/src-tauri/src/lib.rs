@@ -584,6 +584,15 @@ async fn extract_html_from_current_tab() -> Result<String, String> {
     automation::extract_html_from_current_tab().await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_browser_status() -> Result<String, String> {
+    let guard = automation::GLOBAL_BROWSER.lock().await;
+    if guard.is_some() { 
+        return Ok("running".to_string()); 
+    }
+    Ok("stopped".to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 
 pub fn run() {
@@ -782,7 +791,9 @@ pub fn run() {
 
             get_known_users,
 
-            initialize_hub
+            initialize_hub,
+
+            get_browser_status
 
         ])
 

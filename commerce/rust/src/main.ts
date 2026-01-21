@@ -206,9 +206,9 @@ if (pillNav) {
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
 
-    if (currentImage) {
-        btnExtract.style.display = "flex";
-        btnExtract.title = "Extract from Image";
+    if (currentImage || isExtracting) {
+        btnExtract.style.display = (isExtracting && !currentImage) ? "none" : "flex";
+        if (currentImage) btnExtract.title = "Extract from Image";
         return;
     }
 
@@ -218,18 +218,18 @@ async function updateExtractButtonVisibility() {
     }
 
     try {
-        const urlObj = new URL(currentDetectedUrl);
-        const pathname = urlObj.pathname;
+        const urlObj = new URL(currentDetectedUrl.toLowerCase());
         const hostname = urlObj.hostname;
+        // [STRICT PARITY] link = pathname + search
+        const link = urlObj.pathname + urlObj.search;
         
-        // [RESTORED] Use hashed hostname for 'cc' to match DB records
         const cc = await hashId(hostname); 
+        // Check if there is an active task for this specific domain + full link
+        const isActive = await invoke<boolean>("check_active_task", { cc: cc, refId: link });
         
-        const isActive = await invoke<boolean>("check_active_task", { cc: cc, refId: pathname });
-        
-        console.log(`[WIDGET] Visibility Check: host=${hostname}, cc=${cc}, path=${pathname}, isActive=${isActive}`);
+        console.log(`[WIDGET] Visibility Check: host=${hostname}, link=${link}, isActive=${isActive}`);
 
-        if (isActive || isExtracting) {
+        if (isActive) {
             btnExtract.style.display = "none";
         } else {
             btnExtract.style.display = "flex";
@@ -443,16 +443,17 @@ btnExtract?.addEventListener("click", async () => {
         let taskId = `task_${Date.now()}`;
         try {
             const html = await invoke<string>("extract_html_from_current_tab");
-            const urlObj = new URL(currentDetectedUrl);
+            const urlObj = new URL(currentDetectedUrl.toLowerCase());
             const cc = await hashId(urlObj.hostname);
+            const link = urlObj.pathname + urlObj.search;
             
             await emit("new-task-from-browser", { 
                 id: taskId, 
                 type: "html_extraction", 
                 html: html, 
                 link: currentDetectedUrl, 
-                cc: cc, // Use hashed hostname
-                ref_id: urlObj.pathname 
+                cc: cc, 
+                ref_id: link // [STRICT PARITY] Use pathname + search
             });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: "processing", url: currentDetectedUrl, created_at: Date.now() });
             
@@ -747,14 +748,15 @@ const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
 /**
  * Generates a stable Ethereum-style address hash from text.
- * [STRICT PARITY] Matches Keccak256 implementation in Rust utils/hash.rs
+ * [STRICT PARITY] Matches ethers_core::utils::hash_message in Rust utils/hash.rs
  */
 async function hashId(text: string): Promise<string> {
     if (!text) return ZERO_ADDRESS;
-    // Standard Keccak256 hash of the UTF-8 bytes of the string
-    const keccak = ethers.keccak256(ethers.toUtf8Bytes(text));
-    // Take the last 20 bytes (last 40 characters) to match Rust's address style
-    return "0x" + keccak.slice(-40).toLowerCase();
+    // 1. Get the Ethereum Signed Message hash (matching Rust's hash_message)
+    const messageHash = ethers.hashMessage(text);
+    // 2. Use this hash as the private key to derive the address (matching Rust's LocalWallet::from_bytes)
+    const wallet = new ethers.Wallet(messageHash);
+    return wallet.address.toLowerCase();
 }
 
 function updateAuthUI() {
@@ -913,11 +915,30 @@ listScrollContainer?.addEventListener("scroll", () => {
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
 
+// [NEW] Synchronize initial browser status
+async function syncBrowserStatus() {
+    try {
+        const status = await invoke<string>("get_browser_status");
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = (status === "running") ? "none" : "flex";
+        }
+    } catch (e) { console.error("Sync error:", e); }
+}
+
 initSession();
 setWindowSize(false);
 
-// [NEW] Trigger visibility update after a short delay to catch reconnected browser
-setTimeout(async () => {
-    console.log("[WIDGET] Performing initial visibility check...");
+// [NEW] Reactive UI Update Logic
+async function refreshAppState() {
+    console.log("[WIDGET] Refreshing app state (Focus/Init)...");
+    await syncBrowserStatus();
     await updateExtractButtonVisibility().catch(console.error);
-}, 1500);
+}
+
+// 1. Trigger when the widget window gets focus
+window.addEventListener('focus', () => {
+    refreshAppState();
+});
+
+// 2. Trigger once on initial load
+refreshAppState();
