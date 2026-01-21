@@ -405,33 +405,111 @@ impl QuantizedQwen3VLTextAttention {
 
                 
 
-                                    let compressed_size = (num_blocks * 2) + (num_blocks * 16);
+                                                        let _compressed_size = (num_blocks * 2) + (num_blocks * 16);
 
                 
 
-                                    let _ratio = (compressed_size as f64 / original_size as f64) * 100.0;
+                                    
 
                 
 
+                                                        let _ratio = (_compressed_size as f64 / original_size as f64) * 100.0;
+
                 
 
-                    
+                                    
 
-                    // [STRICT ONCE] Only log for Layer 0 and only for the 'k' tensor
+                
 
-                    // if layer_idx == 0 && prefix == "k" {
+                                                        
 
-                    //     println!("╔════════════ KV CACHE COMPRESSION STATS (Layer 0) ════════════╗");
+                
 
-                    //     println!("║  - Legacy F32 Storage Size: {:>10} bytes (100.0%)   ║", original_size);
+                                    
 
-                    //     println!("║  - New 4-bit Packed Size  : {:>10} bytes ({:>5.1}%)    ║", compressed_size, ratio);
+                
 
-                    //     println!("║  - Space Saved            : {:>10} bytes ({:>5.1}%)    ║", original_size - compressed_size, 100.0 - ratio);
+                                                        // [STRICT ONCE] Statistics logging disabled for performance
 
-                    //     println!("╚══════════════════════════════════════════════════════════════╝");
+                
 
-                    // }
+                                    
+
+                
+
+                                                        /*
+
+                
+
+                                    
+
+                
+
+                                                        if _layer_idx == 0 && prefix == "k" {
+
+                
+
+                                    
+
+                
+
+                                                            println!("╔════════════ KV CACHE COMPRESSION STATS (Layer 0) ════════════╗");
+
+                
+
+                                    
+
+                
+
+                                                            println!("║  - Legacy F32 Storage Size: {:>10} bytes (100.0%)   ║", original_size);
+
+                
+
+                                    
+
+                
+
+                                                            println!("║  - New 4-bit Packed Size  : {:>10} bytes ({:>5.1}%)    ║", _compressed_size, _ratio);
+
+                
+
+                                    
+
+                
+
+                                                            println!("║  - Space Saved            : {:>10} bytes ({:>5.1}%)    ║", original_size - _compressed_size, 100.0 - _ratio);
+
+                
+
+                                    
+
+                
+
+                                                            println!("╚══════════════════════════════════════════════════════════════╝");
+
+                
+
+                                    
+
+                
+
+                                                        }
+
+                
+
+                                    
+
+                
+
+                                                        */
+
+                
+
+                                    
+
+                
+
+                                    
 
     
 

@@ -246,9 +246,9 @@ impl Qwen3VLGenerateModel {
              }
         }
         
-        // [CHUNKED PREFILL] - Line Aware (256 tokens)
-        // [ADAPTIVE] Lowered from 512 to 256 to match 1000-char chunking strategy
-        if seq_len > 256 {
+        // [CHUNKED PREFILL] - Line Aware (1024 tokens)
+        // [ADAPTIVE] Increased from 256 to 1024 to significantly speed up heavy document reading.
+        if seq_len > 1024 {
             println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
             
             let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.text_device) {
@@ -260,12 +260,12 @@ impl Qwen3VLGenerateModel {
 
             while current_pos < seq_len - 1 {
                 let remaining = seq_len - current_pos;
-                if remaining <= 256 { break; } 
+                if remaining <= 1024 { break; } 
 
-                let mut chunk_size = 256;
-                let lookback_range = 64; 
+                let mut chunk_size = 1024;
+                let lookback_range = 128; 
                 
-                let search_end = current_pos + 256;
+                let search_end = current_pos + 1024;
                 let search_start = search_end.saturating_sub(lookback_range);
                 
                 for i in (search_start..search_end).rev() {

@@ -238,27 +238,18 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
 
 pub fn page_type_prompt(language: &str) -> String {
     let template = r###"
-[TASK]
-Analyze the provided Pug template snippet and identify the primary category of this webpage.
+[STRICT ROLE]
+You are a web structure classifier. Your ONLY job is to output a JSON object.
 
-[SCHEMA DEFINITIONS]
-- type: The main category of the page content. Must be one of:
-  - 'order': Order history, order details, checkout success.
-  - 'goods': Product list, product detail, shopping cart.
-  - 'tracking': Shipment tracking status, delivery history.
-  - 'review': Product reviews, feedback list.
-  - 'coupon': Coupon list, discount events.
-  - 'event': Promotion pages, event announcements.
-  - '': If none of the above match or the page is irrelevant (e.g., login, setting).
+[CATEGORIES]
+type:'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or '',
 
-[OUTPUT FORMAT]
-Return valid JSON only. No explanation.
-{{
-    "type": "category_string"
-}}
+[OUTPUT RULE]
+- No conversation. No repetition of input. 
+- Output ONLY: {"type": "category"}
 
-[CONTEXT]
-Language: {LANGUAGE}"###;
+[LANGUAGE]
+{LANGUAGE}"###;
     template.replace("{LANGUAGE}", language)
 }
 

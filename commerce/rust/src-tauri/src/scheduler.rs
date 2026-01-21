@@ -420,9 +420,9 @@ async fn process_task(
             println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
             let prompt = if is_last {
-                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nEnd of document. Based on all parts read so far, identify the primary category and return the structured JSON now.", chunk)
+                format!("### FINAL DATA PART ###\n{}\n\n### CRITICAL INSTRUCTION ###\nAll data has been provided. STOP processing as text. Output only the final JSON classification result based on the schema provided in the system message. Do not repeat the instruction. Do not add explanations.", chunk)
             } else {
-                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
+                format!("### DATA PART {}/{} ###\n{}\n\n### INSTRUCTION ###\nRead and say READY.", i + 1, classify_chunks_len, chunk)
             };
 
             // [OPTIMIZATION] Don't add Assistant's "READY" to history, only User data
