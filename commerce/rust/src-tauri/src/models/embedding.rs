@@ -99,10 +99,19 @@ impl QAttention {
         dev: &Device,
         rotary: Arc<RotaryEmbedding>,
     ) -> Result<Self> {
-        let q_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{}.q_proj.weight", prefix), dev)?);
-        let k_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{}.k_proj.weight", prefix), dev)?);
-        let v_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{}.v_proj.weight", prefix), dev)?);
-        let o_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{}.o_proj.weight", prefix), dev)?);
+        let mut find_weight = |suffix1: &str, suffix2: &str| -> Result<QMatMul> {
+            let name1 = format!("{}.{}.weight", prefix, suffix1);
+            let name2 = format!("{}.{}.weight", prefix, suffix2);
+            let tensor = if let Ok(t) = ct.tensor(reader, &name1, dev) { t }
+                         else if let Ok(t) = ct.tensor(reader, &name2, dev) { t }
+                         else { ct.tensor(reader, &format!("{}.weight", prefix), dev)? }; // Fallback for some GGUFs
+            Ok(QMatMul::from_qtensor(tensor)?)
+        };
+
+        let q_proj = find_weight("q_proj", "attn_q")?;
+        let k_proj = find_weight("k_proj", "attn_k")?;
+        let v_proj = find_weight("v_proj", "attn_v")?;
+        let o_proj = find_weight("o_proj", "attn_output")?;
 
         Ok(Self {
             q_proj,
@@ -154,9 +163,18 @@ impl QMlp {
         prefix: &str,
         dev: &Device,
     ) -> Result<Self> {
-        let gate_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{}.gate_proj.weight", prefix), dev)?);
-        let up_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{}.up_proj.weight", prefix), dev)?);
-        let down_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{}.down_proj.weight", prefix), dev)?);
+        let mut find_weight = |suffix1: &str, suffix2: &str| -> Result<QMatMul> {
+            let name1 = format!("{}.{}.weight", prefix, suffix1);
+            let name2 = format!("{}.{}.weight", prefix, suffix2);
+            let tensor = if let Ok(t) = ct.tensor(reader, &name1, dev) { t }
+                         else { ct.tensor(reader, &name2, dev)? };
+            Ok(QMatMul::from_qtensor(tensor)?)
+        };
+
+        let gate_proj = find_weight("gate_proj", "ffn_gate")?;
+        let up_proj = find_weight("up_proj", "ffn_up")?;
+        let down_proj = find_weight("down_proj", "ffn_down")?;
+        
         Ok(Self { gate_proj, up_proj, down_proj })
     }
 
@@ -192,7 +210,7 @@ impl QDecoderLayer {
         let residual = &x;
         let x_norm = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&x_norm)?;
-        (residual + mlp_out)
+        residual + mlp_out
     }
 }
 
@@ -233,7 +251,7 @@ impl EmbeddingModel {
         let tokenizer_path = model_path.join("tokenizer.json");
         let config_path = model_path.join("config.json");
 
-        let device = Device::Cpu; // Still forcing CPU for stability, but now it's 4-bit!
+        let device = Device::Cpu; 
         
         let mut file = std::fs::File::open(&gguf_path).map_err(|e| anyhow!("Failed to open GGUF: {}", e))?;
         let ct = gguf_file::Content::read(&mut file)?;
@@ -242,34 +260,50 @@ impl EmbeddingModel {
         let config: Config = serde_json::from_str(&config_str)?;
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
 
-        // [NEW] Initialize Rotary Embedding for positions
         let rotary = Arc::new(RotaryEmbedding::new(config.head_dim, config.max_position_embeddings, config.rope_theta, &device)?);
 
-        // Load Embeddings
-        let embed_tokens = ct.tensor(&mut file, "model.embed_tokens.weight", &device)?
-            .dequantize(&device)?;
+        // [FIX] Robust Embedding Loading
+        let embed_tokens = if let Ok(t) = ct.tensor(&mut file, "token_embd.weight", &device) {
+            t.dequantize(&device)?
+        } else {
+            ct.tensor(&mut file, "model.embed_tokens.weight", &device)?.dequantize(&device)?
+        };
 
         // Load Layers
         let mut layers = Vec::new();
         for i in 0..config.num_hidden_layers {
-            let prefix = format!("model.layers.{}", i);
+            // Check for GGUF standard 'blk.N' or original 'model.layers.N'
+            let (prefix, is_gguf) = if ct.tensor_infos.contains_key(&format!("blk.{}.attn_norm.weight", i)) {
+                (format!("blk.{}", i), true)
+            } else {
+                (format!("model.layers.{}", i), false)
+            };
+
+            let (in_ln, post_ln, attn, mlp) = if is_gguf {
+                ("attn_norm", "ffn_norm", "", "ffn")
+            } else {
+                ("input_layernorm", "post_attention_layernorm", ".self_attn", ".mlp")
+            };
+
             let input_layernorm = QRmsNorm::new(
-                ct.tensor(&mut file, &format!("{}.input_layernorm.weight", prefix), &device)?.dequantize(&device)?,
+                ct.tensor(&mut file, &format!("{}.{}.weight", prefix, in_ln), &device)?.dequantize(&device)?,
                 config.rms_norm_eps
             );
             let post_attention_layernorm = QRmsNorm::new(
-                ct.tensor(&mut file, &format!("{}.post_attention_layernorm.weight", prefix), &device)?.dequantize(&device)?,
+                ct.tensor(&mut file, &format!("{}.{}.weight", prefix, post_ln), &device)?.dequantize(&device)?,
                 config.rms_norm_eps
             );
-            let self_attn = QAttention::new(&config, &ct, &mut file, &format!("{}.self_attn", prefix), &device, rotary.clone())?;
-            let mlp = QMlp::new(&config, &ct, &mut file, &format!("{}.mlp", prefix), &device)?;
+            
+            let self_attn = QAttention::new(&config, &ct, &mut file, &format!("{}{}", prefix, attn), &device, rotary.clone())?;
+            let mlp = QMlp::new(&config, &ct, &mut file, &format!("{}{}", prefix, mlp), &device)?;
             
             layers.push(QDecoderLayer { self_attn, mlp, input_layernorm, post_attention_layernorm });
         }
 
         // Load final Norm
+        let norm_name = if ct.tensor_infos.contains_key("output_norm.weight") { "output_norm.weight" } else { "model.norm.weight" };
         let norm = QRmsNorm::new(
-            ct.tensor(&mut file, "model.norm.weight", &device)?.dequantize(&device)?,
+            ct.tensor(&mut file, norm_name, &device)?.dequantize(&device)?,
             config.rms_norm_eps
         );
 

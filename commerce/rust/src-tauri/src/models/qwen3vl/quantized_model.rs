@@ -240,14 +240,13 @@ impl QuantizedQwen3VLTextAttention {
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
             
             // [FIX] Quantize KV cache to 4-bit (Q4_0) before saving to disk
-            // This matches the request to quantize Safetensors created during preprocessing.
             let k_q = candle_core::quantized::QTensor::quantize(k, candle_core::quantized::GgmlDType::Q4_0)?;
             let v_q = candle_core::quantized::QTensor::quantize(v, candle_core::quantized::GgmlDType::Q4_0)?;
 
             let mut map = HashMap::new();
-            // Store quantized data and scales
-            map.insert("k_data", k_q.data().dequantize(&Device::Cpu)?); 
-            map.insert("v_data", v_q.data().dequantize(&Device::Cpu)?);
+            // dequantize() must be called on the QTensor itself after successful quantization
+            map.insert("k_data", k_q.dequantize(&Device::Cpu)?); 
+            map.insert("v_data", v_q.dequantize(&Device::Cpu)?);
             
             candle_core::safetensors::save(&map, &file)?;
             
