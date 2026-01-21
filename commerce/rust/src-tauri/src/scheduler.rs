@@ -420,7 +420,7 @@ async fn process_task(
             println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
             let prompt = if is_last {
-                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nEnd of document. Identify the primary category and return JSON.", chunk)
+                format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nEnd of document. Based on all parts read so far, identify the primary category and return the structured JSON now.", chunk)
             } else {
                 format!("[DATA_PART]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
             };
@@ -701,14 +701,9 @@ async fn process_task(
 
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-            let prompt = format!(
-r#"{instruction}
-
-[INPUT SNIPPETS]
-{data}"#,
-                instruction = extraction_instruction,
-                data = combined_pugs
-            );
+            // [OPTIMIZATION] Separate Schema (System) from Data (User)
+            // This ensures the 4000-char limit is dedicated entirely to PUG data.
+            let prompt = format!("[INPUT SNIPPETS]\n{}", combined_pugs);
 
             let mut model_guard = model_mutex.lock().await;
             if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
@@ -718,8 +713,8 @@ r#"{instruction}
                 let summary_text = format!("Processing {}~{}/{}...", current_start, current_end, total_items);
                 tokio::select!{
                     res = model.chat_with_spinner(
-                        "", 
-                        &prompt,
+                        &extraction_instruction, // Schema goes here (System Prompt)
+                        &prompt,                 // Pure Data goes here (User Prompt)
                         &app_handle_clone, 
                         "extraction-progress", 
                         json!({ 
@@ -861,78 +856,65 @@ r#"{instruction}
         let chunks_len = chunks.len();
         let mut full_context_accumulated = String::new(); // Accumulate context here
         
-        for (chunk_idx, chunk) in chunks.iter().enumerate() {
-            let is_last = chunk_idx == chunks_len - 1;
-            full_context_accumulated.push_str(chunk);
-            full_context_accumulated.push('\n');
-
-            // Prepare prompt
-            let prompt = if is_last {
-                format!(
-r#"{instruction}
-
-[INPUT CONTENT]
-{data}"#,
-                    instruction = extraction_instruction,
-                    data = full_context_accumulated
-                )
-            } else {
-                // Intermediate Chunk: Just read and remember
-                format!(
-r#"[CONTEXT]
-You are reading a Pug (Jade) template. 
-Here is the accumulated content so far:
-
-[INPUT SNIPPET]
-{}
-
-[INSTRUCTION]
-Read and memorize this content. Do NOT generate JSON yet. 
-When all parts are sent, I will ask you to extract data into JSON.
-Just say "READY"."#,
-                    full_context_accumulated
-                )
-            };
-
-            let max_tokens = if is_last { 2048 } else { 20 }; // Minimal tokens for acknowledgment
-            
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Ingestion", 
-                "summary": format!("Reading part {}/{} ({} chars)...", chunk_idx + 1, chunks_len, full_context_accumulated.len()),
-                "spinner": "⠋"
-            }));
-
-            let model_guard = model_mutex.lock().await;
-            
-            let response = if let Some(model) = model_guard.as_ref() {
-                let app_handle_clone = app_handle.clone();
-                tokio::select!{
-                    res = model.chat_with_spinner(
-                        "", 
-                        &prompt,
-                        &app_handle_clone, 
-                        "extraction-progress", 
-                        json!({ "category": "Ingestion" }), 
-                        max_tokens, 
-                        Some(cancellation_token.clone()), 
-                        Some(detail_session_id.clone())
-                    ) => res?,
-                    _ = async {
-                        loop {
-                            if cancellation_token.load(Ordering::Relaxed) { break; }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        
+                                    let is_last = chunk_idx == chunks_len - 1;
+        
+                                    
+        
+                                    // Prepare prompt: Only trigger extraction on the final chunk
+        
+                                    let prompt = if is_last {
+        
+                                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nEnd of content. Based on all parts read so far, extract and return the structured JSON now.", chunk)
+        
+                                    } else {
+        
+                                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
+        
+                                    };
+        
+                        
+                                    let max_tokens = if is_last { 2048 } else { 32 }; 
+                    
+                    let _ = app_handle.emit("extraction-progress", json!({
+                        "task_id": task.id,
+                        "category": "Ingestion", 
+                        "summary": format!("Reading part {}/{}...", chunk_idx + 1, chunks_len),
+                        "spinner": "⠋"
+                    }));
+        
+                    let model_guard = model_mutex.lock().await;
+                    
+                    let response = if let Some(model) = model_guard.as_ref() {
+                        let app_handle_clone = app_handle.clone();
+                        tokio::select!{
+                            res = model.chat_with_spinner(
+                                &extraction_instruction, // Schema consistently sent as System Prompt
+                                &prompt,                 // Pure Data Chunk as User Prompt
+                                &app_handle_clone, 
+                                "extraction-progress", 
+                                json!({ "category": "Ingestion" }), 
+                                max_tokens, 
+                                Some(cancellation_token.clone()), 
+                                Some(detail_session_id.clone())
+                            ) => res?,
+                            _ = async {
+                                loop {
+                                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            } => { 
+                                drop(model_guard);
+                                cleanup_task_resources(&task.id);
+                                return Err(anyhow::anyhow!("Task cancelled")); 
+                            }
                         }
-                    } => { 
-                        drop(model_guard);
-                        cleanup_task_resources(&task.id);
-                        return Err(anyhow::anyhow!("Task cancelled")); 
-                    }
-                }
-            } else {
-                "{}".to_string()
-            };
-            drop(model_guard);
-
+                    } else {
+                        "{}".to_string()
+                    };
+                    drop(model_guard);
+        
             if is_last {
                 println!("[EXTRACT-FINAL] Result: {}", response);
                 let full_data = parsing::parse_json_from_llm(&response);
