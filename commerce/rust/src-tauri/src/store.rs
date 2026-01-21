@@ -328,8 +328,20 @@ impl VectorStore {
          let table = self.conn.open_table(target).execute().await?;
          let _ = table.delete(&format!("id = '{}'", id)).await;
          
-         let json_str = data_val.to_string();
-         let text_content = data_val.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
+         let mut final_data = data_val.clone();
+         if let Some(obj) = final_data.as_object_mut() {
+             // Sync tracking fields for query consistency
+             if let Some(tn) = obj.get("tracking_number").cloned() {
+                 if obj.get("tracking").is_none() { obj.insert("tracking".to_string(), tn); }
+             }
+             // Sync price fields
+             if let Some(p) = obj.get("price").cloned() {
+                 if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
+             }
+         }
+
+         let json_str = final_data.to_string();
+         let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
          let status = data_val.get("status").and_then(|v| v.as_str()).map(|s| crate::logic::parse_status(s)).unwrap_or(0);
          
