@@ -601,51 +601,175 @@ registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
 },"###,
-        "order" => r###"- node: order form container CSS1 selector
-- link: '{HREF}'
-- id: Refer to the ID value from the link or an attribute or input value | string
-- tracking_number: Tracking Number | 운송장 번호 | 运单호 | 運單號 | 伝표번호 | Número de seguimiento | Numéro de suivi | Sendungsnummer | Номер накладной | Número de rastreamento | Numero di tracciamento | رقم التتبع | Số vận đơn | Nomor resi | หมายเลขติดตามพัสดุ | string
-- status: 'draft' | 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-- goods: [{ title:{ value:goods title }, link:{ value:goods Link }, id:{ value:product no } }]
-- sender_name: sender_name | string
-- sender_address: sender_address, Filter the addresses to District-level and up | string
-- sender_phone: sender_phone | string
-- recipient_name: recipient_name | string
-- recipient_address: recipient_address, Filter the addresses to District-level and up | string
-- recipient_phone: recipient_phone | string
-- bank: bank company name | string
-- card: card company name | string
-- order_date: order date | string
-- payment_date: payment date or '' | string
-- payment_method: 'C.O.D.' | 'CARD' | 'BANK' | '' | string
-- payment_origin: Payment Gateway Service Name | '' | string
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
-        "coupon" | "event" => r###"- node: {TYPE} container CSS1 selector
-- link: '{HREF}'
-- id: Refer to the ID value from the link or an attribute or input value | string
-- type: 'percentage' | 'fixed_amount' | 'free_shipping' | ''
-- status: 'draft' | 'progress' | 'stop' | 'cancel' | 'expire' | 'complete' | 'error'
-- title: {TYPE} title | string
-- started_at: yyyy-MM-ddThh:mm:ss | string
-- expired_at: yyyy-MM-ddThh:mm:ss | string
-- code: {TYPE} code used at checkout | string
-- discount: Discount value | number
-- quantity: {TYPE} quantity | number
-- usage_limit: Total usage limit for the coupon | number
-- usage_per: Usage limit per customer | number
-- new_customer_only: new customer only | boolean
-- min_order_amount: Minimum order amount required to apply coupon | number
-- max_discount_amount: Maximum discount limit allowed for the coupon | number
-- region_restrictions: region restrictions | boolean
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
-        "review" => r###"- node: review container CSS1 selector
-- link: '{HREF}'
-- id: Refer to the ID value from the link or an attribute or input value | string
-- status: 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-- name: reviewer name | string
-- title: reviewer item title | string
-- completed: order complete | boolean
-- registration_date: yyyy-MM-ddThh:mm:ss | string"###,
+        "order" => r###"node:order form container CSS1 selector,
+link : '{HREF}',
+id:{
+    value:Refer to the ID value from the link or an attribute or input value | string,
+    selector:selector
+},
+tracking_number:{
+    value:tracking number | string,
+    selector:selector
+},
+status:{
+    value:'draft' or 'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+    selector:selector
+},
+goods:[{
+    title:{
+        value:goods title | string,
+        selector:selector
+    },
+    link:{
+        value:URL includes a manage path, an administrative or edit route goods Link | string,
+        selector:selector
+    },
+    id:{
+        value:Refer to the product no value from the link or an attribute or input value | string,
+        selector:selector
+    }
+}],
+sender_name:{
+    value:sender_name | string,
+    selector:selector
+},
+sender_address:{
+    value:sender_address, Filter the addresses to District-level and up | string,
+    selector:selector
+},
+sender_phone:{
+    value:sender_phone | string,
+    selector:selector
+},
+recipient_name:{
+    value:recipient_name | string,
+    selector:selector
+},
+recipient_address:{
+    value:recipient_address, Filter the addresses to District-level and up | string,
+    selector:selector
+},
+recipient_phone:{
+    value:recipient_phone | string,
+    selector:selector
+},
+bank:{
+    value:bank company name | string,
+    selector:selector
+},
+card:{
+    value:card company name | string,
+    selector:selector
+},
+order_date:{
+    value:order date | string,
+    selector:selector
+},
+payment_date:{
+    value:payment date or '' | string,
+    selector:selector
+},
+payment_method:{
+    value:'C.O.D.' or 'CARD' or 'BANK' or '' | string,
+    selector:selector
+},
+payment_origin:{
+    value:Payment Gateway Service Name or '' | string,
+    selector:selector
+},
+registration_date:{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+},"###,
+        "coupon" | "event" => format!(r###"node:{} container CSS1 selector,
+link : '{}',
+id:{{
+    value:Refer to the ID value from the link or an attribute or input value | string,
+    selector:selector
+}},
+type:{{
+    value:'percentage' or 'fixed_amount' or 'free_shipping' or '',
+    selector:selector
+}},
+status:{{
+    value:'draft' or 'progress' or 'stop' or 'cancel' or 'expire' or 'complete' or 'error',
+    selector:selector
+}},
+title:{{
+    value:{} title | string, 
+    selector:selector
+}},
+started_at:{{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+}},
+expired_at:{{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+}},
+code:{{
+    value:{} code used at checkout | string,
+    selector:selector
+}},
+discount:{{
+    value:Discount value | number,
+    selector:selector
+}},
+quantity:{{
+    value:{} quantity | number
+    selector:selector
+}},
+usage_limit:{{
+    value:Total usage limit for the coupon | number,
+    selector:selector
+}},
+usage_per:{{
+    value:Usage limit per customer | number,
+    selector:selector
+}},
+new_customer_only:{{
+    value:new customer only | boolean
+    selector:selector
+}},
+min_order_amount:{{
+    value:Minimum order amount required to apply coupon | number,
+    selector:selector
+}},
+max_discount_amount:{{
+    value:Maximum discount limit allowed for the coupon | number,
+    selector:selector
+}},
+region_restrictions:{{
+    value:region restrictions | boolean,
+    selector:selector
+}},
+registration_date:{{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+}},"###, page_type, href, page_type, page_type, page_type),
+        "review" => format!(r###"node:review container CSS1 selector,
+link : '{}',
+id:Refer to the ID value from the link or an attribute or input value | string,,
+status:{{
+    value:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
+    selector:selector
+}},
+name:{{
+    value:reviewer name | string,
+    selector:selector
+}},
+title:{{
+    value:reviewer item title | string, 
+    selector:selector
+}},
+completed:{{
+    value:order complete | boolean,
+    selector:selector
+}},
+registration_date:{{
+    value:yyyy-MM-ddThh:mm:ss | string,
+    selector:selector
+}},"###, href),
         _ => "- id: Unique identifier.\n- title: General name or title.\n- status: Current state."
     };
 
@@ -656,7 +780,6 @@ Extract detailed information from the provided Pug template into a single struct
 [CONTEXT]
 Page Type: {TYPE}
 Source URL: {HREF}
-Language: {LANGUAGE}
 
 [SCHEMA DEFINITIONS]
 {SCHEMA}
@@ -669,9 +792,9 @@ Language: {LANGUAGE}
 5. Do NOT make up data. Only extract what is present in the Pug structure.
 
 [OUTPUT FORMAT]
-{{ 
+{
     "field_name": "extracted_value"
-}}"###;
+}"###;
 
     template.replace("{TYPE}", page_type)
             .replace("{HREF}", href)
