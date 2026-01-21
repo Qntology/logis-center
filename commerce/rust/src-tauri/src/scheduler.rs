@@ -184,7 +184,8 @@ pub async fn start_background_worker(
                         }
                     },
                     Err(e) => {
-                        if e.to_string().contains("Task cancelled") {
+                        let err_msg = e.to_string();
+                        if err_msg.contains("Task cancelled") {
                              println!("[Scheduler] Task cancelled: {}", task.id);
                              let store_guard = store.lock().await;
                              if let Some(db) = store_guard.as_ref() {
@@ -195,13 +196,26 @@ pub async fn start_background_worker(
                                 "task_id": task.id,
                                 "category": "Done", "summary": "Cancelled by user", "spinner": "🛑", "data": null 
                              }));
-                             // [STRICT] Break the for-loop to stop the entire batch
                              break; 
                         } else {
-                            println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, e);
+                            println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
+                            
+                            // [NEW] Automatic OOM Recovery Logic
+                            if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
+                                println!("[Scheduler] OOM Detected! Force unloading model to protect system VRAM.");
+                                let mut model_guard = model.lock().await;
+                                *model_guard = None; // Explicitly drop model from GPU
+                                
+                                let _ = app_handle.emit("extraction-progress", json!({ 
+                                    "task_id": task.id,
+                                    "category": "Error", "summary": "GPU Memory Full (OOM). Task stopped.", "spinner": "❌"
+                                }));
+                            }
+
                             let store_guard = store.lock().await;
                             if let Some(db) = store_guard.as_ref() {
                                 let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
+                                let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
                             }
                         }
                     }
