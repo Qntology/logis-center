@@ -59,79 +59,38 @@ impl Drop for TaskDataManager {
     }
 }
 
-// Helper to chunk text with overlap, strictly respecting newlines and char boundaries for Pug
-fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
-    if text.len() <= chunk_size {
-        return vec![text.to_string()];
+// Helper to chunk text strictly by lines with a "push-back" (sliding) logic.
+// If a line would exceed the chunk_size, it's moved to the next chunk entirely.
+fn chunk_text(text: &str, chunk_size: usize, _overlap: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+    
+    for line in text.lines() {
+        let line_with_nl = format!("{}\n", line);
+        
+        // If this line alone is somehow bigger than the entire chunk_size,
+        // we have to break it, but this is extremely rare for Pug.
+        if line_with_nl.len() > chunk_size {
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk);
+                current_chunk = String::new();
+            }
+            chunks.push(line_with_nl);
+            continue;
+        }
+
+        // Check if adding this line exceeds the 1024 char (approx tokens) limit
+        if current_chunk.len() + line_with_nl.len() > chunk_size {
+            // [SLIDE] Push current chunk to results and start NEW chunk with this line
+            chunks.push(current_chunk);
+            current_chunk = line_with_nl;
+        } else {
+            current_chunk.push_str(&line_with_nl);
+        }
     }
     
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    
-    while start < text.len() {
-        let mut target_end = (start + chunk_size).min(text.len());
-        
-        // Ensure target_end is a valid char boundary
-        while !text.is_char_boundary(target_end) {
-            target_end -= 1;
-        }
-
-        let mut end = target_end;
-        
-        // Find the NEXT newline after target_end to include the current line fully
-        if target_end < text.len() {
-            if let Some(next_newline_offset) = text[target_end..].find('\n') {
-                end = target_end + next_newline_offset + 1;
-            } else {
-                end = text.len();
-            }
-        }
-        
-        // Safety check for end boundary
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-
-        chunks.push(text[start..end].to_string());
-        
-        if end >= text.len() {
-            break;
-        }
-        
-        // Calculate next start with overlap
-        let mut next_start = end.saturating_sub(overlap);
-        
-        // Ensure next_start is a valid char boundary
-        while !text.is_char_boundary(next_start) {
-            next_start -= 1;
-        }
-        
-        // Align next_start to the START of a line (find the first newline in the overlap zone)
-        if next_start > start && next_start < end {
-             if let Some(line_start) = text[next_start..end].find('\n') {
-                 next_start = next_start + line_start + 1;
-             }
-        }
-        
-        // Final safety for next_start
-        while !text.is_char_boundary(next_start) {
-            next_start += 1; // Move forward to find valid char
-        }
-
-        // Prevent infinite loops or zero progress
-        if next_start >= end {
-            next_start = end; 
-        }
-        
-        // Absolute safety check to ensure progress
-        if next_start <= start {
-             next_start = start + 1; // Force progress by at least 1 byte (might panic on utf8, but better than loop)
-             while !text.is_char_boundary(next_start) && next_start < text.len() {
-                 next_start += 1;
-             }
-        }
-
-        start = next_start;
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
     }
     chunks
 }
@@ -383,7 +342,7 @@ async fn process_task(
 
     // [REVISED] Restore turn-based chunked ingestion for classification.
     // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 1024, 200); // [FIX] Lowered from 4000/500
+    let classify_chunks = chunk_text(&light_pug, 1024, 0); // [FIX] Overlap removed (0)
     let classify_chunks_len = classify_chunks.len();
 
     let mut model_guard = model_mutex.lock().await;
@@ -862,8 +821,8 @@ r#"{instruction}
 
         let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
         
-        // CHUNKING: Split huge content into dynamic chunks with 500-char overlap (Device Optimized)
-        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 500); 
+        // CHUNKING: Split huge content into dynamic chunks with 0-char overlap (Device Optimized)
+        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 0); 
         let extraction_instruction = parsing::item2json(page_type, &url, language);
 
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
