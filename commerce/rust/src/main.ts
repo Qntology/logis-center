@@ -206,38 +206,40 @@ if (pillNav) {
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
 
+    // 1. Physical extraction in progress or image selected
     if (currentImage || isExtracting) {
         btnExtract.style.display = (isExtracting && !currentImage) ? "none" : "flex";
         if (currentImage) btnExtract.title = "Extract from Image";
         return;
     }
 
+    // 2. No detected shop URL
     if (!currentDetectedUrl) {
         btnExtract.style.display = "none";
         return;
     }
 
     try {
+        // [CRITICAL] Normalize criteria: CC and Link must match Backend's stored task info
         const urlObj = new URL(currentDetectedUrl.toLowerCase());
-        const hostname = urlObj.hostname;
-        // [STRICT PARITY] link = pathname + search
-        const link = urlObj.pathname + urlObj.search;
+        const hostname = urlObj.hostname; 
+        const link = (urlObj.pathname + urlObj.search).toLowerCase();
         
-        const cc = await hashId(hostname); 
-        const hashedRefId = await hashId(cc + link);
-        // Check if there is an active task for this specific domain + full link (hashed)
-        const isActive = await invoke<boolean>("check_active_task", { cc: cc, ref_id: hashedRefId });
+        const ccHash = await hashId(hostname); 
+        const hashedRefId = await hashId(ccHash + link);
         
-        console.log(`[WIDGET] Visibility Check: host=${hostname}, link=${link}, cc=${cc}, ref_id=${hashedRefId}, isActive=${isActive}`);
-
+        // 3. Database Check: See if this specific page is currently in the 'tasks' table
+        const isActive = await invoke<boolean>("check_active_task", { cc: ccHash, ref_id: hashedRefId });
+        
         if (isActive === true) {
+            console.log(`[WIDGET] Hiding button - Task ACTIVE for: ${hostname}${link} (Ref: ${hashedRefId})`);
             btnExtract.style.display = "none";
         } else {
             btnExtract.style.display = "flex";
             btnExtract.title = `Extract from ${hostname}`;
         }
     } catch (e) {
-        console.error("[WIDGET] Visibility error (Defaulting to SHOW):", e);
+        console.error("[WIDGET] Visibility check failed, showing button by default:", e);
         btnExtract.style.display = "flex";
     }
 }
@@ -397,19 +399,24 @@ btnExtract?.addEventListener("click", async () => {
     let cc = "";
     if (currentDetectedUrl) {
         try {
-            const urlObj = new URL(currentDetectedUrl);
-            pathname = urlObj.pathname;
-            cc = await hashId(urlObj.hostname);
-            const hashedRefId = await hashId(cc + pathname); // Note: Here it used pathname, updating to maintain consistency if needed, but keeping ref_id name change first
+            const normalizedUrl = currentDetectedUrl.toLowerCase();
+            const urlObj = new URL(normalizedUrl);
+            const hostname = urlObj.hostname;
+            const link = (urlObj.pathname + urlObj.search).toLowerCase();
             
-            const isActive = await invoke<boolean>("check_active_task", { cc: cc, ref_id: hashedRefId });
+            const ccHash = await hashId(hostname); 
+            const hashedRefId = await hashId(ccHash + link);
+            
+            const isActive = await invoke<boolean>("check_active_task", { cc: ccHash, ref_id: hashedRefId });
             if (isActive) {
                 alert("This page is already in the queue or being processed.");
                 openWidget("settings");
                 await updateExtractButtonVisibility();
                 return;
             }
-        } catch(e) {}
+        } catch(e) {
+            console.error("[WIDGET] Pre-click check error:", e);
+        }
     }
 
     // [NEW] Visual feedback: pulse the button
@@ -444,19 +451,28 @@ btnExtract?.addEventListener("click", async () => {
         isExtracting = true;
         let taskId = `task_${Date.now()}`;
         try {
-            const html = await invoke<string>("extract_html_from_current_tab");
-            const urlObj = new URL(currentDetectedUrl.toLowerCase());
+            // Normalize current URL to lowercase for consistent ID generation
+            const normalizedUrl = currentDetectedUrl.toLowerCase();
+            const urlObj = new URL(normalizedUrl);
             const cc = await hashId(urlObj.hostname);
             const link = urlObj.pathname + urlObj.search;
             const hashedRefId = await hashId(cc + link);
             
+            const isActive = await invoke<boolean>("check_active_task", { cc: cc, ref_id: hashedRefId });
+            if (isActive) {
+                alert("This page is already in the queue or being processed.");
+                openWidget("settings");
+                await updateExtractButtonVisibility();
+                return;
+            }
+
             await emit("new-task-from-browser", { 
                 id: taskId, 
                 type: "html_extraction", 
                 html: html, 
                 link: currentDetectedUrl, 
                 cc: cc, 
-                ref_id: hashedRefId // [STRICT PARITY] Use hashed cc + link
+                ref_id: hashedRefId 
             });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: "processing", url: currentDetectedUrl, created_at: Date.now() });
             

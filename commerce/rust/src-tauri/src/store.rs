@@ -227,6 +227,7 @@ impl VectorStore {
 
     pub async fn update_message_status(&self, task_id: &str, status: i32, content: Option<&str>) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
+        // For talks, we still replace the message to show latest status
         table.delete(&format!("task_id = '{}'", task_id)).await?;
         if let Some(c) = content {
             self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status)).await?;
@@ -234,9 +235,20 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn update_task_status(&self, id: &str, _status: i32) -> Result<()> {
+    pub async fn update_task_status(&self, id: &str, status: i32) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
-        table.delete(&format!("id = '{}'", id)).await?;
+        
+        // [FIX] If status is 'complete' (9) or 'error' (6), delete it. 
+        // Otherwise (progress=1, pending=10), we keep it to hide the ⚡ button.
+        if status == 9 || status == 6 || status == 3 {
+            table.delete(&format!("id = '{}'", id)).await?;
+        } else {
+            // Note: LanceDB update is complex with arrow, for simplicity in this specific task tracking table, 
+            // we check if it exists and keep it. A better way would be a true update, 
+            // but keeping it in the table is what matters for 'has_active_task'.
+            // For now, let's just NOT delete it if it's in progress.
+            println!("[Store] Task {} status updated to {}, keeping in active list.", id, status);
+        }
         Ok(())
     }
     

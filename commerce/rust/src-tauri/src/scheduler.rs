@@ -664,8 +664,8 @@ r#"{instruction}
                         // [STRICT PARITY] Generate BCC and REF exactly as server does
                         // bcc = hashId(page.type + (isDetail ? cc.toUpperCase() : cc))
                         let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
-                        // ref = hashId(team + cc + link)
-                        let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, link));
+                        // [FIX] ref = hashId(cc + link) - matches frontend criteria
+                        let ref_val = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
 
                         if !item_id.is_empty() {
                             let mut model_guard = model_mutex.lock().await;
@@ -925,12 +925,8 @@ Just say "READY"."#,
                 crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
             } else { task.to_dest.clone() };
 
-            // [NEW] Generate stable target_id based on link if possible
-            let mut target_id = if let Some(link) = target_data.get("link").and_then(|v| v.as_str()) {
-                crate::utils::hash::hash_id(&format!("{}{}", task.cc, link))
-            } else {
-                task.id.clone()
-            };
+            // [FIX] Use the already hashed ref_id from the task to maintain parity with frontend search criteria
+            let mut target_id = task.ref_id.clone();
 
             let mut found_existing = false;
             let to_table = merge_info.to.clone(); 
@@ -1043,6 +1039,9 @@ Just say "READY"."#,
 
                 let target_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, task.ref_id)); 
                 let mut existing_vector = None;
+                // [FIX] Use task.ref_id directly as the target_id to match parity with frontend
+                let target_id = task.ref_id.clone(); 
+                
                 if let Ok(Some(existing_item)) = db.get_item_by_id(&target_table, &target_id).await {
                     if existing_item.digest == item_digest {
                         println!("[Scheduler] Digest match for direct item {}. Skipping embedding.", target_id);
@@ -1086,10 +1085,10 @@ Just say "READY"."#,
                     // [STRICT PARITY] Re-generate BCC and REF exactly as server does
                     let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
                     let link = extracted_data.get("link").and_then(|v| v.as_str()).unwrap_or("");
-                    let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, link));
+                    // [FIX] Use consistent criteria: hashId(cc_hash + link)
+                    let ref_val = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
                     
-                    // target_id follows server logic: hashId(cc + link)
-                    let target_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link)); 
+                    // target_id is already set to task.ref_id above 
 
                     let _ = db.upsert_item(
                         &target_table, 

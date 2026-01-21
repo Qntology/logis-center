@@ -254,11 +254,8 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
     };
 
     println!("[AUTO] Navigating to {}...", url);
-    let page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
-    let pako_lib = include_str!("assets/scripts/pako.min.js");
-    let content_logic = include_str!("assets/scripts/content.js");
-    let final_script = format!("{};\n{};\n", pako_lib, content_logic); // Removed extra script arg if empty
-    let _ = page.evaluate(final_script).await;
+    let _page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
+    
     Ok(format!("Automation Started."))
 }
 
