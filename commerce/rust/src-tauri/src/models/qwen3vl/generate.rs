@@ -284,13 +284,28 @@ impl Qwen3VLGenerateModel {
             // [NEW] Intermediate Cache Save: Save context knowledge after heavy prefill
             if let Some(path) = &cache_path {
                 if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
-                    // 주입(Prefill) 단계이므로 초고속 모드(4096) 사용
-                    if m.save_kv_cache(path, false, 4096).is_ok() {
-                        let token_path = path.join("tokens.json");
-                        // We save only the part of full_input_ids_vec that corresponds to seqlen_offset
-                        let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
-                        if let Ok(file) = fs::File::create(&token_path) {
-                            let _ = serde_json::to_writer(file, &ingested_tokens);
+                    let token_path = path.join("tokens.json");
+                    let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
+                    
+                    // Check if disk cache is already sufficient (superset)
+                    let mut skip_save = false;
+                    if token_path.exists() {
+                         if let Ok(file) = fs::File::open(&token_path) {
+                             let reader = std::io::BufReader::new(file);
+                             if let Ok(disk_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 if disk_tokens.len() >= ingested_tokens.len() && disk_tokens.starts_with(ingested_tokens) {
+                                     skip_save = true;
+                                 }
+                             }
+                         }
+                    }
+
+                    if !skip_save {
+                        // 주입(Prefill) 단계이므로 초고속 모드(4096) 사용
+                        if m.save_kv_cache(path, false, 4096).is_ok() {
+                            if let Ok(file) = fs::File::create(&token_path) {
+                                let _ = serde_json::to_writer(file, &ingested_tokens);
+                            }
                         }
                     }
                 }
@@ -403,17 +418,34 @@ impl Qwen3VLGenerateModel {
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
                      if !is_extraction {
-                         println!("[KV-DISK] Updating base cache (Injection mode, size 4096) in {:?}", path);
-                         if m.offload_kv_cache(path, target_block_size).is_ok() {
-                             let mut all_tokens = full_input_ids_vec;
-                             all_tokens.extend(&generate);
-                             if !all_tokens.is_empty() {
-                                 all_tokens.pop(); 
-                             }
+                         let mut all_tokens = full_input_ids_vec;
+                         all_tokens.extend(&generate);
+                         if !all_tokens.is_empty() {
+                             all_tokens.pop(); 
+                         }
+                         
+                         let token_path = path.join("tokens.json");
+                         
+                         // Check if disk cache is already sufficient (superset)
+                         let mut skip_save = false;
+                         if token_path.exists() {
+                              if let Ok(file) = fs::File::open(&token_path) {
+                                  let reader = std::io::BufReader::new(file);
+                                  if let Ok(disk_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                      if disk_tokens.len() >= all_tokens.len() && disk_tokens.starts_with(&all_tokens) {
+                                          println!("[KV-DISK] Cache is already a superset. Skipping save to preserve future history.");
+                                          skip_save = true;
+                                      }
+                                  }
+                              }
+                         }
 
-                             let token_path = path.join("tokens.json");
-                             if let Ok(file) = fs::File::create(&token_path) {
-                                 let _ = serde_json::to_writer(file, &all_tokens);
+                         if !skip_save {
+                             println!("[KV-DISK] Updating base cache (Injection mode, size 4096) in {:?}", path);
+                             if m.offload_kv_cache(path, target_block_size).is_ok() {
+                                 if let Ok(file) = fs::File::create(&token_path) {
+                                     let _ = serde_json::to_writer(file, &all_tokens);
+                                 }
                              }
                          }
                      } else {
