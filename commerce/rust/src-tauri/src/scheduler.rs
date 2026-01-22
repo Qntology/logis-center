@@ -298,6 +298,21 @@ async fn process_task(
     let _ = std::fs::create_dir_all("logs/pug");
     println!("[PROCESS] Task {} started processing.", task.id);
 
+    // [LOCK-RELEASE] 시작 시 이전 잔여 리소스 강제 정리
+    {
+        // 모델 락을 잠깐 잡았다가 놓아서 혹시 모를 좀비 상태 정리
+        let mut model_guard = model_mutex.lock().await;
+        if model_guard.is_some() {
+            println!("[PROCESS] Clearing residual model state...");
+            *model_guard = None; 
+        }
+        // KV 폴더의 잠금 파일 확인 (Windows에서는 핸들을 닫는 것만으로 충분하지만, 명시적 로그)
+        let kv_path = std::path::Path::new("tmp_kv").join(&task.id);
+        if kv_path.exists() {
+            println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
+        }
+    }
+
     // [NEW] Clear any leftover resources from previous failed attempts at the START
     cleanup_task_resources(&task.id);
 
@@ -1401,31 +1416,28 @@ async fn process_task(
         }
     }
 
-    let _ = app_handle.emit("extraction-progress", json!({ 
-        "task_id": task.id,
-        "category": "Done", 
-        "summary": final_summary, 
-        "spinner": "✅", 
-        "data": if !is_detail { json!(null) } else { extracted_data }
-    }));
-
-    // [REMOVED] Manual cleanup call (Now handled by DataManager drop)
-
-    // [RESOURCE-RELEASE] Explicitly drop the model to free VRAM/RAM after task completion
-    {
-        let mut model_guard = model_mutex.lock().await;
-        *model_guard = None;
-        println!("[Scheduler] Model resources released.");
+        let _ = app_handle.emit("extraction-progress", json!({
+            "task_id": task.id,
+            "category": "Done",
+            "summary": "Extraction complete.",
+            "data": if !is_detail { json!(null) } else { extracted_data }
+        }));
+    
+        // [LOCK-RELEASE] 정상 종료 시 모델 및 리소스 완전 해제
+        {
+            let mut model_guard = model_mutex.lock().await;
+            *model_guard = None;
+            println!("[PROCESS] Task {} completed. Model unloaded and locks released.", task.id);
+        }
+        
+        Ok(())
     }
-
-    Ok(())
-}
-
-fn cleanup_task_resources(_task_id: &str) {
-    // 텍스트 기반 임시 데이터 폴더만 삭제하고, KV 캐시는 보존합니다.
-    let _ = fs::remove_dir_all("tmp_task_data");
-}
-
+    
+    fn cleanup_task_resources(_task_id: &str) {
+        // 텍스트 임시 파일만 삭제하고, KV 캐시(safetensors)는 보존합니다.
+        let _ = fs::remove_dir_all("tmp_task_data");
+        // [LOCK-SAFETY] 혹시 모를 좀비 파일이 있다면 여기서 처리 가능
+    }
 fn clear_all_temp_data() {
     println!("[Cleanup] Clearing all temporary data directories...");
     let _ = fs::remove_dir_all("tmp_task_data");
