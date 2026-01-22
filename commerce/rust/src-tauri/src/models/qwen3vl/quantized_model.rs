@@ -236,238 +236,128 @@ impl QuantizedQwen3VLTextAttention {
     }
 
                     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-
                         if let Some((k, v)) = &self.kv_cache {
-
                             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-
                             let mut map = HashMap::new();
 
-                
+                            if block_size == 0 {
+                                // [ULTRA-FAST] Raw Tensor Save (10x faster, skips CPU-bound quantization)
+                                map.insert("k_raw".to_string(), k.to_device(&Device::Cpu)?);
+                                map.insert("v_raw".to_string(), v.to_device(&Device::Cpu)?);
+                                map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
+                            } else {
+                                map.insert("mode".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
 
-                            // Helper for 8-bit quantization (Flexible Block Size)
+                                // Helper for 8-bit quantization (Flexible Block Size)
+                                let quantize_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, b_size: usize| -> Result<()> {
+                                    use rayon::prelude::*; 
+                                    
+                                    let shape = t.shape().dims().to_vec();
+                                    let t_flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                                    let num_blocks = (t_flat.len() + b_size - 1) / b_size;
 
-                            let quantize_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, b_size: usize| -> Result<()> {
+                                    let (scales, quantized): (Vec<f32>, Vec<Vec<i8>>) = t_flat.par_chunks(b_size)
+                                        .map(|chunk| {
+                                            let max_val = chunk.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                                            let scale = max_val / 127.0; 
+                                            let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                                            
+                                            let mut local_q = Vec::with_capacity(chunk.len());
+                                            for &val in chunk {
+                                                let q = (val * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                                                local_q.push(q);
+                                            }
+                                            (scale, local_q)
+                                        })
+                                        .unzip();
 
-                                use rayon::prelude::*; 
+                                    let quantized_flat: Vec<i8> = quantized.into_iter().flatten().collect();
+                                    let q_len = quantized_flat.len();
+                                    let bytes: Vec<u8> = quantized_flat.iter().map(|&x| x as u8).collect();
 
+                                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(bytes, (q_len,), &Device::Cpu)?);
+                                    map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?);
+                                    map.insert(format!("{}_shape", prefix), Tensor::from_vec(shape.iter().map(|&x| x as u32).collect(), (shape.len(),), &Device::Cpu)?);
+                                    Ok(())
+                                };
+
+                                quantize_tensor(k, "k", &mut map, block_size)?;
+                                quantize_tensor(v, "v", &mut map, block_size)?;
                                 
-
-                                let shape = t.shape().dims().to_vec();
-
-                                let t_flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-
-                                let num_blocks = (t_flat.len() + b_size - 1) / b_size;
-
-                
-
-                                let (scales, quantized): (Vec<f32>, Vec<Vec<i8>>) = t_flat.par_chunks(b_size)
-
-                                    .map(|chunk| {
-
-                                        let max_val = chunk.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-
-                                        let scale = max_val / 127.0; 
-
-                                        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-
-                                        
-
-                                        let mut local_q = Vec::with_capacity(chunk.len());
-
-                                        for &val in chunk {
-
-                                            let q = (val * inv_scale).round().clamp(-127.0, 127.0) as i8;
-
-                                            local_q.push(q);
-
-                                        }
-
-                                        (scale, local_q)
-
-                                    })
-
-                                    .unzip();
-
-                
-
-                                let quantized_flat: Vec<i8> = quantized.into_iter().flatten().collect();
-
-                                let q_len = quantized_flat.len();
-
-                                let bytes: Vec<u8> = quantized_flat.iter().map(|&x| x as u8).collect();
-
-                
-
-                                map.insert(format!("{}_packed", prefix), Tensor::from_vec(bytes, (q_len,), &Device::Cpu)?);
-
-                                map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?);
-
-                                map.insert(format!("{}_shape", prefix), Tensor::from_vec(shape.iter().map(|&x| x as u32).collect(), (shape.len(),), &Device::Cpu)?);
-
-                                Ok(())
-
-                            };
-
-                
-
-                            quantize_tensor(k, "k", &mut map, block_size)?;
-
-                            quantize_tensor(v, "v", &mut map, block_size)?;
-
-                            
-
-                            // Store the block_size used for this file
-
-                            map.insert("block_size".to_string(), Tensor::from_vec(vec![block_size as u32], (1,), &Device::Cpu)?);
-
-                
-
-                            candle_core::safetensors::save(&map, &file)?;
-
-                            if clear {
-
-                                self.kv_cache = None;
-
+                                // Store the block_size used for this file
+                                map.insert("block_size".to_string(), Tensor::from_vec(vec![block_size as u32], (1,), &Device::Cpu)?);
                             }
 
+                            candle_core::safetensors::save(&map, &file)?;
+                            if clear {
+                                self.kv_cache = None;
+                            }
                         }
-
                         Ok(())
-
                     }
 
                 
 
                     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
-
                         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-
                         if file.exists() {
-
                             let tensors = candle_core::safetensors::load(&file, &Device::Cpu)?;
-
                             
-
-                            // Get the block_size from the file, fallback to 1024 if not found
-
-                            let block_size = tensors.get("block_size")
-
+                            let mode = tensors.get("mode")
                                 .and_then(|t| t.to_vec1::<u32>().ok())
-
                                 .and_then(|v| v.get(0).cloned())
+                                .unwrap_or(1); // Default to quantized
 
-                                .unwrap_or(1024) as usize;
-
-                
+                            let (k, v) = if mode == 0 {
+                                // [ULTRA-FAST] Raw Load
+                                let k = tensors.get("k_raw").ok_or(anyhow!("Missing k_raw"))?;
+                                let v = tensors.get("v_raw").ok_or(anyhow!("Missing v_raw"))?;
+                                let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+                                (k.to_device(device)?.to_dtype(target_dtype)?, v.to_device(device)?.to_dtype(target_dtype)?)
+                            } else {
+                                // Get the block_size from the file, fallback to 1024 if not found
+                                let block_size = tensors.get("block_size")
+                                    .and_then(|t| t.to_vec1::<u32>().ok())
+                                    .and_then(|v| v.get(0).cloned())
+                                    .unwrap_or(1024) as usize;
 
                                         // Helper for dequantization (8-bit Parallelized)
-
-                
-
                                         let dequantize_tensor = |prefix: &str| -> Result<Tensor> {
-
-                
-
                                             use rayon::prelude::*;
-
-                
-
-                            
-
-                
-
                                             let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("Missing packed"))?.to_vec1::<u8>()?;
-
-                
-
                                             let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("Missing scales"))?.to_vec1::<f32>()?;
-
-                
-
                                             let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
-
-                
-
                                             let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
-
-                
-
                                             
-
-                
-
-                                                            // [PARALLEL] Unpack and scale in parallel
-
-                
-
-                                            
-
-                
-
-                                let _total_elements: usize = shape.iter().product();
-
-                
-
-                                            
-
-                
-
-                                // [PARALLEL] Unpack and scale in parallel
-                let decoded: Vec<f32> = packed.par_chunks(block_size)
-                    .enumerate()
-                    .flat_map(|(s_idx, chunk)| {
-                        let scale = scales[s_idx];
-                        chunk.par_iter().map(move |&byte| (byte as i8) as f32 * scale)
-                    })
-                    .collect();
-
-                
-
-                            
-
-                
+                                            // [PARALLEL] Unpack and scale in parallel
+                                            let decoded: Vec<f32> = packed.par_chunks(block_size)
+                                                .enumerate()
+                                                .flat_map(|(s_idx, chunk)| {
+                                                    let scale = scales[s_idx];
+                                                    chunk.par_iter().map(move |&byte| (byte as i8) as f32 * scale)
+                                                })
+                                                .collect();
 
                                             let t = Tensor::from_vec(decoded, shape, &Device::Cpu)?;
-
-                
-
                                             Ok(t.to_device(device)?.to_dtype(if device.is_cuda() { DType::BF16 } else { DType::F32 })?) 
-
-                
-
                                         };
 
-                
-
-                            let k = dequantize_tensor("k")?;
-
-                            let v = dequantize_tensor("v")?;
-
-                
+                                let k = dequantize_tensor("k")?;
+                                let v = dequantize_tensor("v")?;
+                                (k, v)
+                            };
 
                             let current_len = k.dim(2)?;
-
                             if current_len >= expected_len {
-
                                 let k = k.narrow(2, 0, expected_len)?;
-
                                 let v = v.narrow(2, 0, expected_len)?;
-
                                 self.kv_cache = Some((k, v));
-
                             } else {
-
                                 println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
-
                                 self.kv_cache = None;
-
                             }
-
                         }
-
                         Ok(())
-
                     }
 
                 

@@ -301,8 +301,8 @@ impl Qwen3VLGenerateModel {
                     }
 
                     if !skip_save {
-                        // 주입(Prefill) 단계이므로 초고속 모드(8192) 사용
-                        if m.save_kv_cache(path, false, 8192).is_ok() {
+                        // 주입(Prefill) 단계이므로 초고속 모드(Direct Save) 사용
+                        if m.save_kv_cache(path, false, 0).is_ok() {
                             if let Ok(file) = fs::File::create(&token_path) {
                                 let _ = serde_json::to_writer(file, &ingested_tokens);
                             }
@@ -429,10 +429,9 @@ impl Qwen3VLGenerateModel {
                          // Do nothing (No offload, No clear)
                      } else if is_save {
                          // [SAVE MODE] Finalize and Offload to Disk
-                         println!("[KV-DISK] Finalizing ingestion. Saving to disk (Block Size: 8192)...");
+                         println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (No Quantization)...");
                          
-                         // [SPEED] Doubled block size to 8192 for even faster disk writes
-                         let target_block_size = 8192; 
+                         let target_block_size = 0; 
                          
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
