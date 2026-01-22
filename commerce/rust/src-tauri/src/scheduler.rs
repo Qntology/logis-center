@@ -570,11 +570,8 @@ async fn process_task(
                     let out = res?;
                     if is_last {
                         page_type_res = out.clone();
-                        // [NEW] Append the final classification result to history so subsequent turns (Extraction) inherit it
-                        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                            content: Some(out.clone()),
-                            ..Default::default()
-                        }));
+                        // [MEMORY-CONTROL] Do NOT push the final answer to history. 
+                        // This allows subsequent steps to reuse the Body cache (prefix match) without being biased by this answer.
                         
                         let _ = app_handle.emit("extraction-progress", json!({ 
                             "task_id": task.id,
@@ -651,11 +648,7 @@ async fn process_task(
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let _ = std::fs::write(format!("logs/pug/prompt_selectors_{}_{}.pug", task.id, ts_nano), &next_question);
 
-        // Add classification result and the new question to history
-        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-            content: Some(page_type_res.clone()),
-            ..Default::default()
-        }));
+        // [MEMORY-CONTROL] Branching off from the Body content. We do NOT include the previous Classification Answer.
         
         messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(vec![
@@ -705,6 +698,9 @@ async fn process_task(
         *model_guard = None;
         println!("[MEMORY] Model unloaded after Selector ID.");
     }
+
+    // [MEMORY-CONTROL] Revert history to Base Body state (remove Selector Prompt) for the next step
+    messages.pop();
 
             let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
             println!("[Scheduler] Selectors Found: {}", selector_info);        
