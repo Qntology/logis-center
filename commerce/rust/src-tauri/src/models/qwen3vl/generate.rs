@@ -235,8 +235,8 @@ impl Qwen3VLGenerateModel {
              }
         }
         
-        // [CHUNKED PREFILL] - Line Aware (512 tokens)
-        if seq_len > 512 {
+        // [CHUNKED PREFILL] - Line Aware (1024 tokens)
+        if seq_len > 1024 {
             println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
             
             let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.text_device) {
@@ -248,12 +248,12 @@ impl Qwen3VLGenerateModel {
 
             while current_pos < seq_len - 1 {
                 let remaining = seq_len - current_pos;
-                if remaining <= 512 { break; } 
+                if remaining <= 1024 { break; } 
 
-                let mut chunk_size = 512;
-                let lookback_range = 128; 
+                let mut chunk_size = 1024;
+                let lookback_range = 256; 
                 
-                let search_end = current_pos + 512;
+                let search_end = current_pos + 1024;
                 let search_start = search_end.saturating_sub(lookback_range);
                 
                 for i in (search_start..search_end).rev() {
@@ -284,7 +284,8 @@ impl Qwen3VLGenerateModel {
             // [NEW] Intermediate Cache Save: Save context knowledge after heavy prefill
             if let Some(path) = &cache_path {
                 if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
-                    if m.save_kv_cache(path, false).is_ok() {
+                    // 주입(Prefill) 단계이므로 초고속 모드(2048) 사용
+                    if m.save_kv_cache(path, false, 2048).is_ok() {
                         let token_path = path.join("tokens.json");
                         // We save only the part of full_input_ids_vec that corresponds to seqlen_offset
                         let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
@@ -395,14 +396,15 @@ impl Qwen3VLGenerateModel {
         let generate = generation_result?;
 
         if let Some(path) = &cache_path {
-             // [READ-ONLY CHECK] 추출 명령이 포함된 경우 베이스 캐시 보존을 위해 저장을 스킵합니다.
+             // [HYBRID BLOCK SIZE] 주입은 2048(초고속), 추출은 128(정밀도)
              let is_extraction = input.replace_text.contains("ACTION: EXTRACT") || input.replace_text.contains("ACTION: Identify");
-             
+             let target_block_size = if is_extraction { 128 } else { 2048 };
+
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
                      if !is_extraction {
-                         println!("[KV-DISK] Updating base cache in {:?}", path);
-                         if m.offload_kv_cache(path).is_ok() {
+                         println!("[KV-DISK] Updating base cache (Injection mode, size 2048) in {:?}", path);
+                         if m.offload_kv_cache(path, target_block_size).is_ok() {
                              let mut all_tokens = full_input_ids_vec;
                              all_tokens.extend(&generate);
                              if !all_tokens.is_empty() {
@@ -415,8 +417,8 @@ impl Qwen3VLGenerateModel {
                              }
                          }
                      } else {
-                         println!("[KV-DISK] Read-only mode: Skipping cache update to protect base.");
-                         m.clear_kv_cache(); // 메모리만 비우고 파일은 유지
+                         println!("[KV-DISK] Read-only mode (Inference mode, size 128): Skipping cache update.");
+                         m.clear_kv_cache();
                      }
                  },
                  ModelVariant::Standard(m) => m.clear_kv_cache(),

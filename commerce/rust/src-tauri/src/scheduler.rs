@@ -422,12 +422,11 @@ async fn process_task(
         device_config.classify_chunk_size = 1000; 
         device_config.extract_chunk_size = 1000;
     
-        // [REVISED] Restore turn-based chunked ingestion for classification.
-        // This is the original stable logic.
-        let classify_chunks = chunk_text(&light_pug, 1000, 200); 
-        let classify_chunks_len = classify_chunks.len(); 
-        println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);
-    let mut model_guard = model_mutex.lock().await;
+                // [REVISED] Restore turn-based chunked ingestion for classification.
+                // This is the original stable logic.
+                let classify_chunks = chunk_text(&light_pug, 4000, 500); 
+                let classify_chunks_len = classify_chunks.len(); 
+                println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_guard = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");
     
     if model_guard.is_none() {
