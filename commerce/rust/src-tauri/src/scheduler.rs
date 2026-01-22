@@ -500,7 +500,7 @@ async fn process_task(
                 "task_id": task.id,
                 "category": "Classification Ingestion", 
                 "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
-                "spinner": "⠋"
+                "spinner": "⠋" // 스피너 명시
             }));
 
             let params = ChatCompletionParameters {
@@ -583,6 +583,7 @@ async fn process_task(
 
     // Step 2: Identify Selectors (Building on History)
     let _ = app_handle.emit("extraction-progress", json!({ 
+        "task_id": task.id,
         "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type), "spinner": "⠋"
     }));
 
@@ -621,6 +622,7 @@ async fn process_task(
                 &app_handle_clone, 
                 "extraction-progress", 
                 json!({ 
+                    "task_id": task.id,
                     "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type)
                 }), 
                 Some(cancellation_token.clone()), 
@@ -698,6 +700,7 @@ async fn process_task(
         let page_info = final_page_info; // Re-alias for original logic
         
         let _ = app_handle.emit("extraction-progress", json!({ 
+            "task_id": task.id,
             "category": "Classification", 
             "summary": format!("Map: Type={}, Detail={}", 
                 page_info.get("type").and_then(|s| s.as_str()).unwrap_or("?"),
@@ -732,6 +735,7 @@ async fn process_task(
 
     if !is_detail {
         let _ = app_handle.emit("extraction-progress", json!({ 
+            "task_id": task.id,
             "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
         }));
 
@@ -790,14 +794,7 @@ async fn process_task(
         let base_pug_path = base_kv_path.join("base_structure.pug");
         let base_pug_content = std::fs::read_to_string(&base_pug_path).unwrap_or_else(|_| light_pug.clone());
 
-        // [INDEX-LOAD] 최초 분류 단계에서 저장했던 전체 구조 Pug를 불러옵니다.
-        let base_kv_path = std::path::Path::new("tmp_kv").join(&task.id);
-        let base_pug_path = base_kv_path.join("base_structure.pug");
-        let base_pug_content = std::fs::read_to_string(&base_pug_path).unwrap_or_else(|_| light_pug.clone());
-
         let mut all_extracted_items = Vec::new();
-        
-        // [CURSOR] 중복 아이템 처리를 위해 검색 시작 위치를 기억합니다.
         let mut search_cursor = 0;
 
         // [BATCH OPTIMIZATION] 단일 태스크 폴더 내에서 KV 캐시를 공유하며 아이템 처리
@@ -989,9 +986,11 @@ async fn process_task(
         if content_pug.trim().is_empty() {
             println!("[Scheduler] Error: No content found with selector '{}'", target_selector);
             let _ = app_handle.emit("extraction-progress", json!({ 
+                "task_id": task.id,
                 "category": "Error", "summary": format!("Selector '{}' not found.", target_selector), "spinner": "❌"
             }));
             let _ = app_handle.emit("extraction-progress", json!({ 
+                "task_id": task.id,
                 "category": "Done", "summary": "Extraction Failed", "spinner": "🛑", "data": null
             }));
             return Ok(());
@@ -1074,7 +1073,7 @@ async fn process_task(
                                 params,
                                 &app_handle_clone, 
                                 "extraction-progress", 
-                                json!({ "category": "Ingestion" }), 
+                                json!({ "task_id": task.id, "category": "Ingestion" }), 
                                 Some(cancellation_token.clone()), 
                                 Some(detail_session_id.clone())
                             ) => res?,

@@ -275,6 +275,7 @@ impl LogisModel {
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
         let _ = app_handle.emit("extraction-progress", json!({ 
+            "task_id": task_id.clone(),
             "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
         }));
 
@@ -340,12 +341,14 @@ impl LogisModel {
             }
             
             let _ = app_handle.emit("extraction-progress", json!({ 
+               "task_id": task_id.clone(),
                "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
             }));
             
             Ok(())
         } else {
             let _ = app_handle.emit("extraction-progress", json!({ 
+               "task_id": task_id.clone(),
                "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
             }));
             Ok(())
@@ -577,12 +580,21 @@ impl LogisModel {
         image: Option<DynamicImage>, 
         app_handle: &tauri::AppHandle,
         event_name: &str,
-        base_payload: Value,
+        mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator().await?;
+
+        // [FIX] Inject task_id from session_id if it's a task reference
+        if let Some(ref sid) = session_id {
+            if sid.starts_with("task_") || sid.starts_with("img_") {
+                if let Some(obj) = base_payload.as_object_mut() {
+                    obj.insert("task_id".to_string(), json!(sid));
+                }
+            }
+        }
 
         // Emit initial status once
         let _ = app_handle.emit(event_name, base_payload);

@@ -583,6 +583,15 @@ listen("extraction-progress", async (event: any) => {
     const elementId = `progress-${catId}`;
     const extractionLog = document.getElementById("extraction-log");
     
+    // [FIX] Task Cross-talk Prevention
+    // Only update the log if the event belongs to the task currently being viewed
+    if (extractionLog && extractionLog.dataset.activeTaskId) {
+        if (payload.task_id && payload.task_id !== extractionLog.dataset.activeTaskId) {
+            console.log(`[WIDGET] Ignoring progress for background task: ${payload.task_id}`);
+            return;
+        }
+    }
+
     if (payload.category === "Done" || payload.category === "Error") {
         stopSpinner();
         isExtracting = false;
@@ -601,18 +610,8 @@ listen("extraction-progress", async (event: any) => {
     }
 
     if (extractionLog && detailView.style.display !== "none") {
-         // [FIXED] Transition ONLY previous categories to 'Done'
-         if (payload.category !== "Done" && payload.category !== "Error") {
-             const allRows = extractionLog.querySelectorAll(".progress-row");
-             allRows.forEach(row => {
-                 const container = row.closest('[id^="progress-"]');
-                 const spinner = row.querySelector(".active-spinner");
-                 // If this is an old category container, mark it as done
-                 if (container && container.id !== elementId && spinner) {
-                     row.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span style="color:#888;">${row.querySelector(".summary-text")?.textContent || ""}</span>`;
-                 }
-             });
-         }
+         // [FIXED] 카테고리 전환 시 이전 항목을 자동으로 완료 처리하는 로직을 제거합니다.
+         // 오직 'Done' 또는 'Error' 페이로드가 올 때만 체크 표시가 나타나게 합니다.
 
          let p = document.getElementById(elementId);
          if (!p) {
