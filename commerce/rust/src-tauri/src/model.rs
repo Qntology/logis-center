@@ -140,14 +140,18 @@ pub struct LogisModel {
 impl LogisModel {
     pub fn unload_generator(&self) {
         let mut gen = self.generator.lock().unwrap();
-        *gen = None;
-        println!("[MODEL] Generator (Qwen) unloaded to free VRAM.");
+        if gen.is_some() {
+            *gen = None;
+            println!("[MODEL] Generator (Qwen) unloaded to free VRAM.");
+        }
     }
 
     pub fn unload_embedding(&self) {
         let mut emb = self.embedding_model.lock().unwrap();
-        *emb = None;
-        println!("[MODEL] Embedding Model unloaded to free VRAM.");
+        if emb.is_some() {
+            *emb = None;
+            println!("[MODEL] Embedding Model unloaded to free VRAM.");
+        }
     }
 
     async fn load_generator_internal(&self) -> anyhow::Result<Qwen3VLGenerateModel> {

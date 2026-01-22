@@ -885,7 +885,7 @@ async fn process_task(
                 "spinner": "⠋"
             }));
 
-            let batch_size = 5;
+            let batch_size = 20;
             let mut refined_items = Vec::new();
             let total_refine_count = all_extracted_items.len();
             
@@ -928,7 +928,7 @@ async fn process_task(
                             })
                         ],
                         model: "qwen3vl".to_string(),
-                        max_tokens: Some(1024),
+                        max_tokens: Some(2048),
                         temperature: Some(0.1),
                         ..Default::default()
                     };
@@ -954,13 +954,24 @@ async fn process_task(
                                             .or_else(|| parsed.as_array());
                                             
                          if let Some(arr) = items_array {
+                             let mut batch_refined = Vec::new();
                              for (i, refined) in arr.iter().enumerate() {
                                  if i < batch.len() {
                                      let mut original = batch[i].clone();
                                      merge_json(&mut original, refined.clone());
+                                     batch_refined.push(original.clone());
                                      refined_items.push(original);
                                  }
                              }
+                             
+                             // Emit the batch results to be appended in the UI
+                             let _ = app_handle.emit("extraction-progress", json!({
+                                 "task_id": task.id,
+                                 "category": "Data Refinement",
+                                 "data": batch_refined,
+                                 "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
+                             }));
+
                              // If LLM returned fewer items than batch, fill with remaining originals
                              if arr.len() < batch.len() {
                                  for i in arr.len()..batch.len() {
