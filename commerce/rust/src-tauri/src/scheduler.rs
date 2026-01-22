@@ -428,6 +428,7 @@ async fn process_task(
         println!("[ERROR] Failed to write instruction_classify: {}", e);
     }
 
+    let mut line_counter = 1; // 👈 Move outside to keep continuity
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         
@@ -437,7 +438,6 @@ async fn process_task(
             
             let mut prompt = format!("[Reading structure part {}/{}]", i + 1, classify_chunks_len);
 
-            let mut line_counter = 1;
             for line in chunk.lines() {
                 prompt.push_str(&format!("\n{} | {}", line_counter, line));
                 line_counter += 1;
@@ -734,6 +734,7 @@ async fn process_task(
         let _ = std::fs::write(format!("logs/pug/instruction_list_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
 
         let mut all_extracted_items = Vec::new();
+        let mut line_counter = 1; // 👈 Continuous line numbering for items
 
         // [BATCH OPTIMIZATION] Process 4 items at a time to improve stability
         for chunk in item_pugs.chunks(4) {
@@ -751,7 +752,6 @@ async fn process_task(
             // [OPTIMIZATION] Separate Schema (System) from Data (User)
             // Initialize prompt with header and append snippets with line numbers
             let mut prompt = format!("[Reading structure part {}~{}/{}]", current_start, current_end, total_items);
-            let mut line_counter = 1;
             for pug in chunk {
                 for line in pug.lines() {
                     prompt.push_str(&format!("\n{} | {}", line_counter, line));
@@ -928,6 +928,7 @@ async fn process_task(
         
                 // Phase 1: Ingest all chunks (Prefill)
                 let chunks_len = chunks.len();
+                let mut line_counter = 1; // 👈 Continuous line numbering for detail page
                 
                 for (chunk_idx, chunk) in chunks.iter().enumerate() {
                     let is_last = chunk_idx == chunks_len - 1;
@@ -935,7 +936,6 @@ async fn process_task(
                     // Prepare prompt: Only trigger extraction on the final chunk
                     let mut prompt = format!("[Reading structure part {}/{}]", chunk_idx + 1, chunks_len);
 
-                    let mut line_counter = 1;
                     for line in chunk.lines() {
                         prompt.push_str(&format!("\n{} | {}", line_counter, line));
                         line_counter += 1;
