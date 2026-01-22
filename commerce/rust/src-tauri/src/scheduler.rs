@@ -763,13 +763,12 @@ async fn process_task(
 
         let mut all_extracted_items = Vec::new();
 
-        // [BATCH OPTIMIZATION] 개별 아이템별로 독립된 캐시 세션 사용
+        // [BATCH OPTIMIZATION] 단일 태스크 폴더 내에서 KV 캐시를 공유하며 아이템 처리
         for (chunk_idx, chunk) in item_pugs.chunks(1).enumerate() {
             let current_start = all_extracted_items.len() + 1;
             
-            // [SELECTOR-BASED ID] 아이템의 셀렉터 또는 인덱스를 기반으로 고유 캐시 경로 생성
-            // 이를 통해 같은 위치의 아이템은 다음 방문 시 즉시 매칭됨
-            let item_session_id = format!("{}_item_{}", task.id, chunk_idx);
+            // [FIXED] 사용자님의 지시대로 폴더를 나누지 않고 task.id 폴더 하나만 사용합니다.
+            let item_session_id = task.id.clone();
 
             let _ = app_handle.emit("extraction-progress", json!({
                 "task_id": task.id,
