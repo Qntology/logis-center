@@ -19,21 +19,21 @@ use std::path::PathBuf;
 struct TaskDataManager {
     task_id: String,
     created_files: Vec<PathBuf>,
+    app_handle: Option<tauri::AppHandle>,
 }
 
 impl TaskDataManager {
-    fn new(task_id: &str) -> Self {
+    fn new(task_id: &str, app_handle: Option<tauri::AppHandle>) -> Self {
         Self {
             task_id: task_id.to_string(),
             created_files: Vec::new(),
+            app_handle,
         }
     }
 
     fn offload(&mut self, content: &str, suffix: &str) -> Result<PathBuf> {
-        let dir = std::path::Path::new("tmp_task_data");
-        if !dir.exists() {
-            fs::create_dir_all(dir)?;
-        }
+        let dir = utils::paths::get_task_data_dir(self.app_handle.as_ref());
+        
         // Simple unique filename
         let filename = format!("{}_{}_{}.txt", self.task_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_micros(), suffix);
         let path = dir.join(filename);
@@ -179,8 +179,9 @@ pub async fn start_background_worker(
     println!("[Scheduler] Background worker started.");
     
     // [NEW] Clear ALL temporary data directories at startup for a clean slate
-    clear_all_temp_data();
+    clear_all_temp_data(Some(&app_handle));
     
+    let app_handle_clone = app_handle.clone();
     tokio::spawn(async move {
         let mut delay_secs = 1;
         
@@ -286,47 +287,84 @@ pub async fn start_background_worker(
 }
 
 async fn process_task(
+
     task: Task,
+
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
+
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
+
     cancellation_token: &Arc<AtomicBool>,
+
     app_handle: &tauri::AppHandle
+
 )
+
 -> Result<()>
+
 {
-    // [NEW] Ensure log directory exists at runtime
-    let _ = std::fs::create_dir_all("logs/pug");
+
+    // [NEW] Ensure log directory exists at runtime using dynamic path
+
+    let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle));
+
     println!("[PROCESS] Task {} started processing.", task.id);
 
+
+
     // [LOCK-RELEASE] 시작 시 이전 잔여 리소스 강제 정리
+
     {
+
         // 모델 락을 잠깐 잡았다가 놓아서 혹시 모를 좀비 상태 정리
+
         let mut model_guard = model_mutex.lock().await;
+
         if model_guard.is_some() {
+
             println!("[PROCESS] Clearing residual model state...");
+
             *model_guard = None; 
+
         }
+
         // KV 폴더의 잠금 파일 확인 (Windows에서는 핸들을 닫는 것만으로 충분하지만, 명시적 로그)
-        let kv_path = std::path::Path::new("tmp_kv").join(&task.id);
+
+        let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
+
         if kv_path.exists() {
+
             println!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id);
+
         }
+
     }
 
+
+
     // [NEW] Clear any leftover resources from previous failed attempts at the START
-    cleanup_task_resources(&task.id);
+
+    cleanup_task_resources(&task.id, Some(app_handle));
 
 
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+
+
     let _ = app_handle.emit("extraction-progress", json!({ 
+
         "task_id": task.id,
+
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
+
     }));
 
-    // [MEMORY] Initialize Data Manager for this task scope
-    let mut data_manager = TaskDataManager::new(&task.id);
+
+
+    // [MEMORY] Initialize Data Manager for this task scope with AppHandle for dynamic paths
+
+    let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
 
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
     let language = "english"; 
@@ -409,11 +447,11 @@ async fn process_task(
     
     // [DEBUG-LOG] Save generated Pug with nanosecond precision to prevent overwriting
     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let log_path = format!("logs/pug/light_{}_{}.pug", task.id, ts_nano);
+    let log_path = pug_logs_dir.join(format!("light_{}_{}.pug", task.id, ts_nano));
     if let Err(e) = std::fs::write(&log_path, &light_pug) {
         println!("[ERROR] Failed to write light pug: {}", e);
     } else {
-        println!("[DEBUG] Saved light pug to: {}", log_path);
+        println!("[DEBUG] Saved light pug to: {:?}", log_path);
     }
     
         // Determine optimal chunk sizes based on hardware
@@ -468,7 +506,7 @@ async fn process_task(
 
     // [DEBUG-LOG] Save initial classification system prompt
     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let log_path = format!("logs/pug/instruction_classify_{}_{}.pug", task.id, ts_nano);
+    let log_path = pug_logs_dir.join(format!("instruction_classify_{}_{}.pug", task.id, ts_nano));
     if let Err(e) = std::fs::write(&log_path, parsing::page_type_prompt()) {
         println!("[ERROR] Failed to write instruction_classify: {}", e);
     }
@@ -488,7 +526,7 @@ async fn process_task(
 
             // [DEBUG-LOG] Save classification chunk for verification
             let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let log_path = format!("logs/pug/chunk_classify_{}_{}_{}.pug", task.id, i, ts_nano);
+            let log_path = pug_logs_dir.join(format!("chunk_classify_{}_{}_{}.pug", task.id, i, ts_nano));
             if let Err(e) = std::fs::write(&log_path, &prompt) {
                 println!("[ERROR] Failed to write chunk_classify: {}", e);
             }
@@ -643,7 +681,7 @@ async fn process_task(
 
         // [DEBUG-LOG] Save raw selector response
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(format!("logs/pug/res_selectors_{}_{}.res", task.id, ts_nano), &res);
+        let _ = std::fs::write(pug_logs_dir.join(format!("res_selectors_{}_{}.res", task.id, ts_nano)), &res);
         res
     } else { "{}".to_string() };
         drop(model_guard);
@@ -1011,16 +1049,16 @@ async fn process_task(
 
         // [DEBUG-LOG] Save content Pug for verification
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let log_path = format!("logs/pug/content_{}_{}.pug", task.id, ts_nano);
+        let log_path = pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano));
         let _ = std::fs::write(&log_path, &content_pug);
-        println!("[DEBUG] Saved content pug to: {}", log_path);
+        println!("[DEBUG] Saved content pug to: {:?}", log_path);
         
                         // CHUNKING: Split huge content into dynamic chunks with 500-char overlap (Device Optimized) 
                         let chunks = chunk_text(&content_pug, 1000, 200); 
                         let extraction_instruction = parsing::item2json(page_type, &url, language);        
                 // [DEBUG-LOG] Save detail extraction instruction
                 let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                let _ = std::fs::write(format!("logs/pug/instruction_detail_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
+                let _ = std::fs::write(pug_logs_dir.join(format!("instruction_detail_{}_{}.pug", task.id, ts_nano)), &extraction_instruction);
         
                 // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
                 let detail_session_id = format!("{}_detail", task.id);
@@ -1047,7 +1085,7 @@ async fn process_task(
                             }
                     // [DEBUG-LOG] Save detail chunk for verification
                     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                    let log_path = format!("logs/pug/chunk_detail_{}_{}_{}.pug", task.id, chunk_idx, ts_nano);
+                    let log_path = pug_logs_dir.join(format!("chunk_detail_{}_{}_{}.pug", task.id, chunk_idx, ts_nano));
                     if let Err(e) = std::fs::write(&log_path, &prompt) {
                         println!("[ERROR] Failed to write chunk_detail: {}", e);
                     }
@@ -1097,14 +1135,14 @@ async fn process_task(
                                 }
                             } => { 
                                 drop(model_guard);
-                                cleanup_task_resources(&task.id);
+                                cleanup_task_resources(&task.id, Some(app_handle));
                                 return Err(anyhow::anyhow!("Task cancelled")); 
                             }
                         };
                         
                         // [DEBUG-LOG] Save raw detail response
                         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        let _ = std::fs::write(format!("logs/pug/res_detail_{}_{}_{}.res", task.id, chunk_idx, ts_nano), &res);
+                        let _ = std::fs::write(pug_logs_dir.join(format!("res_detail_{}_{}_{}.res", task.id, chunk_idx, ts_nano)), &res);
                         
                         // [NEW] Accumulate back if not the last one
                         if !is_last {
@@ -1444,18 +1482,14 @@ async fn process_task(
         Ok(())
     }
     
-    fn cleanup_task_resources(_task_id: &str) {
+    fn cleanup_task_resources(_task_id: &str, app_handle: Option<&tauri::AppHandle>) {
         // 텍스트 임시 파일만 삭제하고, KV 캐시(safetensors)는 보존합니다.
-        let _ = fs::remove_dir_all("tmp_task_data");
-        // [LOCK-SAFETY] 혹시 모를 좀비 파일이 있다면 여기서 처리 가능
+        let _ = fs::remove_dir_all(utils::paths::get_task_data_dir(app_handle));
     }
-fn clear_all_temp_data() {
+
+fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
     println!("[Cleanup] Clearing all temporary data directories...");
-    let _ = fs::remove_dir_all("tmp_task_data");
-    let _ = fs::remove_dir_all("tmp_kv");
-    // Re-create them as empty
-    let _ = fs::create_dir_all("tmp_task_data");
-    let _ = fs::create_dir_all("tmp_kv");
+    utils::paths::cleanup_temp_dirs(app_handle);
 }
 
 

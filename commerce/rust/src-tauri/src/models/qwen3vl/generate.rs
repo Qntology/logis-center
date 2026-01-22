@@ -180,7 +180,7 @@ impl Qwen3VLGenerateModel {
 
         // KV Cache Disk Loading (Hierarchical Prefix Caching)
         let cache_path = if let Some(sid) = &session_id {
-             let p = std::path::Path::new("tmp_kv").join(sid);
+             let p = crate::utils::paths::get_kv_dir(None).join(sid);
              if !p.exists() { let _ = fs::create_dir_all(&p); }
              Some(p)
         } else {
