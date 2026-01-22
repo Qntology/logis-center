@@ -748,17 +748,6 @@ async fn process_task(
         
         let page_info = final_page_info; // Re-alias for original logic
         
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "task_id": task.id,
-            "category": "Classification", 
-            "summary": format!("Map: Type={}, Detail={}", 
-                page_info.get("type").and_then(|s| s.as_str()).unwrap_or("?"),
-                is_detail
-            ), 
-            "spinner": "✅", 
-            "data": page_info
-        }));
-        
         let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
         let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
         let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
@@ -788,6 +777,26 @@ async fn process_task(
     } else {
         "body".to_string()
     };
+
+    // [COUNT] Calculate actual matches for transparency
+    let match_count = {
+        if let Ok(content) = data_manager.load(&clean_html_path) {
+            let doc = scraper::Html::parse_document(&content);
+            scraper::Selector::parse(&target_selector).map(|s| doc.select(&s).count()).unwrap_or(0)
+        } else { 0 }
+    };
+
+    let _ = app_handle.emit("extraction-progress", json!({ 
+        "task_id": task.id,
+        "category": "Classification", 
+        "summary": format!("Type: {}, Detail: {} ({} matches found)", 
+            page_type, 
+            is_detail,
+            match_count
+        ), 
+        "spinner": "✅", 
+        "data": page_info
+    }));
 
     let mut extracted_data = json!({});
 
