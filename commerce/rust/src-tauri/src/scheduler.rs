@@ -603,7 +603,7 @@ async fn process_task(
         }
     }
 
-    println!("[Scheduler] Checkpoint: Classification Start");
+    println!("[Scheduler] Classification complete. Result Acquisition...");
     println!("[Scheduler] DEBUG: page_type_res length: {}, content: '{:?}'", page_type_res.len(), page_type_res);
     if page_type_res.is_empty() {
         println!("[Scheduler] Error: page_type_res is empty. Model returned nothing.");
@@ -622,22 +622,14 @@ async fn process_task(
     
     if page_type.is_empty() || page_type == "unknown" {
         println!("[Scheduler] Stopping: Unknown page type. Raw response: '{}'", page_type_res);
-        // [FIX] Explicitly drop model before early return
-        {
-            let mut model_guard = model_mutex.lock().await;
-            *model_guard = None;
-        }
+        // [FIX] Unload model if type unknown before early return
+        *model_guard = None;
         return Ok(());
     }
 
     final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
-    // [MEMORY-CONTROL] Unload model after Classification to ensure clean state for next step
-    {
-        let mut model_guard = model_mutex.lock().await;
-        *model_guard = None;
-        println!("[MEMORY] Model unloaded after Classification.");
-    }
+    println!("[Scheduler] Moving to Selector Identification...");
 
     // Step 2: Identify Selectors (Building on History)
     let _ = app_handle.emit("extraction-progress", json!({ 
@@ -695,21 +687,14 @@ async fn process_task(
         let _ = std::fs::write(pug_logs_dir.join(format!("res_selectors_{}_{}.res", task.id, ts_nano)), &res);
         res
     } else { "{}".to_string() };
-        drop(model_guard);
-        
-    // [MEMORY-CONTROL] Unload model after Selector Identification
-    {
-        let mut model_guard = model_mutex.lock().await;
-        *model_guard = None;
-        println!("[MEMORY] Model unloaded after Selector ID.");
-    }
-
+    
     // [MEMORY-CONTROL] Revert history to Base Body state (remove Selector Prompt) for the next step
     messages.pop();
 
             let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
             println!("[Scheduler] Selectors Found: {}", selector_info);        
         let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+        println!("[Scheduler] is_detail determined: {}", is_detail);
 
         // [STRICT PARITY] Ported from proxy/src/index.ts mechanism
         {
@@ -945,18 +930,18 @@ async fn process_task(
                 let instruction = parsing::list2json(&page_type, &language);
                 let prompt = format!("{}\n\n[RAW ITEMS]\n{}", instruction, batch_text);
                 
-                // Call Model
-                let model_guard = model_mutex.lock().await;
+                // [FIX] Reuse existing history (chunks) to ensure safetensors cache hit
                 if let Some(model) = model_guard.as_ref() {
+                     let mut refine_messages = messages.clone();
+                     refine_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                         content: ChatCompletionRequestUserMessageContent::Array(vec![
+                             ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                         ]),
+                         name: None,
+                     }));
+
                      let params = ChatCompletionParameters {
-                        messages: vec![
-                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                                content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
-                                ]),
-                                name: None,
-                            })
-                        ],
+                        messages: refine_messages,
                         model: "qwen3vl".to_string(),
                         max_tokens: Some(2048),
                         temperature: Some(0.1),
@@ -1030,13 +1015,6 @@ async fn process_task(
                 "summary": format!("Refined {} items with AI.", total_refine_count),
                 "spinner": "✅"
             }));
-        }
-
-        // [MEMORY-CONTROL] Unload model after List Refinement
-        {
-            let mut model_guard = model_mutex.lock().await;
-            *model_guard = None;
-            println!("[MEMORY] Model unloaded after List Refinement.");
         }
 
         // 이후 DB 저장 로직으로 연결 (기존 로직 활용)
@@ -1142,13 +1120,6 @@ async fn process_task(
         println!("[EXTRACT-FINAL] Result: {}", response);
         let full_data = parsing::parse_json_from_llm(&response);
         extracted_data = full_data;
-
-        // [MEMORY-CONTROL] Unload model after Detail Extraction
-        {
-            let mut model_guard = model_mutex.lock().await;
-            *model_guard = None;
-            println!("[MEMORY] Model unloaded after Detail Extraction.");
-        }
     }
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -1280,11 +1251,6 @@ async fn process_task(
                 text_to_embed = text_to_embed.chars().take(3000).collect();
             }
             
-            drop(store_guard); 
-            
-            let mut model_guard = model_mutex.lock().await;
-            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-            
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let vector = if let Some(v) = existing_vector {
@@ -1301,7 +1267,6 @@ async fn process_task(
                     } => { return Err(anyhow::anyhow!("Task cancelled")); }
                 }
             } else { None };
-            drop(model_guard);
             
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
@@ -1369,9 +1334,6 @@ async fn process_task(
                 
                 drop(store_guard);
 
-                let mut model_guard = model_mutex.lock().await;
-                if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-                
                 let vector = if let Some(v) = existing_vector {
                     Some(v)
                 } else if let Some(model) = model_guard.as_ref() {
@@ -1386,7 +1348,6 @@ async fn process_task(
                         } => { return Err(anyhow::anyhow!("Task cancelled")); }
                     }
                 } else { None };
-                drop(model_guard);
 
                 let store_guard = store_mutex.lock().await;
                 if let Some(db) = store_guard.as_ref() {

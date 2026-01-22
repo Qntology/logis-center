@@ -16,6 +16,7 @@ trade/model_cache/
 trade/model_offload/
 trade/conda_env/
 
+tmp/
 
 # Data and Database
 trade/data/
