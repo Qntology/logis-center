@@ -717,7 +717,17 @@ async fn process_task(
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let target_selector = if !item_selector.is_empty() { item_selector } else if !node_selector.is_empty() { node_selector } else { "body" };
+    // [SELECTOR-COMBINATION] 사용자 지침에 따라 node와 item 셀렉터를 결합하여 정밀 타격합니다.
+    let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() {
+        format!("{} {}", node_selector, item_selector)
+    } else if !item_selector.is_empty() {
+        item_selector.to_string()
+    } else if !node_selector.is_empty() {
+        node_selector.to_string()
+    } else {
+        "body".to_string()
+    };
+
     let mut extracted_data = json!({});
 
     if !is_detail {
@@ -725,7 +735,7 @@ async fn process_task(
             "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
         }));
 
-        let mut current_selector = if !item_selector.is_empty() { item_selector.to_string() } else if !node_selector.is_empty() { node_selector.to_string() } else { "body".to_string() };
+        let mut current_selector = target_selector.clone();
         
         // [MEMORY] Load clean HTML from disk only when needed
         let mut item_pugs = {
@@ -894,12 +904,11 @@ async fn process_task(
             *model_guard = None; 
             drop(model_guard);
 
-            let batch_results = parsing::parse_json_from_llm(&response);
+            // [FIXED] 아이템이 배열로 오든 객체로 오든 정확히 누적합니다.
             if let Some(arr) = batch_results.as_array() {
                 for mut item_json in arr.iter().cloned() {
                     if !item_json.is_null() && item_json.is_object() {
                         // [STRICT PARITY] Mirror server hashing and metadata
-                        // task.cc is already a hash string from content.js (hashId(domain))
                         let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
                         let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
                         let team_id = if task.to_dest.is_empty() { 
@@ -907,26 +916,22 @@ async fn process_task(
                         } else { task.to_dest.clone() };
 
                         let link = item_json.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        // item_id = hashId(cc + link) - Note: cookies.cc is used in JS
                         let item_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
                         item_json.as_object_mut().unwrap().insert("id".to_string(), json!(item_id));
                         
-                        // [STRICT PARITY] Generate BCC and REF exactly as server does
-                        // bcc = hashId(page.type + (isDetail ? cc.toUpperCase() : cc))
                         let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
-                        // [FIX] ref = hashId(cc + link) - matches frontend criteria
                         let ref_val = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
 
                         if !item_id.is_empty() {
-                            let mut model_guard = model_mutex.lock().await;
-                            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-                            
                             let nl = parsing::json_to_natural_language(&item_json);
                             let item_digest = crate::utils::hash::digest(&nl);
 
+                            let mut model_guard = model_mutex.lock().await;
+                            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
                             let vector = if let Some(model) = model_guard.as_ref() {
                                 Some(model.get_embedding(nl).await.unwrap_or_default())
                             } else { None };
+                            *model_guard = None;
                             drop(model_guard);
 
                             let store_guard = store_mutex.lock().await;
@@ -934,7 +939,7 @@ async fn process_task(
                                 let _ = db.upsert_item(
                                     "items", 
                                     &item_id, 
-                                    page_type, 
+                                    &page_type, 
                                     item_json.clone(), 
                                     vector,
                                     Some(from_addr),
@@ -949,26 +954,18 @@ async fn process_task(
                         all_extracted_items.push(item_json);
                     }
                 }
-            }
-
-                                                
-
-                                    
-
-                        
-
-             else if batch_results.is_object() {
-                // Fallback for single object response
+            } else if batch_results.is_object() && !batch_results.is_null() {
                 all_extracted_items.push(batch_results.clone());
             }
 
-            // [NEW] Emit intermediate results for this batch immediately
+            let current_count = all_extracted_items.len();
             let display_text = parsing::json_to_natural_language(&batch_results);
             let _ = app_handle.emit("extraction-progress", json!({ 
+                "task_id": task.id,
                 "category": "Item Extraction", 
-                "summary": format!("Extracted {}/{} items...", all_extracted_items.len(), total_items),
-                "data": batch_results, // Original JSON data
-                "display_text": display_text, // Human-readable narrative for UI
+                "summary": format!("Extracted {}/{} items...", current_count, total_items),
+                "data": batch_results,
+                "display_text": display_text,
                 "spinner": "⠋"
             }));
         }
