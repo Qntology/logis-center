@@ -401,18 +401,17 @@ async fn process_task(
         println!("[DEBUG] Saved light pug to: {}", log_path);
     }
     
-    // Determine optimal chunk sizes based on hardware
-    // [ADAPTIVE] Increased to 4000 chars to speed up ingestion.
-    let mut device_config = utils::get_optimal_device_config();
-    device_config.classify_chunk_size = 4000; 
-    device_config.extract_chunk_size = 4000;
-
-    // [REVISED] Restore turn-based chunked ingestion for classification.
-    // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 4000, 500);
-    let classify_chunks_len = classify_chunks.len(); 
-    println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);
-
+        // Determine optimal chunk sizes based on hardware
+        // [ADAPTIVE] Increased to 4000 chars to speed up ingestion.
+        let mut device_config = utils::get_optimal_device_config();
+        device_config.classify_chunk_size = 1000; 
+        device_config.extract_chunk_size = 1000;
+    
+        // [REVISED] Restore turn-based chunked ingestion for classification.
+        // This is the original stable logic.
+        let classify_chunks = chunk_text(&light_pug, 1000, 200); 
+        let classify_chunks_len = classify_chunks.len(); 
+        println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);
     let mut model_guard = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");
     
@@ -942,10 +941,9 @@ async fn process_task(
         let _ = std::fs::write(&log_path, &content_pug);
         println!("[DEBUG] Saved content pug to: {}", log_path);
         
-                // CHUNKING: Split huge content into dynamic chunks with 500-char overlap (Device Optimized) 
-                let chunks = chunk_text(&content_pug, 4000, 500); 
-                let extraction_instruction = parsing::item2json(page_type, &url, language);
-        
+                        // CHUNKING: Split huge content into dynamic chunks with 500-char overlap (Device Optimized) 
+                        let chunks = chunk_text(&content_pug, 1000, 200); 
+                        let extraction_instruction = parsing::item2json(page_type, &url, language);        
                 // [DEBUG-LOG] Save detail extraction instruction
                 let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                 let _ = std::fs::write(format!("logs/pug/instruction_detail_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
