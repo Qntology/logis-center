@@ -519,7 +519,7 @@ async fn process_task(
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type, language); 
+        let next_question = parsing::page_selectors_prompt(&page_type); 
         let app_handle_clone = app_handle.clone();
         
         // Add classification result and the new question to history
@@ -676,6 +676,7 @@ async fn process_task(
             println!("[Scheduler] Stopping: No items found even with fallback.");
             return Ok(());
         }
+
 
         let extraction_instruction = parsing::list2json(page_type, language);
         let mut all_extracted_items = Vec::new();
@@ -856,24 +857,21 @@ async fn process_task(
                 let chunks_len = chunks.len();
                 
                 for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                                            let is_last = chunk_idx == chunks_len - 1;
+                    let is_last = chunk_idx == chunks_len - 1;
         
-                                    
+                    // Prepare prompt: Only trigger extraction on the final chunk
+
+                    let prompt = if is_last {
+                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nEnd of content. Based on all parts read so far, extract and return the structured JSON now.\nAnalyze the provided Pug template and return it in the following JSON format, no explanation.\n# selector : sibling value based CSS1 selector ", chunk)
+
+                    } else {
+
+                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
+
+                    };
+
         
-                                    // Prepare prompt: Only trigger extraction on the final chunk
-        
-                                    let prompt = if is_last {
-        
-                                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nEnd of content. Based on all parts read so far, extract and return the structured JSON now.", chunk)
-        
-                                    } else {
-        
-                                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
-        
-                                    };
-        
-                        
-                                    let max_tokens = if is_last { 2048 } else { 32 }; 
+                    let max_tokens = if is_last { 2048 } else { 32 }; 
                     
                     let _ = app_handle.emit("extraction-progress", json!({
                         "task_id": task.id,

@@ -252,53 +252,52 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
     split_doc_to_pug_list(&document, selector_str, mode)
 }
 
+// CLI: DO NOT MODIFY START
 pub fn page_type_prompt() -> String {
-    let template = r###"
-Analyze the provided Pug template and return it in the following JSON format, no explanation. 
-{"type": 'order' or 'goods' or 'tracking' or 'review' or 'coupon' or 'event' or ''}"###;
+    let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+{"type": 'order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | ''}"###;
 }
+// CLI: DO NOT MODIFY END
 
-pub fn page_selectors_prompt(page_type: &str, language: &str) -> String {
-    let template = r###"
-Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+// CLI: DO NOT MODIFY START
+pub fn page_selectors_prompt(page_type: &str) -> String {
+    let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation. 
 {
     "type":'{TYPE}',
     "item":type based item CSS1 selector excluding ads,
     "more":item URL includes a manage path, an administrative or edit route Link CSS1 selector,
     "node":item parent list CSS1 selector excluding ads,
     "next":list next button CSS1 selector,
-    "text":summarize the contents of the items array in {language},
     "detail":is a detail page or a detail form | boolean,
+}"###;
+    template.replace("{TYPE}", page_type)
 }
-"###;
-    template.replace("{TYPE}", page_type).replace("{LANGUAGE}", language)
-}
+// CLI: DO NOT MODIFY END
 
+// CLI: DO NOT MODIFY START
 pub fn para2graph(language: &str) -> String {
-    format!(r###"convert the natural language content to fit the dataset JSON structure. no explanation.
+    let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
 	{
 		"context" : [
 			{
-				"language" : "{}",
+				"language" : "{LANGUAGE}",
 				"type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
 				"text": "Segment the natural language content into single-type contexts"
 			}
 		]
-	}"###, language)
+	}"###;
+    template.replace("{LANGUAGE}", language)
 }
+// CLI: DO NOT MODIFY END
 
+
+// CLI: DO NOT MODIFY START
 pub fn graph2contexts(current: &str) -> String {
-    format!(r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({}); it will be marked as null if a value is absent
+    let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
+	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({CURRENT}); it will be marked as null if a value is absent
 	# #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
 	# #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
 	# #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
-    
-    [TASK]
-    Analyze EACH provided text segment and extract structured conditions. 
-    
-    [OUTPUT FORMAT]
-    Return a JSON object containing a "context" array with one object per segment.
     {
         "context": [
             {
@@ -314,8 +313,10 @@ pub fn graph2contexts(current: &str) -> String {
                 }
             }
         ]
-    }"###, current)
+    }"###;
+    template.replace("{CURRENT}", current)
 }
+// CLI: DO NOT MODIFY END
 
 pub fn item2json(page_type: &str, href: &str, language: &str) -> String {
     let schema = match page_type {
@@ -400,12 +401,12 @@ registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
 },"###.to_string(),
-        "goods" => format!(r###"node:goods form container CSS1 selector,
+        "goods" => r###"node:goods form container CSS1 selector,
 code:{
     value:product constant code | string,
     selector:selector
 },
-link:'{}',
+link:'{HREF}',
 id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
@@ -593,9 +594,9 @@ title:{
 registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-},"###, href),
-        "order" => format!(r###"node:order form container CSS1 selector,
-link : '{}',
+},"###.replace("{HREF}", href),
+        "order" => r###"node:order form container CSS1 selector,
+link : '{HREF}',
 id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
@@ -673,9 +674,9 @@ payment_origin:{
 registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-},"###, href),
-        "coupon" | "event" => format!(r###"node:{} container CSS1 selector,
-link : '{}',
+},"###.replace("{HREF}", href),
+        "coupon" | "event" => r###"node:{TYPE} container CSS1 selector,
+link : '{HREF}',
 id:{
     value:Refer to the ID value from the link or an attribute or input value | string,
     selector:selector
@@ -689,7 +690,7 @@ status:{
     selector:selector
 },
 title:{
-    value:{} title | string, 
+    value:{TYPE} title | string, 
     selector:selector
 },
 started_at:{
@@ -701,7 +702,7 @@ expired_at:{
     selector:selector
 },
 code:{
-    value:{} code used at checkout | string,
+    value:{TYPE} code used at checkout | string,
     selector:selector
 },
 discount:{
@@ -709,7 +710,7 @@ discount:{
     selector:selector
 },
 quantity:{
-    value:{} quantity | number
+    value:{TYPE} quantity | number
     selector:selector
 },
 usage_limit:{
@@ -739,9 +740,9 @@ region_restrictions:{
 registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-},"###, page_type, href, page_type, page_type, page_type),
-        "review" => format!(r###"node:review container CSS1 selector,
-link : '{}',
+},"###.replace("{TYPE}", page_type).replace("{HREF}", href),
+        "review" => r###"node:review container CSS1 selector,
+link : '{HREF}',
 id:Refer to the ID value from the link or an attribute or input value | string,,
 status:{
     value:'progress' or 'stop' or 'cancel' or 'refund' or 'return' or 'exchange' or 'expire' or 'complete' or 'error',
@@ -762,7 +763,7 @@ completed:{
 registration_date:{
     value:yyyy-MM-ddThh:mm:ss | string,
     selector:selector
-},"###, href),
+},"###.replace("{HREF}", href),
         _ => "- id: Unique identifier.\n- title: General name or title.\n- status: Current state.".to_string()
     };
 
