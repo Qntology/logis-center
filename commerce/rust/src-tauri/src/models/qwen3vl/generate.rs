@@ -284,8 +284,8 @@ impl Qwen3VLGenerateModel {
             // [NEW] Intermediate Cache Save: Save context knowledge after heavy prefill
             if let Some(path) = &cache_path {
                 if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
-                    // 주입(Prefill) 단계이므로 초고속 모드(2048) 사용
-                    if m.save_kv_cache(path, false, 2048).is_ok() {
+                    // 주입(Prefill) 단계이므로 초고속 모드(4096) 사용
+                    if m.save_kv_cache(path, false, 4096).is_ok() {
                         let token_path = path.join("tokens.json");
                         // We save only the part of full_input_ids_vec that corresponds to seqlen_offset
                         let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
@@ -396,14 +396,14 @@ impl Qwen3VLGenerateModel {
         let generate = generation_result?;
 
         if let Some(path) = &cache_path {
-             // [HYBRID BLOCK SIZE] 주입은 2048(초고속), 추출은 128(정밀도)
+             // [HYBRID BLOCK SIZE] 주입은 4096(초고속), 추출은 128(정밀도)
              let is_extraction = input.replace_text.contains("ACTION: EXTRACT") || input.replace_text.contains("ACTION: Identify");
-             let target_block_size = if is_extraction { 128 } else { 2048 };
+             let target_block_size = if is_extraction { 128 } else { 4096 };
 
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
                      if !is_extraction {
-                         println!("[KV-DISK] Updating base cache (Injection mode, size 2048) in {:?}", path);
+                         println!("[KV-DISK] Updating base cache (Injection mode, size 4096) in {:?}", path);
                          if m.offload_kv_cache(path, target_block_size).is_ok() {
                              let mut all_tokens = full_input_ids_vec;
                              all_tokens.extend(&generate);
