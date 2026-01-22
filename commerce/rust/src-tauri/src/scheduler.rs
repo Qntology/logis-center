@@ -467,7 +467,7 @@ async fn process_task(
     
                 // [REVISED] Restore turn-based chunked ingestion for classification.
                 // This is the original stable logic.
-                let classify_chunks = chunk_text(&light_pug, 800, 500); 
+                let classify_chunks = chunk_text(&light_pug, 800, 200); 
                 let classify_chunks_len = classify_chunks.len(); 
                 println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_guard = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");

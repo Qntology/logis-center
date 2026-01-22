@@ -75,7 +75,7 @@ impl Qwen3VLGenerateModel {
                 let main_content = gguf_file::Content::read(&mut main_file)?;
                 
                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                let kv_reserve = max_tokens * 200_000;
+                let kv_reserve = max_tokens * 10000;
                 
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::Quantized(model)
@@ -86,7 +86,7 @@ impl Qwen3VLGenerateModel {
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
                  let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                 let kv_reserve = max_tokens * 200_000;
+                 let kv_reserve = max_tokens * 10000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
@@ -235,8 +235,8 @@ impl Qwen3VLGenerateModel {
              }
         }
         
-        // [CHUNKED PREFILL] - Line Aware (1024 tokens)
-        if seq_len > 1024 {
+        // [CHUNKED PREFILL] - Line Aware (2048 tokens)
+        if seq_len > 2048 {
             println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
             
             let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.text_device) {
@@ -248,12 +248,12 @@ impl Qwen3VLGenerateModel {
 
             while current_pos < seq_len - 1 {
                 let remaining = seq_len - current_pos;
-                if remaining <= 1024 { break; } 
+                if remaining <= 2048 { break; } 
 
-                let mut chunk_size = 1024;
+                let mut chunk_size = 2048;
                 let lookback_range = 256; 
                 
-                let search_end = current_pos + 1024;
+                let search_end = current_pos + 2048;
                 let search_start = search_end.saturating_sub(lookback_range);
                 
                 for i in (search_start..search_end).rev() {
@@ -301,8 +301,8 @@ impl Qwen3VLGenerateModel {
                     }
 
                     if !skip_save {
-                        // 주입(Prefill) 단계이므로 초고속 모드(4096) 사용
-                        if m.save_kv_cache(path, false, 4096).is_ok() {
+                        // 주입(Prefill) 단계이므로 초고속 모드(8192) 사용
+                        if m.save_kv_cache(path, false, 8192).is_ok() {
                             if let Ok(file) = fs::File::create(&token_path) {
                                 let _ = serde_json::to_writer(file, &ingested_tokens);
                             }
@@ -320,7 +320,7 @@ impl Qwen3VLGenerateModel {
         let start_pos = seqlen_offset as u32;
         let mut cache_position = Tensor::arange(start_pos, start_pos + seq_len as u32, &self.text_device)?;
         
-        let requested_tokens = mes.max_tokens.unwrap_or(1024);
+        let requested_tokens = mes.max_tokens.unwrap_or(2048);
         let mut sample_len = requested_tokens;
         
         if let Some(limit) = self.hard_token_limit {
@@ -429,10 +429,10 @@ impl Qwen3VLGenerateModel {
                          // Do nothing (No offload, No clear)
                      } else if is_save {
                          // [SAVE MODE] Finalize and Offload to Disk
-                         println!("[KV-DISK] Finalizing ingestion. Saving to disk...");
+                         println!("[KV-DISK] Finalizing ingestion. Saving to disk (Block Size: 8192)...");
                          
-                         // Use large block size for ingestion result
-                         let target_block_size = 4096; 
+                         // [SPEED] Doubled block size to 8192 for even faster disk writes
+                         let target_block_size = 8192; 
                          
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
