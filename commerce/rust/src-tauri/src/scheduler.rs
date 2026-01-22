@@ -904,6 +904,8 @@ async fn process_task(
             *model_guard = None; 
             drop(model_guard);
 
+            let batch_results = parsing::parse_json_from_llm(&response);
+            
             // [FIXED] 아이템이 배열로 오든 객체로 오든 정확히 누적합니다.
             if let Some(arr) = batch_results.as_array() {
                 for mut item_json in arr.iter().cloned() {
@@ -981,7 +983,7 @@ async fn process_task(
         let content_pug = {
             let clean_content = data_manager.load(&clean_html_path)?;
             let document = scraper::Html::parse_document(&clean_content);
-            parsing::convert_doc_to_clean_pug_selector(&document, target_selector, PugMode::FullContent)
+            parsing::convert_doc_to_clean_pug_selector(&document, &target_selector, PugMode::FullContent)
         }; 
         
         if content_pug.trim().is_empty() {
