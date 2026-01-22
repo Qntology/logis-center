@@ -443,31 +443,31 @@ async fn process_task(
     };
     
     // [MEMORY] Load Clean -> Parse Pug -> Drop Clean
-    let full_pug = {
+    let light_pug = {
         let clean_content = data_manager.load(&clean_html_path)?;
         let document = scraper::Html::parse_document(&clean_content);
-        parsing::convert_doc_to_clean_pug(&document, PugMode::FullContent)
+        parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly)
         // clean_content dropped here
     }; 
     
     // [DEBUG-LOG] Save generated Pug with nanosecond precision to prevent overwriting
     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let log_path = pug_logs_dir.join(format!("full_{}_{}.pug", task.id, ts_nano));
-    if let Err(e) = std::fs::write(&log_path, &full_pug) {
-        println!("[ERROR] Failed to write full pug: {}", e);
+    let log_path = pug_logs_dir.join(format!("light_{}_{}.pug", task.id, ts_nano));
+    if let Err(e) = std::fs::write(&log_path, &light_pug) {
+        println!("[ERROR] Failed to write light pug: {}", e);
     } else {
-        println!("[DEBUG] Saved full pug to: {:?}", log_path);
+        println!("[DEBUG] Saved light pug to: {:?}", log_path);
     }
     
         // Determine optimal chunk sizes based on hardware
         // [ADAPTIVE] Increased to 4000 chars to speed up ingestion.
         let mut device_config = utils::get_optimal_device_config();
-        device_config.classify_chunk_size = 2000; 
-        device_config.extract_chunk_size = 2000;
+        device_config.classify_chunk_size = 4000; 
+        device_config.extract_chunk_size = 4000;
     
                 // [REVISED] Restore turn-based chunked ingestion for classification.
                 // This is the original stable logic.
-                let classify_chunks = chunk_text(&full_pug, 2000, 500); 
+                let classify_chunks = chunk_text(&light_pug, 4000, 500); 
                 let classify_chunks_len = classify_chunks.len(); 
                 println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_guard = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");
@@ -1071,72 +1071,123 @@ async fn process_task(
             "detail": false
         });
     } else {
-        // [REUSE] Reuse the existing conversation history from Classification (Full Content Ingestion)
-        // This ensures we hit the KV cache and don't re-ingest the huge content.
-        let extraction_instruction = parsing::item2json(page_type, &url, language);
-
-        // [DEBUG-LOG] Save detail extraction instruction
-        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(pug_logs_dir.join(format!("instruction_detail_{}_{}.pug", task.id, ts_nano)), &extraction_instruction);
-
-        // Append the new instruction to the existing history
-        // Note: 'messages' variable from the Classification phase must be kept up-to-date.
-        // We assume 'messages' contains [System, Chunk1, ... ChunkN+Prompt, ClassifyResult].
-        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: extraction_instruction.clone() })
-            ]),
-            name: None,
-        }));
-
-        let model_guard = model_mutex.lock().await;
-        
-        let response = if let Some(model) = model_guard.as_ref() {
-            let app_handle_clone = app_handle.clone();
-            
-            // Use task.id (same as Classification) to hit the cache
-            let params = ChatCompletionParameters {
-                messages: messages.clone(),
-                model: "qwen3vl".to_string(),
-                max_tokens: Some(2048), // Large output for detail JSON
-                temperature: Some(0.1),
-                ..Default::default()
-            };
-
-            let res = tokio::select!{
-                res = model.chat_params_with_spinner(
-                    params,
-                    &app_handle_clone, 
-                    "extraction-progress", 
-                    json!({ "task_id": task.id, "category": "Extraction", "summary": "Extracting detailed data..." }), 
-                    Some(cancellation_token.clone()), 
-                    Some(task.id.clone())
-                ) => res?,
-                _ = async {
-                    loop {
-                        if cancellation_token.load(Ordering::Relaxed) { break; }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                } => { 
-                    drop(model_guard);
-                    cleanup_task_resources(&task.id, Some(app_handle));
-                    return Err(anyhow::anyhow!("Task cancelled")); 
-                }
-            };
-            
-            // [DEBUG-LOG] Save raw detail response
-            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let _ = std::fs::write(pug_logs_dir.join(format!("res_detail_{}_{}.res", task.id, ts_nano)), &res);
-            
-            res
-        } else {
-            "{}".to_string()
+        // [RESTORED] Detail Extraction Logic (Parity with a60f234b)
+        // Instead of reusing StructureOnly cache, we extract specific FullContent for the target selector.
+        let content_pug = {
+            let clean_content = data_manager.load(&clean_html_path)?;
+            let document = scraper::Html::parse_document(&clean_content);
+            parsing::convert_doc_to_clean_pug_selector(&document, &target_selector, PugMode::FullContent)
         };
-        drop(model_guard);
 
-        println!("[EXTRACT-FINAL] Result: {}", response);
-        let full_data = parsing::parse_json_from_llm(&response);
-        extracted_data = full_data;
+        if content_pug.trim().is_empty() {
+            println!("[Scheduler] Error: No content found with selector '{}'", target_selector);
+            return Ok(());
+        }
+
+        // [DEBUG-LOG] Save content pug
+        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
+
+        // CHUNKING: Split huge content into chunks (1000 chars to be safe for details)
+        let chunks = chunk_text(&content_pug, 1000, 200);
+        let chunks_len = chunks.len();
+        
+        let extraction_instruction = parsing::item2json(page_type, &url, language);
+        let detail_session_id = format!("{}_detail", task.id); // Separate session
+
+        // Phase 1: Ingest all chunks (Accumulate -> Save)
+        let mut detail_messages = vec![
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: extraction_instruction.clone(),
+                name: None,
+            })
+        ];
+
+        let mut extracted_data_temp = json!({});
+
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let is_last = chunk_idx == chunks_len - 1;
+            
+            // Prepare prompt with INGEST/SAVE flags
+            let mut prompt = chunk.clone();
+            
+            // On the very last chunk, we append the JSON instruction AND the SAVE flag
+            // For intermediate chunks, just INGEST
+            let action_flag = if is_last { 
+                format!("\n\nACTION: JSON ONLY\n\nACTION: SAVE") 
+            } else { 
+                format!("\n\nACTION: INGEST") 
+            };
+            
+            let effective_prompt = format!("{}{}", prompt, action_flag);
+
+            // Add to history (without flag for purity, though separate session matters less)
+            detail_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
+                ]),
+                name: None,
+            }));
+
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "task_id": task.id,
+                "category": "Detail Ingestion", 
+                "summary": format!("Reading detail part {}/{}...", chunk_idx + 1, chunks_len),
+                "spinner": "⠋" 
+            }));
+
+            let model_guard = model_mutex.lock().await;
+            
+            let response = if let Some(model) = model_guard.as_ref() {
+                let app_handle_clone = app_handle.clone();
+                let params = ChatCompletionParameters {
+                    messages: detail_messages.clone(),
+                    model: "qwen3vl".to_string(),
+                    max_tokens: Some(if is_last { 2048 } else { 128 }),
+                    temperature: Some(0.1),
+                    ..Default::default()
+                };
+
+                let res = tokio::select!{
+                    res = model.chat_params_with_spinner(
+                        params,
+                        &app_handle_clone, 
+                        "extraction-progress", 
+                        json!({ "task_id": task.id, "category": "Detail Ingestion" }), 
+                        Some(cancellation_token.clone()), 
+                        Some(detail_session_id.clone())
+                    ) => res?,
+                    _ = async {
+                        loop {
+                            if cancellation_token.load(Ordering::Relaxed) { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => { 
+                        drop(model_guard);
+                        return Err(anyhow::anyhow!("Task cancelled")); 
+                    }
+                };
+                
+                // Accumulate back assistant message if not last (to keep context flow in VRAM)
+                if !is_last {
+                    detail_messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                        content: Some(res.clone()),
+                        ..Default::default()
+                    }));
+                }
+                res
+            } else {
+                "{}".to_string()
+            };
+            drop(model_guard);
+
+            if is_last {
+                println!("[EXTRACT-FINAL] Result: {}", response);
+                extracted_data_temp = parsing::parse_json_from_llm(&response);
+            }
+        }
+        
+        extracted_data = extracted_data_temp;
     }
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
