@@ -434,7 +434,12 @@ async fn process_task(
            "category": "Loading Model", "summary": "Loading Model for Analysis...", "spinner": "⠋"
         }));
         match LogisModel::new(None).await {
-            Ok(m) => *model_guard = Some(m),
+            Ok(m) => {
+                *model_guard = Some(m);
+                let _ = app_handle.emit("extraction-progress", json!({ 
+                   "category": "Loading Model", "summary": "Model Ready.", "spinner": "✅"
+                }));
+            },
             Err(e) => {
                 let _ = app_handle.emit("extraction-progress", json!({ 
                    "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
@@ -837,13 +842,14 @@ async fn process_task(
         if needs_refinement {
              let _ = app_handle.emit("extraction-progress", json!({ 
                 "task_id": task.id,
-                "category": "List Processing", 
+                "category": "Data Refinement", 
                 "summary": "Refining extracted data with AI...", 
                 "spinner": "⠋"
             }));
 
             let batch_size = 5;
             let mut refined_items = Vec::new();
+            let total_refine_count = all_extracted_items.len();
             
             // Clone items to process
             let items_to_process = all_extracted_items.clone();
@@ -860,6 +866,9 @@ async fn process_task(
             }
 
             for (batch_idx, batch) in items_to_process.chunks(batch_size).enumerate() {
+                let start_item = batch_idx * batch_size + 1;
+                let end_item = std::cmp::min(start_item + batch.len() - 1, total_refine_count);
+
                 // Construct prompt with indexed items
                 let batch_text: String = batch.iter().enumerate().map(|(i, item)| {
                     format!("Item {}:\n{}", i + 1, item.get("text").and_then(|s| s.as_str()).unwrap_or(""))
@@ -893,8 +902,8 @@ async fn process_task(
                         "extraction-progress", 
                         json!({ 
                             "task_id": task.id,
-                            "category": "List Processing", 
-                            "summary": format!("Refining batch {}...", batch_idx + 1)
+                            "category": "Data Refinement", 
+                            "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
                         }),
                         Some(cancellation_token.clone()),
                         Some(task.id.clone())
@@ -935,6 +944,13 @@ async fn process_task(
             if !refined_items.is_empty() {
                 all_extracted_items = refined_items;
             }
+
+            let _ = app_handle.emit("extraction-progress", json!({ 
+                "task_id": task.id,
+                "category": "Data Refinement", 
+                "summary": format!("Refined {} items with AI.", total_refine_count),
+                "spinner": "✅"
+            }));
         }
 
         // 이후 DB 저장 로직으로 연결 (기존 로직 활용)
