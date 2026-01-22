@@ -397,8 +397,8 @@ The page has been classified as '{TYPE}'.
 Analyze the provided Pug template snippet and identify the structural CSS1 selectors required for data extraction.
 
 [SCHEMA DEFINITIONS]
-- item: CSS1 selector for individual items in a list (e.g., `tr`, `li`, `[class*="{TYPE}"]`). Exclude header, footrer, ads, pagination.
-- node: CSS1 selector for the parent container that holds the list of items (e.g., `table`, `tbody`, `ul`, `ol`, `[class*="{TYPE}"]`).  Exclude header, footrer, ads, pagination.
+- item: Common CSS1 selector for sibling items (e.g., `tr`, `li`). Match recurring patterns and exclude header, footer, ads, and pagination.
+- node: Common CSS1 selector for the main container wrapping all list items (e.g., tbody, ul). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
 - detail: Boolean. Set to `true` if this is a single item detail page. Set to `false` if it is a list page. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
