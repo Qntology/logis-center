@@ -429,10 +429,10 @@ impl Qwen3VLGenerateModel {
                          // Do nothing (No offload, No clear)
                      } else if is_save {
                          // [SAVE MODE] Finalize and Offload to Disk
-                         let is_high_precision = input.replace_text.contains("ACTION: PRECISION_32");
-                         let target_block_size = if is_high_precision { 32 } else { 4096 };
+                         println!("[KV-DISK] Finalizing ingestion. Saving to disk...");
                          
-                         println!("[KV-DISK] Finalizing ingestion. Saving to disk (Block Size: {})...", target_block_size);
+                         // Use large block size for ingestion result
+                         let target_block_size = 4096; 
                          
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
