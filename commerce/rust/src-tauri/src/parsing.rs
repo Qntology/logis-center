@@ -4,7 +4,7 @@ use regex::Regex;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum PugMode {
-    StructureOnly,
+    StructureOnly(bool), // bool: compress repetitive items
     FullContent,
 }
 
@@ -93,7 +93,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             // [STRICT FILTER] 광고 및 불필요 태그 원천 차단
             let ad_patterns = ["ad", "banner", "popup", "modal", "floating", "wing", "sidebar", "aside", "header", "footer", "nav"];
             
-            if mode == &PugMode::StructureOnly {
+            if let PugMode::StructureOnly(_) = mode {
                 // 1. 태그명 기반 필터링
                 if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use", "button", "input", "select", "label"].contains(&tag_name) { return; }
                 
@@ -126,7 +126,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             }
             let mut attrs = Vec::new();
             match mode {
-                PugMode::StructureOnly => {
+                PugMode::StructureOnly(_) => {
                     // Discovery 단계: href만 유지하여 링크 구조 파악
                     if let Some(val) = element.attr("href") { 
                          let val = if val.len() > 150 { &val[..150] } else { val };
@@ -171,38 +171,50 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
             }
 
             // --- Structural Compression for Classification ---
-            let children: Vec<_> = node.children().collect();
-            if *mode == PugMode::StructureOnly && children.len() > 3 {
-                let mut last_tag = "";
-                let mut last_classes = String::new();
-                let mut repeat_count = 0;
+            // Only active if StructureOnly(true)
+            if let PugMode::StructureOnly(true) = mode {
+                // Filter only elements to ensure consecutive elements are compared correctly, ignoring whitespace
+                let elements: Vec<_> = node.children().filter(|n| n.value().is_element()).collect();
                 
-                for (idx, child) in children.iter().enumerate() {
-                    let is_repetitive = if let Some(el) = child.value().as_element() {
-                        let current_classes = el.classes().collect::<Vec<_>>().join(".");
-                        if el.name() == last_tag && current_classes == last_classes {
-                            true
+                if elements.len() > 3 {
+                    let mut last_tag = String::new();
+                    let mut last_classes = String::new();
+                    let mut repeat_count = 0;
+                    
+                    for (idx, child) in elements.iter().enumerate() {
+                        // We know it is_element
+                        let el = child.value().as_element().unwrap();
+                        let tag = el.name();
+                        let classes = el.classes().collect::<Vec<_>>().join(".");
+                        
+                        let is_repetitive = (tag == last_tag && classes == last_classes);
+                        
+                        if is_repetitive {
+                            repeat_count += 1;
                         } else {
-                            last_tag = el.name();
-                            last_classes = current_classes;
-                            false
+                            repeat_count = 0;
+                            last_tag = tag.to_string();
+                            last_classes = classes;
                         }
-                    } else { false };
-
-                    if is_repetitive { repeat_count += 1; } else { repeat_count = 0; }
-
-                    // 반복되는 구조는 2개까지만 보여주고 나머지는 압축
-                    if repeat_count > 1 && idx < children.len() - 1 {
-                        if repeat_count == 2 {
-                            output.push_str(&indent);
-                            output.push_str("    | ... (repetitive items compressed)\n");
+                        
+                        // Compress if repetition count > 1 (meaning at least 3 identical items: original + rep1 + rep2)
+                        if repeat_count > 1 && idx < elements.len() - 1 {
+                            if repeat_count == 2 {
+                                output.push_str(&indent);
+                                output.push_str("    | ... (repetitive items compressed)\n");
+                            }
+                            continue;
                         }
-                        continue; 
+                        
+                        generate_pug_lines(*child, indent_level + 1, output, mode);
                     }
-                    generate_pug_lines(*child, indent_level + 1, output, mode);
+                    return; // Skip default iteration
                 }
-            } else {
-                for child in node.children() { generate_pug_lines(child, indent_level + 1, output, mode); }
+            }
+
+            // --- No Compression: Iterate all children ---
+            for child in node.children() { 
+                generate_pug_lines(child, indent_level + 1, output, mode); 
             }
         },
         Node::Text(text) => {
@@ -264,7 +276,7 @@ Analyze the provided Pug template snippet and identify the primary category of t
   - 'review': Product reviews, feedback list.
   - 'coupon': Coupon list, discount events.
   - 'event': Promotion pages, event announcements.
-  - '': If none of the above match or the page is irrelevant (e.g., login, setting).
+  - '': If none of the above match or the page is irrelevant
 
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.
@@ -280,9 +292,9 @@ The page has been classified as '{TYPE}'.
 Analyze the provided Pug template snippet and identify the structural CSS1 selectors required for data extraction.
 
 [SCHEMA DEFINITIONS]
-- item: CSS1 selector for individual items in a list. Exclude header rows, ads, or pagination.
-- node: CSS1 selector for the parent container that holds the list of items.
-- detail: Boolean. Set to `true` if this is a single item detail page. Set to `false` if it is a list page.
+- item: CSS1 selector for individual items in a list (e.g., `tr`, `li`, `[class*="{TYPE}"]`). Exclude header, footrer, ads, pagination.
+- node: CSS1 selector for the parent container that holds the list of items (e.g., `table`, `tbody`, `ul`, `ol`, `[class*="{TYPE}"]`).  Exclude header, footrer, ads, pagination.
+- detail: Boolean. Set to `true` if this is a single item detail page. Set to `false` if it is a list page. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.
