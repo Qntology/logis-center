@@ -74,7 +74,7 @@ impl Qwen3VLGenerateModel {
                 let mut main_file = std::fs::File::open(&main)?;
                 let main_content = gguf_file::Content::read(&mut main_file)?;
                 
-                let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+                let max_tokens = hard_token_limit.unwrap_or(2048) as u64;
                 let kv_reserve = max_tokens * 100_000;
                 
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
@@ -85,7 +85,7 @@ impl Qwen3VLGenerateModel {
                  let mut file2 = std::fs::File::open(&main)?; 
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
-                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+                 let max_tokens = hard_token_limit.unwrap_or(2048) as u64;
                  let kv_reserve = max_tokens * 100_000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
@@ -155,7 +155,7 @@ impl Qwen3VLGenerateModel {
         // [ADAPTIVE] For ingestion/classification, we must not drop document structure.
         if let Some(limit) = self.hard_token_limit {
             let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
-            let effective_limit = if is_critical { 16384 } else { limit.max(2048) };
+            let effective_limit = if is_critical { 2048 } else { limit.max(2048) };
             let max_input = if effective_limit > 128 { effective_limit - 128 } else { effective_limit };
             
             if seq_len > max_input {
