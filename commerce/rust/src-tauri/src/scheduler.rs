@@ -32,7 +32,7 @@ impl TaskDataManager {
     }
 
     fn offload(&mut self, content: &str, suffix: &str) -> Result<PathBuf> {
-        let dir = utils::paths::get_task_data_dir(self.app_handle.as_ref());
+        let dir = utils::paths::get_task_specific_dir(self.app_handle.as_ref(), &self.task_id);
         
         // Simple unique filename
         let filename = format!("{}_{}_{}.txt", self.task_id, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_micros(), suffix);
@@ -49,11 +49,12 @@ impl TaskDataManager {
 
 impl Drop for TaskDataManager {
     fn drop(&mut self) {
-        println!("[Cleanup] TaskDataManager dropping. Cleaning up temporary files for task: {}", self.task_id);
+        println!("[Cleanup] TaskDataManager dropping. Keeping files for debugging: {}", self.task_id);
         for path in &self.created_files {
-            if path.exists() {
-                let _ = fs::remove_file(path);
-            }
+            println!("[DEBUG] Persisted file: {:?}", path);
+            // if path.exists() {
+            //     let _ = fs::remove_file(path);
+            // }
         }
         // KV 캐시는 재사용을 위해 디스크에 유지합니다.
     }
@@ -304,11 +305,15 @@ async fn process_task(
 
 {
 
-    // [NEW] Ensure log directory exists at runtime using dynamic path
+            // [NEW] Ensure log directory exists at runtime using dynamic path
 
-    let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle));
+            let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
 
-    println!("[PROCESS] Task {} started processing.", task.id);
+            println!("[DEBUG] Pug logs directory: {:?}", pug_logs_dir);
+
+    
+
+        println!("[PROCESS] Task {} started processing.", task.id);
 
 
 
@@ -646,7 +651,7 @@ async fn process_task(
         
         // [DEBUG-LOG] Save selector identification prompt
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(format!("logs/pug/prompt_selectors_{}_{}.pug", task.id, ts_nano), &next_question);
+        let _ = std::fs::write(pug_logs_dir.join(format!("prompt_selectors_{}_{}.pug", task.id, ts_nano)), &next_question);
 
         // [MEMORY-CONTROL] Branching off from the Body content. We do NOT include the previous Classification Answer.
         
@@ -969,7 +974,7 @@ async fn process_task(
                             "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
                         }),
                         Some(cancellation_token.clone()),
-                        Some(format!("{}_refine", task.id)) // [PROTECT] Use separate session to avoid overwriting main cache
+                        Some(task.id.clone()) // [INTEGRATED] Use original session ID to reuse main safetensors
                     ).await;
 
                     if let Ok(res) = refine_res {
@@ -1463,9 +1468,9 @@ async fn process_task(
         Ok(())
     }
     
-    fn cleanup_task_resources(_task_id: &str, app_handle: Option<&tauri::AppHandle>) {
-        // 텍스트 임시 파일만 삭제하고, KV 캐시(safetensors)는 보존합니다.
-        let _ = fs::remove_dir_all(utils::paths::get_task_data_dir(app_handle));
+    fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) {
+        // [FIX] Only remove the specific directory for this task
+        let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
     }
 
 fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
