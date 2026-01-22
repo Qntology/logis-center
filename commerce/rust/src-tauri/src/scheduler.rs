@@ -630,6 +630,13 @@ async fn process_task(
 
     final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
+    // [MEMORY-CONTROL] Unload model after Classification to ensure clean state for next step
+    {
+        let mut model_guard = model_mutex.lock().await;
+        *model_guard = None;
+        println!("[MEMORY] Model unloaded after Classification.");
+    }
+
     // Step 2: Identify Selectors (Building on History)
     let _ = app_handle.emit("extraction-progress", json!({ 
         "task_id": task.id,
@@ -692,6 +699,13 @@ async fn process_task(
     } else { "{}".to_string() };
         drop(model_guard);
         
+    // [MEMORY-CONTROL] Unload model after Selector Identification
+    {
+        let mut model_guard = model_mutex.lock().await;
+        *model_guard = None;
+        println!("[MEMORY] Model unloaded after Selector ID.");
+    }
+
             let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
             println!("[Scheduler] Selectors Found: {}", selector_info);        
         let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1017,6 +1031,13 @@ async fn process_task(
             }));
         }
 
+        // [MEMORY-CONTROL] Unload model after List Refinement
+        {
+            let mut model_guard = model_mutex.lock().await;
+            *model_guard = None;
+            println!("[MEMORY] Model unloaded after List Refinement.");
+        }
+
         // 이후 DB 저장 로직으로 연결 (기존 로직 활용)
         for mut item_json in all_extracted_items.clone() {
             // [STRICT PARITY] 1개씩 처리하며 DB에 넣기
@@ -1120,6 +1141,13 @@ async fn process_task(
         println!("[EXTRACT-FINAL] Result: {}", response);
         let full_data = parsing::parse_json_from_llm(&response);
         extracted_data = full_data;
+
+        // [MEMORY-CONTROL] Unload model after Detail Extraction
+        {
+            let mut model_guard = model_mutex.lock().await;
+            *model_guard = None;
+            println!("[MEMORY] Model unloaded after Detail Extraction.");
+        }
     }
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
