@@ -297,16 +297,34 @@ Return valid JSON only. No explanation.
 
 // CLI: DO NOT MODIFY START
 pub fn para2graph(language: &str) -> String {
-    let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-	{
-		"context" : [
-			{
-				"language" : "{LANGUAGE}",
-				"type": "sales" | "order" | "goods" | "tracking" | "view" | "review" | "coupon" | "event" | "",
-				"text": "Segment the natural language content into single-type contexts"
-			}
-		]
-	}"###;
+    let template = r###"[TASK]
+Analyze the provided natural language text and segment it into distinct business contexts.
+
+[SCHEMA DEFINITIONS]
+- language: The primary language of the input text (e.g., '{LANGUAGE}').
+- type: The business domain of the segment. Must be one of:
+  - 'sales': Sales data, revenue, sold items.
+  - 'order': Purchase orders, order history.
+  - 'goods': Product information, inventory.
+  - 'tracking': Shipment tracking, delivery status.
+  - 'view': Page views, traffic analytics.
+  - 'review': Customer feedback, ratings.
+  - 'coupon': Discounts, vouchers.
+  - 'event': Marketing events, promotions.
+  - '': If the segment does not fit a specific business domain.
+- text: The specific segment of the natural language text relevant to this context.
+
+[OUTPUT FORMAT]
+Return valid JSON only. No explanation.
+{
+    "context": [
+        {
+            "language": "{LANGUAGE}",
+            "type": "string",
+            "text": "string"
+        }
+    ]
+}"###;
     template.replace("{LANGUAGE}", language)
 }
 // CLI: DO NOT MODIFY END
@@ -314,27 +332,47 @@ pub fn para2graph(language: &str) -> String {
 
 // CLI: DO NOT MODIFY START
 pub fn graph2contexts(current: &str) -> String {
-    let template = r###"convert the natural language content to fit the dataset JSON structure. no explanation.
-	# #date : The date value is set by referencing both the natural language's implied time period and the region value against the current time ({CURRENT}); it will be marked as null if a value is absent
-	# #status : 'progress' | 'stop' | 'cancel' | 'refund' | 'return' | 'exchange' | 'expire' | 'complete' | 'error'
-	# #substantial : 'size' | 'weight' | 'shipping_fee' | 'shipping_duration' | 'sale_price' | 'supply_price' | 'low_stock_threshold' | 'discount' | 'min_order_amount' | 'max_discount_amount' | 'usage_limit' | 'usage_per' | ''
-	# #find : 'many' | 'few' | 'much' | 'little' | 'heavy' | 'light' | ''
-    {
-        "context": [
-            {
-                "type": "string",
-                "text": "the_original_segment_text",
-                "status": "string or null",
-                "substantial": "string or null",
-                "find": "string or null",
-                "condition" : {
-                    "date": { "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" },
-                    "quantity": { "eq": number, "lte": number, "gte": number },
-                    "price": { "currency": "string", "eq": number, "lte": number, "gte": number }
-                }
+    let template = r###"[TASK]
+Extract structured search conditions and intent from the provided segmented text.
+
+[CONTEXT]
+Current Time: {CURRENT}
+
+[SCHEMA DEFINITIONS]
+- type: The business domain (passed from input).
+- text: The original segment text.
+- status: The status implied by the text. Must be one of:
+  - 'progress', 'stop', 'cancel', 'refund', 'return', 'exchange', 'expire', 'complete', 'error'.
+  - null if no status is implied.
+- substantial: The primary attribute being queried. Must be one of:
+  - 'size', 'weight', 'shipping_fee', 'shipping_duration', 'sale_price', 'supply_price', 'low_stock_threshold', 'discount', 'min_order_amount', 'max_discount_amount', 'usage_limit', 'usage_per'.
+  - '' or null if not applicable.
+- find: Qualitative quantifier implied by the text. Must be one of:
+  - 'many', 'few', 'much', 'little', 'heavy', 'light'.
+  - '' or null if not applicable.
+- condition: Structured filters derived from the text.
+  - date: Date range relative to '{CURRENT}'. 'eq' (exact), 'lte' (before/until), 'gte' (after/from). Format: 'yyyy-MM-ddThh:mm:ss'.
+  - quantity: Quantity filters. 'eq', 'lte', 'gte'.
+  - price: Price filters. 'currency', 'eq', 'lte', 'gte'.
+
+[OUTPUT FORMAT]
+Return valid JSON only. No explanation.
+{
+    "context": [
+        {
+            "type": "string",
+            "text": "string",
+            "status": "string or null",
+            "substantial": "string or null",
+            "find": "string or null",
+            "condition": {
+                "date": { "eq": "yyyy-MM-ddThh:mm:ss", "lte": "yyyy-MM-ddThh:mm:ss", "gte": "yyyy-MM-ddThh:mm:ss" },
+                "quantity": { "eq": number, "lte": number, "gte": number },
+                "price": { "currency": "string", "eq": number, "lte": number, "gte": number }
             }
-        ]
-    }"###;
+        }
+    ]
+}"###;
     template.replace("{CURRENT}", current)
 }
 // CLI: DO NOT MODIFY END
