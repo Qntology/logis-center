@@ -720,12 +720,18 @@ async fn process_task(
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // [SELECTOR-COMBINATION] 쉼표로 구분된 그룹 셀렉터 각각에 node_selector를 적용하여 정밀도를 높입니다.
+    // [SELECTOR-COMBINATION] Robustly combine node and item selectors, handling comma-separated groups in both.
     let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() {
-        item_selector.split(',')
-            .map(|s| format!("{} {}", node_selector.trim(), s.trim()))
-            .collect::<Vec<_>>()
-            .join(", ")
+        let nodes: Vec<&str> = node_selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let items: Vec<&str> = item_selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        
+        let mut combined = Vec::new();
+        for node in &nodes {
+            for item in &items {
+                combined.push(format!("{} {}", node, item));
+            }
+        }
+        combined.join(", ")
     } else if !item_selector.is_empty() {
         item_selector.to_string()
     } else if !node_selector.is_empty() {
@@ -750,22 +756,22 @@ async fn process_task(
             let document = scraper::Html::parse_document(&clean_content);
             let field_selectors = selector_info.get("selectors").and_then(|v| v.as_object());
 
-            if let Some(subs) = field_selectors {
-                // [SELECTOR-MATCHING] Use the combined target_selector directly
-                let mut potential_items = Vec::new();
-                
-                if let Ok(sel) = scraper::Selector::parse(&target_selector) {
-                    for item in document.select(&sel) {
-                        potential_items.push(item);
-                    }
-                } else {
-                    println!("[Scheduler] Invalid selector: {}", target_selector);
+            // [SELECTOR-MATCHING] Use the combined target_selector directly
+            let mut potential_items = Vec::new();
+            
+            if let Ok(sel) = scraper::Selector::parse(&target_selector) {
+                for item in document.select(&sel) {
+                    potential_items.push(item);
                 }
+            } else {
+                println!("[Scheduler] Invalid selector: {}", target_selector);
+            }
 
-                for item_node in potential_items {
-                    let mut item_json = json!({});
-                    let mut has_data = false;
+            for item_node in potential_items {
+                let mut item_json = json!({});
+                let mut has_data = false;
 
+                if let Some(subs) = field_selectors {
                     for (field_name, sel_str) in subs {
                         if let Ok(sub_sel) = scraper::Selector::parse(sel_str.as_str().unwrap_or("")) {
                             // 1. 현재 노드(item) 내부에서 검색
@@ -779,30 +785,37 @@ async fn process_task(
                             
                             // 2. [MULTI-ROW FIX] 만약 데이터를 못 찾았고, 다음 형제 노드가 '.rows'라면 거기서도 검색
                             if item_json.get(field_name).is_none() {
-                                 if let Some(next_sibling) = item_node.next_sibling() {
-                                     if let Some(sibling_el) = scraper::ElementRef::wrap(next_sibling) {
-                                         if sibling_el.value().name() == "tr" && sibling_el.select(&sub_sel).next().is_some() {
-                                             if let Some(found_el) = sibling_el.select(&sub_sel).next() {
-                                                 let text = found_el.text().collect::<Vec<_>>().join("").trim().to_string();
-                                                 item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text));
-                                                 has_data = true;
-                                             }
-                                         }
-                                     }
-                                 }
+                                    if let Some(next_sibling) = item_node.next_sibling() {
+                                        if let Some(sibling_el) = scraper::ElementRef::wrap(next_sibling) {
+                                            if sibling_el.value().name() == "tr" && sibling_el.select(&sub_sel).next().is_some() {
+                                                if let Some(found_el) = sibling_el.select(&sub_sel).next() {
+                                                    let text = found_el.text().collect::<Vec<_>>().join("").trim().to_string();
+                                                    item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text));
+                                                    has_data = true;
+                                                }
+                                            }
+                                        }
+                                    }
                             }
                         }
                     }
+                } else {
+                    // [FALLBACK] No specific field selectors provided; extract full text
+                    let text = item_node.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                    if !text.is_empty() {
+                        item_json.as_object_mut().unwrap().insert("text".to_string(), json!(text));
+                        has_data = true;
+                    }
+                }
 
-                    if has_data {
-                        if item_json.get("id").is_none() {
-                            if let Some(link_el) = item_node.select(&scraper::Selector::parse("a[href]").unwrap()).next() {
-                                let href = link_el.value().attr("href").unwrap_or("");
-                                item_json.as_object_mut().unwrap().insert("link".to_string(), json!(href));
-                            }
+                if has_data || field_selectors.is_none() {
+                    if item_json.get("id").is_none() {
+                        if let Some(link_el) = item_node.select(&scraper::Selector::parse("a[href]").unwrap()).next() {
+                            let href = link_el.value().attr("href").unwrap_or("");
+                            item_json.as_object_mut().unwrap().insert("link".to_string(), json!(href));
                         }
-                        all_extracted_items.push(item_json);
                     }
+                    all_extracted_items.push(item_json);
                 }
             }
         } // 'document' is dropped here
