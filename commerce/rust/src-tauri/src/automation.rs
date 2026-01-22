@@ -225,9 +225,12 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 "--disable-software-rasterizer",
                 "--disable-gpu-compositing",
                 "--no-first-run",
+                "--disable-notifications",
+                "--disable-extensions",
+                "--disable-popup-blocking",
+                "--blink-settings=imagesEnabled=false", // 이미지 로딩 비활성화로 자원 절약
                 &port_arg,
                 "--remote-allow-origins=*", 
-                "--disable-extensions"
             ];
             let mut builder = BrowserConfig::builder().chrome_executable(&exec_path).with_head().no_sandbox().viewport(None);
             let profile_dir = std::path::Path::new("browser_profiles").join(browser);

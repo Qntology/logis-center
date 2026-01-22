@@ -49,26 +49,13 @@ impl TaskDataManager {
 
 impl Drop for TaskDataManager {
     fn drop(&mut self) {
-        println!("[Cleanup] TaskDataManager dropping. Cleaning up files for task: {}", self.task_id);
+        println!("[Cleanup] TaskDataManager dropping. Cleaning up temporary files for task: {}", self.task_id);
         for path in &self.created_files {
             if path.exists() {
                 let _ = fs::remove_file(path);
             }
         }
-        // Try to remove task data dir if empty
-        let _ = fs::remove_dir("tmp_task_data");
-
-        // [STRICT PARITY] Also clean up KV cache subdirectories for this task
-        let base_path = std::path::Path::new("tmp_kv");
-        if let Ok(entries) = fs::read_dir(base_path) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with(&self.task_id) {
-                        let _ = fs::remove_dir_all(entry.path());
-                    }
-                }
-            }
-        }
+        // KV 캐시는 재사용을 위해 디스크에 유지합니다.
     }
 }
 
@@ -247,12 +234,12 @@ pub async fn start_background_worker(
                     },
                     Err(e) => {
                         let err_msg = e.to_string();
-                        
-                        // [CRITICAL-CLEANUP] 태스크 실패 시에도 메모리 강제 해제
+
+                        // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
                         {
                             let mut model_guard = model.lock().await;
                             *model_guard = None;
-                            println!("[Scheduler] Error detected. Emergency memory release performed.");
+                            println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
                         }
 
                         if err_msg.contains("Task cancelled") {
@@ -456,7 +443,7 @@ async fn process_task(
 
     let mut messages = vec![
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: parsing::page_type_prompt(language),
+            content: parsing::page_type_prompt(),
             name: None,
         })
     ];
@@ -464,7 +451,7 @@ async fn process_task(
     // [DEBUG-LOG] Save initial classification system prompt
     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let log_path = format!("logs/pug/instruction_classify_{}_{}.pug", task.id, ts_nano);
-    if let Err(e) = std::fs::write(&log_path, parsing::page_type_prompt(language)) {
+    if let Err(e) = std::fs::write(&log_path, parsing::page_type_prompt()) {
         println!("[ERROR] Failed to write instruction_classify: {}", e);
     }
 
@@ -587,7 +574,7 @@ async fn process_task(
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type, language); 
+        let next_question = parsing::page_selectors_prompt(&page_type); 
         let app_handle_clone = app_handle.clone();
         
         // [DEBUG-LOG] Save selector identification prompt
@@ -772,31 +759,30 @@ async fn process_task(
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let _ = std::fs::write(format!("logs/pug/instruction_list_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
 
-                let mut all_extracted_items = Vec::new();
-        
-                // [BATCH OPTIMIZATION] Process 4 items at a time to improve stability
-                for chunk in item_pugs.chunks(4) {
-                    let current_start = all_extracted_items.len() + 1;
-                    let current_end = (current_start + chunk.len() - 1).min(total_items);
-        
-                    let _ = app_handle.emit("extraction-progress", json!({
-                        "task_id": task.id,
-                        "category": "Extraction",
-                        "summary": format!("Processing {}~{}/{} items...", current_start, current_end, total_items),
-                        "spinner": "⠋"
-                    }));
-        
-                    // [OPTIMIZATION] Separate Schema (System) from Data (User)
-                    // Initialize prompt and append snippets
-                    let mut prompt = String::new(); 
-                    for (idx, pug) in chunk.iter().enumerate() {
-                        prompt.push_str(&format!("\n### ITEM #{} ###\n{}\n", idx + 1, pug));
-                    }
-        
-            // [DEBUG-LOG] Save the actual chunk sent to LLM
-            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let log_path = format!("logs/pug/chunk_list_{}_{}_{}.pug", task.id, current_start, ts_nano);
-            let _ = std::fs::write(&log_path, &prompt);
+        // [HIERARCHY] 웹페이지의 기본 틀을 먼저 캐싱하기 위한 Base Session
+        let base_session_id = format!("{}_base", task.id);
+
+        let mut all_extracted_items = Vec::new();
+
+        // [BATCH OPTIMIZATION] 개별 아이템별로 독립된 캐시 세션 사용
+        for (chunk_idx, chunk) in item_pugs.chunks(1).enumerate() {
+            let current_start = all_extracted_items.len() + 1;
+            
+            // [SELECTOR-BASED ID] 아이템의 셀렉터 또는 인덱스를 기반으로 고유 캐시 경로 생성
+            // 이를 통해 같은 위치의 아이템은 다음 방문 시 즉시 매칭됨
+            let item_session_id = format!("{}_item_{}", task.id, chunk_idx);
+
+            let _ = app_handle.emit("extraction-progress", json!({
+                "task_id": task.id,
+                "category": "Extraction",
+                "summary": format!("Processing item {}/{}...", current_start, total_items),
+                "spinner": "⠋"
+            }));
+
+            let mut prompt = String::new(); 
+            for (idx, pug) in chunk.iter().enumerate() {
+                prompt.push_str(&format!("\n### ITEM ###\n{}\n", pug));
+            }
 
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -805,38 +791,45 @@ async fn process_task(
             
             let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
-                let summary_text = format!("Processing {}~{}/{}...", current_start, current_end, total_items);
                 let res = tokio::select!{
-                    res = model.chat_with_spinner(
-                        &extraction_instruction, // Schema goes here (System Prompt)
-                        &prompt,                 // Pure Data goes here (User Prompt)
-                        &app_handle_clone, 
-                        "extraction-progress", 
-                        json!({ 
-                            "category": "Item Extraction",
-                            "summary": summary_text
-                        }), 
-                        2048, 
-                        Some(cancellation_token.clone()), 
-                        None 
+                    res = model.chat_params_with_spinner(
+                        crate::openai_types::ChatCompletionParameters {
+                            messages: vec![
+                                crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+                                    content: extraction_instruction.clone(),
+                                    name: None,
+                                }),
+                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
+                                    name: None,
+                                })
+                            ],
+                            model: "qwen3vl".to_string(),
+                            max_tokens: Some(1024),
+                            temperature: Some(0.1),
+                            ..Default::default()
+                        },
+                        &app_handle_clone,
+                        "extraction-progress",
+                        json!({ "category": "Extraction", "task_id": task.id }),
+                        Some(cancellation_token.clone()),
+                        Some(item_session_id) // 개별 아이템 세션 적용
                     ) => res?,
                     _ = async {
                         loop {
                             if cancellation_token.load(Ordering::Relaxed) { break; }
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                    } => { 
+                    } => {
                         drop(model_guard);
-                        cleanup_task_resources(&task.id);
-                        return Err(anyhow::anyhow!("Task cancelled")); 
+                        return Err(anyhow::anyhow!("Task cancelled"));
                     }
                 };
-                
-                // [DEBUG-LOG] Save raw batch response
-                let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                let _ = std::fs::write(format!("logs/pug/res_list_{}_{}_{}.res", task.id, current_start, ts_nano), &res);
                 res
             } else { "[]".to_string() };
+
+            // [VRAM-OPTIMIZATION] 매 아이템 추출 후 모델을 해제하여 메모리 확보 (OOM 방지)
+            *model_guard = None; 
             drop(model_guard);
 
             let batch_results = parsing::parse_json_from_llm(&response);
@@ -1381,18 +1374,9 @@ async fn process_task(
     Ok(())
 }
 
-fn cleanup_task_resources(task_id: &str) {
-    println!("[Cleanup] Removing KV cache for task: {}", task_id);
-    let base_path = std::path::Path::new("tmp_kv");
-    if let Ok(entries) = fs::read_dir(base_path) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(task_id) {
-                    let _ = fs::remove_dir_all(entry.path());
-                }
-            }
-        }
-    }
+fn cleanup_task_resources(_task_id: &str) {
+    // 텍스트 기반 임시 데이터 폴더만 삭제하고, KV 캐시는 보존합니다.
+    let _ = fs::remove_dir_all("tmp_task_data");
 }
 
 fn clear_all_temp_data() {

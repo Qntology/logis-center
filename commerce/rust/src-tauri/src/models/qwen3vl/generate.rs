@@ -178,15 +178,11 @@ impl Qwen3VLGenerateModel {
 
         let mut seqlen_offset = 0;
 
-        // KV Cache Disk Loading (Prefix Caching)
-        // [ADAPTIVE] Disable disk cache for critical ingestion to ensure in-memory consistency
-        let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
+        // KV Cache Disk Loading (Hierarchical Prefix Caching)
         let cache_path = if let Some(sid) = &session_id {
-             if is_critical { None } else {
-                 let p = std::path::Path::new("tmp_kv").join(sid);
-                 if !p.exists() { let _ = fs::create_dir_all(&p); }
-                 Some(p)
-             }
+             let p = std::path::Path::new("tmp_kv").join(sid);
+             if !p.exists() { let _ = fs::create_dir_all(&p); }
+             Some(p)
         } else {
              None
         };
@@ -206,11 +202,10 @@ impl Qwen3VLGenerateModel {
                                      if c == f { match_len += 1; } else { break; }
                                  }
 
-                                 if match_len > 100 {
-                                     println!("[KV-DISK] Cache Hit! Longest Common Prefix: {} tokens.", match_len);
+                                 // [HIERARCHY] 50토큰 이상만 겹쳐도 이전 구조 캐시 활용
+                                 if match_len > 50 {
+                                     println!("[KV-HIERARCHY] Cache Hit! Using prefix: {} tokens.", match_len);
                                      
-                                     // [OPTIMIZATION] Even if match_len is slightly less than cached_tokens.len(),
-                                     // we trust the cache up to match_len.
                                      if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
                                          seqlen_offset = match_len;
                                          loaded = true;
@@ -219,18 +214,14 @@ impl Qwen3VLGenerateModel {
                                          if remaining > 0 {
                                              input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
                                              seq_len = remaining;
-                                             println!("[KV-DISK] Processing only {} new tokens.", seq_len);
+                                             println!("[KV-HIERARCHY] Processing only {} new tokens.", seq_len);
                                          } else {
-                                             // If perfectly matched, we still need to process the very last token 
-                                             // to get the next distribution.
-                                             println!("[KV-DISK] Perfect match. Re-processing last token.");
+                                             println!("[KV-HIERARCHY] Perfect match. Re-processing last token.");
                                              input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
                                              seqlen_offset = seq_len - 1;
                                              seq_len = 1;
                                          }
                                      }
-                                 } else {
-                                     println!("[KV-DISK] Cache Mismatch (Prefix only {}). Starting fresh.", match_len);
                                  }
                              }
                          }
