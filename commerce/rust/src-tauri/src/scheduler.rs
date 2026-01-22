@@ -766,14 +766,34 @@ async fn process_task(
         let base_pug_path = base_kv_path.join("base_structure.pug");
         let base_pug_content = std::fs::read_to_string(&base_pug_path).unwrap_or_else(|_| light_pug.clone());
 
+        // [INDEX-LOAD] 최초 분류 단계에서 저장했던 전체 구조 Pug를 불러옵니다.
+        let base_kv_path = std::path::Path::new("tmp_kv").join(&task.id);
+        let base_pug_path = base_kv_path.join("base_structure.pug");
+        let base_pug_content = std::fs::read_to_string(&base_pug_path).unwrap_or_else(|_| light_pug.clone());
+
         let mut all_extracted_items = Vec::new();
+        
+        // [CURSOR] 중복 아이템 처리를 위해 검색 시작 위치를 기억합니다.
+        let mut search_cursor = 0;
 
         // [BATCH OPTIMIZATION] 단일 태스크 폴더 내에서 KV 캐시를 공유하며 아이템 처리
         for (chunk_idx, chunk) in item_pugs.chunks(1).enumerate() {
             let current_start = all_extracted_items.len() + 1;
             let item_session_id = task.id.clone(); 
+
             let item_pug = if let Some(first) = chunk.get(0) { first.clone() } else { String::new() };
-            let is_matched = !item_pug.is_empty() && base_pug_content.contains(&item_pug);
+            
+            let mut is_matched = false;
+            let mut address_prefix = String::new();
+
+            if !item_pug.is_empty() {
+                if let Some(relative_pos) = base_pug_content[search_cursor..].find(&item_pug) {
+                    let absolute_pos = search_cursor + relative_pos;
+                    address_prefix = base_pug_content[..absolute_pos].to_string();
+                    search_cursor = absolute_pos + item_pug.len();
+                    is_matched = true;
+                }
+            }
 
             let _ = app_handle.emit("extraction-progress", json!({
                 "task_id": task.id,
@@ -801,7 +821,7 @@ async fn process_task(
                             name: None,
                         }),
                         crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(base_pug_content.clone()),
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(address_prefix.clone()),
                             name: None,
                         }),
                         crate::openai_types::ChatCompletionRequestMessage::Assistant(crate::openai_types::ChatCompletionRequestAssistantMessage {
