@@ -395,20 +395,28 @@ impl Qwen3VLGenerateModel {
         let generate = generation_result?;
 
         if let Some(path) = &cache_path {
+             // [READ-ONLY CHECK] 추출 명령이 포함된 경우 베이스 캐시 보존을 위해 저장을 스킵합니다.
+             let is_extraction = input.replace_text.contains("ACTION: EXTRACT") || input.replace_text.contains("ACTION: Identify");
+             
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
-                     println!("[KV-DISK] Saving KV cache to {:?}", path);
-                     if m.offload_kv_cache(path).is_ok() {
-                         let mut all_tokens = full_input_ids_vec;
-                         all_tokens.extend(&generate);
-                         if !all_tokens.is_empty() {
-                             all_tokens.pop(); 
-                         }
+                     if !is_extraction {
+                         println!("[KV-DISK] Updating base cache in {:?}", path);
+                         if m.offload_kv_cache(path).is_ok() {
+                             let mut all_tokens = full_input_ids_vec;
+                             all_tokens.extend(&generate);
+                             if !all_tokens.is_empty() {
+                                 all_tokens.pop(); 
+                             }
 
-                         let token_path = path.join("tokens.json");
-                         if let Ok(file) = fs::File::create(&token_path) {
-                             let _ = serde_json::to_writer(file, &all_tokens);
+                             let token_path = path.join("tokens.json");
+                             if let Ok(file) = fs::File::create(&token_path) {
+                                 let _ = serde_json::to_writer(file, &all_tokens);
+                             }
                          }
+                     } else {
+                         println!("[KV-DISK] Read-only mode: Skipping cache update to protect base.");
+                         m.clear_kv_cache(); // 메모리만 비우고 파일은 유지
                      }
                  },
                  ModelVariant::Standard(m) => m.clear_kv_cache(),

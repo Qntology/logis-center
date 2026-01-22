@@ -761,19 +761,24 @@ async fn process_task(
         // [HIERARCHY] 웹페이지의 기본 틀을 먼저 캐싱하기 위한 Base Session
         let base_session_id = format!("{}_base", task.id);
 
+        // [INDEX-LOAD] 최초 분류 단계에서 저장했던 전체 구조 Pug를 불러옵니다.
+        let base_kv_path = std::path::Path::new("tmp_kv").join(&task.id);
+        let base_pug_path = base_kv_path.join("base_structure.pug");
+        let base_pug_content = std::fs::read_to_string(&base_pug_path).unwrap_or_else(|_| light_pug.clone());
+
         let mut all_extracted_items = Vec::new();
 
         // [BATCH OPTIMIZATION] 단일 태스크 폴더 내에서 KV 캐시를 공유하며 아이템 처리
         for (chunk_idx, chunk) in item_pugs.chunks(1).enumerate() {
             let current_start = all_extracted_items.len() + 1;
-            
-            // [FIXED] 사용자님의 지시대로 폴더를 나누지 않고 task.id 폴더 하나만 사용합니다.
-            let item_session_id = task.id.clone();
+            let item_session_id = task.id.clone(); 
+            let item_pug = if let Some(first) = chunk.get(0) { first.clone() } else { String::new() };
+            let is_matched = !item_pug.is_empty() && base_pug_content.contains(&item_pug);
 
             let _ = app_handle.emit("extraction-progress", json!({
                 "task_id": task.id,
                 "category": "Extraction",
-                "summary": format!("Processing item {}/{}...", current_start, total_items),
+                "summary": format!("Processing item {}/{} (Matched: {})...", current_start, total_items, is_matched),
                 "spinner": "⠋"
             }));
 
@@ -789,19 +794,44 @@ async fn process_task(
             
             let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
+                let mut item_messages = if is_matched {
+                    vec![
+                        crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+                            content: parsing::page_type_prompt(), 
+                            name: None,
+                        }),
+                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(base_pug_content.clone()),
+                            name: None,
+                        }),
+                        crate::openai_types::ChatCompletionRequestMessage::Assistant(crate::openai_types::ChatCompletionRequestAssistantMessage {
+                            content: Some("READY".to_string()),
+                            ..Default::default()
+                        })
+                    ]
+                } else {
+                    vec![
+                        crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
+                            content: extraction_instruction.clone(),
+                            name: None,
+                        })
+                    ]
+                };
+                let extraction_prompt = if is_matched {
+                    format!("{}\n\n[TARGET]\n{}\n\nACTION: EXTRACT JSON", extraction_instruction, item_pug)
+                } else {
+                    format!("[DATA]\n{}\n\nACTION: EXTRACT JSON", item_pug)
+                };
+
+                item_messages.push(crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(extraction_prompt),
+                    name: None,
+                }));
+
                 let res = tokio::select!{
                     res = model.chat_params_with_spinner(
                         crate::openai_types::ChatCompletionParameters {
-                            messages: vec![
-                                crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                                    content: extraction_instruction.clone(),
-                                    name: None,
-                                }),
-                                crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
-                                    name: None,
-                                })
-                            ],
+                            messages: item_messages,
                             model: "qwen3vl".to_string(),
                             max_tokens: Some(1024),
                             temperature: Some(0.1),
@@ -811,7 +841,7 @@ async fn process_task(
                         "extraction-progress",
                         json!({ "category": "Extraction", "task_id": task.id }),
                         Some(cancellation_token.clone()),
-                        Some(item_session_id) // 개별 아이템 세션 적용
+                        Some(item_session_id.clone()) 
                     ) => res?,
                     _ = async {
                         loop {
