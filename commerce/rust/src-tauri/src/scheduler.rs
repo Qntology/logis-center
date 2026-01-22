@@ -751,27 +751,15 @@ async fn process_task(
             let field_selectors = selector_info.get("selectors").and_then(|v| v.as_object());
 
             if let Some(subs) = field_selectors {
-                // [SELECTOR-MATCHING] Nested selection for better stability
+                // [SELECTOR-MATCHING] Use the combined target_selector directly
                 let mut potential_items = Vec::new();
                 
-                if !node_selector.is_empty() {
-                    if let Ok(node_sel) = scraper::Selector::parse(node_selector) {
-                        for node in document.select(&node_sel) {
-                            if let Ok(item_sel) = scraper::Selector::parse(item_selector) {
-                                for item in node.select(&item_sel) {
-                                    potential_items.push(item);
-                                }
-                            }
-                        }
-                    } else {
-                         println!("[Scheduler] Invalid node selector: {}", node_selector);
+                if let Ok(sel) = scraper::Selector::parse(&target_selector) {
+                    for item in document.select(&sel) {
+                        potential_items.push(item);
                     }
                 } else {
-                     if let Ok(item_sel) = scraper::Selector::parse(item_selector) {
-                        for item in document.select(&item_sel) {
-                            potential_items.push(item);
-                        }
-                     }
+                    println!("[Scheduler] Invalid selector: {}", target_selector);
                 }
 
                 for item_node in potential_items {

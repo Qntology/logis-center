@@ -650,7 +650,13 @@ listen("extraction-progress", async (event: any) => {
                  (row as HTMLElement).style.color = "#ef4444"; 
              }
          } else {
-             if (spinner) spinner.innerText = payload.spinner || "⠋";
+             if (spinner) {
+                 spinner.innerText = payload.spinner || "⠋";
+                 if (payload.spinner === "✅" || payload.spinner === "✔") {
+                     spinner.classList.remove("active-spinner");
+                     spinner.style.color = "#4ade80";
+                 }
+             }
              if (summary) summary.innerText = payload.summary || "";
              
              if((payload.display_text || payload.data) && resultsContainer) {
