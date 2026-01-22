@@ -411,46 +411,38 @@ impl Qwen3VLGenerateModel {
         let generate = generation_result?;
 
         if let Some(path) = &cache_path {
-             // [HYBRID BLOCK SIZE] 주입은 4096(초고속), 추출은 128(정밀도)
-             let is_extraction = input.replace_text.contains("ACTION: EXTRACT") || input.replace_text.contains("ACTION: Identify");
-             let target_block_size = if is_extraction { 128 } else { 4096 };
-
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
-                     if !is_extraction {
+                     // [FIX-CRITICAL] Strict Read-Only Mode if Cache Exists
+                     // If tokens.json exists, we ASSUME the base context (Classification/Ingestion) is already saved.
+                     // We NEVER overwrite or append to it during subsequent turns (Selectors, Extraction).
+                     // This ensures safetensors are created ONLY ONCE at the start.
+                     
+                     let token_path = path.join("tokens.json");
+                     
+                     if token_path.exists() {
+                         println!("[KV-DISK] Cache exists. Skipping save to enforce Read-Only mode.");
+                         // Do nothing (Skip offload_kv_cache)
+                         // Just clear memory cache for next run
+                         m.clear_kv_cache();
+                     } else {
+                         // First time only (Classification/Ingestion phase)
+                         println!("[KV-DISK] No cache found. Saving base context (Size: 4096)...");
+                         
+                         // Ingestion mode: Use large block size (4096) for speed
+                         let target_block_size = 4096; 
+                         
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
                          if !all_tokens.is_empty() {
                              all_tokens.pop(); 
                          }
-                         
-                         let token_path = path.join("tokens.json");
-                         
-                         // Check if disk cache is already sufficient (superset)
-                         let mut skip_save = false;
-                         if token_path.exists() {
-                              if let Ok(file) = fs::File::open(&token_path) {
-                                  let reader = std::io::BufReader::new(file);
-                                  if let Ok(disk_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                      if disk_tokens.len() >= all_tokens.len() && disk_tokens.starts_with(&all_tokens) {
-                                          println!("[KV-DISK] Cache is already a superset. Skipping save to preserve future history.");
-                                          skip_save = true;
-                                      }
-                                  }
-                              }
-                         }
 
-                         if !skip_save {
-                             println!("[KV-DISK] Updating base cache (Injection mode, size 4096) in {:?}", path);
-                             if m.offload_kv_cache(path, target_block_size).is_ok() {
-                                 if let Ok(file) = fs::File::create(&token_path) {
-                                     let _ = serde_json::to_writer(file, &all_tokens);
-                                 }
+                         if m.offload_kv_cache(path, target_block_size).is_ok() {
+                             if let Ok(file) = fs::File::create(&token_path) {
+                                 let _ = serde_json::to_writer(file, &all_tokens);
                              }
                          }
-                     } else {
-                         println!("[KV-DISK] Read-only mode (Inference mode, size 128): Skipping cache update.");
-                         m.clear_kv_cache();
                      }
                  },
                  ModelVariant::Standard(m) => m.clear_kv_cache(),
