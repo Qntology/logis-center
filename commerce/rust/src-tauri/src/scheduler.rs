@@ -419,7 +419,17 @@ async fn process_task(
             let is_last = i == classify_chunks_len - 1;
             println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
-            let prompt = format!("[Reading structure part {}/{}]\n{}", i + 1, classify_chunks_len, chunk);
+            let mut prompt = format!("[Reading structure part {}/{}]", i + 1, classify_chunks_len)
+
+            let mut line_counter = 1;
+            for line in chunk.lines() {
+                prompt.push_str(&format!("\n{} | {}", line_counter, line));
+                line_counter += 1;
+            }
+
+            if is_last {
+                prompt.push_str("\n\nACTION: JSON ONLY");
+            }
 
             // [OPTIMIZATION] Don't add Assistant's "READY" to history, only User data
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -857,10 +867,18 @@ async fn process_task(
                     let is_last = chunk_idx == chunks_len - 1;
         
                     // Prepare prompt: Only trigger extraction on the final chunk
+                    let mut prompt = format!("[Reading structure part {}/{}]", chunk_idx + 1, chunks_len)
+                    
+                    let mut line_counter = 1;
+                    for line in chunk.lines() {
+                        prompt.push_str(&format!("\n{} | {}", line_counter, line));
+                        line_counter += 1;
+                    }
 
-                    let prompt = format!("[Reading structure part {}/{}]\n{}", chunk_idx + 1, chunks_len, chunk)
+                    if is_last {
+                        prompt.push_str("\n\nACTION: JSON ONLY");
+                    }
 
-        
                     let max_tokens = if is_last { 2048 } else { 32 }; 
                     
                     let _ = app_handle.emit("extraction-progress", json!({
