@@ -4,7 +4,7 @@ use regex::Regex;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum PugMode {
-    StructureOnly(bool), // bool: compress repetitive items
+    StructureOnly,
     FullContent,
 }
 
@@ -14,15 +14,15 @@ pub fn pre_clean_html(html: &str) -> String {
     let html = re_comm.replace_all(html, "");
 
     // 2. 분류/추출에 전혀 필요 없는 태그들 통째로 제거
-    // Discovery 단계에서 노이즈가 될 수 있는 대형 영역(header, footer, nav 등) 추가 제거 가능성 고려
-    let re_tags = Regex::new(r"(?is)<(script|style|svg|noscript|iframe|head|meta|link|canvas|video|audio|button|input|select|label|header|footer|nav|aside)\b[^>]*>.*?</(script|style|svg|noscript|iframe|head|meta|link|canvas|video|audio|button|input|select|label|header|footer|nav|aside)>").unwrap();
+    // JS filter list: script, style, link, noscript, iframe
+    let re_tags = Regex::new(r"(?is)<(script|style|link|noscript|iframe)\b[^>]*>.*?</(script|style|link|noscript|iframe)>").unwrap();
     let html = re_tags.replace_all(&html, "");
 
     // 3. 닫는 태그가 없는 단일 태그들 정리
-    let re_single = Regex::new(r"(?is)<(meta|link|br|hr|img|input|source)\b[^>]*>").unwrap();
+    let re_single = Regex::new(r"(?is)<(meta|link|br|hr|input|source)\b[^>]*>").unwrap();
     let clean = re_single.replace_all(&html, "");
 
-    // 4. 연속된 줄바꿈 및 불필요한 공백 제거 (토큰 절약)
+    // 4. 연속된 줄바꿈 및 불필요한 공백 제거
     let re_whitespace = Regex::new(r"(?m)^\s*\n").unwrap();
     let clean = re_whitespace.replace_all(&clean, "");
     
@@ -86,155 +86,123 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
 fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode) {
     if indent_level > 50 { return; }
     let indent = "    ".repeat(indent_level);
+    
     match node.value() {
         Node::Element(element) => {
-            let tag_name = element.name();
-            
-            // [STRICT FILTER] 광고 및 불필요 태그 원천 차단
-            let ad_patterns = ["ad", "banner", "popup", "modal", "floating", "wing", "sidebar", "aside", "header", "footer", "nav"];
-            
-            if let PugMode::StructureOnly(_) = mode {
-                // 1. 태그명 기반 필터링
-                if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use", "button", "input", "select", "label"].contains(&tag_name) { return; }
-                
-                // 2. ID/Class 기반 광고 필터링
-                let id = element.id().unwrap_or("").to_lowercase();
-                if ad_patterns.iter().any(|&p| id.contains(p)) { return; }
-                
-                let classes = element.classes().collect::<Vec<_>>().join(" ").to_lowercase();
-                if ad_patterns.iter().any(|&p| classes.contains(p)) { return; }
-            } else {
-                if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use"].contains(&tag_name) { return; }
-            }
+            let tag_name = element.name().to_lowercase();
 
+            // --- base64 이미지를 포함하는 img 태그 제외 ---
             if tag_name == "img" {
                 if let Some(src) = element.attr("src") {
-                    if src.len() > 1000 || src.contains("base64") { return; }
-                }
-            }
-
-            let mut line = String::with_capacity(64);
-            line.push_str(&indent);
-            line.push_str(tag_name);
-            if let Some(id) = element.id() { 
-                line.push('#');
-                line.push_str(id);
-            }
-            for class in element.classes() { 
-                line.push('.');
-                line.push_str(class);
-            }
-            let mut attrs = Vec::new();
-            match mode {
-                PugMode::StructureOnly(_) => {
-                    // Discovery 단계: href만 유지하여 링크 구조 파악
-                    if let Some(val) = element.attr("href") { 
-                         let val = if val.len() > 150 { &val[..150] } else { val };
-                         if !val.starts_with("javascript:") && !val.starts_with('#') {
-                             attrs.push(format!("href='{}'", val.replace("\"", "'"))); 
-                         }
-                    }
-                },
-                PugMode::FullContent => {
-                    for (key, value) in element.attrs() {
-                        if key == "id" || key == "class" { continue; }
-                        if key.starts_with("data-") || ["src", "href", "type", "name", "value", "placeholder", "title", "alt", "checked", "selected", "disabled", "readonly", "rows", "cols", "action", "method"].contains(&key) {
-                             if ["checked", "selected", "disabled", "readonly"].contains(&key) {
-                                 attrs.push(key.to_string());
-                             } else {
-                                 let val_clean = value.replace("\"", "'" ).replace("\n", "");
-                                 let val_trunc = if val_clean.len() > 300 { format!("{}\"...", &val_clean[..300]) } else { val_clean };
-                                 attrs.push(format!(r#"{}='{}'"#, key, val_trunc));
-                             }
-                        }
-                    }
-                }
-            }
-            if !attrs.is_empty() { 
-                line.push('(');
-                line.push_str(&attrs.join(" "));
-                line.push(')');
-            }
-            output.push_str(&line);
-            output.push('\n');
-
-            // --- [STRICT PARITY] Special Textarea Handling ---
-            if tag_name == "textarea" && mode == &PugMode::FullContent {
-                if let Some(val) = element.attr("value") {
-                    for line in val.lines() {
-                        output.push_str(&indent);
-                        output.push_str("    | ");
-                        output.push_str(line.trim());
-                        output.push('\n');
+                    if src.contains("base64") {
+                        return;
                     }
                 }
             }
 
-            // --- Structural Compression for Classification ---
-            // Only active if StructureOnly(true)
-            if let PugMode::StructureOnly(true) = mode {
-                // Filter only elements to ensure consecutive elements are compared correctly, ignoring whitespace
-                let elements: Vec<_> = node.children().filter(|n| n.value().is_element()).collect();
+            // 불필요한 태그들을 만나면 건너뛰기
+            if ["script", "style", "link", "noscript", "iframe"].contains(&tag_name.as_str()) {
+                return;
+            }
+
+            // --- 허용된 속성만 Pug 문법으로 변환 ---
+            let mut attributes_string = String::new();
+            let mut other_attributes = Vec::new();
+
+            // ID 속성 처리 (#my-id)
+            if let Some(id) = element.id() {
+                attributes_string.push_str(&format!("#{}", id));
+            }
+
+            // Class 속성 처리 (.class1.class2)
+            let classes: Vec<_> = element.classes().collect();
+            if !classes.is_empty() {
+                attributes_string.push_str(&format!(".{}", classes.join(".")));
+            }
+
+            // 기본적으로 포함할 속성들
+            let always_include = [
+                "src", "href", "type", "name", "value", "placeholder", 
+                "checked", "selected", "disabled", "readonly", "rows", "cols"
+            ];
+
+            for (name, value) in element.attrs() {
+                if name == "id" || name == "class" {
+                    continue;
+                }
+
+                if name.starts_with("data-") || always_include.contains(&name) {
+                    // Boolean 속성 처리
+                    if ["checked", "selected", "disabled", "readonly"].contains(&name) && (value.is_empty() || value == name) {
+                        other_attributes.push(name.to_string());
+                    } else if !value.is_empty() {
+                        let safe_value = value.replace("\"", "'");
+                        other_attributes.push(format!("{}=\"{}\"", name, safe_value));
+                    }
+                }
+            }
+
+            // 괄호로 묶는 속성들 추가
+            if !other_attributes.is_empty() {
+                attributes_string.push_str(&format!("({})", other_attributes.join(" ")));
+            }
+
+            // div 축약 로직 (Flattening)
+            let mut current_node = node;
+            while let Some(child_div) = {
+                let el = current_node.value().as_element().unwrap();
+                let non_empty_children: Vec<_> = current_node.children().filter(|n| {
+                    match n.value() {
+                        Node::Element(_) => true,
+                        Node::Text(t) => !t.trim().is_empty(),
+                        _ => false
+                    }
+                }).collect();
                 
-                if elements.len() > 3 {
-                    let mut last_tag = String::new();
-                    let mut last_classes = String::new();
-                    let mut repeat_count = 0;
-                    
-                    for (idx, child) in elements.iter().enumerate() {
-                        // We know it is_element
-                        let el = child.value().as_element().unwrap();
-                        let tag = el.name();
-                        let classes = el.classes().collect::<Vec<_>>().join(".");
-                        
-                        let is_repetitive = tag == last_tag && classes == last_classes ;
-                        
-                        if is_repetitive {
-                            repeat_count += 1;
-                        } else {
-                            repeat_count = 0;
-                            last_tag = tag.to_string();
-                            last_classes = classes;
-                        }
-                        
-                        // Compress if repetition count > 1 (meaning at least 3 identical items: original + rep1 + rep2)
-                        if repeat_count > 1 && idx < elements.len() - 1 {
-                            if repeat_count == 2 {
-                                output.push_str(&indent);
-                                output.push_str("    | ... (repetitive items compressed)\n");
-                            }
-                            continue;
-                        }
-                        
-                        generate_pug_lines(*child, indent_level + 1, output, mode);
+                let first_element_child = current_node.children().find(|n| n.value().is_element());
+
+                if el.name() == "div" && non_empty_children.len() == 1 && first_element_child.is_some() && 
+                   first_element_child.unwrap().value().as_element().map(|e| e.name() == "div").unwrap_or(false) {
+                    first_element_child
+                } else {
+                    None
+                }
+            } {
+                current_node = child_div;
+            }
+
+            // 태그 이름과 변환된 속성 문자열을 함께 추가
+            output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
+
+            // textarea의 값 처리
+            if tag_name == "textarea" {
+                let mut text_content = String::new();
+                for child in node.children() {
+                    if let Node::Text(t) = child.value() {
+                        text_content.push_str(t);
                     }
-                    return; // Skip default iteration
+                }
+                if !text_content.trim().is_empty() {
+                    for line in text_content.lines() {
+                        output.push_str(&format!("{}    | {}\n", indent, line.trim()));
+                    }
+                }
+            }
+            // 자식 노드 처리
+            else {
+                for child in current_node.children() {
+                    generate_pug_lines(child, indent_level + 1, output, mode);
                 }
             }
 
-            // --- No Compression: Iterate all children ---
-            for child in node.children() { 
-                generate_pug_lines(child, indent_level + 1, output, mode); 
-            }
-        },
+        }
         Node::Text(text) => {
-            if *mode == PugMode::FullContent {
-                let content = text.trim();
-                if !content.is_empty() {
-                    let content_trunc = if content.len() > 1000 { &content[..1000] } else { content };
-                    for line in content_trunc.lines() {
-                        let trimmed_line = line.trim();
-                        if !trimmed_line.is_empty() {
-                            output.push_str(&indent);
-                            output.push_str("| ");
-                            output.push_str(&trimmed_line.replace("\"", "'" ));
-                            output.push('\n');
-                        }
-                    }
-                }
+            let text_content = text.trim();
+            if !text_content.is_empty() {
+                output.push_str(&format!("{}| {}\n", indent, text_content));
             }
-        },
-        _ => { for child in node.children() { generate_pug_lines(child, indent_level, output, mode); } }
+        }
+        _ => {}
     }
 }
 

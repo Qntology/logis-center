@@ -259,25 +259,19 @@ pub async fn start_background_worker(
 }
 
 async fn process_task(
-
     task: Task,
-
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
-
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
-
     cancellation_token: &Arc<AtomicBool>,
-
     app_handle: &tauri::AppHandle
-
 )
-
 -> Result<()>
-
 {
+    // [NEW] Ensure log directory exists at runtime
+    let _ = std::fs::create_dir_all("logs/pug");
+    println!("[PROCESS] Task {} started processing.", task.id);
 
     // [NEW] Clear any leftover resources from previous failed attempts at the START
-
     cleanup_task_resources(&task.id);
 
 
@@ -367,11 +361,18 @@ async fn process_task(
     let light_pug = {
         let clean_content = data_manager.load(&clean_html_path)?;
         let document = scraper::Html::parse_document(&clean_content);
-        parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly(false))
+        parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly)
         // clean_content dropped here
     }; 
     
-    let _ = std::fs::write("debug_light_pug.txt", &light_pug);
+    // [DEBUG-LOG] Save generated Pug with nanosecond precision to prevent overwriting
+    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let log_path = format!("logs/pug/light_{}_{}.pug", task.id, ts_nano);
+    if let Err(e) = std::fs::write(&log_path, &light_pug) {
+        println!("[ERROR] Failed to write light pug: {}", e);
+    } else {
+        println!("[DEBUG] Saved light pug to: {}", log_path);
+    }
     
     // Determine optimal chunk sizes based on hardware
     // [ADAPTIVE] Increased to 4000 chars to speed up ingestion.
@@ -420,6 +421,13 @@ async fn process_task(
         })
     ];
 
+    // [DEBUG-LOG] Save initial classification system prompt
+    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let log_path = format!("logs/pug/instruction_classify_{}_{}.pug", task.id, ts_nano);
+    if let Err(e) = std::fs::write(&log_path, parsing::page_type_prompt()) {
+        println!("[ERROR] Failed to write instruction_classify: {}", e);
+    }
+
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         
@@ -437,6 +445,13 @@ async fn process_task(
 
             if is_last {
                 prompt.push_str("\n\nACTION: JSON ONLY");
+            }
+
+            // [DEBUG-LOG] Save classification chunk for verification
+            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let log_path = format!("logs/pug/chunk_classify_{}_{}_{}.pug", task.id, i, ts_nano);
+            if let Err(e) = std::fs::write(&log_path, &prompt) {
+                println!("[ERROR] Failed to write chunk_classify: {}", e);
             }
 
             // [OPTIMIZATION] Don't add Assistant's "READY" to history, only User data
@@ -536,6 +551,10 @@ async fn process_task(
         let next_question = parsing::page_selectors_prompt(&page_type); 
         let app_handle_clone = app_handle.clone();
         
+        // [DEBUG-LOG] Save selector identification prompt
+        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let _ = std::fs::write(format!("logs/pug/prompt_selectors_{}_{}.pug", task.id, ts_nano), &next_question);
+
         // Add classification result and the new question to history
         messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content: Some(page_type_res.clone()),
@@ -557,7 +576,7 @@ async fn process_task(
             ..Default::default()
         };
 
-        tokio::select!{
+        let res = tokio::select!{
             res = model.chat_params_with_spinner(
                 params,
                 &app_handle_clone, 
@@ -574,7 +593,12 @@ async fn process_task(
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             } => { return Err(anyhow::anyhow!("Task cancelled")); }
-        }
+        };
+
+        // [DEBUG-LOG] Save raw selector response
+        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let _ = std::fs::write(format!("logs/pug/res_selectors_{}_{}.res", task.id, ts_nano), &res);
+        res
     } else { "{}".to_string() };
         drop(model_guard);
         
@@ -689,6 +713,14 @@ async fn process_task(
         let total_items = item_pugs.len();
         println!("[Scheduler] List Processing: Found {} items using selector '{}'", total_items, current_selector);
         
+        // [DEBUG-LOG] Save each item pug with unique timestamp
+        for (idx, pug) in item_pugs.iter().enumerate() {
+            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let log_path = format!("logs/pug/item_{}_{}_{}_{}.pug", task.id, idx, total_items, ts_nano);
+            let _ = std::fs::write(&log_path, pug);
+        }
+        println!("[DEBUG] Saved {} item pugs to logs/pug/", total_items);
+        
         if total_items == 0 {
             println!("[Scheduler] Stopping: No items found even with fallback.");
             return Ok(());
@@ -696,6 +728,11 @@ async fn process_task(
 
 
         let extraction_instruction = parsing::list2json(page_type, language);
+        
+        // [DEBUG-LOG] Save list extraction instruction
+        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let _ = std::fs::write(format!("logs/pug/instruction_list_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
+
         let mut all_extracted_items = Vec::new();
 
         // [BATCH OPTIMIZATION] Process 4 items at a time to improve stability
@@ -722,6 +759,11 @@ async fn process_task(
                 }
             }
 
+            // [DEBUG-LOG] Save the actual chunk sent to LLM
+            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let log_path = format!("logs/pug/chunk_list_{}_{}_{}.pug", task.id, current_start, ts_nano);
+            let _ = std::fs::write(&log_path, &prompt);
+
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
             let mut model_guard = model_mutex.lock().await;
@@ -730,7 +772,7 @@ async fn process_task(
             let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
                 let summary_text = format!("Processing {}~{}/{}...", current_start, current_end, total_items);
-                tokio::select!{
+                let res = tokio::select!{
                     res = model.chat_with_spinner(
                         &extraction_instruction, // Schema goes here (System Prompt)
                         &prompt,                 // Pure Data goes here (User Prompt)
@@ -754,7 +796,12 @@ async fn process_task(
                         cleanup_task_resources(&task.id);
                         return Err(anyhow::anyhow!("Task cancelled")); 
                     }
-                }
+                };
+                
+                // [DEBUG-LOG] Save raw batch response
+                let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let _ = std::fs::write(format!("logs/pug/res_list_{}_{}_{}.res", task.id, current_start, ts_nano), &res);
+                res
             } else { "[]".to_string() };
             drop(model_guard);
 
@@ -862,11 +909,19 @@ async fn process_task(
             return Ok(());
         }
 
-        let _ = std::fs::write("debug_content_pug.txt", &content_pug); 
+        // [DEBUG-LOG] Save content Pug for verification
+        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let log_path = format!("logs/pug/content_{}_{}.pug", task.id, ts_nano);
+        let _ = std::fs::write(&log_path, &content_pug);
+        println!("[DEBUG] Saved content pug to: {}", log_path);
         
         // CHUNKING: Split huge content into dynamic chunks with 0-char overlap (Device Optimized)
         let chunks = chunk_text(&content_pug, 1000, 0); 
         let extraction_instruction = parsing::item2json(page_type, &url, language);
+
+        // [DEBUG-LOG] Save detail extraction instruction
+        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let _ = std::fs::write(format!("logs/pug/instruction_detail_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
 
         // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
         let detail_session_id = format!("{}_detail", task.id);
@@ -890,6 +945,11 @@ async fn process_task(
                         prompt.push_str("\n\nACTION: JSON ONLY");
                     }
 
+                    // [DEBUG-LOG] Save detail chunk for verification
+                    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    let log_path = format!("logs/pug/chunk_detail_{}_{}_{}.pug", task.id, chunk_idx, ts_nano);
+                    let _ = std::fs::write(&log_path, &prompt);
+
                     let max_tokens = if is_last { 2048 } else { 32 }; 
                     
                     let _ = app_handle.emit("extraction-progress", json!({
@@ -903,7 +963,7 @@ async fn process_task(
                     
                     let response = if let Some(model) = model_guard.as_ref() {
                         let app_handle_clone = app_handle.clone();
-                        tokio::select!{
+                        let res = tokio::select!{
                             res = model.chat_with_spinner(
                                 &extraction_instruction, // Schema consistently sent as System Prompt
                                 &prompt,                 // Pure Data Chunk as User Prompt
@@ -924,7 +984,14 @@ async fn process_task(
                                 cleanup_task_resources(&task.id);
                                 return Err(anyhow::anyhow!("Task cancelled")); 
                             }
+                        };
+                        
+                        // [DEBUG-LOG] Save raw detail response (on last chunk)
+                        if is_last {
+                            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                            let _ = std::fs::write(format!("logs/pug/res_detail_{}_{}.res", task.id, ts_nano), &res);
                         }
+                        res
                     } else {
                         "{}".to_string()
                     };
