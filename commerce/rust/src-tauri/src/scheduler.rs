@@ -382,7 +382,7 @@ async fn process_task(
 
     // [REVISED] Restore turn-based chunked ingestion for classification.
     // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 4000, 0); // [SPEED-UP] Larger chunks for fewer parts
+    let classify_chunks = chunk_text(&light_pug, 1000, 0); // 👈 Reduced to 1000 for strict context management
     let classify_chunks_len = classify_chunks.len(); 
     println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);
 
@@ -472,8 +472,8 @@ async fn process_task(
             let params = ChatCompletionParameters {
                 messages: messages.clone(), 
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(if is_last { 1024 } else { 32 }), // Doubled for safety
-                temperature: Some(0.1), // Very deterministic for classification
+                max_tokens: Some(if is_last { 1024 } else { 128 }), // [INCREASED] Safe generation for confirmation
+                temperature: Some(0.1), 
                 ..Default::default()
             };
 
@@ -500,8 +500,13 @@ async fn process_task(
                             "data": out,
                             "spinner": "✅"
                         }));
-                    } 
-                    // [MODIFIED] Do not push Assistant message back to history here
+                    } else {
+                        // [NEW] Accumulate Assistant message back to history to confirm turn completion
+                        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                            content: Some(out),
+                            ..Default::default()
+                        }));
+                    }
                 },
                 _ = async {
                     loop {
@@ -930,6 +935,14 @@ async fn process_task(
                 let chunks_len = chunks.len();
                 let mut line_counter = 1; // 👈 Continuous line numbering for detail page
                 
+                // [NEW] Persistent message history for detail page
+                let mut detail_messages = vec![
+                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                        content: extraction_instruction.clone(),
+                        name: None,
+                    })
+                ];
+
                 for (chunk_idx, chunk) in chunks.iter().enumerate() {
                     let is_last = chunk_idx == chunks_len - 1;
         
@@ -948,9 +961,11 @@ async fn process_task(
                     // [DEBUG-LOG] Save detail chunk for verification
                     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                     let log_path = format!("logs/pug/chunk_detail_{}_{}_{}.pug", task.id, chunk_idx, ts_nano);
-                    let _ = std::fs::write(&log_path, &prompt);
+                    if let Err(e) = std::fs::write(&log_path, &prompt) {
+                        println!("[ERROR] Failed to write chunk_detail: {}", e);
+                    }
 
-                    let max_tokens = if is_last { 2048 } else { 32 }; 
+                    let max_tokens = if is_last { 2048 } else { 128 }; 
                     
                     let _ = app_handle.emit("extraction-progress", json!({
                         "task_id": task.id,
@@ -959,18 +974,32 @@ async fn process_task(
                         "spinner": "⠋"
                     }));
         
+                    // Build params with accumulated history
+                    detail_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Array(vec![
+                            ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                        ]),
+                        name: None,
+                    }));
+
                     let model_guard = model_mutex.lock().await;
                     
                     let response = if let Some(model) = model_guard.as_ref() {
                         let app_handle_clone = app_handle.clone();
+                        let params = ChatCompletionParameters {
+                            messages: detail_messages.clone(),
+                            model: "qwen3vl".to_string(),
+                            max_tokens: Some(max_tokens as u32),
+                            temperature: Some(0.1),
+                            ..Default::default()
+                        };
+
                         let res = tokio::select!{
-                            res = model.chat_with_spinner(
-                                &extraction_instruction, // Schema consistently sent as System Prompt
-                                &prompt,                 // Pure Data Chunk as User Prompt
+                            res = model.chat_params_with_spinner(
+                                params,
                                 &app_handle_clone, 
                                 "extraction-progress", 
                                 json!({ "category": "Ingestion" }), 
-                                max_tokens, 
                                 Some(cancellation_token.clone()), 
                                 Some(detail_session_id.clone())
                             ) => res?,
@@ -986,10 +1015,16 @@ async fn process_task(
                             }
                         };
                         
-                        // [DEBUG-LOG] Save raw detail response (on last chunk)
-                        if is_last {
-                            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                            let _ = std::fs::write(format!("logs/pug/res_detail_{}_{}.res", task.id, ts_nano), &res);
+                        // [DEBUG-LOG] Save raw detail response
+                        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        let _ = std::fs::write(format!("logs/pug/res_detail_{}_{}_{}.res", task.id, chunk_idx, ts_nano), &res);
+                        
+                        // [NEW] Accumulate back if not the last one
+                        if !is_last {
+                            detail_messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                                content: Some(res.clone()),
+                                ..Default::default()
+                            }));
                         }
                         res
                     } else {
