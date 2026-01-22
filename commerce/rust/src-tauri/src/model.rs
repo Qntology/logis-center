@@ -250,7 +250,7 @@ impl LogisModel {
         let model_path = gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
-        let max_tokens_limit = 1000; // [OPTIMIZED] Perfectly matched with embedding limit and 1000-char chunks
+        let max_tokens_limit = 2048; // [OPTIMIZED] Perfectly matched with embedding limit and 1000-char chunks
 
         // DO NOT LOAD MODELS HERE. Just return the config.
         Ok(Self {
