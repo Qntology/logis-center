@@ -419,7 +419,7 @@ async fn process_task(
             let is_last = i == classify_chunks_len - 1;
             println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
-            let mut prompt = format!("[Reading structure part {}/{}]", i + 1, classify_chunks_len)
+            let mut prompt = format!("[Reading structure part {}/{}]", i + 1, classify_chunks_len);
 
             let mut line_counter = 1;
             for line in chunk.lines() {
@@ -870,7 +870,7 @@ async fn process_task(
                     let is_last = chunk_idx == chunks_len - 1;
         
                     // Prepare prompt: Only trigger extraction on the final chunk
-                    let mut prompt = format!("[Reading structure part {}/{}]", chunk_idx + 1, chunks_len)
+                    let mut prompt = format!("[Reading structure part {}/{}]", chunk_idx + 1, chunks_len);
 
                     let mut line_counter = 1;
                     for line in chunk.lines() {
