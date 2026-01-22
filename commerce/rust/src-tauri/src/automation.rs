@@ -233,7 +233,8 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 "--remote-allow-origins=*", 
             ];
             let mut builder = BrowserConfig::builder().chrome_executable(&exec_path).with_head().no_sandbox().viewport(None);
-            let profile_dir = std::path::Path::new("browser_profiles").join(browser);
+            let tmp_root = crate::utils::paths::get_app_tmp_root(None);
+            let profile_dir = tmp_root.join("browser_profiles").join(browser);
             let _ = std::fs::create_dir_all(&profile_dir);
             let mut p_str = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir).to_string_lossy().to_string();
             if p_str.starts_with(r"\\?\") { p_str = p_str[4..].to_string(); }
