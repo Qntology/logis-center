@@ -182,13 +182,11 @@ impl Qwen3VLGenerateModel {
         // [ADAPTIVE] Disable disk cache for critical ingestion to ensure in-memory consistency
         let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
         let cache_path = if let Some(sid) = &session_id {
-             // [MODIFIED] Force cache creation even for critical tasks to support Pug preprocessing
-             if is_critical {
-                 println!("[CONFIG] Critical task detected ([DATA_PART]/[FULL_STRUCTURE]), but forcing KV cache creation.");
+             if is_critical { None } else {
+                 let p = std::path::Path::new("tmp_kv").join(sid);
+                 if !p.exists() { let _ = fs::create_dir_all(&p); }
+                 Some(p)
              }
-             let p = std::path::Path::new("tmp_kv").join(sid);
-             if !p.exists() { let _ = fs::create_dir_all(&p); }
-             Some(p)
         } else {
              None
         };
@@ -208,7 +206,7 @@ impl Qwen3VLGenerateModel {
                                      if c == f { match_len += 1; } else { break; }
                                  }
 
-                                 if match_len > 50 {
+                                 if match_len > 100 {
                                      println!("[KV-DISK] Cache Hit! Longest Common Prefix: {} tokens.", match_len);
                                      
                                      // [OPTIMIZATION] Even if match_len is slightly less than cached_tokens.len(),
@@ -246,9 +244,8 @@ impl Qwen3VLGenerateModel {
              }
         }
         
-        // [CHUNKED PREFILL] - Line Aware (1024 tokens)
-        // [ADAPTIVE] Increased from 256 to 1024 to significantly speed up heavy document reading.
-        if seq_len > 1024 {
+        // [CHUNKED PREFILL] - Line Aware (512 tokens)
+        if seq_len > 512 {
             println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
             
             let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.text_device) {
@@ -260,12 +257,12 @@ impl Qwen3VLGenerateModel {
 
             while current_pos < seq_len - 1 {
                 let remaining = seq_len - current_pos;
-                if remaining <= 1024 { break; } 
+                if remaining <= 512 { break; } 
 
-                let mut chunk_size = 1024;
+                let mut chunk_size = 512;
                 let lookback_range = 128; 
                 
-                let search_end = current_pos + 1024;
+                let search_end = current_pos + 512;
                 let search_start = search_end.saturating_sub(lookback_range);
                 
                 for i in (search_start..search_end).rev() {

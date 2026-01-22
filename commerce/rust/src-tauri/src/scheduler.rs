@@ -72,42 +72,82 @@ impl Drop for TaskDataManager {
     }
 }
 
-// Helper to chunk text strictly by lines with a "push-back" (sliding) logic.
-// If a line would exceed the chunk_size, it's moved to the next chunk entirely.
-fn chunk_text(text: &str, chunk_size: usize, _overlap: usize) -> Vec<String> {
+// Helper to chunk text with overlap, strictly respecting newlines and char boundaries for Pug     
+fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+    if text.len() <= chunk_size {
+        return vec![text.to_string()];
+    }
+
     let mut chunks = Vec::new();
-    let mut current_chunk = String::new();
-    
-    for line in text.lines() {
-        let line_with_nl = format!("{}\n", line);
-        
-        // If this line alone is somehow bigger than the entire chunk_size,
-        // we have to break it, but this is extremely rare for Pug.
-        if line_with_nl.len() > chunk_size {
-            if !current_chunk.is_empty() {
-                chunks.push(current_chunk);
-                current_chunk = String::new();
-            }
-            chunks.push(line_with_nl);
-            continue;
+    let mut start = 0;
+
+    while start < text.len() {
+        let mut target_end = (start + chunk_size).min(text.len());
+
+        // Ensure target_end is a valid char boundary
+        while !text.is_char_boundary(target_end) {
+            target_end -= 1;
         }
 
-        // Check if adding this line exceeds the 1024 char (approx tokens) limit
-        if current_chunk.len() + line_with_nl.len() > chunk_size {
-            // [SLIDE] Push current chunk to results and start NEW chunk with this line
-            chunks.push(current_chunk);
-            current_chunk = line_with_nl;
-        } else {
-            current_chunk.push_str(&line_with_nl);
+        let mut end = target_end;
+
+        // Find the NEXT newline after target_end to include the current line fully
+        if target_end < text.len() {
+            if let Some(next_newline_offset) = text[target_end..].find('\n') {
+                end = target_end + next_newline_offset + 1;
+            } else {
+                end = text.len();
+            }
         }
-    }
-    
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk);
+
+        // Safety check for end boundary
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+
+        chunks.push(text[start..end].to_string());
+
+        if end >= text.len() {
+            break;
+        }
+
+        // Calculate next start with overlap
+        let mut next_start = end.saturating_sub(overlap);
+
+        // Ensure next_start is a valid char boundary
+        while !text.is_char_boundary(next_start) {
+            next_start -= 1;
+        }
+
+        // Align next_start to the START of a line (find the first newline in the overlap zone)    
+        if next_start > start && next_start < end {
+             if let Some(line_start) = text[next_start..end].find('\n') {
+                 next_start = next_start + line_start + 1;
+             }
+        }
+
+        // Final safety for next_start
+        while !text.is_char_boundary(next_start) {
+            next_start += 1; // Move forward to find valid char
+        }
+
+        // Prevent infinite loops or zero progress
+        if next_start >= end {
+            next_start = end;
+        }
+
+        // Absolute safety check to ensure progress
+        if next_start <= start {
+             next_start = start + 1; // Force progress by at least 1 byte (might panic on utf8, but better than loop)
+             while !text.is_char_boundary(next_start) && next_start < text.len() {
+                 next_start += 1;
+             }
+        }
+
+        start = next_start;
     }
     chunks
 }
-
 // Deep merge for JSON objects
 fn merge_json_results(target: &mut Value, source: &Value) {
     if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
@@ -382,7 +422,7 @@ async fn process_task(
 
     // [REVISED] Restore turn-based chunked ingestion for classification.
     // This is the original stable logic.
-    let classify_chunks = chunk_text(&light_pug, 1000, 0); // 👈 Reduced to 1000 for strict context management
+    let classify_chunks = chunk_text(&light_pug, 4000, 500);
     let classify_chunks_len = classify_chunks.len(); 
     println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);
 
@@ -416,7 +456,7 @@ async fn process_task(
 
     let mut messages = vec![
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: parsing::page_type_prompt(),
+            content: parsing::page_type_prompt(language),
             name: None,
         })
     ];
@@ -424,11 +464,10 @@ async fn process_task(
     // [DEBUG-LOG] Save initial classification system prompt
     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let log_path = format!("logs/pug/instruction_classify_{}_{}.pug", task.id, ts_nano);
-    if let Err(e) = std::fs::write(&log_path, parsing::page_type_prompt()) {
+    if let Err(e) = std::fs::write(&log_path, parsing::page_type_prompt(language)) {
         println!("[ERROR] Failed to write instruction_classify: {}", e);
     }
 
-    let mut line_counter = 1; // 👈 Move outside to keep continuity
     if let Some(model) = model_guard.as_ref() {
         let app_handle_clone = app_handle.clone();
         
@@ -436,12 +475,7 @@ async fn process_task(
             let is_last = i == classify_chunks_len - 1;
             println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
-            let mut prompt = String::new(); // 👈 Removed header
-
-            for line in chunk.lines() {
-                prompt.push_str(&format!("{} | {}\n", line_counter, line));
-                line_counter += 1;
-            }
+            let mut prompt = chunk.clone();
 
             if is_last {
                 prompt.push_str("\n\nACTION: JSON ONLY");
@@ -553,7 +587,7 @@ async fn process_task(
     }));
 
     let page_selectors_res = if let Some(model) = model_guard.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type); 
+        let next_question = parsing::page_selectors_prompt(&page_type, language); 
         let app_handle_clone = app_handle.clone();
         
         // [DEBUG-LOG] Save selector identification prompt
@@ -738,32 +772,27 @@ async fn process_task(
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let _ = std::fs::write(format!("logs/pug/instruction_list_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
 
-        let mut all_extracted_items = Vec::new();
-        let mut line_counter = 1; // 👈 Continuous line numbering for items
-
-        // [BATCH OPTIMIZATION] Process 4 items at a time to improve stability
-        for chunk in item_pugs.chunks(4) {
-            if cancellation_token.load(Ordering::Relaxed) { break; }
-            
-            let current_start = all_extracted_items.len() + 1;
-            let current_end = current_start + chunk.len() - 1;
-
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "category": "Item Extraction", 
-                "summary": format!("Extracting Items {}~{}/{}...", current_start, current_end, total_items),
-                "spinner": "⠋"
-            }));
-
-            // [OPTIMIZATION] Separate Schema (System) from Data (User)
-            // Initialize prompt and append snippets with line numbers
-            let mut prompt = String::new(); // 👈 Removed header
-            for pug in chunk {
-                for line in pug.lines() {
-                    prompt.push_str(&format!("{} | {}\n", line_counter, line));
-                    line_counter += 1;
-                }
-            }
-
+                let mut all_extracted_items = Vec::new();
+        
+                // [BATCH OPTIMIZATION] Process 4 items at a time to improve stability
+                for chunk in item_pugs.chunks(4) {
+                    let current_start = all_extracted_items.len() + 1;
+                    let current_end = (current_start + chunk.len() - 1).min(total_items);
+        
+                    let _ = app_handle.emit("extraction-progress", json!({
+                        "task_id": task.id,
+                        "category": "Extraction",
+                        "summary": format!("Processing {}~{}/{} items...", current_start, current_end, total_items),
+                        "spinner": "⠋"
+                    }));
+        
+                    // [OPTIMIZATION] Separate Schema (System) from Data (User)
+                    // Initialize prompt and append snippets
+                    let mut prompt = String::new(); 
+                    for (idx, pug) in chunk.iter().enumerate() {
+                        prompt.push_str(&format!("\n### ITEM #{} ###\n{}\n", idx + 1, pug));
+                    }
+        
             // [DEBUG-LOG] Save the actual chunk sent to LLM
             let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             let log_path = format!("logs/pug/chunk_list_{}_{}_{}.pug", task.id, current_start, ts_nano);
@@ -920,44 +949,37 @@ async fn process_task(
         let _ = std::fs::write(&log_path, &content_pug);
         println!("[DEBUG] Saved content pug to: {}", log_path);
         
-        // CHUNKING: Split huge content into dynamic chunks with 0-char overlap (Device Optimized)
-        let chunks = chunk_text(&content_pug, 1000, 0); 
-        let extraction_instruction = parsing::item2json(page_type, &url, language);
-
-        // [DEBUG-LOG] Save detail extraction instruction
-        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(format!("logs/pug/instruction_detail_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
-
-        // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
-        let detail_session_id = format!("{}_detail", task.id);
+                // CHUNKING: Split huge content into dynamic chunks with 500-char overlap (Device Optimized) 
+                let chunks = chunk_text(&content_pug, 4000, 500); 
+                let extraction_instruction = parsing::item2json(page_type, &url, language);
         
-                // Phase 1: Ingest all chunks (Prefill)
-                let chunks_len = chunks.len();
-                let mut line_counter = 1; // 👈 Continuous line numbering for detail page
-                
-                // [NEW] Persistent message history for detail page
-                let mut detail_messages = vec![
-                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: extraction_instruction.clone(),
-                        name: None,
-                    })
-                ];
-
-                for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                    let is_last = chunk_idx == chunks_len - 1;
+                // [DEBUG-LOG] Save detail extraction instruction
+                let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                let _ = std::fs::write(format!("logs/pug/instruction_detail_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
         
-                    // Prepare prompt: Only trigger extraction on the final chunk
-                    let mut prompt = String::new(); // 👈 Removed header
-
-                    for line in chunk.lines() {
-                        prompt.push_str(&format!("{} | {}\n", line_counter, line));
-                        line_counter += 1;
-                    }
-
-                    if is_last {
-                        prompt.push_str("\n\nACTION: JSON ONLY");
-                    }
-
+                // [NEW] Use a single session ID for the entire detail page to maintain structural context (table headers, etc.)
+                let detail_session_id = format!("{}_detail", task.id);
+        
+                        // Phase 1: Ingest all chunks (Prefill)
+                        let chunks_len = chunks.len();
+        
+                        // [NEW] Persistent message history for detail page
+                        let mut detail_messages = vec![
+                            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {      
+                                content: extraction_instruction.clone(),
+                                name: None,
+                            })
+                        ];
+        
+                        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                            let is_last = chunk_idx == chunks_len - 1;
+        
+                            // Prepare prompt: Only trigger extraction on the final chunk
+                            let mut prompt = chunk.clone();
+        
+                            if is_last {
+                                prompt.push_str("\n\nACTION: JSON ONLY");
+                            }
                     // [DEBUG-LOG] Save detail chunk for verification
                     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                     let log_path = format!("logs/pug/chunk_detail_{}_{}_{}.pug", task.id, chunk_idx, ts_nano);

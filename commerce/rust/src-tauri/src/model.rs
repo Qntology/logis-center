@@ -239,8 +239,8 @@ impl LogisModel {
             config = utils::DeviceConfig {
                 device: Device::Cpu,
                 is_cpu: true,
-                classify_chunk_size: 1000,
-                extract_chunk_size: 1000,
+                classify_chunk_size: 4000,
+                extract_chunk_size: 4000,
                 name: "CPU-Forced".to_string(),
             };
         }
