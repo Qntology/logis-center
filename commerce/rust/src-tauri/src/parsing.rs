@@ -253,10 +253,8 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
 }
 
 // CLI: DO NOT MODIFY START
-pub fn page_type_prompt() -> String {
-    let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation. 
-{"type": 'order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | ''}"###;
-}
+pub fn page_type_prompt() { r###"Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+{"type": 'order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | ''}"###; }
 // CLI: DO NOT MODIFY END
 
 // CLI: DO NOT MODIFY START

@@ -407,7 +407,7 @@ async fn process_task(
 
     let mut messages = vec![
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: parsing::page_type_prompt(),
+            content: parsing::page_type_prompt,
             name: None,
         })
     ];
