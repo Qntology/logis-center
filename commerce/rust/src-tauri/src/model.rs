@@ -449,12 +449,21 @@ impl LogisModel {
         params: ChatCompletionParameters,
         app_handle: &tauri::AppHandle,
         event_name: &str,
-        base_payload: Value,
+        mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator().await?;
+
+        // [FIX] Inject task_id from session_id if it's a task reference
+        if let Some(ref sid) = session_id {
+            if sid.starts_with("task_") || sid.starts_with("img_") {
+                if let Some(obj) = base_payload.as_object_mut() {
+                    obj.insert("task_id".to_string(), json!(sid));
+                }
+            }
+        }
 
         // Emit initial status once (Frontend will handle continuous spinner animation via .active-spinner class)
         let _ = app_handle.emit(event_name, base_payload);
