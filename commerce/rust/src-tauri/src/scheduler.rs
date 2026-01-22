@@ -544,8 +544,11 @@ async fn process_task(
                 name: None,
             }));
             
-            // [FIX] Append INGEST action flag for model execution, but keep it out of history
-            let effective_prompt = format!("{}\n\nACTION: INGEST", prompt);
+            // [FIX] Append action flag based on chunk position
+            // - INGEST: Accumulate in VRAM (Chunks 1..N-1)
+            // - SAVE: Write to Disk (Chunk N)
+            let action_flag = if is_last { "ACTION: SAVE" } else { "ACTION: INGEST" };
+            let effective_prompt = format!("{}\n\n{}", prompt, action_flag);
 
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "task_id": task.id,

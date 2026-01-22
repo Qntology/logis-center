@@ -413,19 +413,25 @@ impl Qwen3VLGenerateModel {
         if let Some(path) = &cache_path {
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
-                     // [FIX] Explicit Ingestion Control
-                     // Only save/update cache if explicitly instructed via "ACTION: INGEST".
-                     // This allows multi-turn ingestion (Part 1, Part 2...) to build up the cache,
-                     // while preventing unwanted updates during inference (Selectors, Extraction).
+                     // [OPTIMIZATION] Tri-State Cache Management
+                     // 1. INGEST: Keep in VRAM (Accumulate), No Disk Write.
+                     // 2. SAVE: Write to Disk (Finalize), Clear VRAM.
+                     // 3. Default (Inference): Read-Only, Clear VRAM.
                      
-                     let is_ingestion = input.replace_text.contains("ACTION: INGEST");
+                     let is_ingest = input.replace_text.contains("ACTION: INGEST");
+                     let is_save = input.replace_text.contains("ACTION: SAVE");
+                     
                      let token_path = path.join("tokens.json");
                      
-                     if is_ingestion {
-                         // [WRITE MODE] Ingestion phase - Update/Append cache
-                         println!("[KV-DISK] Ingestion mode detected. Updating cache...");
+                     if is_ingest {
+                         // [ACCUMULATE MODE] Keep in VRAM for next turn
+                         println!("[KV-VRAM] Accumulating context in VRAM (No Disk Write)...");
+                         // Do nothing (No offload, No clear)
+                     } else if is_save {
+                         // [SAVE MODE] Finalize and Offload to Disk
+                         println!("[KV-DISK] Finalizing ingestion. Saving to disk...");
                          
-                         // Ingestion uses large block size for speed
+                         // Use large block size for ingestion result
                          let target_block_size = 4096; 
                          
                          let mut all_tokens = full_input_ids_vec;
@@ -440,7 +446,7 @@ impl Qwen3VLGenerateModel {
                              }
                          }
                      } else {
-                         // [READ-ONLY MODE] Inference phase - Skip save
+                         // [READ-ONLY MODE] Inference
                          if token_path.exists() {
                              println!("[KV-DISK] Read-only mode. Skipping cache update.");
                          }
