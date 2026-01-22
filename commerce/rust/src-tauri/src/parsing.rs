@@ -187,7 +187,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                         let tag = el.name();
                         let classes = el.classes().collect::<Vec<_>>().join(".");
                         
-                        let is_repetitive = (tag == last_tag && classes == last_classes);
+                        let is_repetitive = tag == last_tag && classes == last_classes ;
                         
                         if is_repetitive {
                             repeat_count += 1;

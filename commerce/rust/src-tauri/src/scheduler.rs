@@ -367,7 +367,7 @@ async fn process_task(
     let light_pug = {
         let clean_content = data_manager.load(&clean_html_path)?;
         let document = scraper::Html::parse_document(&clean_content);
-        parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly)
+        parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly(false))
         // clean_content dropped here
     }; 
     
