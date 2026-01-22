@@ -413,23 +413,19 @@ impl Qwen3VLGenerateModel {
         if let Some(path) = &cache_path {
              match &mut self.qwen3_vl {
                  ModelVariant::Quantized(m) => {
-                     // [FIX-CRITICAL] Strict Read-Only Mode if Cache Exists
-                     // If tokens.json exists, we ASSUME the base context (Classification/Ingestion) is already saved.
-                     // We NEVER overwrite or append to it during subsequent turns (Selectors, Extraction).
-                     // This ensures safetensors are created ONLY ONCE at the start.
+                     // [FIX] Explicit Ingestion Control
+                     // Only save/update cache if explicitly instructed via "ACTION: INGEST".
+                     // This allows multi-turn ingestion (Part 1, Part 2...) to build up the cache,
+                     // while preventing unwanted updates during inference (Selectors, Extraction).
                      
+                     let is_ingestion = input.replace_text.contains("ACTION: INGEST");
                      let token_path = path.join("tokens.json");
                      
-                     if token_path.exists() {
-                         println!("[KV-DISK] Cache exists. Skipping save to enforce Read-Only mode.");
-                         // Do nothing (Skip offload_kv_cache)
-                         // Just clear memory cache for next run
-                         m.clear_kv_cache();
-                     } else {
-                         // First time only (Classification/Ingestion phase)
-                         println!("[KV-DISK] No cache found. Saving base context (Size: 4096)...");
+                     if is_ingestion {
+                         // [WRITE MODE] Ingestion phase - Update/Append cache
+                         println!("[KV-DISK] Ingestion mode detected. Updating cache...");
                          
-                         // Ingestion mode: Use large block size (4096) for speed
+                         // Ingestion uses large block size for speed
                          let target_block_size = 4096; 
                          
                          let mut all_tokens = full_input_ids_vec;
@@ -443,6 +439,12 @@ impl Qwen3VLGenerateModel {
                                  let _ = serde_json::to_writer(file, &all_tokens);
                              }
                          }
+                     } else {
+                         // [READ-ONLY MODE] Inference phase - Skip save
+                         if token_path.exists() {
+                             println!("[KV-DISK] Read-only mode. Skipping cache update.");
+                         }
+                         m.clear_kv_cache();
                      }
                  },
                  ModelVariant::Standard(m) => m.clear_kv_cache(),

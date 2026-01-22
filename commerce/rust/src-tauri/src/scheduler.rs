@@ -539,20 +539,34 @@ async fn process_task(
             // [OPTIMIZATION] Don't add Assistant's "READY" to history, only User data
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt.clone() })
                 ]),
                 name: None,
             }));
             
+            // [FIX] Append INGEST action flag for model execution, but keep it out of history
+            let effective_prompt = format!("{}\n\nACTION: INGEST", prompt);
+
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "task_id": task.id,
                 "category": "Classification Ingestion", 
                 "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
                 "spinner": "⠋" // 스피너 명시
             }));
+            
+            // Create a temporary messages vector for this turn only, including the flag
+            let mut current_turn_messages = messages.clone();
+            // Pop the last clean message and replace with flagged one
+            current_turn_messages.pop();
+            current_turn_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
+                ]),
+                name: None,
+            }));
 
             let params = ChatCompletionParameters {
-                messages: messages.clone(), 
+                messages: current_turn_messages, // Use the flagged messages
                 model: "qwen3vl".to_string(),
                 max_tokens: Some(if is_last { 1024 } else { 128 }), // [INCREASED] Safe generation for confirmation
                 temperature: Some(0.1), 
