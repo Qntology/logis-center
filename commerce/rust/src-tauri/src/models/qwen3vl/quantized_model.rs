@@ -405,9 +405,15 @@ impl QuantizedQwen3VLTextAttention {
 
                 
 
-                let total_elements: usize = shape.iter().product();
+                                let _total_elements: usize = shape.iter().product();
 
-                // [PARALLEL] Unpack and scale in parallel
+                
+
+                                            
+
+                
+
+                                // [PARALLEL] Unpack and scale in parallel
                 let decoded: Vec<f32> = packed.par_chunks(block_size)
                     .enumerate()
                     .flat_map(|(s_idx, chunk)| {

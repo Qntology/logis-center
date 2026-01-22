@@ -739,237 +739,101 @@ async fn process_task(
     if !is_detail {
         let _ = app_handle.emit("extraction-progress", json!({ 
             "task_id": task.id,
-            "category": "List Processing", "summary": "Splitting list items...", "spinner": "⠋"
+            "category": "List Processing", "summary": "Direct DOM extraction starting...", "spinner": "⠋"
         }));
 
-        let mut current_selector = target_selector.clone();
-        
-        // [MEMORY] Load clean HTML from disk only when needed
-        let mut item_pugs = {
+        let mut all_extracted_items = Vec::new();
+
+        // [FIX] Scoped block to ensure 'document' (!Send) is dropped before .await points
+        {
             let clean_content = data_manager.load(&clean_html_path)?;
             let document = scraper::Html::parse_document(&clean_content);
-            parsing::split_doc_to_pug_list(&document, &current_selector, PugMode::FullContent)
-        }; 
+            let field_selectors = selector_info.get("selectors").and_then(|v| v.as_object());
 
-        // FALLBACK LOGIC: If primary selector fails, try the alternative
-        if item_pugs.is_empty() && current_selector != "body" {
-            let fallback = if current_selector == item_selector && !node_selector.is_empty() { node_selector.to_string() } else { "body".to_string() };
-            if fallback != current_selector {
-                println!("[Scheduler] Selector '{}' failed, trying fallback '{}'", current_selector, fallback);
-                current_selector = fallback;
-                // [MEMORY] Reload clean HTML again for fallback
-                item_pugs = {
-                    let clean_content = data_manager.load(&clean_html_path)?;
-                    let document = scraper::Html::parse_document(&clean_content);
-                    parsing::split_doc_to_pug_list(&document, &current_selector, PugMode::FullContent)
-                };
-            }
-        }
-        
-        let total_items = item_pugs.len();
-        println!("[Scheduler] List Processing: Found {} items using selector '{}'", total_items, current_selector);
-        
-        // [DEBUG-LOG] Save each item pug with unique timestamp
-        for (idx, pug) in item_pugs.iter().enumerate() {
-            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let log_path = format!("logs/pug/item_{}_{}_{}_{}.pug", task.id, idx, total_items, ts_nano);
-            let _ = std::fs::write(&log_path, pug);
-        }
-        println!("[DEBUG] Saved {} item pugs to logs/pug/", total_items);
-        
-        if total_items == 0 {
-            println!("[Scheduler] Stopping: No items found even with fallback.");
-            return Ok(());
-        }
+            if let Some(subs) = field_selectors {
+                // [SELECTOR-MATCHING] document.querySelector('{node} {item}') 매커니즘 구현
+                let combined_selector_str = item_selector.split(',')
+                    .map(|s| format!("{} {}", node_selector.trim(), s.trim()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                
+                let item_sel = scraper::Selector::parse(&combined_selector_str).map_err(|e| anyhow::anyhow!("Invalid item selector: {:?}", e))?;
+                
+                for item_node in document.select(&item_sel) {
+                    let mut item_json = json!({});
+                    let mut has_data = false;
 
-
-        let extraction_instruction = parsing::list2json(page_type, language);
-        
-        // [DEBUG-LOG] Save list extraction instruction
-        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(format!("logs/pug/instruction_list_{}_{}.pug", task.id, ts_nano), &extraction_instruction);
-
-        // [HIERARCHY] 웹페이지의 기본 틀을 먼저 캐싱하기 위한 Base Session
-        let base_session_id = format!("{}_base", task.id);
-
-        // [INDEX-LOAD] 최초 분류 단계에서 저장했던 전체 구조 Pug를 불러옵니다.
-        let base_kv_path = std::path::Path::new("tmp_kv").join(&task.id);
-        let base_pug_path = base_kv_path.join("base_structure.pug");
-        let base_pug_content = std::fs::read_to_string(&base_pug_path).unwrap_or_else(|_| light_pug.clone());
-
-        let mut all_extracted_items = Vec::new();
-        let mut search_cursor = 0;
-
-        // [BATCH OPTIMIZATION] 단일 태스크 폴더 내에서 KV 캐시를 공유하며 아이템 처리
-        for (chunk_idx, chunk) in item_pugs.chunks(1).enumerate() {
-            let current_start = all_extracted_items.len() + 1;
-            let item_session_id = task.id.clone(); 
-
-            let item_pug = if let Some(first) = chunk.get(0) { first.clone() } else { String::new() };
-            
-            let mut is_matched = false;
-            let mut address_prefix = String::new();
-
-            if !item_pug.is_empty() {
-                if let Some(relative_pos) = base_pug_content[search_cursor..].find(&item_pug) {
-                    let absolute_pos = search_cursor + relative_pos;
-                    address_prefix = base_pug_content[..absolute_pos].to_string();
-                    search_cursor = absolute_pos + item_pug.len();
-                    is_matched = true;
-                }
-            }
-
-            let _ = app_handle.emit("extraction-progress", json!({
-                "task_id": task.id,
-                "category": "Extraction",
-                "summary": format!("Processing item {}/{} (Matched: {})...", current_start, total_items, is_matched),
-                "spinner": "⠋"
-            }));
-
-            let mut prompt = String::new(); 
-            for (idx, pug) in chunk.iter().enumerate() {
-                prompt.push_str(&format!("\n### ITEM ###\n{}\n", pug));
-            }
-
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-            let mut model_guard = model_mutex.lock().await;
-            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-            
-            let response = if let Some(model) = model_guard.as_ref() {
-                let app_handle_clone = app_handle.clone();
-                let mut item_messages = if is_matched {
-                    vec![
-                        crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: parsing::page_type_prompt(), 
-                            name: None,
-                        }),
-                        crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(address_prefix.clone()),
-                            name: None,
-                        }),
-                        crate::openai_types::ChatCompletionRequestMessage::Assistant(crate::openai_types::ChatCompletionRequestAssistantMessage {
-                            content: Some("READY".to_string()),
-                            ..Default::default()
-                        })
-                    ]
-                } else {
-                    vec![
-                        crate::openai_types::ChatCompletionRequestMessage::System(crate::openai_types::ChatCompletionRequestSystemMessage {
-                            content: extraction_instruction.clone(),
-                            name: None,
-                        })
-                    ]
-                };
-                let extraction_prompt = if is_matched {
-                    format!("{}\n\n[TARGET]\n{}\n\nACTION: EXTRACT JSON", extraction_instruction, item_pug)
-                } else {
-                    format!("[DATA]\n{}\n\nACTION: EXTRACT JSON", item_pug)
-                };
-
-                item_messages.push(crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(extraction_prompt),
-                    name: None,
-                }));
-
-                let res = tokio::select!{
-                    res = model.chat_params_with_spinner(
-                        crate::openai_types::ChatCompletionParameters {
-                            messages: item_messages,
-                            model: "qwen3vl".to_string(),
-                            max_tokens: Some(1024),
-                            temperature: Some(0.1),
-                            ..Default::default()
-                        },
-                        &app_handle_clone,
-                        "extraction-progress",
-                        json!({ "category": "Extraction", "task_id": task.id }),
-                        Some(cancellation_token.clone()),
-                        Some(item_session_id.clone()) 
-                    ) => res?,
-                    _ = async {
-                        loop {
-                            if cancellation_token.load(Ordering::Relaxed) { break; }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    for (field_name, sel_str) in subs {
+                        if let Ok(sub_sel) = scraper::Selector::parse(sel_str.as_str().unwrap_or("")) {
+                            // 1. 현재 노드(item) 내부에서 검색
+                            if let Some(found_el) = item_node.select(&sub_sel).next() {
+                                let text = found_el.text().collect::<Vec<_>>().join("").trim().to_string();
+                                if !text.is_empty() {
+                                    item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text));
+                                    has_data = true;
+                                }
+                            }
+                            
+                            // 2. [MULTI-ROW FIX] 만약 데이터를 못 찾았고, 다음 형제 노드가 '.rows'라면 거기서도 검색
+                            if item_json.get(field_name).is_none() {
+                                 if let Some(next_sibling) = item_node.next_sibling() {
+                                     if let Some(sibling_el) = scraper::ElementRef::wrap(next_sibling) {
+                                         if sibling_el.value().name() == "tr" && sibling_el.select(&sub_sel).next().is_some() {
+                                             if let Some(found_el) = sibling_el.select(&sub_sel).next() {
+                                                 let text = found_el.text().collect::<Vec<_>>().join("").trim().to_string();
+                                                 item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text));
+                                                 has_data = true;
+                                             }
+                                         }
+                                     }
+                                 }
+                            }
                         }
-                    } => {
-                        drop(model_guard);
-                        return Err(anyhow::anyhow!("Task cancelled"));
                     }
-                };
-                res
-            } else { "[]".to_string() };
 
-            // [VRAM-OPTIMIZATION] 매 아이템 추출 후 모델을 해제하여 메모리 확보 (OOM 방지)
-            *model_guard = None; 
-            drop(model_guard);
-
-            let batch_results = parsing::parse_json_from_llm(&response);
-            
-            // [FIXED] 아이템이 배열로 오든 객체로 오든 정확히 누적합니다.
-            if let Some(arr) = batch_results.as_array() {
-                for mut item_json in arr.iter().cloned() {
-                    if !item_json.is_null() && item_json.is_object() {
-                        // [STRICT PARITY] Mirror server hashing and metadata
-                        let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-                        let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
-                        let team_id = if task.to_dest.is_empty() { 
-                            crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-                        } else { task.to_dest.clone() };
-
-                        let link = item_json.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let item_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
-                        item_json.as_object_mut().unwrap().insert("id".to_string(), json!(item_id));
-                        
-                        let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
-                        let ref_val = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
-
-                        if !item_id.is_empty() {
-                            let nl = parsing::json_to_natural_language(&item_json);
-                            let item_digest = crate::utils::hash::digest(&nl);
-
-                            let mut model_guard = model_mutex.lock().await;
-                            if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
-                            let vector = if let Some(model) = model_guard.as_ref() {
-                                Some(model.get_embedding(nl).await.unwrap_or_default())
-                            } else { None };
-                            *model_guard = None;
-                            drop(model_guard);
-
-                            let store_guard = store_mutex.lock().await;
-                            if let Some(db) = store_guard.as_ref() {
-                                let _ = db.upsert_item(
-                                    "items", 
-                                    &item_id, 
-                                    &page_type, 
-                                    item_json.clone(), 
-                                    vector,
-                                    Some(from_addr),
-                                    Some(&team_id),
-                                    Some(&task.cc),
-                                    Some(&bcc),
-                                    Some(&ref_val),
-                                    Some(&item_digest)
-                                ).await;
+                    if has_data {
+                        if item_json.get("id").is_none() {
+                            if let Some(link_el) = item_node.select(&scraper::Selector::parse("a[href]").unwrap()).next() {
+                                let href = link_el.value().attr("href").unwrap_or("");
+                                item_json.as_object_mut().unwrap().insert("link".to_string(), json!(href));
                             }
                         }
                         all_extracted_items.push(item_json);
                     }
                 }
-            } else if batch_results.is_object() && !batch_results.is_null() {
-                all_extracted_items.push(batch_results.clone());
             }
+        } // 'document' is dropped here
 
-            let current_count = all_extracted_items.len();
-            let display_text = parsing::json_to_natural_language(&batch_results);
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "task_id": task.id,
-                "category": "Item Extraction", 
-                "summary": format!("Extracted {}/{} items...", current_count, total_items),
-                "data": batch_results,
-                "display_text": display_text,
-                "spinner": "⠋" // 추출 중에는 계속 스피너를 보여줍니다.
-            }));
+        let total_items = all_extracted_items.len();
+        println!("[Scheduler] Direct Extraction: Found {} items.", total_items);
+
+        // 이후 DB 저장 로직으로 연결 (기존 로직 활용)
+        for mut item_json in all_extracted_items.clone() {
+            // [STRICT PARITY] 1개씩 처리하며 DB에 넣기
+            let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
+            let team_id = if task.to_dest.is_empty() { 
+                crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
+            } else { task.to_dest.clone() };
+
+            let link = item_json.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let item_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
+            item_json.as_object_mut().unwrap().insert("id".to_string(), json!(item_id));
+            item_json.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
+            
+            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
+            let ref_val = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
+
+            let nl = parsing::json_to_natural_language(&item_json);
+            let item_digest = crate::utils::hash::digest(&nl);
+
+            let store_guard = store_mutex.lock().await;
+            if let Some(db) = store_guard.as_ref() {
+                let _ = db.upsert_item(
+                    "items", &item_id, &page_type, item_json.clone(), None,
+                    Some(from_addr), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)
+                ).await;
+            }
         }
         
         extracted_data = json!({
