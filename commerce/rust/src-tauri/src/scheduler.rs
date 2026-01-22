@@ -207,6 +207,14 @@ pub async fn start_background_worker(
                     },
                     Err(e) => {
                         let err_msg = e.to_string();
+                        
+                        // [CRITICAL-CLEANUP] 태스크 실패 시에도 메모리 강제 해제
+                        {
+                            let mut model_guard = model.lock().await;
+                            *model_guard = None;
+                            println!("[Scheduler] Error detected. Emergency memory release performed.");
+                        }
+
                         if err_msg.contains("Task cancelled") {
                              println!("[Scheduler] Task cancelled: {}", task.id);
                              let store_guard = store.lock().await;

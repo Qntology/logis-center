@@ -278,7 +278,8 @@ impl EmbeddingModel {
             );
             
             let self_attn = QAttention::new(&config, &ct, &mut file, &format!("{}{}", prefix, attn), &device, rotary.clone())?;
-            let mlp = QMlp::new(&config, &ct, &mut file, &format!("{}{}", prefix, mlp), &device)?;
+            let mlp_prefix = if is_gguf { format!("{}.{}", prefix, mlp) } else { format!("{}{}", prefix, mlp) };
+            let mlp = QMlp::new(&config, &ct, &mut file, &mlp_prefix, &device)?;
             
             layers.push(QDecoderLayer { self_attn, mlp, input_layernorm, post_attention_layernorm });
         }

@@ -253,20 +253,43 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
 }
 
 // CLI: DO NOT MODIFY START
-pub fn page_type_prompt() -> String { r###"Analyze the provided Pug template and return it in the following JSON format, no explanation. 
-{"type": 'order' | 'goods' | 'tracking' | 'review' | 'coupon' | 'event' | ''}"###.to_string() }
+pub fn page_type_prompt() -> String { r###"[TASK]
+Analyze the provided Pug template snippet and identify the primary category of this webpage.
+
+[SCHEMA DEFINITIONS]
+- type: The main category of the page content. Must be one of:
+  - 'order': Order history, order details, checkout success.
+  - 'goods': Product list, product detail, shopping cart.
+  - 'tracking': Shipment tracking status, delivery history.
+  - 'review': Product reviews, feedback list.
+  - 'coupon': Coupon list, discount events.
+  - 'event': Promotion pages, event announcements.
+  - '': If none of the above match or the page is irrelevant (e.g., login, setting).
+
+[OUTPUT FORMAT]
+Return valid JSON only. No explanation.
+{
+    "type": ""
+}"###.to_string() }
 // CLI: DO NOT MODIFY END
 
 // CLI: DO NOT MODIFY START
 pub fn page_selectors_prompt(page_type: &str) -> String {
-    let template = r###"Analyze the provided Pug template and return it in the following JSON format, no explanation. 
+    let template = r###"[TASK]
+The page has been classified as '{TYPE}'.
+Analyze the provided Pug template snippet and identify the structural CSS1 selectors required for data extraction.
+
+[SCHEMA DEFINITIONS]
+- item: CSS1 selector for individual items in a list. Exclude header rows, ads, or pagination.
+- node: CSS1 selector for the parent container that holds the list of items.
+- detail: Boolean. Set to `true` if this is a single item detail page. Set to `false` if it is a list page.
+
+[OUTPUT FORMAT]
+Return valid JSON only. No explanation.
 {
-    "type":'{TYPE}',
-    "item":type based item CSS1 selector excluding ads,
-    "more":item URL includes a manage path, an administrative or edit route Link CSS1 selector,
-    "node":item parent list CSS1 selector excluding ads,
-    "next":list next button CSS1 selector,
-    "detail":is a detail page or a detail form | boolean,
+    "item": "",
+    "node": "",
+    "detail": boolean
 }"###;
     template.replace("{TYPE}", page_type)
 }
