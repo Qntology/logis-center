@@ -54,7 +54,7 @@ pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
 
     let mut pug_output = String::new();
 
-    pug_output.reserve(1024 * 10);
+    pug_output.reserve(1024 * 50);
 
     
 
@@ -168,21 +168,35 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
 
 
-            // --- base64 또는 너무 긴 src를 가진 img 태그 제외 ---
+                        // --- base64 또는 너무 긴 src를 가진 img 태그 제외 ---
 
-            if tag_name == "img" {
 
-                if let Some(src) = element.attr("src") {
 
-                    if src.contains("base64") || src.len() > 1000 {
+                        if tag_name == "img" {
 
-                        return;
 
-                    }
 
-                }
+                            if let Some(src) = element.attr("src") {
 
-            }
+
+
+                                if src.contains("base64") || src.len() > 3000 {
+
+
+
+                                    return;
+
+
+
+                                }
+
+
+
+                            }
+
+
+
+                        }
 
 
 
@@ -246,15 +260,15 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
                         other_attributes.push(name.to_string());
 
-                    } else if !value.is_empty() {
+                                        } else if !value.is_empty() {
 
-                        let safe_value = value.replace("\"", "'");
+                                            let safe_value = value.replace("\"", "'");
 
-                        let trunc_value = if safe_value.len() > 300 { format!("{}...", &safe_value[..300]) } else { safe_value };
+                                            let trunc_value = if safe_value.len() > 1000 { format!("{}...", &safe_value[..1000]) } else { safe_value };
 
-                        other_attributes.push(format!("{}=\"{}\"", name, trunc_value));
+                                            other_attributes.push(format!("{}=\"{}\"", name, trunc_value));
 
-                    }
+                                        }
 
                 }
 
@@ -312,17 +326,17 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
         }
 
-        Node::Text(text) => {
+                Node::Text(text) => {
 
-            if *mode == PugMode::FullContent {
+                    if *mode == PugMode::FullContent {
 
-                let text_content = text.trim();
+                        let text_content = text.trim();
 
-                if !text_content.is_empty() {
+                        if !text_content.is_empty() {
 
-                    let text_trunc = if text_content.len() > 2000 { &text_content[..2000] } else { text_content };
+                            let text_trunc = if text_content.len() > 10000 { &text_content[..10000] } else { text_content };
 
-                    for line in text_trunc.lines() {
+                            for line in text_trunc.lines() {
 
                         let trimmed_line = line.trim();
 

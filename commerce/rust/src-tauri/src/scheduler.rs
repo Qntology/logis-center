@@ -460,14 +460,12 @@ async fn process_task(
     }
     
         // Determine optimal chunk sizes based on hardware
-        // [ADAPTIVE] Increased to 800 chars to speed up ingestion.
-        let mut device_config = utils::get_optimal_device_config();
-        device_config.classify_chunk_size = 800; 
-        device_config.extract_chunk_size = 800;
+        // [ADAPTIVE] Increased to 12000 chars to speed up ingestion and improve context coherence.
+        let device_config = utils::get_optimal_device_config();
     
                 // [REVISED] Restore turn-based chunked ingestion for classification.
                 // This is the original stable logic.
-                let classify_chunks = chunk_text(&light_pug, 800, 200); 
+                let classify_chunks = chunk_text(&light_pug, device_config.classify_chunk_size, 2000); 
                 let classify_chunks_len = classify_chunks.len(); 
                 println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_guard = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");
@@ -571,8 +569,8 @@ async fn process_task(
             let params = ChatCompletionParameters {
                 messages: current_turn_messages, // Use the flagged messages
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(if is_last { 2048 } else { 1024 }), // [INCREASED] Safe generation for confirmation
-                temperature: Some(0.1), 
+                max_tokens: Some(if is_last { 30000 } else { 1024 }), // [INCREASED] Safe generation for confirmation
+                temperature: Some(0.95), 
                 ..Default::default()
             };
 
@@ -674,7 +672,7 @@ async fn process_task(
         let params = ChatCompletionParameters {
             messages: messages.clone(),
             model: "qwen3vl".to_string(),
-            max_tokens: Some(2048),
+            max_tokens: Some(30000),
             temperature: Some(0.95),
             ..Default::default()
         };
@@ -938,6 +936,7 @@ async fn process_task(
             for (batch_idx, batch) in items_to_process.chunks(batch_size).enumerate() {
                 let start_item = batch_idx * batch_size + 1;
                 let end_item = std::cmp::min(start_item + batch.len() - 1, total_refine_count);
+                let is_last_batch = end_item == total_refine_count;
 
                 // Construct prompt with indexed items
                 let batch_text: String = batch.iter().enumerate().map(|(i, item)| {
@@ -945,7 +944,8 @@ async fn process_task(
                 }).collect::<Vec<_>>().join("\n\n");
 
                 let instruction = parsing::list2json(&page_type, &language);
-                let prompt = format!("{}\n\n[RAW ITEMS]\n{}", instruction, batch_text);
+                let action_flag = if is_last_batch { "ACTION: SAVE" } else { "ACTION: INGEST" };
+                let prompt = format!("{}\n\n[RAW ITEMS]\n{}\n\n{}", instruction, batch_text, action_flag);
                 
                 // [FIX] Reuse existing history (chunks) to ensure safetensors cache hit
                 if let Some(model) = model_guard.as_ref() {
@@ -960,8 +960,8 @@ async fn process_task(
                      let params = ChatCompletionParameters {
                         messages: refine_messages,
                         model: "qwen3vl".to_string(),
-                        max_tokens: Some(2048),
-                        temperature: Some(0.1),
+                        max_tokens: Some(30000),
+                        temperature: Some(0.95),
                         ..Default::default()
                     };
                     
@@ -1088,8 +1088,9 @@ async fn process_task(
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
 
-        // CHUNKING: Split huge content into chunks (800 chars to be safe for details)
-        let chunks = chunk_text(&content_pug, 800, 200);
+        // CHUNKING: Split huge content into chunks (12000 chars to be safe for details)
+        let device_config = utils::get_optimal_device_config();
+        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 2000);
         let chunks_len = chunks.len();
         
         let extraction_instruction = parsing::item2json(page_type, &url, language);
@@ -1121,10 +1122,10 @@ async fn process_task(
             
             let effective_prompt = format!("{}{}", prompt, action_flag);
 
-            // Add to history (without flag for purity, though separate session matters less)
+            // Add to history WITHOUT flag to avoid polluting prefix cache logic
             detail_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt.clone() })
                 ]),
                 name: None,
             }));
@@ -1140,11 +1141,22 @@ async fn process_task(
             
             let response = if let Some(model) = model_guard.as_ref() {
                 let app_handle_clone = app_handle.clone();
+                
+                // Create temporary messages with the flag for this turn only
+                let mut current_messages = detail_messages.clone();
+                current_messages.pop();
+                current_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
+                    ]),
+                    name: None,
+                }));
+
                 let params = ChatCompletionParameters {
-                    messages: detail_messages.clone(),
+                    messages: current_messages,
                     model: "qwen3vl".to_string(),
-                    max_tokens: Some(if is_last { 2048 } else { 1024 }),
-                    temperature: Some(0.1),
+                    max_tokens: Some(if is_last { 30000 } else { 1024 }),
+                    temperature: Some(0.95),
                     ..Default::default()
                 };
 

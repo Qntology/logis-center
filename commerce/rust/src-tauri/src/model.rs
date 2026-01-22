@@ -243,8 +243,8 @@ impl LogisModel {
             config = utils::DeviceConfig {
                 device: Device::Cpu,
                 is_cpu: true,
-                classify_chunk_size: 4000,
-                extract_chunk_size: 4000,
+                classify_chunk_size: 12000,
+                extract_chunk_size: 12000,
                 name: "CPU-Forced".to_string(),
             };
         }
@@ -254,7 +254,7 @@ impl LogisModel {
         let model_path = gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
-        let max_tokens_limit = 2048; // [OPTIMIZED] Perfectly matched with embedding limit and 1000-char chunks
+        let max_tokens_limit = 32768; // [OPTIMIZED] Increased to prevent truncation and leverage model's large context window
 
         // DO NOT LOAD MODELS HERE. Just return the config.
         Ok(Self {

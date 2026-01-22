@@ -74,8 +74,8 @@ impl Qwen3VLGenerateModel {
                 let mut main_file = std::fs::File::open(&main)?;
                 let main_content = gguf_file::Content::read(&mut main_file)?;
                 
-                let max_tokens = hard_token_limit.unwrap_or(2048) as u64;
-                let kv_reserve = max_tokens * 100_000;
+                let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+                let kv_reserve = max_tokens * 10000;
                 
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::Quantized(model)
@@ -85,8 +85,8 @@ impl Qwen3VLGenerateModel {
                  let mut file2 = std::fs::File::open(&main)?; 
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
-                 let max_tokens = hard_token_limit.unwrap_or(2048) as u64;
-                 let kv_reserve = max_tokens * 100_000;
+                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+                 let kv_reserve = max_tokens * 10000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
@@ -153,28 +153,28 @@ impl Qwen3VLGenerateModel {
 
         // HARD SAFETY CHECK: Truncate Input if it exceeds limit (Smart Tail-Heavy Drop)
         // [ADAPTIVE] For ingestion/classification, we must not drop document structure.
-        if let Some(limit) = self.hard_token_limit {
-            let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
-            let effective_limit = if is_critical { 2048 } else { limit.max(2048) };
-            let max_input = if effective_limit > 128 { effective_limit - 128 } else { effective_limit };
+        // if let Some(limit) = self.hard_token_limit {
+        //     let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
+        //     let effective_limit = if is_critical { 30000 } else { limit.max(30000) };
+        //     let max_input = if effective_limit > 128 { effective_limit - 128 } else { effective_limit };
             
-            if seq_len > max_input {
-                println!("⚠️ [WARN] Input too long ({} > {}). Using System-Aware Truncation (Critical={}).", seq_len, max_input, is_critical);
+        //     if seq_len > max_input {
+        //         println!("⚠️ [WARN] Input too long ({} > {}). Using System-Aware Truncation (Critical={}).", seq_len, max_input, is_critical);
                 
-                // Keep System Prompt (approx first 200 tokens) and the Tail (Most important)
-                let head_reserve = 200.min(max_input / 4);
-                let tail_reserve = max_input - head_reserve;
+        //         // Keep System Prompt (approx first 200 tokens) and the Tail (Most important)
+        //         let head_reserve = 200.min(max_input / 4);
+        //         let tail_reserve = max_input - head_reserve;
                 
-                let head_ids = input_ids.narrow(1, 0, head_reserve)?;
-                let tail_ids = input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?;
+        //         let head_ids = input_ids.narrow(1, 0, head_reserve)?;
+        //         let tail_ids = input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?;
                 
-                input_ids = Tensor::cat(&[head_ids, tail_ids], 1)?;
-                seq_len = max_input;
+        //         input_ids = Tensor::cat(&[head_ids, tail_ids], 1)?;
+        //         seq_len = max_input;
                 
-                // Update full_input_ids_vec to match the new truncated content
-                full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?;
-            }
-        }
+        //         // Update full_input_ids_vec to match the new truncated content
+        //         full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?;
+        //     }
+        // }
 
         let mut seqlen_offset = 0;
 
