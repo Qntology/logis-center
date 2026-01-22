@@ -968,7 +968,7 @@ async fn process_task(
                 "summary": format!("Extracted {}/{} items...", current_count, total_items),
                 "data": batch_results,
                 "display_text": display_text,
-                "spinner": "⠋"
+                "spinner": "⠋" // 추출 중에는 계속 스피너를 보여줍니다.
             }));
         }
         

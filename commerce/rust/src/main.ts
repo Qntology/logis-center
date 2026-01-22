@@ -647,11 +647,13 @@ listen("extraction-progress", async (event: any) => {
              if (summary) summary.innerText = payload.summary || "";
              
              if((payload.display_text || payload.data) && resultsContainer) {
-                  resultsContainer.innerHTML = ""; 
+                  // [APPEND MODE] 기존 내용을 지우지 않고 새로운 결과를 아래에 추가합니다.
                   const pre = document.createElement("pre");
                   pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.7rem"; pre.style.color = "#aaa"; pre.style.background = "#252525"; pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px"; pre.style.borderLeft = "2px solid var(--primary)";
                   pre.innerText = payload.display_text || JSON.stringify(payload.data, null, 2);
                   resultsContainer.appendChild(pre);
+                  
+                  // 스크롤을 맨 아래로 내려서 새로운 결과를 바로 볼 수 있게 합니다.
                   detailContent.scrollTop = detailContent.scrollHeight;
              }
          }
