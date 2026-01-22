@@ -419,11 +419,7 @@ async fn process_task(
             let is_last = i == classify_chunks_len - 1;
             println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
-            let prompt = if is_last {
-                format!("### FINAL DATA PART ###\n{}\n\n### CRITICAL INSTRUCTION ###\nAll data has been provided. STOP processing as text. Output only the final JSON classification result based on the schema provided in the system message. Do not repeat the instruction. Do not add explanations.", chunk)
-            } else {
-                format!("### DATA PART {}/{} ###\n{}\n\n### INSTRUCTION ###\nRead and say READY.", i + 1, classify_chunks_len, chunk)
-            };
+            let prompt = format!("[Reading structure part {}/{}]\n{}", i + 1, classify_chunks_len, chunk);
 
             // [OPTIMIZATION] Don't add Assistant's "READY" to history, only User data
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
