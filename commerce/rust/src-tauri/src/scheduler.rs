@@ -436,10 +436,10 @@ async fn process_task(
             let is_last = i == classify_chunks_len - 1;
             println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
-            let mut prompt = format!("[Reading structure part {}/{}]", i + 1, classify_chunks_len);
+            let mut prompt = String::new(); // 👈 Removed header
 
             for line in chunk.lines() {
-                prompt.push_str(&format!("\n{} | {}", line_counter, line));
+                prompt.push_str(&format!("{} | {}\n", line_counter, line));
                 line_counter += 1;
             }
 
@@ -750,11 +750,11 @@ async fn process_task(
             }));
 
             // [OPTIMIZATION] Separate Schema (System) from Data (User)
-            // Initialize prompt with header and append snippets with line numbers
-            let mut prompt = format!("[Reading structure part {}~{}/{}]", current_start, current_end, total_items);
+            // Initialize prompt and append snippets with line numbers
+            let mut prompt = String::new(); // 👈 Removed header
             for pug in chunk {
                 for line in pug.lines() {
-                    prompt.push_str(&format!("\n{} | {}", line_counter, line));
+                    prompt.push_str(&format!("{} | {}\n", line_counter, line));
                     line_counter += 1;
                 }
             }
@@ -934,10 +934,10 @@ async fn process_task(
                     let is_last = chunk_idx == chunks_len - 1;
         
                     // Prepare prompt: Only trigger extraction on the final chunk
-                    let mut prompt = format!("[Reading structure part {}/{}]", chunk_idx + 1, chunks_len);
+                    let mut prompt = String::new(); // 👈 Removed header
 
                     for line in chunk.lines() {
-                        prompt.push_str(&format!("\n{} | {}", line_counter, line));
+                        prompt.push_str(&format!("{} | {}\n", line_counter, line));
                         line_counter += 1;
                     }
 
