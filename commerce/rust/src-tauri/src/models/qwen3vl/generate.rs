@@ -75,7 +75,7 @@ impl Qwen3VLGenerateModel {
                 let main_content = gguf_file::Content::read(&mut main_file)?;
                 
                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                let kv_reserve = max_tokens * 10000;
+                let kv_reserve = max_tokens * 100_000;
                 
                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::Quantized(model)
@@ -86,7 +86,7 @@ impl Qwen3VLGenerateModel {
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
                  let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                 let kv_reserve = max_tokens * 10000;
+                 let kv_reserve = max_tokens * 100_000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
