@@ -635,12 +635,20 @@ listen("extraction-progress", async (event: any) => {
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
              extractionLog.querySelectorAll(".progress-row").forEach(row => {
                  const s = row.querySelector(".active-spinner");
-                 if (s) row.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span>${row.querySelector(".summary-text")?.textContent || "Complete"}</span>`;
+                 if (s) {
+                     s.classList.remove("active-spinner"); // [FIX] Remove class so setInterval stops overwriting it
+                     row.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span>${row.querySelector(".summary-text")?.textContent || "Complete"}</span>`;
+                 }
              });
          } else if (payload.category === "Error") {
              isExtracting = false;
              const row = p.querySelector(".progress-row");
-             if (row) { row.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary || "Error"}</span>`; (row as HTMLElement).style.color = "#ef4444"; }
+             if (row) { 
+                 const s = row.querySelector(".active-spinner");
+                 if (s) s.classList.remove("active-spinner"); // [FIX]
+                 row.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary || "Error"}</span>`; 
+                 (row as HTMLElement).style.color = "#ef4444"; 
+             }
          } else {
              if (spinner) spinner.innerText = payload.spinner || "⠋";
              if (summary) summary.innerText = payload.summary || "";

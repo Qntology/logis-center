@@ -720,9 +720,12 @@ async fn process_task(
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // [SELECTOR-COMBINATION] 사용자 지침에 따라 node와 item 셀렉터를 결합하여 정밀 타격합니다.
+    // [SELECTOR-COMBINATION] 쉼표로 구분된 그룹 셀렉터 각각에 node_selector를 적용하여 정밀도를 높입니다.
     let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() {
-        format!("{} {}", node_selector, item_selector)
+        item_selector.split(',')
+            .map(|s| format!("{} {}", node_selector.trim(), s.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
     } else if !item_selector.is_empty() {
         item_selector.to_string()
     } else if !node_selector.is_empty() {
