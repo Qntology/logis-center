@@ -462,12 +462,12 @@ async fn process_task(
         // Determine optimal chunk sizes based on hardware
         // [ADAPTIVE] Increased to 4000 chars to speed up ingestion.
         let mut device_config = utils::get_optimal_device_config();
-        device_config.classify_chunk_size = 1000; 
-        device_config.extract_chunk_size = 1000;
+        device_config.classify_chunk_size = 2000; 
+        device_config.extract_chunk_size = 2000;
     
                 // [REVISED] Restore turn-based chunked ingestion for classification.
                 // This is the original stable logic.
-                let classify_chunks = chunk_text(&full_pug, 4000, 500); 
+                let classify_chunks = chunk_text(&full_pug, 2000, 500); 
                 let classify_chunks_len = classify_chunks.len(); 
                 println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_guard = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");
