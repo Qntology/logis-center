@@ -751,15 +751,30 @@ async fn process_task(
             let field_selectors = selector_info.get("selectors").and_then(|v| v.as_object());
 
             if let Some(subs) = field_selectors {
-                // [SELECTOR-MATCHING] document.querySelector('{node} {item}') 매커니즘 구현
-                let combined_selector_str = item_selector.split(',')
-                    .map(|s| format!("{} {}", node_selector.trim(), s.trim()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                // [SELECTOR-MATCHING] Nested selection for better stability
+                let mut potential_items = Vec::new();
                 
-                let item_sel = scraper::Selector::parse(&combined_selector_str).map_err(|e| anyhow::anyhow!("Invalid item selector: {:?}", e))?;
-                
-                for item_node in document.select(&item_sel) {
+                if !node_selector.is_empty() {
+                    if let Ok(node_sel) = scraper::Selector::parse(node_selector) {
+                        for node in document.select(&node_sel) {
+                            if let Ok(item_sel) = scraper::Selector::parse(item_selector) {
+                                for item in node.select(&item_sel) {
+                                    potential_items.push(item);
+                                }
+                            }
+                        }
+                    } else {
+                         println!("[Scheduler] Invalid node selector: {}", node_selector);
+                    }
+                } else {
+                     if let Ok(item_sel) = scraper::Selector::parse(item_selector) {
+                        for item in document.select(&item_sel) {
+                            potential_items.push(item);
+                        }
+                     }
+                }
+
+                for item_node in potential_items {
                     let mut item_json = json!({});
                     let mut has_data = false;
 
@@ -806,6 +821,13 @@ async fn process_task(
 
         let total_items = all_extracted_items.len();
         println!("[Scheduler] Direct Extraction: Found {} items.", total_items);
+
+        let _ = app_handle.emit("extraction-progress", json!({ 
+            "task_id": task.id,
+            "category": "List Processing", 
+            "summary": format!("Direct Extraction: Found {} items.", total_items), 
+            "spinner": "✅"
+        }));
 
         // 이후 DB 저장 로직으로 연결 (기존 로직 활용)
         for mut item_json in all_extracted_items.clone() {
@@ -1284,6 +1306,7 @@ async fn process_task(
             "task_id": task.id,
             "category": "Done",
             "summary": "Extraction complete.",
+            "spinner": "✅",
             "data": if !is_detail { json!(null) } else { extracted_data }
         }));
     
