@@ -857,14 +857,7 @@ async fn process_task(
         
                     // Prepare prompt: Only trigger extraction on the final chunk
 
-                    let prompt = if is_last {
-                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nEnd of content. Based on all parts read so far, extract and return the structured JSON now.\nAnalyze the provided Pug template and return it in the following JSON format, no explanation.\n# selector : sibling value based CSS1 selector ", chunk)
-
-                    } else {
-
-                        format!("[INPUT CONTENT]\n{}\n\n[INSTRUCTION]\nRead and say READY.", chunk)
-
-                    };
+                    let prompt = format!("[Reading structure part {}/{}]\n{}", chunk_idx + 1, chunks_len, chunk)
 
         
                     let max_tokens = if is_last { 2048 } else { 32 }; 
