@@ -830,6 +830,113 @@ async fn process_task(
             "spinner": "✅"
         }));
 
+        // [REFINEMENT] If we have items but no specific field selectors (just raw text), use LLM to structure them.
+        // Re-get field_selectors from selector_info which is still in scope, or rely on the logic that populated all_extracted_items with "text" only.
+        let needs_refinement = selector_info.get("selectors").is_none() && !all_extracted_items.is_empty();
+
+        if needs_refinement {
+             let _ = app_handle.emit("extraction-progress", json!({ 
+                "task_id": task.id,
+                "category": "List Processing", 
+                "summary": "Refining extracted data with AI...", 
+                "spinner": "⠋"
+            }));
+
+            let batch_size = 5;
+            let mut refined_items = Vec::new();
+            
+            // Clone items to process
+            let items_to_process = all_extracted_items.clone();
+            
+            // Helper to merge JSON
+            fn merge_json(a: &mut serde_json::Value, b: serde_json::Value) {
+                if let (Some(a_obj), Some(b_obj)) = (a.as_object_mut(), b.as_object()) {
+                    for (k, v) in b_obj {
+                        if !a_obj.contains_key(k) || a_obj[k].is_null() {
+                            a_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+
+            for (batch_idx, batch) in items_to_process.chunks(batch_size).enumerate() {
+                // Construct prompt with indexed items
+                let batch_text: String = batch.iter().enumerate().map(|(i, item)| {
+                    format!("Item {}:\n{}", i + 1, item.get("text").and_then(|s| s.as_str()).unwrap_or(""))
+                }).collect::<Vec<_>>().join("\n\n");
+
+                let instruction = parsing::list2json(&page_type, &language);
+                let prompt = format!("{}\n\n[RAW ITEMS]\n{}", instruction, batch_text);
+                
+                // Call Model
+                let model_guard = model_mutex.lock().await;
+                if let Some(model) = model_guard.as_ref() {
+                     let params = ChatCompletionParameters {
+                        messages: vec![
+                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                                ]),
+                                name: None,
+                            })
+                        ],
+                        model: "qwen3vl".to_string(),
+                        max_tokens: Some(1024),
+                        temperature: Some(0.1),
+                        ..Default::default()
+                    };
+                    
+                    let app_handle_clone = app_handle.clone();
+                    let refine_res = model.chat_params_with_spinner(
+                        params,
+                        &app_handle_clone, 
+                        "extraction-progress", 
+                        json!({ 
+                            "task_id": task.id,
+                            "category": "List Processing", 
+                            "summary": format!("Refining batch {}...", batch_idx + 1)
+                        }),
+                        Some(cancellation_token.clone()),
+                        Some(task.id.clone())
+                    ).await;
+
+                    if let Ok(res) = refine_res {
+                         let parsed = parsing::parse_json_from_llm(&res);
+                         // Expecting { "items": [...] } or just an array
+                         let items_array = parsed.get("items").and_then(|v| v.as_array())
+                                            .or_else(|| parsed.as_array());
+                                            
+                         if let Some(arr) = items_array {
+                             for (i, refined) in arr.iter().enumerate() {
+                                 if i < batch.len() {
+                                     let mut original = batch[i].clone();
+                                     merge_json(&mut original, refined.clone());
+                                     refined_items.push(original);
+                                 }
+                             }
+                             // If LLM returned fewer items than batch, fill with remaining originals
+                             if arr.len() < batch.len() {
+                                 for i in arr.len()..batch.len() {
+                                     refined_items.push(batch[i].clone());
+                                 }
+                             }
+                         } else {
+                             // Fallback: keep original
+                             refined_items.extend_from_slice(batch);
+                         }
+                    } else {
+                        refined_items.extend_from_slice(batch);
+                    }
+                } else {
+                    refined_items.extend_from_slice(batch);
+                }
+            }
+            
+            if !refined_items.is_empty() {
+                all_extracted_items = refined_items;
+            }
+        }
+
         // 이후 DB 저장 로직으로 연결 (기존 로직 활용)
         for mut item_json in all_extracted_items.clone() {
             // [STRICT PARITY] 1개씩 처리하며 DB에 넣기
