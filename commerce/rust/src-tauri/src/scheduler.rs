@@ -690,17 +690,18 @@ async fn process_task(
                 "spinner": "⠋"
             }));
 
-            // Combine multiple pugs into one prompt
-            let mut combined_pugs = String::new();
-            for (idx, pug) in chunk.iter().enumerate() {
-                combined_pugs.push_str(&format!("\n### ITEM #{} ###\n{}\n", idx + 1, pug));
+            // [OPTIMIZATION] Separate Schema (System) from Data (User)
+            // Initialize prompt with header and append snippets with line numbers
+            let mut prompt = format!("[Reading structure part {}~{}/{}]", current_start, current_end, total_items);
+            let mut line_counter = 1;
+            for pug in chunk {
+                for line in pug.lines() {
+                    prompt.push_str(&format!("\n{} | {}", line_counter, line));
+                    line_counter += 1;
+                }
             }
 
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-            // [OPTIMIZATION] Separate Schema (System) from Data (User)
-            // This ensures the 4000-char limit is dedicated entirely to PUG data.
-            let prompt = format!("[INPUT SNIPPETS]\n{}", combined_pugs);
 
             let mut model_guard = model_mutex.lock().await;
             if model_guard.is_none() { if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); } }
