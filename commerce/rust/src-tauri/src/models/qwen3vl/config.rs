@@ -2,6 +2,7 @@ use serde::Deserialize;
 use candle_nn::Activation;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct Qwen3VLGenerationConfig {
     pub bos_token_id: u32,
     pub eos_token_id: serde_json::Value, 
