@@ -203,6 +203,10 @@ impl Qwen3VLGenerateModel {
         // [OPTIMIZATION] Detect action flags early to control caching behavior
         let is_ingest = input.replace_text.contains("ACTION: INGEST");
         let is_save = input.replace_text.contains("ACTION: SAVE");
+        
+        if is_save || is_ingest {
+            println!("[KV-FLAG] Detected Flags - SAVE: {}, INGEST: {}", is_save, is_ingest);
+        }
 
         let mut seqlen_offset = 0;
 
@@ -228,6 +232,15 @@ impl Qwen3VLGenerateModel {
                                  for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
                                      if c == f { match_len += 1; } else { break; }
                                  }
+
+                                 if match_len < 50 {
+                                     println!("[KV-HIERARCHY] Cache Mismatch! Prefix match only {} tokens.", match_len);
+                                     if !cached_tokens.is_empty() && !full_input_ids_vec.is_empty() {
+                                         println!("[KV-HIERARCHY] Cache (first 5): {:?}", &cached_tokens[..cached_tokens.len().min(5)]);
+                                         println!("[KV-HIERARCHY] Input (first 5): {:?}", &full_input_ids_vec[..full_input_ids_vec.len().min(5)]);
+                                     }
+                                 }
+
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
                                      if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
@@ -260,6 +273,15 @@ impl Qwen3VLGenerateModel {
                                  for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
                                      if c == f { match_len += 1; } else { break; }
                                  }
+
+                                 if match_len < 50 {
+                                     println!("[KV-HIERARCHY] Cache Mismatch! Prefix match only {} tokens.", match_len);
+                                     if !cached_tokens.is_empty() && !full_input_ids_vec.is_empty() {
+                                         println!("[KV-HIERARCHY] Cache (first 5): {:?}", &cached_tokens[..cached_tokens.len().min(5)]);
+                                         println!("[KV-HIERARCHY] Input (first 5): {:?}", &full_input_ids_vec[..full_input_ids_vec.len().min(5)]);
+                                     }
+                                 }
+
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
                                      if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {

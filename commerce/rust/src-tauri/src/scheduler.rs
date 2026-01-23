@@ -619,14 +619,25 @@ async fn process_task(
     // [CRITICAL] Unload Small Model and WAIT until VRAM is actually freed
     if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
     
-    // Drop lock briefly to ensure any background drops complete
-    drop(model_lock); 
+    // [FORCE-RELEASE] Explicitly drop the entire LogisModel to ensure no ghost references keep VRAM alive
+    drop(model_lock);
+    {
+        let mut model_guard = model_mutex.lock().await;
+        *model_guard = None; // Kill the generator AND the embedding model
+        println!("[PROCESS] LogisModel explicitly dropped for transition.");
+    }
     
     // Increase target to 2000MB and timeout to 10s for better stability
     wait_for_resources_settled(2000, 1500, 10000).await;
 
     // Re-acquire lock for Large model loading
-    let model_lock = model_mutex.lock().await;
+    let mut model_lock = model_mutex.lock().await;
+    if model_lock.is_none() {
+        println!("[PROCESS] Re-initializing LogisModel for Large inference...");
+        if let Ok(m) = LogisModel::new(None).await {
+            *model_lock = Some(m);
+        }
+    }
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -733,24 +744,22 @@ async fn process_task(
             ..Default::default()
         };
 
-        let res = tokio::select!{
-            res = model.chat_params_with_spinner(
-                params,
-                &app_handle_clone, 
-                "Preprocessing (Large)",
-                json!({ "task_id": task.id, "category": "Preprocessing (Large)", "summary": "Finding selectors..." }), 
-                Some(cancellation_token.clone()), 
-                // [INJECTION] Persistent memory link
-                Some(task.id.clone()) 
-            ) => res?,
-            _ = async {
-                loop {
-                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            } => { return Err(anyhow::anyhow!("Task cancelled")); }
-        };
-        res
+                let res = tokio::select!{
+                    res = model.chat_params_with_spinner(
+                        params,
+                        &app_handle_clone, 
+                        "Preprocessing (Large)",
+                        json!({ "task_id": task.id, "category": "Preprocessing (Large)", "summary": "Finding selectors..." }), 
+                        Some(cancellation_token.clone()), 
+                        Some(task.id.clone()) // [FIX] Explicitly pass task.id as session_id
+                    ) => res?,
+                    _ = async {
+                        loop {
+                            if cancellation_token.load(Ordering::Relaxed) { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                };        res
     } else { "{}".to_string() };
 
     let selector_info = parsing::parse_json_from_llm(&page_selectors_res);

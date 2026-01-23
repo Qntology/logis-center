@@ -238,6 +238,11 @@ impl QuantizedQwen3VLTextAttention {
                     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
                         if let Some((k, v)) = &self.kv_cache {
                             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+                            
+                            if self.layer_idx == 0 {
+                                println!("[KV-DEBUG] Layer 0 saving cache. Shape: {:?}", k.shape());
+                            }
+
                             let mut map = HashMap::new();
 
                             // [EXPERIMENTAL] bit_depth: 4 or 8
@@ -313,6 +318,10 @@ impl QuantizedQwen3VLTextAttention {
                             if clear {
                                 self.kv_cache = None;
                             }
+                        } else {
+                            if self.layer_idx == 0 {
+                                println!("[KV-DEBUG] Layer 0 has NO cache to save!");
+                            }
                         }
                         Ok(())
                     }
@@ -371,7 +380,7 @@ impl QuantizedQwen3VLTextAttention {
 
                         // [INJECTION-TRANSFORM] Auto-match dimensions regardless of model source
                         let (_b, h, _s, d) = k.dims4()?;
-                        let target_heads = self.num_attention_heads;
+                        let target_heads = self.num_key_value_heads;
                         let target_dim = self.head_dim;
 
                         if h != target_heads || d != target_dim {
