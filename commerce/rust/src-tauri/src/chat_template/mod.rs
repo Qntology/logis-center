@@ -100,8 +100,25 @@ impl ChatTemplate {
     }
 
     pub fn apply_chat_template(&self, messages: &ChatCompletionParameters) -> Result<String> {
+        // [FIX] Flatten User Message Content Arrays to String for Jinja Compatibility
+        // Qwen chat template expects 'content' to be a string, not an array.
+        let mut flattened_messages = messages.messages.clone();
+        for msg in &mut flattened_messages {
+            if let crate::openai_types::ChatCompletionRequestMessage::User(user_msg) = msg {
+                if let crate::openai_types::ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
+                    let mut text_content = String::new();
+                    for part in parts {
+                        if let crate::openai_types::ChatCompletionRequestMessageContentPart::Text(text_part) = part {
+                            text_content.push_str(&text_part.text);
+                        }
+                    }
+                    user_msg.content = crate::openai_types::ChatCompletionRequestUserMessageContent::Text(text_content);
+                }
+            }
+        }
+
         let context = context! {
-            messages => &messages.messages,
+            messages => flattened_messages,
             tools => &messages.tools.as_ref(),
             add_generation_prompt => true,
         };
