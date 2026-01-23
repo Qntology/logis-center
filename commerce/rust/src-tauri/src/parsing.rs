@@ -387,7 +387,10 @@ pub fn split_html_to_pug_list(html: &str, selector_str: &str, mode: PugMode) -> 
 }
 
 pub fn page_type_prompt() -> String { r###"[TASK]
-Analyze the provided Pug template snippet and identify the primary category of this webpage.
+Based on the PREVIOUSLY RECORDED Pug template content, identify the primary category of this webpage.
+
+[INSTRUCTION]
+You have already received the page data in chunks. Analyze the entire history and determine the page type. 
 
 [SCHEMA DEFINITIONS]
 - type: The main category of the page content. Must be one of:
@@ -402,13 +405,16 @@ Analyze the provided Pug template snippet and identify the primary category of t
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.
 {
-    "type": ""
+    "type": "..."
 }"###.to_string() }
 
 pub fn page_selectors_prompt(page_type: &str) -> String {
     let template = r###"[TASK]
 The page has been classified as '{TYPE}'.
-Analyze the provided Pug template snippet and identify the structural CSS1 selectors required for data extraction.
+Based on the PREVIOUSLY RECORDED history, identify the structural CSS1 selectors required for data extraction.
+
+[INSTRUCTION]
+Analyze the page structure you have already learned and find the repeating patterns.
 
 [SCHEMA DEFINITIONS]
 - item: Common CSS1 selector for sibling items (e.g., `tr`, `li`). Match recurring patterns and exclude header, footer, ads, and pagination.
@@ -418,8 +424,8 @@ Analyze the provided Pug template snippet and identify the structural CSS1 selec
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.
 {
-    "item": "",
-    "node": "",
+    "item": "...",
+    "node": "...",
     "detail": boolean
 }"###;
     template.replace("{TYPE}", page_type)
