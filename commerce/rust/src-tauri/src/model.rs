@@ -124,42 +124,61 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
     parts.join(" ")
 }
 
+use tokio::sync::Mutex as TokioMutex;
+
+pub enum ModelSize {
+    Small, // 0.6B for Ingestion
+    Large, // 2B-VL for Inference
+}
+
+impl PartialEq for ModelSize {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ModelSize::Small, ModelSize::Small) => true,
+            (ModelSize::Large, ModelSize::Large) => true,
+            _ => false,
+        }
+    }
+}
+
 pub struct LogisModel {
-    generator: Arc<Mutex<Option<Qwen3VLGenerateModel>>>,
-    embedding_model: Arc<Mutex<Option<EmbeddingModel>>>,
+    generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
+    embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
-    pub is_cpu_mode: bool, // Moved up
+    pub is_cpu_mode: bool, 
     
     // Config for Lazy Reloading
-    model_path: String,
+    small_model_path: String,
+    large_model_path: String,
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
     dtype: Option<DType>, 
+    current_size: Arc<TokioMutex<Option<ModelSize>>>,
 }
 impl LogisModel {
-    pub fn unload_generator(&self) {
-        let mut gen = self.generator.lock().unwrap();
+    pub async fn unload_generator(&self) {
+        let mut gen = self.generator.lock().await;
         if gen.is_some() {
             *gen = None;
-            println!("[MODEL] Generator (Qwen) unloaded to free VRAM.");
+            let mut size = self.current_size.lock().await;
+            *size = None;
+            println!("[MODEL] Generator unloaded to free VRAM.");
         }
     }
 
-    pub fn unload_embedding(&self) {
-        let mut emb = self.embedding_model.lock().unwrap();
+    pub async fn unload_embedding(&self) {
+        let mut emb = self.embedding_model.lock().await;
         if emb.is_some() {
             *emb = None;
             println!("[MODEL] Embedding Model unloaded to free VRAM.");
         }
     }
 
-    async fn load_generator_internal(&self) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator (Qwen)...");
-        let m_path = self.model_path.clone();
+    async fn load_generator_internal(&self, path: &str) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator from {}...", path);
         let dev = self.device_config.device.clone();
         
-        // Extract device ID if possible (simplified)
         let mut dev_id = 0;
         if let Some(id_str) = self.device_config.name.split('-').nth(1) {
              if let Ok(id) = id_str.parse::<usize>() { dev_id = id; }
@@ -167,77 +186,67 @@ impl LogisModel {
 
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
+        let path_clone = path.to_string();
 
         let generator = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init(&m_path, Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize))
+            Qwen3VLGenerateModel::init(&path_clone, Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize))
         }).await??;
         
         Ok(generator)
     }
 
-    fn load_embedding_internal(&self) -> anyhow::Result<EmbeddingModel> {
-        println!("[MODEL] Loading Embedding Model (Gemma)...");
-        // Embedding model is forced to CPU in original logic, or we can follow config.
-        // Original logic forced CPU to save VRAM. With exclusive loading, we *could* use GPU if we wanted,
-        // but keeping it on CPU is safer for now or we can use the device config.
-        // Let's stick to the device config to be consistent, or CPU if preferred.
-        // For now, let's follow the device config but maybe force CPU if VRAM is tight?
-        // Actually, exclusive loading allows us to use GPU for embedding too!
-        
-        // However, EmbeddingModel implementation in this codebase might be CPU optimized or
-        // the `new` method in embedding.rs might have hardcoded CPU. 
-        // Let's check embedding.rs... It says "Forcing CPU". 
-        // So we just call new.
-        
+    pub async fn load_embedding_internal(&self) -> anyhow::Result<EmbeddingModel> {
         EmbeddingModel::new(&self.embedding_path)
     }
 
-    pub async fn ensure_generator(&self) -> anyhow::Result<()> {
+    pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
         // 1. Unload Embedding if loaded
-        self.unload_embedding();
+        self.unload_embedding().await;
 
-        // 2. Load Generator if not loaded (Check-Load-Store pattern)
-        let need_load = {
-            let gen_guard = self.generator.lock().unwrap();
-            gen_guard.is_none()
+        // 2. Check if we need to switch models
+        let mut current_size_guard = self.current_size.lock().await;
+        let mut gen_guard = self.generator.lock().await;
+
+        let needs_reload = match *current_size_guard {
+            Some(ref s) => s != &size,
+            None => true,
         };
 
-        if need_load {
-            let gen = self.load_generator_internal().await?;
-            let mut gen_guard = self.generator.lock().unwrap();
+        if needs_reload || gen_guard.is_none() {
+            println!("[MODEL] Switching/Loading model to size: {:?}", match size { ModelSize::Small => "Small", ModelSize::Large => "Large" });
+            *gen_guard = None; // Force drop
+            
+            let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
+            let gen = self.load_generator_internal(path).await?;
+            
             *gen_guard = Some(gen);
+            *current_size_guard = Some(size);
         }
         Ok(())
     }
 
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         // 1. Unload Generator if loaded
-        self.unload_generator();
+        self.unload_generator().await;
 
-        // 2. Load Embedding if not loaded (Check-Load-Store pattern)
-        let need_load = {
-            let emb_guard = self.embedding_model.lock().unwrap();
-            emb_guard.is_none()
-        };
-
-        if need_load {
+        // 2. Load Embedding if not loaded
+        let mut emb_guard = self.embedding_model.lock().await;
+        if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
             let emb = tokio::task::spawn_blocking(move || {
                 EmbeddingModel::new(&self_clone)
             }).await??;
             
-            let mut emb_guard = self.embedding_model.lock().unwrap();
             *emb_guard = Some(emb);
         }
         Ok(())
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel with Lazy Loading Configuration");
+        println!("[MODEL-00] Initializing LogisModel with Dual-Model Relay Configuration");
 
         let mut config = utils::get_optimal_device_config();
         
-        // Override if CPU preference is explicit
         if device_preference == Some("cpu") {
             println!("[MODEL] Explicit CPU preference detected.");
             config = utils::DeviceConfig {
@@ -250,22 +259,26 @@ impl LogisModel {
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
-        let gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
-        let model_path = gguf_dir.to_str().unwrap().to_string();
+        let small_gguf_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
+        let large_gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
+        
+        let small_model_path = small_gguf_dir.to_str().unwrap().to_string();
+        let large_model_path = large_gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
-        let max_tokens_limit = 32768; // [OPTIMIZED] Increased to prevent truncation and leverage model's large context window
+        let max_tokens_limit = 32768; 
 
-        // DO NOT LOAD MODELS HERE. Just return the config.
         Ok(Self {
-            generator: Arc::new(Mutex::new(None)),
-            embedding_model: Arc::new(Mutex::new(None)),
-            is_cpu_mode: config.is_cpu, // Moved up
-            model_path,
+            generator: Arc::new(TokioMutex::new(None)),
+            embedding_model: Arc::new(TokioMutex::new(None)),
+            is_cpu_mode: config.is_cpu,
+            small_model_path,
+            large_model_path,
             embedding_path,
             device_config: config.clone(),
             max_tokens_limit: max_tokens_limit as u32,
             dtype: None, 
+            current_size: Arc::new(TokioMutex::new(None)),
         })
     }
 
@@ -283,8 +296,8 @@ impl LogisModel {
             "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
         }));
 
-        // Ensure generator is loaded (and embedding is unloaded)
-        self.ensure_generator().await?;
+        // Ensure LARGE generator is loaded for Vision tasks
+        self.ensure_generator(ModelSize::Large).await?;
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
@@ -365,7 +378,7 @@ impl LogisModel {
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
         // Ensure generator is loaded
-        self.ensure_generator().await?;
+        self.ensure_generator(ModelSize::Large).await?;
         
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
@@ -374,8 +387,8 @@ impl LogisModel {
         
         println!("[MODEL-CHAT] Sending Chat Request...");
         
-        tokio::task::spawn_blocking(move || {
-            let mut gen_guard = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
@@ -458,7 +471,7 @@ impl LogisModel {
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
-        self.ensure_generator().await?;
+        self.ensure_generator(ModelSize::Large).await?;
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {
@@ -474,8 +487,8 @@ impl LogisModel {
 
         let self_clone = self.generator.clone();
         
-        let task = tokio::task::spawn_blocking(move || {
-            let mut gen_guard = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+        let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
         });
@@ -495,15 +508,15 @@ impl LogisModel {
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
-        self.ensure_generator().await?;
+        self.ensure_generator(ModelSize::Large).await?;
 
         // Emit initial status once
         let _ = app_handle.emit(event_name, base_payload);
 
         let self_clone = self.generator.clone();
         
-        let task = tokio::task::spawn_blocking(move || {
-            let mut gen_guard = self_clone.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+        let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let mut content_parts = Vec::new();
@@ -546,9 +559,9 @@ impl LogisModel {
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
-        self.ensure_generator().await?;
+        self.ensure_generator(ModelSize::Large).await?;
         
-        let mut gen_guard = self.generator.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+        let mut gen_guard = self.generator.lock().await;
         let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
         
         let mut content_parts = Vec::new();
@@ -598,7 +611,7 @@ impl LogisModel {
         session_id: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
-        self.ensure_generator().await?;
+        self.ensure_generator(ModelSize::Large).await?;
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {
@@ -616,8 +629,8 @@ impl LogisModel {
         let max_tok = self.max_tokens_limit;
         
         // Spawn the heavy task using Tokio directly for standard behavior
-        let task = tokio::task::spawn_blocking(move || {
-            let mut gen_guard = generator_arc.lock().map_err(|_| anyhow!("Poisoned lock"))?;
+        let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = generator_arc.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let mut content_parts = Vec::new();
@@ -691,8 +704,8 @@ impl LogisModel {
 
         let embedding_model_arc = self.embedding_model.clone();
         
-        tokio::task::spawn_blocking(move || {
-            let guard = embedding_model_arc.lock().unwrap();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
+            let guard = embedding_model_arc.blocking_lock();
             if let Some(model) = guard.as_ref() {
                 model.embed(&text).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
             } else {

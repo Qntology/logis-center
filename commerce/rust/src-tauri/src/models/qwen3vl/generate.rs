@@ -74,11 +74,11 @@ impl Qwen3VLGenerateModel {
                 let mut main_file = std::fs::File::open(&main)?;
                 let main_content = gguf_file::Content::read(&mut main_file)?;
                 
-                let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                let kv_reserve = max_tokens * 10000;
-                
-                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
-                ModelVariant::Quantized(model)
+                                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+                                 // [OPTIMIZED] Accurate KV budget: ~30,000 bytes per token for Qwen 2B models (28 layers, BF16)
+                                 let kv_reserve = max_tokens * 30000;
+                                 
+                                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;                ModelVariant::Quantized(model)
             } else if let Some(main) = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }) {
                  let mut file = std::fs::File::open(&main)?;
                  let content = gguf_file::Content::read(&mut file)?;
@@ -86,7 +86,7 @@ impl Qwen3VLGenerateModel {
                  let content2 = gguf_file::Content::read(&mut file2)?;
                  
                  let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                 let kv_reserve = max_tokens * 10000;
+                 let kv_reserve = max_tokens * 30000;
                  
                  let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                  ModelVariant::Quantized(model)
@@ -105,6 +105,8 @@ impl Qwen3VLGenerateModel {
         let generation_config_path = std::path::Path::new(path).join("generation_config.json");
         let generation_config: Qwen3VLGenerationConfig =
             serde_json::from_slice(&std::fs::read(generation_config_path)?)?;
+        let model_name = if path.contains("0.6B") { "qwen3vl-0.6B".to_string() } else { "qwen3vl-2B".to_string() };
+
         Ok(Self {
             chat_template,
             tokenizer,
@@ -115,7 +117,7 @@ impl Qwen3VLGenerateModel {
             eos_token_id1: generation_config.eos_token_id[0] as u32,
             eos_token_id2: generation_config.eos_token_id[1] as u32,
             generation_config,
-            model_name: "qwen3vl".to_string(),
+            model_name,
             hard_token_limit,
         })
     }
@@ -151,36 +153,16 @@ impl Qwen3VLGenerateModel {
 
         let mut full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
 
-        // HARD SAFETY CHECK: Truncate Input if it exceeds limit (Smart Tail-Heavy Drop)
-        // [ADAPTIVE] For ingestion/classification, we must not drop document structure.
-        // if let Some(limit) = self.hard_token_limit {
-        //     let is_critical = input.replace_text.contains("[DATA_PART]") || input.replace_text.contains("[FULL_STRUCTURE]");
-        //     let effective_limit = if is_critical { 30000 } else { limit.max(30000) };
-        //     let max_input = if effective_limit > 128 { effective_limit - 128 } else { effective_limit };
-            
-        //     if seq_len > max_input {
-        //         println!("⚠️ [WARN] Input too long ({} > {}). Using System-Aware Truncation (Critical={}).", seq_len, max_input, is_critical);
-                
-        //         // Keep System Prompt (approx first 200 tokens) and the Tail (Most important)
-        //         let head_reserve = 200.min(max_input / 4);
-        //         let tail_reserve = max_input - head_reserve;
-                
-        //         let head_ids = input_ids.narrow(1, 0, head_reserve)?;
-        //         let tail_ids = input_ids.narrow(1, seq_len - tail_reserve, tail_reserve)?;
-                
-        //         input_ids = Tensor::cat(&[head_ids, tail_ids], 1)?;
-        //         seq_len = max_input;
-                
-        //         // Update full_input_ids_vec to match the new truncated content
-        //         full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?;
-        //     }
-        // }
+        // [OPTIMIZATION] Detect action flags early to control caching behavior
+        let is_ingest = input.replace_text.contains("ACTION: INGEST");
+        let is_save = input.replace_text.contains("ACTION: SAVE");
 
         let mut seqlen_offset = 0;
 
         // KV Cache Disk Loading (Hierarchical Prefix Caching)
         let cache_path = if let Some(sid) = &session_id {
-             let p = crate::utils::paths::get_kv_dir(None).join(sid);
+             let model_type_sub = if self.model_name.contains("0.6B") || self.model_name.contains("small") { "small" } else { "large" };
+             let p = crate::utils::paths::get_kv_dir(None).join(sid).join(model_type_sub);
              if !p.exists() { let _ = fs::create_dir_all(&p); }
              Some(p)
         } else {
@@ -281,30 +263,33 @@ impl Qwen3VLGenerateModel {
             seq_len = seq_len - current_pos;
             println!("\n[PREFILL] Ingested up to offset {}.", seqlen_offset);
 
-            // [NEW] Intermediate Cache Save: Save context knowledge after heavy prefill
-            if let Some(path) = &cache_path {
-                if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
-                    let token_path = path.join("tokens.json");
-                    let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
-                    
-                    // Check if disk cache is already sufficient (superset)
-                    let mut skip_save = false;
-                    if token_path.exists() {
-                         if let Ok(file) = fs::File::open(&token_path) {
-                             let reader = std::io::BufReader::new(file);
-                             if let Ok(disk_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                 if disk_tokens.len() >= ingested_tokens.len() && disk_tokens.starts_with(ingested_tokens) {
-                                     skip_save = true;
+            // [OPTIMIZED] Skip intermediate disk save during prefill if we are just ingesting.
+            // Only save intermediate state if explicitly saving to disk this turn.
+            if is_save && !is_ingest {
+                if let Some(path) = &cache_path {
+                    if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
+                        let token_path = path.join("tokens.json");
+                        let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
+                        
+                        // Check if disk cache is already sufficient (superset)
+                        let mut skip_save = false;
+                        if token_path.exists() {
+                             if let Ok(file) = fs::File::open(&token_path) {
+                                 let reader = std::io::BufReader::new(file);
+                                 if let Ok(disk_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                     if disk_tokens.len() >= ingested_tokens.len() && disk_tokens.starts_with(ingested_tokens) {
+                                         skip_save = true;
+                                     }
                                  }
                              }
-                         }
-                    }
+                        }
 
-                    if !skip_save {
-                        // 주입(Prefill) 단계이므로 초고속 모드(Direct Save) 사용
-                        if m.save_kv_cache(path, false, 0).is_ok() {
-                            if let Ok(file) = fs::File::create(&token_path) {
-                                let _ = serde_json::to_writer(file, &ingested_tokens);
+                        if !skip_save {
+                            // 주입(Prefill) 단계이므로 초고속 모드(Direct Save) 사용
+                            if m.save_kv_cache(path, false, 0).is_ok() {
+                                if let Ok(file) = fs::File::create(&token_path) {
+                                    let _ = serde_json::to_writer(file, &ingested_tokens);
+                                }
                             }
                         }
                     }
@@ -418,9 +403,6 @@ impl Qwen3VLGenerateModel {
                      // 2. SAVE: Write to Disk (Finalize), Clear VRAM.
                      // 3. Default (Inference): Read-Only, Clear VRAM.
                      
-                     let is_ingest = input.replace_text.contains("ACTION: INGEST");
-                     let is_save = input.replace_text.contains("ACTION: SAVE");
-                     
                      let token_path = path.join("tokens.json");
                      
                      if is_ingest {
@@ -428,7 +410,7 @@ impl Qwen3VLGenerateModel {
                          println!("[KV-VRAM] Accumulating context in VRAM (No Disk Write)...");
                          // Do nothing (No offload, No clear)
                      } else if is_save {
-                         // [SAVE MODE] Finalize and Offload to Disk
+                         // [SAVE MODE] Finalize and Persist to Disk
                          println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (No Quantization)...");
                          
                          let target_block_size = 0; 
@@ -439,7 +421,10 @@ impl Qwen3VLGenerateModel {
                              all_tokens.pop(); 
                          }
 
-                         if m.offload_kv_cache(path, target_block_size).is_ok() {
+                         // [VRAM HOT-SWAP] Use save_kv_cache(clear=false) instead of offload
+                         // This keeps the context in VRAM for immediate reuse in the next Turn, 
+                         // while also securing it on disk.
+                         if m.save_kv_cache(path, false, target_block_size).is_ok() {
                              if let Ok(file) = fs::File::create(&token_path) {
                                  let _ = serde_json::to_writer(file, &all_tokens);
                              }

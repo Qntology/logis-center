@@ -239,8 +239,11 @@ pub async fn start_background_worker(
 
                         // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
                         {
-                            let mut model_guard = model.lock().await;
-                            *model_guard = None;
+                            let mut model_lock = model.lock().await;
+                            if let Some(m) = model_lock.as_ref() {
+                                m.unload_generator().await;
+                            }
+                            *model_lock = None;
                             println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
                         }
 
@@ -262,8 +265,11 @@ pub async fn start_background_worker(
                             // [NEW] Automatic OOM Recovery Logic
                             if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
                                 println!("[Scheduler] OOM Detected! Force unloading model to protect system VRAM.");
-                                let mut model_guard = model.lock().await;
-                                *model_guard = None; // Explicitly drop model from GPU
+                                let mut model_lock = model.lock().await;
+                                if let Some(m) = model_lock.as_ref() {
+                                    m.unload_generator().await;
+                                }
+                                *model_lock = None; // Explicitly drop model from GPU
                                 
                                 let _ = app_handle.emit("extraction-progress", json!({ 
                                     "task_id": task.id,
@@ -318,23 +324,16 @@ async fn process_task(
 
 
     // [LOCK-RELEASE] 시작 시 이전 잔여 리소스 강제 정리
-
     {
-
         // 모델 락을 잠깐 잡았다가 놓아서 혹시 모를 좀비 상태 정리
-
-        let mut model_guard = model_mutex.lock().await;
-
-        if model_guard.is_some() {
-
+        let mut model_lock = model_mutex.lock().await;
+        if let Some(m) = model_lock.as_ref() {
             println!("[PROCESS] Clearing residual model state...");
-
-            *model_guard = None; 
-
+            m.unload_generator().await;
         }
+        *model_lock = None; 
 
         // KV 폴더의 잠금 파일 확인 (Windows에서는 핸들을 닫는 것만으로 충분하지만, 명시적 로그)
-
         let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
 
         if kv_path.exists() {
@@ -378,37 +377,75 @@ async fn process_task(
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         
-        let mut model_guard = model_mutex.lock().await;
-        if model_guard.is_none() {
-            let _ = app_handle.emit("extraction-progress", json!({ 
-               "task_id": task.id,
-               "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
-            }));
-            match LogisModel::new(None).await {
-                Ok(m) => *model_guard = Some(m),
-                Err(e) => {
-                    let _ = app_handle.emit("extraction-progress", json!({ 
-                       "task_id": task.id,
-                       "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
-                    }));
-                    return Ok(());
-                }
-            }
-        }
+                let mut model_lock = model_mutex.lock().await;
         
-        if let Some(model) = model_guard.as_ref() {
-            let res = model.extract_from_image(
-                task.id.clone(),
-                image_path,
-                language.to_string(),
-                app_handle,
-                Some(cancellation_token.clone()),
-                store_mutex
-            ).await;
-            
-            drop(model_guard);
-            return res;
-        }
+                if model_lock.is_none() {
+        
+                    let _ = app_handle.emit("extraction-progress", json!({ 
+        
+                       "task_id": task.id,
+        
+                       "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
+        
+                    }));
+        
+                    match LogisModel::new(None).await {
+        
+                        Ok(m) => *model_lock = Some(m),
+        
+                        Err(e) => {
+        
+                            let _ = app_handle.emit("extraction-progress", json!({ 
+        
+                               "task_id": task.id,
+        
+                               "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
+        
+                            }));
+        
+                            if let Some(m) = model_lock.as_ref() {
+        
+                                m.unload_generator().await;
+        
+                            }
+        
+                            return Ok(());
+        
+                        }
+        
+                    }
+        
+                }
+        
+                
+        
+                if let Some(model) = model_lock.as_ref() {
+        
+                    let res = model.extract_from_image(
+        
+                        task.id.clone(),
+        
+                        image_path,
+        
+                        language.to_string(),
+        
+                        app_handle,
+        
+                        Some(cancellation_token.clone()),
+        
+                        store_mutex
+        
+                    ).await;
+        
+                    
+        
+                    drop(model_lock);
+        
+                    return res;
+        
+                }
+        
+        
         return Ok(());
     }
 
@@ -465,26 +502,30 @@ async fn process_task(
     
                 // [REVISED] Restore turn-based chunked ingestion for classification.
                 // This is the original stable logic.
-                let classify_chunks = chunk_text(&light_pug, device_config.classify_chunk_size, 2000); 
+                let classify_chunks = chunk_text(&light_pug, device_config.classify_chunk_size, 3000); 
                 let classify_chunks_len = classify_chunks.len(); 
-                println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_guard = model_mutex.lock().await;
+                println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_lock = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");
     
-    if model_guard.is_none() {
+    if model_lock.is_none() {
         let _ = app_handle.emit("extraction-progress", json!({ 
            "category": "Loading Model", "summary": "Loading Model for Analysis...", "spinner": "⠋"
         }));
         match LogisModel::new(None).await {
             Ok(m) => {
-                *model_guard = Some(m);
+                *model_lock = Some(m);
                 let _ = app_handle.emit("extraction-progress", json!({ 
                    "category": "Loading Model", "summary": "Model Ready.", "spinner": "✅"
                 }));
             },
             Err(e) => {
                 let _ = app_handle.emit("extraction-progress", json!({ 
+                   "task_id": task.id,
                    "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
                 }));
+                if let Some(m) = model_lock.as_ref() {
+                    m.unload_generator().await;
+                }
                 return Ok(());
             }
         }
@@ -514,12 +555,15 @@ async fn process_task(
         println!("[ERROR] Failed to write instruction_classify: {}", e);
     }
 
-    if let Some(model) = model_guard.as_ref() {
+    if let Some(model) = model_lock.as_ref() {
         let app_handle_clone = app_handle.clone();
         
+        // Ensure SMALL model is loaded for Phase 1 (Ingestion)
+        model.ensure_generator(crate::model::ModelSize::Small).await?;
+
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
-            println!("[Scheduler] Classification: Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
+            println!("[Scheduler] Classification (Small): Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
             let mut prompt = chunk.clone();
 
@@ -534,7 +578,6 @@ async fn process_task(
                 println!("[ERROR] Failed to write chunk_classify: {}", e);
             }
 
-            // [OPTIMIZATION] Don't add Assistant's "READY" to history, only User data
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
                     ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt.clone() })
@@ -542,22 +585,18 @@ async fn process_task(
                 name: None,
             }));
             
-            // [FIX] Append action flag based on chunk position
-            // - INGEST: Accumulate in VRAM (Chunks 1..N-1)
-            // - SAVE: Write to Disk (Chunk N)
+            // ACTION: SAVE on last chunk to persist structural memory for 0.6B
             let action_flag = if is_last { "ACTION: SAVE" } else { "ACTION: INGEST" };
             let effective_prompt = format!("{}\n\n{}", prompt, action_flag);
 
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "task_id": task.id,
-                "category": "Classification Ingestion", 
+                "category": "Structure Ingestion (Small)", 
                 "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
-                "spinner": "⠋" // 스피너 명시
+                "spinner": "⠋" 
             }));
             
-            // Create a temporary messages vector for this turn only, including the flag
             let mut current_turn_messages = messages.clone();
-            // Pop the last clean message and replace with flagged one
             current_turn_messages.pop();
             current_turn_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
@@ -567,10 +606,10 @@ async fn process_task(
             }));
 
             let params = ChatCompletionParameters {
-                messages: current_turn_messages, // Use the flagged messages
+                messages: current_turn_messages,
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(if is_last { 30000 } else { 1024 }), // [INCREASED] Safe generation for confirmation
-                temperature: Some(0.95), 
+                max_tokens: Some(if is_last { 1024 } else { 1024 }), 
+                temperature: Some(0.1), 
                 ..Default::default()
             };
 
@@ -581,8 +620,8 @@ async fn process_task(
                     "extraction-progress", 
                     json!({ 
                         "task_id": task.id,
-                        "category": "Classification Ingestion",
-                        "summary": if is_last { "Identifying page type...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
+                        "category": "Structure Ingestion (Small)",
+                        "summary": if is_last { "Saving structural memory...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
                     }), 
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
@@ -590,18 +629,7 @@ async fn process_task(
                     let out = res?;
                     if is_last {
                         page_type_res = out.clone();
-                        // [MEMORY-CONTROL] Do NOT push the final answer to history. 
-                        // This allows subsequent steps to reuse the Body cache (prefix match) without being biased by this answer.
-                        
-                        let _ = app_handle.emit("extraction-progress", json!({ 
-                            "task_id": task.id,
-                            "category": "Classification Ingestion",
-                            "summary": "Page type identified.",
-                            "data": out,
-                            "spinner": "✅"
-                        }));
                     } else {
-                        // [NEW] Accumulate Assistant message back to history to confirm turn completion
                         messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
                             content: Some(out),
                             ..Default::default()
@@ -618,53 +646,53 @@ async fn process_task(
         }
     }
 
-    println!("[Scheduler] Classification complete. Result Acquisition...");
-    println!("[Scheduler] DEBUG: page_type_res length: {}, content: '{:?}'", page_type_res.len(), page_type_res);
-    if page_type_res.is_empty() {
-        println!("[Scheduler] Error: page_type_res is empty. Model returned nothing.");
-        return Err(anyhow::anyhow!("Model returned empty classification response"));
-    }
+    println!("[Scheduler] Small Model Ingestion complete. Switching to LARGE model for intelligence tasks.");
     
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+    // Phase 2: Switch to LARGE model for actual intelligence (Selectors, Extraction)
+    if let Some(model) = model_lock.as_ref() {
+        let _ = app_handle.emit("extraction-progress", json!({ 
+            "task_id": task.id,
+            "category": "Intelligence Handover", "summary": "Switching to Vision Model (2B)...", "spinner": "⠋"
+        }));
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
+    }
+
     let mut final_page_info = json!({});
-    
-    println!("[Scheduler] Checkpoint: Classification End");
     
     let type_info = parsing::parse_json_from_llm(&page_type_res);
     let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-    println!("[Scheduler] Classification Result: '{}'", page_type);
+    println!("[Scheduler] Classification Result (from Small): '{}'", page_type);
     
     if page_type.is_empty() || page_type == "unknown" {
-        println!("[Scheduler] Stopping: Unknown page type. Raw response: '{}'", page_type_res);
+        println!("[Scheduler] Stopping: Unknown page type.");
         // [FIX] Unload model if type unknown before early return
-        *model_guard = None;
+        if let Some(m) = model_lock.as_ref() {
+            m.unload_generator().await;
+        }
         return Ok(());
     }
 
     final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
 
-    println!("[Scheduler] Moving to Selector Identification...");
-
-    // Step 2: Identify Selectors (Building on History)
+    // Step 2: Identify Selectors (Using 2B Model with inherited 0.6B history)
     let _ = app_handle.emit("extraction-progress", json!({ 
         "task_id": task.id,
-        "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type), "spinner": "⠋"
+        "category": "Classification (Large)", "summary": format!("Type: {}. Determining selectors...", page_type), "spinner": "⠋"
     }));
 
-    let page_selectors_res = if let Some(model) = model_guard.as_ref() {
+    let page_selectors_res = if let Some(model) = model_lock.as_ref() {
         let next_question = parsing::page_selectors_prompt(&page_type); 
         let app_handle_clone = app_handle.clone();
         
-        // [DEBUG-LOG] Save selector identification prompt
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let _ = std::fs::write(pug_logs_dir.join(format!("prompt_selectors_{}_{}.pug", task.id, ts_nano)), &next_question);
 
-        // [MEMORY-CONTROL] Branching off from the Body content. We do NOT include the previous Classification Answer.
-        
+        // Inherit history from 0.6B Phase
         messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: next_question })
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: format!("{}\n\nACTION: SAVE", next_question) })
             ]),
             name: None,
         }));
@@ -672,8 +700,8 @@ async fn process_task(
         let params = ChatCompletionParameters {
             messages: messages.clone(),
             model: "qwen3vl".to_string(),
-            max_tokens: Some(30000),
-            temperature: Some(0.95),
+            max_tokens: Some(1024),
+            temperature: Some(0.1),
             ..Default::default()
         };
 
@@ -684,10 +712,10 @@ async fn process_task(
                 "extraction-progress", 
                 json!({ 
                     "task_id": task.id,
-                    "category": "Classification", "summary": format!("Type: {}. Finding selectors...", page_type)
+                    "category": "Classification (Large)", "summary": format!("Type: {}. Finding selectors...", page_type)
                 }), 
                 Some(cancellation_token.clone()), 
-                Some(task.id.clone())
+                Some(task.id.clone()) // Will create 2B safetensors cache
             ) => res?,
             _ = async {
                 loop {
@@ -697,13 +725,11 @@ async fn process_task(
             } => { return Err(anyhow::anyhow!("Task cancelled")); }
         };
 
-        // [DEBUG-LOG] Save raw selector response
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let _ = std::fs::write(pug_logs_dir.join(format!("res_selectors_{}_{}.res", task.id, ts_nano)), &res);
         res
     } else { "{}".to_string() };
     
-    // [MEMORY-CONTROL] Revert history to Base Body state (remove Selector Prompt) for the next step
     messages.pop();
 
             let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
@@ -948,7 +974,7 @@ async fn process_task(
                 let prompt = format!("{}\n\n[RAW ITEMS]\n{}\n\n{}", instruction, batch_text, action_flag);
                 
                 // [FIX] Reuse existing history (chunks) to ensure safetensors cache hit
-                if let Some(model) = model_guard.as_ref() {
+                if let Some(model) = model_lock.as_ref() {
                      let mut refine_messages = messages.clone();
                      refine_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                          content: ChatCompletionRequestUserMessageContent::Array(vec![
@@ -1088,9 +1114,9 @@ async fn process_task(
         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
 
-        // CHUNKING: Split huge content into chunks (12000 chars to be safe for details)
+        // CHUNKING: Split huge content into chunks (24000 chars to be safe for details)
         let device_config = utils::get_optimal_device_config();
-        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 2000);
+        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 3000);
         let chunks_len = chunks.len();
         
         let extraction_instruction = parsing::item2json(page_type, &url, language);
@@ -1137,9 +1163,9 @@ async fn process_task(
                 "spinner": "⠋" 
             }));
 
-            let model_guard = model_mutex.lock().await;
+            let mut model_lock = model_mutex.lock().await;
             
-            let response = if let Some(model) = model_guard.as_ref() {
+            let response = if let Some(model) = model_lock.as_ref() {
                 let app_handle_clone = app_handle.clone();
                 
                 // Create temporary messages with the flag for this turn only
@@ -1175,7 +1201,9 @@ async fn process_task(
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     } => { 
-                        drop(model_guard);
+                        if let Some(m) = model_lock.as_ref() {
+                            m.unload_generator().await;
+                        }
                         return Err(anyhow::anyhow!("Task cancelled")); 
                     }
                 };
@@ -1191,7 +1219,7 @@ async fn process_task(
             } else {
                 "{}".to_string()
             };
-            drop(model_guard);
+            drop(model_lock);
 
             if is_last {
                 println!("[EXTRACT-FINAL] Result: {}", response);
@@ -1335,7 +1363,7 @@ async fn process_task(
 
             let vector = if let Some(v) = existing_vector {
                 Some(v)
-            } else if let Some(model) = model_guard.as_ref() {
+            } else if let Some(model) = model_lock.as_ref() {
                 let text_clone = text_to_embed.clone();
                 tokio::select!{
                     res = model.get_embedding(text_clone) => Some(res?),
@@ -1416,7 +1444,7 @@ async fn process_task(
 
                 let vector = if let Some(v) = existing_vector {
                     Some(v)
-                } else if let Some(model) = model_guard.as_ref() {
+                } else if let Some(model) = model_lock.as_ref() {
                     let text_clone = text_to_embed.clone();
                     tokio::select!{
                         res = model.get_embedding(text_clone) => Some(res?),
@@ -1501,8 +1529,9 @@ async fn process_task(
     
         // [LOCK-RELEASE] 정상 종료 시 모델 및 리소스 완전 해제
         {
-            let mut model_guard = model_mutex.lock().await;
-            *model_guard = None;
+            if let Some(m) = model_mutex.lock().await.as_ref() {
+                m.unload_generator().await;
+            }
             println!("[PROCESS] Task {} completed. Model unloaded and locks released.", task.id);
         }
         

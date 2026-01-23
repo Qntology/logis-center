@@ -13,7 +13,7 @@ pub mod chat_template;
 pub mod tokenizer;
 
 use tauri::{State, Manager, Listener}; // Added Manager
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as TokioMutex;
 use model::LogisModel;
 use store::{VectorStore, TradeDocument};
 use std::sync::Arc;
@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 
 pub struct AppState {
-    pub model: Arc<Mutex<Option<LogisModel>>>,
-    pub store: Arc<Mutex<Option<VectorStore>>>,
+    pub model: Arc<TokioMutex<Option<LogisModel>>>,
+    pub store: Arc<TokioMutex<Option<VectorStore>>>,
     pub cancellation_token: Arc<AtomicBool>,
 }
 
@@ -44,11 +44,15 @@ async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, S
     }
 
     // 2. Force drop model and store to release VRAM/RAM immediately
-    let mut model_guard = state.model.lock().await;
-    *model_guard = None;
+    {
+        let mut model_guard = state.model.lock().await;
+        *model_guard = None;
+    }
     
-    let mut store_guard = state.store.lock().await;
-    *store_guard = None;
+    {
+        let mut store_guard = state.store.lock().await;
+        *store_guard = None;
+    }
 
     println!("[STOP] Cancellation signal sent, DB updated, and model/store dropped.");
     Ok("Stop signal sent and resources released.".to_string())
@@ -56,11 +60,15 @@ async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, S
 
 #[tauri::command]
 async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
-    let mut model_guard = state.model.lock().await;
-    *model_guard = None;
+    {
+        let mut model_guard = state.model.lock().await;
+        *model_guard = None;
+    }
     
-    let mut store_guard = state.store.lock().await;
-    *store_guard = None;
+    {
+        let mut store_guard = state.store.lock().await;
+        *store_guard = None;
+    }
 
     println!("[UNLOAD] Model and Store explicitly dropped from memory.");
     Ok("Memory cleared.".to_string())
@@ -640,8 +648,8 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let model = Arc::new(Mutex::new(None));
-    let store = Arc::new(Mutex::new(None));
+    let model = Arc::new(TokioMutex::new(None));
+    let store = Arc::new(TokioMutex::new(None));
     let cancellation_token = Arc::new(AtomicBool::new(false));
 
     tauri::Builder::default()

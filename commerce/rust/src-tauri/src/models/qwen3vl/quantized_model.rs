@@ -707,13 +707,14 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
+        use rayon::prelude::*;
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
-        for layer in self.layers.iter_mut() {
-            layer.save_kv_cache(path, clear, block_size)?;
-        }
-        Ok(())
+        // [PARALLEL] Save all 28 layers in parallel to maximize Disk/CPU throughput
+        self.layers.par_iter_mut().try_for_each(|layer| {
+            layer.save_kv_cache(path, clear, block_size)
+        })
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -721,12 +722,15 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
+        use rayon::prelude::*;
         if path.exists() {
-            for layer in self.layers.iter_mut() {
-                layer.load_kv_cache(path, device, expected_len)?;
-            }
+            // [PARALLEL] Load all 28 layers in parallel
+            self.layers.par_iter_mut().try_for_each(|layer| {
+                layer.load_kv_cache(path, device, expected_len)
+            })
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 }
 

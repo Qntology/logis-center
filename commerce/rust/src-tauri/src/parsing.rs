@@ -260,15 +260,15 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
                         other_attributes.push(name.to_string());
 
-                                        } else if !value.is_empty() {
+                                                            } else if !value.is_empty() {
 
-                                            let safe_value = value.replace("\"", "'");
+                                                                let safe_value = value.replace("\"", "'");
 
-                                            let trunc_value = if safe_value.len() > 1000 { format!("{}...", &safe_value[..1000]) } else { safe_value };
+                                                                let trunc_value = if safe_value.len() > 3000 { format!("{}...", &safe_value[..3000]) } else { safe_value };
 
-                                            other_attributes.push(format!("{}=\"{}\"", name, trunc_value));
+                                                                other_attributes.push(format!("{}=\"{}\"", name, trunc_value));
 
-                                        }
+                                                            }
 
                 }
 
@@ -326,17 +326,17 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
 
         }
 
-                Node::Text(text) => {
+                        Node::Text(text) => {
 
-                    if *mode == PugMode::FullContent {
+                            if *mode == PugMode::FullContent {
 
-                        let text_content = text.trim();
+                                let text_content = text.trim();
 
-                        if !text_content.is_empty() {
+                                if !text_content.is_empty() {
 
-                            let text_trunc = if text_content.len() > 10000 { &text_content[..10000] } else { text_content };
+                                    let text_trunc = if text_content.len() > 30000 { &text_content[..30000] } else { text_content };
 
-                            for line in text_trunc.lines() {
+                                    for line in text_trunc.lines() {
 
                         let trimmed_line = line.trim();
 
