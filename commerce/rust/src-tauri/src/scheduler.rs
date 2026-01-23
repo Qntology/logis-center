@@ -610,7 +610,9 @@ async fn process_task(
         drop(model_lock);
         
         // Wait for VRAM
-        wait_for_resources_settled(2000, 1500, 5000).await;
+        if !wait_for_resources_settled(2500, 1500, 5000).await {
+            return Err(anyhow::anyhow!("Insufficient VRAM to load Large model. Please close other GPU-heavy apps."));
+        }
 
         // 1.2 Infer with 2B
         let mut model_lock = model_mutex.lock().await;
@@ -723,7 +725,7 @@ async fn process_task(
     }
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-    wait_for_resources_settled(2000, 1500, 5000).await;
+    wait_for_resources_settled(2500, 1500, 5000).await;
 
     // --- TASK 2: SELECTOR IDENTIFICATION ---
     {
@@ -776,7 +778,7 @@ async fn process_task(
         }
         drop(model_lock);
 
-        wait_for_resources_settled(2000, 1500, 5000).await;
+        wait_for_resources_settled(2500, 1500, 5000).await;
 
         // 2.2 Infer with 2B
         let mut model_lock = model_mutex.lock().await;
@@ -1112,7 +1114,7 @@ async fn process_task(
                     }
                 }
                 
-                wait_for_resources_settled(2000, 1500, 5000).await;
+                wait_for_resources_settled(2500, 1500, 5000).await;
 
                 // [SWITCHING PATTERN] 2. Infer with 2B
                 let refine_res_str = {
@@ -1332,7 +1334,7 @@ async fn process_task(
             }
         }
         
-        wait_for_resources_settled(2000, 1500, 5000).await;
+        wait_for_resources_settled(2500, 1500, 5000).await;
 
         // 2. Infer with 2B (Last chunk only triggers generation)
         let response = {
@@ -1730,8 +1732,8 @@ fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
 }
 
 /// Robustly waits for both VRAM and System RAM to be reclaimed.
-/// It monitors if the resource availability has "settled" (stopped increasing).
-async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max_wait_ms: u64) {
+/// Returns true if targets met, false if timed out.
+async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max_wait_ms: u64) -> bool {
     use nvml_wrapper::Nvml;
     use sysinfo::System;
     
@@ -1748,10 +1750,8 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
 
     println!("[RESOURCE-WATCH] Monitoring recovery (VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
 
-    let my_pid = std::process::id();
-
     while start_time.elapsed().as_millis() < max_wait_ms as u128 {
-        sys.refresh_all(); // Refresh both memory and process list
+        sys.refresh_all(); 
         let current_ram = sys.available_memory();
         let mut current_vram = 0;
 
@@ -1764,69 +1764,15 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
             } else { false }
         } else { false };
 
-        // Check 1: Target Thresholds
-        let mut meets_vram = !has_gpu || current_vram >= target_vram_bytes;
+        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
         let meets_ram = current_ram >= target_ram_bytes;
         
-        // [PROCESS-ANALYSIS & OPTIMIZATION] 
         if has_gpu {
-            if let Some(ref nvml_inst) = nvml {
-                if let Ok(dev) = nvml_inst.device_by_index(0) {
-                    let mut other_gpu_usage: u64 = 0;
-                    let mut gpu_users = Vec::new();
-
-                    let mut process_procs = |procs: Vec<nvml_wrapper::struct_wrappers::device::ProcessInfo>| {
-                        for p in procs {
-                            let used = match p.used_gpu_memory {
-                                UsedGpuMemory::Used(b) => b,
-                                UsedGpuMemory::Unavailable => 0,
-                            };
-                            if p.pid != my_pid {
-                                other_gpu_usage += used;
-                            }
-                            
-                            // Collect for diagnostic log
-                            let proc_name = sys.process(sysinfo::Pid::from(p.pid as usize))
-                                .map(|proc| proc.name().to_string())
-                                .unwrap_or_else(|| "Unknown".to_string());
-                            let is_me = if p.pid == my_pid { "(Me)" } else { "" };
-                            if used > 0 {
-                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, used / 1024 / 1024));
-                            }
-                        }
-                    };
-
-                    // Check both Compute and Graphics (Browsers)
-                    if let Ok(p) = dev.running_compute_processes() { process_procs(p); }
-                    if let Ok(p) = dev.running_graphics_processes() { process_procs(p); }
-
-                    // Optimization: If memory is mostly reserved by me, allow proceeding
-                    if !meets_vram && other_gpu_usage < 500 * 1024 * 1024 {
-                        println!("[RESOURCE-WATCH] VRAM is reserved by ME or free for reuse. Proceeding.");
-                        meets_vram = true;
-                    }
-
-                    // Diagnostic Log: Every 2s if still waiting
-                    if (!meets_vram || !meets_ram) && start_time.elapsed().as_millis() % 2000 < 250 {
-                        if !gpu_users.is_empty() {
-                            println!("[RESOURCE-DIAG] GPU Users: {}", gpu_users.join(", "));
-                        }
-                        if !meets_ram {
-                            let mut heavy_procs: Vec<_> = sys.processes().values()
-                                .filter(|p| p.memory() > 500 * 1024 * 1024)
-                                .map(|p| format!("{}[{}MB]", p.name(), p.memory() / 1024 / 1024))
-                                .collect();
-                            heavy_procs.sort();
-                            println!("[RESOURCE-DIAG] Top RAM Users: {}", heavy_procs.join(", "));
-                        }
-                    }
-                }
+            if (!meets_vram || !meets_ram) && start_time.elapsed().as_millis() % 2000 < 250 {
+                println!("[RESOURCE-DIAG] Waiting for Driver Cleanup... Current Free VRAM: {:.2} GB", current_vram as f64 / 1e9);
             }
         }
 
-        // Check 2: True Stability (Delta check)
-        // We ensure memory isn't moving significantly in EITHER direction.
-        // A 50MB margin handles background OS noise.
         let vram_delta = (current_vram as i64 - last_vram as i64).abs();
         let ram_delta = (current_ram as i64 - last_ram as i64).abs();
         let margin = 50 * 1024 * 1024; // 50MB
@@ -1837,23 +1783,18 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
         if meets_vram && meets_ram && is_vram_stable && is_ram_stable {
             stable_count += 1;
             if stable_count >= 3 { 
-                println!("[RESOURCE-WATCH] Resources reached target and stabilized (Delta < 50MB). Proceeding.");
-                return;
+                println!("[RESOURCE-WATCH] Resources reached target and stabilized. Proceeding.");
+                return true;
             }
         } else {
-            if stable_count > 0 {
-                println!("[RESOURCE-WATCH] Fluctuation detected (V-Delta: {}MB, R-Delta: {}MB). Resetting watch.", 
-                    vram_delta / 1024 / 1024, ram_delta / 1024 / 1024);
-            }
             stable_count = 0;
         }
 
         last_vram = current_vram;
         last_ram = current_ram;
-
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
-    println!("[RESOURCE-WATCH] Timeout reached. Free VRAM: {:.2} GB, RAM: {:.2} GB. Proceeding anyway.", 
-        last_vram as f64 / 1e9, last_ram as f64 / 1e9);
+    println!("[RESOURCE-WATCH] Timeout reached. Targets not met (VRAM: {:.2} GB).", last_vram as f64 / 1e9);
+    false
 }
