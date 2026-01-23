@@ -100,8 +100,11 @@ impl Qwen3VLGenerateModel {
         let qwen3_vl = if !gguf_files.is_empty() {
             let model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned();
 
-            let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-            let kv_reserve = max_tokens * 30000;
+            // [OPTIMIZATION] Realistic KV Cache Reservation
+            // Standard tasks rarely hit 32k. Reserving for 8k is usually enough for most web pages.
+            let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;
+            let reserve_tokens = limit_tokens.min(8192); 
+            let kv_reserve = reserve_tokens * 18000; // Adjusted multiplier for more realistic overhead
 
             if is_vision_model {
                 // CASE 1: Vision-Language Model

@@ -615,9 +615,17 @@ async fn process_task(
 
     println!("[Scheduler] Small Model Recording Complete. Handing over to LARGE model for Preprocessing.");
     
-    // [CRITICAL] Unload Small Model
+    // [CRITICAL] Unload Small Model and WAIT until VRAM is actually freed
     if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
-    wait_for_resources_settled(1000, 1500, 5000).await;
+    
+    // Drop lock briefly to ensure any background drops complete
+    drop(model_lock); 
+    
+    // Increase target to 2000MB and timeout to 10s for better stability
+    wait_for_resources_settled(2000, 1500, 10000).await;
+
+    // Re-acquire lock for Large model loading
+    let model_lock = model_mutex.lock().await;
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -1580,31 +1588,76 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
 
     println!("[RESOURCE-WATCH] Monitoring recovery (VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
 
+    let my_pid = std::process::id();
+
     while start_time.elapsed().as_millis() < max_wait_ms as u128 {
-        sys.refresh_memory();
+        sys.refresh_all(); // Refresh both memory and process list
         let current_ram = sys.available_memory();
         let mut current_vram = 0;
 
-        if let Some(ref nvml_inst) = nvml {
+        let has_gpu = if let Some(ref nvml_inst) = nvml {
             if let Ok(dev) = nvml_inst.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() {
                     current_vram = mem.free;
+                    true
+                } else { false }
+            } else { false }
+        } else { false };
+
+        // Check 1: Target Thresholds
+        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
+        let meets_ram = current_ram >= target_ram_bytes;
+        
+        // [PROCESS-ANALYSIS] If targets not met, identify who is using the memory
+        if (!meets_vram || !meets_ram) && start_time.elapsed().as_millis() % 2000 < 250 {
+            if !meets_vram && has_gpu {
+                if let Some(ref nvml_inst) = nvml {
+                    if let Ok(dev) = nvml_inst.device_by_index(0) {
+                        if let Ok(procs) = dev.compute_running_processes() {
+                            let mut gpu_users = Vec::new();
+                            for p in procs {
+                                let proc_name = sys.process(sysinfo::Pid::from(p.pid as usize))
+                                    .map(|proc| proc.name().to_string())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                let is_me = if p.pid == my_pid { "(Me)" } else { "" };
+                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, p.used_gpu_memory / 1024 / 1024));
+                            }
+                            println!("[RESOURCE-DIAG] GPU Users: {}", gpu_users.join(", "));
+                        }
+                    }
                 }
+            }
+            if !meets_ram {
+                let mut heavy_procs: Vec<_> = sys.processes().values()
+                    .filter(|p| p.memory() > 500 * 1024 * 1024) // Over 500MB
+                    .map(|p| format!("{}[{}MB]", p.name(), p.memory() / 1024 / 1024))
+                    .collect();
+                heavy_procs.sort();
+                println!("[RESOURCE-DIAG] Top RAM Users: {}", heavy_procs.join(", "));
             }
         }
 
-        // Check if we met the minimum thresholds AND if the values have stopped changing (settled)
-        let meets_threshold = (current_vram >= target_vram_bytes || nvml.is_none()) && (current_ram >= target_ram_bytes);
-        let is_stable = current_vram == last_vram && current_ram == last_ram;
+        // Check 2: True Stability (Delta check)
+        // We ensure memory isn't moving significantly in EITHER direction.
+        // A 50MB margin handles background OS noise.
+        let vram_delta = (current_vram as i64 - last_vram as i64).abs();
+        let ram_delta = (current_ram as i64 - last_ram as i64).abs();
+        let margin = 50 * 1024 * 1024; // 50MB
 
-        if meets_threshold && is_stable {
+        let is_vram_stable = !has_gpu || vram_delta < margin;
+        let is_ram_stable = ram_delta < margin;
+
+        if meets_vram && meets_ram && is_vram_stable && is_ram_stable {
             stable_count += 1;
-            if stable_count >= 3 { // Must be stable for 3 consecutive checks (600ms)
-                println!("[RESOURCE-WATCH] Stabilized. VRAM: {:.2}GB, RAM: {:.2}GB free.", 
-                    current_vram as f64 / 1e9, current_ram as f64 / 1e9);
+            if stable_count >= 3 { 
+                println!("[RESOURCE-WATCH] Resources reached target and stabilized (Delta < 50MB). Proceeding.");
                 return;
             }
         } else {
+            if stable_count > 0 {
+                println!("[RESOURCE-WATCH] Fluctuation detected (V-Delta: {}MB, R-Delta: {}MB). Resetting watch.", 
+                    vram_delta / 1024 / 1024, ram_delta / 1024 / 1024);
+            }
             stable_count = 0;
         }
 
@@ -1614,7 +1667,8 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
-    println!("[RESOURCE-WATCH] Timeout reached or thresholds not met. Proceeding anyway.");
+    println!("[RESOURCE-WATCH] Timeout reached. Free VRAM: {:.2} GB, RAM: {:.2} GB. Proceeding anyway.", 
+        last_vram as f64 / 1e9, last_ram as f64 / 1e9);
 }
 
 

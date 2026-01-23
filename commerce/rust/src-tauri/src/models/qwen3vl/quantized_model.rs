@@ -583,8 +583,8 @@ impl QuantizedQwen3VLTextModel {
                          is_vram_checked = true;
                          
                          // [OPTIMIZATION] Dynamic OS Reserve
-                         // 150MB is usually enough for basic display/system overhead on top of what's already used.
-                         let os_reserve = 150_000_000; 
+                         // 80MB is the bare minimum to keep the display stable on most systems.
+                         let os_reserve = 80_000_000; 
                          safety_floor = os_reserve + kv_reserve;
 
                          println!("[VRAM-BUDGET] Live Free: {:.2} GB. Safety Buffer (OS+KV): {:.2} MB. Layer Cost: {:.2} MB", 
@@ -598,13 +598,14 @@ impl QuantizedQwen3VLTextModel {
         for layer_idx in 0..config.num_hidden_layers {
             // Organic Check based on actual remaining bytes
             if current_device.is_cuda() && is_vram_checked {
-                 // Check if we have absolute space: Layer Cost + Safety Floor
-                 if simulated_free_vram > (cost_per_layer + safety_floor) {
+                 // [FLEXIBLE] If we have at least 1.2x the layer cost available beyond the safety floor, keep loading on GPU.
+                 // This is more aggressive than the previous strict check.
+                 if simulated_free_vram > ( (cost_per_layer as f64 * 1.1) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                  } else {
                      if current_device.is_cuda() {
-                        println!("[OFFLOAD] VRAM Full. Layer {} and subsequent moved to CPU. (Remaining: {:.2} MB)", 
-                            layer_idx, simulated_free_vram as f64/1e6);
+                        println!("[OFFLOAD] VRAM Budget Low. Layer {} and subsequent moved to CPU. (Available: {:.2} MB, Required: {:.2} MB)", 
+                            layer_idx, simulated_free_vram as f64/1e6, (cost_per_layer + safety_floor) as f64/1e6);
                      }
                      current_device = Device::Cpu;
                  }
