@@ -613,7 +613,8 @@ impl QuantizedQwen3VLTextModel {
         let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, norm_dtype)?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
-        let mrope_section = config.rope_scaling.mrope_section.clone();
+        // [FIX] rope_scaling is now optional. Unwrap or default.
+        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
         Ok(Self {
             embed_tokens,

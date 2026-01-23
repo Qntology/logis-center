@@ -713,7 +713,9 @@ impl Qwen3VLTextModel {
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
-        let mrope_section = config.rope_scaling.mrope_section.clone();
+        // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
+        // Given Qwen3 config flow, if it was missing it should have failed earlier or defaults populated.
+        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         Ok(Self {
             embed_tokens,
             layers,
@@ -799,14 +801,18 @@ impl Qwen3VLModel {
         let config = config.clone();
         let v_config = config.vision_config.clone().ok_or(anyhow!("Missing vision_config for Qwen3VLModel"))?;
         let visual = Qwen3VLVisionModel::new(v_config, vb_m.pp("visual"))?;
+        
+        // [FIX] text_config is optional, but required for Qwen3VLModel
+        let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
+        
         let language_model =
-            Qwen3VLTextModel::new(config.text_config.clone(), vb_m.pp("language_model"))?;
+            Qwen3VLTextModel::new(text_config.clone(), vb_m.pp("language_model"))?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(language_model.embed_tokens.embeddings().clone(), None)
         } else {
             linear_no_bias(
-                config.text_config.hidden_size,
-                config.text_config.vocab_size,
+                text_config.hidden_size,
+                text_config.vocab_size,
                 vb.pp("lm_head"),
             )?
         };
