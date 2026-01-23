@@ -669,7 +669,8 @@ async fn process_task(
                 "Preprocessing (Large)",
                 json!({ "task_id": task.id, "category": "Preprocessing (Large)", "summary": "Identifying page type..." }), 
                 Some(cancellation_token.clone()), 
-                Some(format!("{}_large", task.id)) 
+                // [INJECTION] Use the SAME session ID as 0.6B to trigger memory injection
+                Some(task.id.clone()) 
             ) => res?,
             _ = async {
                 loop {
@@ -730,7 +731,8 @@ async fn process_task(
                 "Preprocessing (Large)",
                 json!({ "task_id": task.id, "category": "Preprocessing (Large)", "summary": "Finding selectors..." }), 
                 Some(cancellation_token.clone()), 
-                Some(format!("{}_large", task.id)) 
+                // [INJECTION] Persistent memory link
+                Some(task.id.clone()) 
             ) => res?,
             _ = async {
                 loop {

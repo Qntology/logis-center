@@ -205,8 +205,7 @@ impl Qwen3VLGenerateModel {
 
         // KV Cache Disk Loading (Hierarchical Prefix Caching)
         let cache_path = if let Some(sid) = &session_id {
-             let model_type_sub = if self.model_name.contains("0.6B") || self.model_name.contains("small") { "small" } else { "large" };
-             let p = crate::utils::paths::get_kv_dir(None).join(sid).join(model_type_sub);
+             let p = crate::utils::paths::get_kv_dir(None).join(sid);
              if !p.exists() { let _ = fs::create_dir_all(&p); }
              Some(p)
         } else {

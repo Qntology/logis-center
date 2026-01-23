@@ -321,77 +321,49 @@ impl QuantizedQwen3VLTextAttention {
 
                     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
                         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-                        if file.exists() {
-                            let tensors = candle_core::safetensors::load(&file, &Device::Cpu)?;
+                        if !file.exists() { return Ok(()); }
+
+                        let tensors = candle_core::safetensors::load(&file, &Device::Cpu)?;
+                        
+                        let mode = tensors.get("mode").and_then(|t| t.to_vec1::<u32>().ok()).and_then(|v| v.get(0).cloned()).unwrap_or(1);
+                        let bits = tensors.get("bits").and_then(|t| t.to_vec1::<u32>().ok()).and_then(|v| v.get(0).cloned()).unwrap_or(8);
+
+                        let (mut k, mut v) = if mode == 0 {
+                            let k = tensors.get("k_raw").ok_or(anyhow!("Missing k_raw"))?;
+                            let v = tensors.get("v_raw").ok_or(anyhow!("Missing v_raw"))?;
+                            let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+                            (k.to_device(device)?.to_dtype(target_dtype)?, v.to_device(device)?.to_dtype(target_dtype)?)
+                        } else {
+                            let block_size = tensors.get("block_size").and_then(|t| t.to_vec1::<u32>().ok()).and_then(|v| v.get(0).cloned()).unwrap_or(1024) as usize;
                             
-                            let mode = tensors.get("mode")
-                                .and_then(|t| t.to_vec1::<u32>().ok())
-                                .and_then(|v| v.get(0).cloned())
-                                .unwrap_or(1);
-
-                            let bits = tensors.get("bits")
-                                .and_then(|t| t.to_vec1::<u32>().ok())
-                                .and_then(|v| v.get(0).cloned())
-                                .unwrap_or(8); // Default to 8-bit for backward compatibility
-
-                            let (k, v) = if mode == 0 {
-                                // [ULTRA-FAST] Raw Load
-                                let k = tensors.get("k_raw").ok_or(anyhow!("Missing k_raw"))?;
-                                let v = tensors.get("v_raw").ok_or(anyhow!("Missing v_raw"))?;
-                                let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-                                (k.to_device(device)?.to_dtype(target_dtype)?, v.to_device(device)?.to_dtype(target_dtype)?)
-                            } else {
-                                let block_size = tensors.get("block_size")
-                                    .and_then(|t| t.to_vec1::<u32>().ok())
-                                    .and_then(|v| v.get(0).cloned())
-                                    .unwrap_or(1024) as usize;
-
-                                        // Helper for Dequantization
-                                        let dequantize_tensor = |prefix: &str, b_depth: u32| -> Result<Tensor> {
-                                            use rayon::prelude::*;
-                                            let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("Missing packed"))?.to_vec1::<u8>()?;
-                                            let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("Missing scales"))?.to_vec1::<f32>()?;
-                                            let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
-                                            let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
-                                            
-                                            let total_elements: usize = shape.iter().product();
-                                            
-                                            let mut decoded: Vec<f32> = if b_depth == 4 {
-                                                // Unpack 4-bit (2 values per byte)
-                                                let packed_block_size = (block_size + 1) / 2;
-                                                packed.par_chunks(packed_block_size)
-                                                    .enumerate()
-                                                    .flat_map(|(s_idx, chunk)| {
-                                                        let scale = scales[s_idx];
-                                                        let mut out = Vec::with_capacity(chunk.len() * 2);
-                                                        for &byte in chunk {
-                                                            let low = (byte & 0x0F) as f32 - 8.0;
-                                                            let high = (byte >> 4) as f32 - 8.0;
-                                                            out.push(low * scale);
-                                                            out.push(high * scale);
-                                                        }
-                                                        out.into_par_iter()
-                                                    })
-                                                    .collect()
-                                            } else {
-                                                // Standard 8-bit
-                                                packed.par_chunks(block_size)
-                                                    .enumerate()
-                                                    .flat_map(|(s_idx, chunk)| {
-                                                        let scale = scales[s_idx];
-                                                        chunk.par_iter().map(move |&byte| (byte as i8) as f32 * scale)
-                                                    })
-                                                    .collect()
-                                            };
-
-                                            decoded.truncate(total_elements); // Ensure exact size
-                                            let t = Tensor::from_vec(decoded, shape, &Device::Cpu)?;
-                                            Ok(t.to_device(device)?.to_dtype(if device.is_cuda() { DType::BF16 } else { DType::F32 })?) 
-                                        };
-
-                                let k = dequantize_tensor("k", bits)?;
-                                let v = dequantize_tensor("v", bits)?;
-                                (k, v)
+                            let dequantize_tensor = |prefix: &str, b_depth: u32| -> Result<Tensor> {
+                                use rayon::prelude::*;
+                                let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("Missing packed"))?.to_vec1::<u8>()?;
+                                let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("Missing scales"))?.to_vec1::<f32>()?;
+                                let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
+                                let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
+                                let total_elements: usize = shape.iter().product();
+                                
+                                let mut decoded: Vec<f32> = if b_depth == 4 {
+                                    let packed_block_size = (block_size + 1) / 2;
+                                    packed.par_chunks(packed_block_size).enumerate().flat_map(|(s_idx, chunk)| {
+                                        let scale = scales[s_idx];
+                                        let mut out = Vec::with_capacity(chunk.len() * 2);
+                                        for &byte in chunk {
+                                            out.push(((byte & 0x0F) as f32 - 8.0) * scale);
+                                            out.push(((byte >> 4) as f32 - 8.0) * scale);
+                                        }
+                                        out.into_par_iter()
+                                    }).collect()
+                                } else {
+                                    packed.par_chunks(block_size).enumerate().flat_map(|(s_idx, chunk)| {
+                                        let scale = scales[s_idx];
+                                        chunk.par_iter().map(move |&byte| (byte as i8) as f32 * scale)
+                                    }).collect()
+                                };
+                                decoded.truncate(total_elements);
+                                let t = Tensor::from_vec(decoded, shape, &Device::Cpu)?;
+                                Ok(t.to_device(device)?.to_dtype(if device.is_cuda() { DType::BF16 } else { DType::F32 })?) 
                             };
 
                             let current_len = k.dim(2)?;
@@ -403,11 +375,11 @@ impl QuantizedQwen3VLTextAttention {
                                 println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
                                 self.kv_cache = None;
                             }
+                            println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
+                            self.kv_cache = None;
                         }
                         Ok(())
                     }
-
-                
 
                     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
                         self.save_kv_cache(path, true, block_size)
