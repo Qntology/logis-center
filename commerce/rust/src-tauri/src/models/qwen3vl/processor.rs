@@ -220,6 +220,18 @@ impl Qwen3VLProcessor {
         let mut image_grid_thw = None;
         let pixel_values_video = None;
         let video_grid_thw: Option<Tensor> = None;
+
+        // [BRANCH] If the model doesn't define an image token, it's pure text. Skip vision processing.
+        if self.image_token.is_empty() || self.image_token == "" {
+            return Ok(GeneralInput {
+                replace_text: text.to_string(),
+                pixel_values: None,
+                image_grid_thw: None,
+                pixel_values_video: None,
+                video_grid_thw: None,
+            });
+        }
+
         let vision_map = self.extract_vision_info(messages)?;
         let img_mean =
             Tensor::from_slice(&self.img_process_cfg.image_mean, (3, 1, 1), &self.device)?

@@ -71,16 +71,16 @@ pub struct Qwen3VLConfig {
     pub architectures: Option<Vec<String>>, 
     pub auto_map: Option<std::collections::HashMap<String, String>>,
     pub hidden_size: Option<usize>,
-    pub image_token_id: usize,
+    pub image_token_id: Option<usize>,
     pub model_type: String, 
     pub text_config: Qwen3VLTextConfig,
     pub tie_word_embeddings: bool,
     pub torch_dtype: Option<String>,
     pub transformers_version: String,
-    pub video_token_id: usize,
-    pub vision_config: Qwen3VLVisionConfig,
-    pub vision_start_token_id: usize,
-    pub vision_end_token_id: usize,
+    pub video_token_id: Option<usize>,
+    pub vision_config: Option<Qwen3VLVisionConfig>,
+    pub vision_start_token_id: Option<usize>,
+    pub vision_end_token_id: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

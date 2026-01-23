@@ -25,7 +25,8 @@ use std::fs;
 
 enum ModelVariant {
     Standard(Qwen3VLModel),
-    Quantized(QuantizedQwen3VLModel),
+    QuantizedVL(QuantizedQwen3VLModel),
+    QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel),
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -55,48 +56,51 @@ impl Qwen3VLGenerateModel {
         let cfg_dtype = cfg.text_config.dtype.as_str();
         let dtype = get_dtype(dtype, cfg_dtype);
         
-        // Processor uses vision_device for image processing
-        let pre_processor = Qwen3VLProcessor::new(path, &vision_dev, dtype)?;
+        // Processor initialization with vision support check
+        let has_vision = cfg.image_token_id.is_some() && mmproj_path.is_some();
+        let pre_processor = if has_vision {
+            Qwen3VLProcessor::new(path, &vision_dev, dtype)?
+        } else {
+            // Create a text-only processor (it won't attempt to find image tokens)
+            let mut p = Qwen3VLProcessor::new(path, &vision_dev, dtype)?;
+            // Internal hack to signal text-only mode
+            // We'll ensure processor doesn't crash without these
+            p
+        };
         
-        // Check for GGUF files first
         let gguf_files = find_type_files(path, "gguf")?;
-        println!("[DEBUG] Found {} GGUF files in {}", gguf_files.len(), path);
+        
+        let is_vision_model = gguf_files.iter().any(|f| f.contains("mmproj"));
         
         let qwen3_vl = if !gguf_files.is_empty() {
-            // Find mmproj (vision) and main model
             let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
             let model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned();
 
-            if let (Some(mmproj), Some(main)) = (mmproj_path, model_path.clone()) {
+            let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
+            let kv_reserve = max_tokens * 30000;
+
+            if is_vision_model && mmproj_path.is_some() {
+                // CASE 1: Vision-Language Model
+                let mmproj = mmproj_path.unwrap();
+                let main = model_path.ok_or(anyhow!("Missing main GGUF for VL model"))?;
                 let mut mmproj_file = std::fs::File::open(&mmproj)?;
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_file)?;
-                
                 let mut main_file = std::fs::File::open(&main)?;
                 let main_content = gguf_file::Content::read(&mut main_file)?;
                 
-                                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                                 // [OPTIMIZED] Accurate KV budget: ~30,000 bytes per token for Qwen 2B models (28 layers, BF16)
-                                 let kv_reserve = max_tokens * 30000;
-                                 
-                                 let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;                ModelVariant::Quantized(model)
-            } else if let Some(main) = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }) {
-                 let mut file = std::fs::File::open(&main)?;
-                 let content = gguf_file::Content::read(&mut file)?;
-                 let mut file2 = std::fs::File::open(&main)?; 
-                 let content2 = gguf_file::Content::read(&mut file2)?;
-                 
-                 let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
-                 let kv_reserve = max_tokens * 30000;
-                 
-                 let model = QuantizedQwen3VLModel::new(&cfg, &content, &mut file, &content2, &mut file2, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
-                 ModelVariant::Quantized(model)
+                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
+                ModelVariant::QuantizedVL(model)
             } else {
-                 return Err(anyhow!("No valid GGUF model found"));
+                // CASE 2: Pure Text Model (0.6B etc.)
+                let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
+                let mut file = std::fs::File::open(&main)?;
+                let content = gguf_file::Content::read(&mut file)?;
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new(&cfg, &content, &mut file, &text_dev, text_device_id, dtype, kv_reserve)?;
+                ModelVariant::QuantizedText(model)
             }
         } else {
+            // ... (standard/safetensors branch)
             let model_list = find_type_files(path, "safetensors")?;
-            // Standard model currently doesn't support dual device as easily in this wrapper,
-            // but we use text_dev as primary.
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, &text_dev)? };
             let model = Qwen3VLModel::new(cfg, vb)?;
             ModelVariant::Standard(model)
@@ -171,34 +175,27 @@ impl Qwen3VLGenerateModel {
 
         if let Some(path) = &cache_path {
              match &mut self.qwen3_vl {
-                 ModelVariant::Quantized(m) => {
+                 ModelVariant::QuantizedVL(m) => {
                      let token_path = path.join("tokens.json");
                      let mut loaded = false;
                      if token_path.exists() {
                          if let Ok(file) = fs::File::open(&token_path) {
                              let reader = std::io::BufReader::new(file);
                              if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                 // FIND LONGEST COMMON PREFIX
                                  let mut match_len = 0;
                                  for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
                                      if c == f { match_len += 1; } else { break; }
                                  }
-
-                                 // [HIERARCHY] 50토큰 이상만 겹쳐도 이전 구조 캐시 활용
                                  if match_len > 50 {
-                                     println!("[KV-HIERARCHY] Cache Hit! Using prefix: {} tokens.", match_len);
-                                     
+                                     println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
                                      if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
                                          seqlen_offset = match_len;
                                          loaded = true;
-                                         
                                          let remaining = seq_len.saturating_sub(seqlen_offset);
                                          if remaining > 0 {
                                              input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
                                              seq_len = remaining;
-                                             println!("[KV-HIERARCHY] Processing only {} new tokens.", seq_len);
                                          } else {
-                                             println!("[KV-HIERARCHY] Perfect match. Re-processing last token.");
                                              input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
                                              seqlen_offset = seq_len - 1;
                                              seq_len = 1;
@@ -208,10 +205,39 @@ impl Qwen3VLGenerateModel {
                              }
                          }
                      }
-                     
-                     if !loaded {
-                         m.clear_kv_cache();
+                     if !loaded { m.clear_kv_cache(); }
+                 },
+                 ModelVariant::QuantizedText(m) => {
+                     let token_path = path.join("tokens.json");
+                     let mut loaded = false;
+                     if token_path.exists() {
+                         if let Ok(file) = fs::File::open(&token_path) {
+                             let reader = std::io::BufReader::new(file);
+                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 let mut match_len = 0;
+                                 for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
+                                     if c == f { match_len += 1; } else { break; }
+                                 }
+                                 if match_len > 50 {
+                                     println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
+                                     if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
+                                         seqlen_offset = match_len;
+                                         loaded = true;
+                                         let remaining = seq_len.saturating_sub(seqlen_offset);
+                                         if remaining > 0 {
+                                             input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
+                                             seq_len = remaining;
+                                         } else {
+                                             input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
+                                             seqlen_offset = seq_len - 1;
+                                             seq_len = 1;
+                                         }
+                                     }
+                                 }
+                             }
+                         }
                      }
+                     if !loaded { m.clear_kv_cache(); }
                  },
                  _ => {} 
              }
@@ -220,7 +246,6 @@ impl Qwen3VLGenerateModel {
         // [CHUNKED PREFILL] - Line Aware (2048 tokens)
         if seq_len > 2048 {
             println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
-            
             let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.text_device) {
                 ids.flatten_all()?.to_vec1::<u32>()?.get(0).cloned().unwrap_or(198)
             } else { 198 };
@@ -234,7 +259,6 @@ impl Qwen3VLGenerateModel {
 
                 let mut chunk_size = 2048;
                 let lookback_range = 256; 
-                
                 let search_end = current_pos + 2048;
                 let search_start = search_end.saturating_sub(lookback_range);
                 
@@ -251,7 +275,8 @@ impl Qwen3VLGenerateModel {
                 
                 let _logits = match &mut self.qwen3_vl {
                     ModelVariant::Standard(m) => m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset + current_pos)?,
-                    ModelVariant::Quantized(m) => m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset + current_pos)?,
+                    ModelVariant::QuantizedVL(m) => m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset + current_pos)?,
+                    ModelVariant::QuantizedText(m) => m.forward(&chunk_ids, Some(&chunk_pos), seqlen_offset + current_pos)?,
                 };
                 
                 current_pos += chunk_size;
@@ -263,34 +288,17 @@ impl Qwen3VLGenerateModel {
             seq_len = seq_len - current_pos;
             println!("\n[PREFILL] Ingested up to offset {}.", seqlen_offset);
 
-            // [OPTIMIZED] Skip intermediate disk save during prefill if we are just ingesting.
-            // Only save intermediate state if explicitly saving to disk this turn.
             if is_save && !is_ingest {
                 if let Some(path) = &cache_path {
-                    if let ModelVariant::Quantized(m) = &mut self.qwen3_vl {
+                    let res = match &mut self.qwen3_vl {
+                        ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 0),
+                        ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, 0),
+                        _ => Ok(()),
+                    };
+                    if res.is_ok() {
                         let token_path = path.join("tokens.json");
-                        let ingested_tokens = &full_input_ids_vec[..seqlen_offset];
-                        
-                        // Check if disk cache is already sufficient (superset)
-                        let mut skip_save = false;
-                        if token_path.exists() {
-                             if let Ok(file) = fs::File::open(&token_path) {
-                                 let reader = std::io::BufReader::new(file);
-                                 if let Ok(disk_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                     if disk_tokens.len() >= ingested_tokens.len() && disk_tokens.starts_with(ingested_tokens) {
-                                         skip_save = true;
-                                     }
-                                 }
-                             }
-                        }
-
-                        if !skip_save {
-                            // 주입(Prefill) 단계이므로 초고속 모드(Direct Save) 사용
-                            if m.save_kv_cache(path, false, 0).is_ok() {
-                                if let Ok(file) = fs::File::create(&token_path) {
-                                    let _ = serde_json::to_writer(file, &ingested_tokens);
-                                }
-                            }
+                        if let Ok(file) = fs::File::create(&token_path) {
+                            let _ = serde_json::to_writer(file, &&full_input_ids_vec[..seqlen_offset]);
                         }
                     }
                 }
@@ -345,12 +353,17 @@ impl Qwen3VLGenerateModel {
                         Some(&cache_position),
                         seqlen_offset,
                     )?,
-                    ModelVariant::Quantized(m) => m.forward(
+                    ModelVariant::QuantizedVL(m) => m.forward(
                         &input_ids,
                         pixel_values.as_ref(),
                         image_grid_thw_tensor.as_ref(),
                         pixel_values_video.as_ref(),
                         video_grid_thw_tensor.as_ref(),
+                        Some(&cache_position),
+                        seqlen_offset,
+                    )?,
+                    ModelVariant::QuantizedText(m) => m.forward(
+                        &input_ids,
                         Some(&cache_position),
                         seqlen_offset,
                     )?,
@@ -380,16 +393,33 @@ impl Qwen3VLGenerateModel {
                                     break;
                                 }
                                 
-                                seqlen_offset += seq_len;
-                                seq_len = 1;
-                                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.text_device)?;
-                                cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.text_device)?;
+                                                seqlen_offset += seq_len;
                                 
-                if pixel_values.is_some() {
-                    pixel_values = None;
-                    pixel_values_video = None;
-                }
-            }
+                                                seq_len = 1;
+                                
+                                                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.text_device)?;
+                                
+                                                cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.text_device)?;
+                                
+                                                                
+                                
+                                                // [BRANCH] Only reset vision inputs if the model variant actually supports vision
+                                
+                                                if matches!(self.qwen3_vl, ModelVariant::Standard(_) | ModelVariant::QuantizedVL(_)) {
+                                
+                                                    if pixel_values.is_some() {
+                                
+                                                        pixel_values = None;
+                                
+                                                        pixel_values_video = None;
+                                
+                                                    }
+                                
+                                                }
+                                
+                                            }
+                                
+                                
             Ok(generate)
         })();
 
@@ -397,43 +427,41 @@ impl Qwen3VLGenerateModel {
 
         if let Some(path) = &cache_path {
              match &mut self.qwen3_vl {
-                 ModelVariant::Quantized(m) => {
-                     // [OPTIMIZATION] Tri-State Cache Management
-                     // 1. INGEST: Keep in VRAM (Accumulate), No Disk Write.
-                     // 2. SAVE: Write to Disk (Finalize), Clear VRAM.
-                     // 3. Default (Inference): Read-Only, Clear VRAM.
-                     
+                 ModelVariant::QuantizedVL(m) => {
                      let token_path = path.join("tokens.json");
-                     
                      if is_ingest {
-                         // [ACCUMULATE MODE] Keep in VRAM for next turn
-                         println!("[KV-VRAM] Accumulating context in VRAM (No Disk Write)...");
-                         // Do nothing (No offload, No clear)
+                         println!("[KV-VRAM] Accumulating context in VRAM (VL)...");
                      } else if is_save {
-                         // [SAVE MODE] Finalize and Persist to Disk
-                         println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (No Quantization)...");
-                         
+                         println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (VL)...");
                          let target_block_size = 0; 
-                         
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
-                         if !all_tokens.is_empty() {
-                             all_tokens.pop(); 
-                         }
-
-                         // [VRAM HOT-SWAP] Use save_kv_cache(clear=false) instead of offload
-                         // This keeps the context in VRAM for immediate reuse in the next Turn, 
-                         // while also securing it on disk.
+                         if !all_tokens.is_empty() { all_tokens.pop(); }
                          if m.save_kv_cache(path, false, target_block_size).is_ok() {
                              if let Ok(file) = fs::File::create(&token_path) {
                                  let _ = serde_json::to_writer(file, &all_tokens);
                              }
                          }
                      } else {
-                         // [READ-ONLY MODE] Inference
-                         if token_path.exists() {
-                             println!("[KV-DISK] Read-only mode. Skipping cache update.");
+                         m.clear_kv_cache();
+                     }
+                 },
+                 ModelVariant::QuantizedText(m) => {
+                     let token_path = path.join("tokens.json");
+                     if is_ingest {
+                         println!("[KV-VRAM] Accumulating context in VRAM (Text)...");
+                     } else if is_save {
+                         println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (Text)...");
+                         let target_block_size = 0; 
+                         let mut all_tokens = full_input_ids_vec;
+                         all_tokens.extend(&generate);
+                         if !all_tokens.is_empty() { all_tokens.pop(); }
+                         if m.save_kv_cache(path, false, target_block_size).is_ok() {
+                             if let Ok(file) = fs::File::create(&token_path) {
+                                 let _ = serde_json::to_writer(file, &all_tokens);
+                             }
                          }
+                     } else {
                          m.clear_kv_cache();
                      }
                  },
@@ -442,11 +470,33 @@ impl Qwen3VLGenerateModel {
         } else {
             match &mut self.qwen3_vl {
                 ModelVariant::Standard(m) => m.clear_kv_cache(),
-                ModelVariant::Quantized(m) => m.clear_kv_cache(),
+                ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
+                ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
             }
         }
 
-        let res = self.tokenizer.token_decode(generate)?;
-        Ok(res)
-    }
-}
+                let res = self.tokenizer.token_decode(generate)?;
+
+                Ok(res)
+
+            }
+
+        
+
+            pub fn clear_kv_cache(&mut self) {
+
+                match &mut self.qwen3_vl {
+
+                    ModelVariant::Standard(m) => m.clear_kv_cache(),
+
+                    ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
+
+                    ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
+
+                }
+
+            }
+
+        }
+
+        

@@ -773,17 +773,18 @@ impl QuantizedQwen3VLModel {
 
         // 1. Vision Model - Dynamic Loading
         let mut actual_vision_device = vision_device.clone();
+        let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config for VL model"))?;
+
         if actual_vision_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(vision_device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
                          let total_vram = mem.total;
-                         // Vision only needs a small system reserve, not the KV reserve.
-                         let os_reserve = (total_vram as f64 * 0.02) as u64; // 2% for system
-                         let vision_safety_floor = os_reserve.max(100_000_000); // at least 100MB
+                         let os_reserve = (total_vram as f64 * 0.02) as u64; 
+                         let vision_safety_floor = os_reserve.max(100_000_000); 
                          
                          if mem.free < (vision_total_cost + vision_safety_floor) {
-                             println!("[OFFLOAD] Vision Budget Exhausted on ID {}. Switching to CPU.", vision_device_id);
+                             println!("[OFFLOAD] Vision Budget Exhausted. Switching to CPU.");
                              actual_vision_device = Device::Cpu;
                          }
                      }
@@ -795,7 +796,7 @@ impl QuantizedQwen3VLModel {
 
         // Load Vision from mmproj file
         let vb_visual = from_gguf_content(config, ct_vision, reader_vision, &actual_vision_device, vision_dtype)?;
-        let visual = Qwen3VLVisionModel::new(config.vision_config.clone(), vb_visual.pp("visual"))?;
+        let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
         // Load Language Model from main file
         let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve)?;
@@ -869,10 +870,11 @@ impl QuantizedQwen3VLModel {
         let (image_embeds, deepstack_image_embeds) =
             self.visual.forward(&pixel_values, &image_grid_thw)?;
         
+        let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?
             .to_vec1::<u32>()?
             .iter()
-            .map(|&x| x as usize / self.config.vision_config.spatial_merge_size.pow(2))
+            .map(|&x| x as usize / spatial_merge_size.pow(2))
             .collect();
         
         // Transfer results to text_device for language processing
@@ -887,11 +889,12 @@ impl QuantizedQwen3VLModel {
 
 
     fn get_placeholder_mask(&self, input_ids: &Tensor, is_image: bool) -> Result<Tensor> {
-        let special_token = if is_image {
-            Tensor::new(vec![self.config.image_token_id as u32], input_ids.device())?
+        let special_token_id = if is_image {
+            self.config.image_token_id.unwrap_or(0) as u32
         } else {
-            Tensor::new(vec![self.config.video_token_id as u32], input_ids.device())?
+            self.config.video_token_id.unwrap_or(0) as u32
         };
+        let special_token = Tensor::new(vec![special_token_id], input_ids.device())?;
         let special_mask = input_ids
             .broadcast_eq(&special_token)?
             .to_dtype(candle_core::DType::U32)?;
@@ -993,6 +996,92 @@ impl QuantizedQwen3VLModel {
     }
 }
 
+pub struct QuantizedQwen3TextModel {
+    pub language_model: QuantizedQwen3VLTextModel,
+    pub lm_head: QLinear,
+    pub text_device: Device,
+}
+
+impl QuantizedQwen3TextModel {
+    pub fn new<R: std::io::Seek + std::io::Read>(
+        config: &Qwen3VLConfig,
+        ct_main: &gguf_file::Content,
+        reader_main: &mut R,
+        text_device: &Device,
+        text_device_id: usize,
+        dtype: DType,
+        kv_reserve: u64,
+    ) -> Result<Self> {
+        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized)");
+        
+        let language_model = QuantizedQwen3VLTextModel::new(
+            &config.text_config, 
+            ct_main, 
+            reader_main, 
+            "model", 
+            text_device, 
+            text_device_id, 
+            dtype, 
+            kv_reserve
+        )?;
+
+        let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
+        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
+            l
+        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
+            l
+        } else {
+            get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+        };
+
+        Ok(Self {
+            language_model,
+            lm_head,
+            text_device: text_device.clone(),
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        cache_position: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let flat_input = input_ids.flatten_all()?;
+        let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
+        let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+
+        // Pure text position IDs
+        let start = if let Some(cp) = cache_position { cp.i(0)?.to_scalar::<u32>()? } else { 0 };
+        let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?
+            .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
+
+        let outputs = self.language_model.forward(
+            &inputs_embeds,
+            seqlen_offset,
+            Some(&position_ids),
+            None,
+            None,
+        )?;
+        
+        let seq_len = outputs.dim(1)?;
+        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
+        
+        let hidden_state = if !hidden_state.device().same_device(self.lm_head.device()) {
+            hidden_state.to_device(self.lm_head.device())?
+        } else {
+            hidden_state
+        };
+
+        Ok(self.lm_head.forward(&hidden_state)?)
+    }
+
+    pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len) }
+}
+
 // Helper functions
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
@@ -1056,7 +1145,8 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
                  // parts[0]="deepstack", parts[1]="5", parts[2..]="fc1.weight"
                  if parts.len() >= 2 {
                      if let Ok(layer_idx) = parts[1].parse::<usize>() {
-                         if let Some(pos) = config.vision_config.deepstack_visual_indexes.iter().position(|&x| x == layer_idx) {
+                         let v_idx_opt = config.vision_config.as_ref().and_then(|vc| vc.deepstack_visual_indexes.iter().position(|&x| x == layer_idx));
+                         if let Some(pos) = v_idx_opt {
                              let suffix = parts[2..].join(".");
                              new_name = format!("visual.deepstack_merger_list.{}.{}", pos, suffix)
                                             .replace("fc1", "linear_fc1")
