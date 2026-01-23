@@ -531,9 +531,8 @@ async fn process_task(
         }
     }
     
-    // Step 1: Ingest & Classify with Small Model (0.6B)
-    // Goal: Use the lightweight model to determine WHAT this page is.
-    // Optimization: This avoids loading the heavy 2B model for simple identification tasks.
+    // Step 1: Record (Ingest) with Small Model (0.6B)
+    // Goal: Just swallow the huge PUG content to build a record/cache.
     
     use crate::openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage, 
@@ -544,50 +543,37 @@ async fn process_task(
 
     let mut messages = vec![
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: "You are a web page analysis assistant. Output must be strictly JSON format. No explanations.".to_string(),
+            content: "You are a data recording assistant.".to_string(),
             name: None,
         })
     ];
 
-    let mut detected_page_type = String::new();
-
     if let Some(model) = model_lock.as_ref() {
         let app_handle_clone = app_handle.clone();
-        
-        // Ensure SMALL model is loaded for Phase 1 (Ingestion & Classification)
         model.ensure_generator(crate::model::ModelSize::Small).await?;
 
-        // 1-1. Ingest Content
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
-            println!("[Scheduler] Ingestion (Small): Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
+            println!("[Scheduler] Recording (Small): Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
             let prompt = chunk.clone();
             
             // [DEBUG-LOG] Save chunk for verification
             let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let log_path = pug_logs_dir.join(format!("chunk_06b_{}_{}.pug", i, ts_nano));
+            let log_path = pug_logs_dir.join(format!("record_06b_{}_{}.pug", i, ts_nano));
             let _ = std::fs::write(&log_path, &prompt);
 
-            // On the last chunk, we immediately ask for classification to save a turn
-            let effective_prompt = if is_last {
-                // Combine Ingestion + Classification Prompt + SAVE flag
-                format!("{}\n\n{}\n\nACTION: JSON ONLY\n\nACTION: SAVE", prompt, parsing::page_type_prompt())
-            } else {
-                format!("{}\n\nACTION: INGEST", prompt)
-            };
-
-            let log_category = if is_last { "Classification (Small)" } else { "Content Ingestion (Small)" };
-            let log_summary = if is_last { "Identifying page type..." } else { "Reading content..." };
+            // NO QUESTION here. Just record the data.
+            let action_flag = if is_last { "ACTION: SAVE" } else { "ACTION: INGEST" };
+            let effective_prompt = format!("{}\n\n{}", prompt, action_flag);
 
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "task_id": task.id,
-                "category": log_category,
-                "summary": format!("{} ({}/{})", log_summary, i + 1, classify_chunks_len),
+                "category": "Data Recording (Small)",
+                "summary": format!("Recording content... ({}/{})", i + 1, classify_chunks_len),
                 "spinner": "⠋" 
             }));
 
-            // Push User Message
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
                     ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
@@ -595,11 +581,10 @@ async fn process_task(
                 name: None,
             }));
 
-            // Generate
             let params = ChatCompletionParameters {
                 messages: messages.clone(),
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(if is_last { 512 } else { 16 }), // Increased buffer for classification
+                max_tokens: Some(16), // No output expected
                 temperature: Some(0.1),
                 ..Default::default()
             };
@@ -608,8 +593,8 @@ async fn process_task(
                 res = model.chat_params_with_spinner(
                     params,
                     &app_handle_clone, 
-                    log_category,
-                    json!({ "task_id": task.id, "category": log_category, "summary": log_summary }),
+                    "Data Recording (Small)",
+                    json!({ "task_id": task.id, "category": "Data Recording (Small)", "summary": "Recording..." }),
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
                 ) => res?,
@@ -621,95 +606,111 @@ async fn process_task(
                 } => { return Err(anyhow::anyhow!("Task cancelled")); }
             };
 
-            // Capture Assistant Response
             messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
                 content: Some(res.clone()),
                 ..Default::default()
             }));
-
-            if is_last {
-                println!("[Scheduler] Raw Classification Response: {:?}", res); // [DEBUG] Check raw output
-                
-                // Parse Classification Result
-                let type_info = parsing::parse_json_from_llm(&res);
-                detected_page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                println!("[Scheduler] Classification Result (from Small): '{}'", detected_page_type);
-            }
         }
     }
 
-    // [CHECKPOINT] If classification failed or unknown, stop here.
-    if detected_page_type.is_empty() || detected_page_type == "unknown" {
-        println!("[Scheduler] Stopping: Unknown page type.");
-        if let Some(m) = model_lock.as_ref() {
-            m.unload_generator().await;
-        }
-        return Ok(());
-    }
-
-    println!("[Scheduler] Small Model Phase Complete. Detected: {}", detected_page_type);
+    println!("[Scheduler] Small Model Recording Complete. Handing over to LARGE model for Preprocessing.");
     
-    // [CRITICAL] Unload Small Model NOW to free VRAM for Large Model
-    if let Some(m) = model_lock.as_ref() {
-        m.unload_generator().await; 
-    }
-    
-    // [NEW] Wait for both GPU and CPU resources to be fully reclaimed and stable
-    println!("[Scheduler] Waiting for system resources to settle (GC/Driver cleanup)...");
-    wait_for_resources_settled(1000, 1500, 5000).await; // 1GB VRAM, 1.5GB RAM margin, max 5s
+    // [CRITICAL] Unload Small Model
+    if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+    wait_for_resources_settled(1000, 1500, 5000).await;
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // Phase 2: Switch to LARGE model for Extraction (Selectors -> Data)
-    // [OPTIMIZATION] We DO NOT pass the full `messages` history. 
-    // The 2B model cannot use the 0.6B's KV cache anyway, so passing the history 
-    // forces it to re-read everything (Prefill), causing slowness.
-    // Instead, we start a FRESH context for the 2B model focused only on the target task.
-
+    // Step 2: Preprocessing (Classification -> Selectors) with LARGE model (2B)
     if let Some(model) = model_lock.as_ref() {
         let _ = app_handle.emit("extraction-progress", json!({ 
             "task_id": task.id,
-            "category": "Intelligence Handover", "summary": "Switching to Vision Model (2B)...", "spinner": "⠋"
+            "category": "Intelligence Loading", "summary": "Loading 2B Model for Preprocessing...", "spinner": "⠋"
         }));
-        // This will load the 2B model
         model.ensure_generator(crate::model::ModelSize::Large).await?;
     }
 
-    let mut final_page_info = json!({ "type": detected_page_type });
-    let page_type = detected_page_type.clone();
-
-    // Step 2a: Identify Selectors (Using 2B Model)
-    // We give it the page type hint directly.
-    
-    let _ = app_handle.emit("extraction-progress", json!({
-        "task_id": task.id,
-        "category": "Structure Analysis (Large)", "summary": format!("Type: {}. Determining selectors...", page_type), "spinner": "⠋"
-    }));
-
-    // Re-build a short context for 2B
+    // [IMPORTANT] 2B needs the content again to do classification. 
+    // We pass the full content or a significant part of it to 2B for the first time.
     let mut large_messages = vec![
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: "You are an expert web scraper.".to_string(),
+            content: "You are an expert web analysis assistant. Output must be strictly JSON format.".to_string(),
             name: None,
         })
     ];
+
+    let page_type_res = if let Some(model) = model_lock.as_ref() {
+        let type_prompt = parsing::page_type_prompt();
+        let app_handle_clone = app_handle.clone();
+        
+        // 2B must ingest the data to classify. We use ACTION: SAVE so 2B's work is also cached.
+        let header_chunk = classify_chunks.get(0).cloned().unwrap_or_default();
+        let classification_input = format!("PAGE CONTENT:\n{}\n\nTASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", header_chunk, type_prompt);
+
+        large_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(vec![
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: classification_input })
+            ]),
+            name: None,
+        }));
+
+        let params = ChatCompletionParameters {
+            messages: large_messages.clone(),
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(512),
+            temperature: Some(0.1),
+            ..Default::default()
+        };
+
+        let res = tokio::select!{
+            res = model.chat_params_with_spinner(
+                params,
+                &app_handle_clone, 
+                "Preprocessing (Large)",
+                json!({ "task_id": task.id, "category": "Preprocessing (Large)", "summary": "Identifying page type..." }), 
+                Some(cancellation_token.clone()), 
+                Some(format!("{}_large", task.id)) 
+            ) => res?,
+            _ = async {
+                loop {
+                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => { return Err(anyhow::anyhow!("Task cancelled")); }
+        };
+        
+        large_messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content: Some(res.clone()),
+            ..Default::default()
+        }));
+        
+        res
+    } else { "{}".to_string() };
+
+    let type_info = parsing::parse_json_from_llm(&page_type_res);
+    let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    println!("[Scheduler] 2B Classification Result: '{}'", page_type);
+    
+    if page_type.is_empty() || page_type == "unknown" {
+        if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+        return Ok(());
+    }
+
+    let mut final_page_info = json!({ "type": page_type });
+
+    // Step 2b: Identify Selectors (Using 2B Model)
+    let _ = app_handle.emit("extraction-progress", json!({
+        "task_id": task.id,
+        "category": "Preprocessing (Large)", "summary": "Determining selectors...", "spinner": "⠋"
+    }));
 
     let page_selectors_res = if let Some(model) = model_lock.as_ref() {
         let next_question = parsing::page_selectors_prompt(&page_type); 
         let app_handle_clone = app_handle.clone();
         
-        // Provide context: "This is a [Type] page. [Content snippet if needed or just Instruction]"
-        // Since 2B doesn't have the content loaded, we might need to re-inject a SMALL, RELEVANT part of the content 
-        // OR rely on its ability to generalize from the instruction if it doesn't strictly need the HTML to guess standard selectors.
-        // HOWEVER, to find *actual* selectors, it needs to see the HTML structure. 
-        // So we re-inject the FIRST chunk (usually contains header/table structure) for selector identification.
-        
-        let header_chunk = classify_chunks.get(0).cloned().unwrap_or_default();
-        let selector_prompt = format!("PAGE CONTEXT (Snippet):\n{}\n\nTASK: Based on this structure, {}\n\nACTION: SAVE", header_chunk, next_question);
-
         large_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: selector_prompt })
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: format!("{}\n\nACTION: SAVE", next_question) })
             ]),
             name: None,
         }));
@@ -726,14 +727,10 @@ async fn process_task(
             res = model.chat_params_with_spinner(
                 params,
                 &app_handle_clone, 
-                "extraction-progress", 
-                json!({ 
-                    "task_id": task.id,
-                    "category": "Structure Analysis (Large)", "summary": format!("Type: {}. Finding selectors...", page_type)
-                }), 
+                "Preprocessing (Large)",
+                json!({ "task_id": task.id, "category": "Preprocessing (Large)", "summary": "Finding selectors..." }), 
                 Some(cancellation_token.clone()), 
-                // We use a DIFFERENT session ID for 2B to avoid collision/confusion with 0.6B cache path
-                Some(format!("{}_large_struct", task.id)) 
+                Some(format!("{}_large", task.id)) 
             ) => res?,
             _ = async {
                 loop {
@@ -745,9 +742,8 @@ async fn process_task(
         res
     } else { "{}".to_string() };
 
-    // We don't need to pop messages here because we used a dedicated `large_messages` vector.
-
     let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
+
             println!("[Scheduler] Selectors Found: {}", selector_info);        
         let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
         println!("[Scheduler] is_detail determined: {}", is_detail);
