@@ -193,8 +193,10 @@ impl QuantizedQwen3VLTextAttention {
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let k = Tensor::cat(&[prev_k, &key_states], 2)?;
-                let v = Tensor::cat(&[prev_v, &value_states], 2)?;
+                let prev_k = if prev_k.dtype() != key_states.dtype() { prev_k.to_dtype(key_states.dtype())? } else { prev_k.clone() };
+                let prev_v = if prev_v.dtype() != value_states.dtype() { prev_v.to_dtype(value_states.dtype())? } else { prev_v.clone() };
+                let k = Tensor::cat(&[&prev_k, &key_states], 2)?;
+                let v = Tensor::cat(&[&prev_v, &value_states], 2)?;
                 (k, v)
             }
         };
@@ -517,7 +519,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.offload_kv_cache(path, block_size)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize) -> Result<()> {
+        let device = self.input_layernorm.weight().device();
         self.self_attn.load_kv_cache(path, device, expected_len)
     }
 }

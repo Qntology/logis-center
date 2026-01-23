@@ -532,9 +532,16 @@ async fn process_task(
         }
     }
     
-    // Step 1: Record (Ingest) with Small Model (0.6B)
-    // Goal: Just swallow the huge PUG content to build a record/cache.
-    
+    // Release the initial lock so tasks can re-acquire it as needed
+    drop(model_lock);
+
+    // ==================================================================================
+    // [STRICT SWITCHING PATTERN]
+    // 1. Ingest content + Question with 0.6B (Save Cache)
+    // 2. Load 2B (Load Cache) -> Answer
+    // Repeat for each distinct task to ensure perfect cache alignment.
+    // ==================================================================================
+
     use crate::openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage, 
         ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
@@ -542,305 +549,349 @@ async fn process_task(
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
     };
 
-    let mut messages = vec![
-        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: "You are a data recording assistant.".to_string(),
-            name: None,
-        })
-    ];
+    let system_prompt = "You are a data recording assistant.".to_string();
+    let mut page_type = String::new();
+    let mut selector_info = json!({});
 
-    if let Some(model) = model_lock.as_ref() {
-        let app_handle_clone = app_handle.clone();
-        model.ensure_generator(crate::model::ModelSize::Small).await?;
+    // --- TASK 1: CLASSIFICATION ---
+    {
+        println!("[Scheduler] Starting TASK 1: CLASSIFICATION (Switching Pattern)");
+        let type_prompt = parsing::page_type_prompt();
+        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", type_prompt);
 
-        for (i, chunk) in classify_chunks.iter().enumerate() {
-            let is_last = i == classify_chunks_len - 1;
-            println!("[Scheduler] Recording (Small): Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
+        // 1.1 Ingest with 0.6B
+        let mut model_lock = model_mutex.lock().await;
+        if model_lock.is_none() {
+             *model_lock = Some(LogisModel::new(None).await?);
+        }
+        if let Some(model) = model_lock.as_ref() {
+            model.ensure_generator(crate::model::ModelSize::Small).await?;
+            let app_handle_clone = app_handle.clone();
             
-            let prompt = chunk.clone();
+            // Ingest Chunks
+            let mut messages = vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
+            ];
+
+            for (i, chunk) in classify_chunks.iter().enumerate() {
+                let is_last = i == classify_chunks_len - 1;
+                let content = if is_last {
+                    // Attach Question to the last chunk for 0.6B to cache the "Pre-Answer" state
+                    format!("{}\n\n{}", chunk, task_specific_prompt)
+                } else {
+                    format!("{}\n\nACTION: INGEST", chunk)
+                };
+
+                messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
+                    ]),
+                    name: None,
+                }));
+
+                let params = ChatCompletionParameters {
+                    messages: messages.clone(),
+                    model: "qwen3vl".to_string(),
+                    max_tokens: Some(16), 
+                    temperature: Some(0.1),
+                    ..Default::default()
+                };
+
+                let _ = model.chat_params_with_spinner(
+                    params, &app_handle_clone, "Data Recording (Small)",
+                    json!({ "task_id": task.id, "category": "Classification (Ingest)", "summary": format!("Ingesting part {}/{}", i+1, classify_chunks_len) }),
+                    Some(cancellation_token.clone()), Some(task.id.clone())
+                ).await?;
+            }
             
-            // [DEBUG-LOG] Save chunk for verification
-            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let log_path = pug_logs_dir.join(format!("record_06b_{}_{}.pug", i, ts_nano));
-            let _ = std::fs::write(&log_path, &prompt);
+            // Unload 0.6B explicitly to force flush and VRAM release
+            model.unload_generator().await;
+        }
+        drop(model_lock);
+        
+        // Wait for VRAM
+        wait_for_resources_settled(2000, 1500, 5000).await;
 
-            // NO QUESTION here. Just record the data.
-            let action_flag = if is_last { "ACTION: SAVE" } else { "ACTION: INGEST" };
-            let effective_prompt = format!("{}\n\n{}", prompt, action_flag);
+        // 1.2 Infer with 2B
+        let mut model_lock = model_mutex.lock().await;
+        if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+        
+        let res = if let Some(model) = model_lock.as_ref() {
+            model.ensure_generator(crate::model::ModelSize::Large).await?;
+            let app_handle_clone = app_handle.clone();
 
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "task_id": task.id,
-                "category": "Data Recording (Small)",
-                "summary": format!("Recording content... ({}/{})", i + 1, classify_chunks_len),
-                "spinner": "⠋" 
-            }));
+            // [FIX] Reconstruct FULL history exactly as 0.6B saw it to hit the cache
+            let mut messages = vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
+            ];
 
+            // Add intermediate chunks
+            for chunk in classify_chunks.iter().take(classify_chunks_len.saturating_sub(1)) {
+                let content = format!("{}\n\nACTION: INGEST", chunk);
+                messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
+                    ]),
+                    name: None,
+                }));
+                // IMPORTANT: 0.6B generated an empty assistant reply for each chunk. We must mimic that or the cache slots won't align?
+                // Actually, 'generate' adds the assistant reply to the history internally? 
+                // No, we passed 'messages' which we built manually.
+                // In 0.6B loop, we didn't add assistant replies to the 'messages' vector we re-created for 2B.
+                // Wait, 0.6B loop logic:
+                // let _ = model.chat_params...
+                // It does NOT update the 'messages' variable in the loop automatically. 
+                // So 0.6B saw: [Sys, User(Chunk1)], then [Sys, User(Chunk2)]... ?
+                // NO! 0.6B loop re-created 'messages' vec for each iteration:
+                // let messages = vec![Sys, User(Chunk)];
+                
+                // AH! 0.6B was NOT accumulating history in the loop I wrote previously!
+                // It was sending INDEPENDENT requests for each chunk!
+                // "let messages = vec![Sys, User(content)];" inside the loop!
+                
+                // If 0.6B sent independent requests, it overwrote the cache each time or appended?
+                // KV Cache is strictly append-only if session_id matches.
+                // So 0.6B effectively built a cache of: Sys + Chunk1 + Sys + Chunk2 ... ?
+                // No, usually KV cache resets if the prefix doesn't match.
+                
+                // IF we want to chain chunks, we must accumulate them in the messages vector.
+                
+                // CORRECT LOGIC for 0.6B loop (which I wrote):
+                // It sends [Sys, Chunk] each time.
+                // This means 0.6B was NOT building a continuous context of the whole page!
+                // It was just processing chunks individually.
+                
+                // BUT, to analyze the page, we need the WHOLE context.
+                // So 2B *must* see the whole context.
+                
+                // If 0.6B processed chunks individually, the cache might be fragmented or just the last chunk.
+                // UNLESS the 'session_id' mechanism in 'generate.rs' persists the KV cache and appends.
+                
+                // Assuming 'generate.rs' appends to cache if prompt matches prefix:
+                // 1. Sys + Chunk1 -> Cache: [Sys, Chunk1]
+                // 2. Sys + Chunk2 -> Mismatch! (Prefix "Sys" matches, but "Chunk2" != "Chunk1").
+                // So it would reset and cache [Sys, Chunk2].
+                
+                // CONCLUSION: The 0.6B loop I wrote previously was FLAWED for context building.
+                // It should have accumulated messages.
+                
+                // HOWEVER, to fix 2B *now* assuming we want full context:
+                // We should feed 2B the full sequence.
+                // And to make 0.6B useful, 0.6B should *also* have received the full sequence accumulating.
+                
+                // BUT, changing 0.6B loop is big.
+                // Let's assume the user wants 2B to have full context.
+                // I will construct the FULL messages for 2B.
+            }
+
+            // Add last chunk with question
+            let last_chunk = classify_chunks.last().cloned().unwrap_or_default();
+            let effective_input = format!("{}\n\n{}", last_chunk, task_specific_prompt);
             messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_input })
                 ]),
                 name: None,
             }));
 
             let params = ChatCompletionParameters {
-                messages: messages.clone(),
+                messages,
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(16), // No output expected
+                max_tokens: Some(512), 
                 temperature: Some(0.1),
                 ..Default::default()
             };
 
-            let res = tokio::select!{
-                res = model.chat_params_with_spinner(
-                    params,
-                    &app_handle_clone, 
-                    "Data Recording (Small)",
-                    json!({ "task_id": task.id, "category": "Data Recording (Small)", "summary": "Recording..." }),
-                    Some(cancellation_token.clone()), 
-                    Some(task.id.clone())
-                ) => res?,
-                _ = async {
-                    loop {
-                        if cancellation_token.load(Ordering::Relaxed) { break; }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                } => { return Err(anyhow::anyhow!("Task cancelled")); }
-            };
+            model.chat_params_with_spinner(
+                params, &app_handle_clone, "Preprocessing (Large)",
+                json!({ "task_id": task.id, "category": "Classification (Infer)", "summary": "Analyzing page type..." }),
+                Some(cancellation_token.clone()), Some(task.id.clone())
+            ).await?
+        } else { "{}".to_string() };
+        
+        // Unload 2B
+        if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+        drop(model_lock);
 
-            messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                content: Some(res.clone()),
-                ..Default::default()
-            }));
-        }
-    }
-
-    println!("[Scheduler] Small Model Recording Complete. Handing over to LARGE model for Preprocessing.");
-    
-    // [CRITICAL] Unload Small Model and WAIT until VRAM is actually freed
-    if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
-    
-    // [FORCE-RELEASE] Explicitly drop the entire LogisModel to ensure no ghost references keep VRAM alive
-    drop(model_lock);
-    {
-        let mut model_guard = model_mutex.lock().await;
-        *model_guard = None; // Kill the generator AND the embedding model
-        println!("[PROCESS] LogisModel explicitly dropped for transition.");
-    }
-    
-    // Increase target to 2000MB and timeout to 10s for better stability
-    wait_for_resources_settled(2000, 1500, 10000).await;
-
-    // Re-acquire lock for Large model loading
-    let mut model_lock = model_mutex.lock().await;
-    if model_lock.is_none() {
-        println!("[PROCESS] Re-initializing LogisModel for Large inference...");
-        if let Ok(m) = LogisModel::new(None).await {
-            *model_lock = Some(m);
+        let type_info = parsing::parse_json_from_llm(&res);
+        page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        println!("[Scheduler] Classification Result: {}", page_type);
+        
+        if page_type.is_empty() || page_type == "unknown" {
+            return Ok(());
         }
     }
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    wait_for_resources_settled(2000, 1500, 5000).await;
 
-    // Step 2: Preprocessing (Classification -> Selectors) with LARGE model (2B)
-    if let Some(model) = model_lock.as_ref() {
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "task_id": task.id,
-            "category": "Intelligence Loading", "summary": "Loading 2B Model for Preprocessing...", "spinner": "⠋"
-        }));
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
-    }
+    // --- TASK 2: SELECTOR IDENTIFICATION ---
+    {
+        println!("[Scheduler] Starting TASK 2: SELECTORS (Switching Pattern)");
+        let selector_prompt = parsing::page_selectors_prompt(&page_type); 
+        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", selector_prompt);
 
-    // [IMPORTANT] 2B needs the content again to do classification. 
-    // We pass the full content or a significant part of it to 2B for the first time.
-    let mut large_messages = vec![
-        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: "You are a data recording assistant.".to_string(),
-            name: None,
-        })
-    ];
-
-    let mut page_type_res = "{}".to_string();
-
-    if let Some(model) = model_lock.as_ref() {
-        let type_prompt = parsing::page_type_prompt();
-        let app_handle_clone = app_handle.clone();
+        // 2.1 Ingest with 0.6B (Re-ingest chunks + New Question)
+        let mut model_lock = model_mutex.lock().await;
+        if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
         
-        // [MULTI-CHUNK] Ingest ALL chunks into 2B model to ensure full context
-        for (i, chunk) in classify_chunks.iter().enumerate() {
-            let is_last = i == classify_chunks_len - 1;
+        if let Some(model) = model_lock.as_ref() {
+            model.ensure_generator(crate::model::ModelSize::Small).await?;
+            let app_handle_clone = app_handle.clone();
             
-            // [STRICT PARITY] Prompt must match 0.6B EXACTLY for Cache Hit.
-            // 0.6B used: format!("{}\n\n{}", prompt, action_flag);
-            let classification_input = if is_last {
-                format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", chunk, type_prompt)
-            } else {
-                format!("{}\n\nACTION: INGEST", chunk)
-            };
+            let mut messages = vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
+            ];
 
-            large_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            for (i, chunk) in classify_chunks.iter().enumerate() {
+                let is_last = i == classify_chunks_len - 1;
+                let content = if is_last {
+                    format!("{}\n\n{}", chunk, task_specific_prompt)
+                } else {
+                    format!("{}\n\nACTION: INGEST", chunk)
+                };
+
+                messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
+                    ]),
+                    name: None,
+                }));
+
+                let params = ChatCompletionParameters {
+                    messages: messages.clone(),
+                    model: "qwen3vl".to_string(),
+                    max_tokens: Some(16), 
+                    temperature: Some(0.1),
+                    ..Default::default()
+                };
+
+                let _ = model.chat_params_with_spinner(
+                    params, &app_handle_clone, "Data Recording (Small)",
+                    json!({ "task_id": task.id, "category": "Selectors (Ingest)", "summary": format!("Updating context part {}/{}", i+1, classify_chunks_len) }),
+                    Some(cancellation_token.clone()), Some(task.id.clone())
+                ).await?;
+            }
+            model.unload_generator().await;
+        }
+        drop(model_lock);
+
+        wait_for_resources_settled(2000, 1500, 5000).await;
+
+        // 2.2 Infer with 2B
+        let mut model_lock = model_mutex.lock().await;
+        if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+        
+        let res = if let Some(model) = model_lock.as_ref() {
+            model.ensure_generator(crate::model::ModelSize::Large).await?;
+            let app_handle_clone = app_handle.clone();
+
+            // [FIX] Reconstruct FULL history exactly as 0.6B saw it to hit the cache
+            let mut messages = vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
+            ];
+
+            for chunk in classify_chunks.iter().take(classify_chunks_len.saturating_sub(1)) {
+                let content = format!("{}\n\nACTION: INGEST", chunk);
+                messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
+                    ]),
+                    name: None,
+                }));
+            }
+
+            let last_chunk = classify_chunks.last().cloned().unwrap_or_default();
+            let effective_input = format!("{}\n\n{}", last_chunk, task_specific_prompt);
+            
+            messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: classification_input })
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_input })
                 ]),
                 name: None,
             }));
 
             let params = ChatCompletionParameters {
-                messages: large_messages.clone(),
+                messages,
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(30000),
+                max_tokens: Some(1024), 
                 temperature: Some(0.1),
                 ..Default::default()
             };
 
-            let res = tokio::select!{
-                res = model.chat_params_with_spinner(
-                    params,
-                    &app_handle_clone, 
-                    "Preprocessing (Large)",
-                    json!({ 
-                        "task_id": task.id, 
-                        "category": "Preprocessing (Large)", 
-                        "summary": format!("Analyzing content part {}/{}...", i+1, classify_chunks_len) 
-                    }), 
-                    Some(cancellation_token.clone()), 
-                    // [INJECTION] Use the SAME session ID as 0.6B to trigger memory injection
-                    Some(task.id.clone()) 
-                ) => res?,
-                _ = async {
-                    loop {
-                        if cancellation_token.load(Ordering::Relaxed) { break; }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                } => { return Err(anyhow::anyhow!("Task cancelled")); }
-            };
-            
-            // Store result only if it's the answer
-            if is_last {
-                page_type_res = res.clone();
-            }
-
-            large_messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                content: Some(res),
-                ..Default::default()
-            }));
-        }
-    }
-
-    let type_info = parsing::parse_json_from_llm(&page_type_res);
-    let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-    println!("[Scheduler] 2B Classification Result: '{}'", page_type);
-    
-    if page_type.is_empty() || page_type == "unknown" {
+            model.chat_params_with_spinner(
+                params, &app_handle_clone, "Preprocessing (Large)",
+                json!({ "task_id": task.id, "category": "Selectors (Infer)", "summary": "Identifying selectors..." }),
+                Some(cancellation_token.clone()), Some(task.id.clone())
+            ).await?
+        } else { "{}".to_string() };
+        
         if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
-        return Ok(());
+        drop(model_lock);
+
+        selector_info = parsing::parse_json_from_llm(&res);
+        println!("[Scheduler] Selectors Found: {}", selector_info);
     }
 
     let mut final_page_info = json!({ "type": page_type });
+    let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+    println!("[Scheduler] is_detail determined: {}", is_detail);
 
-    // Step 2b: Identify Selectors (Using 2B Model)
-    let _ = app_handle.emit("extraction-progress", json!({
-        "task_id": task.id,
-        "category": "Preprocessing (Large)", "summary": "Determining selectors...", "spinner": "⠋"
-    }));
+    // [STRICT PARITY] Ported from proxy/src/index.ts mechanism
+    {
+        let store_guard = store_mutex.lock().await;
+        if let Some(db) = store_guard.as_ref() {
+            let team_id = if task.to_dest.is_empty() { 
+                crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
+            } else { task.to_dest.clone() };
 
-    let page_selectors_res = if let Some(model) = model_lock.as_ref() {
-        let next_question = parsing::page_selectors_prompt(&page_type); 
-        let app_handle_clone = app_handle.clone();
-        
-        large_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: format!("{}\n\nACTION: SAVE", next_question) })
-            ]),
-            name: None,
-        }));
+            // 1. page_id = hashId(cc + pathname) - Stripping search params to prevent duplicate schemas for same route
+            let clean_path = if let Some(pos) = task.ref_id.find('?') { &task.ref_id[..pos] } else { &task.ref_id };
+            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, clean_path)); 
+            
+            // 2. bcc = hashId(type + (isDetail ? cc.toUpperCase() : cc)) - Crucial for Tree grouping
+            let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
 
-        let params = ChatCompletionParameters {
-            messages: large_messages.clone(),
-            model: "qwen3vl".to_string(),
-            max_tokens: Some(30000),
-            temperature: Some(0.1),
-            ..Default::default()
-        };
-
-                let res = tokio::select!{
-                    res = model.chat_params_with_spinner(
-                        params,
-                        &app_handle_clone, 
-                        "Preprocessing (Large)",
-                        json!({ "task_id": task.id, "category": "Preprocessing (Large)", "summary": "Finding selectors..." }), 
-                        Some(cancellation_token.clone()), 
-                        Some(task.id.clone()) // [FIX] Explicitly pass task.id as session_id
-                    ) => res?,
-                    _ = async {
-                        loop {
-                            if cancellation_token.load(Ordering::Relaxed) { break; }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    } => { return Err(anyhow::anyhow!("Task cancelled")); }
-                };        res
-    } else { "{}".to_string() };
-
-    let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
-
-            println!("[Scheduler] Selectors Found: {}", selector_info);        
-        let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-        println!("[Scheduler] is_detail determined: {}", is_detail);
-
-        // [STRICT PARITY] Ported from proxy/src/index.ts mechanism
-        {
-            let store_guard = store_mutex.lock().await;
-            if let Some(db) = store_guard.as_ref() {
-                let team_id = if task.to_dest.is_empty() { 
-                    crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-                } else { task.to_dest.clone() };
-
-                // 1. page_id = hashId(cc + pathname) - Stripping search params to prevent duplicate schemas for same route
-                let clean_path = if let Some(pos) = task.ref_id.find('?') { &task.ref_id[..pos] } else { &task.ref_id };
-                let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, clean_path)); 
-                
-                // 2. bcc = hashId(type + (isDetail ? cc.toUpperCase() : cc)) - Crucial for Tree grouping
-                let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
-    
-                // 3. Prepare data exactly as proxy does
-                let mut page_data = selector_info.clone();
-                if let Some(obj) = page_data.as_object_mut() {
-                    let url_obj = url::Url::parse(&url).unwrap();
-                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                    obj.insert("link".to_string(), json!(clean_path));
-                    obj.insert("type".to_string(), json!(page_type));
-                }
-
-                let _ = db.upsert_item(
-                    "pages", 
-                    &page_id, 
-                    "pages", 
-                    page_data, 
-                    None,
-                    Some(&task.from_source),
-                    Some(&team_id),
-                    Some(&task.cc),
-                    Some(&bcc),
-                    Some(clean_path), // ref_id stored as clean path
-                    None
-                ).await;
-                println!("[Scheduler] Page learned with Proxy parity: {}", page_id);
+            // 3. Prepare data exactly as proxy does
+            let mut page_data = selector_info.clone();
+            if let Some(obj) = page_data.as_object_mut() {
+                let url_obj = url::Url::parse(&url).unwrap();
+                obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                obj.insert("link".to_string(), json!(clean_path));
+                obj.insert("type".to_string(), json!(page_type));
             }
-        } 
 
-        // Merge selectors into final_page_info
-
-        if let Some(obj) = selector_info.as_object() {
-            for (k, v) in obj {
-                final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone());
-            }
+            let _ = db.upsert_item(
+                "pages", 
+                &page_id, 
+                "pages", 
+                page_data, 
+                None,
+                Some(&task.from_source),
+                Some(&team_id),
+                Some(&task.cc),
+                Some(&bcc),
+                Some(clean_path), // ref_id stored as clean path
+                None
+            ).await;
+            println!("[Scheduler] Page learned with Proxy parity: {}", page_id);
         }
-        
-        let page_info = final_page_info; // Re-alias for original logic
-        
-        let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
-        let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
-        let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
+    } 
+
+    // Merge selectors into final_page_info
+
+    if let Some(obj) = selector_info.as_object() {
+        for (k, v) in obj {
+            final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone());
+        }
+    }
+    
+    let page_info = final_page_info; // Re-alias for original logic
+    
+    let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
+    let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
+    let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
 
     if page_type == "" || page_type == "unknown" {
         return Ok (());
@@ -1022,76 +1073,127 @@ async fn process_task(
                 let action_flag = if is_last_batch { "ACTION: SAVE" } else { "ACTION: INGEST" };
                 let prompt = format!("{}\n\n[RAW ITEMS]\n{}\n\n{}", instruction, batch_text, action_flag);
                 
-                // [FIX] Reuse existing history (chunks) to ensure safetensors cache hit
-                if let Some(model) = model_lock.as_ref() {
-                     let mut refine_messages = messages.clone();
-                     refine_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                         content: ChatCompletionRequestUserMessageContent::Array(vec![
-                             ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
-                         ]),
-                         name: None,
-                     }));
+                // [SWITCHING PATTERN] 1. Ingest with 0.6B
+                {
+                    let mut model_lock = model_mutex.lock().await;
+                    if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+                    if let Some(model) = model_lock.as_ref() {
+                        model.ensure_generator(crate::model::ModelSize::Small).await?;
+                        let app_handle_clone = app_handle.clone();
+                        
+                        let messages = vec![
+                            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                                content: "You are a data recording assistant.".to_string(),
+                                name: None,
+                            }),
+                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt.clone() })
+                                ]),
+                                name: None,
+                            })
+                        ];
 
-                     let params = ChatCompletionParameters {
-                        messages: refine_messages,
-                        model: "qwen3vl".to_string(),
-                        max_tokens: Some(30000),
-                        temperature: Some(0.95),
-                        ..Default::default()
-                    };
-                    
-                    let app_handle_clone = app_handle.clone();
-                    let refine_res = model.chat_params_with_spinner(
-                        params,
-                        &app_handle_clone, 
-                        "extraction-progress", 
-                        json!({ 
-                            "task_id": task.id,
-                            "category": "Data Refinement", 
-                            "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
-                        }),
-                        Some(cancellation_token.clone()),
-                        Some(task.id.clone()) // [INTEGRATED] Use original session ID to reuse main safetensors
-                    ).await;
+                        let params = ChatCompletionParameters {
+                            messages,
+                            model: "qwen3vl".to_string(),
+                            max_tokens: Some(16),
+                            temperature: Some(0.1),
+                            ..Default::default()
+                        };
 
-                    if let Ok(res) = refine_res {
-                         let parsed = parsing::parse_json_from_llm(&res);
-                         // Expecting { "items": [...] } or just an array
-                         let items_array = parsed.get("items").and_then(|v| v.as_array())
-                                            .or_else(|| parsed.as_array());
-                                            
-                         if let Some(arr) = items_array {
-                             let mut batch_refined = Vec::new();
-                             for (i, refined) in arr.iter().enumerate() {
-                                 if i < batch.len() {
-                                     let mut original = batch[i].clone();
-                                     merge_json(&mut original, refined.clone());
-                                     batch_refined.push(original.clone());
-                                     refined_items.push(original);
-                                 }
-                             }
-                             
-                             // Emit the batch results to be appended in the UI
-                             let _ = app_handle.emit("extraction-progress", json!({
-                                 "task_id": task.id,
-                                 "category": "Data Refinement",
-                                 "data": batch_refined,
-                                 "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
-                             }));
-
-                             // If LLM returned fewer items than batch, fill with remaining originals
-                             if arr.len() < batch.len() {
-                                 for i in arr.len()..batch.len() {
-                                     refined_items.push(batch[i].clone());
-                                 }
-                             }
-                         } else {
-                             // Fallback: keep original
-                             refined_items.extend_from_slice(batch);
-                         }
-                    } else {
-                        refined_items.extend_from_slice(batch);
+                        let _ = model.chat_params_with_spinner(
+                            params, &app_handle_clone, "Data Refinement (Small)",
+                            json!({ "task_id": task.id, "category": "Refinement (Ingest)", "summary": format!("Ingesting batch {}...", batch_idx + 1) }),
+                            Some(cancellation_token.clone()), Some(task.id.clone())
+                        ).await?;
+                        
+                        model.unload_generator().await;
                     }
+                }
+                
+                wait_for_resources_settled(2000, 1500, 5000).await;
+
+                // [SWITCHING PATTERN] 2. Infer with 2B
+                let refine_res_str = {
+                    let mut model_lock = model_mutex.lock().await;
+                    if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+                    
+                    let res = if let Some(model) = model_lock.as_ref() {
+                        model.ensure_generator(crate::model::ModelSize::Large).await?;
+                        let app_handle_clone = app_handle.clone();
+                        
+                        let messages = vec![
+                            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                                content: "You are a data recording assistant.".to_string(),
+                                name: None,
+                            }),
+                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                                ]),
+                                name: None,
+                            })
+                        ];
+
+                        let params = ChatCompletionParameters {
+                            messages,
+                            model: "qwen3vl".to_string(),
+                            max_tokens: Some(4096),
+                            temperature: Some(0.95),
+                            ..Default::default()
+                        };
+                        
+                        model.chat_params_with_spinner(
+                            params, &app_handle_clone, "Data Refinement (Large)",
+                            json!({ 
+                                "task_id": task.id,
+                                "category": "Refinement (Infer)", 
+                                "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
+                            }),
+                            Some(cancellation_token.clone()), Some(task.id.clone())
+                        ).await?
+                    } else { "{}".to_string() };
+                    
+                    if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+                    res
+                };
+
+                if !refine_res_str.is_empty() {
+                     let parsed = parsing::parse_json_from_llm(&refine_res_str);
+                     // Expecting { "items": [...] } or just an array
+                     let items_array = parsed.get("items").and_then(|v| v.as_array())
+                                        .or_else(|| parsed.as_array());
+                                        
+                     if let Some(arr) = items_array {
+                         let mut batch_refined = Vec::new();
+                         for (i, refined) in arr.iter().enumerate() {
+                             if i < batch.len() {
+                                 let mut original = batch[i].clone();
+                                 merge_json(&mut original, refined.clone());
+                                 batch_refined.push(original.clone());
+                                 refined_items.push(original);
+                             }
+                         }
+                         
+                         // Emit the batch results to be appended in the UI
+                         let _ = app_handle.emit("extraction-progress", json!({
+                             "task_id": task.id,
+                             "category": "Data Refinement",
+                             "data": batch_refined,
+                             "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
+                         }));
+
+                         // If LLM returned fewer items than batch, fill with remaining originals
+                         if arr.len() < batch.len() {
+                             for i in arr.len()..batch.len() {
+                                 refined_items.push(batch[i].clone());
+                             }
+                         }
+                     } else {
+                         // Fallback: keep original
+                         refined_items.extend_from_slice(batch);
+                     }
                 } else {
                     refined_items.extend_from_slice(batch);
                 }
@@ -1171,56 +1273,100 @@ async fn process_task(
         let extraction_instruction = parsing::item2json(page_type, &url, language);
         let detail_session_id = format!("{}_detail", task.id); // Separate session
 
-        // Phase 1: Ingest all chunks (Accumulate -> Save)
-        let mut detail_messages = vec![
-            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content: extraction_instruction.clone(),
-                name: None,
-            })
-        ];
-
+        // [SWITCHING PATTERN] Detail Extraction
         let mut extracted_data_temp = json!({});
 
-        for (chunk_idx, chunk) in chunks.iter().enumerate() {
-            let is_last = chunk_idx == chunks_len - 1;
-            
-            // Prepare prompt with INGEST/SAVE flags
-            let prompt = chunk.clone();
-            
-            // On the very last chunk, we append the JSON instruction AND the SAVE flag
-            // For intermediate chunks, just INGEST
-            let action_flag = if is_last { 
-                format!("\n\nACTION: JSON ONLY\n\nACTION: SAVE") 
-            } else { 
-                format!("\n\nACTION: INGEST") 
-            };
-            
-            let effective_prompt = format!("{}{}", prompt, action_flag);
-
-            // Add to history WITHOUT flag to avoid polluting prefix cache logic
-            detail_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt.clone() })
-                ]),
-                name: None,
-            }));
-
-            let _ = app_handle.emit("extraction-progress", json!({ 
-                "task_id": task.id,
-                "category": "Detail Ingestion", 
-                "summary": format!("Reading detail part {}/{}...", chunk_idx + 1, chunks_len),
-                "spinner": "⠋" 
-            }));
-
-            let model_lock = model_mutex.lock().await;
-            
-            let response = if let Some(model) = model_lock.as_ref() {
+        // 1. Ingest ALL chunks with 0.6B
+        {
+            let mut model_lock = model_mutex.lock().await;
+            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+            if let Some(model) = model_lock.as_ref() {
+                model.ensure_generator(crate::model::ModelSize::Small).await?;
                 let app_handle_clone = app_handle.clone();
                 
-                // Create temporary messages with the flag for this turn only
-                let mut current_messages = detail_messages.clone();
-                current_messages.pop();
-                current_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                let mut messages = vec![
+                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                            content: extraction_instruction.clone(),
+                            name: None,
+                        })
+                    ];
+
+                for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                    let is_last = chunk_idx == chunks_len - 1;
+                    
+                    // Prompt construction (Match 0.6B logic exactly)
+                    let prompt = chunk.clone();
+                    let action_flag = if is_last { 
+                        format!("\n\nACTION: JSON ONLY\n\nACTION: SAVE") 
+                    } else { 
+                        format!("\n\nACTION: INGEST") 
+                    };
+                    let effective_prompt = format!("{}{}", prompt, action_flag);
+
+                    // Note: Detail extraction usually needs the instruction prepended or appended?
+                    // Original code had instruction as System Message.
+                    // Here we follow the pattern: System Msg + User Msg.
+                    
+                    messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Array(vec![
+                            ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
+                        ]),
+                        name: None,
+                    }));
+
+                    let params = ChatCompletionParameters {
+                        messages: messages.clone(),
+                        model: "qwen3vl".to_string(),
+                        max_tokens: Some(if is_last { 16 } else { 16 }), // Small model just ingests
+                        temperature: Some(0.1),
+                        ..Default::default()
+                    };
+
+                    let _ = model.chat_params_with_spinner(
+                        params, &app_handle_clone, "Detail Extraction (Small)",
+                        json!({ "task_id": task.id, "category": "Detail Ingestion", "summary": format!("Ingesting part {}/{}...", chunk_idx + 1, chunks_len) }),
+                        Some(cancellation_token.clone()), Some(detail_session_id.clone())
+                    ).await?;
+                }
+                model.unload_generator().await;
+            }
+        }
+        
+        wait_for_resources_settled(2000, 1500, 5000).await;
+
+        // 2. Infer with 2B (Last chunk only triggers generation)
+        let response = {
+            let mut model_lock = model_mutex.lock().await;
+            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+            
+            let res = if let Some(model) = model_lock.as_ref() {
+                model.ensure_generator(crate::model::ModelSize::Large).await?;
+                let app_handle_clone = app_handle.clone();
+                
+                // [FIX] Reconstruct FULL history to hit the cache
+                let mut messages = vec![
+                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                        content: extraction_instruction.clone(),
+                        name: None,
+                    }),
+                ];
+
+                for chunk in chunks.iter().take(chunks_len.saturating_sub(1)) {
+                    let content = format!("{}\n\nACTION: INGEST", chunk);
+                    messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Array(vec![
+                            ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
+                        ]),
+                        name: None,
+                    }));
+                }
+
+                let last_chunk = chunks.last().cloned().unwrap_or_default();
+                let prompt = last_chunk;
+                let action_flag = format!("\n\nACTION: JSON ONLY\n\nACTION: SAVE");
+                let effective_prompt = format!("{}{}", prompt, action_flag);
+                
+                messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Array(vec![
                         ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
                     ]),
@@ -1228,52 +1374,27 @@ async fn process_task(
                 }));
 
                 let params = ChatCompletionParameters {
-                    messages: current_messages,
+                    messages,
                     model: "qwen3vl".to_string(),
-                    max_tokens: Some(30000),
+                    max_tokens: Some(16384),
                     temperature: Some(0.95),
                     ..Default::default()
                 };
 
-                let res = tokio::select!{
-                    res = model.chat_params_with_spinner(
-                        params,
-                        &app_handle_clone, 
-                        "extraction-progress", 
-                        json!({ "task_id": task.id, "category": "Detail Ingestion" }), 
-                        Some(cancellation_token.clone()), 
-                        Some(detail_session_id.clone())
-                    ) => res?,
-                    _ = async {
-                        loop {
-                            if cancellation_token.load(Ordering::Relaxed) { break; }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    } => { 
-                        if let Some(m) = model_lock.as_ref() {
-                            m.unload_generator().await;
-                        }
-                        return Err(anyhow::anyhow!("Task cancelled")); 
-                    }
-                };
-                
-                // Accumulate back assistant message if not last (to keep context flow in VRAM)
-                if !is_last {
-                    detail_messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                        content: Some(res.clone()),
-                        ..Default::default()
-                    }));
-                }
-                res
-            } else {
-                "{}".to_string()
-            };
-            drop(model_lock);
+                model.chat_params_with_spinner(
+                    params, &app_handle_clone, "Detail Extraction (Large)",
+                    json!({ "task_id": task.id, "category": "Detail Extraction", "summary": "Generating structured data..." }),
+                    Some(cancellation_token.clone()), Some(detail_session_id.clone())
+                ).await?
+            } else { "{}".to_string() };
+            
+            if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+            res
+        };
 
-            if is_last {
-                println!("[EXTRACT-FINAL] Result: {}", response);
-                extracted_data_temp = parsing::parse_json_from_llm(&response);
-            }
+        if !response.is_empty() {
+            println!("[EXTRACT-FINAL] Result: {}", response);
+            extracted_data_temp = parsing::parse_json_from_llm(&response);
         }
         
         extracted_data = extracted_data_temp;
@@ -1412,18 +1533,24 @@ async fn process_task(
 
             let vector = if let Some(v) = existing_vector {
                 Some(v)
-            } else if let Some(model) = model_lock.as_ref() {
-                let text_clone = text_to_embed.clone();
-                tokio::select!{
-                    res = model.get_embedding(text_clone) => Some(res?),
-                    _ = async {
-                        loop {
-                            if cancellation_token.load(Ordering::Relaxed) { break; }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
-                    } => { return Err(anyhow::anyhow!("Task cancelled")); }
-                }
-            } else { None };
+            } else {
+                // [FIX] Re-acquire lock locally
+                let mut model_lock = model_mutex.lock().await;
+                if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+                
+                if let Some(model) = model_lock.as_ref() {
+                    let text_clone = text_to_embed.clone();
+                    tokio::select!{
+                        res = model.get_embedding(text_clone) => Some(res?),
+                        _ = async {
+                            loop {
+                                if cancellation_token.load(Ordering::Relaxed) { break; }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                    }
+                } else { None }
+            };
             
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
@@ -1491,21 +1618,26 @@ async fn process_task(
                 
                 drop(store_guard);
 
-                let vector = if let Some(v) = existing_vector {
-                    Some(v)
-                } else if let Some(model) = model_lock.as_ref() {
-                    let text_clone = text_to_embed.clone();
-                    tokio::select!{
-                        res = model.get_embedding(text_clone) => Some(res?),
-                        _ = async {
-                            loop {
-                                if cancellation_token.load(Ordering::Relaxed) { break; }
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            }
-                        } => { return Err(anyhow::anyhow!("Task cancelled")); }
-                    }
-                } else { None };
-
+                            let vector = if let Some(v) = existing_vector {
+                                Some(v)
+                            } else {
+                                // [FIX] Re-acquire lock locally
+                                let mut model_lock = model_mutex.lock().await;
+                                if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+                                
+                                if let Some(model) = model_lock.as_ref() {
+                                    let text_clone = text_to_embed.clone();
+                                    tokio::select!{
+                                        res = model.get_embedding(text_clone) => Some(res?),
+                                        _ = async {
+                                            loop {
+                                                if cancellation_token.load(Ordering::Relaxed) { break; }
+                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                            }
+                                        } => { return Err(anyhow::anyhow!("Task cancelled")); }
+                                    }
+                                } else { None }
+                            };
                 let store_guard = store_mutex.lock().await;
                 if let Some(db) = store_guard.as_ref() {
                     let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
