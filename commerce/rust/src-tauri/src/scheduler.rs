@@ -182,7 +182,6 @@ pub async fn start_background_worker(
     // [NEW] Clear ALL temporary data directories at startup for a clean slate
     clear_all_temp_data(Some(&app_handle));
     
-    let app_handle_clone = app_handle.clone();
     tokio::spawn(async move {
         let mut delay_secs = 1;
         
@@ -565,10 +564,15 @@ async fn process_task(
             
             let prompt = chunk.clone();
             
+            // [DEBUG-LOG] Save chunk for verification
+            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let log_path = pug_logs_dir.join(format!("chunk_06b_{}_{}.pug", i, ts_nano));
+            let _ = std::fs::write(&log_path, &prompt);
+
             // On the last chunk, we immediately ask for classification to save a turn
             let effective_prompt = if is_last {
-                // Combine Ingestion + Classification Prompt
-                format!("{}\n\n{}\n\nACTION: JSON ONLY", prompt, parsing::page_type_prompt())
+                // Combine Ingestion + Classification Prompt + SAVE flag
+                format!("{}\n\n{}\n\nACTION: JSON ONLY\n\nACTION: SAVE", prompt, parsing::page_type_prompt())
             } else {
                 format!("{}\n\nACTION: INGEST", prompt)
             };
@@ -649,8 +653,10 @@ async fn process_task(
     if let Some(m) = model_lock.as_ref() {
         m.unload_generator().await; 
     }
-    // Optional: Small sleep to allow VRAM cleanup
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    
+    // [NEW] Wait for both GPU and CPU resources to be fully reclaimed and stable
+    println!("[Scheduler] Waiting for system resources to settle (GC/Driver cleanup)...");
+    wait_for_resources_settled(1000, 1500, 5000).await; // 1GB VRAM, 1.5GB RAM margin, max 5s
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -1172,7 +1178,7 @@ async fn process_task(
                 "spinner": "⠋" 
             }));
 
-            let mut model_lock = model_mutex.lock().await;
+            let model_lock = model_mutex.lock().await;
             
             let response = if let Some(model) = model_lock.as_ref() {
                 let app_handle_clone = app_handle.clone();
@@ -1555,6 +1561,62 @@ async fn process_task(
 fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
     println!("[Cleanup] Clearing all temporary data directories...");
     utils::paths::cleanup_temp_dirs(app_handle);
+}
+
+/// Robustly waits for both VRAM and System RAM to be reclaimed.
+/// It monitors if the resource availability has "settled" (stopped increasing).
+async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max_wait_ms: u64) {
+    use nvml_wrapper::Nvml;
+    use sysinfo::System;
+    
+    let mut sys = System::new_all();
+    let nvml = Nvml::init().ok();
+    let start_time = std::time::Instant::now();
+    
+    let target_vram_bytes = target_vram_mb * 1024 * 1024;
+    let target_ram_bytes = target_ram_mb * 1024 * 1024;
+
+    let mut last_vram = 0;
+    let mut last_ram = 0;
+    let mut stable_count = 0;
+
+    println!("[RESOURCE-WATCH] Monitoring recovery (VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
+
+    while start_time.elapsed().as_millis() < max_wait_ms as u128 {
+        sys.refresh_memory();
+        let current_ram = sys.available_memory();
+        let mut current_vram = 0;
+
+        if let Some(ref nvml_inst) = nvml {
+            if let Ok(dev) = nvml_inst.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    current_vram = mem.free;
+                }
+            }
+        }
+
+        // Check if we met the minimum thresholds AND if the values have stopped changing (settled)
+        let meets_threshold = (current_vram >= target_vram_bytes || nvml.is_none()) && (current_ram >= target_ram_bytes);
+        let is_stable = current_vram == last_vram && current_ram == last_ram;
+
+        if meets_threshold && is_stable {
+            stable_count += 1;
+            if stable_count >= 3 { // Must be stable for 3 consecutive checks (600ms)
+                println!("[RESOURCE-WATCH] Stabilized. VRAM: {:.2}GB, RAM: {:.2}GB free.", 
+                    current_vram as f64 / 1e9, current_ram as f64 / 1e9);
+                return;
+            }
+        } else {
+            stable_count = 0;
+        }
+
+        last_vram = current_vram;
+        last_ram = current_ram;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    println!("[RESOURCE-WATCH] Timeout reached or thresholds not met. Proceeding anyway.");
 }
 
 

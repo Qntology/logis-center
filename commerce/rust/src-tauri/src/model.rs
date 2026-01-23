@@ -16,7 +16,7 @@ use crate::openai_types::{
 use candle_core::{Device, DType};
 use image::DynamicImage;
 use serde_json::{Value, json, Map};
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, atomic::AtomicBool};
 use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::BASE64_STANDARD;

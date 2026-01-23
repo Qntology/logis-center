@@ -95,7 +95,6 @@ impl Qwen3VLGenerateModel {
         let is_vision_model = mmproj_path.is_some();
 
         // Processor initialization with vision support check
-        let has_vision = cfg.image_token_id.is_some() && is_vision_model;
         let pre_processor = Qwen3VLProcessor::new(path, &vision_dev, dtype)?;
         
         let qwen3_vl = if !gguf_files.is_empty() {
@@ -196,7 +195,7 @@ impl Qwen3VLGenerateModel {
         println!("[GENERATE] Input Token Count: {}", seq_len);
         println!("[GENERATE] Input Shape: {:?}", input_ids.shape());
 
-        let mut full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
+        let full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
 
         // [OPTIMIZATION] Detect action flags early to control caching behavior
         let is_ingest = input.replace_text.contains("ACTION: INGEST");

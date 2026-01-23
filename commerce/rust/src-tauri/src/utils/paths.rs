@@ -1,5 +1,5 @@
-use std::path::{PathBuf, Path};
-use tauri::{AppHandle, Manager};
+use std::path::PathBuf;
+use tauri::AppHandle;
 use std::fs;
 
 pub fn get_app_tmp_root(_app: Option<&AppHandle>) -> PathBuf {
