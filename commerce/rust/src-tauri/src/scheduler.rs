@@ -1615,59 +1615,62 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
         } else { false };
 
         // Check 1: Target Thresholds
-        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
+        let mut meets_vram = !has_gpu || current_vram >= target_vram_bytes;
         let meets_ram = current_ram >= target_ram_bytes;
         
-        // [PROCESS-ANALYSIS] If targets not met, identify who is using the memory
-        if (!meets_vram || !meets_ram) && start_time.elapsed().as_millis() % 2000 < 250 {
-            if !meets_vram && has_gpu {
-                if let Some(ref nvml_inst) = nvml {
-                    if let Ok(dev) = nvml_inst.device_by_index(0) {
-                        let mut gpu_users = Vec::new();
-                        
-                        // 1. Compute Processes
-                        if let Ok(procs) = dev.running_compute_processes() {
-                            for p in procs {
-                                let proc_name = sys.process(sysinfo::Pid::from(p.pid as usize))
-                                    .map(|proc| proc.name().to_string())
-                                    .unwrap_or_else(|| "Unknown".to_string());
-                                let is_me = if p.pid == my_pid { "(Me)" } else { "" };
-                                let used_mem = match p.used_gpu_memory {
-                                    UsedGpuMemory::Used(bytes) => bytes,
-                                    UsedGpuMemory::Unavailable => 0,
-                                };
-                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, used_mem / 1024 / 1024));
-                            }
-                        }
-                        
-                        // 2. Graphics Processes (Browsers often fall here)
-                        if let Ok(procs) = dev.running_graphics_processes() {
-                            for p in procs {
-                                let proc_name = sys.process(sysinfo::Pid::from(p.pid as usize))
-                                    .map(|proc| proc.name().to_string())
-                                    .unwrap_or_else(|| "Unknown".to_string());
-                                let is_me = if p.pid == my_pid { "(Me)" } else { "" };
-                                let used_mem = match p.used_gpu_memory {
-                                    UsedGpuMemory::Used(bytes) => bytes,
-                                    UsedGpuMemory::Unavailable => 0,
-                                };
-                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, used_mem / 1024 / 1024));
-                            }
-                        }
+        // [PROCESS-ANALYSIS & OPTIMIZATION] 
+        if has_gpu {
+            if let Some(ref nvml_inst) = nvml {
+                if let Ok(dev) = nvml_inst.device_by_index(0) {
+                    let mut other_gpu_usage: u64 = 0;
+                    let mut gpu_users = Vec::new();
 
+                    let mut process_procs = |procs: Vec<nvml_wrapper::struct_wrappers::device::ProcessInfo>| {
+                        for p in procs {
+                            let used = match p.used_gpu_memory {
+                                UsedGpuMemory::Used(b) => b,
+                                UsedGpuMemory::Unavailable => 0,
+                            };
+                            if p.pid != my_pid {
+                                other_gpu_usage += used;
+                            }
+                            
+                            // Collect for diagnostic log
+                            let proc_name = sys.process(sysinfo::Pid::from(p.pid as usize))
+                                .map(|proc| proc.name().to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            let is_me = if p.pid == my_pid { "(Me)" } else { "" };
+                            if used > 0 {
+                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, used / 1024 / 1024));
+                            }
+                        }
+                    };
+
+                    // Check both Compute and Graphics (Browsers)
+                    if let Ok(p) = dev.running_compute_processes() { process_procs(p); }
+                    if let Ok(p) = dev.running_graphics_processes() { process_procs(p); }
+
+                    // Optimization: If memory is mostly reserved by me, allow proceeding
+                    if !meets_vram && other_gpu_usage < 500 * 1024 * 1024 {
+                        println!("[RESOURCE-WATCH] VRAM is reserved by ME or free for reuse. Proceeding.");
+                        meets_vram = true;
+                    }
+
+                    // Diagnostic Log: Every 2s if still waiting
+                    if (!meets_vram || !meets_ram) && start_time.elapsed().as_millis() % 2000 < 250 {
                         if !gpu_users.is_empty() {
                             println!("[RESOURCE-DIAG] GPU Users: {}", gpu_users.join(", "));
                         }
+                        if !meets_ram {
+                            let mut heavy_procs: Vec<_> = sys.processes().values()
+                                .filter(|p| p.memory() > 500 * 1024 * 1024)
+                                .map(|p| format!("{}[{}MB]", p.name(), p.memory() / 1024 / 1024))
+                                .collect();
+                            heavy_procs.sort();
+                            println!("[RESOURCE-DIAG] Top RAM Users: {}", heavy_procs.join(", "));
+                        }
                     }
                 }
-            }
-            if !meets_ram {
-                let mut heavy_procs: Vec<_> = sys.processes().values()
-                    .filter(|p| p.memory() > 500 * 1024 * 1024) // Over 500MB
-                    .map(|p| format!("{}[{}MB]", p.name(), p.memory() / 1024 / 1024))
-                    .collect();
-                heavy_procs.sort();
-                println!("[RESOURCE-DIAG] Top RAM Users: {}", heavy_procs.join(", "));
             }
         }
 

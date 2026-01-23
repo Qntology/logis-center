@@ -236,8 +236,15 @@ impl Qwen3VLGenerateModel {
                                  if match_len < 50 {
                                      println!("[KV-HIERARCHY] Cache Mismatch! Prefix match only {} tokens.", match_len);
                                      if !cached_tokens.is_empty() && !full_input_ids_vec.is_empty() {
-                                         println!("[KV-HIERARCHY] Cache (first 5): {:?}", &cached_tokens[..cached_tokens.len().min(5)]);
-                                         println!("[KV-HIERARCHY] Input (first 5): {:?}", &full_input_ids_vec[..full_input_ids_vec.len().min(5)]);
+                                         let divergent_token_cache = cached_tokens.get(match_len).cloned();
+                                         let divergent_token_input = full_input_ids_vec.get(match_len).cloned();
+                                         
+                                         if let (Some(c), Some(i)) = (divergent_token_cache, divergent_token_input) {
+                                             let text_c = self.tokenizer.token_decode(vec![c]).unwrap_or_else(|_| "Unknown".to_string());
+                                             let text_i = self.tokenizer.token_decode(vec![i]).unwrap_or_else(|_| "Unknown".to_string());
+                                             println!("[KV-HIERARCHY] Divergence point (token {}): Cache='{}' ({}) vs Input='{}' ({})", 
+                                                match_len, text_c, c, text_i, i);
+                                         }
                                      }
                                  }
 
@@ -277,8 +284,15 @@ impl Qwen3VLGenerateModel {
                                  if match_len < 50 {
                                      println!("[KV-HIERARCHY] Cache Mismatch! Prefix match only {} tokens.", match_len);
                                      if !cached_tokens.is_empty() && !full_input_ids_vec.is_empty() {
-                                         println!("[KV-HIERARCHY] Cache (first 5): {:?}", &cached_tokens[..cached_tokens.len().min(5)]);
-                                         println!("[KV-HIERARCHY] Input (first 5): {:?}", &full_input_ids_vec[..full_input_ids_vec.len().min(5)]);
+                                         let divergent_token_cache = cached_tokens.get(match_len).cloned();
+                                         let divergent_token_input = full_input_ids_vec.get(match_len).cloned();
+                                         
+                                         if let (Some(c), Some(i)) = (divergent_token_cache, divergent_token_input) {
+                                             let text_c = self.tokenizer.token_decode(vec![c]).unwrap_or_else(|_| "Unknown".to_string());
+                                             let text_i = self.tokenizer.token_decode(vec![i]).unwrap_or_else(|_| "Unknown".to_string());
+                                             println!("[KV-HIERARCHY] Divergence point (token {}): Cache='{}' ({}) vs Input='{}' ({})", 
+                                                match_len, text_c, c, text_i, i);
+                                         }
                                      }
                                  }
 
