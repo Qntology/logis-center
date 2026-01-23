@@ -13,6 +13,21 @@ pub struct Qwen3VLGenerationConfig {
     pub transformers_version: String,
 }
 
+impl Default for Qwen3VLGenerationConfig {
+    fn default() -> Self {
+        Self {
+            bos_token_id: 151643,
+            eos_token_id: vec![151643, 151645],
+            pad_token_id: 151643,
+            repetition_penalty: 1.0,
+            temperature: 0.1,
+            top_k: 20,
+            top_p: 0.9,
+            transformers_version: "4.45.0".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Qwen3VLVisionConfig {
     pub depth: usize,
@@ -89,6 +104,15 @@ pub struct Size {
     pub shortest_edge: usize,
 }
 
+impl Default for Size {
+    fn default() -> Self {
+        Self {
+            longest_edge: 1344,
+            shortest_edge: 224,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PreprocessorConfig {
     pub do_convert_rgb: Option<bool>,
@@ -105,4 +129,25 @@ pub struct PreprocessorConfig {
     pub merge_size: usize,
     pub temporal_patch_size: usize,
     pub size: Size,
+}
+
+impl Default for PreprocessorConfig {
+    fn default() -> Self {
+        Self {
+            do_convert_rgb: Some(true),
+            do_normalize: Some(true),
+            do_pad: Some(true),
+            do_resize: Some(true),
+            do_rescale: Some(true),
+            image_mean: vec![0.48145466, 0.4578275, 0.40821073],
+            image_std: vec![0.26862954, 0.26130258, 0.2757771],
+            max_pixels: Some(12845056),
+            min_pixels: Some(3136),
+            rescale_factor: Some(0.00392156862745098),
+            patch_size: 14,
+            merge_size: 2,
+            temporal_patch_size: 2,
+            size: Size::default(),
+        }
+    }
 }

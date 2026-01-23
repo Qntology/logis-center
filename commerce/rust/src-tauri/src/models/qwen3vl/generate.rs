@@ -45,6 +45,9 @@ pub struct Qwen3VLGenerateModel {
 
 impl Qwen3VLGenerateModel {
     pub fn init(path: &str, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>) -> Result<Self> {
+        // [FIX] Normalize path to remove Windows UNC prefix (\\?\) which causes issues with some loaders
+        let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
+        
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
         let config_path = std::path::Path::new(path).join("config.json");
@@ -98,8 +101,11 @@ impl Qwen3VLGenerateModel {
         };
 
         let generation_config_path = std::path::Path::new(path).join("generation_config.json");
-        let generation_config: Qwen3VLGenerationConfig =
-            serde_json::from_slice(&std::fs::read(generation_config_path)?)?;
+        let generation_config: Qwen3VLGenerationConfig = if generation_config_path.exists() {
+            serde_json::from_slice(&std::fs::read(generation_config_path)?)?
+        } else {
+            Qwen3VLGenerationConfig::default()
+        };
         let model_name = if path.contains("0.6B") { "qwen3vl-0.6B".to_string() } else { "qwen3vl-2B".to_string() };
 
         Ok(Self {
@@ -466,28 +472,15 @@ impl Qwen3VLGenerateModel {
             }
         }
 
-                let res = self.tokenizer.token_decode(generate)?;
+        let res = self.tokenizer.token_decode(generate)?;
+        Ok(res)
+    }
 
-                Ok(res)
-
-            }
-
-        
-
-            pub fn clear_kv_cache(&mut self) {
-
-                match &mut self.qwen3_vl {
-
-                    ModelVariant::Standard(m) => m.clear_kv_cache(),
-
-                    ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
-
-                    ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
-
-                }
-
-            }
-
+    pub fn clear_kv_cache(&mut self) {
+        match &mut self.qwen3_vl {
+            ModelVariant::Standard(m) => m.clear_kv_cache(),
+            ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
+            ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
         }
-
-        
+    }
+}

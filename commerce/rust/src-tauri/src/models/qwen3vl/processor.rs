@@ -44,8 +44,11 @@ pub struct Qwen3VLProcessor {
 impl Qwen3VLProcessor {
     pub fn new(path: &str, device: &Device, dtype: DType) -> Result<Self> {
         let img_process_cfg_file = std::path::Path::new(path).join("preprocessor_config.json");
-        let img_process_cfg: PreprocessorConfig =
-            serde_json::from_slice(&std::fs::read(img_process_cfg_file)?)?;
+        let img_process_cfg: PreprocessorConfig = if img_process_cfg_file.exists() {
+            serde_json::from_slice(&std::fs::read(img_process_cfg_file)?)?
+        } else {
+            PreprocessorConfig::default()
+        };
 
         let image_token = "<|image_pad|>".to_string();
         let video_token = "<|video_pad|>".to_string();
