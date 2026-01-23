@@ -56,32 +56,23 @@ impl Qwen3VLGenerateModel {
         let cfg_dtype = cfg.text_config.dtype.as_str();
         let dtype = get_dtype(dtype, cfg_dtype);
         
-        // Processor initialization with vision support check
-        let has_vision = cfg.image_token_id.is_some() && mmproj_path.is_some();
-        let pre_processor = if has_vision {
-            Qwen3VLProcessor::new(path, &vision_dev, dtype)?
-        } else {
-            // Create a text-only processor (it won't attempt to find image tokens)
-            let mut p = Qwen3VLProcessor::new(path, &vision_dev, dtype)?;
-            // Internal hack to signal text-only mode
-            // We'll ensure processor doesn't crash without these
-            p
-        };
-        
         let gguf_files = find_type_files(path, "gguf")?;
-        
-        let is_vision_model = gguf_files.iter().any(|f| f.contains("mmproj"));
+        let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
+        let is_vision_model = mmproj_path.is_some();
+
+        // Processor initialization with vision support check
+        let has_vision = cfg.image_token_id.is_some() && is_vision_model;
+        let pre_processor = Qwen3VLProcessor::new(path, &vision_dev, dtype)?;
         
         let qwen3_vl = if !gguf_files.is_empty() {
-            let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
             let model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned();
 
             let max_tokens = hard_token_limit.unwrap_or(4096) as u64;
             let kv_reserve = max_tokens * 30000;
 
-            if is_vision_model && mmproj_path.is_some() {
+            if is_vision_model {
                 // CASE 1: Vision-Language Model
-                let mmproj = mmproj_path.unwrap();
+                let mmproj = mmproj_path.ok_or(anyhow!("Missing mmproj GGUF"))?;
                 let main = model_path.ok_or(anyhow!("Missing main GGUF for VL model"))?;
                 let mut mmproj_file = std::fs::File::open(&mmproj)?;
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_file)?;
