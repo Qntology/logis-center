@@ -474,7 +474,7 @@ impl Qwen3VLGenerateModel {
                          println!("[KV-VRAM] Accumulating context in VRAM (VL)...");
                      } else if is_save {
                          println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (VL)...");
-                         let target_block_size = 0; 
+                         let target_block_size = 1024; 
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
                          if !all_tokens.is_empty() { all_tokens.pop(); }
@@ -493,7 +493,7 @@ impl Qwen3VLGenerateModel {
                          println!("[KV-VRAM] Accumulating context in VRAM (Text)...");
                      } else if is_save {
                          println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (Text)...");
-                         let target_block_size = 0; 
+                         let target_block_size = 1024; 
                          let mut all_tokens = full_input_ids_vec;
                          all_tokens.extend(&generate);
                          if !all_tokens.is_empty() { all_tokens.pop(); }

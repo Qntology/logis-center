@@ -483,7 +483,8 @@ async fn process_task(
     let light_pug = {
         let clean_content = data_manager.load(&clean_html_path)?;
         let document = scraper::Html::parse_document(&clean_content);
-        parsing::convert_doc_to_clean_pug(&document, PugMode::StructureOnly)
+        // [FIX] Use FullContent for ingestion to maximize context for 2B later
+        parsing::convert_doc_to_clean_pug(&document, PugMode::FullContent)
         // clean_content dropped here
     }; 
     
@@ -504,7 +505,7 @@ async fn process_task(
                 // This is the original stable logic.
                 let classify_chunks = chunk_text(&light_pug, device_config.classify_chunk_size, 3000); 
                 let classify_chunks_len = classify_chunks.len(); 
-                println!("[Scheduler] Classification: {} chunks created.", classify_chunks_len);    let mut model_lock = model_mutex.lock().await;
+                println!("[Scheduler] Ingestion: {} chunks created.", classify_chunks_len);    let mut model_lock = model_mutex.lock().await;
     println!("[Scheduler] Model lock acquired.");
     
     if model_lock.is_none() {
@@ -531,9 +532,10 @@ async fn process_task(
         }
     }
     
-    let mut page_type_res = String::new();
-
-    // Step 1: Ingest chunks for Classification with full history
+    // Step 1: Ingest & Classify with Small Model (0.6B)
+    // Goal: Use the lightweight model to determine WHAT this page is.
+    // Optimization: This avoids loading the heavy 2B model for simple identification tasks.
+    
     use crate::openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage, 
         ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
@@ -543,162 +545,171 @@ async fn process_task(
 
     let mut messages = vec![
         ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-            content: "You are a web page analysis assistant.".to_string(),
+            content: "You are a web page analysis assistant. Output must be strictly JSON format. No explanations.".to_string(),
             name: None,
         })
     ];
 
-    // [DEBUG-LOG] Save initial classification system prompt
-    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let log_path = pug_logs_dir.join(format!("instruction_classify_{}_{}.pug", task.id, ts_nano));
-    if let Err(e) = std::fs::write(&log_path, parsing::page_type_prompt()) {
-        println!("[ERROR] Failed to write instruction_classify: {}", e);
-    }
+    let mut detected_page_type = String::new();
 
     if let Some(model) = model_lock.as_ref() {
         let app_handle_clone = app_handle.clone();
         
-        // Ensure SMALL model is loaded for Phase 1 (Ingestion)
+        // Ensure SMALL model is loaded for Phase 1 (Ingestion & Classification)
         model.ensure_generator(crate::model::ModelSize::Small).await?;
 
+        // 1-1. Ingest Content
         for (i, chunk) in classify_chunks.iter().enumerate() {
             let is_last = i == classify_chunks_len - 1;
-            println!("[Scheduler] Classification (Small): Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
+            println!("[Scheduler] Ingestion (Small): Processing chunk {}/{} (Last={})", i + 1, classify_chunks_len, is_last);
             
-            let mut prompt = chunk.clone();
-
-            if is_last {
-                prompt.push_str(&format!("\n\n{}\n\nACTION: JSON ONLY", parsing::page_type_prompt()));
-            }
-
-            // [DEBUG-LOG] Save classification chunk for verification
-            let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            let log_path = pug_logs_dir.join(format!("chunk_classify_{}_{}_{}.pug", task.id, i, ts_nano));
-            if let Err(e) = std::fs::write(&log_path, &prompt) {
-                println!("[ERROR] Failed to write chunk_classify: {}", e);
-            }
-
-            messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt.clone() })
-                ]),
-                name: None,
-            }));
+            let prompt = chunk.clone();
             
-            // ACTION: SAVE on last chunk to persist structural memory for 0.6B
-            let action_flag = if is_last { "ACTION: SAVE" } else { "ACTION: INGEST" };
-            let effective_prompt = format!("{}\n\n{}", prompt, action_flag);
+            // On the last chunk, we immediately ask for classification to save a turn
+            let effective_prompt = if is_last {
+                // Combine Ingestion + Classification Prompt
+                format!("{}\n\n{}\n\nACTION: JSON ONLY", prompt, parsing::page_type_prompt())
+            } else {
+                format!("{}\n\nACTION: INGEST", prompt)
+            };
+
+            let log_category = if is_last { "Classification (Small)" } else { "Content Ingestion (Small)" };
+            let log_summary = if is_last { "Identifying page type..." } else { "Reading content..." };
 
             let _ = app_handle.emit("extraction-progress", json!({ 
                 "task_id": task.id,
-                "category": "Structure Ingestion (Small)", 
-                "summary": format!("Reading structure part {}/{}...", i + 1, classify_chunks_len),
+                "category": log_category,
+                "summary": format!("{} ({}/{})", log_summary, i + 1, classify_chunks_len),
                 "spinner": "⠋" 
             }));
-            
-            let mut current_turn_messages = messages.clone();
-            current_turn_messages.pop();
-            current_turn_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+
+            // Push User Message
+            messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Array(vec![
                     ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
                 ]),
                 name: None,
             }));
 
+            // Generate
             let params = ChatCompletionParameters {
-                messages: current_turn_messages,
+                messages: messages.clone(),
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(if is_last { 1024 } else { 1024 }), 
-                temperature: Some(0.1), 
+                max_tokens: Some(if is_last { 512 } else { 16 }), // Increased buffer for classification
+                temperature: Some(0.1),
                 ..Default::default()
             };
 
-            tokio::select!{
+            let res = tokio::select!{
                 res = model.chat_params_with_spinner(
                     params,
                     &app_handle_clone, 
-                    "extraction-progress", 
-                    json!({ 
-                        "task_id": task.id,
-                        "category": "Structure Ingestion (Small)",
-                        "summary": if is_last { "Saving structural memory...".to_string() } else { format!("Reading structure part {}/{}...", i + 1, classify_chunks_len) }
-                    }), 
+                    log_category,
+                    json!({ "task_id": task.id, "category": log_category, "summary": log_summary }),
                     Some(cancellation_token.clone()), 
                     Some(task.id.clone())
-                ) => { 
-                    let out = res?;
-                    if is_last {
-                        page_type_res = out.clone();
-                    } else {
-                        messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                            content: Some(out),
-                            ..Default::default()
-                        }));
-                    }
-                },
+                ) => res?,
                 _ = async {
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 } => { return Err(anyhow::anyhow!("Task cancelled")); }
+            };
+
+            // Capture Assistant Response
+            messages.push(ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+                content: Some(res.clone()),
+                ..Default::default()
+            }));
+
+            if is_last {
+                println!("[Scheduler] Raw Classification Response: {:?}", res); // [DEBUG] Check raw output
+                
+                // Parse Classification Result
+                let type_info = parsing::parse_json_from_llm(&res);
+                detected_page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                println!("[Scheduler] Classification Result (from Small): '{}'", detected_page_type);
             }
         }
     }
 
-    println!("[Scheduler] Small Model Ingestion complete. Switching to LARGE model for intelligence tasks.");
-    
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-    // Phase 2: Switch to LARGE model for actual intelligence (Selectors, Extraction)
-    if let Some(model) = model_lock.as_ref() {
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "task_id": task.id,
-            "category": "Intelligence Handover", "summary": "Switching to Vision Model (2B)...", "spinner": "⠋"
-        }));
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
-    }
-
-    let mut final_page_info = json!({});
-    
-    let type_info = parsing::parse_json_from_llm(&page_type_res);
-    let page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-    println!("[Scheduler] Classification Result (from Small): '{}'", page_type);
-    
-    if page_type.is_empty() || page_type == "unknown" {
+    // [CHECKPOINT] If classification failed or unknown, stop here.
+    if detected_page_type.is_empty() || detected_page_type == "unknown" {
         println!("[Scheduler] Stopping: Unknown page type.");
-        // [FIX] Unload model if type unknown before early return
         if let Some(m) = model_lock.as_ref() {
             m.unload_generator().await;
         }
         return Ok(());
     }
 
-    final_page_info.as_object_mut().unwrap().insert("type".to_string(), json!(page_type));
+    println!("[Scheduler] Small Model Phase Complete. Detected: {}", detected_page_type);
+    
+    // [CRITICAL] Unload Small Model NOW to free VRAM for Large Model
+    if let Some(m) = model_lock.as_ref() {
+        m.unload_generator().await; 
+    }
+    // Optional: Small sleep to allow VRAM cleanup
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Step 2: Identify Selectors (Using 2B Model with inherited 0.6B history)
-    let _ = app_handle.emit("extraction-progress", json!({ 
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+    // Phase 2: Switch to LARGE model for Extraction (Selectors -> Data)
+    // [OPTIMIZATION] We DO NOT pass the full `messages` history. 
+    // The 2B model cannot use the 0.6B's KV cache anyway, so passing the history 
+    // forces it to re-read everything (Prefill), causing slowness.
+    // Instead, we start a FRESH context for the 2B model focused only on the target task.
+
+    if let Some(model) = model_lock.as_ref() {
+        let _ = app_handle.emit("extraction-progress", json!({ 
+            "task_id": task.id,
+            "category": "Intelligence Handover", "summary": "Switching to Vision Model (2B)...", "spinner": "⠋"
+        }));
+        // This will load the 2B model
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
+    }
+
+    let mut final_page_info = json!({ "type": detected_page_type });
+    let page_type = detected_page_type.clone();
+
+    // Step 2a: Identify Selectors (Using 2B Model)
+    // We give it the page type hint directly.
+    
+    let _ = app_handle.emit("extraction-progress", json!({
         "task_id": task.id,
-        "category": "Classification (Large)", "summary": format!("Type: {}. Determining selectors...", page_type), "spinner": "⠋"
+        "category": "Structure Analysis (Large)", "summary": format!("Type: {}. Determining selectors...", page_type), "spinner": "⠋"
     }));
+
+    // Re-build a short context for 2B
+    let mut large_messages = vec![
+        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: "You are an expert web scraper.".to_string(),
+            name: None,
+        })
+    ];
 
     let page_selectors_res = if let Some(model) = model_lock.as_ref() {
         let next_question = parsing::page_selectors_prompt(&page_type); 
         let app_handle_clone = app_handle.clone();
         
-        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(pug_logs_dir.join(format!("prompt_selectors_{}_{}.pug", task.id, ts_nano)), &next_question);
+        // Provide context: "This is a [Type] page. [Content snippet if needed or just Instruction]"
+        // Since 2B doesn't have the content loaded, we might need to re-inject a SMALL, RELEVANT part of the content 
+        // OR rely on its ability to generalize from the instruction if it doesn't strictly need the HTML to guess standard selectors.
+        // HOWEVER, to find *actual* selectors, it needs to see the HTML structure. 
+        // So we re-inject the FIRST chunk (usually contains header/table structure) for selector identification.
+        
+        let header_chunk = classify_chunks.get(0).cloned().unwrap_or_default();
+        let selector_prompt = format!("PAGE CONTEXT (Snippet):\n{}\n\nTASK: Based on this structure, {}\n\nACTION: SAVE", header_chunk, next_question);
 
-        // Inherit history from 0.6B Phase
-        messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+        large_messages.push(ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Array(vec![
-                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: format!("{}\n\nACTION: SAVE", next_question) })
+                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: selector_prompt })
             ]),
             name: None,
         }));
 
         let params = ChatCompletionParameters {
-            messages: messages.clone(),
+            messages: large_messages.clone(),
             model: "qwen3vl".to_string(),
             max_tokens: Some(1024),
             temperature: Some(0.1),
@@ -712,10 +723,11 @@ async fn process_task(
                 "extraction-progress", 
                 json!({ 
                     "task_id": task.id,
-                    "category": "Classification (Large)", "summary": format!("Type: {}. Finding selectors...", page_type)
+                    "category": "Structure Analysis (Large)", "summary": format!("Type: {}. Finding selectors...", page_type)
                 }), 
                 Some(cancellation_token.clone()), 
-                Some(task.id.clone()) // Will create 2B safetensors cache
+                // We use a DIFFERENT session ID for 2B to avoid collision/confusion with 0.6B cache path
+                Some(format!("{}_large_struct", task.id)) 
             ) => res?,
             _ = async {
                 loop {
@@ -724,15 +736,12 @@ async fn process_task(
                 }
             } => { return Err(anyhow::anyhow!("Task cancelled")); }
         };
-
-        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(pug_logs_dir.join(format!("res_selectors_{}_{}.res", task.id, ts_nano)), &res);
         res
     } else { "{}".to_string() };
-    
-    messages.pop();
 
-            let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
+    // We don't need to pop messages here because we used a dedicated `large_messages` vector.
+
+    let selector_info = parsing::parse_json_from_llm(&page_selectors_res);
             println!("[Scheduler] Selectors Found: {}", selector_info);        
         let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
         println!("[Scheduler] is_detail determined: {}", is_detail);
