@@ -471,9 +471,7 @@ impl Qwen3VLGenerateModel {
              match &mut self.qwen3_vl {
                  ModelVariant::QuantizedVL(m) => {
                      let token_path = path.join("tokens.json");
-                     if is_ingest {
-                         println!("[KV-VRAM] Accumulating context in VRAM (VL)...");
-                     } else if is_save {
+                     if is_save {
                          println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (VL)...");
                          let target_block_size = 1024; 
                          let mut all_tokens = full_input_ids_vec;
@@ -484,15 +482,15 @@ impl Qwen3VLGenerateModel {
                                  let _ = serde_json::to_writer(file, &all_tokens);
                              }
                          }
+                     } else if is_ingest {
+                         println!("[KV-VRAM] Accumulating context in VRAM (VL)...");
                      } else {
                          m.clear_kv_cache();
                      }
                  },
                  ModelVariant::QuantizedText(m) => {
                      let token_path = path.join("tokens.json");
-                     if is_ingest {
-                         println!("[KV-VRAM] Accumulating context in VRAM (Text)...");
-                     } else if is_save {
+                     if is_save {
                          println!("[KV-DISK] Finalizing ingestion. Ultra-fast Direct Save (Text)...");
                          let target_block_size = 1024; 
                          let mut all_tokens = full_input_ids_vec;
@@ -503,6 +501,8 @@ impl Qwen3VLGenerateModel {
                                  let _ = serde_json::to_writer(file, &all_tokens);
                              }
                          }
+                     } else if is_ingest {
+                         println!("[KV-VRAM] Accumulating context in VRAM (Text)...");
                      } else {
                          m.clear_kv_cache();
                      }
