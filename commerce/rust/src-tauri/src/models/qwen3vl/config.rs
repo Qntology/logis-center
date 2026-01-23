@@ -4,7 +4,7 @@ use candle_nn::Activation;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Qwen3VLGenerationConfig {
     pub bos_token_id: u32,
-    pub eos_token_id: Vec<i64>, 
+    pub eos_token_id: serde_json::Value, 
     pub pad_token_id: u32,
     pub repetition_penalty: f32,
     pub temperature: f32,
@@ -17,7 +17,7 @@ impl Default for Qwen3VLGenerationConfig {
     fn default() -> Self {
         Self {
             bos_token_id: 151643,
-            eos_token_id: vec![151643, 151645],
+            eos_token_id: serde_json::json!([151643, 151645]),
             pad_token_id: 151643,
             repetition_penalty: 1.0,
             temperature: 0.1,
@@ -57,7 +57,7 @@ pub struct Qwen3VLTextConfig {
     pub architectural: Option<String>, 
     pub attention_bias: bool,
     pub attention_dropout: f32,
-    pub bos_token_id: u32,
+    pub bos_token_id: Option<u32>,
     pub eos_token_id: u32,
     pub head_dim: usize,
     pub hidden_act: Activation,
@@ -71,14 +71,14 @@ pub struct Qwen3VLTextConfig {
     pub num_hidden_layers: usize,
     pub num_key_value_heads: usize,
     pub rms_norm_eps: f64,
-    pub rope_scaling: RopeScaling,
+    pub rope_scaling: Option<RopeScaling>,
     pub rope_theta: f32,
     pub sliding_window: Option<usize>,
     pub tie_word_embeddings: bool,
     pub use_cache: bool,
     pub use_sliding_window: Option<bool>,
     pub vocab_size: usize,
-    pub dtype: String,
+    pub dtype: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -88,7 +88,7 @@ pub struct Qwen3VLConfig {
     pub hidden_size: Option<usize>,
     pub image_token_id: Option<usize>,
     pub model_type: String, 
-    pub text_config: Qwen3VLTextConfig,
+    pub text_config: Option<Qwen3VLTextConfig>,
     pub tie_word_embeddings: bool,
     pub torch_dtype: Option<String>,
     pub transformers_version: String,

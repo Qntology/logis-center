@@ -377,8 +377,14 @@ impl LogisModel {
     }
 
     pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
-        // Ensure generator is loaded
-        self.ensure_generator(ModelSize::Large).await?;
+        // [FIX] Use current generator if available, else default to Large
+        {
+            let gen_guard = self.generator.lock().await;
+            if gen_guard.is_none() {
+                drop(gen_guard);
+                self.ensure_generator(ModelSize::Large).await?;
+            }
+        }
         
         let self_clone = self.generator.clone();
         let system_text = system.to_string();
@@ -470,8 +476,14 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
     ) -> anyhow::Result<String> {
-        // Ensure generator is loaded
-        self.ensure_generator(ModelSize::Large).await?;
+        // [FIX] Do not force reload Large. Use current if available, else default to Large.
+        {
+            let gen_guard = self.generator.lock().await;
+            if gen_guard.is_none() {
+                drop(gen_guard);
+                self.ensure_generator(ModelSize::Large).await?;
+            }
+        }
 
         // [FIX] Inject task_id from session_id if it's a task reference
         if let Some(ref sid) = session_id {

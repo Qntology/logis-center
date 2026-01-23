@@ -798,8 +798,10 @@ impl QuantizedQwen3VLModel {
         let vb_visual = from_gguf_content(config, ct_vision, reader_vision, &actual_vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
+
         // Load Language Model from main file
-        let language_model = QuantizedQwen3VLTextModel::new(&config.text_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve)?;
+        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve)?;
         
         // --- Organic Budget Calculation for Head ---
         let mut head_weight_size = 0_u64;
@@ -1014,8 +1016,10 @@ impl QuantizedQwen3TextModel {
     ) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text Model (0.6B Optimized)");
         
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
+
         let language_model = QuantizedQwen3VLTextModel::new(
-            &config.text_config, 
+            t_config, 
             ct_main, 
             reader_main, 
             "model", 

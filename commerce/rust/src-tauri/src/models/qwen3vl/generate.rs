@@ -51,12 +51,43 @@ impl Qwen3VLGenerateModel {
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
         let config_path = std::path::Path::new(path).join("config.json");
-        let cfg: Qwen3VLConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
+        
+        // [FIX] Robust Config Loading
+        // 1. Read raw JSON
+        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
+        
+        // 2. Try standard deserialization first
+        let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() {
+            serde_json::from_value(raw_config)?
+        } else {
+            // 3. Fallback: Construct config assuming root IS the text config
+            println!("[CONFIG] 'text_config' missing. Assuming flat text model structure.");
+            let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())
+                .map_err(|e| anyhow!("Failed to parse flat text config: {}", e))?;
+            
+            // Construct Qwen3VLConfig manually
+            crate::models::qwen3vl::config::Qwen3VLConfig {
+                architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize),
+                image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize),
+                model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(),
+                text_config: Some(text_config),
+                tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true),
+                torch_dtype: raw_config.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize),
+                vision_config: None, // No vision config for flat text models
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+            }
+        };
         
         let text_dev = get_device(text_device);
         let vision_dev = get_device(vision_device);
         
-        let cfg_dtype = cfg.text_config.dtype.as_str();
+        // Safe access to optional text_config
+        let cfg_dtype = cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16");
         let dtype = get_dtype(dtype, cfg_dtype);
         
         let gguf_files = find_type_files(path, "gguf")?;
@@ -108,6 +139,19 @@ impl Qwen3VLGenerateModel {
         };
         let model_name = if path.contains("0.6B") { "qwen3vl-0.6B".to_string() } else { "qwen3vl-2B".to_string() };
 
+        let (eos_token_id1, eos_token_id2) = match &generation_config.eos_token_id {
+            serde_json::Value::Number(n) => {
+                let id = n.as_u64().unwrap_or(151645) as u32;
+                (id, id)
+            },
+            serde_json::Value::Array(arr) => {
+                let id1 = arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32;
+                let id2 = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(id1 as u64) as u32;
+                (id1, id2)
+            },
+            _ => (151643, 151643),
+        };
+
         Ok(Self {
             chat_template,
             tokenizer,
@@ -115,8 +159,8 @@ impl Qwen3VLGenerateModel {
             qwen3_vl,
             text_device: text_dev,
             vision_device: vision_dev,
-            eos_token_id1: generation_config.eos_token_id[0] as u32,
-            eos_token_id2: generation_config.eos_token_id[1] as u32,
+            eos_token_id1,
+            eos_token_id2,
             generation_config,
             model_name,
             hard_token_limit,
