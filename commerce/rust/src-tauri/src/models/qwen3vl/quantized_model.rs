@@ -240,51 +240,72 @@ impl QuantizedQwen3VLTextAttention {
                             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
                             let mut map = HashMap::new();
 
+                            // [EXPERIMENTAL] bit_depth: 4 or 8
+                            let bits = 4u32; 
+                            map.insert("bits".to_string(), Tensor::from_vec(vec![bits], (1,), &Device::Cpu)?);
+
                             if block_size == 0 {
-                                // [ULTRA-FAST] Raw Tensor Save (10x faster, skips CPU-bound quantization)
+                                // [ULTRA-FAST] Raw Tensor Save
                                 map.insert("k_raw".to_string(), k.to_device(&Device::Cpu)?);
                                 map.insert("v_raw".to_string(), v.to_device(&Device::Cpu)?);
                                 map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
                             } else {
                                 map.insert("mode".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
 
-                                // Helper for 8-bit quantization (Flexible Block Size)
-                                let quantize_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, b_size: usize| -> Result<()> {
+                                // Helper for Flexible Quantization (4-bit or 8-bit)
+                                let quantize_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, b_size: usize, b_depth: u32| -> Result<()> {
                                     use rayon::prelude::*; 
                                     
                                     let shape = t.shape().dims().to_vec();
                                     let t_flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
                                     let num_blocks = (t_flat.len() + b_size - 1) / b_size;
 
-                                    let (scales, quantized): (Vec<f32>, Vec<Vec<i8>>) = t_flat.par_chunks(b_size)
+                                    let (scales, quantized_data): (Vec<f32>, Vec<Vec<u8>>) = t_flat.par_chunks(b_size)
                                         .map(|chunk| {
                                             let max_val = chunk.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                                            let scale = max_val / 127.0; 
-                                            let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
                                             
-                                            let mut local_q = Vec::with_capacity(chunk.len());
-                                            for &val in chunk {
-                                                let q = (val * inv_scale).round().clamp(-127.0, 127.0) as i8;
-                                                local_q.push(q);
+                                            if b_depth == 4 {
+                                                // 4-bit: Map -8..7 to 0..15
+                                                let scale = max_val / 7.0;
+                                                let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                                                let mut qs = Vec::with_capacity(chunk.len());
+                                                for &val in chunk {
+                                                    let q = ((val * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
+                                                    qs.push(q);
+                                                }
+                                                // Pack two 4-bit values into one u8
+                                                let mut packed = Vec::with_capacity((qs.len() + 1) / 2);
+                                                for i in (0..qs.len()).step_by(2) {
+                                                    let low = qs[i];
+                                                    let high = if i + 1 < qs.len() { qs[i+1] } else { 0 };
+                                                    packed.push((high << 4) | (low & 0x0F));
+                                                }
+                                                (scale, packed)
+                                            } else {
+                                                // 8-bit: Standard i8
+                                                let scale = max_val / 127.0;
+                                                let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                                                let mut packed = Vec::with_capacity(chunk.len());
+                                                for &val in chunk {
+                                                    let q = (val * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                                                    packed.push(q as u8);
+                                                }
+                                                (scale, packed)
                                             }
-                                            (scale, local_q)
                                         })
                                         .unzip();
 
-                                    let quantized_flat: Vec<i8> = quantized.into_iter().flatten().collect();
-                                    let q_len = quantized_flat.len();
-                                    let bytes: Vec<u8> = quantized_flat.iter().map(|&x| x as u8).collect();
-
-                                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(bytes, (q_len,), &Device::Cpu)?);
+                                    let flat_data: Vec<u8> = quantized_data.into_iter().flatten().collect();
+                                    
+                                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(flat_data.clone(), (flat_data.len(),), &Device::Cpu)?);
                                     map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?);
                                     map.insert(format!("{}_shape", prefix), Tensor::from_vec(shape.iter().map(|&x| x as u32).collect(), (shape.len(),), &Device::Cpu)?);
                                     Ok(())
                                 };
 
-                                quantize_tensor(k, "k", &mut map, block_size)?;
-                                quantize_tensor(v, "v", &mut map, block_size)?;
+                                quantize_tensor(k, "k", &mut map, block_size, bits)?;
+                                quantize_tensor(v, "v", &mut map, block_size, bits)?;
                                 
-                                // Store the block_size used for this file
                                 map.insert("block_size".to_string(), Tensor::from_vec(vec![block_size as u32], (1,), &Device::Cpu)?);
                             }
 
@@ -306,7 +327,12 @@ impl QuantizedQwen3VLTextAttention {
                             let mode = tensors.get("mode")
                                 .and_then(|t| t.to_vec1::<u32>().ok())
                                 .and_then(|v| v.get(0).cloned())
-                                .unwrap_or(1); // Default to quantized
+                                .unwrap_or(1);
+
+                            let bits = tensors.get("bits")
+                                .and_then(|t| t.to_vec1::<u32>().ok())
+                                .and_then(|v| v.get(0).cloned())
+                                .unwrap_or(8); // Default to 8-bit for backward compatibility
 
                             let (k, v) = if mode == 0 {
                                 // [ULTRA-FAST] Raw Load
@@ -315,35 +341,56 @@ impl QuantizedQwen3VLTextAttention {
                                 let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
                                 (k.to_device(device)?.to_dtype(target_dtype)?, v.to_device(device)?.to_dtype(target_dtype)?)
                             } else {
-                                // Get the block_size from the file, fallback to 1024 if not found
                                 let block_size = tensors.get("block_size")
                                     .and_then(|t| t.to_vec1::<u32>().ok())
                                     .and_then(|v| v.get(0).cloned())
                                     .unwrap_or(1024) as usize;
 
-                                        // Helper for dequantization (8-bit Parallelized)
-                                        let dequantize_tensor = |prefix: &str| -> Result<Tensor> {
+                                        // Helper for Dequantization
+                                        let dequantize_tensor = |prefix: &str, b_depth: u32| -> Result<Tensor> {
                                             use rayon::prelude::*;
                                             let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("Missing packed"))?.to_vec1::<u8>()?;
                                             let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("Missing scales"))?.to_vec1::<f32>()?;
                                             let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
                                             let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
                                             
-                                            // [PARALLEL] Unpack and scale in parallel
-                                            let decoded: Vec<f32> = packed.par_chunks(block_size)
-                                                .enumerate()
-                                                .flat_map(|(s_idx, chunk)| {
-                                                    let scale = scales[s_idx];
-                                                    chunk.par_iter().map(move |&byte| (byte as i8) as f32 * scale)
-                                                })
-                                                .collect();
+                                            let total_elements: usize = shape.iter().product();
+                                            
+                                            let mut decoded: Vec<f32> = if b_depth == 4 {
+                                                // Unpack 4-bit (2 values per byte)
+                                                let packed_block_size = (block_size + 1) / 2;
+                                                packed.par_chunks(packed_block_size)
+                                                    .enumerate()
+                                                    .flat_map(|(s_idx, chunk)| {
+                                                        let scale = scales[s_idx];
+                                                        let mut out = Vec::with_capacity(chunk.len() * 2);
+                                                        for &byte in chunk {
+                                                            let low = (byte & 0x0F) as f32 - 8.0;
+                                                            let high = (byte >> 4) as f32 - 8.0;
+                                                            out.push(low * scale);
+                                                            out.push(high * scale);
+                                                        }
+                                                        out.into_par_iter()
+                                                    })
+                                                    .collect()
+                                            } else {
+                                                // Standard 8-bit
+                                                packed.par_chunks(block_size)
+                                                    .enumerate()
+                                                    .flat_map(|(s_idx, chunk)| {
+                                                        let scale = scales[s_idx];
+                                                        chunk.par_iter().map(move |&byte| (byte as i8) as f32 * scale)
+                                                    })
+                                                    .collect()
+                                            };
 
+                                            decoded.truncate(total_elements); // Ensure exact size
                                             let t = Tensor::from_vec(decoded, shape, &Device::Cpu)?;
                                             Ok(t.to_device(device)?.to_dtype(if device.is_cuda() { DType::BF16 } else { DType::F32 })?) 
                                         };
 
-                                let k = dequantize_tensor("k")?;
-                                let v = dequantize_tensor("v")?;
+                                let k = dequantize_tensor("k", bits)?;
+                                let v = dequantize_tensor("v", bits)?;
                                 (k, v)
                             };
 
