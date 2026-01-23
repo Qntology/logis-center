@@ -549,7 +549,6 @@ async fn process_task(
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
     };
 
-    let system_prompt = "You are a data recording assistant.".to_string();
     let mut page_type = String::new();
     let mut selector_info = json!({});
 
@@ -569,9 +568,7 @@ async fn process_task(
             let app_handle_clone = app_handle.clone();
             
             // Ingest Chunks
-            let mut messages = vec![
-                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
-            ];
+            let mut messages = vec![];
 
             for (i, chunk) in classify_chunks.iter().enumerate() {
                 let is_last = i == classify_chunks_len - 1;
@@ -621,9 +618,7 @@ async fn process_task(
             let app_handle_clone = app_handle.clone();
 
             // [FIX] Reconstruct FULL history exactly as 0.6B saw it to hit the cache
-            let mut messages = vec![
-                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
-            ];
+            let mut messages = vec![];
 
             // Add intermediate chunks
             for chunk in classify_chunks.iter().take(classify_chunks_len.saturating_sub(1)) {
@@ -739,9 +734,7 @@ async fn process_task(
             model.ensure_generator(crate::model::ModelSize::Small).await?;
             let app_handle_clone = app_handle.clone();
             
-            let mut messages = vec![
-                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
-            ];
+            let mut messages = vec![];
 
             for (i, chunk) in classify_chunks.iter().enumerate() {
                 let is_last = i == classify_chunks_len - 1;
@@ -788,9 +781,7 @@ async fn process_task(
             let app_handle_clone = app_handle.clone();
 
             // [FIX] Reconstruct FULL history exactly as 0.6B saw it to hit the cache
-            let mut messages = vec![
-                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage { content: system_prompt.clone(), name: None }),
-            ];
+            let mut messages = vec![];
 
             for chunk in classify_chunks.iter().take(classify_chunks_len.saturating_sub(1)) {
                 let content = format!("{}\n\nACTION: INGEST", chunk);
