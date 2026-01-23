@@ -711,7 +711,6 @@ async fn process_task(
         
         // Unload 2B
         if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
-        *model_lock = None; // Total release
         drop(model_lock);
 
         let type_info = parsing::parse_json_from_llm(&res);
@@ -829,6 +828,7 @@ async fn process_task(
         } else { "{}".to_string() };
         
         if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+        *model_lock = None; // Force total release
         drop(model_lock);
 
         selector_info = parsing::parse_json_from_llm(&res);
@@ -1073,9 +1073,9 @@ async fn process_task(
 
                 let instruction = parsing::list2json(&page_type, &language);
                 let action_flag = if is_last_batch { "ACTION: SAVE" } else { "ACTION: INGEST" };
-                let prompt = format!("{}\n\n[RAW ITEMS]\n{}\n\n{}", instruction, batch_text, action_flag);
+                let pure_data_input = format!("[RAW ITEMS]\n{}\n\n{}", batch_text, action_flag);
                 
-                // [SWITCHING PATTERN] 1. Ingest with 0.6B
+                // [STRICT RELAY] 1. Ingest with 0.6B
                 {
                     let mut model_lock = model_mutex.lock().await;
                     if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
@@ -1090,35 +1090,28 @@ async fn process_task(
                             }),
                             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                                 content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt.clone() })
+                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: pure_data_input.clone() })
                                 ]),
                                 name: None,
                             })
                         ];
 
-                        let params = ChatCompletionParameters {
-                            messages,
-                            model: "qwen3vl".to_string(),
-                            max_tokens: Some(16),
-                            temperature: Some(0.1),
-                            ..Default::default()
-                        };
-
                         let _ = model.chat_params_with_spinner(
-                            params, &app_handle_clone, "Data Refinement (Small)",
-                            json!({ "task_id": task.id, "category": "Refinement (Ingest)", "summary": format!("Ingesting batch {}...", batch_idx + 1) }),
+                            ChatCompletionParameters { messages, model: "qwen3vl".to_string(), max_tokens: Some(16), temperature: Some(0.1), ..Default::default() },
+                            &app_handle_clone, "Refinement (Small)",
+                            json!({ "task_id": task.id, "category": "Refinement (Ingest)", "summary": format!("Ingesting batch {}/{}...", batch_idx + 1, (total_refine_count + batch_size - 1) / batch_size) }),
                             Some(cancellation_token.clone()), Some(task.id.clone())
                         ).await?;
                         
                         model.unload_generator().await;
                     }
-                    *model_lock = None; // Total release
+                    *model_lock = None;
                     drop(model_lock);
                 }
                 
                 wait_for_resources_settled(2500, 1500).await;
 
-                // [SWITCHING PATTERN] 2. Infer with 2B
+                // [STRICT RELAY] 2. Infer with 2B
                 let refine_res_str = {
                     let mut model_lock = model_mutex.lock().await;
                     if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
@@ -1134,32 +1127,32 @@ async fn process_task(
                             }),
                             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                                 content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: prompt })
+                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: pure_data_input })
+                                ]),
+                                name: None,
+                            }),
+                            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage { content: Some("".to_string()), ..Default::default() }),
+                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                                        text: format!("TASK: {}\n\nACTION: JSON ONLY", instruction) 
+                                    })
                                 ]),
                                 name: None,
                             })
                         ];
 
-                        let params = ChatCompletionParameters {
-                            messages,
-                            model: "qwen3vl".to_string(),
-                            max_tokens: Some(4096),
-                            temperature: Some(0.95),
-                            ..Default::default()
-                        };
-                        
                         model.chat_params_with_spinner(
-                            params, &app_handle_clone, "Data Refinement (Large)",
-                            json!({ 
-                                "task_id": task.id,
-                                "category": "Refinement (Infer)", 
-                                "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
-                            }),
+                            ChatCompletionParameters { messages, model: "qwen3vl".to_string(), max_tokens: Some(4096), temperature: Some(0.95), ..Default::default() },
+                            &app_handle_clone, "Refinement (Large)",
+                            json!({ "task_id": task.id, "category": "Refinement (Infer)", "summary": format!("Refining items {}-{}...", start_item, end_item) }),
                             Some(cancellation_token.clone()), Some(task.id.clone())
                         ).await?
                     } else { "{}".to_string() };
                     
                     if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+                    *model_lock = None;
+                    drop(model_lock);
                     res
                 };
 
@@ -1395,6 +1388,8 @@ async fn process_task(
             } else { "{}".to_string() };
             
             if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+            *model_lock = None; // Force total release
+            drop(model_lock);
             res
         };
 
