@@ -604,15 +604,13 @@ async fn process_task(
                 ).await?;
             }
             
-            // Unload 0.6B explicitly to force flush and VRAM release
+            // Unload 0.6B explicitly
             model.unload_generator().await;
         }
+        *model_lock = None; // Force total release
         drop(model_lock);
         
-        // Wait for VRAM
-        if !wait_for_resources_settled(2500, 1500, 5000).await {
-            return Err(anyhow::anyhow!("Insufficient VRAM to load Large model. Please close other GPU-heavy apps."));
-        }
+        wait_for_resources_settled(2500, 1500).await;
 
         // 1.2 Infer with 2B
         let mut model_lock = model_mutex.lock().await;
@@ -713,6 +711,7 @@ async fn process_task(
         
         // Unload 2B
         if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+        *model_lock = None; // Total release
         drop(model_lock);
 
         let type_info = parsing::parse_json_from_llm(&res);
@@ -725,7 +724,7 @@ async fn process_task(
     }
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-    wait_for_resources_settled(2500, 1500, 5000).await;
+    wait_for_resources_settled(2500, 1500).await;
 
     // --- TASK 2: SELECTOR IDENTIFICATION ---
     {
@@ -776,9 +775,10 @@ async fn process_task(
             }
             model.unload_generator().await;
         }
+        *model_lock = None; // Total release
         drop(model_lock);
 
-        wait_for_resources_settled(2500, 1500, 5000).await;
+        wait_for_resources_settled(2500, 1500).await;
 
         // 2.2 Infer with 2B
         let mut model_lock = model_mutex.lock().await;
@@ -1112,9 +1112,11 @@ async fn process_task(
                         
                         model.unload_generator().await;
                     }
+                    *model_lock = None; // Total release
+                    drop(model_lock);
                 }
                 
-                wait_for_resources_settled(2500, 1500, 5000).await;
+                wait_for_resources_settled(2500, 1500).await;
 
                 // [SWITCHING PATTERN] 2. Infer with 2B
                 let refine_res_str = {
@@ -1332,9 +1334,11 @@ async fn process_task(
                 }
                 model.unload_generator().await;
             }
+            *model_lock = None; // Force total release
+            drop(model_lock);
         }
         
-        wait_for_resources_settled(2500, 1500, 5000).await;
+        wait_for_resources_settled(2500, 1500).await;
 
         // 2. Infer with 2B (Last chunk only triggers generation)
         let response = {
@@ -1732,25 +1736,23 @@ fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
 }
 
 /// Robustly waits for both VRAM and System RAM to be reclaimed.
-/// Returns true if targets met, false if timed out.
-async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max_wait_ms: u64) -> bool {
+/// This function loops indefinitely until the target resources are met.
+async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
     use nvml_wrapper::Nvml;
     use sysinfo::System;
     
     let mut sys = System::new_all();
     let nvml = Nvml::init().ok();
-    let start_time = std::time::Instant::now();
     
     let target_vram_bytes = target_vram_mb * 1024 * 1024;
     let target_ram_bytes = target_ram_mb * 1024 * 1024;
 
-    let mut last_vram = 0;
-    let mut last_ram = 0;
     let mut stable_count = 0;
+    let mut last_report = std::time::Instant::now();
 
-    println!("[RESOURCE-WATCH] Monitoring recovery (VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
+    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
 
-    while start_time.elapsed().as_millis() < max_wait_ms as u128 {
+    loop {
         sys.refresh_all(); 
         let current_ram = sys.available_memory();
         let mut current_vram = 0;
@@ -1767,34 +1769,22 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
         let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
         let meets_ram = current_ram >= target_ram_bytes;
         
-        if has_gpu {
-            if (!meets_vram || !meets_ram) && start_time.elapsed().as_millis() % 2000 < 250 {
-                println!("[RESOURCE-DIAG] Waiting for Driver Cleanup... Current Free VRAM: {:.2} GB", current_vram as f64 / 1e9);
-            }
-        }
-
-        let vram_delta = (current_vram as i64 - last_vram as i64).abs();
-        let ram_delta = (current_ram as i64 - last_ram as i64).abs();
-        let margin = 50 * 1024 * 1024; // 50MB
-
-        let is_vram_stable = !has_gpu || vram_delta < margin;
-        let is_ram_stable = ram_delta < margin;
-
-        if meets_vram && meets_ram && is_vram_stable && is_ram_stable {
+        if meets_vram && meets_ram {
             stable_count += 1;
             if stable_count >= 3 { 
-                println!("[RESOURCE-WATCH] Resources reached target and stabilized. Proceeding.");
-                return true;
+                println!("[RESOURCE-WATCH] Resources cleared. Proceeding.");
+                break;
             }
         } else {
             stable_count = 0;
+            // 5초마다 상태 보고
+            if last_report.elapsed().as_secs() >= 5 {
+                println!("[RESOURCE-DIAG] Still waiting for VRAM... Current Free: {:.2} GB, Target: {:.2} GB", 
+                    current_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0);
+                last_report = std::time::Instant::now();
+            }
         }
 
-        last_vram = current_vram;
-        last_ram = current_ram;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-
-    println!("[RESOURCE-WATCH] Timeout reached. Targets not met (VRAM: {:.2} GB).", last_vram as f64 / 1e9);
-    false
 }
