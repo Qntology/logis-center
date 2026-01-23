@@ -366,15 +366,31 @@ impl QuantizedQwen3VLTextAttention {
                                 Ok(t.to_device(device)?.to_dtype(if device.is_cuda() { DType::BF16 } else { DType::F32 })?) 
                             };
 
-                            let current_len = k.dim(2)?;
-                            if current_len >= expected_len {
-                                let k = k.narrow(2, 0, expected_len)?;
-                                let v = v.narrow(2, 0, expected_len)?;
-                                self.kv_cache = Some((k, v));
-                            } else {
-                                println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
-                                self.kv_cache = None;
-                            }
+                            (dequantize_tensor("k", bits)?, dequantize_tensor("v", bits)?)
+                        };
+
+                        // [INJECTION-TRANSFORM] Auto-match dimensions regardless of model source
+                        let (_b, h, _s, d) = k.dims4()?;
+                        let target_heads = self.num_attention_heads;
+                        let target_dim = self.head_dim;
+
+                        if h != target_heads || d != target_dim {
+                            println!("[MEMORY-INJECTION] Adapting layer {} structure: Heads {}->{}, Dim {}->{}", 
+                                self.layer_idx, h, target_heads, d, target_dim);
+                            
+                            k = k.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(d))?.narrow(D::Minus1, 0, target_dim)?;
+                            v = v.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(d))?.narrow(D::Minus1, 0, target_dim)?;
+                            k = k.pad_with_zeros(1, 0, target_heads.saturating_sub(h))?.narrow(1, 0, target_heads)?;
+                            v = v.pad_with_zeros(1, 0, target_heads.saturating_sub(h))?.narrow(1, 0, target_heads)?;
+                        }
+
+                        // [RESTORED] Original Assignment Logic with Length Check
+                        let current_len = k.dim(2)?;
+                        if current_len >= expected_len {
+                            let k = k.narrow(2, 0, expected_len)?;
+                            let v = v.narrow(2, 0, expected_len)?;
+                            self.kv_cache = Some((k, v));
+                        } else {
                             println!("[KV-WARN] Cache too short ({} < {}). Clearing.", current_len, expected_len);
                             self.kv_cache = None;
                         }
