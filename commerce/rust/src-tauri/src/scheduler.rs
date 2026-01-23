@@ -12,6 +12,7 @@ use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
+use nvml_wrapper::enums::device::UsedGpuMemory;
 
 // --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
 // Handles offloading of large text data to disk to prevent RAM/VRAM bloating.
@@ -1157,7 +1158,7 @@ async fn process_task(
             let is_last = chunk_idx == chunks_len - 1;
             
             // Prepare prompt with INGEST/SAVE flags
-            let mut prompt = chunk.clone();
+            let prompt = chunk.clone();
             
             // On the very last chunk, we append the JSON instruction AND the SAVE flag
             // For intermediate chunks, just INGEST
@@ -1613,15 +1614,39 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, max
             if !meets_vram && has_gpu {
                 if let Some(ref nvml_inst) = nvml {
                     if let Ok(dev) = nvml_inst.device_by_index(0) {
-                        if let Ok(procs) = dev.compute_running_processes() {
-                            let mut gpu_users = Vec::new();
+                        let mut gpu_users = Vec::new();
+                        
+                        // 1. Compute Processes
+                        if let Ok(procs) = dev.running_compute_processes() {
                             for p in procs {
                                 let proc_name = sys.process(sysinfo::Pid::from(p.pid as usize))
                                     .map(|proc| proc.name().to_string())
                                     .unwrap_or_else(|| "Unknown".to_string());
                                 let is_me = if p.pid == my_pid { "(Me)" } else { "" };
-                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, p.used_gpu_memory / 1024 / 1024));
+                                let used_mem = match p.used_gpu_memory {
+                                    UsedGpuMemory::Used(bytes) => bytes,
+                                    UsedGpuMemory::Unavailable => 0,
+                                };
+                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, used_mem / 1024 / 1024));
                             }
+                        }
+                        
+                        // 2. Graphics Processes (Browsers often fall here)
+                        if let Ok(procs) = dev.running_graphics_processes() {
+                            for p in procs {
+                                let proc_name = sys.process(sysinfo::Pid::from(p.pid as usize))
+                                    .map(|proc| proc.name().to_string())
+                                    .unwrap_or_else(|| "Unknown".to_string());
+                                let is_me = if p.pid == my_pid { "(Me)" } else { "" };
+                                let used_mem = match p.used_gpu_memory {
+                                    UsedGpuMemory::Used(bytes) => bytes,
+                                    UsedGpuMemory::Unavailable => 0,
+                                };
+                                gpu_users.push(format!("{}{}[{}MB]", proc_name, is_me, used_mem / 1024 / 1024));
+                            }
+                        }
+
+                        if !gpu_users.is_empty() {
                             println!("[RESOURCE-DIAG] GPU Users: {}", gpu_users.join(", "));
                         }
                     }
