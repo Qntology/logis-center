@@ -217,6 +217,8 @@ async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
     if (currentImage) {
         btnExtract.style.display = "flex";
+        btnExtract.innerHTML = "⚡";
+        btnExtract.classList.remove("active-spinner");
         btnExtract.title = "Extract from Image";
         return;
     }
@@ -233,13 +235,25 @@ async function updateExtractButtonVisibility() {
         const isActive = await invoke<boolean>("check_active_task", { 
             payload: { cc: ccHash, refId: hashedRefId } 
         });
+
         if (isActive === true) {
-            btnExtract.style.display = "none";
+            // [NEW] Show spinner if task is already running for this page
+            btnExtract.style.display = "flex";
+            btnExtract.classList.add("active-spinner");
+            btnExtract.title = "Extraction in progress...";
+            // The global startSpinner() logic will handle the actual frame rotation 
+            // because we added .active-spinner class.
+            if (!spinnerInterval) startSpinner(); 
         } else {
             btnExtract.style.display = "flex";
+            btnExtract.innerHTML = "⚡";
+            btnExtract.classList.remove("active-spinner");
             btnExtract.title = `Extract from ${hostname}`;
         }
-    } catch (e) { btnExtract.style.display = "flex"; }
+    } catch (e) { 
+        btnExtract.style.display = "flex"; 
+        btnExtract.innerHTML = "⚡";
+    }
 }
 
 listen("browser-match-found", async (event: any) => {
