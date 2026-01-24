@@ -435,25 +435,10 @@ async function renderNavigation() {
 searchInput?.addEventListener("input", () => {
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = window.setTimeout(async () => {
-        const keyword = searchInput.value.toLowerCase();
-        if (!keyword) { refreshList(); return; }
-        try {
-            const results = await invoke<[string, string, number][]>("search_documents", { query: keyword });
-            if (docTableBody) {
-                docTableBody.innerHTML = "";
-                if (results.length === 0) {
-                    docTableBody.innerHTML = "<tr><td colspan='4' style='text-align:center; padding:20px;'>No AI matches.</td></tr>";
-                } else {
-                    results.forEach(([id, text, score]) => {
-                        const tr = document.createElement("tr");
-                        tr.style.cursor = "pointer";
-                        tr.innerHTML = `<td style='text-align:center;'>✨</td><td>Result</td><td title="${text}">${id.slice(0,8)}...</td><td>${score.toFixed(2)}</td>`;
-                        tr.addEventListener("click", () => showDetail(id));
-                        docTableBody.appendChild(tr);
-                    });
-                }
-            }
-        } catch (e) { console.error("Filter error:", e); }
+        currentPage = 0;
+        hasMore = true;
+        if (docTableBody) docTableBody.innerHTML = "";
+        await loadMoreDocs();
     }, 800);
 });
 
@@ -787,17 +772,43 @@ async function loadMoreDocs() {
     if (isLoading || !hasMore) return;
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
+    
+    const keyword = searchInput?.value.toLowerCase() || "";
+    
     try {
-        // [REMOVED] renderTaskRows call here. Active tasks now only appear in Settings (Chat).
-
-        const docs = await invoke<any[]>("get_all_documents", { limit: pageSize, offset: currentPage * pageSize });
-        if (docs.length < pageSize) hasMore = false;
-        if (docs.length > 0) {
-            cachedDocs = [...cachedDocs, ...docs];
-            renderDocRows(docs);
-            currentPage++;
-        } else if (currentPage === 0) {
-            docTableBody.innerHTML = "<tr><td colspan='5' style='text-align:center; padding:20px;'>No documents found.</td></tr>";
+        if (keyword) {
+            // [NEW] Paginated Search
+            const results = await invoke<[string, string, number][]>("search_documents", { 
+                query: keyword, 
+                limit: pageSize, 
+                offset: currentPage * pageSize 
+            });
+            
+            if (results.length < pageSize) hasMore = false;
+            
+            if (results.length > 0) {
+                results.forEach(([id, text, score]) => {
+                    const tr = document.createElement("tr");
+                    tr.style.cursor = "pointer";
+                    tr.innerHTML = `<td style='text-align:center;'>✨</td><td>Result</td><td title="${text}">${id.slice(0,8)}...</td><td>${score.toFixed(2)}</td>`;
+                    tr.addEventListener("click", () => showDetail(id));
+                    docTableBody?.appendChild(tr);
+                });
+                currentPage++;
+            } else if (currentPage === 0) {
+                if (docTableBody) docTableBody.innerHTML = "<tr><td colspan='4' style='text-align:center; padding:20px;'>No AI matches.</td></tr>";
+            }
+        } else {
+            // [STRICT] Regular Paginated List
+            const docs = await invoke<any[]>("get_all_documents", { limit: pageSize, offset: currentPage * pageSize });
+            if (docs.length < pageSize) hasMore = false;
+            if (docs.length > 0) {
+                cachedDocs = [...cachedDocs, ...docs];
+                renderDocRows(docs);
+                currentPage++;
+            } else if (currentPage === 0) {
+                if (docTableBody) docTableBody.innerHTML = "<tr><td colspan='5' style='text-align:center; padding:20px;'>No documents found.</td></tr>";
+            }
         }
     } catch (e) { console.error(e); } 
     finally { isLoading = false; if (loadingIndicator) loadingIndicator.style.display = "none"; }
