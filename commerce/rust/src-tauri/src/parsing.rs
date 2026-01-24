@@ -34,11 +34,15 @@ pub fn pre_clean_html(html: &str) -> String {
 
 
 
-    // 3. 단일 태그 및 불필요한 메타 태그 정리
+        // 3. 단일 태그 및 불필요한 메타 태그 정리 (input은 제외하고 보존)
 
-    let re_single = Regex::new(r"(?is)<(meta|link|br|hr|input|source)\b[^>]*>").unwrap();
 
-    let clean = re_single.replace_all(&html, "");
+
+        let re_single = Regex::new(r"(?is)<(meta|link|br|hr|source)\b[^>]*>").unwrap();
+
+
+
+        let clean = re_single.replace_all(&html, "");
 
 
 
@@ -222,7 +226,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 attributes_string.push_str(&format!("({})", other_attributes.join(" ")));
             }
 
-            // div 축약 로직
+            // div 축약 로직 (JS Parity: 실제 태그 출력 전에 하단으로 이동)
             let mut current_node = node;
             while let Some(current_el) = current_node.value().as_element() {
                 if current_el.name().to_lowercase() != "div" { break; }
