@@ -14,10 +14,11 @@ const DB_URI: &str = "data/lancedb";
 pub struct Task {
     pub id: String,
     pub r#type: String,
-    pub from_source: String, 
-    pub to_dest: String,     
+    pub from: String, 
+    pub to: String,     
     pub cc: String,
     pub bcc: String,
+    #[serde(rename = "ref")]
     pub ref_id: String,
     #[serde(rename = "data")]
     pub data_json: String,   
@@ -132,7 +133,7 @@ impl VectorStore {
     pub async fn has_active_task(&self, cc: &str, ref_id: &str) -> Result<bool> {
         let table = self.conn.open_table("tasks").execute().await?;
         let results = table.query()
-            .only_if(format!("cc = '{}' AND ref_id = '{}' AND (status = 10 OR status = 1)", cc, ref_id))
+            .only_if(format!("cc = '{}' AND ref = '{}' AND (status = 10 OR status = 1)", cc, ref_id))
             .limit(1).execute().await?.try_collect::<Vec<_>>().await?;
         Ok(!results.is_empty())
     }
