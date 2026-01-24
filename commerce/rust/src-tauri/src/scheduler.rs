@@ -484,11 +484,8 @@ async fn process_task(
     // [MEMORY] Load Clean -> Parse Pug -> Drop Clean
     let light_pug = {
         let clean_content = data_manager.load(&clean_html_path)?;
-        let document = scraper::Html::parse_document(&clean_content);
-        // [FIX] Use FullContent for ingestion to maximize context for 2B later
-        let pug = parsing::convert_doc_to_clean_pug(&document, PugMode::FullContent);
-        // [CRITICAL] Sanitize special characters that could break tokenizer parity
-        parsing::sanitize_llm_input(&pug)
+        // [CLASSIFICATION ONLY] Use high-level entry function as requested
+        parsing::convert_to_clean_pug(&clean_content, PugMode::FullContent)
     }; 
     
     // [DEBUG-LOG] Save generated Pug with nanosecond precision to prevent overwriting
@@ -1171,7 +1168,19 @@ async fn process_task(
         let content_pug = {
             let clean_content = data_manager.load(&clean_html_path)?;
             let document = scraper::Html::parse_document(&clean_content);
-            parsing::convert_doc_to_clean_pug_selector(&document, &target_selector, PugMode::FullContent)
+            let mut pug_output = String::new();
+            
+            if let Ok(selector) = scraper::Selector::parse(&target_selector) {
+                for node in document.tree.root().descendants() {
+                    if let Some(element_ref) = scraper::ElementRef::wrap(node) {
+                        if selector.matches(&element_ref) {
+                             parsing::generate_pug_lines(node, 0, &mut pug_output, &PugMode::FullContent);
+                             break;
+                        }
+                    }
+                }
+            }
+            parsing::sanitize_llm_input(&pug_output)
         };
 
         if content_pug.trim().is_empty() {

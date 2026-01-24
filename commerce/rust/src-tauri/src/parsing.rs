@@ -162,7 +162,7 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
 
 
 
-fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode) {
+pub fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode) {
     if indent_level > 50 { return; }
     let indent = "    ".repeat(indent_level);
     
