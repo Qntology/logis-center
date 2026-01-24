@@ -240,13 +240,15 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 .with_head()
                 .no_sandbox()
                 .viewport(None);
+
             let tmp_root = crate::utils::paths::get_app_tmp_root(None);
             let profile_dir = tmp_root.join("browser_profiles").join(browser);
             let _ = std::fs::create_dir_all(&profile_dir);
             let mut p_str = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir).to_string_lossy().to_string();
             if p_str.starts_with(r"\\?\") { p_str = p_str[4..].to_string(); }
-            builder = builder.user_data_dir(std::path::PathBuf::from(p_str));
-            builder.args(args).build().map_err(|e| anyhow!("Config error: {}", e))
+            
+            builder = builder.user_data_dir(std::path::PathBuf::from(p_str)).args(args);
+            builder.build().map_err(|e| anyhow!("Config error: {}", e))
         };
 
         // 3. Launch
