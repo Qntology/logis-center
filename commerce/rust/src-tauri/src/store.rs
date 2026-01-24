@@ -79,22 +79,16 @@ impl VectorStore {
         ]));
 
         let existing = self.conn.table_names().execute().await?;
-        
-        // Check and fix 'tasks' table
         if existing.contains(&"tasks".to_string()) {
             let table = self.conn.open_table("tasks").execute().await?;
             let current_schema = table.schema().await?;
             let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
                 field.data_type() == &DataType::Utf8
             } else { true };
-
             if needs_recreate {
-                println!("[Store] Schema mismatch for tasks. Dropping and recreating...");
                 let _ = self.conn.drop_table("tasks", &[]).await;
             }
         }
-        
-        // Re-check existence after potential drop
         let existing = self.conn.table_names().execute().await?;
         if !existing.contains(&"tasks".to_string()) {
             let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
@@ -109,20 +103,16 @@ impl VectorStore {
             Field::new("created_at", DataType::Int64, false),
         ]));
 
-        // Check and fix 'talks' table
         if existing.contains(&"talks".to_string()) {
             let table = self.conn.open_table("talks").execute().await?;
             let current_schema = table.schema().await?;
             let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
                 field.data_type() == &DataType::Utf8
             } else { true };
-
             if needs_recreate {
-                println!("[Store] Schema mismatch for talks. Dropping and recreating...");
                 let _ = self.conn.drop_table("talks", &[]).await;
             }
         }
-
         let existing = self.conn.table_names().execute().await?;
         if !existing.contains(&"talks".to_string()) {
             let _ = self.conn.create_table("talks", RecordBatchIterator::new(vec![], msg_schema)).execute().await;
@@ -158,12 +148,7 @@ impl VectorStore {
 
     pub async fn get_all_messages(&self, limit: usize, offset: usize) -> Result<Vec<Value>> {
         let table = self.conn.open_table("talks").execute().await?;
-        // Query with limit and offset, ordered by created_at descending to get latest first
-        let results = table.query()
-            .limit(limit)
-            .offset(offset)
-            .execute().await?.try_collect::<Vec<_>>().await?;
-        
+        let results = table.query().limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -174,18 +159,11 @@ impl VectorStore {
             let createds = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..batch.num_rows() {
                 msgs.push(json!({
-                    "id": ids.value(i), 
-                    "role": roles.value(i), 
-                    "content": contents.value(i), 
-                    "task_id": task_ids.value(i), 
-                    "status": statuses.value(i), 
-                    "created_at": createds.value(i)
+                    "id": ids.value(i), "role": roles.value(i), "content": contents.value(i), 
+                    "task_id": task_ids.value(i), "status": statuses.value(i), "created_at": createds.value(i)
                 }));
             }
         }
-        // Since we want to display oldest at the top in the UI, 
-        // but fetch newest first for pagination, we sort the final combined batch if needed.
-        // For standard "load more" chat, we usually fetch DESC and the UI prepends.
         msgs.sort_by_key(|m| m["created_at"].as_i64().unwrap_or(0));
         Ok(msgs)
     }
@@ -215,15 +193,14 @@ impl VectorStore {
 
     pub async fn get_pending_tasks(&self, limit: usize) -> Result<Vec<Task>> {
         let table = self.conn.open_table("tasks").execute().await?;
-        // [FIX] Include both pending (10) and in-progress (1) tasks
         let filter = "status = 10 OR status = 1";
         let results = table.query().only_if(filter).limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut tasks = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            let f_src = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-            let t_dst = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let froms = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let tos = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
             let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
             let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
             let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
@@ -233,8 +210,8 @@ impl VectorStore {
             let sts = batch.column(10).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             for i in 0..batch.num_rows() {
                 tasks.push(Task {
-                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from: f_src.value(i).to_string(), 
-                    to: t_dst.value(i).to_string(), cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(), 
+                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from: froms.value(i).to_string(), 
+                    to: tos.value(i).to_string(), cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(), 
                     ref_id: refs.value(i).to_string(), data_json: datas.value(i).to_string(), 
                     created_at: crs.value(i), updated_at: ups.value(i), status: sts.value(i),
                 });
@@ -246,7 +223,6 @@ impl VectorStore {
 
     pub async fn update_message_status(&self, task_id: &str, status: i32, content: Option<&str>) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
-        // For talks, we still replace the message to show latest status
         table.delete(&format!("task_id = '{}'", task_id)).await?;
         if let Some(c) = content {
             self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status)).await?;
@@ -256,16 +232,8 @@ impl VectorStore {
 
     pub async fn update_task_status(&self, id: &str, status: i32) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
-        
-        // [FIX] Crucial: Only delete if the task is finished (9=complete, 6=error, 3=cancel)
-        // If it's in progress (1), we KEEP it in the table so that 'check_active_task' finds it.
         if status == 9 || status == 6 || status == 3 {
-            println!("[Store] Task {} finished with status {}, removing from tasks table.", id, status);
             table.delete(&format!("id = '{}'", id)).await?;
-        } else {
-            // Since LanceDB update is complex, we just ensure it exists.
-            // In a more robust system, we would perform a true SQL UPDATE here.
-            println!("[Store] Task {} is now in status {}, keeping record for visibility check.", id, status);
         }
         Ok(())
     }
@@ -273,7 +241,6 @@ impl VectorStore {
     pub async fn init_all_tables(&self) -> Result<()> {
         let tables = vec!["items", "sales", "tracking", "event", "users", "talks", "pages"];
         let item_field = Field::new("item", DataType::Float32, true);
-        
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("type", DataType::Utf8, false),
@@ -291,24 +258,17 @@ impl VectorStore {
             Field::new("created_at", DataType::Int64, false), 
             Field::new("updated_at", DataType::Int64, false),
         ]));
-
         let existing = self.conn.table_names().execute().await?;
         for name in tables {
-            // [STRICT] If table exists, verify its schema or recreate to avoid type mismatch
             if existing.contains(&name.to_string()) {
                 let table = self.conn.open_table(name).execute().await?;
                 let current_schema = table.schema().await?;
-                // Check if 'status' is still Utf8 (index 8 based on schema)
                 let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
                     field.data_type() == &DataType::Utf8
                 } else { true };
-
                 if needs_recreate {
-                    println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
                     let _ = self.conn.drop_table(name, &[]).await;
-                } else {
-                    continue;
-                }
+                } else { continue; }
             }
             let table = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await?;
             let _ = table.create_index(&["text"], lancedb::index::Index::Auto).execute().await;
@@ -318,31 +278,15 @@ impl VectorStore {
     }
     
     pub async fn upsert_item(
-        &self, 
-        table_name: &str, 
-        id: &str, 
-        type_: &str, 
-        data_val: Value, 
-        vector: Option<Vec<f32>>,
-        from: Option<&str>,
-        to: Option<&str>,
-        cc: Option<&str>,
-        bcc: Option<&str>,
-        ref_id: Option<&str>,
-        digest: Option<&str>
+        &self, table_name: &str, id: &str, type_: &str, data_val: Value, vector: Option<Vec<f32>>,
+        from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, ref_val: Option<&str>, digest: Option<&str>
     ) -> Result<()> {
-         // Standardize table name
          let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
          let _ = table.delete(&format!("id = '{}'", id)).await;
-         
          let mut final_data = data_val.clone();
-
-         // [NEW] Automatic Decompression for Server Data
-         // If data is provided as a compressed blob (from Cloudflare/D1 parity)
          if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
-             // Check if it's a base64 string or binary indicator
-             if blob_base64.len() > 50 { // Minimal heuristic for blob
+             if blob_base64.len() > 50 {
                  use base64::prelude::BASE64_STANDARD;
                  use base64::Engine;
                  if let Ok(decoded) = BASE64_STANDARD.decode(blob_base64) {
@@ -352,181 +296,85 @@ impl VectorStore {
                  }
              }
          }
-
          if let Some(obj) = final_data.as_object_mut() {
-             // Sync tracking fields for query consistency
              if let Some(tn) = obj.get("tracking_number").cloned() {
                  if obj.get("tracking").is_none() { obj.insert("tracking".to_string(), tn); }
              }
-             // Sync price fields
              if let Some(p) = obj.get("price").cloned() {
                  if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
              }
          }
-
          let json_str = final_data.to_string();
          let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
-
          let status = data_val.get("status").and_then(|v| v.as_str()).map(|s| crate::logic::parse_status(s)).unwrap_or(0);
-         
-         // [STRICT] Multi-field mapping for 'amount'
-         let amount = data_val.get("total_amount")
-            .or_else(|| data_val.get("sale_price"))
-            .or_else(|| data_val.get("supply_price"))
-            .or_else(|| data_val.get("price"))
-            .or_else(|| data_val.get("shipping_fee"))
-            .or_else(|| data_val.get("discount"))
-            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok())))
-            .unwrap_or(0.0) as f32;
-         
-         // [NEW] Expanded doc_date -> created_at logic
-         let doc_date_str = data_val.get("order_date")
-            .or_else(|| data_val.get("registration_date"))
-            .or_else(|| data_val.get("release_date"))
-            .or_else(|| data_val.get("manufacture_date"))
-            .or_else(|| data_val.get("shipping_date"))
-            .or_else(|| data_val.get("started_at"))
-            .or_else(|| data_val.get("expired_at"))
-            .or_else(|| data_val.get("payment_date"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
+         let amount = data_val.get("total_amount").or_else(|| data_val.get("sale_price")).or_else(|| data_val.get("supply_price")).or_else(|| data_val.get("price")).or_else(|| data_val.get("shipping_fee")).or_else(|| data_val.get("discount")).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))).unwrap_or(0.0) as f32;
+         let doc_date_str = data_val.get("order_date").or_else(|| data_val.get("registration_date")).or_else(|| data_val.get("release_date")).or_else(|| data_val.get("manufacture_date")).or_else(|| data_val.get("shipping_date")).or_else(|| data_val.get("started_at")).or_else(|| data_val.get("expired_at")).or_else(|| data_val.get("payment_date")).and_then(|v| v.as_str()).unwrap_or("");
          let now_ts = chrono::Utc::now().timestamp_millis();
          let created_at = if !doc_date_str.is_empty() {
-             // Try to parse 'yyyy-MM-ddThh:mm:ss' or similar. Fallback to now on failure.
-             chrono::DateTime::parse_from_rfc3339(doc_date_str)
-                .map(|dt| dt.timestamp_millis())
-                .unwrap_or_else(|_|
-                    // Try naive format if RFC3339 fails
-                    chrono::NaiveDateTime::parse_from_str(doc_date_str, "%Y-%m-%dT%H:%M:%S")
-                        .map(|dt| dt.and_utc().timestamp_millis())
-                        .unwrap_or(now_ts)
-                )
-         } else {
-             now_ts
-         };
-
+             chrono::DateTime::parse_from_rfc3339(doc_date_str).map(|dt| dt.timestamp_millis()).unwrap_or_else(|_| chrono::NaiveDateTime::parse_from_str(doc_date_str, "%Y-%m-%dT%H:%M:%S").map(|dt| dt.and_utc().timestamp_millis()).unwrap_or(now_ts))
+         } else { now_ts };
          let schema = table.schema().await?;
          let values_builder = Float32Array::from(vector.unwrap_or(vec![0.0; 768]));
          let list_field = Field::new("item", DataType::Float32, true);
          let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 768, Arc::new(values_builder), None)?;
-
          let batch = RecordBatch::try_new(schema.clone(), vec![
                 Arc::new(StringArray::from(vec![id])), Arc::new(StringArray::from(vec![type_])),
                 Arc::new(StringArray::from(vec![from.unwrap_or("")])), Arc::new(StringArray::from(vec![to.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![cc.unwrap_or("")])), Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![ref_id.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![ref_val.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
                 Arc::new(arrow_array::Int32Array::from(vec![status])), Arc::new(arrow_array::Float32Array::from(vec![amount])),
-                Arc::new(list_array),
-                Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![json_str])),
-                Arc::new(Int64Array::from(vec![created_at])),
-                Arc::new(Int64Array::from(vec![now_ts])),
+                Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![json_str])),
+                Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
          ])?;
-         
          table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
          Ok(())
     }
 
-    /// [NEW] Initializes user and team profiles exactly like before_server.
     pub async fn initialize_user_profiles(&self, user_address: &str, user_email: &str, flag: &str) -> Result<()> {
         let team_id = crate::utils::hash::hash_id(user_address);
         let user_name = user_email.split('@').next().unwrap_or("user");
-
-        // 1. Initialize 'base' structure for team
-        let mut base = json!({
-            "pages": {},
-            "goods": {"draft": 0, "count": 0},
-            "order": {"draft": 0, "count": 0},
-            "event": {"draft": 0, "count": 0},
-            "coupon": {"draft": 0, "count": 0},
-            "tracking": {"draft": 0, "count": 0},
-            "search": {"draft": 0, "count": 0},
-            "review": {"draft": 0, "count": 0},
-            "member": {"draft": 0, "count": 0}
-        });
-
-        let properties = vec![
-            "price", "quantity", "width", "height", "length", "weight", 
-            "shipping_fee", "shipping_duration", "sale_price", "supply_price", 
-            "low_stock_threshold", "discount", "min_order_amount", 
-            "max_discount_amount", "usage_limit", "usage_per", "started_at", "expired_at"
-        ];
-
+        let mut base = json!({"pages": {}, "goods": {"draft": 0, "count": 0}, "order": {"draft": 0, "count": 0}, "event": {"draft": 0, "count": 0}, "coupon": {"draft": 0, "count": 0}, "tracking": {"draft": 0, "count": 0}, "search": {"draft": 0, "count": 0}, "review": {"draft": 0, "count": 0}, "member": {"draft": 0, "count": 0}});
+        let properties = vec!["price", "quantity", "width", "height", "length", "weight", "shipping_fee", "shipping_duration", "sale_price", "supply_price", "low_stock_threshold", "discount", "min_order_amount", "max_discount_amount", "usage_limit", "usage_per", "started_at", "expired_at"];
         if let Some(base_obj) = base.as_object_mut() {
             for (table_name, table_val) in base_obj.iter_mut() {
                 if table_name != "pages" {
                     if let Some(table_obj) = table_val.as_object_mut() {
-                        for prop in &properties {
-                            table_obj.insert(prop.to_string(), json!({"max": 0, "min": 0}));
-                        }
+                        for prop in &properties { table_obj.insert(prop.to_string(), json!({"max": 0, "min": 0})); }
                     }
                 }
             }
         }
-
-        // 2. Create Team Data
-        let team_data = json!({
-            "flag": flag,
-            "name": format!("{}'s team", user_name),
-            "title": "",
-            "region": null,
-            "page_count": 0,
-            "favicon": null,
-            "base": base
-        });
-
-        // 3. Create User Data
-        let user_data = json!({
-            "flag": flag,
-            "name": user_name,
-            "title": "",
-            "region": null,
-            "page_count": 0,
-            "favicon": null
-        });
-
-        // 4. Upsert into 'users' table
+        let team_data = json!({"flag": flag, "name": format!("{}'s team", user_name), "title": "", "region": null, "page_count": 0, "favicon": null, "base": base});
+        let user_data = json!({"flag": flag, "name": user_name, "title": "", "region": null, "page_count": 0, "favicon": null});
         self.upsert_item("users", &team_id, "team", team_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
         self.upsert_item("users", user_address, "user", user_data, None, Some(user_address), Some(&team_id), None, None, None, None).await?;
-
         Ok(())
     }
 
     pub async fn get_all_items(&self, table_name: &str, limit: usize, offset: usize) -> Result<Vec<TradeDocument>> {
         let table = self.conn.open_table(table_name).execute().await?;
-        // LanceDB doesn't always support complex order_by in all versions, 
-        // so we fetch and then ensure we are using the limit/offset correctly.
-        // For better performance with large datasets, we'd use a search or index.
-        let results = table.query()
-            .limit(limit)
-            .offset(offset)
-            .execute().await?.try_collect::<Vec<_>>().await?;
+        let results = table.query().limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
             let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
             let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
             let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
             let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
             let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
-
             for i in 0..batch.num_rows() {
                 docs.push(TradeDocument { 
-                    uuid: ids.value(i).to_string(), 
-                    doc_type: types.value(i).to_string(), 
-                    text: texts.value(i).to_string(), 
-                    json_data: jsons.value(i).to_string(),
-                    digest: digests.value(i).to_string(),
-                    total_amount: amounts.value(i),
-                    doc_status: statuses.value(i).to_string(),
-                    created_at_ts: createds.value(i),
-                    ..Default::default() 
+                    uuid: ids.value(i).to_string(), doc_type: types.value(i).to_string(), 
+                    ref_val: refs.value(i).to_string(),
+                    text: texts.value(i).to_string(), json_data: jsons.value(i).to_string(),
+                    digest: digests.value(i).to_string(), total_amount: amounts.value(i),
+                    doc_status: statuses.value(i).to_string(), created_at_ts: createds.value(i), ..Default::default() 
                 });
             }
         }
-        // Ensure latest first
         docs.sort_by_key(|d| std::cmp::Reverse(d.created_at_ts));
         Ok(docs)
     }
@@ -538,23 +386,19 @@ impl VectorStore {
         let batch = &results[0];
         let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
         let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
         let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
         let texts = batch.column(11).as_any().downcast_ref::<StringArray>().unwrap();
         let jsons = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
         let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
         let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
-
         Ok(Some(TradeDocument { 
-            uuid: ids.value(0).to_string(), 
-            doc_type: types.value(0).to_string(), 
-            text: texts.value(0).to_string(), 
-            json_data: jsons.value(0).to_string(), 
-            digest: digests.value(0).to_string(),
-            total_amount: amounts.value(0),
-            doc_status: statuses.value(0).to_string(),
-            created_at_ts: createds.value(0),
-            ..Default::default() 
+            uuid: ids.value(0).to_string(), doc_type: types.value(0).to_string(), 
+            ref_val: refs.value(0).to_string(),
+            text: texts.value(0).to_string(), json_data: jsons.value(0).to_string(), 
+            digest: digests.value(0).to_string(), total_amount: amounts.value(0),
+            doc_status: statuses.value(0).to_string(), created_at_ts: createds.value(0), ..Default::default() 
         }))
     }
     
@@ -600,7 +444,7 @@ impl VectorStore {
         let target_str = match value { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => value.to_string() };
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let datas = batch.column(13).as_any().downcast_ref::<StringArray>().unwrap();
+            let datas = batch.column(12).as_any().downcast_ref::<StringArray>().unwrap();
             for i in 0..batch.num_rows() {
                 let json_str = datas.value(i);
                 if let Ok(data) = serde_json::from_str::<Value>(json_str) {
@@ -619,11 +463,13 @@ impl VectorStore {
 pub struct TradeDocument {
     pub uuid: String,
     pub doc_type: String,
+    #[serde(rename = "ref")]
+    pub ref_val: String,
     pub text: String,
     pub json_data: String,
     pub digest: String,
     pub vector: Vec<f32>,
-    pub created_at_ts: i64, // Added field
+    pub created_at_ts: i64, 
     pub item_descriptions: Vec<String>, 
     pub item_hs_codes: Vec<String>,
     pub item_sku_numbers: Vec<String>,
