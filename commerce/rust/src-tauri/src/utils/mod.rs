@@ -37,7 +37,7 @@ pub fn get_best_device() -> Device {
                 }
             }
         }
-        // Fallback to 0 if NVML fails but CUDA feature is on
+        println!("[DEVICE-SCAN] NVML failed or no GPUs found. Trying default CUDA 0...");
         Device::new_cuda(0).unwrap_or(Device::Cpu)
     }
     #[cfg(not(feature = "cuda"))]
@@ -69,12 +69,15 @@ Error: {}",
     }
     let output_str = String::from_utf8_lossy(&output.stdout);
     let output_str = output_str.trim();
-    let sm_float = match output_str.parse::<f32>() {
+    
+    // Multi-GPU 환경에서는 여러 줄이 나올 수 있으므로 첫 번째 줄만 파싱
+    let first_line = output_str.lines().next().unwrap_or("0.0");
+    let sm_float = match first_line.parse::<f32>() {
         Ok(num) => num,
         Err(_) => {
             return Err(anyhow::anyhow!(format!(
-                "gpr sm arch: {} parse float32 error",
-                output_str
+                "gpu sm arch: {} parse float32 error",
+                first_line
             )));
         }
     };
@@ -88,6 +91,7 @@ pub struct DeviceConfig {
     pub classify_chunk_size: usize,
     pub extract_chunk_size: usize,
     pub name: String,
+    pub gpu_id: usize,
 }
 
 pub fn get_optimal_device_config() -> DeviceConfig {
@@ -117,6 +121,7 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                         classify_chunk_size: 24_000, 
                         extract_chunk_size: 24_000,
                         name: format!("GPU-{}", best_id),
+                        gpu_id: best_id as usize,
                     };
                 }
             }
@@ -130,6 +135,7 @@ pub fn get_optimal_device_config() -> DeviceConfig {
         classify_chunk_size: 24_000,  
         extract_chunk_size: 24_000,   
         name: "CPU".to_string(),
+        gpu_id: 0,
     }
 }
 
