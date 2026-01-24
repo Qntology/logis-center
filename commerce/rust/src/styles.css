@@ -103,23 +103,61 @@ body {
 
 .pill-nav:active { cursor: grabbing; }
 
-/* New Search Input Styling */
+/* Search Container & Chips */
+.search-container {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    overflow-x: auto;
+    padding: 0 5px;
+    gap: 5px;
+    scrollbar-width: none; /* Hide scrollbar for cleaner look */
+}
+.search-container::-webkit-scrollbar { display: none; }
+
+.search-tags-container {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.search-chip {
+    display: flex;
+    align-items: center;
+    background: var(--primary);
+    color: #000;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: bold;
+    white-space: nowrap;
+    gap: 4px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.search-chip.domain { background: #e2e8f0; color: #475569; }
+.search-chip.type { background: #fee2e2; color: #b91c1c; }
+.search-chip.mode { background: #dcfce7; color: #15803d; }
+
+.search-chip .remove-btn {
+    cursor: pointer;
+    font-size: 0.8rem;
+    line-height: 1;
+    opacity: 0.6;
+}
+.search-chip .remove-btn:hover { opacity: 1; }
+
 .search-input {
+    min-width: 100px;
     flex: 1;
     background: transparent;
     border: none;
     color: #000;
-    font-size: 1rem;
-    margin: 0;
-    padding: 0 10px;
+    font-size: 0.95rem;
     outline: none;
-    pointer-events: auto; /* Enable typing */
-    user-select: text; /* Allow text selection */
-    -webkit-user-select: text;
-    -moz-user-select: text;
-    -ms-user-select: text;
+    pointer-events: auto;
+    user-select: text;
 }
-.search-input::placeholder { color: rgba(0,0,0,0.4); }
 
 /* Nav Image Preview */
 .nav-preview-container {

@@ -37,6 +37,15 @@ let currentDetectedUrl = "";
 let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
+// [TAG SYSTEM] Hashtag-style search state
+interface SearchTag {
+    id: string;
+    label: string;
+    type: 'domain' | 'type' | 'mode' | 'path';
+    value: string;
+}
+let activeTags: SearchTag[] = [];
+
 // List State
 let cachedDocs: any[] = [];
 let currentPage = 0;
@@ -308,6 +317,44 @@ function hideNavigation() {
     }
 }
 
+// Helper to manage Search Tags
+function addSearchTag(label: string, type: 'domain' | 'type' | 'mode' | 'path', value: string) {
+    const id = `${type}:${value}`;
+    if (activeTags.find(t => t.id === id)) return;
+    
+    activeTags.push({ id, label, type, value });
+    updateTagsUI();
+    
+    // Auto-trigger search when tags change
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = window.setTimeout(() => loadMoreDocs(true), 300);
+}
+
+function removeSearchTag(id: string) {
+    activeTags = activeTags.filter(t => t.id !== id);
+    updateTagsUI();
+    loadMoreDocs(true);
+}
+
+function updateTagsUI() {
+    const container = document.getElementById("search-tags-container");
+    if (!container) return;
+    
+    container.innerHTML = "";
+    activeTags.forEach(tag => {
+        const chip = document.createElement("div");
+        chip.className = `search-chip ${tag.type}`;
+        chip.innerHTML = `
+            <span>${tag.label}</span>
+            <span class="remove-btn" onclick="document.dispatchEvent(new CustomEvent('remove-tag', {detail: '${tag.id}'}))">✕</span>
+        `;
+        container.appendChild(chip);
+    });
+}
+
+// Global listener for tag removal (since inline onclick can't see local functions easily)
+document.addEventListener('remove-tag', (e: any) => removeSearchTag(e.detail));
+
 async function renderNavigation() {
     const pageList = document.getElementById("nav-list-pages");
     const userList = document.getElementById("nav-list-users");
@@ -318,7 +365,7 @@ async function renderNavigation() {
 
     if (!pageList || !userList) return;
 
-    // 0. Update Profile Section
+    // Update Profile Section
     if (currentSession.email) {
         if (profileName) profileName.innerText = currentSession.email.split('@')[0];
         if (btnSignin) btnSignin.classList.add("hidden");
@@ -337,7 +384,7 @@ async function renderNavigation() {
         if (pages.length === 0) {
             pageList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No shared pages found.</div>";
         } else {
-            // [STRICT PARITY] Grouping: Domain -> Type -> (List or Detail)
+            // [STRICT PARITY] Build hierarchical tree like content.js / apac
             const tree: Record<string, any> = {};
             
             pages.forEach(p => {
@@ -345,48 +392,46 @@ async function renderNavigation() {
                 try { data = JSON.parse(p.json_data); } catch(e) { data = { origin: "unknown", type: p.doc_type }; }
                 
                 const domain = (data.origin || "unknown").replace(/^https?:\/\//, "");
-                const type = (p.doc_type || "general").toUpperCase();
-                const isDetail = data.detail === true; // From before_server schema
+                const type = (data.type || p.doc_type || "general").toUpperCase();
+                const isDetail = data.detail === true;
                 
                 if (!tree[domain]) tree[domain] = {};
-                if (!tree[domain][type]) tree[domain][type] = { lists: [], details: [] };
+                if (!tree[domain][type]) tree[domain][type] = [];
                 
-                const item = { uuid: p.uuid, link: data.link || "/", text: data.text || "Untitled" };
-                if (isDetail) tree[domain][type].details.push(item);
-                else tree[domain][type].lists.push(item);
+                tree[domain][type].push({ 
+                    uuid: p.uuid, 
+                    link: data.link || "/", 
+                    text: data.text || "Untitled",
+                    isDetail,
+                    domain,
+                    type
+                });
             });
 
             for (const [domain, types] of Object.entries(tree)) {
                 const domainDiv = document.createElement("div");
                 domainDiv.className = "nav-domain-group";
-                domainDiv.style.marginBottom = "10px";
-                domainDiv.innerHTML = `<div style="font-size:0.65rem; color:#999; padding:0 5px 5px; font-weight:bold; border-bottom:1px solid #eee; margin-bottom:5px;">${domain}</div>`;
+                domainDiv.style.marginBottom = "8px";
+                domainDiv.innerHTML = `<div class="domain-header" style="font-size:0.65rem; color:#999; padding:5px; font-weight:bold; cursor:pointer;">🌐 ${domain}</div>`;
                 
-                for (const [type, categories] of Object.entries<any>(types)) {
+                for (const [type, items] of Object.entries<any[]>(types)) {
                     const typeSection = document.createElement("div");
                     typeSection.className = "nav-accordion";
                     
-                    // Combined content for the accordion: List items then Detail items
-                    const buildItemsHtml = (items: any[], label: string, color: string) => {
-                        if (items.length === 0) return "";
-                        return `
-                            <div style="font-size:0.6rem; color:${color}; padding:4px 10px; text-transform:uppercase; letter-spacing:1px; opacity:0.6;">${label}</div>
+                    typeSection.innerHTML = `
+                        <div class="nav-header" style="display:flex; justify-content:space-between; padding:6px 10px; background:#f8fafc; border-radius:6px; cursor:pointer; margin-bottom:2px;">
+                            <span style="font-size:0.7rem; font-weight:bold; color:#475569;"># ${type}</span>
+                            <span class="arrow" style="font-size:0.6rem; color:#cbd5e1;">▼</span>
+                        </div>
+                        <div class="nav-content hidden" style="padding:4px 0;">
                             ${items.map(it => `
-                                <div class="nav-link" data-id="${it.uuid}" style="padding:6px 20px; font-size:0.75rem; color:#555; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${it.link}">
-                                    • ${it.link}
+                                <div class="nav-link ${it.isDetail ? 'detail' : 'list'}" 
+                                     data-id="${it.uuid}" data-domain="${it.domain}" data-type="${it.type}" data-mode="${it.isDetail ? 'Detail' : 'List'}" data-path="${it.link}"
+                                     style="padding:5px 15px; font-size:0.75rem; color:#334155; cursor:pointer; display:flex; align-items:center; gap:6px;">
+                                    <span style="font-size:0.6rem; color:${it.isDetail ? '#db2777' : '#2563eb'}; opacity:0.8;">${it.isDetail ? '◈' : '☰'}</span>
+                                    <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${it.link}</span>
                                 </div>
                             `).join("")}
-                        `;
-                    };
-
-                    typeSection.innerHTML = `
-                        <div class="nav-header" style="display:flex; justify-content:space-between; padding:8px 10px; background:#fafafa; border-radius:6px; cursor:pointer; border:1px solid #f0f0f0; margin-bottom:2px;">
-                            <span style="font-size:0.7rem; font-weight:bold; color:var(--primary);">${type}</span>
-                            <span class="arrow" style="font-size:0.6rem; color:#ccc;">▼</span>
-                        </div>
-                        <div class="nav-content hidden" style="padding:5px 0;">
-                            ${buildItemsHtml(categories.lists, "Lists", "#2563eb")}
-                            ${buildItemsHtml(categories.details, "Details", "#db2777")}
                         </div>
                     `;
                     
@@ -397,18 +442,23 @@ async function renderNavigation() {
                         header.querySelector(".arrow")!.innerHTML = content.classList.contains("hidden") ? "▼" : "▲";
                     };
                     
+                    // Domain click also adds a tag
+                    domainDiv.querySelector(".domain-header")!.addEventListener("click", (e) => {
+                        e.stopPropagation();
+                        addSearchTag(`@${domain}`, 'domain', domain);
+                    });
+
                     typeSection.querySelectorAll(".nav-link").forEach((link: any) => {
                         link.onclick = (e: Event) => {
                             e.stopPropagation();
+                            const ds = link.dataset;
+                            // Click adds multiple tags for precise filtering
+                            addSearchTag(`@${ds.domain}`, 'domain', ds.domain);
+                            addSearchTag(`#${ds.type}`, 'type', ds.type);
+                            addSearchTag(`[${ds.mode}]`, 'mode', ds.mode);
+                            // addSearchTag(`${ds.path}`, 'path', ds.path); // Path might be too long for a chip, keeping it for search logic
+                            
                             hideNavigation();
-                            // Logic parity: If List item, show list. If Detail item, show detail.
-                            const uuid = (e.currentTarget as HTMLElement).dataset.id;
-                            if (uuid) {
-                                // If it's a detail link, we could potentially go straight to showDetail
-                                // but for search consistency, we'll filter first.
-                                searchInput.value = `type:${type.toLowerCase()} path:${link.innerText.replace("• ", "").trim()}`;
-                                btnSubmit.click();
-                            }
                         };
                     });
                     domainDiv.appendChild(typeSection);
@@ -417,7 +467,7 @@ async function renderNavigation() {
             }
         }
 
-        // 2. Render Users (Team Members)
+        // Render Users (Team Members)
         const users = await invoke<any[]>("get_known_users");
         userList.innerHTML = "";
         if (users.length > 0) {
@@ -441,10 +491,7 @@ async function renderNavigation() {
 searchInput?.addEventListener("input", () => {
     if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
     searchDebounceTimer = window.setTimeout(async () => {
-        currentPage = 0;
-        hasMore = true;
-        if (docTableBody) docTableBody.innerHTML = "";
-        await loadMoreDocs();
+        await loadMoreDocs(true);
     }, 800);
 });
 
@@ -782,18 +829,36 @@ async function refreshList() {
     await loadMoreDocs();
 }
 
-async function loadMoreDocs() {
+async function loadMoreDocs(reset: boolean = false) {
+    if (reset) {
+        currentPage = 0;
+        hasMore = true;
+        if (docTableBody) docTableBody.innerHTML = "";
+        cachedDocs = [];
+    }
+
     if (isLoading || !hasMore) return;
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
     
-    const keyword = searchInput?.value.toLowerCase() || "";
+    // Construct query from tags + text
+    let queryParts = activeTags.map(t => {
+        if (t.type === 'domain') return `host:${t.value}`;
+        if (t.type === 'type') return `type:${t.value.toLowerCase()}`;
+        if (t.type === 'mode') return `mode:${t.value.toLowerCase()}`;
+        return t.value;
+    });
+    
+    const textInput = searchInput?.value.toLowerCase() || "";
+    if (textInput) queryParts.push(textInput);
+    
+    const finalQuery = queryParts.join(" ");
     
     try {
-        if (keyword) {
-            // [NEW] Paginated Search
+        if (finalQuery) {
+            // [NEW] Paginated Search with Tags support
             const results = await invoke<[string, string, number][]>("search_documents", { 
-                query: keyword, 
+                query: finalQuery, 
                 limit: pageSize, 
                 offset: currentPage * pageSize 
             });
