@@ -211,7 +211,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 if name == "id" || name == "class" { continue; }
 
                 if name.starts_with("data-") || always_include.contains(&name) {
-                    // Boolean 속성 처리 (ex: disabled, checked, readonly)
+                    // Boolean 속성 처리
                     if ["checked", "selected", "disabled", "readonly"].contains(&name) && (value.is_empty() || value == name) {
                         other_attributes.push(name.to_string());
                     } else if !value.is_empty() {
@@ -226,13 +226,12 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 attributes_string.push_str(&format!("({})", other_attributes.join(" ")));
             }
 
-            // div 축약 로직 (JS Parity: 실제 태그 출력 전에 하단으로 이동)
+            // div 축약 로직 (JS Parity)
             let mut current_node = node;
             while let Some(current_el) = current_node.value().as_element() {
                 if current_el.name().to_lowercase() != "div" { break; }
                 
-                let children: Vec<_> = current_node.children().collect();
-                let valid_children: Vec<_> = children.iter().filter(|n| {
+                let valid_children: Vec<_> = current_node.children().filter(|n| {
                     match n.value() {
                         Node::Element(_) => true,
                         Node::Text(t) => !t.trim().is_empty(),
@@ -243,7 +242,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 if valid_children.len() == 1 {
                     if let Some(child_el) = valid_children[0].value().as_element() {
                         if child_el.name().to_lowercase() == "div" {
-                            current_node = *valid_children[0];
+                            current_node = valid_children[0];
                             continue;
                         }
                     }
@@ -251,7 +250,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 break;
             }
 
-            // 태그 이름과 변환된 속성 문자열을 함께 추가
+            // 태그 이름과 변환된 속성 문자열을 함께 추가 (원래 노드 기준)
             output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
 
             // textarea의 값 처리
@@ -269,10 +268,23 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                     }
                 }
             } else {
+                // 자식 노드 처리 (축약된 노드의 자식들 탐색)
                 for child in current_node.children() {
                     generate_pug_lines(child, indent_level + 1, output, mode);
                 }
             }
+        }
+        Node::Text(text) => {
+            if *mode == PugMode::FullContent {
+                let text_content = text.trim();
+                if !text_content.is_empty() {
+                    output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));
+                }
+            }
+        }
+        _ => {}
+    }
+}
         }
         Node::Text(text) => {
             if *mode == PugMode::FullContent {
