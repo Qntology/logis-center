@@ -1739,6 +1739,23 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
 
     println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
 
+/// Robustly waits for both VRAM and System RAM to be reclaimed.
+/// This function loops indefinitely until ANY GPU meets the target resources.
+async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
+    use nvml_wrapper::Nvml;
+    use sysinfo::System;
+    
+    let mut sys = System::new_all();
+    let nvml = Nvml::init().ok();
+    
+    let target_vram_bytes = target_vram_mb * 1024 * 1024;
+    let target_ram_bytes = target_ram_mb * 1024 * 1024;
+
+    let mut stable_count = 0;
+    let mut last_report = std::time::Instant::now();
+
+    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
+
     loop {
         sys.refresh_all(); 
         let current_ram = sys.available_memory();
@@ -1770,7 +1787,7 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
             stable_count += 1;
             if stable_count >= 3 { 
                 if has_gpu {
-                    println!("[RESOURCE-WATCH] Best GPU ID: {} matches target. Proceeding.", best_gpu_id);
+                    println!("[RESOURCE-WATCH] GPU ID: {} is ready with {:.2} GB Free. Proceeding.", best_gpu_id, max_free_vram as f64 / 1e9);
                 }
                 break;
             }
@@ -1790,4 +1807,5 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
 }

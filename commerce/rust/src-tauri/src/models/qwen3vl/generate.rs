@@ -44,12 +44,35 @@ pub struct Qwen3VLGenerateModel {
 }
 
 impl Qwen3VLGenerateModel {
-    pub fn init(path: &str, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>) -> Result<Self> {
+    pub fn init(
+        path: &str, 
+        text_device: Option<&Device>, 
+        text_device_id: usize, 
+        vision_device: Option<&Device>, 
+        vision_device_id: usize, 
+        dtype: Option<DType>, 
+        hard_token_limit: Option<usize>
+    ) -> Result<Self> {
+        Self::init_with_tokenizer(path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit)
+    }
+
+    pub fn init_with_tokenizer(
+        path: &str, 
+        tokenizer_path: Option<&str>,
+        text_device: Option<&Device>, 
+        text_device_id: usize, 
+        vision_device: Option<&Device>, 
+        vision_device_id: usize, 
+        dtype: Option<DType>, 
+        hard_token_limit: Option<usize>
+    ) -> Result<Self> {
         // [FIX] Normalize path to remove Windows UNC prefix (\\?\) which causes issues with some loaders
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
-        
-        let chat_template = ChatTemplate::init(path)?;
-        let tokenizer = TokenizerModel::init(path)?;
+        let tok_path = tokenizer_path.unwrap_or(path);
+        let tok_path = if let Some(stripped) = tok_path.strip_prefix(r"\\?\") { stripped } else { tok_path };
+
+        let chat_template = ChatTemplate::init(tok_path)?;
+        let tokenizer = TokenizerModel::init(tok_path)?;
         let config_path = std::path::Path::new(path).join("config.json");
         
         // [FIX] Robust Config Loading
@@ -95,7 +118,7 @@ impl Qwen3VLGenerateModel {
         let is_vision_model = mmproj_path.is_some();
 
         // Processor initialization with vision support check
-        let pre_processor = Qwen3VLProcessor::new(path, &vision_dev, dtype)?;
+        let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
         
         let qwen3_vl = if !gguf_files.is_empty() {
             let model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned();

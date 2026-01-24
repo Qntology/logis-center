@@ -175,35 +175,27 @@ impl LogisModel {
         }
     }
 
-    async fn load_generator_internal(&self, path: &str) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {}...", path);
+    async fn load_generator_internal(&self, path: &str, tokenizer_path: Option<&str>) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator from {} on GPU-{}...", path, self.device_config.gpu_id);
         let dev = self.device_config.device.clone();
-        
-        let mut dev_id = 0;
-        if let Some(id_str) = self.device_config.name.split('-').nth(1) {
-             if let Ok(id) = id_str.parse::<usize>() { dev_id = id; }
-        }
+        let dev_id = self.device_config.gpu_id;
 
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
+        let tok_path = tokenizer_path.map(|s| s.to_string());
 
         let generator = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init(&path_clone, Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize))
+            // If tok_path is provided, use it instead of the default model path for tokenizer
+            Qwen3VLGenerateModel::init_with_tokenizer(&path_clone, tok_path.as_deref(), Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize))
         }).await??;
         
         Ok(generator)
     }
 
-    pub async fn load_embedding_internal(&self) -> anyhow::Result<EmbeddingModel> {
-        EmbeddingModel::new(&self.embedding_path)
-    }
-
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        // 1. Unload Embedding if loaded
         self.unload_embedding().await;
 
-        // 2. Check if we need to switch models
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
 
@@ -213,11 +205,18 @@ impl LogisModel {
         };
 
         if needs_reload || gen_guard.is_none() {
-            println!("[MODEL] Switching/Loading model to size: {:?}", match size { ModelSize::Small => "Small", ModelSize::Large => "Large" });
-            *gen_guard = None; // Force drop
+            println!("[MODEL] Switching/Loading model to size: {:?} on GPU-{}", 
+                match size { ModelSize::Small => "Small", ModelSize::Large => "Large" },
+                self.device_config.gpu_id
+            );
+            *gen_guard = None;
             
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-            let gen = self.load_generator_internal(path).await?;
+            
+            // [CRITICAL] 0.6B(Small) loads using 2B(Large)'s tokenizer to ensure Token ID parity for KV Cache
+            let tok_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+            
+            let gen = self.load_generator_internal(path, tok_path).await?;
             
             *gen_guard = Some(gen);
             *current_size_guard = Some(size);
@@ -233,6 +232,8 @@ impl LogisModel {
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
+            let gpu_id = self.device_config.gpu_id;
+            println!("[MODEL] Loading Embedding Model on GPU-{}...", gpu_id);
             let emb = tokio::task::spawn_blocking(move || {
                 EmbeddingModel::new(&self_clone)
             }).await??;
@@ -243,7 +244,7 @@ impl LogisModel {
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel with Dual-Model Relay Configuration");
+        println!("[MODEL-00] Initializing LogisModel with Multi-GPU Support");
 
         let mut config = utils::get_optimal_device_config();
         
@@ -255,6 +256,7 @@ impl LogisModel {
                 classify_chunk_size: 12000,
                 extract_chunk_size: 12000,
                 name: "CPU-Forced".to_string(),
+                gpu_id: 0,
             };
         }
 
