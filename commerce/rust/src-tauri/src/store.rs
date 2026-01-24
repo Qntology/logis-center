@@ -94,22 +94,26 @@ impl VectorStore {
             let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
         }
 
+        // [FIX] talks schema expanded to include cc, bcc, ref for contextual filtering
         let msg_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("role", DataType::Utf8, false), 
             Field::new("content", DataType::Utf8, false),
             Field::new("task_id", DataType::Utf8, true),
             Field::new("status", DataType::Int32, true), 
+            Field::new("cc", DataType::Utf8, true),
+            Field::new("bcc", DataType::Utf8, true),
+            Field::new("ref", DataType::Utf8, true),
             Field::new("created_at", DataType::Int64, false),
         ]));
 
         if existing.contains(&"talks".to_string()) {
             let table = self.conn.open_table("talks").execute().await?;
             let current_schema = table.schema().await?;
-            let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
-                field.data_type() == &DataType::Utf8
-            } else { true };
+            // Check if it already has 'ref' column
+            let needs_recreate = current_schema.field_with_name("ref").is_err();
             if needs_recreate {
+                println!("[Store] talks schema outdated. Dropping and recreating...");
                 let _ = self.conn.drop_table("talks", &[]).await;
             }
         }
@@ -128,7 +132,10 @@ impl VectorStore {
         Ok(!results.is_empty())
     }
 
-    pub async fn add_message(&self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<i32>) -> Result<()> {
+    pub async fn add_message(
+        &self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<i32>,
+        cc: Option<&str>, bcc: Option<&str>, ref_val: Option<&str>
+    ) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
         let schema = table.schema().await?;
         let batch = RecordBatch::try_new(
@@ -139,6 +146,9 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![content.to_string()])),
                 Arc::new(StringArray::from(vec![task_id.unwrap_or("").to_string()])),
                 Arc::new(arrow_array::Int32Array::from(vec![status.unwrap_or(0)])),
+                Arc::new(StringArray::from(vec![cc.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![ref_val.unwrap_or("")])),
                 Arc::new(Int64Array::from(vec![chrono::Utc::now().timestamp_millis()])),
             ],
         )?;
@@ -151,6 +161,7 @@ impl VectorStore {
         let mut q = table.query();
         if let Some(f) = filter { q = q.only_if(f); }
         let results = q.limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
+        
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -158,11 +169,16 @@ impl VectorStore {
             let contents = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
             let task_ids = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
             let statuses = batch.column(4).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
-            let createds = batch.column(5).as_any().downcast_ref::<Int64Array>().unwrap();
+            let ccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+            let bccs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
+            let refs = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
+            let createds = batch.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..batch.num_rows() {
                 msgs.push(json!({
                     "id": ids.value(i), "role": roles.value(i), "content": contents.value(i), 
-                    "task_id": task_ids.value(i), "status": statuses.value(i), "created_at": createds.value(i)
+                    "task_id": task_ids.value(i), "status": statuses.value(i), 
+                    "cc": ccs.value(i), "bcc": bccs.value(i), "ref": refs.value(i),
+                    "created_at": createds.value(i)
                 }));
             }
         }
@@ -225,9 +241,13 @@ impl VectorStore {
 
     pub async fn update_message_status(&self, task_id: &str, status: i32, content: Option<&str>) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
+        // For talks, we still replace the message to show latest status
+        // Note: When updating, we should ideally preserve cc/bcc/ref if possible,
+        // but since LanceDB update is complex, we just replace.
+        // The caller (scheduler) might need to provide these.
         table.delete(&format!("task_id = '{}'", task_id)).await?;
         if let Some(c) = content {
-            self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status)).await?;
+            self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status), None, None, None).await?;
         }
         Ok(())
     }
@@ -428,7 +448,7 @@ impl VectorStore {
          if let Some(ref f) = filter { vq = vq.only_if(f); }
          let vres = vq.limit(limit).nearest_to(query_vec)?.execute().await?.try_collect::<Vec<_>>().await?;
          for b in vres {
-             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap(); 
              let txs = b.column(12).as_any().downcast_ref::<StringArray>().unwrap();
              for i in 0..b.num_rows() {
                  let id = ids.value(i).to_string();

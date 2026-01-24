@@ -803,7 +803,16 @@ pub fn run() {
                                 data_json: payload_val.to_string(), created_at: now, updated_at: now, status: 10,
                             };
                             let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
-                            let _ = db.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", &msg_content, Some(&task.id), Some(1)).await;
+                            let _ = db.add_message(
+                                &uuid::Uuid::new_v4().to_string(), 
+                                "system_task", 
+                                &msg_content, 
+                                Some(&task.id), 
+                                Some(1),
+                                Some(&task.cc),
+                                Some(&task.bcc),
+                                Some(&task.ref_id)
+                            ).await;
                             let _ = db.add_task(task).await;
                         }
                     });

@@ -114,8 +114,6 @@ const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormEle
 const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const globalNavSpinner = document.getElementById("global-nav-spinner") as HTMLElement;
 
-const btnSpinnerAction = document.getElementById("btn-spinner-action") as HTMLButtonElement;
-
 function startSpinner() {
     if (spinnerInterval) clearInterval(spinnerInterval);
     if (globalNavSpinner) {
@@ -337,7 +335,7 @@ async function renderNavigation() {
         // 1. Pages Tree (Domain -> Type -> Page)
         let pages = await Select["pages"](); 
         
-        // [FIX] Inject Current Page if not present
+        // Inject Current Page if not present
         if (currentDetectedUrl) {
             try {
                 const urlObj = new URL(currentDetectedUrl);
@@ -345,22 +343,20 @@ async function renderNavigation() {
                 const link = urlObj.pathname + urlObj.search;
                 const origin = urlObj.origin;
                 
-                // Check if already exists to avoid duplicate
                 const exists = pages.some(p => {
                     const d = p.data || p;
                     return (d.link === link && (d.origin || "").includes(domain));
                 });
 
                 if (!exists) {
-                    console.log("[NAV] Injecting current page:", link);
                     pages.unshift({
                         id: "current-page",
-                        type: "tracking", // Default to tracking/active type
+                        type: "tracking",
                         data: {
                             origin: origin,
                             link: link,
                             title: "Current Page",
-                            item: true // Treat as list item for icon
+                            item: true
                         }
                     });
                 }
@@ -375,53 +371,62 @@ async function renderNavigation() {
             // Grouping Logic
             const tree: Record<string, Record<string, any[]>> = {};
             pages.forEach(p => {
-                let data = p.data || p; // Normalize
+                let data = p.data || p;
                 const domain = (data.origin || "unknown").replace(/^https?:\/\//, "");
                 const type = (data.type || "general").toUpperCase();
-                const isDetail = data.detail === true;
                 
                 if (!tree[domain]) tree[domain] = {};
                 if (!tree[domain][type]) tree[domain][type] = [];
                 
-                                tree[domain][type].push({ 
-                                    uuid: p.id, 
-                                    link: data.link || "/", 
-                                    text: data.text || data.title || data.link || "Untitled", 
-                                    isDetail: data.detail === true || !data.item,
-                                    domain,
-                                    type,
-                                    active: currentDetectedUrl.includes(data.link),
-                                    // [NEW] Carry related hashes for context
-                                    cc: p.cc,
-                                    bcc: p.bcc,
-                                    ref: p.ref_val || p.ref // Map to backend unified name
-                                });
-                            });
+                tree[domain][type].push({ 
+                    uuid: p.id, 
+                    link: data.link || "/", 
+                    text: data.text || data.title || data.link || "Untitled", 
+                    isDetail: data.detail === true || !data.item,
+                    domain,
+                    type,
+                    active: currentDetectedUrl.includes(data.link),
+                    cc: p.cc,
+                    bcc: p.bcc,
+                    ref: p.ref_val || p.ref
+                });
+            });
+
+            // HTML Generation
+            for (const [domain, types] of Object.entries(tree)) {
+                const branchDiv = document.createElement("div");
+                branchDiv.className = "logis-branch";
                 
-                            // HTML Generation
-                            for (const [domain, types] of Object.entries(tree)) {
-                                // ... (Branch logic)
-                                for (const [type, items] of Object.entries(types)) {
-                                    // ... (Type header)
-                                    items.forEach(it => {
-                                        const icon = it.isDetail ? '◈' : '☰';
-                                        const activeClass = it.active ? 'active' : '';
-                                        const childClass = it.isDetail ? 'child' : '';
-                                        const displayText = it.text || it.link; 
-                                        
-                                        html += `
-                                            <a href="#" class="logis-page ${activeClass} ${childClass}" 
-                                               data-id="${it.uuid}" data-domain="${it.domain}" data-type="${it.type}" data-mode="${it.isDetail ? 'Detail' : 'List'}"
-                                               data-cc="${it.cc}" data-bcc="${it.bcc}" data-ref="${it.ref}">
-                                                <span class="icon">${icon}</span>
-                                                <span class="text" title="${displayText}">${displayText}</span>
-                                            </a>
-                                        `;
-                                    });
-                                    // ...
-                                }
-                                // ...
-                            }                
+                let html = `
+                    <div class="logis-parent">
+                        <div class="logis-favicon"></div>
+                        <strong>${domain}</strong>
+                    </div>
+                `;
+
+                for (const [type, items] of Object.entries(types)) {
+                    html += `<div class="logis-children">
+                        <div class="logis-type-header"># ${type}</div>`;
+                    
+                    items.forEach(it => {
+                        const icon = it.isDetail ? '◈' : '☰';
+                        const activeClass = it.active ? 'active' : '';
+                        const childClass = it.isDetail ? 'child' : '';
+                        const displayText = it.text || it.link; 
+                        
+                        html += `
+                            <a href="#" class="logis-page ${activeClass} ${childClass}" 
+                               data-id="${it.uuid}" data-domain="${it.domain}" data-type="${it.type}" data-mode="${it.isDetail ? 'Detail' : 'List'}"
+                               data-cc="${it.cc}" data-bcc="${it.bcc}" data-ref="${it.ref}">
+                                <span class="icon">${icon}</span>
+                                <span class="text" title="${displayText}">${displayText}</span>
+                            </a>
+                        `;
+                    });
+                    html += `</div>`;
+                }
+                branchDiv.innerHTML = html;
+                
                 // Bind Clicks
                 branchDiv.querySelectorAll(".logis-page").forEach((link: any) => {
                     link.onclick = (e: Event) => {
@@ -429,19 +434,16 @@ async function renderNavigation() {
                         e.stopPropagation();
                         const ds = link.dataset;
                         
-                        // [CONTEXT] Update global active context
                         activeContext.cc = ds.cc || "";
                         activeContext.bcc = ds.bcc || "";
                         activeContext.ref = ds.ref || "";
 
-                        // [UX] Log navigation action to chat history
                         renderMessage({
                             id: `nav-${Date.now()}`,
                             role: "system_task",
                             content: `Navigated to: ${ds.domain} - ${ds.type}`,
                             status: 9, 
                             created_at: Date.now(),
-                            // Ensure this log is also associated with the context
                             cc: activeContext.cc,
                             bcc: activeContext.bcc,
                             ref: activeContext.ref
@@ -451,14 +453,11 @@ async function renderNavigation() {
                         addSearchTag(`#${ds.type}`, 'type', ds.type);
                         addSearchTag(`[${ds.mode}]`, 'mode', ds.mode);
                         
-                        // Refresh chat history for this new context
                         fetchChatHistory(true);
-
                         hideNavigation();
                     };
                 });
                 
-                // Add Favicon (Async)
                 const faviconUrl = `https://${domain}/favicon.ico`;
                 const favEl = branchDiv.querySelector(".logis-favicon") as HTMLElement;
                 if(favEl) favEl.style.backgroundImage = `url(${faviconUrl})`;
@@ -474,7 +473,6 @@ async function renderNavigation() {
         if (users.length === 0) {
             userList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No team members.</div>";
         } else {
-            // Group by Team
             const teamMap: Record<string, any> = {};
             const membersMap: Record<string, any[]> = {};
 
@@ -489,10 +487,8 @@ async function renderNavigation() {
                 }
             });
 
-            // If no explicit teams found, group under 'Unknown' or inferred
             for (const [teamId, members] of Object.entries(membersMap)) {
                 const teamName = teamMap[teamId]?.name || "Team " + teamId.slice(0,6);
-                
                 const branchDiv = document.createElement("div");
                 branchDiv.className = "logis-branch";
                 
@@ -560,17 +556,11 @@ async function syncData() {
     } catch (e) { console.error("[SYNC] Failed:", e); }
 }
 
-// ... (List Logic) ...
-
 // [NEW] Global Navigation Link Handler (from item2html)
 document.addEventListener('nav-link', async (e: any) => {
     const targetLink = e.detail;
     console.log("[NAV] Internal Link Clicked:", targetLink);
-    
-    // Add chip for the specific path to filter items
     addSearchTag(targetLink, 'path', targetLink);
-    
-    // Move to List View
     openWidget("list");
     listView.style.display = "block";
     detailView.style.display = "none";
@@ -623,18 +613,14 @@ document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
 document.addEventListener('view-task-log', () => { openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; });
 
 btnExtract?.addEventListener("click", async () => {
-    let pathname = "/";
-    let cc = "";
     if (currentDetectedUrl) {
         try {
             const normalizedUrl = currentDetectedUrl.toLowerCase();
             const urlObj = new URL(normalizedUrl);
             const hostname = urlObj.hostname;
             const link = (urlObj.pathname + urlObj.search).toLowerCase();
-            
             const ccHash = await hashId(hostname); 
             const hashedRefId = await hashId(ccHash + link);
-            
             const isActive = await invoke<boolean>("check_active_task", { 
                 payload: { cc: ccHash, refId: hashedRefId } 
             });
@@ -671,18 +657,12 @@ btnExtract?.addEventListener("click", async () => {
             const normalizedUrl = currentDetectedUrl.toLowerCase();
             const urlObj = new URL(normalizedUrl);
             const cc = await hashId(urlObj.hostname);
-            const rawPath = urlObj.pathname + urlObj.search; // [STRICT] Real path for link
+            const rawPath = urlObj.pathname + urlObj.search;
             const hashedRefId = await hashId(cc + rawPath.toLowerCase());
             
             await emit("new-task-from-browser", { 
-                id: taskId, 
-                type: "html_extraction", 
-                html: html, 
-                link: rawPath, // [FIX] Send raw path
-                cc: cc, 
-                ref_id: hashedRefId, // [FIX] Send hash as ref_id
-                from: currentSession.address,
-                to: currentSession.team
+                id: taskId, type: "html_extraction", html: html, link: rawPath, 
+                cc: cc, ref_id: hashedRefId, from: currentSession.address, to: currentSession.team
             });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: 10, task_id: hashedRefId, created_at: Date.now() });
             await updateExtractButtonVisibility();
@@ -699,9 +679,7 @@ async function renderProgressToUI(payload: any) {
     const extractionLog = document.getElementById("extraction-log");
     
     if (extractionLog && extractionLog.dataset.activeTaskId) {
-        if (payload.task_id && payload.task_id !== extractionLog.dataset.activeTaskId) {
-            return;
-        }
+        if (payload.task_id && payload.task_id !== extractionLog.dataset.activeTaskId) return;
     }
 
     if (payload.category === "Done" || payload.category === "Error") {
@@ -853,41 +831,21 @@ async function loadMoreDocs(reset: boolean = false) {
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
     
-    // Construct query
-    let queryParts = activeTags.map(t => {
-        if (t.type === 'domain') return `host:${t.value}`;
-        if (t.type === 'type') return `type:${t.value.toLowerCase()}`;
-        if (t.type === 'mode') return `mode:${t.value.toLowerCase()}`;
-        return t.value;
-    });
-    
-    const textInput = searchInput?.value.toLowerCase() || "";
-    if (textInput) queryParts.push(textInput);
-    const finalQuery = queryParts.join(" ");
-    
     try {
         let docs: any[] = [];
-        
-        // Final Query string from tags + text
         const textInput = searchInput?.value.toLowerCase() || "";
         let queryParts = activeTags.map(t => {
             if (t.type === 'domain') return `host:${t.value}`;
             if (t.type === 'type') return `type:${t.value.toLowerCase()}`;
+            if (t.type === 'mode') return `mode:${t.value.toLowerCase()}`;
             return t.value;
         });
         if (textInput) queryParts.push(textInput);
         const finalQuery = queryParts.join(" ");
 
-        // [STRICT] If we have structured tags, the DB shim will use SQL filter.
-        // If it's pure text, it will use FTS search.
-        docs = await Select["items"]({ 
-            value: finalQuery, 
-            limit: pageSize, 
-            offset: currentPage * pageSize 
-        });
+        docs = await Select["items"]({ value: finalQuery, limit: pageSize, offset: currentPage * pageSize });
 
         if (docs.length < pageSize) hasMore = false;
-        
         if (docs.length > 0) {
             cachedDocs = [...cachedDocs, ...docs];
             renderDocs(docs);
@@ -897,37 +855,26 @@ async function loadMoreDocs(reset: boolean = false) {
         }
     } catch (e) { 
         console.error("[WIDGET] loadMoreDocs error:", e);
-        if (currentPage === 0 && docListContainer) {
-            docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
-        }
+        if (currentPage === 0 && docListContainer) docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
     } 
-    finally { 
-        isLoading = false; 
-        if (loadingIndicator) loadingIndicator.style.display = "none"; 
-    }
+    finally { isLoading = false; if (loadingIndicator) loadingIndicator.style.display = "none"; }
 }
 
 function renderDocs(docs: any[]) {
     if (!docListContainer) return;
-    
     docs.forEach(doc => {
         const html = item2html(doc, false, currentDetectedUrl);
         docListContainer.insertAdjacentHTML('beforeend', html);
-        
         const lastEl = docListContainer.lastElementChild as HTMLElement;
         if (lastEl) {
             lastEl.addEventListener("click", (e) => {
                 const target = e.target as HTMLElement;
                 if (target.closest('.toggle-more') || target.closest('.more-label')) return;
-                if (!target.closest('a') && !target.closest('input')) {
-                    showDetail(doc.id);
-                }
+                if (!target.closest('a') && !target.closest('input')) showDetail(doc.id);
             });
         }
     });
 }
-
-// ... (showDetail, etc.)
 
 async function showDetail(uuid: string) {
     currentDetailUuid = uuid;
@@ -953,11 +900,9 @@ btnDetailBack?.addEventListener("click", () => { detailView.style.display = "non
 document.getElementById("btn-settings-back")?.addEventListener("click", collapseWidget);
 btnListBack?.addEventListener("click", collapseWidget);
 
-// [NEW] Tree Profile Actions
 document.getElementById("nav-signin")?.addEventListener("click", () => openWidget("settings"));
 document.getElementById("nav-signout")?.addEventListener("click", () => { document.getElementById("btn-logout")?.click(); });
 
-// Image Logic
 async function handleImageUpload(path: string) {
     currentImage = path;
     if (navPreviewContainer && navImgThumbnail) {
@@ -985,7 +930,6 @@ navUploadBtn?.addEventListener("click", async () => {
     if (file) await handleImageUpload(file as string);
 });
 
-// Auth & Chat
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
@@ -1000,8 +944,6 @@ async function checkAuthStatus() {
         const params = new URLSearchParams(queryParams);
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
         const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: { hash: currentSession.hash, token: currentSession.token } });
-        const qrAuthSpinner = document.getElementById("qr-auth-spinner");
-        if (qrAuthSpinner) { let idx = 0; qrAuthSpinner.innerText = spinnerFrames[idx++ % spinnerFrames.length]; }
         let session = data.session || data; 
         if (session && session.hash) {
             const hashChanged = session.hash !== currentSession.hash;
@@ -1010,9 +952,7 @@ async function checkAuthStatus() {
             if (hashChanged && !currentSession.email && currentTab === "settings") performQrAuth();
             if (currentSession.email) { 
                 await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" }); 
-                updateAuthUI(); 
-                fetchChatHistory();
-                syncData(); // [NEW] Sync data after auth
+                updateAuthUI(); fetchChatHistory(); syncData();
             }
         }
     } catch (e) { console.warn("Auth check failed:", e); }
@@ -1062,211 +1002,48 @@ function startPolling() {
 }
 
 function renderMessage(msg: any) {
-
     if (!chatTalks) return;
-
-    
-
-    // [FIX] Use task_id as primary identifier for system logs to prevent duplicates
-
     const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
-
     let existing = document.getElementById(msgId);
-
-    
-
     const isSystemTask = msg.role === "system_task";
-
     const roleClass = msg.role === "user" ? "user" : "system";
-
-
-
-    // Update Preprocessing Log Count (only for new tasks)
-
     if (isSystemTask && !existing) {
-
         systemLogCount++;
-
         const countEl = document.querySelector('.system-label .count');
-
         if (countEl) countEl.innerHTML = `(${systemLogCount})`;
-
     }
-
-    
-
-    const statusMap: Record<number, { icon: string, text: string, color: string }> = { 
-
-        1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 
-
-        2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 
-
-        3: { icon: "🚫", text: "cancelled", color: "#666" }, 
-
-        6: { icon: "❌", text: "error", color: "#ef4444" }, 
-
-        9: { icon: "✅", text: "done", color: "#22c55e" }, 
-
-        10: { icon: "📥", text: "pending", color: "#999" } 
-
-    };
-
+    const statusMap: Record<number, { icon: string, text: string, color: string }> = { 1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 3: { icon: "🚫", text: "cancelled", color: "#666" }, 6: { icon: "❌", text: "error", color: "#ef4444" }, 9: { icon: "✅", text: "done", color: "#22c55e" }, 10: { icon: "📥", text: "pending", color: "#999" } };
     const currentStatus = statusMap[msg.status] || statusMap[1];
-
     const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-
-
     let displayHtml = "";
-
     let itemData: any = null;
-
-    try { 
-
-        itemData = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; 
-
-    } catch (e) { 
-
-        displayHtml = msg.content; 
-
-    }
-
-
-
-    if (itemData && typeof itemData === 'object') {
-
-        // [PARITY] If content is structured data, show a summary
-
-        displayHtml = itemData.text || itemData.title || itemData.summary || JSON.stringify(itemData);
-
-    }
-
-
-
-    const htmlContent = `
-
-        <div class="chat-message">
-
-            <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
-
-                <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
-
-                <span>${timeStr}</span>
-
-            </div>
-
-            <div class="content">${displayHtml}</div>
-
-            ${isSystemTask ? `
-
-                <div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};">
-
-                    <span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}
-
-                </div>
-
-            ` : ""}
-
-        </div>
-
-    `;
-
-
-
+    try { itemData = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch (e) { displayHtml = msg.content; }
+    if (itemData && typeof itemData === 'object') displayHtml = itemData.text || itemData.title || itemData.summary || JSON.stringify(itemData);
+    const htmlContent = `<div class="chat-message"><div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;"><span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span><span>${timeStr}</span></div><div class="content">${displayHtml}</div>${isSystemTask ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};"><span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}</div>` : ""}</div>`;
     if (existing) {
-
-        // [UPDATE] Replace content in place
-
         existing.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
-
-        existing.dataset.status = msg.status;
-
-        existing.innerHTML = htmlContent;
-
+        existing.dataset.status = msg.status; existing.innerHTML = htmlContent;
     } else {
-
-        // [APPEND] Insert new message
-
-        const messageDiv = document.createElement("div");
-
-        messageDiv.id = msgId;
-
-        messageDiv.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
-
-        messageDiv.dataset.taskId = msg.task_id || msg.id;
-
-        messageDiv.dataset.status = msg.status;
-
-        messageDiv.innerHTML = htmlContent;
-
-        
-
-        // Clicks for System Tasks
-
+        const messageDiv = document.createElement("div"); messageDiv.id = msgId; messageDiv.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
+        messageDiv.dataset.taskId = msg.task_id || msg.id; messageDiv.dataset.status = msg.status; messageDiv.innerHTML = htmlContent;
         if (isSystemTask) {
-
             messageDiv.style.cursor = "pointer";
-
             messageDiv.onclick = async () => {
-
-                const taskId = messageDiv.dataset.taskId;
-
-                const status = parseInt(messageDiv.dataset.status || "0");
-
-                
-
-                if (status === 9 && taskId) {
-
-                    // Show Result in Detail View
-
-                    showDetail(taskId);
-
-                } else if (taskId) {
-
-                    // Show Progress Logs
-
-                    openWidget("list");
-
-                    listView.style.display = "none";
-
-                    detailView.style.display = "flex";
-
-                    detailTitle.innerText = "Task Progress";
-
+                const taskId = messageDiv.dataset.taskId; const status = parseInt(messageDiv.dataset.status || "0");
+                if (status === 9 && taskId) showDetail(taskId);
+                else if (taskId) {
+                    openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; detailTitle.innerText = "Task Progress";
                     const logArea = document.getElementById("extraction-log");
-
                     if (logArea && logArea.dataset.activeTaskId !== taskId) {
-
-                        logArea.innerHTML = "<div style='padding:10px;'>📡 Loading task history...</div>";
-
-                        logArea.dataset.activeTaskId = taskId;
-
-                        const logs = await invoke<any[]>("get_task_logs", { taskId });
-
-                        logArea.innerHTML = "";
-
-                        logs.forEach(l => renderProgressToUI(l));
-
+                        logArea.innerHTML = "<div style='padding:10px;'>📡 Loading task history...</div>"; logArea.dataset.activeTaskId = taskId;
+                        const logs = await invoke<any[]>("get_task_logs", { taskId }); logArea.innerHTML = ""; logs.forEach(l => renderProgressToUI(l));
                     }
-
                 }
-
             };
-
         }
-
         chatTalks.insertAdjacentElement('beforeend', messageDiv);
-
     }
-
-    
-
-    // Auto-scroll to bottom for new messages
-
-    const scroll = document.getElementById("chat-scroll");
-
-    if (scroll && !existing) scroll.scrollTop = scroll.scrollHeight;
-
+    const scroll = document.getElementById("chat-scroll"); if (scroll && !existing) scroll.scrollTop = scroll.scrollHeight;
 }
 
 function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
@@ -1275,60 +1052,37 @@ async function initSession() {
     if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
     else { const legacy = localStorage.getItem("device_hash"); if (legacy) currentSession.hash = legacy; }
     if (!currentSession.hash && ethers) { const w = ethers.Wallet.createRandom(); currentSession.hash = w.address.toLowerCase().replace("0x", ""); saveSession(); }
-    saveSession();
-    currentSession.address = currentSession.address || ZERO_ADDRESS;
-    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS);
-    updateAuthUI(); startPolling();
+    saveSession(); currentSession.address = currentSession.address || ZERO_ADDRESS; currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS); updateAuthUI(); startPolling();
 }
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
 document.getElementById("btn-logout")?.addEventListener("click", async () => { if (await ask("Are you sure?", { title: "Sign Out", kind: "warning" })) { currentSession.email = undefined; updateAuthUI(); } });
-
 listScrollContainer?.addEventListener("scroll", () => { if (listScrollContainer.scrollTop + listScrollContainer.clientHeight >= listScrollContainer.scrollHeight - 20) loadMoreDocs(); });
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
 document.getElementById("unload-btn")?.addEventListener("click", async () => { try { await invoke("unload_model"); alert("Memory cleared."); } catch (e) {} });
-
 async function syncBrowserStatus() { try { const s = await invoke<string>("get_browser_status"); if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; } catch (e) {} }
 initSession(); setWindowSize(false); syncBrowserStatus();
-
 const talksScroll = document.getElementById("chat-scroll");
 if (talksScroll) {
     talksScroll.addEventListener('wheel', (e: WheelEvent) => { talksScroll.scrollTop -= e.deltaY; e.preventDefault(); }, { passive: false });
     talksScroll.addEventListener('scroll', () => { if (talksScroll.scrollTop + talksScroll.clientHeight >= talksScroll.scrollHeight - 20) loadMoreChat(); });
 }
-
-async function fetchChatHistory(reset: boolean = true) {
-    if (reset) { chatPage = 0; chatHasMore = true; if (chatTalks) chatTalks.innerHTML = ""; }
-    await loadMoreChat();
-}
-
+async function fetchChatHistory(reset: boolean = true) { if (reset) { chatPage = 0; chatHasMore = true; if (chatTalks) chatTalks.innerHTML = ""; } await loadMoreChat(); }
 async function loadMoreChat() {
     if (isChatLoading || !chatHasMore) return;
     isChatLoading = true;
-    
     try {
-        // [RELATIONSHIP] Build SQL filter string based on active navigation context
         let sqlFilter = null;
-        if (activeContext.ref) {
-            sqlFilter = `ref = '${activeContext.ref}'`;
-        } else if (activeContext.bcc) {
-            sqlFilter = `bcc = '${activeContext.bcc}'`;
-        } else if (activeContext.cc) {
-            sqlFilter = `cc = '${activeContext.cc}'`;
-        }
-
-        const messages = await invoke<any[]>("get_chat_messages", { 
-            limit: pageSize, 
-            offset: chatPage * pageSize,
-            filter: sqlFilter // Pass contextual filter
-        });
+        if (activeContext.ref) sqlFilter = `ref = '${activeContext.ref}'`;
+        else if (activeContext.bcc) sqlFilter = `bcc = '${activeContext.bcc}'`;
+        else if (activeContext.cc) sqlFilter = `cc = '${activeContext.cc}'`;
+        const messages = await invoke<any[]>("get_chat_messages", { limit: pageSize, offset: chatPage * pageSize, filter: sqlFilter });
         if (chatTalks) {
             if (messages && messages.length > 0) {
                 if (messages.length < pageSize) chatHasMore = false;
                 messages.sort((a, b) => a.created_at - b.created_at);
-                messages.forEach(msg => renderMessage(msg));
-                chatPage++;
+                messages.forEach(msg => renderMessage(msg)); chatPage++;
             } else { chatHasMore = false; if (chatPage === 0) chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>"; }
             if (!currentSession.email && currentTab === "settings" && chatPage === 1) performQrAuth();
         }
