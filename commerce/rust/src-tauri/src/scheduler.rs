@@ -81,11 +81,14 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
         let mut end = target_end;
 
         // Find the NEXT newline after target_end to include the current line fully
+        // [SAFETY] Limit search to 2000 chars to avoid oversized chunks from single long lines
         if target_end < text.len() {
-            if let Some(next_newline_offset) = text[target_end..].find('\n') {
+            let search_window = &text[target_end..(target_end + 2000).min(text.len())];
+            if let Some(next_newline_offset) = search_window.find('\n') {
                 end = target_end + next_newline_offset + 1;
             } else {
-                end = text.len();
+                // If no newline found in window, just use target_end to avoid VRAM spikes
+                end = target_end;
             }
         }
 
@@ -1273,7 +1276,7 @@ async fn process_task(
                 let params = ChatCompletionParameters {
                     messages,
                     model: "qwen3vl".to_string(),
-                    max_tokens: Some(2048),
+                    max_tokens: Some(4096),
                     temperature: Some(0.1),
                     ..Default::default()
                 };

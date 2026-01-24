@@ -276,7 +276,7 @@ impl LogisModel {
         let large_model_path = large_gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
-        let max_tokens_limit = 32768; 
+        let max_tokens_limit = 65536; 
 
         Ok(Self {
             generator: Arc::new(TokioMutex::new(None)),

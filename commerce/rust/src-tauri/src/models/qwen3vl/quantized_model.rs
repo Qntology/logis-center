@@ -405,13 +405,14 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        // [UPSCALE-REFILL] Drop last N tokens from cache to let 2B re-refine the most critical context
-        let current_len = k.dim(2)?;
-        let use_len = if current_len > upscale_refill_len { current_len - upscale_refill_len } else { current_len };
-        let final_len = use_len.min(expected_len);
+        // [UPSCALE-REFILL] Drop last N tokens from cache to let 2B re-refine the most critical context.
+        // [FIX] Must use EXACTLY the same logic as seqlen_offset calculation in generate.rs to avoid shape mismatches.
+        let final_len = if expected_len > upscale_refill_len { expected_len - upscale_refill_len } else { expected_len };
 
         if final_len > 0 {
-            self.kv_cache = Some((k.narrow(2, 0, final_len)?, v.narrow(2, 0, final_len)?));
+            // Ensure we don't try to narrow more than what is available in the loaded tensor
+            let safe_len = final_len.min(k.dim(2)?);
+            self.kv_cache = Some((k.narrow(2, 0, safe_len)?, v.narrow(2, 0, safe_len)?));
         }
         Ok(())
     }
