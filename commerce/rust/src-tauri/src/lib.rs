@@ -680,6 +680,69 @@ async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<
     Ok(logs)
 }
 
+#[tauri::command]
+async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<String, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        let mut count = 0;
+        for item in items {
+            // Basic parsing to determine ID and Table
+            // In content.js structure: id, type are top level or in data
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            
+            // Determine table based on type
+            let table = match type_str.as_str() {
+                "sales" | "goods" | "order" => "sales",
+                "tracking" | "receiving" | "shipping" => "tracking",
+                "event" | "coupon" => "event",
+                "member" | "team" | "user" => "users",
+                "talk" => "talks",
+                // Pages are stored in 'items' table with type='pages' in some contexts, 
+                // or 'pages' table if strictly separated. The store supports "pages".
+                // Based on previous context, page navigation items are usually type='order'/'goods' but acting as navigation nodes.
+                // However, we want to store them where 'get_known_pages' looks. 
+                // 'get_known_pages' looks at "pages" table.
+                // Let's assume the sync sends items intended for the "pages" table if they are nav items.
+                _ => {
+                    // Fallback: If it looks like a page (has origin/link), put in pages
+                    if item.get("origin").is_some() || item.get("link").is_some() {
+                        "pages"
+                    } else {
+                        "items" 
+                    }
+                }
+            };
+
+            // Handling the "pages" and "users" specifically for the sync request
+            // If the frontend sends explicit table hint, we could use that, but for now infer from type.
+            let final_table = if type_str == "team" || type_str == "user" || type_str == "member" {
+                "users"
+            } else if item.get("data").and_then(|d| d.get("origin")).is_some() {
+                "pages"
+            } else {
+                "items" // Default bucket
+            };
+
+            // Prepare fields
+            let from = item.get("from").and_then(|v| v.as_str());
+            let to = item.get("to").and_then(|v| v.as_str());
+            let cc = item.get("cc").and_then(|v| v.as_str());
+            let bcc = item.get("bcc").and_then(|v| v.as_str());
+            let ref_id = item.get("ref").and_then(|v| v.as_str());
+            let digest = item.get("digest").and_then(|v| v.as_str());
+
+            if !id.is_empty() {
+                let _ = db.upsert_item(final_table, &id, &type_str, item.clone(), None, from, to, cc, bcc, ref_id, digest).await;
+                count += 1;
+            }
+        }
+        Ok(format!("Synced {} items", count))
+    } else {
+        Err("DB not initialized".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let model = Arc::new(TokioMutex::new(None));
@@ -753,7 +816,8 @@ pub fn run() {
             summarize_image, search_documents, get_all_documents, get_document, check_query_intent, deep_research_command, ai_search_complex,
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
-            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs
+            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
+            upsert_items
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

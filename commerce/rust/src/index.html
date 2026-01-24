@@ -94,17 +94,9 @@
                      </div>
                  </div>
 
-                 <table id="doc-table">
-                   <thead>
-                       <tr>
-                           <th style="width: 30px;"><input type="checkbox" id="select-all-checkbox"></th>
-                           <th>Type</th>
-                           <th>No.</th>
-                           <th>Amount</th>
-                       </tr>
-                   </thead>
-                   <tbody id="doc-tbody"></tbody>
-                 </table>
+                 <!-- REPLACED: Table with Div Container for Cards -->
+                 <div id="doc-list" class="card-list"></div>
+                 
                  <div id="loading-indicator" style="display:none; text-align:center; padding:10px; font-size:0.8rem; color:#666;">Loading...</div>
                </div>
                <!-- AI Results Area -->
@@ -133,8 +125,6 @@
            </div>
         </div>
 
-        <!-- Tab: Query (Removed/Merged) -->
-        
         <!-- Tab: Automation -->
         <div id="tab-automation" class="tab-content">
            <div class="header-row"><h2>Browser Auto</h2></div>
@@ -177,8 +167,6 @@
                 </div>
            </div>
            
-           <!-- Original Settings Content (Hidden or moved? User said "reflect chat", implies replacement or addition) -->
-           <!-- Keeping vital buttons accessible via a hidden menu or bottom if needed, but for now focusing on Chat as requested -->
            <div id="settings-tools" style="margin-top:10px; padding-top:10px; border-top:1px solid #333; display:none;">
                <div id="device-status">Checking system...</div>
                <button id="unload-btn" class="action-btn" style="background:#ef4444; border:none;">Free Memory</button>
