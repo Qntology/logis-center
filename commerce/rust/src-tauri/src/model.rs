@@ -175,7 +175,7 @@ impl LogisModel {
         }
     }
 
-    async fn load_generator_internal(&self, path: &str, tokenizer_path: Option<&str>) -> anyhow::Result<Qwen3VLGenerateModel> {
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>) -> anyhow::Result<Qwen3VLGenerateModel> {
         println!("[MODEL] Loading Generator from {} on GPU-{}...", path, self.device_config.gpu_id);
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
@@ -183,19 +183,26 @@ impl LogisModel {
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
-        let tok_path = tokenizer_path.map(|s| s.to_string());
+        let shared_path = shared_config_path.map(|s| s.to_string());
 
         let generator = tokio::task::spawn_blocking(move || {
-            // If tok_path is provided, use it instead of the default model path for tokenizer
-            Qwen3VLGenerateModel::init_with_tokenizer(&path_clone, tok_path.as_deref(), Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize))
+            // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
+            Qwen3VLGenerateModel::init_with_config(
+                &path_clone, 
+                shared_path.as_deref(), // Tokenizer path
+                shared_path.as_deref(), // Config path
+                Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize)
+            )
         }).await??;
         
         Ok(generator)
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
+        // 1. Unload Embedding if loaded
         self.unload_embedding().await;
 
+        // 2. Check if we need to switch models
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
 
@@ -209,14 +216,15 @@ impl LogisModel {
                 match size { ModelSize::Small => "Small", ModelSize::Large => "Large" },
                 self.device_config.gpu_id
             );
-            *gen_guard = None;
+            *gen_guard = None; // Force drop
             
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
             
-            // [CRITICAL] 0.6B(Small) loads using 2B(Large)'s tokenizer to ensure Token ID parity for KV Cache
-            let tok_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+            // [CRITICAL] Both models MUST share the same Config & Tokenizer from the 2B directory
+            // to ensure KV Cache compatibility (Rope scaling, Sliding window, etc.)
+            let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
             
-            let gen = self.load_generator_internal(path, tok_path).await?;
+            let gen = self.load_generator_internal(path, shared_path).await?;
             
             *gen_guard = Some(gen);
             *current_size_guard = Some(size);

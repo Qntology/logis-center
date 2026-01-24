@@ -53,7 +53,7 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>, 
         hard_token_limit: Option<usize>
     ) -> Result<Self> {
-        Self::init_with_tokenizer(path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit)
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit)
     }
 
     pub fn init_with_tokenizer(
@@ -66,18 +66,34 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>, 
         hard_token_limit: Option<usize>
     ) -> Result<Self> {
-        // [FIX] Normalize path to remove Windows UNC prefix (\\?\) which causes issues with some loaders
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit)
+    }
+
+    pub fn init_with_config(
+        path: &str, 
+        tokenizer_path: Option<&str>,
+        config_path: Option<&str>,
+        text_device: Option<&Device>, 
+        text_device_id: usize, 
+        vision_device: Option<&Device>, 
+        vision_device_id: usize, 
+        dtype: Option<DType>, 
+        hard_token_limit: Option<usize>
+    ) -> Result<Self> {
+        // [FIX] Normalize path to remove Windows UNC prefix
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
         let tok_path = if let Some(stripped) = tok_path.strip_prefix(r"\\?\") { stripped } else { tok_path };
+        
+        let cfg_path = config_path.unwrap_or(path);
+        let cfg_path = if let Some(stripped) = cfg_path.strip_prefix(r"\\?\") { stripped } else { cfg_path };
 
         let chat_template = ChatTemplate::init(tok_path)?;
         let tokenizer = TokenizerModel::init(tok_path)?;
-        let config_path = std::path::Path::new(path).join("config.json");
+        let final_config_path = std::path::Path::new(cfg_path).join("config.json");
         
-        // [FIX] Robust Config Loading
-        // 1. Read raw JSON
-        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
+        // [FIX] Robust Config Loading using final_config_path
+        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&final_config_path)?)?;
         
         // 2. Try standard deserialization first
         let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() {
@@ -156,7 +172,7 @@ impl Qwen3VLGenerateModel {
             ModelVariant::Standard(model)
         };
 
-        let generation_config_path = std::path::Path::new(path).join("generation_config.json");
+        let generation_config_path = std::path::Path::new(cfg_path).join("generation_config.json");
         let generation_config: Qwen3VLGenerationConfig = if generation_config_path.exists() {
             serde_json::from_slice(&std::fs::read(generation_config_path)?)?
         } else {
