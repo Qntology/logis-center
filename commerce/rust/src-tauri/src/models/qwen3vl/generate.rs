@@ -143,7 +143,7 @@ impl Qwen3VLGenerateModel {
             // Standard tasks rarely hit 32k. Reserving for 8k-16k is safer for long pages.
             let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;
             let reserve_tokens = limit_tokens.min(16384); 
-            let kv_reserve = reserve_tokens * 120000; // Realistic overhead (~120KB per token for 2B architecture)
+            let kv_reserve = reserve_tokens * 40000; // Realistic overhead (~40KB per token average)
 
             if is_vision_model {
                 // CASE 1: Vision-Language Model
@@ -229,27 +229,20 @@ impl Qwen3VLGenerateModel {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         // Make input mutable to take ownership of fields
         let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let mut input_ids = self
-            .tokenizer
-            .text_encode(input.replace_text.clone(), &self.text_device)?;
-        let mut seq_len = input_ids.dim(1)?;
         
-        println!("[GENERATE] Input Token Count: {}", seq_len);
-        println!("[GENERATE] Input Shape: {:?}", input_ids.shape());
+        // [FIX] Memory-Safe Tokenization: Encode on CPU first to prevent VRAM spikes
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+        let total_tokens = full_input_ids_vec.len();
+        
+        println!("[GENERATE] Input Token Count: {}", total_tokens);
 
-        let full_input_ids_vec = input_ids.flatten_all()?.to_vec1::<u32>()?; // Save original full input for saving later
-
-        // [OPTIMIZATION] Detect action flags early to control caching behavior
+        // [OPTIMIZATION] Detect action flags early
         let is_ingest = input.replace_text.contains("ACTION: INGEST");
         let is_save = input.replace_text.contains("ACTION: SAVE");
         
-        if is_save || is_ingest {
-            println!("[KV-FLAG] Detected Flags - SAVE: {}, INGEST: {}", is_save, is_ingest);
-        }
-
         let mut seqlen_offset = 0;
 
-        // KV Cache Disk Loading (Hierarchical Prefix Caching)
+        // KV Cache Disk Loading
         let cache_path = if let Some(sid) = &session_id {
              let p = crate::utils::paths::get_kv_dir(None).join(sid);
              if !p.exists() { let _ = fs::create_dir_all(&p); }
@@ -272,42 +265,12 @@ impl Qwen3VLGenerateModel {
                                      if c == f { match_len += 1; } else { break; }
                                  }
 
-                                 if match_len < 50 {
-                                     println!("[KV-HIERARCHY] Cache Mismatch (Auto-Recovering via Prefill)...");
-                                     m.clear_kv_cache(); // Ensure clean state
-                                     if !cached_tokens.is_empty() && !full_input_ids_vec.is_empty() {
-                                         let divergent_token_cache = cached_tokens.get(match_len).cloned();
-                                         let divergent_token_input = full_input_ids_vec.get(match_len).cloned();
-                                         
-                                         if let (Some(c), Some(i)) = (divergent_token_cache, divergent_token_input) {
-                                             let text_c = self.tokenizer.token_decode(vec![c]).unwrap_or_else(|_| "Unknown".to_string());
-                                             let text_i = self.tokenizer.token_decode(vec![i]).unwrap_or_else(|_| "Unknown".to_string());
-                                             // println!("[KV-HIERARCHY] Divergence point (token {}): Cache='{}' ({}) vs Input='{}' ({})", 
-                                             //    match_len, text_c, c, text_i, i);
-                                         }
-                                     }
-                                 }
-
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
-                                     
-                                     // [UPSCALE-LOGIC] Sharp Refill: 2B model benefits from re-computing the last N tokens of 0.6B's context.
                                      let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
-                                     
                                      if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
-                                         // If we intentionally dropped tokens for upscaling, offset MUST reflect the actual cache loaded
-                                         let effective_match_len = if match_len > refill_len { match_len - refill_len } else { match_len };
-                                         seqlen_offset = effective_match_len;
+                                         seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                          loaded = true;
-                                         let remaining = seq_len.saturating_sub(seqlen_offset);
-                                         if remaining > 0 {
-                                             input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
-                                             seq_len = remaining;
-                                         } else {
-                                             input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
-                                             seqlen_offset = seq_len - 1;
-                                             seq_len = 1;
-                                         }
                                      }
                                  }
                              }
@@ -327,42 +290,12 @@ impl Qwen3VLGenerateModel {
                                      if c == f { match_len += 1; } else { break; }
                                  }
 
-                                 if match_len < 50 {
-                                     println!("[KV-HIERARCHY] Cache Mismatch (Auto-Recovering via Prefill)...");
-                                     m.clear_kv_cache();
-                                     if !cached_tokens.is_empty() && !full_input_ids_vec.is_empty() {
-                                         let divergent_token_cache = cached_tokens.get(match_len).cloned();
-                                         let divergent_token_input = full_input_ids_vec.get(match_len).cloned();
-                                         
-                                         if let (Some(c), Some(i)) = (divergent_token_cache, divergent_token_input) {
-                                             let text_c = self.tokenizer.token_decode(vec![c]).unwrap_or_else(|_| "Unknown".to_string());
-                                             let text_i = self.tokenizer.token_decode(vec![i]).unwrap_or_else(|_| "Unknown".to_string());
-                                             // println!("[KV-HIERARCHY] Divergence point (token {}): Cache='{}' ({}) vs Input='{}' ({})", 
-                                             //    match_len, text_c, c, text_i, i);
-                                         }
-                                     }
-                                 }
-
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
-                                     
-                                     // [UPSCALE-LOGIC] Sharp Refill: 2B model benefits from re-computing the last N tokens of 0.6B's context.
                                      let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
-
                                      if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
-                                         // Update offset to reflect the dropped tokens for upscaling
-                                         let effective_match_len = if match_len > refill_len { match_len - refill_len } else { match_len };
-                                         seqlen_offset = effective_match_len;
+                                         seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                          loaded = true;
-                                         let remaining = seq_len.saturating_sub(seqlen_offset);
-                                         if remaining > 0 {
-                                             input_ids = input_ids.narrow(1, seqlen_offset, remaining)?;
-                                             seq_len = remaining;
-                                         } else {
-                                             input_ids = input_ids.narrow(1, seq_len - 1, 1)?;
-                                             seqlen_offset = seq_len - 1;
-                                             seq_len = 1;
-                                         }
                                      }
                                  }
                              }
@@ -374,63 +307,75 @@ impl Qwen3VLGenerateModel {
              }
         }
         
-        // [CHUNKED PREFILL] - Line Aware (2048 tokens)
-        if seq_len > 2048 {
-            println!("[PREFILL] Line-aware chunking {} tokens...", seq_len);
-            let newline_token_id = if let Ok(ids) = self.tokenizer.text_encode("\n".to_string(), &self.text_device) {
-                ids.flatten_all()?.to_vec1::<u32>()?.get(0).cloned().unwrap_or(198)
-            } else { 198 };
+        // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
+        let mut current_pos = seqlen_offset;
+        let prefill_chunk_size = 2048;
+        let newline_token_id = 198; // Fallback for '\n'
 
-            let mut current_pos = 0;
-            let input_vec = full_input_ids_vec.clone();
+        while current_pos < total_tokens {
+            let remaining = total_tokens - current_pos;
+            
+            // If this is the very last token, we let the generation loop handle it
+            if remaining == 1 && seqlen_offset < total_tokens { break; }
 
-            while current_pos < seq_len - 1 {
-                let remaining = seq_len - current_pos;
-                if remaining <= 2048 { break; } 
-
-                let mut chunk_size = 2048;
-                let lookback_range = 256; 
-                let search_end = current_pos + 2048;
-                let search_start = search_end.saturating_sub(lookback_range);
-                
-                for i in (search_start..search_end).rev() {
-                    if i < input_vec.len() && input_vec[i] == newline_token_id {
-                        chunk_size = i - current_pos + 1; 
+            // Determine chunk size (2048 or remaining)
+            let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+            
+            // If not the final chunk of the whole input, try to align to newline for stability
+            if current_pos + chunk_size < total_tokens {
+                let search_start = (current_pos + chunk_size).saturating_sub(256);
+                for i in (search_start..(current_pos + chunk_size)).rev() {
+                    if full_input_ids_vec[i] == newline_token_id {
+                        chunk_size = i - current_pos + 1;
                         break;
                     }
                 }
-
-                let chunk_ids = input_ids.narrow(1, current_pos, chunk_size)?;
-                let start_pos = (seqlen_offset + current_pos) as u32;
-                let chunk_pos = Tensor::arange(start_pos, start_pos + chunk_size as u32, &self.text_device)?;
-                
-                let _logits = match &mut self.qwen3_vl {
-                    ModelVariant::Standard(m) => m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset + current_pos)?,
-                    ModelVariant::QuantizedVL(m) => m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset + current_pos)?,
-                    ModelVariant::QuantizedText(m) => m.forward(&chunk_ids, Some(&chunk_pos), seqlen_offset + current_pos)?,
-                };
-                
-                current_pos += chunk_size;
-                print!(">"); use std::io::Write; std::io::stdout().flush().ok();
             }
-            
-            seqlen_offset += current_pos;
-            input_ids = input_ids.narrow(1, current_pos, seq_len - current_pos)?;
-            seq_len = seq_len - current_pos;
-            println!("\n[PREFILL] Ingested up to offset {}.", seqlen_offset);
 
-            if is_save && !is_ingest {
-                if let Some(path) = &cache_path {
-                    let res = match &mut self.qwen3_vl {
-                        ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 0),
-                        ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, 0),
-                        _ => Ok(()),
-                    };
-                    if res.is_ok() {
-                        let token_path = path.join("tokens.json");
-                        if let Ok(file) = fs::File::create(&token_path) {
-                            let _ = serde_json::to_writer(file, &&full_input_ids_vec[..seqlen_offset]);
-                        }
+            // [CRITICAL] Final token of the entire input must be processed by the generation loop 
+            // to get the first predicted token logits.
+            if current_pos + chunk_size >= total_tokens {
+                chunk_size = total_tokens - current_pos - 1; 
+            }
+
+            if chunk_size == 0 { break; }
+
+            // Transfer ONLY this chunk to GPU
+            let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
+            let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
+            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+            
+            print!(">"); use std::io::Write; std::io::stdout().flush().ok();
+
+            match &mut self.qwen3_vl {
+                ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
+            };
+            
+            current_pos += chunk_size;
+        }
+
+        // Finalize state for generation loop
+        seqlen_offset = current_pos;
+        let mut seq_len = total_tokens - seqlen_offset;
+        let last_tokens_vec = &full_input_ids_vec[seqlen_offset..];
+        let mut input_ids = Tensor::from_vec(last_tokens_vec.to_vec(), (1, seq_len), &self.text_device)?;
+        
+        println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
+
+        // Save progress if requested
+        if is_save && !is_ingest && seqlen_offset > 0 {
+            if let Some(path) = &cache_path {
+                let res = match &mut self.qwen3_vl {
+                    ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 0),
+                    ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, 0),
+                    _ => Ok(()),
+                };
+                if res.is_ok() {
+                    let token_path = path.join("tokens.json");
+                    if let Ok(file) = fs::File::create(&token_path) {
+                        let _ = serde_json::to_writer(file, &full_input_ids_vec[..seqlen_offset]);
                     }
                 }
             }
@@ -441,8 +386,7 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values_video = input.pixel_values_video.take();
         let video_grid_thw_tensor = input.video_grid_thw.take();
         
-        let start_pos = seqlen_offset as u32;
-        let mut cache_position = Tensor::arange(start_pos, start_pos + seq_len as u32, &self.text_device)?;
+        let mut cache_position = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?;
         
         let requested_tokens = mes.max_tokens.unwrap_or(2048);
         let mut sample_len = requested_tokens;
