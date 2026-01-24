@@ -65,6 +65,12 @@ let currentDetailUuid: string | null = null;
 let isExtracting = false; 
 let spinnerInterval: number | null = null;
 let systemLogCount = 0;
+// [NEW] Active navigation context for related logs/chat
+let activeContext = {
+    cc: "",
+    bcc: "",
+    ref: ""
+};
 
 // --- UI Elements ---
 const contentPanel = document.getElementById("content-panel") as HTMLElement;
@@ -377,54 +383,45 @@ async function renderNavigation() {
                 if (!tree[domain]) tree[domain] = {};
                 if (!tree[domain][type]) tree[domain][type] = [];
                 
-                tree[domain][type].push({ 
-                    uuid: p.id, 
-                    link: data.link || "/", 
-                    // [FIX] Fallback title logic: text -> title -> link
-                    text: data.detail ? "Detail" : "List", 
-                    // [FIX] Detail logic: Explicit detail flag OR missing item selector (List has item selector)
-                    isDetail: data.detail === true || !data.item,
-                    domain,
-                    type,
-                    active: currentDetectedUrl.includes(data.link)
-                });
-            });
-
-            // HTML Generation
-            for (const [domain, types] of Object.entries(tree)) {
-                const branchDiv = document.createElement("div");
-                branchDiv.className = "logis-branch";
+                                tree[domain][type].push({ 
+                                    uuid: p.id, 
+                                    link: data.link || "/", 
+                                    text: data.text || data.title || data.link || "Untitled", 
+                                    isDetail: data.detail === true || !data.item,
+                                    domain,
+                                    type,
+                                    active: currentDetectedUrl.includes(data.link),
+                                    // [NEW] Carry related hashes for context
+                                    cc: p.cc,
+                                    bcc: p.bcc,
+                                    ref: p.ref_val || p.ref // Map to backend unified name
+                                });
+                            });
                 
-                let html = `
-                    <div class="logis-parent">
-                        <div class="logis-favicon"></div> <!-- Placeholder for favicon -->
-                        <strong>${domain}</strong>
-                    </div>
-                `;
-
-                for (const [type, items] of Object.entries(types)) {
-                    html += `<div class="logis-children">
-                        <div class="logis-type-header"># ${type}</div>`;
-                    
-                    items.forEach(it => {
-                        const icon = it.isDetail ? '◈' : '☰';
-                        const activeClass = it.active ? 'active' : '';
-                        const childClass = it.isDetail ? 'child' : '';
-                        // [FIX] Ensure text content is safe and visible
-                        const displayText = it.text || it.link; 
-                        
-                        html += `
-                            <a href="#" class="logis-page ${activeClass} ${childClass}" 
-                               data-id="${it.uuid}" data-domain="${it.domain}" data-type="${it.type}" data-mode="${it.isDetail ? 'Detail' : 'List'}">
-                                <span class="icon">${icon}</span>
-                                <span class="text" title="${displayText}">${displayText}</span>
-                            </a>
-                        `;
-                    });
-                    html += `</div>`;
-                }
-                branchDiv.innerHTML = html;
-                
+                            // HTML Generation
+                            for (const [domain, types] of Object.entries(tree)) {
+                                // ... (Branch logic)
+                                for (const [type, items] of Object.entries(types)) {
+                                    // ... (Type header)
+                                    items.forEach(it => {
+                                        const icon = it.isDetail ? '◈' : '☰';
+                                        const activeClass = it.active ? 'active' : '';
+                                        const childClass = it.isDetail ? 'child' : '';
+                                        const displayText = it.text || it.link; 
+                                        
+                                        html += `
+                                            <a href="#" class="logis-page ${activeClass} ${childClass}" 
+                                               data-id="${it.uuid}" data-domain="${it.domain}" data-type="${it.type}" data-mode="${it.isDetail ? 'Detail' : 'List'}"
+                                               data-cc="${it.cc}" data-bcc="${it.bcc}" data-ref="${it.ref}">
+                                                <span class="icon">${icon}</span>
+                                                <span class="text" title="${displayText}">${displayText}</span>
+                                            </a>
+                                        `;
+                                    });
+                                    // ...
+                                }
+                                // ...
+                            }                
                 // Bind Clicks
                 branchDiv.querySelectorAll(".logis-page").forEach((link: any) => {
                     link.onclick = (e: Event) => {
@@ -432,18 +429,31 @@ async function renderNavigation() {
                         e.stopPropagation();
                         const ds = link.dataset;
                         
+                        // [CONTEXT] Update global active context
+                        activeContext.cc = ds.cc || "";
+                        activeContext.bcc = ds.bcc || "";
+                        activeContext.ref = ds.ref || "";
+
                         // [UX] Log navigation action to chat history
                         renderMessage({
                             id: `nav-${Date.now()}`,
                             role: "system_task",
                             content: `Navigated to: ${ds.domain} - ${ds.type}`,
-                            status: 9, // Done
-                            created_at: Date.now()
+                            status: 9, 
+                            created_at: Date.now(),
+                            // Ensure this log is also associated with the context
+                            cc: activeContext.cc,
+                            bcc: activeContext.bcc,
+                            ref: activeContext.ref
                         });
 
                         addSearchTag(`@${ds.domain}`, 'domain', ds.domain);
                         addSearchTag(`#${ds.type}`, 'type', ds.type);
                         addSearchTag(`[${ds.mode}]`, 'mode', ds.mode);
+                        
+                        // Refresh chat history for this new context
+                        fetchChatHistory(true);
+
                         hideNavigation();
                     };
                 });
@@ -1057,7 +1067,9 @@ function renderMessage(msg: any) {
 
     
 
-    const msgId = `msg-${msg.id}`;
+    // [FIX] Use task_id as primary identifier for system logs to prevent duplicates
+
+    const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
 
     let existing = document.getElementById(msgId);
 
@@ -1069,7 +1081,7 @@ function renderMessage(msg: any) {
 
 
 
-    // [NEW] Update Preprocessing Log Count
+    // Update Preprocessing Log Count (only for new tasks)
 
     if (isSystemTask && !existing) {
 
@@ -1083,18 +1095,178 @@ function renderMessage(msg: any) {
 
     
 
-    const statusMap: Record<number, { icon: string, text: string, color: string }> = { 1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 3: { icon: "🚫", text: "cancelled", color: "#666" }, 6: { icon: "❌", text: "error", color: "#ef4444" }, 9: { icon: "✅", text: "done", color: "#22c55e" }, 10: { icon: "📥", text: "pending", color: "#999" } };
+    const statusMap: Record<number, { icon: string, text: string, color: string }> = { 
+
+        1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 
+
+        2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 
+
+        3: { icon: "🚫", text: "cancelled", color: "#666" }, 
+
+        6: { icon: "❌", text: "error", color: "#ef4444" }, 
+
+        9: { icon: "✅", text: "done", color: "#22c55e" }, 
+
+        10: { icon: "📥", text: "pending", color: "#999" } 
+
+    };
+
     const currentStatus = statusMap[msg.status] || statusMap[1];
+
     const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+
+
     let displayHtml = "";
+
     let itemData: any = null;
-    try { itemData = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch (e) { displayHtml = msg.content; }
-    if (itemData) {
-        displayHtml = typeof itemData === 'string' ? itemData : (itemData.text || itemData.title || JSON.stringify(itemData)); 
+
+    try { 
+
+        itemData = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; 
+
+    } catch (e) { 
+
+        displayHtml = msg.content; 
+
     }
-    const html = `<div class="chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" id="${msgId}" data-task-id="${msg.task_id || msg.id}" data-status="${msg.status}" style="cursor: ${isSystemTask ? 'pointer' : 'default'};"><div class="chat-message"><div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;"><span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span><span>${timeStr}</span></div><div class="content">${displayHtml}</div>${isSystemTask ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};">${currentStatus.icon} ${currentStatus.text.toUpperCase()}</div>` : ""}</div></div>`;
-    if (existing) existing.outerHTML = html;
-    else chatTalks.insertAdjacentHTML('beforeend', html);
+
+
+
+    if (itemData && typeof itemData === 'object') {
+
+        // [PARITY] If content is structured data, show a summary
+
+        displayHtml = itemData.text || itemData.title || itemData.summary || JSON.stringify(itemData);
+
+    }
+
+
+
+    const htmlContent = `
+
+        <div class="chat-message">
+
+            <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
+
+                <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
+
+                <span>${timeStr}</span>
+
+            </div>
+
+            <div class="content">${displayHtml}</div>
+
+            ${isSystemTask ? `
+
+                <div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};">
+
+                    <span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}
+
+                </div>
+
+            ` : ""}
+
+        </div>
+
+    `;
+
+
+
+    if (existing) {
+
+        // [UPDATE] Replace content in place
+
+        existing.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
+
+        existing.dataset.status = msg.status;
+
+        existing.innerHTML = htmlContent;
+
+    } else {
+
+        // [APPEND] Insert new message
+
+        const messageDiv = document.createElement("div");
+
+        messageDiv.id = msgId;
+
+        messageDiv.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
+
+        messageDiv.dataset.taskId = msg.task_id || msg.id;
+
+        messageDiv.dataset.status = msg.status;
+
+        messageDiv.innerHTML = htmlContent;
+
+        
+
+        // Clicks for System Tasks
+
+        if (isSystemTask) {
+
+            messageDiv.style.cursor = "pointer";
+
+            messageDiv.onclick = async () => {
+
+                const taskId = messageDiv.dataset.taskId;
+
+                const status = parseInt(messageDiv.dataset.status || "0");
+
+                
+
+                if (status === 9 && taskId) {
+
+                    // Show Result in Detail View
+
+                    showDetail(taskId);
+
+                } else if (taskId) {
+
+                    // Show Progress Logs
+
+                    openWidget("list");
+
+                    listView.style.display = "none";
+
+                    detailView.style.display = "flex";
+
+                    detailTitle.innerText = "Task Progress";
+
+                    const logArea = document.getElementById("extraction-log");
+
+                    if (logArea && logArea.dataset.activeTaskId !== taskId) {
+
+                        logArea.innerHTML = "<div style='padding:10px;'>📡 Loading task history...</div>";
+
+                        logArea.dataset.activeTaskId = taskId;
+
+                        const logs = await invoke<any[]>("get_task_logs", { taskId });
+
+                        logArea.innerHTML = "";
+
+                        logs.forEach(l => renderProgressToUI(l));
+
+                    }
+
+                }
+
+            };
+
+        }
+
+        chatTalks.insertAdjacentElement('beforeend', messageDiv);
+
+    }
+
+    
+
+    // Auto-scroll to bottom for new messages
+
+    const scroll = document.getElementById("chat-scroll");
+
+    if (scroll && !existing) scroll.scrollTop = scroll.scrollHeight;
+
 }
 
 function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
@@ -1134,8 +1306,23 @@ async function fetchChatHistory(reset: boolean = true) {
 async function loadMoreChat() {
     if (isChatLoading || !chatHasMore) return;
     isChatLoading = true;
+    
     try {
-        const messages = await invoke<any[]>("get_chat_messages", { limit: pageSize, offset: chatPage * pageSize });
+        // [RELATIONSHIP] Build SQL filter string based on active navigation context
+        let sqlFilter = null;
+        if (activeContext.ref) {
+            sqlFilter = `ref = '${activeContext.ref}'`;
+        } else if (activeContext.bcc) {
+            sqlFilter = `bcc = '${activeContext.bcc}'`;
+        } else if (activeContext.cc) {
+            sqlFilter = `cc = '${activeContext.cc}'`;
+        }
+
+        const messages = await invoke<any[]>("get_chat_messages", { 
+            limit: pageSize, 
+            offset: chatPage * pageSize,
+            filter: sqlFilter // Pass contextual filter
+        });
         if (chatTalks) {
             if (messages && messages.length > 0) {
                 if (messages.length < pageSize) chatHasMore = false;

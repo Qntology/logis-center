@@ -146,9 +146,11 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn get_all_messages(&self, limit: usize, offset: usize) -> Result<Vec<Value>> {
+    pub async fn get_all_messages(&self, limit: usize, offset: usize, filter: Option<String>) -> Result<Vec<Value>> {
         let table = self.conn.open_table("talks").execute().await?;
-        let results = table.query().limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
+        let mut q = table.query();
+        if let Some(f) = filter { q = q.only_if(f); }
+        let results = q.limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
