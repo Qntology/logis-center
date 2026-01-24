@@ -1413,7 +1413,7 @@ async fn process_task(
                             None,
                             Some(&task.from), Some(&team_id), Some(&task.cc),
                             Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
-                            Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.ref_id))),
+                            Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))),
                             None
                         ).await;
                     }
@@ -1432,8 +1432,8 @@ async fn process_task(
                 crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
             } else { task.to.clone() };
 
-            // [FIX] Use the already hashed ref_id from the task to maintain parity with frontend search criteria
-            let mut target_id = task.ref_id.clone();
+            // [FIX] Use the already hashed r#ref from the task to maintain parity with frontend search criteria
+            let mut target_id = task.r#ref.clone();
 
             let mut found_existing = false;
             let to_table = merge_info.to.clone(); 
@@ -1544,10 +1544,10 @@ async fn process_task(
                 let mut text_to_embed = parsing::json_to_natural_language(&extracted_data);
                 let item_digest = crate::utils::hash::digest(&text_to_embed); 
 
-                let _target_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, task.ref_id)); 
+                let _target_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, task.r#ref)); 
                 let mut existing_vector = None;
-                // [FIX] Use task.ref_id directly as the target_id to match parity with frontend
-                let target_id = task.ref_id.clone(); 
+                // [FIX] Use task.r#ref directly as the target_id to match parity with frontend
+                let target_id = task.r#ref.clone(); 
                 
                 if let Ok(Some(existing_item)) = db.get_item_by_id(&target_table, &target_id).await {
                     if existing_item.digest == item_digest {
@@ -1592,10 +1592,10 @@ async fn process_task(
 
                     // [STRICT PARITY] Re-generate BCC and REF exactly as server does
                     let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
-                    // [FIX] Use the pre-calculated hashed ref_id from the task to match frontend criteria
-                    let ref_val = task.ref_id.clone(); 
+                    // [FIX] Use the pre-calculated hashed r#ref from the task to match frontend criteria
+                    let ref_val = task.r#ref.clone(); 
                     
-                    // target_id is already set to task.ref_id above 
+                    // target_id is already set to task.r#ref above 
 
                     let _ = db.upsert_item(
                         &target_table, 

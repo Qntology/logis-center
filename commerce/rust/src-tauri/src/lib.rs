@@ -186,7 +186,7 @@ async fn summarize_image(
             to: "local".to_string(),
             cc: "".to_string(),
             bcc: "".to_string(),
-            ref_id: "manual".to_string(),
+            r#ref: "manual".to_string(),
             data_json: task_data.to_string(),
             created_at: now,
             updated_at: now,
@@ -543,14 +543,14 @@ async fn proxy_fetch(
 struct ActiveTaskQuery {
     cc: String,
     #[serde(alias = "refId")]
-    ref_id: String,
+    r#ref: String,
 }
 
 #[tauri::command]
 async fn check_active_task(state: State<'_, AppState>, payload: ActiveTaskQuery) -> Result<bool, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
-        db.has_active_task(&payload.cc, &payload.ref_id).await.map_err(|e| e.to_string())
+        db.has_active_task(&payload.cc, &payload.r#ref).await.map_err(|e| e.to_string())
     } else { Ok(false) }
 }
 
@@ -728,11 +728,11 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let to = item.get("to").and_then(|v| v.as_str());
             let cc = item.get("cc").and_then(|v| v.as_str());
             let bcc = item.get("bcc").and_then(|v| v.as_str());
-            let ref_id = item.get("ref").and_then(|v| v.as_str());
+            let r#ref = item.get("ref").and_then(|v| v.as_str());
             let digest = item.get("digest").and_then(|v| v.as_str());
 
             if !id.is_empty() {
-                let _ = db.upsert_item(final_table, &id, &type_str, item.clone(), None, from, to, cc, bcc, ref_id, digest).await;
+                let _ = db.upsert_item(final_table, &id, &type_str, item.clone(), None, from, to, cc, bcc, r#ref, digest).await;
                 count += 1;
             }
         }
@@ -799,7 +799,7 @@ pub fn run() {
                                 from: from_addr, to: team_id,
                                 cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                r#ref: payload_val.get("r#ref").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 data_json: payload_val.to_string(), created_at: now, updated_at: now, status: 10,
                             };
                             let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
@@ -811,7 +811,7 @@ pub fn run() {
                                 Some(1),
                                 Some(&task.cc),
                                 Some(&task.bcc),
-                                Some(&task.ref_id)
+                                Some(&task.r#ref)
                             ).await;
                             let _ = db.add_task(task).await;
                         }

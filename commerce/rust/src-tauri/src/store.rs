@@ -277,16 +277,21 @@ impl VectorStore {
             if existing.contains(&name.to_string()) {
                 let table = self.conn.open_table(name).execute().await?;
                 let current_schema = table.schema().await?;
-                let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
-                    field.data_type() == &DataType::Utf8
-                } else { true };
-                if needs_recreate {
+                
+                // [FIX] Check for 'ref' column existence and 'status' type to trigger migration
+                let has_ref = current_schema.field_with_name("ref").is_ok();
+                let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
+                    field.data_type() == &DataType::Int32
+                } else { false };
+
+                if !has_ref || !status_is_int {
+                    println!("[Store] Schema mismatch for {}. Dropping and recreating...", name);
                     let _ = self.conn.drop_table(name, &[]).await;
-                } else { continue; }
+                } else {
+                    continue;
+                }
             }
             let table = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await?;
-            let _ = table.create_index(&["text"], lancedb::index::Index::Auto).execute().await;
-            let _ = table.create_index(&["data"], lancedb::index::Index::Auto).execute().await;
         }
         Ok(())
     }
