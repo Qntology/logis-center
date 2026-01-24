@@ -12,7 +12,6 @@ use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
-use nvml_wrapper::enums::device::UsedGpuMemory;
 
 // --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
 // Handles offloading of large text data to disk to prevent RAM/VRAM bloating.

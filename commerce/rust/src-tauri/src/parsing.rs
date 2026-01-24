@@ -239,7 +239,7 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
                 if valid_children.len() == 1 {
                     if let Some(child_el) = valid_children[0].value().as_element() {
                         if child_el.name().to_lowercase() == "div" {
-                            current_node = valid_children[0];
+                            current_node = *valid_children[0];
                             continue;
                         }
                     }
