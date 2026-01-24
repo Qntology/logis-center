@@ -565,10 +565,14 @@ async fn initialize_hub(
 }
 
 #[tauri::command]
-async fn get_chat_messages(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+async fn get_chat_messages(
+    state: State<'_, AppState>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<Value>, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
-        db.get_all_messages(50).await.map_err(|e| e.to_string())
+        db.get_all_messages(limit, offset).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 

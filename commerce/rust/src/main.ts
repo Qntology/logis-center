@@ -43,6 +43,12 @@ let currentPage = 0;
 const pageSize = 10;
 let isLoading = false;
 let hasMore = true;
+
+// Chat Pagination State
+let chatPage = 0;
+let chatHasMore = true;
+let isChatLoading = false;
+
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
 let isExtracting = false; 
@@ -1313,28 +1319,64 @@ if (talksScroll) {
         // Prevent default browser scroll behavior to avoid jitter
         e.preventDefault();
     }, { passive: false });
+
+    // Infinite scroll for chat
+    talksScroll.addEventListener('scroll', () => {
+        // Since it's rotated 180deg, when we scroll "down" (to older messages), 
+        // the scrollTop increases towards the scrollHeight.
+        if (talksScroll.scrollTop + talksScroll.clientHeight >= talksScroll.scrollHeight - 20) {
+            loadMoreChat();
+        }
+    });
 }
 
-async function fetchChatHistory() {
+async function fetchChatHistory(reset: boolean = true) {
+    if (reset) {
+        chatPage = 0;
+        chatHasMore = true;
+        if (chatTalks) chatTalks.innerHTML = "";
+    }
+    await loadMoreChat();
+}
+
+async function loadMoreChat() {
+    if (isChatLoading || !chatHasMore) return;
+    isChatLoading = true;
+    
     try {
-        const messages = await invoke<any[]>("get_chat_messages");
+        const messages = await invoke<any[]>("get_chat_messages", { 
+            limit: pageSize, 
+            offset: chatPage * pageSize 
+        });
         
         if (chatTalks) {
-            chatTalks.innerHTML = ""; 
             if (messages && messages.length > 0) {
-                // Sort by creation time (ascending)
+                // If we got fewer than requested, no more to load
+                if (messages.length < pageSize) chatHasMore = false;
+                
+                // Sort by creation time (ascending) for chronological display
                 messages.sort((a, b) => a.created_at - b.created_at);
+                
+                // When loading more (older) messages, we might want to prepend, 
+                // but since the container is rotated 180deg, appending actually adds to the "top" of the visual list.
                 messages.forEach(msg => renderMessage(msg));
+                
+                chatPage++;
             } else {
-                chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>";
+                chatHasMore = false;
+                if (chatPage === 0) {
+                    chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>";
+                }
             }
 
             // [FIX] After loading history, if still not logged in, show QR at the bottom
-            if (!currentSession.email && currentTab === "settings") {
+            if (!currentSession.email && currentTab === "settings" && chatPage === 1) {
                 performQrAuth();
             }
         }
     } catch (e) {
         console.error("[WIDGET] Failed to fetch chat history:", e);
+    } finally {
+        isChatLoading = false;
     }
 }
