@@ -290,8 +290,14 @@ impl Qwen3VLGenerateModel {
 
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
-                                     if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
-                                         seqlen_offset = match_len;
+                                     
+                                     // [UPSCALE-LOGIC] Sharp Refill: 2B model benefits from re-computing the last N tokens of 0.6B's context.
+                                     let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
+                                     
+                                     if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
+                                         // If we intentionally dropped tokens for upscaling, offset MUST reflect the actual cache loaded
+                                         let effective_match_len = if match_len > refill_len { match_len - refill_len } else { match_len };
+                                         seqlen_offset = effective_match_len;
                                          loaded = true;
                                          let remaining = seq_len.saturating_sub(seqlen_offset);
                                          if remaining > 0 {
@@ -339,8 +345,14 @@ impl Qwen3VLGenerateModel {
 
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
-                                     if m.load_kv_cache(path, &self.text_device, match_len).is_ok() {
-                                         seqlen_offset = match_len;
+                                     
+                                     // [UPSCALE-LOGIC] Sharp Refill: 2B model benefits from re-computing the last N tokens of 0.6B's context.
+                                     let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
+
+                                     if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
+                                         // Update offset to reflect the dropped tokens for upscaling
+                                         let effective_match_len = if match_len > refill_len { match_len - refill_len } else { match_len };
+                                         seqlen_offset = effective_match_len;
                                          loaded = true;
                                          let remaining = seq_len.saturating_sub(seqlen_offset);
                                          if remaining > 0 {
