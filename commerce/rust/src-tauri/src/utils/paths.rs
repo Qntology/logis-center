@@ -52,10 +52,13 @@ pub fn init_directories(app: Option<&AppHandle>) {
 pub fn cleanup_temp_dirs(app: Option<&AppHandle>) {
     let kv = get_kv_dir(app);
     let data = get_task_data_dir(app);
+    let logs = get_logs_dir(app);
     
     let _ = fs::remove_dir_all(&kv);
     let _ = fs::remove_dir_all(&data);
+    let _ = fs::remove_dir_all(&logs);
     
     let _ = fs::create_dir_all(&kv);
     let _ = fs::create_dir_all(&data);
+    let _ = fs::create_dir_all(&logs);
 }
