@@ -336,6 +336,22 @@ impl VectorStore {
          let _ = table.delete(&format!("id = '{}'", id)).await;
          
          let mut final_data = data_val.clone();
+
+         // [NEW] Automatic Decompression for Server Data
+         // If data is provided as a compressed blob (from Cloudflare/D1 parity)
+         if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
+             // Check if it's a base64 string or binary indicator
+             if blob_base64.len() > 50 { // Minimal heuristic for blob
+                 use base64::prelude::BASE64_STANDARD;
+                 use base64::Engine;
+                 if let Ok(decoded) = BASE64_STANDARD.decode(blob_base64) {
+                     if let Ok(decompressed) = crate::utils::compression::decompress_to_value(&decoded) {
+                         final_data = decompressed;
+                     }
+                 }
+             }
+         }
+
          if let Some(obj) = final_data.as_object_mut() {
              // Sync tracking fields for query consistency
              if let Some(tn) = obj.get("tracking_number").cloned() {

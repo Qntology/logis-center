@@ -497,8 +497,20 @@ async fn proxy_fetch(
 
 
 
-    for (k, v) in headers { req_builder = req_builder.header(k, v); }
-    if let Some(b) = body { req_builder = req_builder.json(&b); }
+    for (k, v) in headers.iter() { req_builder = req_builder.header(k, v); }
+    
+    if let Some(b) = body { 
+        if headers.get("Content-Encoding").map(|v| v.as_str()) == Some("gzip") {
+            // [STRICT PARITY] Compress body if Gzip is requested
+            if let Ok(compressed) = crate::utils::compression::compress_value(&b) {
+                req_builder = req_builder.body(compressed);
+            } else {
+                req_builder = req_builder.json(&b);
+            }
+        } else {
+            req_builder = req_builder.json(&b); 
+        }
+    }
 
     let response = req_builder.send().await.map_err(|e| e.to_string())?;
     let status = response.status();

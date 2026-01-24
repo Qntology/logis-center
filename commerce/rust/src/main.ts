@@ -1051,6 +1051,66 @@ function renderMessage(msg: any) {
     const currentStatus = statusMap[msg.status] || statusMap[1];
     const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+    // [RICH-RENDERING] Parse content if it's a JSON object (Server Parity)
+    let displayHtml = "";
+    let itemData: any = null;
+    try {
+        itemData = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
+    } catch (e) {
+        displayHtml = msg.content; // Fallback to plain text
+    }
+
+    if (itemData) {
+        const type = (itemData.type || "").toLowerCase();
+        const text = itemData.text || "";
+        const title = itemData.title || "";
+        const price = itemData.sale_price || itemData.price || "";
+        const currency = itemData.currency || "USD";
+        const statusText = parseStatus(msg.status);
+
+        // Helper for rich fields
+        const tpl = (label: string, val: any, unit: string = "") => {
+            if (val === undefined || val === null || val === "") return "";
+            return `<div class="rich-field" style="display:flex; justify-content:space-between; margin-bottom:2px; font-size:0.7rem;">
+                <strong style="color:#888; text-transform:uppercase;">${label}</strong>
+                <span style="color:#eee;">${val}${unit ? ' <i style="font-style:normal; opacity:0.6;">'+unit+'</i>' : ''}</span>
+            </div>`;
+        };
+
+        if (type === "order" || type === "sales" || type === "goods") {
+            displayHtml = `
+                <div class="rich-item sales">
+                    <div style="font-weight:bold; color:var(--primary); margin-bottom:5px; font-size:0.8rem;">${title || "Commerce Item"}</div>
+                    ${tpl("Price", price, currency)}
+                    ${tpl("Qty", itemData.quantity)}
+                    ${tpl("SKU", itemData.stock_keeping_unit)}
+                    ${itemData.link ? `<a href="${itemData.link}" class="link-btn" style="display:inline-block; margin-top:5px; color:var(--primary); font-size:0.65rem;">View Original ↗</a>` : ""}
+                </div>
+            `;
+        } else if (type === "tracking") {
+            displayHtml = `
+                <div class="rich-item tracking">
+                    <div style="font-weight:bold; color:#4ade80; margin-bottom:5px; font-size:0.8rem;">📦 ${itemData.id || "Tracking"}</div>
+                    <div style="font-size:0.75rem; color:#ddd; margin-bottom:8px;">${text}</div>
+                    ${tpl("Carrier", itemData.carrier)}
+                    ${tpl("Sender", itemData.sender_name)}
+                    ${tpl("Recipient", itemData.recipient_name)}
+                </div>
+            `;
+        } else if (type === "event" || type === "coupon") {
+            displayHtml = `
+                <div class="rich-item event">
+                    <div style="font-weight:bold; color:#fbbf24; margin-bottom:5px; font-size:0.8rem;">🎟️ ${title}</div>
+                    ${tpl("Discount", itemData.discount)}
+                    ${tpl("Code", itemData.code)}
+                    ${tpl("Ends", itemData.expired_at)}
+                </div>
+            `;
+        } else {
+            displayHtml = text || title || msg.content;
+        }
+    }
+
     const html = `
         <div class="chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" id="${msgId}" 
              data-task-id="${msg.task_id || msg.id}" 
@@ -1061,9 +1121,9 @@ function renderMessage(msg: any) {
                     <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
                     <span>${timeStr}</span>
                 </div>
-                <div class="content">${msg.content}</div>
+                <div class="content">${displayHtml}</div>
                 ${isSystemTask ? `
-                    <div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(0,0,0,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};">
+                    <div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};">
                         ${currentStatus.icon} ${currentStatus.text.toUpperCase()}
                     </div>
                 ` : ""}
