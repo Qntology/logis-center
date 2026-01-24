@@ -784,8 +784,9 @@ async fn process_task(
             } else { task.to.clone() };
 
             // 1. page_id = hashId(cc + pathname) - Stripping search params to prevent duplicate schemas for same route
-            let clean_path = if let Some(pos) = task.ref_id.find('?') { &task.ref_id[..pos] } else { &task.ref_id };
-            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, clean_path)); 
+            let url_obj = url::Url::parse(&url).unwrap();
+            let raw_path = url_obj.path(); // Actual path string
+            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
             
             // 2. bcc = hashId(type + (isDetail ? cc.toUpperCase() : cc)) - Crucial for Tree grouping
             let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
@@ -794,9 +795,8 @@ async fn process_task(
             // 3. Prepare data exactly as proxy does
             let mut page_data = selector_info.clone();
             if let Some(obj) = page_data.as_object_mut() {
-                let url_obj = url::Url::parse(&url).unwrap();
                 obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                obj.insert("link".to_string(), json!(clean_path));
+                obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
                 obj.insert("type".to_string(), json!(page_type));
             }
 
@@ -810,7 +810,7 @@ async fn process_task(
                 Some(&team_id),
                 Some(&task.cc),
                 Some(&bcc),
-                Some(clean_path), // ref_id stored as clean path
+                Some(raw_path), // ref stored as path for lookup parity
                 None
             ).await;
             println!("[Scheduler] Page learned with Proxy parity: {}", page_id);

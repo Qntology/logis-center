@@ -530,7 +530,6 @@ async function syncData() {
         
         const url = `${API_HOST}/?${params.toString()}`;
         
-        // Fetch from Server
         const response = await invoke<any>("proxy_fetch", {
             url: url,
             method: "GET",
@@ -538,26 +537,34 @@ async function syncData() {
             session_params: { hash: currentSession.hash, token: currentSession.token }
         });
 
-        // The response structure usually contains results: []
-        // We need to parse pages/users from the results or specific endpoints.
-        // Based on `before_server`, the root endpoint might return session info or initial data.
-        // Assuming we might need specific queries or just process what's returned.
-        // For this example, let's assume we fetch specific types if needed, 
-        // or iterate through `response.results` if the server returns a feed.
-        
         if (response.results && Array.isArray(response.results)) {
-            // Upsert to Local LanceDB
             await Upsert["items"](response.results);
             console.log("[SYNC] Data upserted.");
             
-            // Re-render
+            // [REACTIVE] Re-render navigation immediately after sync
             await renderNavigation();
+            // Also refresh list if on list tab
+            if (currentTab === "list") await loadMoreDocs(true);
         }
         
-    } catch (e) {
-        console.error("[SYNC] Failed:", e);
-    }
+    } catch (e) { console.error("[SYNC] Failed:", e); }
 }
+
+// ... (List Logic) ...
+
+// [NEW] Global Navigation Link Handler (from item2html)
+document.addEventListener('nav-link', async (e: any) => {
+    const targetLink = e.detail;
+    console.log("[NAV] Internal Link Clicked:", targetLink);
+    
+    // Add chip for the specific path to filter items
+    addSearchTag(targetLink, 'path', targetLink);
+    
+    // Move to List View
+    openWidget("list");
+    listView.style.display = "block";
+    detailView.style.display = "none";
+});
 
 // --- List Logic (Updated for Cards) ---
 searchInput?.addEventListener("input", () => {
@@ -654,16 +661,16 @@ btnExtract?.addEventListener("click", async () => {
             const normalizedUrl = currentDetectedUrl.toLowerCase();
             const urlObj = new URL(normalizedUrl);
             const cc = await hashId(urlObj.hostname);
-            const link = urlObj.pathname + urlObj.search;
-            const hashedRefId = await hashId(cc + link);
+            const rawPath = urlObj.pathname + urlObj.search; // [STRICT] Real path for link
+            const hashedRefId = await hashId(cc + rawPath.toLowerCase());
             
             await emit("new-task-from-browser", { 
                 id: taskId, 
                 type: "html_extraction", 
                 html: html, 
-                link: currentDetectedUrl, 
+                link: rawPath, // [FIX] Send raw path
                 cc: cc, 
-                ref_id: hashedRefId,
+                ref_id: hashedRefId, // [FIX] Send hash as ref_id
                 from: currentSession.address,
                 to: currentSession.team
             });

@@ -10,14 +10,11 @@ interface DbQuery {
     value?: any;
     limit?: number;
     offset?: number;
-    // content.js specific filters
     from?: string;
     to?: string;
     ref?: string;
     type?: string;
 }
-
-// --- Shim Implementation ---
 
 export const Select: Record<string, (query: any) => Promise<any[]>> = {};
 export const Upsert: Record<string, (value: any) => Promise<any>> = {};
@@ -27,27 +24,19 @@ export const Delete: Record<string, (query: any) => Promise<any>> = {};
 Select["items"] = async function(query: DbQuery = {}) {
     try {
         let results: any[] = [];
-
-        // Case A: Search by ID/Ref specifically (Simulated via search or get_document)
         if (query.key === 'id' || query.key === 'ref') {
-            // Use get_document for precise ID lookup
             if (query.key === 'id' && typeof query.value === 'string') {
                 const doc = await invoke<any>("get_document", { uuid: query.value });
                 if (doc) {
                     const parsed = parseItemData(doc.json_data);
-                    // Merge top-level doc properties
                     results.push({ ...parsed, ...doc }); 
                 }
             } else {
-                // If searching by ref, we might need a search query
-                // For now, fallback to search_documents with the ref string
                 const searchRes = await invoke<[string, string, number][]>("search_documents", {
                     query: String(query.value),
                     limit: 50,
                     offset: 0
                 });
-                
-                // Fetch full docs for these results
                 for (const [id] of searchRes) {
                     const doc = await invoke<any>("get_document", { uuid: id });
                     if (doc) {
@@ -57,26 +46,19 @@ Select["items"] = async function(query: DbQuery = {}) {
                 }
             }
         } 
-        // Case B: General List / Full Fetch
         else {
             const limit = query.limit || 50;
             const offset = query.offset || 0;
-
             const docs = await invoke<any[]>("get_all_documents", { limit, offset });
-            
             results = docs.map(doc => {
                 const parsed = parseItemData(doc.json_data);
-                // Ensure ID parity
                 parsed.id = parsed.id || doc.uuid;
                 return parsed;
             });
-
-            // Client-side filtering for properties not supported by get_all_documents
             if (query.type) {
                 results = results.filter(r => r.type === query.type);
             }
         }
-
         return results;
     } catch (e) {
         console.error("[DB Shim] Select['items'] error:", e);
@@ -84,61 +66,65 @@ Select["items"] = async function(query: DbQuery = {}) {
     }
 };
 
-// 2. PAGES (Routing/Navigation Nodes)
+// 2. PAGES (Routing/Navigation Nodes with Join Logic)
 Select["pages"] = async function(query: DbQuery = {}) {
-    // [FIX] Independent fetching to prevent one failure from blocking all results
-    let pageDocs: any[] = [];
-    let itemDocs: any[] = [];
-
     try {
-        pageDocs = await invoke<any[]>("get_known_pages");
-    } catch (e) {
-        console.warn("[DB Shim] Failed to fetch from 'pages' table (might be empty/missing):", e);
-    }
+        // [HOP 1] Fetch Page definitions (Schema & Link)
+        let pageDocs: any[] = [];
+        try { pageDocs = await invoke<any[]>("get_known_pages"); } catch (e) {}
 
-    try {
-        itemDocs = await invoke<any[]>("get_all_documents", { limit: 200, offset: 0 });
-    } catch (e) {
-        console.warn("[DB Shim] Failed to fetch from 'items' table:", e);
-    }
+        // [HOP 2] Fetch Item instances to get real Titles (Join Emulation)
+        // We fetch a larger batch of items to find matching references
+        let itemDocs: any[] = [];
+        try { itemDocs = await invoke<any[]>("get_all_documents", { limit: 200, offset: 0 }); } catch (e) {}
 
-    try {
-        const combined = [...pageDocs, ...itemDocs];
+        const itemsMap = new Map();
+        itemDocs.forEach(doc => {
+            const parsed = parseItemData(doc.json_data);
+            // Store the latest title for this reference (ref could be a path or hash)
+            if (doc.ref) {
+                if (!itemsMap.has(doc.ref)) itemsMap.set(doc.ref, parsed.title || parsed.text || "");
+            }
+        });
+
         const unique = new Map();
+        const combined = [...pageDocs, ...itemDocs];
 
         combined.forEach(doc => {
             if (!unique.has(doc.uuid)) {
                 const parsed = parseItemData(doc.json_data);
-                
-                // Check if it's a page-like item
-                // 1. Explicitly in 'pages' table (doc_type check logic in backend might tag them)
-                // 2. Has 'origin' or 'link' properties (the hallmark of a page node)
-                // 3. Has type 'pages' or 'page'
                 const typeStr = (parsed.type || doc.doc_type || "").toLowerCase();
-                const isPage = (doc.doc_type === 'pages') || 
-                               (typeStr === 'pages' || typeStr === 'page') || 
-                               (parsed.origin || (parsed.data && parsed.data.origin));
+                
+                // Hallmarks of a page: 
+                // 1. In 'pages' table
+                // 2. Explicit type 'pages'
+                // 3. Has origin/link data
+                const isPage = (doc.doc_type === 'pages') || (typeStr === 'pages') || (parsed.origin || (parsed.data && parsed.data.origin));
                 
                 if (isPage) {
+                    const data = parsed.data || parsed;
+                    // [JOIN] Try to find a real title from itemsMap using the reference
+                    // In legacy, doc.ref is the join key.
+                    const realTitle = itemsMap.get(doc.ref) || data.title || data.text || "";
+
                     unique.set(doc.uuid, {
                         ...parsed,
                         id: parsed.id || doc.uuid,
                         type: parsed.type || doc.doc_type || "page",
-                        data: parsed.data || parsed // Ensure data structure consistency
+                        title: realTitle, // [FIX] Overwrite with joined title
+                        data: { ...data, title: realTitle }
                     });
                 }
             }
         });
 
         let results = Array.from(unique.values());
-
         if (query.key === 'id' && query.value) {
             results = results.filter(r => r.id === query.value);
         }
-
         return results;
     } catch (e) {
-        console.error("[DB Shim] Select['pages'] aggregation error:", e);
+        console.error("[DB Shim] Select['pages'] error:", e);
         return [];
     }
 };
@@ -147,61 +133,41 @@ Select["pages"] = async function(query: DbQuery = {}) {
 Select["users"] = async function(query: DbQuery = {}) {
     try {
         const docs = await invoke<any[]>("get_known_users");
-        
-        let results = docs.map(doc => {
+        return docs.map(doc => {
             const parsed = parseItemData(doc.json_data);
             return {
                 ...parsed,
                 id: parsed.id || doc.uuid,
-                type: parsed.type || doc.doc_type, // team vs user
+                type: parsed.type || doc.doc_type,
                 data: parsed.data || parsed
             };
         });
-
-        if (query.key === 'id' && query.value) {
-            results = results.filter(r => r.id === query.value);
-        }
-
-        return results;
-    } catch (e) {
-        console.error("[DB Shim] Select['users'] error:", e);
-        return [];
-    }
+    } catch (e) { return []; }
 };
 
-// 4. CRONS (Tasks) - Stub for now or map to active tasks
+// 4. CRONS
 Select["crons"] = async function(query: DbQuery = {}) {
-    // Rust has 'get_active_tasks'
     try {
         const tasks = await invoke<any[]>("get_active_tasks");
         if (query.key === 'ref' && query.value) {
             return tasks.filter(t => t.ref_id === query.value);
         }
         return tasks;
-    } catch (e) {
-        console.error("[DB Shim] Select['crons'] error:", e);
-        return [];
-    }
+    } catch (e) { return []; }
 };
 
-// --- Upsert Implementation ---
-// Generic upsert handler using the new Rust command
 async function handleUpsert(value: any) {
     if (!value) return;
     const items = Array.isArray(value) ? value : [value];
     try {
-        // [NEW] Call the Rust command to save items
         await invoke("upsert_items", { items });
         return items;
-    } catch (e) {
-        console.error("[DB Shim] Upsert error:", e);
-        return [];
-    }
+    } catch (e) { return []; }
 }
 
 Upsert["items"] = handleUpsert;
 Upsert["pages"] = handleUpsert;
 Upsert["users"] = handleUpsert;
-Upsert["crons"] = handleUpsert; // Will go to tasks logic in backend
+Upsert["crons"] = handleUpsert;
 
-Delete["items"] = async (q) => { console.warn("Delete not implemented in frontend shim"); return {}; };
+Delete["items"] = async (q) => { return {}; };
