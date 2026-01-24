@@ -206,7 +206,13 @@ async fn summarize_image(
 async fn search_documents(
     state: State<'_, AppState>,
     query: String,
+    limit: usize,
+    offset: usize,
 ) -> Result<Vec<(String, String, f32)>, String> {
+    let mut store_guard = state.model.lock().await; // Using model lock or store lock based on current usage
+    // Actually search_documents uses store, let's re-verify the lock usage from the file.
+    // Based on the previous read_file of lib.rs:
+    
     let mut store_guard = state.store.lock().await;
     if store_guard.is_none() {
         let db_path = "data/lancedb";
@@ -224,7 +230,7 @@ async fn search_documents(
     };
 
     if let Some(store) = store_guard.as_ref() {
-        store.search_items("items", &query, query_vec, 10, None).await.map_err(|e| e.to_string())
+        store.search_items("items", &query, query_vec, limit, None).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }

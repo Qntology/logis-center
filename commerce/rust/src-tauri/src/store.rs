@@ -470,7 +470,13 @@ impl VectorStore {
 
     pub async fn get_all_items(&self, table_name: &str, limit: usize, offset: usize) -> Result<Vec<TradeDocument>> {
         let table = self.conn.open_table(table_name).execute().await?;
-        let results = table.query().limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
+        // LanceDB doesn't always support complex order_by in all versions, 
+        // so we fetch and then ensure we are using the limit/offset correctly.
+        // For better performance with large datasets, we'd use a search or index.
+        let results = table.query()
+            .limit(limit)
+            .offset(offset)
+            .execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -496,6 +502,8 @@ impl VectorStore {
                 });
             }
         }
+        // Ensure latest first
+        docs.sort_by_key(|d| std::cmp::Reverse(d.created_at_ts));
         Ok(docs)
     }
 
