@@ -1701,4 +1701,3 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
-}

@@ -118,8 +118,8 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                     return DeviceConfig {
                         device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
                         is_cpu: false,
-                        classify_chunk_size: 24_000, 
-                        extract_chunk_size: 24_000,
+                        classify_chunk_size: 12_000, 
+                        extract_chunk_size: 12_000,
                         name: format!("GPU-{}", best_id),
                         gpu_id: best_id as usize,
                     };
@@ -132,8 +132,8 @@ pub fn get_optimal_device_config() -> DeviceConfig {
     DeviceConfig {
         device: Device::Cpu,
         is_cpu: true,
-        classify_chunk_size: 24_000,  
-        extract_chunk_size: 24_000,   
+        classify_chunk_size: 12_000,  
+        extract_chunk_size: 12_000,   
         name: "CPU".to_string(),
         gpu_id: 0,
     }
