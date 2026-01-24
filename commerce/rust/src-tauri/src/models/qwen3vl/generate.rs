@@ -143,7 +143,7 @@ impl Qwen3VLGenerateModel {
             // Standard tasks rarely hit 32k. Reserving for 8k-16k is safer for long pages.
             let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;
             let reserve_tokens = limit_tokens.min(16384); 
-            let kv_reserve = reserve_tokens * 40000; // Realistic overhead (~40KB per token average)
+            let kv_reserve = reserve_tokens * 70000; // Optimized overhead with driver cleanup delay
 
             if is_vision_model {
                 // CASE 1: Vision-Language Model
@@ -309,7 +309,7 @@ impl Qwen3VLGenerateModel {
         
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
         let mut current_pos = seqlen_offset;
-        let prefill_chunk_size = 2048;
+        let prefill_chunk_size = 256; // Lowered to 256 to minimize 'cat' peak VRAM spikes
         let newline_token_id = 198; // Fallback for '\n'
 
         while current_pos < total_tokens {
@@ -318,7 +318,7 @@ impl Qwen3VLGenerateModel {
             // If this is the very last token, we let the generation loop handle it
             if remaining == 1 && seqlen_offset < total_tokens { break; }
 
-            // Determine chunk size (2048 or remaining)
+            // Determine chunk size (256 or remaining)
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             
             // If not the final chunk of the whole input, try to align to newline for stability
@@ -352,6 +352,9 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
             };
+            
+            // [OOM-PREVENTION] Small delay between chunks to let driver settle memory
+            std::thread::sleep(std::time::Duration::from_millis(150));
             
             current_pos += chunk_size;
         }
