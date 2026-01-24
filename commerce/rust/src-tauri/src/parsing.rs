@@ -159,211 +159,127 @@ pub fn convert_to_clean_pug_selector(html: &str, selector_str: &str, mode: PugMo
 
 
 fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output: &mut String, mode: &PugMode) {
-
     if indent_level > 50 { return; }
-
     let indent = "    ".repeat(indent_level);
-
     
-
     match node.value() {
-
         Node::Element(element) => {
-
             let tag_name = element.name().to_lowercase();
 
-
-
-                        // --- base64 또는 너무 긴 src를 가진 img 태그 제외 ---
-
-
-
-                        if tag_name == "img" {
-
-
-
-                            if let Some(src) = element.attr("src") {
-
-
-
-                                if src.contains("base64") || src.len() > 3000 {
-
-
-
-                                    return;
-
-
-
-                                }
-
-
-
-                            }
-
-
-
-                        }
-
-
-
-            // 불필요한 태그들 한 번 더 필터링
-
-            if ["script", "style", "link", "noscript", "iframe", "svg", "path", "meta", "head", "symbol", "defs", "use"].contains(&tag_name.as_str()) {    
-
-                return;
-
+            // --- base64 이미지를 포함하는 img 태그 제외 ---
+            if tag_name == "img" {
+                if let Some(src) = element.attr("src") {
+                    if src.contains("base64") {
+                        return;
+                    }
+                }
             }
 
+            // 불필요한 태그들을 만나면 건너뛰기
+            if ["script", "style", "link", "noscript", "iframe"].contains(&tag_name.as_str()) {
+                return;
+            }
 
-
+            // --- 허용된 속성만 Pug 문법으로 변환 ---
             let mut attributes_string = String::new();
-
             let mut other_attributes = Vec::new();
 
-
-
-            // ID 및 Class 처리
-
+            // ID 속성 처리 (#my-id)
             if let Some(id) = element.id() {
-
                 attributes_string.push_str(&format!("#{}", id));
-
             }
 
-            let classes: Vec<_> = element.classes().collect();
-
-            if !classes.is_empty() {
-
-                attributes_string.push_str(&format!(".{}", classes.join(".")));
-
+            // Class 속성 처리 (.class1.class2)
+            if let Some(classes) = element.attr("class") {
+                let class_list: Vec<_> = classes.split_whitespace().collect();
+                if !class_list.is_empty() {
+                    attributes_string.push_str(&format!(".{}", class_list.join(".")));
+                }
             }
-
-
 
             // 필수 속성 정의
-
             let always_include = [
-
                 "src", "href", "type", "name", "value", "placeholder", 
-
                 "checked", "selected", "disabled", "readonly", "rows", "cols"
-
             ];
 
-
-
             for (name, value) in element.attrs() {
-
                 if name == "id" || name == "class" { continue; }
 
-
-
                 if name.starts_with("data-") || always_include.contains(&name) {
-
-                    // 불리언 속성 처리 (Pug 스타일)
-
+                    // Boolean 속성 처리 (ex: disabled, checked, readonly)
                     if ["checked", "selected", "disabled", "readonly"].contains(&name) && (value.is_empty() || value == name) {
-
                         other_attributes.push(name.to_string());
-
-                                                            } else if !value.is_empty() {
-
-                                                                let safe_value = value.replace("\"", "'");
-
-                                                                let trunc_value = if safe_value.len() > 3000 { format!("{}...", &safe_value[..3000]) } else { safe_value };
-
-                                                                other_attributes.push(format!("{}=\"{}\"", name, trunc_value));
-
-                                                            }
-
+                    } else if !value.is_empty() {
+                        let safe_value = value.replace("\"", "'");
+                        other_attributes.push(format!("{}=\"{}\"", name, safe_value));
+                    }
                 }
-
             }
 
-
-
+            // 괄호로 묶는 속성들 추가
             if !other_attributes.is_empty() {
-
                 attributes_string.push_str(&format!("({})", other_attributes.join(" ")));
-
             }
 
+            // div 축약 로직
+            let mut current_node = node;
+            while let Some(current_el) = current_node.value().as_element() {
+                if current_el.name().to_lowercase() != "div" { break; }
+                
+                let children: Vec<_> = current_node.children().collect();
+                let valid_children: Vec<_> = children.iter().filter(|n| {
+                    match n.value() {
+                        Node::Element(_) => true,
+                        Node::Text(t) => !t.trim().is_empty(),
+                        _ => false
+                    }
+                }).collect();
 
+                if valid_children.len() == 1 {
+                    if let Some(child_el) = valid_children[0].value().as_element() {
+                        if child_el.name().to_lowercase() == "div" {
+                            current_node = valid_children[0];
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
 
-            // 태그 및 속성 출력
-
+            // 태그 이름과 변환된 속성 문자열을 함께 추가
             output.push_str(&format!("{}{}{}\n", indent, tag_name, attributes_string));
 
-
-
-            // textarea 및 일반 텍스트 콘텐츠 처리
-
+            // textarea의 값 처리
             if tag_name == "textarea" {
-
                 let mut text_content = String::new();
-
-                for child in node.children() {
-
+                for child in current_node.children() {
                     if let Node::Text(t) = child.value() { text_content.push_str(t); }
-
                 }
-
                 if !text_content.trim().is_empty() {
-
                     for line in text_content.lines() {
-
-                        output.push_str(&format!("{}    | {}\n", indent, line.trim()));
-
-                    }
-
-                }
-
-            } else {
-
-                for child in node.children() {
-
-                    generate_pug_lines(child, indent_level + 1, output, mode);
-
-                }
-
-            }
-
-
-
-        }
-
-                        Node::Text(text) => {
-
-                            if *mode == PugMode::FullContent {
-
-                                let text_content = text.trim();
-
-                                if !text_content.is_empty() {
-
-                                    let text_trunc = if text_content.len() > 30000 { &text_content[..30000] } else { text_content };
-
-                                    for line in text_trunc.lines() {
-
-                        let trimmed_line = line.trim();
-
-                        if !trimmed_line.is_empty() {
-
-                            output.push_str(&format!("{}| {}\n", indent, trimmed_line.replace("\"", "'")));
-
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            output.push_str(&format!("{}    | {}\n", indent, trimmed));
                         }
-
                     }
-
                 }
-
+            } else {
+                for child in current_node.children() {
+                    generate_pug_lines(child, indent_level + 1, output, mode);
+                }
             }
-
         }
-
+        Node::Text(text) => {
+            if *mode == PugMode::FullContent {
+                let text_content = text.trim();
+                if !text_content.is_empty() {
+                    output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));
+                }
+            }
+        }
         _ => {}
-
     }
-
 }
 
 pub fn split_doc_to_pug_list(document: &Html, selector_str: &str, mode: PugMode) -> Vec<String> {
