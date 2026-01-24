@@ -1742,32 +1742,48 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
     loop {
         sys.refresh_all(); 
         let current_ram = sys.available_memory();
-        let mut current_vram = 0;
+        let mut max_free_vram = 0;
+        let mut best_gpu_id = 0;
+        let mut gpu_count = 0;
 
         let has_gpu = if let Some(ref nvml_inst) = nvml {
-            if let Ok(dev) = nvml_inst.device_by_index(0) {
-                if let Ok(mem) = dev.memory_info() {
-                    current_vram = mem.free;
-                    true
-                } else { false }
+            if let Ok(count) = nvml_inst.device_count() {
+                gpu_count = count;
+                for i in 0..count {
+                    if let Ok(dev) = nvml_inst.device_by_index(i) {
+                        if let Ok(mem) = dev.memory_info() {
+                            if mem.free > max_free_vram {
+                                max_free_vram = mem.free;
+                                best_gpu_id = i;
+                            }
+                        }
+                    }
+                }
+                gpu_count > 0
             } else { false }
         } else { false };
 
-        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
+        let meets_vram = !has_gpu || max_free_vram >= target_vram_bytes;
         let meets_ram = current_ram >= target_ram_bytes;
         
         if meets_vram && meets_ram {
             stable_count += 1;
             if stable_count >= 3 { 
-                println!("[RESOURCE-WATCH] Resources cleared. Proceeding.");
+                if has_gpu {
+                    println!("[RESOURCE-WATCH] Best GPU ID: {} matches target. Proceeding.", best_gpu_id);
+                }
                 break;
             }
         } else {
             stable_count = 0;
-            // 5초마다 상태 보고
             if last_report.elapsed().as_secs() >= 5 {
-                println!("[RESOURCE-DIAG] Still waiting for VRAM... Current Free: {:.2} GB, Target: {:.2} GB", 
-                    current_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0);
+                if has_gpu {
+                    println!("[RESOURCE-DIAG] Still waiting... Best GPU {} Free: {:.2} GB, Target: {:.2} GB (Total GPUs: {})", 
+                        best_gpu_id, max_free_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0, gpu_count);
+                } else {
+                    println!("[RESOURCE-DIAG] Still waiting for RAM... Free: {:.2} GB, Target: {:.2} GB", 
+                        current_ram as f64 / 1e9, target_ram_mb as f64 / 1024.0);
+                }
                 last_report = std::time::Instant::now();
             }
         }

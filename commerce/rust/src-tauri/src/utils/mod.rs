@@ -109,23 +109,14 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                     }
                 }
                 
-                // Threshold: If free VRAM > 4GB, treat as High-End GPU
-                if max_free > 4_000_000_000 {
+                if max_free > 0 {
+                    println!("🚀 [DEVICE-CONFIG] Selected GPU-{} with {:.2} GB Free.", best_id, max_free as f64 / 1e9);
                     return DeviceConfig {
                         device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
                         is_cpu: false,
                         classify_chunk_size: 24_000, 
                         extract_chunk_size: 24_000,
                         name: format!("GPU-{}", best_id),
-                    };
-                } else if max_free > 0 {
-                    // Low VRAM GPU (e.g. 2GB~4GB) -> Safe Mode
-                     return DeviceConfig {
-                        device: Device::new_cuda(best_id as usize).unwrap_or(Device::Cpu),
-                        is_cpu: false,
-                        classify_chunk_size: 24_000, 
-                        extract_chunk_size: 24_000,  
-                        name: format!("GPU-{}-LowMem", best_id),
                     };
                 }
             }
