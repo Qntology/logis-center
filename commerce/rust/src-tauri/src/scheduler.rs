@@ -1697,8 +1697,6 @@ fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
     utils::paths::cleanup_temp_dirs(app_handle);
 }
 
-/// Robustly waits for both VRAM and System RAM to be reclaimed.
-/// This function loops indefinitely until ANY GPU meets the target resources.
 async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
     use nvml_wrapper::Nvml;
     use sysinfo::System;
@@ -1707,15 +1705,17 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
     let nvml = Nvml::init().ok();
     
     let target_vram_bytes = target_vram_mb * 1024 * 1024;
-    let target_ram_bytes = target_ram_mb * 1024 * 1024;
+    // Lower default RAM threshold slightly for better compatibility (1000MB)
+    let adjusted_ram_target = if target_ram_mb > 1000 { 1000 } else { target_ram_mb };
+    let target_ram_bytes = adjusted_ram_target * 1024 * 1024;
 
     let mut stable_count = 0;
     let mut last_report = std::time::Instant::now();
 
-    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB, RAM > {}MB)...", target_vram_mb, target_ram_mb);
+    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB, RAM > {}MB)...", target_vram_mb, adjusted_ram_target);
 
     loop {
-        sys.refresh_all(); 
+        sys.refresh_memory(); // Only refresh memory for speed
         let current_ram = sys.available_memory();
         let mut max_free_vram = 0;
         let mut best_gpu_id = 0;
@@ -1743,22 +1743,20 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
         
         if meets_vram && meets_ram {
             stable_count += 1;
-            if stable_count >= 3 { 
-                if has_gpu {
-                    println!("[RESOURCE-WATCH] GPU ID: {} is ready with {:.2} GB Free. Proceeding.", best_gpu_id, max_free_vram as f64 / 1e9);
-                }
+            if stable_count >= 2 { // Reduced from 3 to 2 for faster transition
                 break;
             }
         } else {
             stable_count = 0;
             if last_report.elapsed().as_secs() >= 5 {
-                if has_gpu {
-                    println!("[RESOURCE-DIAG] Still waiting... Best GPU {} Free: {:.2} GB, Target: {:.2} GB (Total GPUs: {})", 
-                        best_gpu_id, max_free_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0, gpu_count);
+                let vram_status = if has_gpu {
+                    format!("VRAM: {:.2} / {:.2} GB", max_free_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0)
                 } else {
-                    println!("[RESOURCE-DIAG] Still waiting for RAM... Free: {:.2} GB, Target: {:.2} GB", 
-                        current_ram as f64 / 1e9, target_ram_mb as f64 / 1024.0);
-                }
+                    "VRAM: N/A".to_string()
+                };
+                let ram_status = format!("RAM: {:.2} / {:.2} GB", current_ram as f64 / 1e9, adjusted_ram_target as f64 / 1024.0);
+                
+                println!("[RESOURCE-DIAG] Still waiting... {} | {}", vram_status, ram_status);
                 last_report = std::time::Instant::now();
             }
         }

@@ -8509,6 +8509,7 @@ dependencies = [
  "futures",
  "image",
  "lancedb",
+ "memmap2",
  "minijinja",
  "num",
  "nvml-wrapper",

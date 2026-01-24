@@ -55,6 +55,7 @@ arrow-array = "56.2.0"
 arrow-schema = "56.2.0"
 ego-tree = "0.10"
 nvml-wrapper = "0.9.0"
+memmap2 = "0.9"
 
 [features]
 default = ["cuda"]
@@ -64,7 +65,7 @@ flash-attn = []
 
 
 [profile.dev]
-opt-level = 0      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
+opt-level = 2      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
 incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
 
 [profile.release]

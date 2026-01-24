@@ -159,11 +159,14 @@ pub struct LogisModel {
 impl LogisModel {
     pub async fn unload_generator(&self) {
         let mut gen = self.generator.lock().await;
-        if gen.is_some() {
-            *gen = None;
+        if let Some(mut m) = gen.take() {
+            // [FAST-RELEASE] Explicitly clear cache and drop internal tensors before None-ing
+            m.clear_kv_cache();
+            drop(m); // Triggers immediate drop of internal handles
+            
             let mut size = self.current_size.lock().await;
             *size = None;
-            println!("[MODEL] Generator unloaded to free VRAM.");
+            println!("[MODEL] Generator destroyed and VRAM reclaimed.");
         }
     }
 
