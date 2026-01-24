@@ -122,18 +122,20 @@ Select["pages"] = async function(query: DbQuery = {}) {
         const combined = [...pageDocs, ...itemDocs];
 
         combined.forEach(doc => {
-            if (!unique.has(doc.uuid)) {
+            const docId = doc.id || doc.uuid;
+            if (docId && !unique.has(docId)) {
                 const parsed = parseItemData(doc.json_data);
-                const typeStr = (parsed.type || doc.doc_type || "").toLowerCase();
-                const isPage = (doc.doc_type === 'pages') || (typeStr === 'pages') || (parsed.origin || (parsed.data && parsed.data.origin));
+                const typeStr = (parsed.type || doc.type || doc.doc_type || "").toLowerCase();
+                const isPage = (doc.type === 'pages' || doc.doc_type === 'pages' || typeStr === 'pages') || (parsed.origin || (parsed.data && parsed.data.origin));
                 
                 if (isPage) {
                     const data = parsed.data || parsed;
                     const realTitle = itemsMap.get(doc.ref) || data.title || data.text || "";
-                    unique.set(doc.uuid, {
-                        ...parsed,
-                        id: parsed.id || doc.uuid,
-                        type: parsed.type || doc.doc_type || "page",
+                    unique.set(docId, {
+                        ...doc, // Spread original DB fields first (id, cc, bcc, ref, etc.)
+                        ...parsed, // Overwrite with parsed fields
+                        id: docId,
+                        type: typeStr,
                         title: realTitle,
                         data: { ...data, title: realTitle }
                     });

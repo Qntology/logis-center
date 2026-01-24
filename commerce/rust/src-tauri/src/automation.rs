@@ -228,11 +228,18 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 "--disable-notifications",
                 "--disable-extensions",
                 "--disable-popup-blocking",
-                "--blink-settings=imagesEnabled=false", // 이미지 로딩 비활성화로 자원 절약
+                "--blink-settings=imagesEnabled=false",
+                "--disable-blink-features=AutomationControlled", // [CRITICAL] Hide automation status
+                "--password-store=basic", // Prevent password manager popups
+                "--no-default-browser-check",
                 &port_arg,
                 "--remote-allow-origins=*", 
             ];
-            let mut builder = BrowserConfig::builder().chrome_executable(&exec_path).with_head().no_sandbox().viewport(None);
+            let mut builder = BrowserConfig::builder()
+                .chrome_executable(&exec_path)
+                .with_head()
+                .no_sandbox()
+                .viewport(None);
             let tmp_root = crate::utils::paths::get_app_tmp_root(None);
             let profile_dir = tmp_root.join("browser_profiles").join(browser);
             let _ = std::fs::create_dir_all(&profile_dir);
@@ -263,7 +270,10 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
     };
 
     println!("[AUTO] Navigating to {}...", url);
-    let _page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
+    let page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
+    
+    // [CRITICAL STEALTH] Redefine navigator.webdriver to bypass detection
+    let _ = page.evaluate_on_new_document("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})").await;
     
     Ok(format!("Automation Started."))
 }

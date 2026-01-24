@@ -318,97 +318,97 @@ async function renderAccordion(nodes: any[], level = 1): Promise<string> {
 
     for (var n = 0; n < nodes.length; n++) {
         var node = nodes[n];
+        var nodeId = node.id || node.uuid || `node-${level}-${n}`;
         var active = '';
         var host = '';
-        var type = '';
+        var type = 'page';
         var content = '';
         var name = '';
         var desc: string[] = [];
 
-        if (!navTmp[node.id]) {
-            navTmp[node.id] = true;
+        // ONLY generate HTML if this node hasn't been rendered yet
+        if (!navTmp[nodeId]) {
+            navTmp[nodeId] = true;
 
             if (node.name) {
-                type = node.type;
+                type = node.type || "team";
                 name = node.name;
-
                 if (node.type === "team") {
                     var teamName = node.name;
-                    if (node.from === currentSession.address && node.id === node.to) {
+                    if (node.from === currentSession.address && nodeId === node.to) {
                         teamName = "Members";
-                        content = "Edit";
                     }
                     host = `<strong>${teamName}</strong>`;
                 } else {
-                    if (node.from === currentSession.address) {
-                        desc.push("owner");
-                    }
+                    if (node.from === currentSession.address) desc.push("owner");
                     content = `<span>${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>`;
                 }
-
-                if (node.id === activeContext.ref) {
-                    active = "active";
-                }
-            } else if (node.data) {
+                if (nodeId === activeContext.ref) active = "active";
+            } else if (node.data || node.type) {
                 type = 'page';
-                // [HIDE HASH] Use type and status instead of link hash
-                name = `<span>${node.type}</span> <span>${(node.data.item ? " Draft" : " ")}</span>`;
+                const data = node.data || {};
+                const nodeType = node.type || data.type || 'unknown';
+                name = `<span>${nodeType}</span> <span>${(data.item ? " Draft" : " ")}</span>`;
 
-                if (node.data.origin) {
-                    var _url = new URL(node.data.origin);
-                    if (!navTmp[_url.host] && node.data.item) {
+                if (data.origin) {
+                    var _url = new URL(data.origin);
+                    if (!navTmp[_url.host] && data.item) {
                         host = `<strong>${_url.host}</strong>`;
                         navTmp[_url.host] = true;
                     }
-                    if (node.id === activeContext.ref || currentDetectedUrl.includes(node.data.link)) {
+                    if (nodeId === activeContext.ref || (currentDetectedUrl && currentDetectedUrl.includes(data.link))) {
                         active = "active";
                     }
                 }
 
                 var total = { draft: 0, count: 0 };
-                // Parity with cookies.pages structure
                 const pagesStats = (currentSession as any).pages;
-                if (pagesStats && pagesStats[node.cc] && pagesStats[node.cc][node.type]) {
-                    total = pagesStats[node.cc][node.type];
+                const cc = node.cc || data.cc;
+                if (pagesStats && cc && pagesStats[cc] && pagesStats[cc][nodeType]) {
+                    total = pagesStats[cc][nodeType];
                 }
 
                 var recent = '';
                 try {
-                    // Optimized check for recent items
-                    const _items = await Select['items']({ key: 'bcc', value: node.bcc, limit: 1 });
-                    if (_items.length) {
-                        const _item = _items[0];
-                        const updateTime = (window as any).utils?.time2text ? (window as any).utils.time2text(_item.created_at) : "recently";
-                        recent = `<strong class="recent-tag">${updateTime}</strong>`;
+                    const bcc = node.bcc || data.bcc;
+                    if (bcc) {
+                        const _items = await Select['items']({ key: 'bcc', value: bcc, limit: 1 });
+                        if (_items.length) {
+                            recent = `<strong>${time2text(_items[0].created_at)}</strong>`;
+                        }
                     }
                 } catch (err) {}
 
-                var count = node.data.item ? `<u>(${total.draft})</u>` : `<u>(${total.count})</u>`;
+                var count = data.item ? `<u>(${total.draft})</u>` : `<u>(${total.count})</u>`;
                 content = `<span>${name} ${count}</span> ${recent}`;
             }
+
+            var hasChildren = node.children && node.children.length > 0;
+            const inputId = `${type}-${nodeId}`;
+
+            html += `
+                <input type="checkbox" name="${type}" id="${inputId}" ${hasChildren ? 'checked' : ''} style="display:none;" />
+                <li class="logis-parent ${hasChildren ? 'has-children' : ''}" ${type}-id="${nodeId}">
+                    ${host}
+                    <label for="${inputId}" class="logis-label ${inputId} ${active}" 
+                           data-id="${nodeId}" 
+                           data-cc="${node.cc || (node.data && node.data.cc) || ''}" 
+                           data-bcc="${node.bcc || (node.data && node.data.bcc) || ''}" 
+                           data-ref="${node.ref || node.ref_val || (node.data && node.data.ref) || ''}"
+                           data-domain="${node.domain || ''}" 
+                           data-type="${node.type || (node.data && node.data.type) || ''}">
+                        ${content}
+                    </label>
+            `;
+
+            if (hasChildren) {
+                html += `<div class="logis-child ${inputId}">`;
+                html += await renderAccordion(node.children, level + 1);
+                html += `</div>`;
+            }
+
+            html += `</li>`;
         }
-
-        var hasChildren = node.children && node.children.length > 0;
-        const inputId = `${type}-${node.id}`;
-
-        html += `
-            <input type="checkbox" name="${type}" id="${inputId}" ${hasChildren ? 'checked' : ''} style="display:none;" />
-            <li class="logis-parent ${hasChildren ? 'has-children' : ''}" data-nav-id="${node.id}">
-                ${host}
-                <label for="${inputId}" class="logis-label ${inputId} ${active}" 
-                       data-id="${node.id}" data-cc="${node.cc}" data-bcc="${node.bcc}" data-ref="${node.ref_val || node.ref}"
-                       data-domain="${node.domain}" data-type="${node.type}">
-                    ${content}
-                </label>
-        `;
-
-        if (hasChildren) {
-            html += `<div class="logis-child ${inputId}">`;
-            html += await renderAccordion(node.children, level + 1);
-            html += `</div>`;
-        }
-
-        html += `</li>`;
     }
 
     html += `</ul>`;
@@ -453,36 +453,51 @@ async function renderNavigation() {
 
                 const domain = new URL(data.origin).hostname;
                 _page.domain = domain;
+                _page.id = _page.id || _page.uuid; // Ensure ID exists
 
                 if (data.item) {
-                    branchs[`${data.origin}#${_page.type}`] = { ..._page, children: [] };
+                    const listKey = `${data.origin}#${_page.type}`;
+                    if (!branchs[listKey]) {
+                        branchs[listKey] = { ..._page, children: [] };
+                    } else {
+                        // If we already have a shell, upgrade it to a full List node
+                        Object.assign(branchs[listKey], _page);
+                    }
                 }
-                branchs[_page.id] = { ..._page, children: [] };
+                // Always keep a ref by ID for grouping details
+                if (!branchs[_page.id]) {
+                    branchs[_page.id] = { ..._page, children: [] };
+                }
             }
 
-            // 2. Logic Tree Assembly (List as Parent, Details as Children)
-            const processed = new Set();
+            // 2. Logic Tree Assembly
             const tree: any[] = [];
+            const processedIds = new Set();
 
+            // First, process all nodes that are Lists (Parents)
             for (let key in branchs) {
-                let _page = branchs[key];
-                if (processed.has(_page.id)) continue;
+                let node = branchs[key];
+                if (key.includes('#')) { // It's an origin#type group
+                    tree.push(node);
+                    processedIds.add(node.id);
+                }
+            }
+
+            // Second, attach Details to their respective Lists, or add as top-level if standalone
+            for (var p = 0; p < _pages.length; p++) {
+                let _page = _pages[p];
+                const pageId = _page.id || _page.uuid;
+                if (processedIds.has(pageId)) continue;
 
                 const data = _page.data || _page;
                 const parentKey = `${data.origin}#${_page.type}`;
-                const parent = branchs[parentKey];
-
-                if (parent && parent.id !== _page.id) {
-                    // This is a detail page, push to its list parent
-                    if (!parent.children.some((c: any) => c.id === _page.id)) {
-                        parent.children.push(_page);
-                        processed.add(_page.id);
-                    }
-                } else if (data.item) {
-                    // This is a list parent
-                    tree.push(_page);
-                    processed.add(_page.id);
+                
+                if (branchs[parentKey]) {
+                    branchs[parentKey].children.push(_page);
+                } else {
+                    tree.push({ ..._page, children: [] });
                 }
+                processedIds.add(pageId);
             }
 
             // 3. Render
@@ -491,7 +506,6 @@ async function renderNavigation() {
             // 4. Bind Clicks manually to labels
             pageList.querySelectorAll(".logis-label").forEach((label: any) => {
                 label.onclick = (e: Event) => {
-                    // Only trigger if clicking the label text, not the checkbox toggle area if nested
                     const ds = label.dataset;
                     if (!ds.id) return;
 
