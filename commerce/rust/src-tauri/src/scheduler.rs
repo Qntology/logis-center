@@ -82,7 +82,15 @@ fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
         // Find the NEXT newline after target_end to include the current line fully
         // [SAFETY] Limit search to 2000 chars to avoid oversized chunks from single long lines
         if target_end < text.len() {
-            let search_window = &text[target_end..(target_end + 2000).min(text.len())];
+            let window_end = (target_end + 2000).min(text.len());
+            let mut safe_window_end = window_end;
+            
+            // Ensure safe_window_end is a valid char boundary
+            while safe_window_end > target_end && !text.is_char_boundary(safe_window_end) {
+                safe_window_end -= 1;
+            }
+
+            let search_window = &text[target_end..safe_window_end];
             if let Some(next_newline_offset) = search_window.find('\n') {
                 end = target_end + next_newline_offset + 1;
             } else {
