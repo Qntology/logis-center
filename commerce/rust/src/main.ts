@@ -563,7 +563,15 @@ btnExtract?.addEventListener("click", async () => {
 });
 
 listen("extraction-progress", async (event: any) => {
-    const payload = event.payload;
+    renderProgressToUI(event.payload);
+});
+
+// Custom event for recovery
+document.addEventListener('render-progress', (e: any) => {
+    renderProgressToUI(e.detail);
+});
+
+async function renderProgressToUI(payload: any) {
     const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "general";
     const elementId = `progress-${catId}`;
     const extractionLog = document.getElementById("extraction-log");
@@ -656,7 +664,7 @@ listen("extraction-progress", async (event: any) => {
              }
          }
     }
-});
+}
 
 btnStopTask?.addEventListener("click", async () => {
     let confirmed = false;
@@ -1092,8 +1100,20 @@ function renderMessage(msg: any) {
                 const logArea = document.getElementById("extraction-log");
                 if (logArea) {
                     if (logArea.dataset.activeTaskId !== taskId) {
-                        logArea.innerHTML = `<div style='color:var(--primary); padding:10px;'>📡 Monitoring Task: ${taskId.slice(0,8)}...</div>`;
+                        logArea.innerHTML = `<div style='color:var(--primary); padding:10px;'>📡 Recovery Task History: ${taskId.slice(0,8)}...</div>`;
                         logArea.dataset.activeTaskId = taskId;
+                        
+                        // [RECOVERY] Fetch full history from disk
+                        invoke<any[]>("get_task_logs", { taskId }).then(logs => {
+                            logArea.innerHTML = "";
+                            logs.forEach(log => {
+                                // Simulate receiving each event to reuse the rendering logic
+                                document.dispatchEvent(new CustomEvent('render-progress', { detail: log }));
+                            });
+                        }).catch(e => {
+                            console.error("Recovery failed", e);
+                            logArea.innerHTML = `<div style='color:#ef4444; padding:10px;'>Failed to recover history. Monitoring live...</div>`;
+                        });
                     }
                 }
                 if (btnStopTask) btnStopTask.style.display = "flex";

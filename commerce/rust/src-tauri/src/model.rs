@@ -505,7 +505,12 @@ impl LogisModel {
         }
 
         // Emit initial status once (Frontend will handle continuous spinner animation via .active-spinner class)
-        let _ = app_handle.emit(event_name, base_payload);
+        let _ = app_handle.emit(event_name, &base_payload);
+        
+        // [LOG] Save to task history if task_id exists
+        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
+            crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
+        }
 
         let self_clone = self.generator.clone();
         

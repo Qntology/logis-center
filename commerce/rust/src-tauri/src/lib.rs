@@ -652,6 +652,18 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
     }
 }
 
+#[tauri::command]
+async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<Vec<Value>, String> {
+    let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task_id);
+    if !log_path.exists() { return Ok(vec![]); }
+
+    let content = std::fs::read_to_string(log_path).map_err(|e| e.to_string())?;
+    let logs = content.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    Ok(logs)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let model = Arc::new(TokioMutex::new(None));
@@ -725,7 +737,7 @@ pub fn run() {
             summarize_image, search_documents, get_all_documents, get_document, check_query_intent, deep_research_command, ai_search_complex,
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
-            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model
+            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -358,13 +358,27 @@ async fn process_task(
 
 
 
-    let _ = app_handle.emit("extraction-progress", json!({ 
+        let payload = json!({ 
 
-        "task_id": task.id,
 
-        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
 
-    }));
+            "task_id": task.id,
+
+
+
+            "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
+
+
+
+        });
+
+
+
+        let _ = app_handle.emit("extraction-progress", &payload);
+
+
+
+        log_task_progress(app_handle, &task.id, &payload);
 
 
 
@@ -382,28 +396,24 @@ async fn process_task(
                 let mut model_lock = model_mutex.lock().await;
         
                 if model_lock.is_none() {
-        
-                    let _ = app_handle.emit("extraction-progress", json!({ 
-        
+                    let payload = json!({ 
                        "task_id": task.id,
-        
                        "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
-        
-                    }));
+                    });
+                    let _ = app_handle.emit("extraction-progress", &payload);
+                    log_task_progress(app_handle, &task.id, &payload);
         
                     match LogisModel::new(None).await {
         
                         Ok(m) => *model_lock = Some(m),
         
                         Err(e) => {
-        
-                            let _ = app_handle.emit("extraction-progress", json!({ 
-        
+                            let payload = json!({ 
                                "task_id": task.id,
-        
                                "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
-        
-                            }));
+                            });
+                            let _ = app_handle.emit("extraction-progress", &payload);
+                            log_task_progress(app_handle, &task.id, &payload);
         
                             if let Some(m) = model_lock.as_ref() {
         
@@ -509,21 +519,29 @@ async fn process_task(
     println!("[Scheduler] Model lock acquired.");
     
     if model_lock.is_none() {
-        let _ = app_handle.emit("extraction-progress", json!({ 
+        let payload = json!({ 
+           "task_id": task.id,
            "category": "Loading Model", "summary": "Loading Model for Analysis...", "spinner": "⠋"
-        }));
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        log_task_progress(app_handle, &task.id, &payload);
         match LogisModel::new(None).await {
             Ok(m) => {
                 *model_lock = Some(m);
-                let _ = app_handle.emit("extraction-progress", json!({ 
+                let payload = json!({ 
+                   "task_id": task.id,
                    "category": "Loading Model", "summary": "Model Ready.", "spinner": "✅"
-                }));
+                });
+                let _ = app_handle.emit("extraction-progress", &payload);
+                log_task_progress(app_handle, &task.id, &payload);
             },
             Err(e) => {
-                let _ = app_handle.emit("extraction-progress", json!({ 
+                let payload = json!({ 
                    "task_id": task.id,
                    "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
-                }));
+                });
+                let _ = app_handle.emit("extraction-progress", &payload);
+                log_task_progress(app_handle, &task.id, &payload);
                 if let Some(m) = model_lock.as_ref() {
                     m.unload_generator().await;
                 }
@@ -847,7 +865,7 @@ async fn process_task(
         } else { 0 }
     };
 
-    let _ = app_handle.emit("extraction-progress", json!({ 
+    let payload = json!({ 
         "task_id": task.id,
         "category": "Classification", 
         "summary": format!("Type: {}, Detail: {} ({} matches found)", 
@@ -857,15 +875,19 @@ async fn process_task(
         ), 
         "spinner": "✅", 
         "data": page_info
-    }));
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &payload);
 
     let mut extracted_data = json!({});
 
     if !is_detail {
-        let _ = app_handle.emit("extraction-progress", json!({ 
+        let payload = json!({ 
             "task_id": task.id,
             "category": "List Processing", "summary": "Direct DOM extraction starting...", "spinner": "⠋"
-        }));
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        log_task_progress(app_handle, &task.id, &payload);
 
         let mut all_extracted_items = Vec::new();
 
@@ -942,24 +964,28 @@ async fn process_task(
         let total_items = all_extracted_items.len();
         println!("[Scheduler] Direct Extraction: Found {} items.", total_items);
 
-        let _ = app_handle.emit("extraction-progress", json!({ 
+        let payload = json!({ 
             "task_id": task.id,
             "category": "List Processing", 
             "summary": format!("Direct Extraction: Found {} items.", total_items), 
             "spinner": "✅"
-        }));
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        log_task_progress(app_handle, &task.id, &payload);
 
         // [REFINEMENT] If we have items but no specific field selectors (just raw text), use LLM to structure them.
         // Re-get field_selectors from selector_info which is still in scope, or rely on the logic that populated all_extracted_items with "text" only.
         let needs_refinement = selector_info.get("selectors").is_none() && !all_extracted_items.is_empty();
 
         if needs_refinement {
-             let _ = app_handle.emit("extraction-progress", json!({ 
+             let payload = json!({ 
                 "task_id": task.id,
                 "category": "Data Refinement", 
                 "summary": "Refining extracted data with AI...", 
                 "spinner": "⠋"
-            }));
+            });
+            let _ = app_handle.emit("extraction-progress", &payload);
+            log_task_progress(app_handle, &task.id, &payload);
 
             let batch_size = 20;
             let mut refined_items = Vec::new();
@@ -1092,12 +1118,14 @@ async fn process_task(
                          }
                          
                          // Emit the batch results to be appended in the UI
-                         let _ = app_handle.emit("extraction-progress", json!({
+                         let payload = json!({
                              "task_id": task.id,
                              "category": "Data Refinement",
                              "data": batch_refined,
                              "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
-                         }));
+                         });
+                         let _ = app_handle.emit("extraction-progress", &payload);
+                         log_task_progress(app_handle, &task.id, &payload);
 
                          // If LLM returned fewer items than batch, fill with remaining originals
                          if arr.len() < batch.len() {
@@ -1118,12 +1146,14 @@ async fn process_task(
                 all_extracted_items = refined_items;
             }
 
-            let _ = app_handle.emit("extraction-progress", json!({ 
+            let payload = json!({ 
                 "task_id": task.id,
                 "category": "Data Refinement", 
                 "summary": format!("Refined {} items with AI.", total_refine_count),
                 "spinner": "✅"
-            }));
+            });
+            let _ = app_handle.emit("extraction-progress", &payload);
+            log_task_progress(app_handle, &task.id, &payload);
         }
 
         // 이후 DB 저장 로직으로 연결 (기존 로직 활용)
@@ -1348,9 +1378,12 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let _ = app_handle.emit("extraction-progress", json!({ 
+    let payload = json!({ 
+        "task_id": task.id,
         "category": "Saving", "summary": "Syncing related entities...", "spinner": "⠋"
-    }));
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &payload);
 
     // [NEW] Side-Effect Logic: If order has goods, iterate and upsert tracking/goods links
     if page_type == "order" {
@@ -1611,13 +1644,15 @@ async fn process_task(
         }
     }
 
-        let _ = app_handle.emit("extraction-progress", json!({
+        let payload = json!({
             "task_id": task.id,
             "category": "Done",
             "summary": "Extraction complete.",
             "spinner": "✅",
             "data": if !is_detail { json!(null) } else { extracted_data }
-        }));
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        log_task_progress(app_handle, &task.id, &payload);
     
         // [LOCK-RELEASE] 정상 종료 시 모델 및 리소스 완전 해제
         {
@@ -1634,6 +1669,20 @@ async fn process_task(
         // [FIX] Only remove the specific directory for this task
         let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
     }
+
+pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_json::Value) {
+    use std::io::Write;
+    let log_path = crate::utils::paths::get_task_log_file(Some(app), task_id);
+    
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path) 
+    {
+        let line = format!("{}\n", payload.to_string());
+        let _ = file.write_all(line.as_bytes());
+    }
+}
 
 fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
     println!("[Cleanup] Clearing all temporary data directories...");
