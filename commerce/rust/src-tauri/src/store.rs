@@ -351,9 +351,11 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn get_all_items(&self, table_name: &str, limit: usize, offset: usize) -> Result<Vec<TradeDocument>> {
+    pub async fn get_all_items(&self, table_name: &str, limit: usize, offset: usize, filter: Option<String>) -> Result<Vec<TradeDocument>> {
         let table = self.conn.open_table(table_name).execute().await?;
-        let results = table.query().limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
+        let mut q = table.query();
+        if let Some(f) = filter { q = q.only_if(f); }
+        let results = q.limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();

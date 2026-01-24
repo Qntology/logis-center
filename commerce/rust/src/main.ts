@@ -858,11 +858,23 @@ async function loadMoreDocs(reset: boolean = false) {
     try {
         let docs: any[] = [];
         
-        if (finalQuery) {
-            docs = await Select["items"]({ key: 'ref', value: finalQuery, limit: pageSize, offset: currentPage * pageSize });
-        } else {
-            docs = await Select["items"]({ limit: pageSize, offset: currentPage * pageSize });
-        }
+        // Final Query string from tags + text
+        const textInput = searchInput?.value.toLowerCase() || "";
+        let queryParts = activeTags.map(t => {
+            if (t.type === 'domain') return `host:${t.value}`;
+            if (t.type === 'type') return `type:${t.value.toLowerCase()}`;
+            return t.value;
+        });
+        if (textInput) queryParts.push(textInput);
+        const finalQuery = queryParts.join(" ");
+
+        // [STRICT] If we have structured tags, the DB shim will use SQL filter.
+        // If it's pure text, it will use FTS search.
+        docs = await Select["items"]({ 
+            value: finalQuery, 
+            limit: pageSize, 
+            offset: currentPage * pageSize 
+        });
 
         if (docs.length < pageSize) hasMore = false;
         
@@ -873,8 +885,16 @@ async function loadMoreDocs(reset: boolean = false) {
         } else if (currentPage === 0) {
             if (docListContainer) docListContainer.innerHTML = "<div style='text-align:center; padding:20px; color:#999;'>No documents found.</div>";
         }
-    } catch (e) { console.error(e); } 
-    finally { isLoading = false; if (loadingIndicator) loadingIndicator.style.display = "none"; }
+    } catch (e) { 
+        console.error("[WIDGET] loadMoreDocs error:", e);
+        if (currentPage === 0 && docListContainer) {
+            docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
+        }
+    } 
+    finally { 
+        isLoading = false; 
+        if (loadingIndicator) loadingIndicator.style.display = "none"; 
+    }
 }
 
 function renderDocs(docs: any[]) {

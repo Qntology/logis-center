@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { parseItemData } from "./utils";
+import { parseItemData, hashId } from "./utils";
 
 // --- Types ---
 interface DbQuery {
@@ -20,45 +20,80 @@ export const Select: Record<string, (query: any) => Promise<any[]>> = {};
 export const Upsert: Record<string, (value: any) => Promise<any>> = {};
 export const Delete: Record<string, (query: any) => Promise<any>> = {};
 
+// Helper: Parse tags into SQL filter string for LanceDB
+async function parseQueryToFilter(queryStr: string): Promise<string | null> {
+    if (!queryStr) return null;
+    
+    const filters: string[] = [];
+    const parts = queryStr.split(' ');
+    
+    for (const part of parts) {
+        if (part.startsWith('host:')) {
+            const host = part.replace('host:', '');
+            const cc = await hashId(host);
+            filters.push(`cc = '${cc}'`);
+        } else if (part.startsWith('type:')) {
+            const type = part.replace('type:', '').toLowerCase();
+            filters.push(`type = '${type}'`);
+        } else if (part.startsWith('mode:')) {
+            // mode:list or mode:detail (mapping logic can be added if needed)
+        }
+    }
+    
+    return filters.length > 0 ? filters.join(' AND ') : null;
+}
+
 // 1. ITEMS (Main Documents)
 Select["items"] = async function(query: DbQuery = {}) {
     try {
         let results: any[] = [];
-        if (query.key === 'id' || query.key === 'ref') {
-            if (query.key === 'id' && typeof query.value === 'string') {
-                const doc = await invoke<any>("get_document", { uuid: query.value });
-                if (doc) {
-                    const parsed = parseItemData(doc.json_data);
-                    results.push({ ...parsed, ...doc }); 
-                }
-            } else {
-                const searchRes = await invoke<[string, string, number][]>("search_documents", {
-                    query: String(query.value),
-                    limit: 50,
-                    offset: 0
-                });
-                for (const [id] of searchRes) {
-                    const doc = await invoke<any>("get_document", { uuid: id });
-                    if (doc) {
-                        const parsed = parseItemData(doc.json_data);
-                        results.push({ ...parsed, ...doc });
-                    }
-                }
+
+        // Case A: Specific ID lookup
+        if (query.key === 'id' && typeof query.value === 'string') {
+            const doc = await invoke<any>("get_document", { uuid: query.value });
+            if (doc) {
+                const parsed = parseItemData(doc.json_data);
+                results.push({ ...parsed, ...doc, id: doc.uuid }); 
             }
-        } 
-        else {
-            const limit = query.limit || 50;
-            const offset = query.offset || 0;
-            const docs = await invoke<any[]>("get_all_documents", { limit, offset });
+            return results;
+        }
+
+        // Case B: Filtered or General Search
+        const limit = query.limit || 50;
+        const offset = query.offset || 0;
+        
+        // Construct SQL filter from tags (e.g., host:..., type:...)
+        const sqlFilter = await parseQueryToFilter(String(query.value || ''));
+
+        if (sqlFilter || !query.value) {
+            // [OPTIMIZED] Use get_all_documents with SQL filter for exact matches (Navigation clicks)
+            const docs = await invoke<any[]>("get_all_documents", { 
+                limit, 
+                offset, 
+                filter: sqlFilter 
+            });
+            
             results = docs.map(doc => {
                 const parsed = parseItemData(doc.json_data);
-                parsed.id = parsed.id || doc.uuid;
-                return parsed;
+                return { ...parsed, ...doc, id: doc.uuid };
             });
-            if (query.type) {
-                results = results.filter(r => r.type === query.type);
-            }
+        } else {
+            // [OPTIMIZED] Use search_documents for fuzzy text search
+            // We no longer call get_document in a loop! 
+            // search_items in Rust returns (id, json_data, score).
+            const searchRes = await invoke<[string, string, number][]>("search_documents", {
+                query: String(query.value),
+                limit,
+                offset,
+                filter: null
+            });
+            
+            results = searchRes.map(([id, jsonData, score]) => {
+                const parsed = parseItemData(jsonData);
+                return { ...parsed, id, score };
+            });
         }
+
         return results;
     } catch (e) {
         console.error("[DB Shim] Select['items'] error:", e);
@@ -66,22 +101,18 @@ Select["items"] = async function(query: DbQuery = {}) {
     }
 };
 
-// 2. PAGES (Routing/Navigation Nodes with Join Logic)
+// 2. PAGES
 Select["pages"] = async function(query: DbQuery = {}) {
     try {
-        // [HOP 1] Fetch Page definitions (Schema & Link)
         let pageDocs: any[] = [];
-        try { pageDocs = await invoke<any[]>("get_known_pages"); } catch (e) {}
+        try { pageDocs = await invoke<any[]>("get_known_pages", { filter: null }); } catch (e) {}
 
-        // [HOP 2] Fetch Item instances to get real Titles (Join Emulation)
-        // We fetch a larger batch of items to find matching references
         let itemDocs: any[] = [];
-        try { itemDocs = await invoke<any[]>("get_all_documents", { limit: 200, offset: 0 }); } catch (e) {}
+        try { itemDocs = await invoke<any[]>("get_all_documents", { limit: 200, offset: 0, filter: null }); } catch (e) {}
 
         const itemsMap = new Map();
         itemDocs.forEach(doc => {
             const parsed = parseItemData(doc.json_data);
-            // Store the latest title for this reference (ref could be a path or hash)
             if (doc.ref) {
                 if (!itemsMap.has(doc.ref)) itemsMap.set(doc.ref, parsed.title || parsed.text || "");
             }
@@ -94,24 +125,16 @@ Select["pages"] = async function(query: DbQuery = {}) {
             if (!unique.has(doc.uuid)) {
                 const parsed = parseItemData(doc.json_data);
                 const typeStr = (parsed.type || doc.doc_type || "").toLowerCase();
-                
-                // Hallmarks of a page: 
-                // 1. In 'pages' table
-                // 2. Explicit type 'pages'
-                // 3. Has origin/link data
                 const isPage = (doc.doc_type === 'pages') || (typeStr === 'pages') || (parsed.origin || (parsed.data && parsed.data.origin));
                 
                 if (isPage) {
                     const data = parsed.data || parsed;
-                    // [JOIN] Try to find a real title from itemsMap using the reference
-                    // In legacy, doc.ref is the join key.
                     const realTitle = itemsMap.get(doc.ref) || data.title || data.text || "";
-
                     unique.set(doc.uuid, {
                         ...parsed,
                         id: parsed.id || doc.uuid,
                         type: parsed.type || doc.doc_type || "page",
-                        title: realTitle, // [FIX] Overwrite with joined title
+                        title: realTitle,
                         data: { ...data, title: realTitle }
                     });
                 }
@@ -129,7 +152,7 @@ Select["pages"] = async function(query: DbQuery = {}) {
     }
 };
 
-// 3. USERS (Team Members)
+// 3. USERS
 Select["users"] = async function(query: DbQuery = {}) {
     try {
         const docs = await invoke<any[]>("get_known_users");

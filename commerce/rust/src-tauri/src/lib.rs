@@ -207,12 +207,9 @@ async fn search_documents(
     state: State<'_, AppState>,
     query: String,
     limit: usize,
-    offset: usize,
+    _offset: usize,
+    filter: Option<String>,
 ) -> Result<Vec<(String, String, f32)>, String> {
-    let mut store_guard = state.model.lock().await; // Using model lock or store lock based on current usage
-    // Actually search_documents uses store, let's re-verify the lock usage from the file.
-    // Based on the previous read_file of lib.rs:
-    
     let mut store_guard = state.store.lock().await;
     if store_guard.is_none() {
         let db_path = "data/lancedb";
@@ -230,7 +227,7 @@ async fn search_documents(
     };
 
     if let Some(store) = store_guard.as_ref() {
-        store.search_items("items", &query, query_vec, limit, None).await.map_err(|e| e.to_string())
+        store.search_items("items", &query, query_vec, limit, filter).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }
@@ -261,10 +258,11 @@ async fn get_all_documents(
     state: State<'_, AppState>,
     limit: usize,
     offset: usize,
+    filter: Option<String>,
 ) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let mut results = store.get_all_items("items", limit, offset).await.map_err(|e| e.to_string())?;
+        let mut results = store.get_all_items("items", limit, offset, filter).await.map_err(|e| e.to_string())?;
         
         // [DYNAMIC] Convert JSON to Natural Language for UI display only
         for doc in results.iter_mut() {
@@ -594,7 +592,7 @@ async fn get_chat_messages(
 async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("pages", 20, 0).await.map_err(|e| e.to_string())
+        store.get_all_items("pages", 100, 0, None).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -602,7 +600,7 @@ async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument
 async fn get_known_users(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("users", 20, 0).await.map_err(|e| e.to_string())
+        store.get_all_items("users", 20, 0, None).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -692,7 +690,7 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
             
             // Determine table based on type
-            let table = match type_str.as_str() {
+            let _table = match type_str.as_str() {
                 "sales" | "goods" | "order" => "sales",
                 "tracking" | "receiving" | "shipping" => "tracking",
                 "event" | "coupon" => "event",
