@@ -419,11 +419,10 @@ async function renderNavigation() {
                     typeSection.className = "nav-accordion";
                     
                     typeSection.innerHTML = `
-                        <div class="nav-header" style="display:flex; justify-content:space-between; padding:6px 10px; background:#f8fafc; border-radius:6px; cursor:pointer; margin-bottom:2px;">
+                        <div class="nav-header" style="display:flex; justify-content:space-between; padding:6px 10px; background:#f8fafc; border-radius:6px; margin-bottom:2px;">
                             <span style="font-size:0.7rem; font-weight:bold; color:#475569;"># ${type}</span>
-                            <span class="arrow" style="font-size:0.6rem; color:#cbd5e1;">▼</span>
                         </div>
-                        <div class="nav-content hidden" style="padding:4px 0;">
+                        <div class="nav-content" style="padding:4px 0;">
                             ${items.map(it => `
                                 <div class="nav-link ${it.isDetail ? 'detail' : 'list'}" 
                                      data-id="${it.uuid}" data-domain="${it.domain}" data-type="${it.type}" data-mode="${it.isDetail ? 'Detail' : 'List'}" data-path="${it.link}"
@@ -435,19 +434,6 @@ async function renderNavigation() {
                         </div>
                     `;
                     
-                    const header = typeSection.querySelector(".nav-header") as HTMLElement;
-                    const content = typeSection.querySelector(".nav-content") as HTMLElement;
-                    header.onclick = () => {
-                        content.classList.toggle("hidden");
-                        header.querySelector(".arrow")!.innerHTML = content.classList.contains("hidden") ? "▼" : "▲";
-                    };
-                    
-                    // Domain click also adds a tag
-                    domainDiv.querySelector(".domain-header")!.addEventListener("click", (e) => {
-                        e.stopPropagation();
-                        addSearchTag(`@${domain}`, 'domain', domain);
-                    });
-
                     typeSection.querySelectorAll(".nav-link").forEach((link: any) => {
                         link.onclick = (e: Event) => {
                             e.stopPropagation();
