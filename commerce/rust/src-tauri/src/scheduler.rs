@@ -706,6 +706,7 @@ async fn process_task(
         
         // Unload 2B
         if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+        *model_lock = None; // [CRITICAL] Fully destroy LogisModel to free CUDA context
         drop(model_lock);
 
         let type_info = parsing::parse_json_from_llm(&res);
