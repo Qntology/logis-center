@@ -779,9 +779,9 @@ async fn process_task(
     {
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
-            let team_id = if task.to_dest.is_empty() { 
+            let team_id = if task.to.is_empty() { 
                 crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-            } else { task.to_dest.clone() };
+            } else { task.to.clone() };
 
             // 1. page_id = hashId(cc + pathname) - Stripping search params to prevent duplicate schemas for same route
             let clean_path = if let Some(pos) = task.ref_id.find('?') { &task.ref_id[..pos] } else { &task.ref_id };
@@ -806,7 +806,7 @@ async fn process_task(
                 "pages", 
                 page_data, 
                 None,
-                Some(&task.from_source),
+                Some(&task.from),
                 Some(&team_id),
                 Some(&task.cc),
                 Some(&bcc),
@@ -1160,10 +1160,10 @@ async fn process_task(
         for mut item_json in all_extracted_items.clone() {
             // [STRICT PARITY] 1개씩 처리하며 DB에 넣기
             let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-            let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
-            let team_id = if task.to_dest.is_empty() { 
+            let from_addr = if task.from.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from };
+            let team_id = if task.to.is_empty() { 
                 crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-            } else { task.to_dest.clone() };
+            } else { task.to.clone() };
 
             let link = item_json.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let item_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, link));
@@ -1359,8 +1359,8 @@ async fn process_task(
     
     let id_val_raw = normalized_data.get("id").or_else(|| normalized_data.get("index")).cloned();
     // [STRICT PARITY] Use the task's existing destination (respecting login status)
-    let team_id = if !task.to_dest.is_empty() { 
-        task.to_dest.clone() 
+    let team_id = if !task.to.is_empty() { 
+        task.to.clone() 
     } else { 
         crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
     };
@@ -1411,7 +1411,7 @@ async fn process_task(
                             "tracking", 
                             tracking_data, 
                             None,
-                            Some(&task.from_source), Some(&team_id), Some(&task.cc),
+                            Some(&task.from), Some(&team_id), Some(&task.cc),
                             Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))),
                             Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.ref_id))),
                             None
@@ -1428,9 +1428,9 @@ async fn process_task(
         let store_guard = store_mutex.lock().await;
         if let Some(db) = store_guard.as_ref() {
             let mut target_data = extracted_data.clone();
-            let team_id = if task.to_dest.is_empty() { 
+            let team_id = if task.to.is_empty() { 
                 crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-            } else { task.to_dest.clone() };
+            } else { task.to.clone() };
 
             // [FIX] Use the already hashed ref_id from the task to maintain parity with frontend search criteria
             let mut target_id = task.ref_id.clone();
@@ -1501,7 +1501,7 @@ async fn process_task(
                 println!("[Scheduler] Saving item: {} to {}", target_id, to_table);
                 
                 let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-                let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
+                let from_addr = if task.from.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from };
 
                 // [STRICT PARITY] Re-generate BCC and REF for the target
                 let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
@@ -1585,10 +1585,10 @@ async fn process_task(
                 let store_guard = store_mutex.lock().await;
                 if let Some(db) = store_guard.as_ref() {
                     let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-                    let from_addr = if task.from_source.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from_source };
-                    let team_id = if task.to_dest.is_empty() { 
+                    let from_addr = if task.from.is_empty() { "0x0000000000000000000000000000000000000000" } else { &task.from };
+                    let team_id = if task.to.is_empty() { 
                         crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-                    } else { task.to_dest.clone() };
+                    } else { task.to.clone() };
 
                     // [STRICT PARITY] Re-generate BCC and REF exactly as server does
                     let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_val));
