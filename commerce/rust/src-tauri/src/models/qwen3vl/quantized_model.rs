@@ -122,10 +122,7 @@ impl QuantizedQwen3VLTextAttention {
         layer_idx: usize,
     ) -> Result<Self> {
         let _hidden_size = config.hidden_size;
-        let num_attention_heads = config.num_attention_heads;
         let head_dim = config.head_dim;
-        let num_key_value_heads = config.num_key_value_heads;
-        let num_kv_groups = num_attention_heads / num_key_value_heads;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
@@ -133,6 +130,37 @@ impl QuantizedQwen3VLTextAttention {
         } else {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
+
+        // [FIX] Dynamic Head Detection: Trust GGUF tensor shapes over config to prevent reshape mismatches.
+        let q_weight_name = format!("{base_name}.{q}.weight");
+        let k_weight_name = format!("{base_name}.{k}.weight");
+
+        let num_attention_heads = if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
+            let out_features = info.shape.dims()[0];
+            out_features / head_dim
+        } else {
+            config.num_attention_heads
+        };
+
+        let num_key_value_heads = if let Some(info) = ct.tensor_infos.get(&k_weight_name) {
+            let out_features = info.shape.dims()[0];
+            out_features / head_dim
+        } else {
+            config.num_key_value_heads
+        };
+
+        let num_kv_groups = if num_key_value_heads > 0 {
+            num_attention_heads / num_key_value_heads
+        } else {
+            1
+        };
+
+        if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
+            if layer_idx == 0 {
+                println!("[MODEL-FIX] Architecture Mismatch Detected. GGUF: {} heads / {} KV heads. Config: {} heads / {} KV heads. Overriding config.",
+                    num_attention_heads, num_key_value_heads, config.num_attention_heads, config.num_key_value_heads);
+            }
+        }
 
         let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
         let k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
@@ -251,22 +279,18 @@ impl QuantizedQwen3VLTextAttention {
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
             let mut map = HashMap::new();
 
-            // Always save raw copy to CPU for backup/fast-path
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
 
-            // [EXPERIMENTAL] bit_depth: 4 or 8
             let bits = 4u32; 
             map.insert("bits".to_string(), Tensor::from_vec(vec![bits], (1,), &Device::Cpu)?);
 
             if block_size == 0 {
-                // [ULTRA-FAST] Raw Tensor Save
                 map.insert("k_raw".to_string(), k_cpu);
                 map.insert("v_raw".to_string(), v_cpu);
                 map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
             } else {
                 map.insert("mode".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
-                // [RESTORED] Quantization logic for space saving
                 let quantize_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, b_size: usize, b_depth: u32| -> Result<()> {
                     use rayon::prelude::*; 
                     let shape = t.shape().dims().to_vec();
@@ -302,7 +326,7 @@ impl QuantizedQwen3VLTextAttention {
                             }
                         }).unzip();
                     let flat_data: Vec<u8> = quantized_data.into_iter().flatten().collect();
-                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(flat_data, (flat_data.len(),), &Device::Cpu)?);
+                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(flat_data.clone(), (flat_data.len(),), &Device::Cpu)?);
                     map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?);
                     map.insert(format!("{}_shape", prefix), Tensor::from_vec(shape.iter().map(|&x| x as u32).collect(), (shape.len(),), &Device::Cpu)?);
                     Ok(())
@@ -503,9 +527,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.offload_kv_cache(path, block_size)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
         let device = self.input_layernorm.weight().device();
-        self.self_attn.load_kv_cache(path, device, expected_len)
+        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len)
     }
 }
 
@@ -534,10 +558,18 @@ impl QuantizedQwen3VLTextModel {
         
         let embed_tokens = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
-             Embedding::new(tensor, config.hidden_size)
+             let real_hidden_size = tensor.dim(1)?;
+             if real_hidden_size != config.hidden_size {
+                 println!("[MODEL-FIX] Embedding Hidden Size Mismatch. GGUF: {}, Config: {}. Using GGUF.", real_hidden_size, config.hidden_size);
+             }
+             Embedding::new(tensor, real_hidden_size)
         } else if let Ok(tensor) = ct.tensor(reader, alt_token_emb, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
-             Embedding::new(tensor, config.hidden_size)
+             let real_hidden_size = tensor.dim(1)?;
+             if real_hidden_size != config.hidden_size {
+                 println!("[MODEL-FIX] Embedding Hidden Size Mismatch (Alt). GGUF: {}, Config: {}. Using GGUF.", real_hidden_size, config.hidden_size);
+             }
+             Embedding::new(tensor, real_hidden_size)
         } else {
              return Err(anyhow!("Failed to load embedding. Tried {}, {}", token_emb_name, alt_token_emb));
         };
@@ -563,8 +595,8 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let estimated_activation_buffer = 20_000_000; // 20MB buffer for activations
-        let cost_per_layer = if layer_weight_size > 0 { layer_weight_size + estimated_activation_buffer } else { 60_000_000 }; // Fallback to 60MB
+        let estimated_activation_buffer = 256_000_000; // 256MB buffer for activations (account for prefill peak)
+        let cost_per_layer = if layer_weight_size > 0 { layer_weight_size + estimated_activation_buffer } else { 80_000_000 }; // Fallback to 80MB
 
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
