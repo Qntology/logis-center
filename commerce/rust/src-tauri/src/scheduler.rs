@@ -1276,7 +1276,7 @@ async fn process_task(
                 let params = ChatCompletionParameters {
                     messages,
                     model: "qwen3vl".to_string(),
-                    max_tokens: Some(4096),
+                    max_tokens: Some(8192),
                     temperature: Some(0.1),
                     ..Default::default()
                 };
