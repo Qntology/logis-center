@@ -310,6 +310,111 @@ function updateTagsUI() {
 document.addEventListener('remove-tag', (e: any) => removeSearchTag(e.detail));
 
 // --- Tree Rendering Logic (Pages & Users) ---
+// --- Original Logic Implementation from content.js ---
+let navTmp: Record<string, boolean> = {};
+
+async function renderAccordion(nodes: any[], level = 1): Promise<string> {
+    let html = `<ul class="logis-branch">`;
+
+    for (var n = 0; n < nodes.length; n++) {
+        var node = nodes[n];
+        var active = '';
+        var host = '';
+        var type = '';
+        var content = '';
+        var name = '';
+        var desc: string[] = [];
+
+        if (!navTmp[node.id]) {
+            navTmp[node.id] = true;
+
+            if (node.name) {
+                type = node.type;
+                name = node.name;
+
+                if (node.type === "team") {
+                    var teamName = node.name;
+                    if (node.from === currentSession.address && node.id === node.to) {
+                        teamName = "Members";
+                        content = "Edit";
+                    }
+                    host = `<strong>${teamName}</strong>`;
+                } else {
+                    if (node.from === currentSession.address) {
+                        desc.push("owner");
+                    }
+                    content = `<span>${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>`;
+                }
+
+                if (node.id === activeContext.ref) {
+                    active = "active";
+                }
+            } else if (node.data) {
+                type = 'page';
+                // [HIDE HASH] Use type and status instead of link hash
+                name = `<span>${node.type}</span> <span>${(node.data.item ? " Draft" : " ")}</span>`;
+
+                if (node.data.origin) {
+                    var _url = new URL(node.data.origin);
+                    if (!navTmp[_url.host] && node.data.item) {
+                        host = `<strong>${_url.host}</strong>`;
+                        navTmp[_url.host] = true;
+                    }
+                    if (node.id === activeContext.ref || currentDetectedUrl.includes(node.data.link)) {
+                        active = "active";
+                    }
+                }
+
+                var total = { draft: 0, count: 0 };
+                // Parity with cookies.pages structure
+                const pagesStats = (currentSession as any).pages;
+                if (pagesStats && pagesStats[node.cc] && pagesStats[node.cc][node.type]) {
+                    total = pagesStats[node.cc][node.type];
+                }
+
+                var recent = '';
+                try {
+                    // Optimized check for recent items
+                    const _items = await Select['items']({ key: 'bcc', value: node.bcc, limit: 1 });
+                    if (_items.length) {
+                        const _item = _items[0];
+                        const updateTime = (window as any).utils?.time2text ? (window as any).utils.time2text(_item.created_at) : "recently";
+                        recent = `<strong class="recent-tag">${updateTime}</strong>`;
+                    }
+                } catch (err) {}
+
+                var count = node.data.item ? `<u>(${total.draft})</u>` : `<u>(${total.count})</u>`;
+                content = `<span>${name} ${count}</span> ${recent}`;
+            }
+        }
+
+        var hasChildren = node.children && node.children.length > 0;
+        const inputId = `${type}-${node.id}`;
+
+        html += `
+            <input type="checkbox" name="${type}" id="${inputId}" ${hasChildren ? 'checked' : ''} style="display:none;" />
+            <li class="logis-parent ${hasChildren ? 'has-children' : ''}" data-nav-id="${node.id}">
+                ${host}
+                <label for="${inputId}" class="logis-label ${inputId} ${active}" 
+                       data-id="${node.id}" data-cc="${node.cc}" data-bcc="${node.bcc}" data-ref="${node.ref_val || node.ref}"
+                       data-domain="${node.domain}" data-type="${node.type}">
+                    ${content}
+                </label>
+        `;
+
+        if (hasChildren) {
+            html += `<div class="logis-child ${inputId}">`;
+            html += await renderAccordion(node.children, level + 1);
+            html += `</div>`;
+        }
+
+        html += `</li>`;
+    }
+
+    html += `</ul>`;
+    return html;
+}
+
 async function renderNavigation() {
     const pageList = document.getElementById("nav-list-pages");
     const userList = document.getElementById("nav-list-users");
@@ -320,6 +425,7 @@ async function renderNavigation() {
 
     if (!pageList || !userList) return;
 
+    // Profile UI
     if (currentSession.email) {
         if (profileName) profileName.innerText = currentSession.email.split('@')[0];
         if (btnSignin) btnSignin.classList.add("hidden");
@@ -327,192 +433,89 @@ async function renderNavigation() {
         if (profileFavicon && blockies) {
             const icon = blockies.create({ seed: currentSession.email, size: 8, scale: 4 });
             profileFavicon.innerHTML = ""; profileFavicon.appendChild(icon);
-            icon.style.borderRadius = "4px"; icon.style.width = "100%"; icon.style.height = "100%";
         }
     }
 
     try {
-        // 1. Pages Tree (Domain -> Type -> Page)
-        let pages = await Select["pages"](); 
+        navTmp = {}; // Reset for fresh render
+        let _pages = await Select["pages"]();
         
-        // Inject Current Page if not present
-        if (currentDetectedUrl) {
-            try {
-                const urlObj = new URL(currentDetectedUrl);
-                const domain = urlObj.hostname;
-                const link = urlObj.pathname + urlObj.search;
-                const origin = urlObj.origin;
-                
-                const exists = pages.some(p => {
-                    const d = p.data || p;
-                    return (d.link === link && (d.origin || "").includes(domain));
-                });
-
-                if (!exists) {
-                    pages.unshift({
-                        id: "current-page",
-                        type: "tracking",
-                        data: {
-                            origin: origin,
-                            link: link,
-                            title: "Current Page",
-                            item: true
-                        }
-                    });
-                }
-            } catch (e) { console.error("Current URL parse error:", e); }
-        }
-
-        pageList.innerHTML = "";
-        
-        if (pages.length === 0) {
+        if (_pages.length === 0) {
             pageList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No shared pages found.</div>";
         } else {
-            // Grouping Logic
-            const tree: Record<string, Record<string, any[]>> = {};
-            pages.forEach(p => {
-                let data = p.data || p;
-                const domain = (data.origin || "unknown").replace(/^https?:\/\//, "");
-                const type = (data.type || "general").toUpperCase();
-                
-                if (!tree[domain]) tree[domain] = {};
-                if (!tree[domain][type]) tree[domain][type] = [];
-                
-                tree[domain][type].push({ 
-                    uuid: p.id, 
-                    link: data.link || "/", 
-                    text: data.text || data.title || data.link || "Untitled", 
-                    isDetail: data.detail === true || !data.item,
-                    domain,
-                    type,
-                    active: currentDetectedUrl.includes(data.link),
-                    cc: p.cc,
-                    bcc: p.bcc,
-                    ref: p.ref_val || p.ref
-                });
-            });
+            const branchs: Record<string, any> = {};
 
-            // HTML Generation
-            for (const [domain, types] of Object.entries(tree)) {
-                const branchDiv = document.createElement("div");
-                branchDiv.className = "logis-branch";
-                
-                let html = `
-                    <div class="logis-parent">
-                        <div class="logis-favicon"></div>
-                        <strong>${domain}</strong>
-                    </div>
-                `;
+            // 1. Build branch Map (origin#type and id)
+            for (var p = 0; p < _pages.length; p++) {
+                var _page = _pages[p];
+                const data = _page.data || _page;
+                if (!data.origin) continue;
 
-                for (const [type, items] of Object.entries(types)) {
-                    html += `<div class="logis-children">
-                        <div class="logis-type-header"># ${type}</div>`;
-                    
-                    items.forEach(it => {
-                        const icon = it.isDetail ? '◈' : '☰';
-                        const activeClass = it.active ? 'active' : '';
-                        const childClass = it.isDetail ? 'child' : '';
-                        const displayText = it.text || it.link; 
-                        
-                        html += `
-                            <a href="#" class="logis-page ${activeClass} ${childClass}" 
-                               data-id="${it.uuid}" data-domain="${it.domain}" data-type="${it.type}" data-mode="${it.isDetail ? 'Detail' : 'List'}"
-                               data-cc="${it.cc}" data-bcc="${it.bcc}" data-ref="${it.ref}">
-                                <span class="icon">${icon}</span>
-                                <span class="text" title="${displayText}">${displayText}</span>
-                            </a>
-                        `;
-                    });
-                    html += `</div>`;
+                const domain = new URL(data.origin).hostname;
+                _page.domain = domain;
+
+                if (data.item) {
+                    branchs[`${data.origin}#${_page.type}`] = { ..._page, children: [] };
                 }
-                branchDiv.innerHTML = html;
-                
-                // Bind Clicks
-                branchDiv.querySelectorAll(".logis-page").forEach((link: any) => {
-                    link.onclick = (e: Event) => {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        const ds = link.dataset;
-                        
-                        activeContext.cc = ds.cc || "";
-                        activeContext.bcc = ds.bcc || "";
-                        activeContext.ref = ds.ref || "";
-
-                        renderMessage({
-                            id: `nav-${Date.now()}`,
-                            role: "system_task",
-                            content: `Navigated to: ${ds.domain} - ${ds.type}`,
-                            status: 9, 
-                            created_at: Date.now(),
-                            cc: activeContext.cc,
-                            bcc: activeContext.bcc,
-                            ref: activeContext.ref
-                        });
-
-                        addSearchTag(`@${ds.domain}`, 'domain', ds.domain);
-                        addSearchTag(`#${ds.type}`, 'type', ds.type);
-                        addSearchTag(`[${ds.mode}]`, 'mode', ds.mode);
-                        
-                        fetchChatHistory(true);
-                        hideNavigation();
-                    };
-                });
-                
-                const faviconUrl = `https://${domain}/favicon.ico`;
-                const favEl = branchDiv.querySelector(".logis-favicon") as HTMLElement;
-                if(favEl) favEl.style.backgroundImage = `url(${faviconUrl})`;
-
-                pageList.appendChild(branchDiv);
+                branchs[_page.id] = { ..._page, children: [] };
             }
+
+            // 2. Logic Tree Assembly (List as Parent, Details as Children)
+            const processed = new Set();
+            const tree: any[] = [];
+
+            for (let key in branchs) {
+                let _page = branchs[key];
+                if (processed.has(_page.id)) continue;
+
+                const data = _page.data || _page;
+                const parentKey = `${data.origin}#${_page.type}`;
+                const parent = branchs[parentKey];
+
+                if (parent && parent.id !== _page.id) {
+                    // This is a detail page, push to its list parent
+                    if (!parent.children.some((c: any) => c.id === _page.id)) {
+                        parent.children.push(_page);
+                        processed.add(_page.id);
+                    }
+                } else if (data.item) {
+                    // This is a list parent
+                    tree.push(_page);
+                    processed.add(_page.id);
+                }
+            }
+
+            // 3. Render
+            pageList.innerHTML = await renderAccordion(tree);
+
+            // 4. Bind Clicks manually to labels
+            pageList.querySelectorAll(".logis-label").forEach((label: any) => {
+                label.onclick = (e: Event) => {
+                    // Only trigger if clicking the label text, not the checkbox toggle area if nested
+                    const ds = label.dataset;
+                    if (!ds.id) return;
+
+                    activeContext.cc = ds.cc || "";
+                    activeContext.bcc = ds.bcc || "";
+                    activeContext.ref = ds.ref || "";
+
+                    addSearchTag(`@${ds.domain}`, 'domain', ds.domain);
+                    addSearchTag(`#${ds.type}`, 'type', ds.type);
+                    
+                    fetchChatHistory(true);
+                    hideNavigation();
+                };
+            });
         }
 
-        // 2. Users Tree (Team -> Members)
+        // Users rendering (simplified parity)
         const users = await Select["users"]();
         userList.innerHTML = "";
-        
-        if (users.length === 0) {
-            userList.innerHTML = "<div style='color:#999; padding:10px; font-size:0.75rem;'>No team members.</div>";
-        } else {
-            const teamMap: Record<string, any> = {};
-            const membersMap: Record<string, any[]> = {};
-
-            users.forEach(u => {
-                let data = u.data || u;
-                if (data.type === "team") {
-                    teamMap[u.id] = data;
-                } else {
-                    const teamId = u.to || "unknown";
-                    if (!membersMap[teamId]) membersMap[teamId] = [];
-                    membersMap[teamId].push(data);
-                }
-            });
-
-            for (const [teamId, members] of Object.entries(membersMap)) {
-                const teamName = teamMap[teamId]?.name || "Team " + teamId.slice(0,6);
-                const branchDiv = document.createElement("div");
-                branchDiv.className = "logis-branch";
-                
-                let html = `
-                    <div class="logis-parent">
-                        <strong>${teamName}</strong>
-                    </div>
-                    <div class="logis-children">
-                `;
-                
-                members.forEach(m => {
-                    html += `
-                        <div class="logis-page" style="cursor:default;">
-                            <span class="icon">👤</span>
-                            <span class="text">${m.name || m.id.slice(0,8)}</span>
-                        </div>
-                    `;
-                });
-                
-                html += `</div>`;
-                branchDiv.innerHTML = html;
-                userList.appendChild(branchDiv);
-            }
+        if (users.length > 0) {
+            const teamNodes = users.filter(u => u.type === "team").map(u => ({...u, children: users.filter(m => m.to === u.id && m.id !== u.id)}));
+            userList.innerHTML = await renderAccordion(teamNodes);
         }
+
     } catch (e) { console.error("Nav render error:", e); }
 }
 
