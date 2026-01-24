@@ -19,7 +19,7 @@ pub struct Task {
     pub cc: String,
     pub bcc: String,
     #[serde(rename = "ref")]
-    pub ref_id: String,
+    pub r#ref: String,
     #[serde(rename = "data")]
     pub data_json: String,   
     pub created_at: i64,
@@ -94,7 +94,6 @@ impl VectorStore {
             let _ = self.conn.create_table("tasks", RecordBatchIterator::new(vec![], task_schema)).execute().await;
         }
 
-        // [FIX] talks schema expanded to include cc, bcc, ref for contextual filtering
         let msg_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("role", DataType::Utf8, false), 
@@ -110,10 +109,8 @@ impl VectorStore {
         if existing.contains(&"talks".to_string()) {
             let table = self.conn.open_table("talks").execute().await?;
             let current_schema = table.schema().await?;
-            // Check if it already has 'ref' column
             let needs_recreate = current_schema.field_with_name("ref").is_err();
             if needs_recreate {
-                println!("[Store] talks schema outdated. Dropping and recreating...");
                 let _ = self.conn.drop_table("talks", &[]).await;
             }
         }
@@ -124,17 +121,17 @@ impl VectorStore {
         Ok(())
     }
 
-    pub async fn has_active_task(&self, cc: &str, ref_id: &str) -> Result<bool> {
+    pub async fn has_active_task(&self, cc: &str, r#ref: &str) -> Result<bool> {
         let table = self.conn.open_table("tasks").execute().await?;
         let results = table.query()
-            .only_if(format!("cc = '{}' AND ref = '{}' AND (status = 10 OR status = 1)", cc, ref_id))
+            .only_if(format!("cc = '{}' AND ref = '{}' AND (status = 10 OR status = 1)", cc, r#ref))
             .limit(1).execute().await?.try_collect::<Vec<_>>().await?;
         Ok(!results.is_empty())
     }
 
     pub async fn add_message(
         &self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<i32>,
-        cc: Option<&str>, bcc: Option<&str>, ref_val: Option<&str>
+        cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>
     ) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
         let schema = table.schema().await?;
@@ -148,7 +145,7 @@ impl VectorStore {
                 Arc::new(arrow_array::Int32Array::from(vec![status.unwrap_or(0)])),
                 Arc::new(StringArray::from(vec![cc.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![ref_val.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])),
                 Arc::new(Int64Array::from(vec![chrono::Utc::now().timestamp_millis()])),
             ],
         )?;
@@ -161,7 +158,6 @@ impl VectorStore {
         let mut q = table.query();
         if let Some(f) = filter { q = q.only_if(f); }
         let results = q.limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
-        
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -198,7 +194,7 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![task.to])),
                 Arc::new(StringArray::from(vec![task.cc])),
                 Arc::new(StringArray::from(vec![task.bcc])),
-                Arc::new(StringArray::from(vec![task.ref_id])),
+                Arc::new(StringArray::from(vec![task.r#ref])),
                 Arc::new(StringArray::from(vec![task.data_json])),
                 Arc::new(Int64Array::from(vec![task.created_at])),
                 Arc::new(Int64Array::from(vec![task.updated_at])),
@@ -230,7 +226,7 @@ impl VectorStore {
                 tasks.push(Task {
                     id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from: froms.value(i).to_string(), 
                     to: tos.value(i).to_string(), cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(), 
-                    ref_id: refs.value(i).to_string(), data_json: datas.value(i).to_string(), 
+                    r#ref: refs.value(i).to_string(), data_json: datas.value(i).to_string(), 
                     created_at: crs.value(i), updated_at: ups.value(i), status: sts.value(i),
                 });
             }
@@ -241,10 +237,6 @@ impl VectorStore {
 
     pub async fn update_message_status(&self, task_id: &str, status: i32, content: Option<&str>) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
-        // For talks, we still replace the message to show latest status
-        // Note: When updating, we should ideally preserve cc/bcc/ref if possible,
-        // but since LanceDB update is complex, we just replace.
-        // The caller (scheduler) might need to provide these.
         table.delete(&format!("task_id = '{}'", task_id)).await?;
         if let Some(c) = content {
             self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status), None, None, None).await?;
@@ -301,7 +293,7 @@ impl VectorStore {
     
     pub async fn upsert_item(
         &self, table_name: &str, id: &str, type_: &str, data_val: Value, vector: Option<Vec<f32>>,
-        from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, ref_val: Option<&str>, digest: Option<&str>
+        from: Option<&str>, to: Option<&str>, cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>, digest: Option<&str>
     ) -> Result<()> {
          let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
@@ -343,7 +335,7 @@ impl VectorStore {
                 Arc::new(StringArray::from(vec![id])), Arc::new(StringArray::from(vec![type_])),
                 Arc::new(StringArray::from(vec![from.unwrap_or("")])), Arc::new(StringArray::from(vec![to.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![cc.unwrap_or("")])), Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
-                Arc::new(StringArray::from(vec![ref_val.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),
                 Arc::new(arrow_array::Int32Array::from(vec![status])), Arc::new(arrow_array::Float32Array::from(vec![amount])),
                 Arc::new(list_array), Arc::new(StringArray::from(vec![text_content])), Arc::new(StringArray::from(vec![json_str])),
                 Arc::new(Int64Array::from(vec![created_at])), Arc::new(Int64Array::from(vec![now_ts])),
@@ -382,6 +374,10 @@ impl VectorStore {
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let froms = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let tos = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+            let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
             let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
             let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
@@ -391,11 +387,13 @@ impl VectorStore {
             let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..batch.num_rows() {
                 docs.push(TradeDocument { 
-                    uuid: ids.value(i).to_string(), doc_type: types.value(i).to_string(), 
-                    ref_val: refs.value(i).to_string(),
+                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), 
+                    from: froms.value(i).to_string(), to: tos.value(i).to_string(),
+                    cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(),
+                    r#ref: refs.value(i).to_string(),
                     text: texts.value(i).to_string(), json_data: jsons.value(i).to_string(),
                     digest: digests.value(i).to_string(), total_amount: amounts.value(i),
-                    doc_status: statuses.value(i).to_string(), created_at_ts: createds.value(i), ..Default::default() 
+                    status: statuses.value(i).to_string(), created_at_ts: createds.value(i), ..Default::default() 
                 });
             }
         }
@@ -410,6 +408,10 @@ impl VectorStore {
         let batch = &results[0];
         let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let froms = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let tos = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        let ccs = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+        let bccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
         let refs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
         let statuses = batch.column(8).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
         let amounts = batch.column(9).as_any().downcast_ref::<Float32Array>().unwrap();
@@ -418,11 +420,13 @@ impl VectorStore {
         let digests = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
         let createds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
         Ok(Some(TradeDocument { 
-            uuid: ids.value(0).to_string(), doc_type: types.value(0).to_string(), 
-            ref_val: refs.value(0).to_string(),
+            id: ids.value(0).to_string(), r#type: types.value(0).to_string(), 
+            from: froms.value(0).to_string(), to: tos.value(0).to_string(),
+            cc: ccs.value(0).to_string(), bcc: bccs.value(0).to_string(),
+            r#ref: refs.value(0).to_string(),
             text: texts.value(0).to_string(), json_data: jsons.value(0).to_string(), 
             digest: digests.value(0).to_string(), total_amount: amounts.value(0),
-            doc_status: statuses.value(0).to_string(), created_at_ts: createds.value(0), ..Default::default() 
+            status: statuses.value(0).to_string(), created_at_ts: createds.value(0), ..Default::default() 
         }))
     }
     
@@ -485,10 +489,15 @@ impl VectorStore {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TradeDocument {
-    pub uuid: String,
-    pub doc_type: String,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub from: String,
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
     #[serde(rename = "ref")]
-    pub ref_val: String,
+    pub r#ref: String,
     pub text: String,
     pub json_data: String,
     pub digest: String,
@@ -503,7 +512,7 @@ pub struct TradeDocument {
     pub transaction_group: Option<String>,
     pub link_reason: Option<String>,
     pub doc_number: String,
-    pub doc_status: String, 
+    pub status: String, 
     pub issue_date: String,
     pub reference_export: String,
     pub reference_buyer: String,
