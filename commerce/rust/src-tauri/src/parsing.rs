@@ -285,18 +285,6 @@ fn generate_pug_lines(node: NodeRef<scraper::Node>, indent_level: usize, output:
         _ => {}
     }
 }
-        }
-        Node::Text(text) => {
-            if *mode == PugMode::FullContent {
-                let text_content = text.trim();
-                if !text_content.is_empty() {
-                    output.push_str(&format!("{}| {}\n", indent, text_content.replace("\"", "'")));
-                }
-            }
-        }
-        _ => {}
-    }
-}
 
 pub fn split_doc_to_pug_list(document: &Html, selector_str: &str, mode: PugMode) -> Vec<String> {
     let selector = match Selector::parse(selector_str) {
