@@ -8,6 +8,12 @@ pub enum PugMode {
     FullContent,
 }
 
+pub fn sanitize_llm_input(text: &str) -> String {
+    // [CRITICAL] Prevent internal special tokens like <|vision_start|> 
+    // from being interpreted as control signals by breaking the sequence.
+    text.replace("<|", "< |").replace("|>", "| >")
+}
+
 pub fn pre_clean_html(html: &str) -> String {
 
     // 1. 주석 제거

@@ -484,8 +484,9 @@ async fn process_task(
         let clean_content = data_manager.load(&clean_html_path)?;
         let document = scraper::Html::parse_document(&clean_content);
         // [FIX] Use FullContent for ingestion to maximize context for 2B later
-        parsing::convert_doc_to_clean_pug(&document, PugMode::FullContent)
-        // clean_content dropped here
+        let pug = parsing::convert_doc_to_clean_pug(&document, PugMode::FullContent);
+        // [CRITICAL] Sanitize special characters that could break tokenizer parity
+        parsing::sanitize_llm_input(&pug)
     }; 
     
     // [DEBUG-LOG] Save generated Pug with nanosecond precision to prevent overwriting
