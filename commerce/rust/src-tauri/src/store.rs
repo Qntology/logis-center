@@ -66,11 +66,11 @@ impl VectorStore {
         let task_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("type", DataType::Utf8, false),
-            Field::new("from_source", DataType::Utf8, false),
-            Field::new("to_dest", DataType::Utf8, false),
+            Field::new("from", DataType::Utf8, false),
+            Field::new("to", DataType::Utf8, false),
             Field::new("cc", DataType::Utf8, false),
             Field::new("bcc", DataType::Utf8, false),
-            Field::new("ref_id", DataType::Utf8, false),
+            Field::new("ref", DataType::Utf8, false),
             Field::new("data", DataType::Utf8, false), 
             Field::new("created_at", DataType::Int64, false),
             Field::new("updated_at", DataType::Int64, false),
@@ -197,8 +197,8 @@ impl VectorStore {
             vec![
                 Arc::new(StringArray::from(vec![task.id])),
                 Arc::new(StringArray::from(vec![task.r#type])),
-                Arc::new(StringArray::from(vec![task.from_source])),
-                Arc::new(StringArray::from(vec![task.to_dest])),
+                Arc::new(StringArray::from(vec![task.from])),
+                Arc::new(StringArray::from(vec![task.to])),
                 Arc::new(StringArray::from(vec![task.cc])),
                 Arc::new(StringArray::from(vec![task.bcc])),
                 Arc::new(StringArray::from(vec![task.ref_id])),
@@ -232,8 +232,8 @@ impl VectorStore {
             let sts = batch.column(10).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
             for i in 0..batch.num_rows() {
                 tasks.push(Task {
-                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from_source: f_src.value(i).to_string(), 
-                    to_dest: t_dst.value(i).to_string(), cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(), 
+                    id: ids.value(i).to_string(), r#type: types.value(i).to_string(), from: f_src.value(i).to_string(), 
+                    to: t_dst.value(i).to_string(), cc: ccs.value(i).to_string(), bcc: bccs.value(i).to_string(), 
                     ref_id: refs.value(i).to_string(), data_json: datas.value(i).to_string(), 
                     created_at: crs.value(i), updated_at: ups.value(i), status: sts.value(i),
                 });

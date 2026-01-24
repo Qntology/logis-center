@@ -456,9 +456,12 @@ tr:hover { background: rgba(0,0,0,0.05); }
     filter: none;
 }
 
-#system-toggle:checked ~ .chat-container .chat-talk {
+/* Default: Hide System Logs */
+.chat-talk.system {
     display: none;
 }
+
+/* Checked: Show System Logs */
 #system-toggle:checked ~ .chat-container .chat-talk.system {
     display: block;
 }

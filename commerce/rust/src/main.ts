@@ -64,6 +64,7 @@ let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
 let isExtracting = false; 
 let spinnerInterval: number | null = null;
+let systemLogCount = 0;
 
 // --- UI Elements ---
 const contentPanel = document.getElementById("content-panel") as HTMLElement;
@@ -430,6 +431,16 @@ async function renderNavigation() {
                         e.preventDefault();
                         e.stopPropagation();
                         const ds = link.dataset;
+                        
+                        // [UX] Log navigation action to chat history
+                        renderMessage({
+                            id: `nav-${Date.now()}`,
+                            role: "system_task",
+                            content: `Navigated to: ${ds.domain} - ${ds.type}`,
+                            status: 9, // Done
+                            created_at: Date.now()
+                        });
+
                         addSearchTag(`@${ds.domain}`, 'domain', ds.domain);
                         addSearchTag(`#${ds.type}`, 'type', ds.type);
                         addSearchTag(`[${ds.mode}]`, 'mode', ds.mode);
@@ -1014,11 +1025,37 @@ function startPolling() {
 }
 
 function renderMessage(msg: any) {
+
     if (!chatTalks) return;
+
+    
+
     const msgId = `msg-${msg.id}`;
+
     let existing = document.getElementById(msgId);
+
+    
+
     const isSystemTask = msg.role === "system_task";
+
     const roleClass = msg.role === "user" ? "user" : "system";
+
+
+
+    // [NEW] Update Preprocessing Log Count
+
+    if (isSystemTask && !existing) {
+
+        systemLogCount++;
+
+        const countEl = document.querySelector('.system-label .count');
+
+        if (countEl) countEl.innerHTML = `(${systemLogCount})`;
+
+    }
+
+    
+
     const statusMap: Record<number, { icon: string, text: string, color: string }> = { 1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 3: { icon: "🚫", text: "cancelled", color: "#666" }, 6: { icon: "❌", text: "error", color: "#ef4444" }, 9: { icon: "✅", text: "done", color: "#22c55e" }, 10: { icon: "📥", text: "pending", color: "#999" } };
     const currentStatus = statusMap[msg.status] || statusMap[1];
     const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });

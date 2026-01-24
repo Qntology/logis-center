@@ -182,8 +182,8 @@ async fn summarize_image(
         let task = crate::store::Task {
             id: task_id.clone(),
             r#type: "image_extraction".to_string(),
-            from_source: "manual_upload".to_string(),
-            to_dest: "local".to_string(),
+            from: "manual_upload".to_string(),
+            to: "local".to_string(),
             cc: "".to_string(),
             bcc: "".to_string(),
             ref_id: "manual".to_string(),
@@ -797,7 +797,7 @@ pub fn run() {
                             let task = crate::store::Task {
                                 id: payload_val.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                 r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                                from_source: from_addr, to_dest: team_id,
+                                from: from_addr, to: team_id,
                                 cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
