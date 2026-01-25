@@ -325,6 +325,41 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_cache = None
     }
 
+    // [LIVE-BRIDGE] Inject 1024-dim KV from 0.6B into 2048-dim VRAM of 2B
+    pub fn inject_live_kv(&mut self, k_small: &Tensor, v_small: &Tensor) -> Result<()> {
+        let target_heads = self.num_key_value_heads;
+        let target_dim = self.head_dim;
+        
+        // 1. Dimension Projection (1024 -> 2048)
+        let k_projected = k_small.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(k_small.dim(D::Minus1)?))?;
+        let v_projected = v_small.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(v_small.dim(D::Minus1)?))?;
+        
+        // 2. Head Replication (8 heads -> 16 heads)
+        let mut k_heads = vec![];
+        let mut v_heads = vec![];
+        let source_heads = k_projected.dim(1)?;
+        
+        for i in 0..target_heads {
+            let src_idx = i % source_heads;
+            k_heads.push(k_projected.narrow(1, src_idx, 1)?);
+            v_heads.push(v_projected.narrow(1, src_idx, 1)?);
+        }
+        
+        let k_final = Tensor::cat(&k_heads, 1)?;
+        let v_final = Tensor::cat(&v_heads, 1)?;
+        
+        // 3. Append to existing cache
+        self.kv_cache = match &self.kv_cache {
+            None => Some((k_final, v_final)),
+            Some((prev_k, prev_v)) => {
+                let k = Tensor::cat(&[prev_k, &k_final], 2)?;
+                let v = Tensor::cat(&[prev_v, &v_final], 2)?;
+                Some((k, v))
+            }
+        };
+        Ok(())
+    }
+
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         let mut map = HashMap::new();
@@ -948,6 +983,15 @@ impl QuantizedQwen3VLTextModel {
         }
     }
 
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor]) -> Result<()> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if i < k_list.len() {
+                layer.self_attn.inject_live_kv(&k_list[i], &v_list[i])?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
         use rayon::prelude::*;
         if !path.exists() {
@@ -1323,6 +1367,10 @@ impl QuantizedQwen3VLModel {
 
     pub fn clear_kv_cache(&mut self) {
         self.language_model.clear_kv_cache();
+    }
+
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor]) -> Result<()> {
+        self.language_model.inject_live_kv(k_list, v_list)
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {

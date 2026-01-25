@@ -143,9 +143,12 @@ impl PartialEq for ModelSize {
 
 pub struct LogisModel {
     generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
+    // [DUAL-ENGINE] Optional second slot for 0.6B to run alongside 2B
+    small_generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
     embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
+    pub dual_mode_enabled: bool, // New flag
     
     // Config for Lazy Reloading
     small_model_path: String,
@@ -202,10 +205,8 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        // 1. Unload Embedding if loaded
         self.unload_embedding().await;
 
-        // 2. Check if we need to switch models
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
 
@@ -215,20 +216,24 @@ impl LogisModel {
         };
 
         if needs_reload || gen_guard.is_none() {
-            println!("[MODEL] Switching/Loading model to size: {:?} on GPU-{}", 
-                match size { ModelSize::Small => "Small", ModelSize::Large => "Large" },
-                self.device_config.gpu_id
-            );
-            *gen_guard = None; // Force drop
+            println!("[MODEL] Switching/Loading model to size: {:?}...", size);
+            
+            // [DUAL-ENGINE-HANDOVER] 
+            // If switching from Small to Large, move Small to the secondary slot instead of dropping.
+            if *current_size_guard == Some(ModelSize::Small) && size == ModelSize::Large && self.dual_mode_enabled {
+                let mut small_slot = self.small_generator.lock().await;
+                if let Some(m) = gen_guard.take() {
+                    println!("[DUAL] Moving 0.6B to secondary background slot.");
+                    *small_slot = Some(m);
+                }
+            } else {
+                *gen_guard = None; // Normal drop
+            }
             
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-            
-            // [CRITICAL] Both models MUST share the same Config & Tokenizer from the 2B directory
-            // to ensure KV Cache compatibility (Rope scaling, Sliding window, etc.)
             let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
             
             let gen = self.load_generator_internal(path, shared_path).await?;
-            
             *gen_guard = Some(gen);
             *current_size_guard = Some(size);
         }
@@ -275,7 +280,8 @@ impl LogisModel {
         let small_gguf_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
         let large_gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         
-        let small_model_path = small_gguf_dir.to_str().unwrap().to_string();
+        // [ULTRA-LIGHT] Use IQ1_S for maximum ingestion speed and minimum VRAM
+        let small_model_path = small_gguf_dir.join("Qwen3-0.6B-UD-IQ1_S.gguf").to_str().unwrap().to_string();
         let large_model_path = large_gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
@@ -283,8 +289,10 @@ impl LogisModel {
 
         Ok(Self {
             generator: Arc::new(TokioMutex::new(None)),
+            small_generator: Arc::new(TokioMutex::new(None)), // [DUAL]
             embedding_model: Arc::new(TokioMutex::new(None)),
             is_cpu_mode: config.is_cpu,
+            dual_mode_enabled: true, // [NEW] Enable by default for fastest PUG analysis
             small_model_path,
             large_model_path,
             embedding_path,

@@ -600,19 +600,50 @@ impl Qwen3VLGenerateModel {
         Ok(res)
     }
 
-        pub fn clear_kv_cache(&mut self) {
-
-            match &mut self.qwen3_vl {
-
-                ModelVariant::Standard(m) => m.clear_kv_cache(),
-
-                ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
-
-                ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
-
-            }
-
+    pub fn clear_kv_cache(&mut self) {
+        match &mut self.qwen3_vl {
+            ModelVariant::Standard(_) => {},
+            ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
+            ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
         }
+    }
+
+    pub fn get_current_kv(&self) -> (Vec<candle_core::Tensor>, Vec<candle_core::Tensor>) {
+        let mut ks = vec![];
+        let mut vs = vec![];
+        
+        match &self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => {
+                for layer in &m.language_model.layers {
+                    if let Some((k, v)) = &layer.self_attn.kv_cache {
+                        ks.push(k.clone());
+                        vs.push(v.clone());
+                    }
+                }
+            },
+            ModelVariant::QuantizedText(m) => {
+                for layer in &m.language_model.layers {
+                    if let Some((k, v)) = &layer.self_attn.kv_cache {
+                        ks.push(k.clone());
+                        vs.push(v.clone());
+                    }
+                }
+            },
+            _ => {}
+        }
+        (ks, vs)
+    }
+
+    pub fn inject_kv(&mut self, ks: &[candle_core::Tensor], vs: &[candle_core::Tensor]) -> anyhow::Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.inject_live_kv(ks, vs)?,
+            ModelVariant::QuantizedText(m) => m.inject_live_kv(ks, vs)?,
+            _ => return Err(anyhow::anyhow!("KV Injection not supported for this model variant")),
+        }
+        Ok(())
+    }
+
+
 
     
 

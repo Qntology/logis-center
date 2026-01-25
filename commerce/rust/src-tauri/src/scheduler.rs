@@ -605,123 +605,77 @@ async fn process_task(
     let page_type;
     let mut selector_info = json!({});
 
-    // --- TASK 1: CLASSIFICATION ---
+    // --- TASK 1: CLASSIFICATION (DUAL-ENGINE STREAMING) ---
     {
-        println!("[Scheduler] Starting TASK 1: CLASSIFICATION (Fast 0.6B -> Precise 2B)");
+        println!("[Scheduler] Starting DUAL-ENGINE STREAMING (0.6B -> 2B Live Bridge)");
         let type_prompt = parsing::page_type_prompt();
-        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", type_prompt);
+        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY", type_prompt);
 
-        // [MEM-WATCH] Snapshot baseline before loading 0.6B
-        let (base_ram_1, base_vram_1) = crate::utils::resources::get_memory_usage();
-
-        // 1.1 Fast Ingest with 0.6B
+        // [SYNC-START] Ensure BOTH models are ready in memory
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-        if let Some(model) = model_lock.as_ref() {
-            model.ensure_generator(crate::model::ModelSize::Small).await?;
-            let app_handle_clone = app_handle.clone();
-            
-            // [TOKEN-FUSING] Pre-compress whitespace to reduce total tokens without losing data
-            let compressed_pug = light_pug.replace("  ", " ").replace("  ", " ").replace("\n\n", "\n");
-            let classify_chunks_compressed = chunk_text(&compressed_pug, device_config.classify_chunk_size, 3000);
-            
-            let mut cumulative_pug = String::new();
-            let chunks_len = classify_chunks_compressed.len();
+        let model = model_lock.as_ref().unwrap();
+        
+        // Load 2B (Target) first, then 0.6B (Worker)
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
+        model.ensure_generator(crate::model::ModelSize::Small).await?;
+        
+        let app_handle_clone = app_handle.clone();
+        let chunks_len = classify_chunks.len();
 
-            for (i, chunk) in classify_chunks_compressed.iter().enumerate() {
-                cumulative_pug.push_str(chunk);
-                let is_last = i == chunks_len - 1;
+        for (i, chunk) in classify_chunks.iter().enumerate() {
+            let is_last = i == chunks_len - 1;
+            let content = if is_last { format!("{}\n\n{}", chunk, task_specific_prompt) } else { chunk.clone() };
+
+            // 1. Ingest with 0.6B (Fast Worker)
+            let res = {
+                let mut small_gen_lock = model.small_generator.lock().await;
+                let gen = small_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Small generator not active"))?;
                 
-                // [MAX-SPEED] Always INGEST and SAVE every chunk.
-                // With 4-bit VRAM packing and parallel saving, this is now faster than re-processing.
-                let content = if is_last {
-                    format!("{}\n\n{}", cumulative_pug, task_specific_prompt)
-                } else {
-                    format!("{}\n\nACTION: INGEST\n\nACTION: SAVE", cumulative_pug)
-                };
-
-                let messages = vec![
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                let params = ChatCompletionParameters {
+                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                         content: ChatCompletionRequestUserMessageContent::Array(vec![
                             ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
                         ]),
                         name: None,
-                    })
-                ];
-
-                let params = ChatCompletionParameters {
-                    messages,
-                    model: "qwen3vl".to_string(),
-                    max_tokens: Some(16), 
-                    temperature: Some(0.1),
+                    })],
+                    model: "qwen3vl".to_string(), max_tokens: Some(16), temperature: Some(0.1),
                     ..Default::default()
                 };
-
-                let _ = model.chat_params_with_spinner(
-                    params, &app_handle_clone, "Fast Ingestion (0.6B)",
-                    json!({ "task_id": task.id, "category": "Classification (Ingest)", "summary": format!("Stream Ingesting HTML {}/{} (Compressed)...", i+1, chunks_len) }),
-                    Some(cancellation_token.clone()), Some(task.id.clone())
-                ).await?;
-            }
-            model.unload_generator().await;
-        }
-        *model_lock = None; // Total release
-        drop(model_lock);
-        
-        // [STRICT-UNLOAD] Verify 0.6B is gone before loading 2B
-        crate::utils::resources::wait_for_memory_release(base_ram_1, base_vram_1, 8000).await;
-
-        // 1.2 Precise Infer with 2B
-        // [MEM-WATCH] Snapshot baseline before loading 2B
-        let (base_ram_1_2b, base_vram_1_2b) = crate::utils::resources::get_memory_usage();
-
-        let mut model_lock = model_mutex.lock().await;
-        if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-        
-        let res = if let Some(model) = model_lock.as_ref() {
-            model.ensure_generator(crate::model::ModelSize::Large).await?;
-            let app_handle_clone = app_handle.clone();
-
-            // [KV-SYNC] Send FULL cumulative PUG + Prompt. 
-            // 2B will find the HTML prefix in its saved cache, load it, 
-            // and process ONLY the prompt (instant response).
-            let full_content = format!("{}\n\n{}", light_pug, task_specific_prompt);
-
-            let messages = vec![
-                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Array(vec![
-                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: full_content })
-                    ]),
-                    name: None,
-                })
-            ];
-
-            let params = ChatCompletionParameters {
-                messages,
-                model: "qwen3vl".to_string(),
-                max_tokens: Some(512), 
-                temperature: Some(0.1),
-                ..Default::default()
+                
+                // Generate chunk-wise
+                let result = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                
+                // 2. Extract 0.6B KV memory and Inject into 2B memory IMMEDIATELY (VRAM-to-VRAM)
+                let (ks, vs) = gen.get_current_kv();
+                let mut large_gen_lock = model.generator.lock().await;
+                let target = large_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Large generator not active"))?;
+                target.inject_kv(&ks, &vs)?;
+                
+                // [SPEED-UP] Clear 0.6B cache after transfer to keep it fast for the next chunk
+                gen.clear_kv_cache();
+                
+                result
             };
 
-            model.chat_params_with_spinner(
-                params, &app_handle_clone, "Precise Analysis (2B)",
-                json!({ "task_id": task.id, "category": "Classification (Infer)", "summary": "Finalizing page classification..." }),
-                Some(cancellation_token.clone()), Some(task.id.clone())
-            ).await?
-        } else { "{}".to_string() };
+            let payload = json!({ 
+                "task_id": task.id, 
+                "category": "PUG Analysis", 
+                "summary": format!("Streaming PUG Context {}/{}...", i+1, chunks_len) 
+            });
+            let _ = app_handle.emit("extraction-progress", &payload);
+            
+            if is_last {
+                let type_info = parsing::parse_json_from_llm(&res);
+                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            }
+        }
         
-        // Unload 2B
-        if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
-        *model_lock = None; 
-        drop(model_lock);
-
-        // [STRICT-UNLOAD] Verify 2B is gone
-        crate::utils::resources::wait_for_memory_release(base_ram_1_2b, base_vram_1_2b, 5000).await;
-
-        let type_info = parsing::parse_json_from_llm(&res);
-        page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        println!("[Scheduler] Classification Result: {}", page_type);
+        // Release Small generator to free VRAM for 2B's final inference
+        {
+            let mut small_slot = model.small_generator.lock().await;
+            *small_slot = None; 
+        }
         
         if page_type.is_empty() || page_type == "unknown" {
             return Ok(());
@@ -731,119 +685,66 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
     wait_for_resources_settled(2500, 1500).await;
 
-    // --- TASK 2: SELECTOR IDENTIFICATION ---
+    // --- TASK 2: SELECTOR IDENTIFICATION (DUAL-ENGINE STREAMING) ---
     {
-        println!("[Scheduler] Starting TASK 2: SELECTORS (Fast 0.6B -> Precise 2B)");
+        println!("[Scheduler] Starting DUAL-ENGINE STREAMING (0.6B -> 2B Live Bridge)");
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", selector_prompt);
+        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY", selector_prompt);
 
-        // [MEM-WATCH] Snapshot baseline before loading 0.6B
-        let (base_ram_2, base_vram_2) = crate::utils::resources::get_memory_usage();
-
-        // 2.1 Fast Ingest with 0.6B
+        // Ensure models are active
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-        if let Some(model) = model_lock.as_ref() {
-            model.ensure_generator(crate::model::ModelSize::Small).await?;
-            let app_handle_clone = app_handle.clone();
-            
-            // [TOKEN-FUSING] Apply whitespace compression here as well
-            let compressed_pug = light_pug.replace("  ", " ").replace("  ", " ").replace("\n\n", "\n");
-            let classify_chunks_compressed = chunk_text(&compressed_pug, device_config.classify_chunk_size, 3000);
+        let model = model_lock.as_ref().unwrap();
+        
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
+        model.ensure_generator(crate::model::ModelSize::Small).await?;
+        
+        let app_handle_clone = app_handle.clone();
+        let chunks_len = classify_chunks.len();
 
-            let mut cumulative_pug = String::new();
-            let chunks_len = classify_chunks_compressed.len();
+        for (i, chunk) in classify_chunks.iter().enumerate() {
+            let is_last = i == chunks_len - 1;
+            let content = if is_last { format!("{}\n\n{}", chunk, task_specific_prompt) } else { chunk.clone() };
 
-            for (i, chunk) in classify_chunks_compressed.iter().enumerate() {
-                cumulative_pug.push_str(chunk);
-                let is_last = i == chunks_len - 1;
-                // [MAX-SPEED] Always INGEST and SAVE every chunk.
-                let content = if is_last {
-                    format!("{}\n\n{}\n\nACTION: SAVE", cumulative_pug, task_specific_prompt)
-                } else {
-                    format!("{}\n\nACTION: INGEST\n\nACTION: SAVE", cumulative_pug)
-                };
-
-
-                let messages = vec![
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            // 1. Ingest with 0.6B
+            let res = {
+                let mut small_gen_lock = model.small_generator.lock().await;
+                let gen = small_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Small generator not active"))?;
+                
+                let params = ChatCompletionParameters {
+                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                         content: ChatCompletionRequestUserMessageContent::Array(vec![
                             ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
                         ]),
                         name: None,
-                    })
-                ];
-
-                let params = ChatCompletionParameters {
-                    messages,
-                    model: "qwen3vl".to_string(),
-                    max_tokens: Some(16), 
-                    temperature: Some(0.1),
+                    })],
+                    model: "qwen3vl".to_string(), max_tokens: Some(16), temperature: Some(0.1),
                     ..Default::default()
                 };
-
-                let _ = model.chat_params_with_spinner(
-                    params, &app_handle_clone, "Fast Ingestion (0.6B)",
-                    json!({ "task_id": task.id, "category": "Selectors (Ingest)", "summary": format!("Stream Ingesting HTML {}/{} (Compressed)...", i+1, chunks_len) }),
-                    Some(cancellation_token.clone()), Some(task.id.clone())
-                ).await?;
-            }
-            model.unload_generator().await;
-        }
-        *model_lock = None; 
-        drop(model_lock);
-
-        // [STRICT-UNLOAD] Verify 0.6B is gone before loading 2B
-        crate::utils::resources::wait_for_memory_release(base_ram_2, base_vram_2, 8000).await;
-
-        // 2.2 Precise Infer with 2B
-        // [MEM-WATCH] Snapshot baseline before loading 2B
-        let (base_ram_2_2b, base_vram_2_2b) = crate::utils::resources::get_memory_usage();
-
-        let mut model_lock = model_mutex.lock().await;
-        if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-        
-        let res = if let Some(model) = model_lock.as_ref() {
-            model.ensure_generator(crate::model::ModelSize::Large).await?;
-            let app_handle_clone = app_handle.clone();
-
-            let full_content = format!("{}\n\n{}", light_pug, task_specific_prompt);
-
-            let messages = vec![
-                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Array(vec![
-                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: full_content })
-                    ]),
-                    name: None,
-                })
-            ];
-
-            let params = ChatCompletionParameters {
-                messages,
-                model: "qwen3vl".to_string(),
-                max_tokens: Some(512), 
-                temperature: Some(0.1),
-                ..Default::default()
+                
+                let result = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                
+                // 2. Inject into 2B
+                let (ks, vs) = gen.get_current_kv();
+                let mut large_gen_lock = model.generator.lock().await;
+                let target = large_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Large generator not active"))?;
+                target.inject_kv(&ks, &vs)?;
+                
+                gen.clear_kv_cache();
+                result
             };
 
-            model.chat_params_with_spinner(
-                params, &app_handle_clone, "Selectors (Infer)",
-                json!({ "task_id": task.id, "category": "Selectors (Infer)", "summary": "Identifying page selectors..." }),
-                Some(cancellation_token.clone()), Some(task.id.clone())
-            ).await?
-        } else { "{}".to_string() };
+            let payload = json!({ "task_id": task.id, "category": "Selectors Identification", "summary": format!("Streaming Context {}/{}...", i+1, chunks_len) });
+            let _ = app_handle.emit("extraction-progress", &payload);
+            
+            if is_last {
+                selector_info = parsing::parse_json_from_llm(&res);
+                println!("[Scheduler] Selectors Identified: {}", selector_info);
+            }
+        }
         
-        // Unload 2B
-        if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
-        *model_lock = None; 
-        drop(model_lock);
-
-        // [STRICT-UNLOAD] Verify 2B is gone
-        crate::utils::resources::wait_for_memory_release(base_ram_2_2b, base_vram_2_2b, 5000).await;
-
-        let res_info = parsing::parse_json_from_llm(&res);
-        selector_info = res_info;
-        println!("[Scheduler] Selectors Identified: {}", selector_info);
+        let mut small_slot = model.small_generator.lock().await;
+        *small_slot = None; 
     }
 
     let mut final_page_info = json!({ "type": page_type });
