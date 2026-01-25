@@ -605,24 +605,6 @@ async fn process_task(
     let mut page_type = String::new();
     let mut selector_info = json!({});
 
-    // --- TASK 1: CLASSIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
-    {
-        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
-        let type_prompt = parsing::page_type_prompt();
-        
-        let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                        text: format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt) 
-                    })
-                ]),
-                name: None,
-            })],
-            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
-            ..Default::default()
-        };
-
         // 1. Prepare BOTH models
         {
             let mut model_lock = model_mutex.lock().await;
@@ -630,22 +612,62 @@ async fn process_task(
             let model = model_lock.as_ref().unwrap();
             model.ensure_generator(crate::model::ModelSize::Small).await?;
             model.ensure_generator(crate::model::ModelSize::Large).await?;
-        } // model_lock dropped here
+        }
 
-        // 2. Stream from 0.6B to 2B (Holding only internal generator locks)
+        // 2. Real-time Stream from 0.6B to 2B (ZERO-REDUNDANCY PIPELINE)
         {
             let (large_gen_mutex, small_gen_mutex) = {
                 let mut model_lock = model_mutex.lock().await;
                 let model = model_lock.as_mut().unwrap();
                 (model.generator.clone(), model.small_generator.clone())
-            }; // top-level model_lock dropped here
+            };
 
-            let mut large_gen_lock = large_gen_mutex.lock().await; 
-            let mut small_gen_lock = small_gen_mutex.lock().await; 
+            // Step 1: Tokenize ONCE using Small model's tokenizer
+            let mut full_token_ids = Vec::new();
+            {
+                let mut small_gen = small_gen_mutex.lock().await;
+                if let Some(worker) = small_gen.as_mut() {
+                    let mes_render = worker.chat_template.apply_chat_template(&params)?;
+                    let input = worker.pre_processor.process_info(&params, &mes_render)?;
+                    full_token_ids = worker.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+                }
+            }
+            
+            let total_tokens = full_token_ids.len();
+            println!("[Scheduler] Global Tokenization Complete: {} tokens.", total_tokens);
 
-            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                println!("[Scheduler] Real-time Relay Started...");
-                let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(task.id.clone()), Some(target))?;
+            // Step 2: Feed slices through the pipeline
+            let mut current_pos = 0;
+            let prefill_chunk_size = 1024; // Increased since text overhead is gone
+
+            while current_pos < total_tokens - 1 {
+                if cancellation_token.load(Ordering::Relaxed) { break; }
+
+                let end_pos = (current_pos + prefill_chunk_size).min(total_tokens - 1);
+                let chunk_ids = &full_token_ids[current_pos..end_pos];
+                
+                // Step A: 0.6B calculates (Holding only 0.6B lock)
+                let kv_chunk = {
+                    let mut small_gen = small_gen_mutex.lock().await;
+                    if let Some(worker) = small_gen.as_mut() {
+                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()))?;
+                        // worker.clear_kv_cache(); // Prevent Small's memory from bloating
+                        Some(res)
+                    } else { None }
+                };
+
+                // Step B: 2B Injects (Briefly holding 2B lock)
+                if let Some((ks, vs)) = kv_chunk {
+                    let mut large_gen = large_gen_mutex.lock().await;
+                    if let Some(target) = large_gen.as_mut() {
+                        target.inject_kv(&ks, &vs)?;
+                    }
+                }
+                
+                current_pos = end_pos;
+                let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
+                println!("[RELAY] Poured {}/{} tokens ({:.1}%) into 2B Cup.", current_pos, total_tokens, progress);
+                tokio::task::yield_now().await;
             }
         }
 
@@ -665,19 +687,18 @@ async fn process_task(
             }
             drop(gen_lock);
             
-            // Re-acquire model lock just for unloading
             let mut model_lock = model_mutex.lock().await;
             model_lock.as_mut().unwrap().unload_generator().await; 
         }
         if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
-    }
+
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
     wait_for_resources_settled(2500, 1500).await;
 
     // --- TASK 2: SELECTOR IDENTIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
     {
-        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
+        println!("[Scheduler] Starting DUAL-ENGINE RELAY (Selector Identification)");
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         
         let params = ChatCompletionParameters {
@@ -693,29 +714,60 @@ async fn process_task(
             ..Default::default()
         };
 
-        let mut model_lock = model_mutex.lock().await;
-        if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-        let model = model_lock.as_ref().unwrap();
-
-        // [FIX] Correct Order: Load Small FIRST, then Large
-        model.ensure_generator(crate::model::ModelSize::Small).await?;
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
-
+        // Stream relay
         {
-            let mut large_gen_lock = model.generator.lock().await;
-            let mut small_gen_lock = model.small_generator.lock().await;
-            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)), Some(target))?;
+            let (large_gen_mutex, small_gen_mutex) = {
+                let mut model_lock = model_mutex.lock().await;
+                if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+                let model = model_lock.as_mut().unwrap();
+                model.ensure_generator(crate::model::ModelSize::Small).await?;
+                model.ensure_generator(crate::model::ModelSize::Large).await?;
+                (model.generator.clone(), model.small_generator.clone())
+            };
+
+            let mut full_token_ids = Vec::new();
+            {
+                let mut small_gen = small_gen_mutex.lock().await;
+                if let Some(worker) = small_gen.as_mut() {
+                    let mes_render = worker.chat_template.apply_chat_template(&params)?;
+                    let input = worker.pre_processor.process_info(&params, &mes_render)?;
+                    full_token_ids = worker.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+                }
+            }
+            
+            let total_tokens = full_token_ids.len();
+            let mut current_pos = 0;
+            let prefill_chunk_size = 1024;
+
+            while current_pos < total_tokens - 1 {
+                if cancellation_token.load(Ordering::Relaxed) { break; }
+                let end_pos = (current_pos + prefill_chunk_size).min(total_tokens - 1);
+                let chunk_ids = &full_token_ids[current_pos..end_pos];
+
+                let kv_chunk = {
+                    let mut small_gen = small_gen_mutex.lock().await;
+                    if let Some(worker) = small_gen.as_mut() {
+                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()))?;
+                        // worker.clear_kv_cache();
+                        Some(res)
+                    } else { None }
+                };
+                if let Some((ks, vs)) = kv_chunk {
+                    let mut large_gen = large_gen_mutex.lock().await;
+                    if let Some(target) = large_gen.as_mut() { target.inject_kv(&ks, &vs)?; }
+                }
+                current_pos = end_pos;
+                tokio::task::yield_now().await;
             }
         }
 
-        if let Some(gen) = model.generator.lock().await.as_mut() {
+        if let Some(gen) = model_mutex.lock().await.as_mut().unwrap().generator.lock().await.as_mut() {
             println!("[Scheduler] 2B Identifying selectors immediately...");
             let res = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)))?;
             selector_info = parsing::parse_json_from_llm(&res);
             println!("[Scheduler] Selectors Identified: {}", selector_info);
         }
-        model.unload_generator().await;
+        model_mutex.lock().await.as_mut().unwrap().unload_generator().await;
     }
 
     let mut final_page_info = json!({ "type": page_type });
@@ -1215,24 +1267,53 @@ async fn process_task(
             ..Default::default()
         };
 
-        // 2. Real-time Stream from 0.6B to 2B
+        // 2. Real-time Stream from 0.6B to 2B (NON-BLOCKING)
         {
-            let mut model_lock = model_mutex.lock().await;
-            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-            let model = model_lock.as_ref().unwrap();
+            let (large_gen_mutex, small_gen_mutex) = {
+                let mut model_lock = model_mutex.lock().await;
+                if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+                let model = model_lock.as_mut().unwrap();
+                model.ensure_generator(crate::model::ModelSize::Small).await?;
+                model.ensure_generator(crate::model::ModelSize::Large).await?;
+                (model.generator.clone(), model.small_generator.clone())
+            };
 
-            model.ensure_generator(crate::model::ModelSize::Small).await?;
-            model.ensure_generator(crate::model::ModelSize::Large).await?;
-
+            let mut full_token_ids = Vec::new();
             {
-                let mut large_gen_lock = model.generator.lock().await;
-                let mut small_gen_lock = model.small_generator.lock().await;
-                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                    println!("[Scheduler] Detail Ingestion (Relay) Started...");
-                    let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(detail_session_id.clone()), Some(target))?;
+                let mut small_gen = small_gen_mutex.lock().await;
+                if let Some(worker) = small_gen.as_mut() {
+                    let mes_render = worker.chat_template.apply_chat_template(&params)?;
+                    let input = worker.pre_processor.process_info(&params, &mes_render)?;
+                    full_token_ids = worker.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
                 }
             }
-            model.unload_generator().await; // Unload Small
+            
+            let total_tokens = full_token_ids.len();
+            let mut current_pos = 0;
+            let prefill_chunk_size = 1024;
+
+            println!("[Scheduler] Detail Relay Starting: {} tokens...", total_tokens);
+
+            while current_pos < total_tokens - 1 {
+                if cancellation_token.load(Ordering::Relaxed) { break; }
+                let end_pos = (current_pos + prefill_chunk_size).min(total_tokens - 1);
+                let chunk_ids = &full_token_ids[current_pos..end_pos];
+
+                let kv_chunk = {
+                    let mut small_gen = small_gen_mutex.lock().await;
+                    if let Some(worker) = small_gen.as_mut() {
+                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()))?;
+                        // worker.clear_kv_cache();
+                        Some(res)
+                    } else { None }
+                };
+                if let Some((ks, vs)) = kv_chunk {
+                    let mut large_gen = large_gen_mutex.lock().await;
+                    if let Some(target) = large_gen.as_mut() { target.inject_kv(&ks, &vs)?; }
+                }
+                current_pos = end_pos;
+                tokio::task::yield_now().await;
+            }
         }
         
         wait_for_resources_settled(2500, 1500).await;
@@ -1240,18 +1321,16 @@ async fn process_task(
         // 3. Precise Infer with 2B (Immediate)
         let response = {
             let mut model_lock = model_mutex.lock().await;
-            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-            let _model = model_lock.as_ref().unwrap();
+            let model_instance = model_lock.as_mut().unwrap();
             
-            let res = if let Some(model_instance) = model_lock.as_ref() {
-                model_instance.ensure_generator(crate::model::ModelSize::Large).await?;
-                if let Some(gen) = model_instance.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 2B Extracting details immediately...");
-                    gen.generate(params, Some(cancellation_token.clone()), Some(detail_session_id.clone()))?
-                } else { "{}".to_string() }
+            let mut gen_lock = model_instance.generator.lock().await;
+            let res = if let Some(gen) = gen_lock.as_mut() {
+                println!("[Scheduler] 2B Extracting details immediately...");
+                gen.generate(params, Some(cancellation_token.clone()), Some(detail_session_id.clone()))?
             } else { "{}".to_string() };
             
-            if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+            drop(gen_lock);
+            model_instance.unload_generator().await;
             *model_lock = None; 
             res
         };
@@ -1585,6 +1664,7 @@ async fn process_task(
         
         Ok(())
     }
+}
     
     fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) {
         // [FIX] Only remove the specific directory for this task
@@ -1703,3 +1783,4 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
+

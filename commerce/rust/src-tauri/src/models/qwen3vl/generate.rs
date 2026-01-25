@@ -241,32 +241,106 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+    /// [FAST-RELAY] Processes a slice of pre-tokenized IDs directly. 
+    /// This is the "Zero-Text-Overhead" pipeline.
+    pub fn prefill_only_ids(&mut self, token_ids: &[u32], start_pos: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        if token_ids.is_empty() { return Ok((vec![], vec![])); }
+        
+        let chunk_size = token_ids.len();
+        let end_pos = start_pos + chunk_size;
+
+        let chunk_ids = Tensor::from_vec(token_ids.to_vec(), (1, chunk_size), &self.text_device)?;
+        let chunk_pos = Tensor::arange(start_pos as u32, end_pos as u32, &self.text_device)?;
+
+        if let Some(flag) = &cancel_flag {
+            if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
+        }
+
+        match &mut self.qwen3_vl {
+            ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
+            ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
+            ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), start_pos)?; },
+        };
+
+        let (full_ks, full_vs) = self.get_current_kv();
+        
+        // [INCREMENTAL-FLOW] Slice to return only the NEW KVs for this chunk
+        // This allows 0.6B to keep its full context (essential for correctness) 
+        // while sending only the delta to 2B (essential for efficiency/correctness).
+        let mut new_ks = Vec::with_capacity(full_ks.len());
+        let mut new_vs = Vec::with_capacity(full_vs.len());
+
+        for (k, v) in full_ks.iter().zip(full_vs.iter()) {
+            // KV Cache Shape: [Batch, Heads, SeqLen, HeadDim]
+            // We slice on Dim 2 (SeqLen)
+            let seq_len = k.dim(2)?;
+            if start_pos < seq_len {
+                let len = usize::min(chunk_size, seq_len - start_pos);
+                // Ensure we don't slice out of bounds
+                new_ks.push(k.narrow(2, start_pos, len)?);
+                new_vs.push(v.narrow(2, start_pos, len)?);
+            } else {
+                // If something weird happened and cache didn't grow, push empty or handle error.
+                // For robustness, we push empty slices or skip? 
+                // Best to push 0-length slices to maintain layer count structure.
+                new_ks.push(k.narrow(2, 0, 0)?);
+                new_vs.push(v.narrow(2, 0, 0)?);
+            }
+        }
+
+        Ok((new_ks, new_vs))
+    }
+
+    pub fn prefill_only_chunk(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, start_pos: usize, chunk_size: usize) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
         let total_tokens = full_input_ids_vec.len();
 
-        let seqlen_offset = self.get_kv_len();
-        let mut current_pos = seqlen_offset;
-        // [STABILITY-FIX] 512 is the sweet spot for CPU. 10k at once causes N^2 RAM explosion.
+        let end_pos = (start_pos + chunk_size).min(total_tokens - 1);
+        if start_pos >= end_pos { return Ok((vec![], vec![])); }
+
+        let actual_chunk_size = end_pos - start_pos;
+        let chunk_vec = &full_input_ids_vec[start_pos..end_pos];
+        let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, actual_chunk_size), &self.text_device)?;
+        let chunk_pos = Tensor::arange(start_pos as u32, end_pos as u32, &self.text_device)?;
+
+        if let Some(flag) = &cancel_flag {
+            if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
+        }
+
+        match &mut self.qwen3_vl {
+            ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
+            ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
+            ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), start_pos)?; },
+        };
+
+        let (ks, vs) = self.get_current_kv();
+        // Return only the NEWLY added KV parts if possible, or just the whole set
+        // For simplicity and since we clear after each push, this returns the current chunk's KV.
+        Ok((ks, vs))
+    }
+
+    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let input = self.pre_processor.process_info(&mes, &mes_render)?;
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+        let total_tokens = full_input_ids_vec.len();
+
+        let mut current_pos = self.get_kv_len();
         let prefill_chunk_size = 512; 
 
-        println!("[PREFILL] Starting optimized relay: 0/{} tokens (0%)", total_tokens);
+        println!("[PREFILL] Starting non-blocking prefill: {}/{} tokens", current_pos, total_tokens);
 
         while current_pos < total_tokens {
-            let now = std::time::Instant::now();
             let remaining = total_tokens - current_pos;
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             
-            // [MAX-SPEED-RELAY] Leave only the absolute minimum (1 token) for 2B. 
-            // 0.6B handles everything else.
             if current_pos + chunk_size >= total_tokens { 
                 chunk_size = (total_tokens - current_pos).saturating_sub(1); 
             }
             if chunk_size == 0 { break; }
 
-            // Step 1: Tensor Prep
             let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
             let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
@@ -275,47 +349,20 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
             }
 
-            // Step 2: Forward Pass (No Sleep for maximum performance)
             match &mut self.qwen3_vl {
                 ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
             };
-            let forward_time = now.elapsed().as_millis();
             
-            // Step 3: Relay
-            if let Some(ref mut target) = relay_target {
-                let (ks, vs) = self.get_current_kv();
-                target.inject_kv(&ks, &vs)?;
-                self.clear_kv_cache(); 
-            }
-            let total_time = now.elapsed().as_millis();
-
             current_pos += chunk_size;
-            
-            // [DETAILED-LOGGING] Log progress with time metrics
-            let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
-            println!("[RELAY] Pushed {}/{} tokens ({:.1}%) | Forward: {}ms | Total: {}ms", 
-                current_pos, total_tokens, progress, forward_time, total_time);
-        }
-
-        // Save progress if session_id is provided (for CPU sequential mode)
-        if let Some(sid) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(sid);
-            if !path.exists() { let _ = fs::create_dir_all(&path); }
-            
-            match &mut self.qwen3_vl {
-                ModelVariant::QuantizedVL(m) => { let _ = m.save_kv_cache(&path, false, 1024); },
-                ModelVariant::QuantizedText(m) => { let _ = m.save_kv_cache(&path, false, 1024); },
-                _ => {},
-            }
-            let token_path = path.join("tokens.json");
-            if let Ok(file) = fs::File::create(&token_path) {
-                let _ = serde_json::to_writer(file, &full_input_ids_vec);
+            if current_pos % 2048 == 0 {
+                println!("[PREFILL] Processed {}/{} tokens...", current_pos, total_tokens);
             }
         }
 
-        Ok(current_pos)
+        let (ks, vs) = self.get_current_kv();
+        Ok((ks, vs))
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {

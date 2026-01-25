@@ -242,16 +242,6 @@ impl QuantizedQwen3VLTextAttention {
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
         
-        // [TURBO-RELAY-03] Head Pruning
-        // Identify 0.6B worker by its hidden dimension (1024)
-        let is_worker = self.q_proj.device().is_cpu() || (self.num_attention_heads * self.head_dim == 1024);
-        
-        let (actual_heads, is_pruned) = if is_worker {
-            (1, true) // Force 1 head for ghost engine
-        } else {
-            (self.num_attention_heads, false)
-        };
-
         let query_states = self.q_proj.forward(xs)?.reshape((
             b_sz,
             q_len,
@@ -271,17 +261,6 @@ impl QuantizedQwen3VLTextAttention {
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
-
-        // Apply pruning by narrowing the head dimension if enabled
-        let (query_states, key_states, value_states) = if is_pruned {
-            (
-                query_states.narrow(1, 0, actual_heads)?,
-                key_states.narrow(1, 0, (actual_heads / self.num_kv_groups).max(1))?,
-                value_states.narrow(1, 0, (actual_heads / self.num_kv_groups).max(1))?
-            )
-        } else {
-            (query_states, key_states, value_states)
-        };
 
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
@@ -317,22 +296,14 @@ impl QuantizedQwen3VLTextAttention {
             None
         };
 
-        let current_kv_groups = if is_pruned { 1 } else { self.num_kv_groups };
-
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,
             &value_states,
-            Some(current_kv_groups),
+            Some(self.num_kv_groups),
             adjusted_mask.as_ref(),
             self.scaling,
         )?;
-
-        let mut attn_output = attn_output;
-        if is_pruned {
-            // If pruned, pad the attention output back to original size to match o_proj expectation
-            attn_output = attn_output.pad_with_zeros(D::Minus1, 0, (self.num_attention_heads - actual_heads) * self.head_dim)?;
-        }
 
         let attn_output =
             attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
@@ -591,16 +562,12 @@ impl QuantizedQwen3VLTextAttention {
             
             // 2. Head Alignment
             if h != target_heads {
-                // If head counts differ, we replicate or pad heads to match 2B's attention map.
-                let mut k_heads = vec![];
-                let mut v_heads = vec![];
-                for i in 0..target_heads {
-                    let source_idx = i % h; // Round-robin mapping if 2B has more heads
-                    k_heads.push(k.narrow(1, source_idx, 1)?);
-                    v_heads.push(v.narrow(1, source_idx, 1)?);
+                // If head counts differ, we replicate heads to match 2B's attention map.
+                let head_repeat = target_heads / h;
+                if head_repeat > 1 {
+                    k = k.repeat((1, head_repeat, 1, 1))?;
+                    v = v.repeat((1, head_repeat, 1, 1))?;
                 }
-                k = Tensor::cat(&k_heads, 1)?;
-                v = Tensor::cat(&v_heads, 1)?;
             }
         }
 
@@ -691,26 +658,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         if xs.dtype() != target_dtype { xs = xs.to_dtype(target_dtype)?; }
 
-        // [GHOST-ENGINE-01] Extreme Layer Dropping
-        // Identify worker by device (CPU) or hidden size (1024)
-        let is_worker = dev.is_cpu() || (self.self_attn.num_attention_heads * self.self_attn.head_dim == 1024);
-        
-        if is_worker && self.self_attn.layer_idx % 6 != 0 && self.self_attn.layer_idx != 23 {
-            // Passthrough: Skip entire layer math
-            return Ok(xs);
-        }
-        
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
+        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
         let xs = residual.add(&xs)?;
         
-        // [GHOST-ENGINE-02] Activation Bypassing
-        // Skip heavy MLP and non-linearities for 0.6B worker.
-        if is_worker {
-            return Ok(xs); // Just Return Attn-Output + Residual, bypassing MLP entirely
-        }
-
         let residual = xs.clone();
         let xs = self.post_attention_layernorm.forward(&xs)?;
         let xs = {
