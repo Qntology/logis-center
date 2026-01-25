@@ -28,34 +28,13 @@ pub struct AppState {
 
 #[tauri::command]
 async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, String> {
+    // 1. Set the flag only. DO NOT try to lock model/store here as it blocks the UI thread.
     state.cancellation_token.store(true, Ordering::SeqCst);
     
-    // 1. Update DB to clear active tasks so they reflect as 'Cancelled' in UI
-    {
-        let store_guard = state.store.lock().await;
-        if let Some(db) = store_guard.as_ref() {
-            if let Ok(active_tasks) = db.get_pending_tasks(50).await {
-                for task in active_tasks {
-                    let _ = db.update_task_status(&task.id, 3).await; // 3 = Cancelled
-                    let _ = db.update_message_status(&task.id, 3, Some("Force stopped by user")).await;
-                }
-            }
-        }
-    }
-
-    // 2. Force drop model and store to release VRAM/RAM immediately
-    {
-        let mut model_guard = state.model.lock().await;
-        *model_guard = None;
-    }
-    
-    {
-        let mut store_guard = state.store.lock().await;
-        *store_guard = None;
-    }
-
-    println!("[STOP] Cancellation signal sent, DB updated, and model/store dropped.");
-    Ok("Stop signal sent and resources released.".to_string())
+    // 2. Update DB status in a non-blocking way if possible, or just skip for now.
+    // The worker will catch the flag and clean up properly.
+    println!("[STOP] Cancellation signal sent. Waiting for worker to catch it.");
+    Ok("Stop signal sent.".to_string())
 }
 
 #[tauri::command]
@@ -749,6 +728,57 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
     }
 }
 
+#[derive(serde::Serialize)]
+struct InitialSyncData {
+    tasks: Vec<store::Task>,
+    pages: Vec<store::TradeDocument>,
+    users: Vec<store::TradeDocument>,
+    items: Vec<store::TradeDocument>,
+    browser_status: String,
+    current_url: String,
+    is_client: bool,
+    is_admin: bool,
+}
+
+#[tauri::command]
+async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, String> {
+    scheduler::mark_ui_ready();
+    
+    let store_guard = state.store.lock().await;
+    let mut tasks = Vec::new();
+    let mut pages = Vec::new();
+    let mut users = Vec::new();
+    let mut items = Vec::new();
+    
+    if let Some(db) = store_guard.as_ref() {
+        tasks = db.get_pending_tasks(10).await.unwrap_or_default();
+        pages = db.get_all_items("pages", 50, 0, None).await.unwrap_or_default();
+        users = db.get_all_items("users", 20, 0, None).await.unwrap_or_default();
+        items = db.get_all_items("items", 10, 0, None).await.unwrap_or_default();
+    }
+    
+    let browser_status = {
+        let guard = automation::GLOBAL_BROWSER.lock().await;
+        if guard.is_some() { "running".to_string() } else { "stopped".to_string() }
+    };
+
+    let (current_url, is_client, is_admin) = {
+        let state = automation::LAST_DETECTED_STATE.lock().await;
+        (state.url.clone(), state.is_client, state.is_admin)
+    };
+
+    Ok(InitialSyncData {
+        tasks,
+        pages,
+        users,
+        items,
+        browser_status,
+        current_url,
+        is_client,
+        is_admin,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let model = Arc::new(TokioMutex::new(None));
@@ -758,6 +788,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             model: model.clone(),
             store: store.clone(),
@@ -832,7 +863,7 @@ pub fn run() {
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
-            upsert_items, set_ignore_cursor_events
+            upsert_items, set_ignore_cursor_events, mark_ui_ready
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

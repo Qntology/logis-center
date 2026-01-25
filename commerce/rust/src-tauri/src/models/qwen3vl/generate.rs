@@ -149,32 +149,56 @@ impl Qwen3VLGenerateModel {
                 // CASE 1: Vision-Language Model
                 let mmproj = mmproj_path.ok_or(anyhow!("Missing mmproj GGUF"))?;
                 let main = model_path.ok_or(anyhow!("Missing main GGUF for VL model"))?;
-                let mut mmproj_file = std::fs::File::open(&mmproj)?;
-                let mmproj_content = gguf_file::Content::read(&mut mmproj_file)?;
-                let mut main_file = std::fs::File::open(&main)?;
-                let main_content = gguf_file::Content::read(&mut main_file)?;
                 
-                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
+                // [MMAP-OPTIMIZATION] Use Mmap for GGUF to support Parallel Loading and Prefetching
+                let main_file = std::fs::File::open(&main)?;
+                let main_mmap = unsafe { memmap2::MmapOptions::new().map(&main_file)? };
+                let mmproj_file = std::fs::File::open(&mmproj)?;
+                let mmproj_mmap = unsafe { memmap2::MmapOptions::new().map(&mmproj_file)? };
+
+                // [PREFETCH] Hint OS to load weights into memory immediately
+                #[cfg(unix)]
+                {
+                    use memmap2::Advice;
+                    let _ = main_mmap.advise(Advice::WillNeed);
+                    let _ = mmproj_mmap.advise(Advice::WillNeed);
+                }
+
+                let mut main_cursor = std::io::Cursor::new(&main_mmap[..]);
+                let main_content = gguf_file::Content::read(&mut main_cursor)?;
+                let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
+                let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
+                
+                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, &main_mmap, &mmproj_content, &mmproj_mmap, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedVL(model)
             } else {
                 // CASE 2: Pure Text Model (0.6B etc.)
                 let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
-                let mut file = std::fs::File::open(&main)?;
-                let content = gguf_file::Content::read(&mut file)?;
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new(&cfg, &content, &mut file, &text_dev, text_device_id, dtype, kv_reserve)?;
+                
+                let file = std::fs::File::open(&main)?;
+                let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                
+                #[cfg(unix)]
+                {
+                    use memmap2::Advice;
+                    let _ = mmap.advise(Advice::WillNeed);
+                }
+
+                let mut cursor = std::io::Cursor::new(&mmap[..]);
+                let content = gguf_file::Content::read(&mut cursor)?;
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, &mmap, &text_dev, text_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedText(model)
             }
         } else {
             // CASE 3: Standard Safetensors with mmap for instant loading
             let model_list = find_type_files(path, "safetensors")?;
             
-            // [MMAP-OPTIMIZATION] Using memmap2 for rapid switching
-            let mut handles = Vec::new();
-            for p in &model_list {
+            // [MMAP-OPTIMIZATION] Option 1: Parallel Loading using rayon
+            use rayon::prelude::*;
+            let _handles: Vec<_> = model_list.par_iter().map(|p| {
                 let file = std::fs::File::open(p)?;
-                let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-                handles.push(mmap);
-            }
+                unsafe { memmap2::MmapOptions::new().map(&file) }
+            }).collect::<Result<Vec<_>, _>>()?;
             
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, &text_dev)? };
             let model = Qwen3VLModel::new(cfg, vb)?;
@@ -356,14 +380,22 @@ impl Qwen3VLGenerateModel {
             
             print!(">"); use std::io::Write; std::io::stdout().flush().ok();
 
+            // [CANCELLATION-CHECK] Check if user clicked stop between chunks
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    println!("[GENERATE] Cancellation detected during prefill.");
+                    return Err(anyhow!("Generation cancelled during prefill"));
+                }
+            }
+
             match &mut self.qwen3_vl {
                 ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
             };
             
-            // [OOM-PREVENTION] Small delay between chunks to let driver settle memory
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            // [SPEED-UP] Drastically reduced delay to speed up prefilling
+            std::thread::sleep(std::time::Duration::from_millis(10));
             
             current_pos += chunk_size;
         }
@@ -377,7 +409,7 @@ impl Qwen3VLGenerateModel {
         println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
 
         // Save progress if requested
-        if is_save && !is_ingest && seqlen_offset > 0 {
+        if is_save && seqlen_offset > 0 {
             if let Some(path) = &cache_path {
                 let res = match &mut self.qwen3_vl {
                     ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 0),

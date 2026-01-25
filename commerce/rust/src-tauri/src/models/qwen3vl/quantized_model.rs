@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
+use rayon::prelude::*;
 use nvml_wrapper::Nvml;
 use std::path::Path;
 use std::fs;
@@ -277,11 +278,13 @@ impl QuantizedQwen3VLTextAttention {
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
         if let Some((k, v)) = &self.kv_cache {
             let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-            let mut map = HashMap::new();
-
+            
+            // [PARALLEL-TRANSFER] Move K and V to CPU in parallel tasks if possible,
+            // but for simplicity and safety, we ensure they are handled within rayon context.
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
 
+            let mut map = HashMap::new();
             let bits = 4u32; 
             map.insert("bits".to_string(), Tensor::from_vec(vec![bits], (1,), &Device::Cpu)?);
 
@@ -291,48 +294,43 @@ impl QuantizedQwen3VLTextAttention {
                 map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
             } else {
                 map.insert("mode".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
-                let quantize_tensor = |t: &Tensor, prefix: &str, map: &mut HashMap<String, Tensor>, b_size: usize, b_depth: u32| -> Result<()> {
-                    use rayon::prelude::*; 
+                
+                // Helper for parallel quantization
+                let quantize_and_store = |t: &Tensor, prefix: &str, target_map: &mut HashMap<String, Tensor>| -> Result<()> {
                     let shape = t.shape().dims().to_vec();
                     let t_flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-                    let num_blocks = (t_flat.len() + b_size - 1) / b_size;
-                    let (scales, quantized_data): (Vec<f32>, Vec<Vec<u8>>) = t_flat.par_chunks(b_size)
+                    let num_blocks = (t_flat.len() + block_size - 1) / block_size;
+                    
+                    use rayon::prelude::*;
+                    let (scales, quantized_data): (Vec<f32>, Vec<Vec<u8>>) = t_flat.par_chunks(block_size)
                         .map(|chunk| {
                             let max_val = chunk.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                            if b_depth == 4 {
-                                let scale = max_val / 7.0;
-                                let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-                                let mut qs = Vec::with_capacity(chunk.len());
-                                for &val in chunk {
-                                    let q = ((val * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
-                                    qs.push(q);
-                                }
-                                let mut packed = Vec::with_capacity((qs.len() + 1) / 2);
-                                for i in (0..qs.len()).step_by(2) {
-                                    let low = qs[i];
-                                    let high = if i + 1 < qs.len() { qs[i+1] } else { 0 };
-                                    packed.push((high << 4) | (low & 0x0F));
-                                }
-                                (scale, packed)
-                            } else {
-                                let scale = max_val / 127.0;
-                                let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-                                let mut packed = Vec::with_capacity(chunk.len());
-                                for &val in chunk {
-                                    let q = (val * inv_scale).round().clamp(-127.0, 127.0) as i8;
-                                    packed.push(q as u8);
-                                }
-                                (scale, packed)
+                            let scale = max_val / 7.0;
+                            let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                            let mut qs = Vec::with_capacity(chunk.len());
+                            for &val in chunk {
+                                let q = ((val * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
+                                qs.push(q);
                             }
+                            let mut packed = Vec::with_capacity((qs.len() + 1) / 2);
+                            for i in (0..qs.len()).step_by(2) {
+                                let low = qs[i];
+                                let high = if i + 1 < qs.len() { qs[i+1] } else { 0 };
+                                packed.push((high << 4) | (low & 0x0F));
+                            }
+                            (scale, packed)
                         }).unzip();
+
                     let flat_data: Vec<u8> = quantized_data.into_iter().flatten().collect();
-                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(flat_data.clone(), (flat_data.len(),), &Device::Cpu)?);
-                    map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?);
-                    map.insert(format!("{}_shape", prefix), Tensor::from_vec(shape.iter().map(|&x| x as u32).collect(), (shape.len(),), &Device::Cpu)?);
+                    let flat_len = flat_data.len();
+                    target_map.insert(format!("{}_packed", prefix), Tensor::from_vec(flat_data, (flat_len,), &Device::Cpu)?);
+                    target_map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?);
+                    target_map.insert(format!("{}_shape", prefix), Tensor::from_vec(shape.iter().map(|&x| x as u32).collect(), (shape.len(),), &Device::Cpu)?);
                     Ok(())
                 };
-                quantize_tensor(k, "k", &mut map, block_size, bits)?;
-                quantize_tensor(v, "v", &mut map, block_size, bits)?;
+
+                quantize_and_store(&k_cpu, "k", &mut map)?;
+                quantize_and_store(&v_cpu, "v", &mut map)?;
                 map.insert("block_size".to_string(), Tensor::from_vec(vec![block_size as u32], (1,), &Device::Cpu)?);
             }
 
@@ -520,6 +518,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.clear_kv_cache();
     }
 
+    pub fn device(&self) -> &Device {
+        self.input_layernorm.weight().device()
+    }
+
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
         self.self_attn.save_kv_cache(path, clear, block_size)
     }
@@ -543,6 +545,127 @@ pub struct QuantizedQwen3VLTextModel {
 }
 
 impl QuantizedQwen3VLTextModel {
+    pub fn new_with_mmap(
+        config: &Qwen3VLTextConfig,
+        ct: &gguf_file::Content,
+        mmap: &[u8],
+        base_name: &str,
+        device: &Device,
+        device_id: usize,
+        dtype: DType,
+        kv_reserve: u64,
+    ) -> Result<Self> {
+        let mut reader = std::io::Cursor::new(mmap);
+        let token_emb_name = format!("{base_name}.embed_tokens.weight");
+        let alt_token_emb = "token_embd.weight";
+        
+        let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
+             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let h = tensor.dim(1)?;
+             (Embedding::new(tensor, h), h)
+        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, device) {
+             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let h = tensor.dim(1)?;
+             (Embedding::new(tensor, h), h)
+        } else {
+             return Err(anyhow!("Failed to load embedding."));
+        };
+
+        if actual_hidden_size != config.hidden_size {
+            println!("[MODEL-FIX] Hidden Size Mismatch. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_hidden_size);
+        }
+
+        // Create a patched config for layer initialization
+        let mut patched_config = config.clone();
+        patched_config.hidden_size = actual_hidden_size;
+        let config = &patched_config; // Re-alias to use patched version below
+
+        let nvml = Nvml::init().ok();
+        let mut current_device = device.clone();
+        
+        let mut layer_weight_size = 0_u64;
+        let probe_prefix_gguf = "blk.0.";
+        let probe_prefix_std = "model.layers.0.";
+        let layer_prefix = if ct.tensor_infos.keys().any(|k| k.starts_with(probe_prefix_gguf)) { probe_prefix_gguf } else { probe_prefix_std };
+
+        for (name, info) in &ct.tensor_infos {
+            if name.starts_with(layer_prefix) {
+                let elements: usize = info.shape.elem_count();
+                let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
+                layer_weight_size += size as u64;
+            }
+        }
+        
+        let estimated_activation_buffer = 200_000_000; 
+        let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 };
+        let mut simulated_free_vram: u64 = 0;
+        let mut is_vram_checked = false;
+        let mut safety_floor: u64 = 0;
+
+        if current_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                     if let Ok(mem) = dev.memory_info() {
+                         simulated_free_vram = mem.free;
+                         is_vram_checked = true;
+                         let os_reserve = 80_000_000; 
+                         safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
+                     }
+                 }
+             }
+        }
+
+        let mut layer_devices = vec![];
+        let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
+
+        for _ in 0..config.num_hidden_layers {
+            if current_device.is_cuda() && is_vram_checked {
+                 if simulated_free_vram > ( (effective_cost as f64 * 1.02) as u64 + safety_floor ) {
+                     simulated_free_vram = simulated_free_vram.saturating_sub(effective_cost);
+                 } else {
+                     current_device = Device::Cpu;
+                 }
+            }
+            layer_devices.push(current_device.clone());
+        }
+
+        // [ORGANIC] Dynamic Threading for Parallel Loading
+        let thread_config = crate::utils::resources::get_optimal_thread_config();
+        println!("[MODEL] Organic Loading: Using {} threads ({})", thread_config.thread_count, thread_config.description);
+        
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_config.thread_count).build()?;
+        
+        // Ensure we capture the PATCHED config, not the original one
+        let final_config = config; 
+
+        let layers: Result<Vec<_>> = pool.install(|| {
+            (0..final_config.num_hidden_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
+                let mut local_cursor = std::io::Cursor::new(mmap);
+                let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
+                let standard = format!("{base_name}.layers.{layer_idx}");
+                let gguf_blk = format!("blk.{layer_idx}");
+                let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
+                QuantizedQwen3VLTextDecoderLayer::new(
+                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx
+                )
+            }).collect()
+        });
+        
+        let layers = layers?;
+        
+        let norm_name = format!("{base_name}.norm");
+        let alt_norm = "output_norm";
+        let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
+        let last_device = layers.last().map(|l| l.device()).unwrap_or(device);
+        let norm_dtype = if last_device.is_cpu() { DType::F32 } else { dtype };
+        let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype)?;
+        
+        let head_dim = config.head_dim;
+        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
+        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
+        
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section })
+    }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
         ct: &gguf_file::Content,
@@ -557,23 +680,21 @@ impl QuantizedQwen3VLTextModel {
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
-        let embed_tokens = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
+        let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
-             let real_hidden_size = tensor.dim(1)?;
-             if real_hidden_size != config.hidden_size {
-                 println!("[MODEL-FIX] Embedding Hidden Size Mismatch. GGUF: {}, Config: {}. Using GGUF.", real_hidden_size, config.hidden_size);
-             }
-             Embedding::new(tensor, real_hidden_size)
+             let h = tensor.dim(1)?;
+             (Embedding::new(tensor, h), h)
         } else if let Ok(tensor) = ct.tensor(reader, alt_token_emb, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
-             let real_hidden_size = tensor.dim(1)?;
-             if real_hidden_size != config.hidden_size {
-                 println!("[MODEL-FIX] Embedding Hidden Size Mismatch (Alt). GGUF: {}, Config: {}. Using GGUF.", real_hidden_size, config.hidden_size);
-             }
-             Embedding::new(tensor, real_hidden_size)
+             let h = tensor.dim(1)?;
+             (Embedding::new(tensor, h), h)
         } else {
-             return Err(anyhow!("Failed to load embedding. Tried {}, {}", token_emb_name, alt_token_emb));
+             return Err(anyhow!("Failed to load embedding."));
         };
+
+        let mut patched_config = config.clone();
+        patched_config.hidden_size = actual_hidden_size;
+        let config = &patched_config;
 
         // Initialize NVML for dynamic VRAM check
         let nvml = Nvml::init().ok();
@@ -811,6 +932,104 @@ pub struct QuantizedQwen3VLModel {
 }
 
 impl QuantizedQwen3VLModel {
+    pub fn new_with_mmap(
+        config: &Qwen3VLConfig,
+        ct_main: &gguf_file::Content,
+        main_mmap: &[u8],
+        ct_vision: &gguf_file::Content,
+        mmproj_mmap: &[u8],
+        text_device: &Device,
+        text_device_id: usize,
+        vision_device: &Device,
+        vision_device_id: usize,
+        dtype: DType,
+        kv_reserve: u64,
+    ) -> Result<Self> {
+        let nvml = Nvml::init().ok();
+        
+        let mut vision_weight_size = 0_u64;
+        for (_, info) in &ct_vision.tensor_infos {
+            let elements: usize = info.shape.elem_count();
+            let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
+            vision_weight_size += size as u64;
+        }
+        let vision_overhead = (vision_weight_size as f64 * 0.30) as u64;
+        
+        let mut actual_vision_device = vision_device.clone();
+        let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
+
+        if actual_vision_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(vision_device_id as u32) {
+                     if let Ok(mem) = dev.memory_info() {
+                         let total_vram = mem.total;
+                         let os_reserve = (total_vram as f64 * 0.02) as u64; 
+                         let vision_safety_floor = os_reserve.max(100_000_000); 
+                         if mem.free < (vision_weight_size + vision_overhead + vision_safety_floor) {
+                             actual_vision_device = Device::Cpu;
+                         }
+                     }
+                 }
+             }
+        }
+        
+        let vision_dtype = if actual_vision_device.is_cpu() { DType::F32 } else { dtype };
+        
+        let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
+        let vb_visual = from_gguf_content(config, ct_vision, &mut reader_vision, &actual_vision_device, vision_dtype)?;
+        let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
+
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
+        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
+            t_config, ct_main, main_mmap, "model", text_device, text_device_id, dtype, kv_reserve
+        )?;
+
+        let mut reader_main = std::io::Cursor::new(main_mmap);
+        let mut head_weight_size = 0_u64;
+        let head_names = ["lm_head.weight", "output.weight", "token_embd.weight"];
+        for name in head_names {
+            if let Some(info) = ct_main.tensor_infos.get(name) {
+                let elements: usize = info.shape.elem_count();
+                let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
+                head_weight_size = size as u64;
+                break;
+            }
+        }
+        
+        let mut head_device = text_device.clone();
+        if head_device.is_cuda() {
+             if let Some(nvml_inst) = &nvml {
+                 if let Ok(dev) = nvml_inst.device_by_index(text_device_id as u32) {
+                     if let Ok(mem) = dev.memory_info() {
+                         let absolute_min_margin = 50_000_000;
+                         if mem.free < (head_weight_size + absolute_min_margin) {
+                             head_device = Device::Cpu;
+                         }
+                     }
+                 }
+             }
+        }
+
+        let head_dtype = if head_device.is_cpu() { DType::F32 } else { dtype };
+
+        let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "lm_head", &head_device, head_dtype) {
+            l
+        } else if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "output", &head_device, head_dtype) {
+            l
+        } else {
+            get_qlinear(ct_main, &mut reader_main, "token_embd", &head_device, head_dtype)?
+        };
+
+        Ok(Self {
+            config: config.clone(),
+            visual,
+            language_model,
+            lm_head,
+            rope_deltas: None,
+            text_device: text_device.clone(),
+            vision_device: actual_vision_device,
+        })
+    }
     pub fn new<R: std::io::Seek + std::io::Read, R2: std::io::Seek + std::io::Read>(
         config: &Qwen3VLConfig,
         ct_main: &gguf_file::Content,
@@ -1071,6 +1290,46 @@ pub struct QuantizedQwen3TextModel {
 }
 
 impl QuantizedQwen3TextModel {
+    pub fn new_with_mmap(
+        config: &Qwen3VLConfig,
+        ct_main: &gguf_file::Content,
+        mmap: &[u8],
+        text_device: &Device,
+        text_device_id: usize,
+        dtype: DType,
+        kv_reserve: u64,
+    ) -> Result<Self> {
+        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized) with Mmap");
+        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
+
+        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
+            t_config, 
+            ct_main, 
+            mmap, 
+            "model", 
+            text_device, 
+            text_device_id, 
+            dtype, 
+            kv_reserve
+        )?;
+
+        let mut reader = std::io::Cursor::new(mmap);
+        let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
+        let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) {
+            l
+        } else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) {
+            l
+        } else {
+            get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype)?
+        };
+
+        Ok(Self {
+            language_model,
+            lm_head,
+            text_device: text_device.clone(),
+        })
+    }
+
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLConfig,
         ct_main: &gguf_file::Content,

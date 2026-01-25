@@ -182,18 +182,36 @@ fn merge_json_results(target: &mut Value, source: &Value) {
     }
 }
 
+use tokio::sync::Notify;
+use once_cell::sync::Lazy;
+
+// [UI-SYNC] Instant notification system to wake up the worker
+static UI_READY_SIGNAL: Lazy<Notify> = Lazy::new(|| Notify::new());
+static UI_READY_FLAG: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_ui_ready() {
+    UI_READY_FLAG.store(true, Ordering::SeqCst);
+    UI_READY_SIGNAL.notify_waiters(); // Wake up any sleeping tasks instantly
+    println!("[Scheduler] UI signaled ready. Background worker woke up.");
+}
+
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
 ) {
-    println!("[Scheduler] Background worker started.");
+    println!("[Scheduler] Background worker waiting for UI Ready signal...");
     
-    // [NEW] Clear ALL temporary data directories at startup for a clean slate
     clear_all_temp_data(Some(&app_handle));
     
     tokio::spawn(async move {
+        // [EVENT-DRIVEN-WAIT] Zero CPU usage, zero delay. 
+        // Wakes up exactly when mark_ui_ready is called.
+        if !UI_READY_FLAG.load(Ordering::SeqCst) {
+            UI_READY_SIGNAL.notified().await;
+        }
+        
         let mut delay_secs = 1;
         
         loop {
@@ -342,6 +360,10 @@ async fn process_task(
             m.unload_generator().await;
         }
         *model_lock = None; 
+        drop(model_lock); // Drop explicitly to free resources
+
+        // [STRICT-UNLOAD] Give a small delay for resources to settle
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // KV 폴더의 잠금 파일 확인 (Windows에서는 핸들을 닫는 것만으로 충분하지만, 명시적 로그)
         let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
@@ -357,10 +379,15 @@ async fn process_task(
 
 
     // [NEW] Clear any leftover resources from previous failed attempts at the START
-
     cleanup_task_resources(&task.id, Some(app_handle));
 
-
+    // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
+    let payload = json!({ 
+        "task_id": task.id,
+        "category": "Processing", "summary": "Resuming task...", "spinner": "⠋" 
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &payload);
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -584,6 +611,9 @@ async fn process_task(
         let type_prompt = parsing::page_type_prompt();
         let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", type_prompt);
 
+        // [MEM-WATCH] Snapshot baseline before loading 0.6B
+        let (base_ram_1, base_vram_1) = crate::utils::resources::get_memory_usage();
+
         // 1.1 Fast Ingest with 0.6B
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
@@ -591,16 +621,22 @@ async fn process_task(
             model.ensure_generator(crate::model::ModelSize::Small).await?;
             let app_handle_clone = app_handle.clone();
             
+            // [CUMULATIVE-INGEST] Incremental context building for perfect KV cache hits
+            let mut cumulative_pug = String::new();
+            let chunks_len = classify_chunks.len();
+
             for (i, chunk) in classify_chunks.iter().enumerate() {
-                let is_last = i == classify_chunks_len - 1;
+                cumulative_pug.push_str(chunk);
+                let is_last = i == chunks_len - 1;
+                
+                // [SPEED-UP] Always INGEST and SAVE every chunk.
+                // This ensures the next chunk call hits the disk cache and processes ONLY the delta.
                 let content = if is_last {
-                    format!("{}\n\n{}", chunk, task_specific_prompt)
+                    format!("{}\n\n{}", cumulative_pug, task_specific_prompt)
                 } else {
-                    format!("{}\n\nACTION: INGEST", chunk)
+                    format!("{}\n\nACTION: INGEST\n\nACTION: SAVE", cumulative_pug)
                 };
 
-                // [CLEAN-LOOP] Create a NEW messages vector for each chunk to prevent history accumulation in RAM.
-                // The engine's session_id persists the context on disk (safetensors).
                 let messages = vec![
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                         content: ChatCompletionRequestUserMessageContent::Array(vec![
@@ -620,7 +656,7 @@ async fn process_task(
 
                 let _ = model.chat_params_with_spinner(
                     params, &app_handle_clone, "Fast Ingestion (0.6B)",
-                    json!({ "task_id": task.id, "category": "Classification (Ingest)", "summary": format!("Recording part {}/{}...", i+1, classify_chunks_len) }),
+                    json!({ "task_id": task.id, "category": "Classification (Ingest)", "summary": format!("Processing HTML part {}/{}...", i+1, chunks_len) }),
                     Some(cancellation_token.clone()), Some(task.id.clone())
                 ).await?;
             }
@@ -629,10 +665,13 @@ async fn process_task(
         *model_lock = None; // Total release
         drop(model_lock);
         
-        wait_for_resources_settled(2500, 1500).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // [STRICT-UNLOAD] Verify 0.6B is gone before loading 2B
+        crate::utils::resources::wait_for_memory_release(base_ram_1, base_vram_1, 8000).await;
 
         // 1.2 Precise Infer with 2B
+        // [MEM-WATCH] Snapshot baseline before loading 2B
+        let (base_ram_1_2b, base_vram_1_2b) = crate::utils::resources::get_memory_usage();
+
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
         
@@ -640,11 +679,15 @@ async fn process_task(
             model.ensure_generator(crate::model::ModelSize::Large).await?;
             let app_handle_clone = app_handle.clone();
 
-            // [KV-HIT] Construct ONLY the final query. 2B will load 0.6B's saved cache automatically.
+            // [KV-SYNC] Send FULL cumulative PUG + Prompt. 
+            // 2B will find the HTML prefix in its saved cache, load it, 
+            // and process ONLY the prompt (instant response).
+            let full_content = format!("{}\n\n{}", light_pug, task_specific_prompt);
+
             let messages = vec![
                 ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Array(vec![
-                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: task_specific_prompt })
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: full_content })
                     ]),
                     name: None,
                 })
@@ -670,6 +713,9 @@ async fn process_task(
         *model_lock = None; 
         drop(model_lock);
 
+        // [STRICT-UNLOAD] Verify 2B is gone
+        crate::utils::resources::wait_for_memory_release(base_ram_1_2b, base_vram_1_2b, 5000).await;
+
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
         println!("[Scheduler] Classification Result: {}", page_type);
@@ -688,6 +734,9 @@ async fn process_task(
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY\n\nACTION: SAVE", selector_prompt);
 
+        // [MEM-WATCH] Snapshot baseline before loading 0.6B
+        let (base_ram_2, base_vram_2) = crate::utils::resources::get_memory_usage();
+
         // 2.1 Fast Ingest with 0.6B
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
@@ -695,12 +744,16 @@ async fn process_task(
             model.ensure_generator(crate::model::ModelSize::Small).await?;
             let app_handle_clone = app_handle.clone();
             
+            let mut cumulative_pug = String::new();
+            let chunks_len = classify_chunks.len();
+
             for (i, chunk) in classify_chunks.iter().enumerate() {
-                let is_last = i == classify_chunks_len - 1;
+                cumulative_pug.push_str(chunk);
+                let is_last = i == chunks_len - 1;
                 let content = if is_last {
-                    format!("{}\n\n{}", chunk, task_specific_prompt)
+                    format!("{}\n\n{}", cumulative_pug, task_specific_prompt)
                 } else {
-                    format!("{}\n\nACTION: INGEST", chunk)
+                    cumulative_pug.clone()
                 };
 
                 let messages = vec![
@@ -722,7 +775,7 @@ async fn process_task(
 
                 let _ = model.chat_params_with_spinner(
                     params, &app_handle_clone, "Fast Ingestion (0.6B)",
-                    json!({ "task_id": task.id, "category": "Selectors (Ingest)", "summary": format!("Updating context part {}/{}...", i+1, classify_chunks_len) }),
+                    json!({ "task_id": task.id, "category": "Selectors (Ingest)", "summary": format!("Processing HTML part {}/{}...", i+1, chunks_len) }),
                     Some(cancellation_token.clone()), Some(task.id.clone())
                 ).await?;
             }
@@ -731,10 +784,13 @@ async fn process_task(
         *model_lock = None; 
         drop(model_lock);
 
-        wait_for_resources_settled(2500, 1500).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // [STRICT-UNLOAD] Verify 0.6B is gone before loading 2B
+        crate::utils::resources::wait_for_memory_release(base_ram_2, base_vram_2, 8000).await;
 
         // 2.2 Precise Infer with 2B
+        // [MEM-WATCH] Snapshot baseline before loading 2B
+        let (base_ram_2_2b, base_vram_2_2b) = crate::utils::resources::get_memory_usage();
+
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
         
@@ -742,10 +798,12 @@ async fn process_task(
             model.ensure_generator(crate::model::ModelSize::Large).await?;
             let app_handle_clone = app_handle.clone();
 
+            let full_content = format!("{}\n\n{}", light_pug, task_specific_prompt);
+
             let messages = vec![
                 ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                     content: ChatCompletionRequestUserMessageContent::Array(vec![
-                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: task_specific_prompt })
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: full_content })
                     ]),
                     name: None,
                 })
@@ -771,8 +829,8 @@ async fn process_task(
         *model_lock = None; 
         drop(model_lock);
 
-        wait_for_resources_settled(2500, 1500).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // [STRICT-UNLOAD] Verify 2B is gone
+        crate::utils::resources::wait_for_memory_release(base_ram_2_2b, base_vram_2_2b, 5000).await;
 
         let res_info = parsing::parse_json_from_llm(&res);
         selector_info = res_info;
@@ -791,9 +849,20 @@ async fn process_task(
                 crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
             } else { task.to.clone() };
 
-            // 1. page_id = hashId(cc + pathname) - Stripping search params to prevent duplicate schemas for same route
-            let url_obj = url::Url::parse(&url).unwrap();
-            let raw_path = url_obj.path(); // Actual path string
+            // [STRICT PARITY] Ported from proxy/src/index.ts mechanism
+            // If URL is relative, it MUST have a valid origin to combine with.
+            let origin_str = task_data.get("origin").and_then(|s| s.as_str()).ok_or_else(|| anyhow::anyhow!("Missing origin in task data"))?;
+            let base_url = url::Url::parse(origin_str).map_err(|e| anyhow::anyhow!("Invalid origin URL: {}", e))?;
+
+            let url_obj = match url::Url::parse(&url) {
+                Ok(parsed) => parsed,
+                Err(url::ParseError::RelativeUrlWithoutBase) => {
+                    base_url.join(&url).map_err(|e| anyhow::anyhow!("Failed to join relative URL: {}", e))?
+                },
+                Err(e) => return Err(anyhow::anyhow!("Invalid target URL: {}", e)),
+            };
+            
+            let raw_path = url_obj.path();
             let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
             
             // 2. bcc = hashId(type + (isDetail ? cc.toUpperCase() : cc)) - Crucial for Tree grouping
@@ -898,6 +967,17 @@ async fn process_task(
         log_task_progress(app_handle, &task.id, &payload);
 
         let mut all_extracted_items = Vec::new();
+
+        // [3번 가속: PRE-FETCH] 리스트 처리를 시작하기 전에 백그라운드에서 Large 모델의 무게추를 미리 로드함
+        {
+            tokio::spawn(async move {
+                let large_dir = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
+                    .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
+                if let Some(path) = large_dir {
+                    let _ = pre_fetch_weights(&path);
+                }
+            });
+        }
 
         // [FIX] Scoped block to ensure 'document' (!Send) is dropped before .await points
         {
@@ -1677,6 +1757,32 @@ async fn process_task(
         // [FIX] Only remove the specific directory for this task
         let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
     }
+
+// [3번 가속: PRE-FETCH] OS 페이지 캐시에 무게추 파일을 미리 로드함
+fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
+    use std::io::Read;
+    println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let p = entry.path();
+                    if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
+                        if let Ok(mut file) = std::fs::File::open(p) {
+                            let mut buffer = [0u8; 1024 * 1024]; // 1MB buffer
+                            // 파일 전체를 읽어서 OS가 램에 캐싱하도록 유도함
+                            while let Ok(n) = file.read(&mut buffer) {
+                                if n == 0 { break; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("[PRE-FETCH] Warm-up complete.");
+    Ok(())
+}
 
 pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_json::Value) {
     use std::io::Write;

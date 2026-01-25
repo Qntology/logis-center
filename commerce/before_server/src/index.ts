@@ -489,9 +489,15 @@ export default {
 
 			if(origin && href){
 				try{
-					if(href.indexOf(origin) > -1){
-						var url = new URL(href) // or new URL(url)
+					// [SAFE-URL] 상대 경로 대응을 위한 URL 파싱 보호
+					var url;
+					try {
+						url = new URL(href);
+					} catch (e) {
+						url = new URL(href, origin);
+					}
 
+					if(href.indexOf(origin) > -1 || url.origin === origin){
 						var currentHost = url.host
 
 						var host = currentHost.split('.')
@@ -975,7 +981,13 @@ export default {
 				created_at = parseInt(req.query.created_at)
 			}
 
-			var url = new URL(href)
+			// [SAFE-URL] 상대 경로 대응을 위한 URL 파싱 보호
+			var url;
+			try {
+				url = new URL(href);
+			} catch (e) {
+				url = new URL(href, origin || "https://commerce.logis.center");
+			}
 
 			var pathname = url.pathname.toLowerCase()
 

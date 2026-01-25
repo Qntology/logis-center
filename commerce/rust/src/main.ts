@@ -118,13 +118,25 @@ function startSpinner() {
     if (spinnerInterval) clearInterval(spinnerInterval);
     if (globalNavSpinner) {
         globalNavSpinner.style.display = "inline-block";
-        globalNavSpinner.onclick = () => {
+        globalNavSpinner.onclick = async () => {
             openWidget("list");
             listView.style.display = "none";
             detailView.style.display = "flex";
             detailTitle.innerText = "Task Progress";
             if (btnStopTask) btnStopTask.style.display = "flex";
             if (btnDetailDelete) btnDetailDelete.style.display = "none";
+
+            // [LOG-RECOVERY] Fetch and restore log history if we open the view mid-task
+            const logArea = document.getElementById("extraction-log");
+            if (logArea && logArea.dataset.activeTaskId) {
+                const taskId = logArea.dataset.activeTaskId;
+                logArea.innerHTML = "<div style='padding:10px;'>📡 Synchronizing logs...</div>";
+                try {
+                    const logs = await invoke<any[]>("get_task_logs", { taskId });
+                    logArea.innerHTML = "";
+                    logs.forEach(l => renderProgressToUI(l));
+                } catch (e) { console.error("Log recovery failed:", e); }
+            }
         };
     }
     
@@ -234,6 +246,13 @@ if (pillNav) {
 // --- Search & Main Nav ---
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
+    
+    // [UI-FIX] If already extracting, keep the button hidden and let the spinner show
+    if (isExtracting) {
+        btnExtract.style.display = "none";
+        return;
+    }
+
     if (currentImage) {
         btnExtract.style.display = "flex";
         btnExtract.innerHTML = "⚡";
@@ -241,37 +260,37 @@ async function updateExtractButtonVisibility() {
         btnExtract.title = "Extract from Image";
         return;
     }
+// ... (기존 로직) ...
     if (!currentDetectedUrl) {
         btnExtract.style.display = "none";
         return;
     }
+
+    // [UI-FIX] Show the button immediately before performing async checks
+    btnExtract.style.display = "flex";
+    btnExtract.innerHTML = "⚡";
+    btnExtract.classList.remove("active-spinner");
+
     try {
         const urlObj = new URL(currentDetectedUrl.toLowerCase());
         const hostname = urlObj.hostname; 
         const link = (urlObj.pathname + urlObj.search).toLowerCase();
         const ccHash = await hashId(hostname); 
         const hashedRefId = await hashId(ccHash + link);
+        
+        btnExtract.title = `Extract from ${hostname}`;
+
         const isActive = await invoke<boolean>("check_active_task", { 
             payload: { cc: ccHash, refId: hashedRefId } 
         });
 
         if (isActive === true) {
-            // [NEW] Show spinner if task is already running for this page
-            btnExtract.style.display = "flex";
             btnExtract.classList.add("active-spinner");
             btnExtract.title = "Extraction in progress...";
-            // The global startSpinner() logic will handle the actual frame rotation 
-            // because we added .active-spinner class.
             if (!spinnerInterval) startSpinner(); 
-        } else {
-            btnExtract.style.display = "flex";
-            btnExtract.innerHTML = "⚡";
-            btnExtract.classList.remove("active-spinner");
-            btnExtract.title = `Extract from ${hostname}`;
         }
     } catch (e) { 
-        btnExtract.style.display = "flex"; 
-        btnExtract.innerHTML = "⚡";
+        console.warn("[WIDGET] visibility check error:", e);
     }
 }
 
@@ -286,6 +305,12 @@ listen("browser-match-found", async (event: any) => {
 });
 
 const handleSearchInteraction = () => {
+    // [UI-FIX] If the panel is already expanded, don't refresh the navigation or clear the list.
+    // This prevents annoying UI flickering when the user just wants to type in the search bar.
+    if (isExpanded && currentTab === "list") {
+        return;
+    }
+
     openWidget("list");
     const navOverlay = document.getElementById("nav-categories");
     if (navOverlay) {
@@ -685,7 +710,19 @@ btnExtract?.addEventListener("click", async () => {
 
     btnExtract.style.opacity = "0.5";
     const logArea = document.getElementById("extraction-log");
-    if (logArea) logArea.innerHTML = "";
+    
+    // [UI-RESET] Clear previous task's debris and status messages
+    if (logArea) {
+        logArea.innerHTML = "";
+        logArea.dataset.activeTaskId = ""; // Clear active task tracking
+    }
+    if (detailTitle) detailTitle.innerText = "Task Progress";
+    if (detailContent && logArea) {
+        // Keep only the log area, remove any error/stop messages from previous run
+        detailContent.innerHTML = "";
+        detailContent.appendChild(logArea);
+    }
+
     setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
 
     openWidget("settings");
@@ -1103,6 +1140,45 @@ async function initSession() {
     else { const legacy = localStorage.getItem("device_hash"); if (legacy) currentSession.hash = legacy; }
     if (!currentSession.hash && ethers) { const w = ethers.Wallet.createRandom(); currentSession.hash = w.address.toLowerCase().replace("0x", ""); saveSession(); }
     saveSession(); currentSession.address = currentSession.address || ZERO_ADDRESS; currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS); updateAuthUI(); startPolling();
+
+    // [SUPER-HANDSHAKE] Get all initial data in one go
+    try {
+        console.log("[WIDGET] UI Ready handshake starting...");
+        const data = await invoke<any>("mark_ui_ready");
+        console.log("[WIDGET] Initial data received:", data);
+
+        // 1. Browser & URL Status
+        if (btnAutoLaunch) btnAutoLaunch.style.display = (data.browser_status === "running") ? "none" : "flex";
+        
+        if (data.current_url) {
+            currentDetectedUrl = data.current_url;
+            // Trigger UI update based on the detected URL
+            updateExtractButtonVisibility();
+        }
+
+        // 2. Pre-populate items list (if empty)
+        if (data.items && data.items.length > 0 && cachedDocs.length === 0) {
+            cachedDocs = data.items;
+            renderDocs(data.items);
+            currentPage = 1;
+        }
+
+        // 3. Trigger tree renders background
+        // (renderNavigation will now use cached data if we optimize it further, 
+        // but for now, the DB is warm and ready)
+        renderNavigation();
+
+        // 4. If there are active tasks, start spinner
+        if (data.tasks && data.tasks.length > 0) {
+            const lastTask = data.tasks[data.tasks.length - 1];
+            renderMessage({ 
+                id: lastTask.id, role: "system_task", 
+                content: `Resuming: ${lastTask.id}`, 
+                status: 1, created_at: Date.now() 
+            });
+            startSpinner();
+        }
+    } catch (e) { console.error("[WIDGET] Handshake failed:", e); }
 }
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
