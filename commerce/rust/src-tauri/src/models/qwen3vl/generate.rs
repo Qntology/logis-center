@@ -176,7 +176,7 @@ impl Qwen3VLGenerateModel {
                 handles.push(mmap);
             }
             
-            let vb = VarBuilder::from_mmaped_safetensors(&model_list, dtype, &text_dev)?;
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, &text_dev)? };
             let model = Qwen3VLModel::new(cfg, vb)?;
             ModelVariant::Standard(model)
         };
@@ -582,11 +582,15 @@ impl Qwen3VLGenerateModel {
 
     
 
-        /// [ASSISTANT-MODE] Ingest context using Small (0.6B) model and return KV Cache metadata
+            /// [ASSISTANT-MODE] Ingest context using Small (0.6B) model and return KV Cache metadata
 
-        pub fn prefill_assistant(&mut self, full_input_ids: &[u32], sid: &Option<String>) -> Result<usize> {
+    
 
-            println!("[ASSISTANT] Rapid Ingestion using 0.6B...");
+            pub fn prefill_assistant(&mut self, _full_input_ids: &[u32], _sid: &Option<String>) -> Result<usize> {
+
+    
+
+                println!("[ASSISTANT] Rapid Ingestion using 0.6B...");
 
             // This is essentially the same as the prefill part of generate, but forced for Small variant
 

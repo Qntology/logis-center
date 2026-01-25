@@ -189,25 +189,18 @@ function collapseWidget() {
 const interactiveElements = ['.pill-nav', '#content-panel'];
 
 function setupMousePassthrough() {
+    // [FIX] 기본적으로 위젯은 클릭이 가능해야 합니다. 
+    // 윈도우 크기(380x80)가 이미 작기 때문에 윈도우 밖은 자동으로 클릭이 통과됩니다.
+    invoke('set_ignore_cursor_events', { ignore: false }).catch(console.error);
+
     interactiveElements.forEach(selector => {
         const el = document.querySelector(selector);
         if (el) {
             el.addEventListener('mouseenter', () => {
                 invoke('set_ignore_cursor_events', { ignore: false }).catch(console.error);
             });
-            el.addEventListener('mouseleave', (e: any) => {
-                // Only ignore if we are not moving into another interactive element
-                const relatedTarget = e.relatedTarget as HTMLElement;
-                const isStillInside = interactiveElements.some(s => relatedTarget?.closest(s));
-                if (!isStillInside) {
-                    invoke('set_ignore_cursor_events', { ignore: true }).catch(console.error);
-                }
-            });
         }
     });
-
-    // Initial state: ignore if not hovering
-    invoke('set_ignore_cursor_events', { ignore: true }).catch(console.error);
 }
 
 // Drag Logic

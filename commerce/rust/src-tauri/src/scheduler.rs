@@ -575,7 +575,7 @@ async fn process_task(
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
     };
 
-    let mut page_type = String::new();
+    let page_type;
     let mut selector_info = json!({});
 
     // --- TASK 1: CLASSIFICATION ---
@@ -1718,23 +1718,23 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
         sys.refresh_memory(); // Only refresh memory for speed
         let current_ram = sys.available_memory();
         let mut max_free_vram = 0;
-        let mut best_gpu_id = 0;
-        let mut gpu_count = 0;
+        let mut _best_gpu_id = 0;
+        let mut _gpu_count = 0;
 
         let has_gpu = if let Some(ref nvml_inst) = nvml {
             if let Ok(count) = nvml_inst.device_count() {
-                gpu_count = count;
+                _gpu_count = count;
                 for i in 0..count {
                     if let Ok(dev) = nvml_inst.device_by_index(i) {
                         if let Ok(mem) = dev.memory_info() {
                             if mem.free > max_free_vram {
                                 max_free_vram = mem.free;
-                                best_gpu_id = i;
+                                _best_gpu_id = i;
                             }
                         }
                     }
                 }
-                gpu_count > 0
+                _gpu_count > 0
             } else { false }
         } else { false };
 

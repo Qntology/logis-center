@@ -291,7 +291,7 @@ impl VectorStore {
                     continue;
                 }
             }
-            let table = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await?;
+            let _table = self.conn.create_table(name, RecordBatchIterator::new(vec![], schema.clone())).execute().await?;
         }
         Ok(())
     }
