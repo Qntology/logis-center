@@ -106,19 +106,19 @@ struct QuantizedKV {
 }
 
 pub struct QuantizedQwen3VLTextAttention {
-    q_proj: QLinear,
-    k_proj: QLinear,
-    v_proj: QLinear,
-    o_proj: QLinear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    num_kv_groups: usize,
-    scaling: f64,
-    kv_cache: Option<(Tensor, Tensor)>,
-    layer_idx: usize,
+    pub q_proj: QLinear,
+    pub k_proj: QLinear,
+    pub v_proj: QLinear,
+    pub o_proj: QLinear,
+    pub q_norm: RmsNorm,
+    pub k_norm: RmsNorm,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub num_kv_groups: usize,
+    pub scaling: f64,
+    pub kv_cache: Option<(Tensor, Tensor)>,
+    pub layer_idx: usize,
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -274,28 +274,32 @@ impl QuantizedQwen3VLTextAttention {
         Ok(attn_output)
     }
 
-    fn compress_to_4bit(&self, t: &Tensor, _block_size: usize) -> Result<(Tensor, Tensor, Vec<usize>)> {
+    fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
         let t_f32 = t.to_dtype(DType::F32)?;
         
-        // Calculate scales
-        let scales = t_f32.abs()?.max_keepdim(D::Minus1)?
-            .broadcast_div(&Tensor::new(7.0f32, t.device())?)?;
+        // 1. Calculate scales (intensity) per vector
+        let scales = t_f32.abs()?.mean_keepdim(D::Minus1)?;
         
-        // Quantize to 0-15 range using broadcast ops
-        let q = t_f32.broadcast_div(&scales)?.round()?
-            .broadcast_add(&Tensor::new(8.0f32, t.device())?)?
-            .clamp(0.0, 15.0)?
-            .to_dtype(DType::U8)?;
+        // 2. Quantize to 1-bit: 1 if >= 0, 0 if < 0
+        let zero = Tensor::new(0.0f32, t.device())?;
+        let q = t_f32.broadcast_ge(&zero)?.to_dtype(DType::U8)?;
 
-        // [VRAM-PACKING] Pack two 4-bit values into one U8
-        let dims = q.dims();
-        let last_dim = dims[dims.len() - 1];
+        // [VRAM-1BIT-PACKING] Pack 8 bits into one U8
+        let last_dim = original_shape[original_shape.len() - 1];
         
-        let packed_q = if last_dim % 2 == 0 {
-            let low = q.narrow(D::Minus1, 0, last_dim / 2)?;
-            let high = q.narrow(D::Minus1, last_dim / 2, last_dim / 2)?;
-            low.broadcast_add(&high.broadcast_mul(&Tensor::new(16u8, q.device())?)?)?
+        let packed_q = if last_dim % 8 == 0 {
+            let mut bits = vec![];
+            for i in 0..8 {
+                let chunk = q.narrow(D::Minus1, i * (last_dim / 8), last_dim / 8)?;
+                let shifted = chunk.broadcast_mul(&Tensor::new(1u8 << i, q.device())?)?;
+                bits.push(shifted);
+            }
+            let mut final_packed = bits[0].clone();
+            for i in 1..8 {
+                final_packed = final_packed.broadcast_add(&bits[i])?;
+            }
+            final_packed
         } else {
             q
         };
@@ -303,21 +307,27 @@ impl QuantizedQwen3VLTextAttention {
         Ok((packed_q, scales, original_shape))
     }
 
-    fn decompress_from_4bit(&self, packed: &Tensor, scales: &Tensor, _block_size: usize) -> Result<Tensor> {
+    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, _original_shape: &[usize]) -> Result<Tensor> {
         let device = packed.device();
         
-        // Simulation of Unpacking using arithmetic (Candle lacks native bitwise kernels)
-        // high = packed / 16, low = packed - (high * 16)
-        let sixteen = Tensor::new(16u8, device)?;
-        let high = packed.broadcast_div(&sixteen)?;
-        let low = packed.broadcast_sub(&high.broadcast_mul(&sixteen)?)?;
+        // Unpack 1-bit to F32 (-1.0 or 1.0) using arithmetic simulation
+        let mut bits = vec![];
+        for i in 0..8 {
+            let mask = 1u8 << i;
+            // Unpack bit: (packed / mask) % 2
+            let shifted = packed.broadcast_div(&Tensor::new(mask, device)?)?;
+            let bit_val = shifted.broadcast_div(&Tensor::new(2u8, device)?)?;
+            let bit = shifted.broadcast_sub(&bit_val.broadcast_mul(&Tensor::new(2u8, device)?)?)?
+                .to_dtype(DType::F32)?
+                .broadcast_mul(&Tensor::new(2.0f32, device)?)? // 0,1 -> 0,2
+                .broadcast_sub(&Tensor::new(1.0f32, device)?)?; // 0,2 -> -1,1
+            bits.push(bit);
+        }
         
-        // Concat low and high back into the original dimension
-        let unpacked = Tensor::cat(&[low, high], D::Minus1)?
-            .to_dtype(DType::F32)?
-            .broadcast_sub(&Tensor::new(8.0f32, device)?)?;
+        // Reconstruct the original dimension
+        let unpacked = Tensor::cat(&bits, D::Minus1)?;
             
-        // Apply scales
+        // Restore intensity using scales
         Ok(unpacked.broadcast_mul(scales)?)
     }
 
@@ -369,10 +379,9 @@ impl QuantizedQwen3VLTextAttention {
             let v_cpu = v.to_device(&Device::Cpu)?;
             
             if block_size == 0 {
-                // [DEFAULT-QUANT] Always compress to 4-bit when saving to disk to save space (1/16 size)
-                let bs = 32;
-                let (k_packed, k_scales, k_shape) = self.compress_to_4bit(&k_cpu, bs)?;
-                let (v_packed, v_scales, _) = self.compress_to_4bit(&v_cpu, bs)?;
+                // [ULTRA-LIGHT-QUANT] Always compress to 1-bit when saving to disk (1/16 size)
+                let (k_packed, k_scales, k_shape) = self.compress_to_1bit(&k_cpu)?;
+                let (v_packed, v_scales, _) = self.compress_to_1bit(&v_cpu)?;
                 
                 map.insert("k_packed".to_string(), k_packed);
                 map.insert("v_packed".to_string(), v_packed);
@@ -380,8 +389,7 @@ impl QuantizedQwen3VLTextAttention {
                 map.insert("v_scales".to_string(), v_scales);
                 map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
                 map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-                map.insert("bits".to_string(), Tensor::from_vec(vec![4u32], (1,), &Device::Cpu)?);
-                map.insert("block_size".to_string(), Tensor::from_vec(vec![bs as u32], (1,), &Device::Cpu)?);
+                map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
             } else {
                 map.insert("k_raw".to_string(), k_cpu);
                 map.insert("v_raw".to_string(), v_cpu);
@@ -412,53 +420,54 @@ impl QuantizedQwen3VLTextAttention {
         } else {
             // [RESTORED] Dequantization path
             let block_size = tensors.get("block_size").and_then(|t| t.to_vec1::<u32>().ok()).and_then(|v| v.get(0).cloned()).unwrap_or(1024) as usize;
-            let dequantize_tensor = |prefix: &str, b_depth: u32| -> Result<Tensor> {
-                use rayon::prelude::*;
-                let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("Missing packed"))?.to_vec1::<u8>()?;
-                let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("Missing scales"))?.to_vec1::<f32>()?;
-                let shape_u32 = tensors.get("k_shape").ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
-                let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
-                let total_elements: usize = shape.iter().product();
-                let mut decoded: Vec<f32> = if b_depth == 4 {
-                    let packed_block_size = (block_size + 1) / 2;
-                    // Check if Mode 2 (VRAM Packed) or Mode 1 (Standard Packed)
-                    if mode == 2 {
-                        // VRAM Packed (low | high << 4) - Scales are per-vector [B, H, S, 1]
-                        let vec_len = shape[shape.len() - 1] / 2;
-                        packed.par_chunks(vec_len).enumerate().flat_map(|(v_idx, chunk)| {
-                            let scale = scales[v_idx];
-                            let mut out = Vec::with_capacity(chunk.len() * 2);
-                            for &byte in chunk {
-                                out.push(((byte & 0x0F) as f32 - 8.0) * scale);
-                                out.push(((byte >> 4) as f32 - 8.0) * scale);
+                        let dequantize_tensor = |prefix: &str, b_depth: u32| -> Result<Tensor> {
+                            use rayon::prelude::*;
+                            let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("Missing packed"))?;
+                            let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("Missing scales"))?;
+                            let shape_u32 = tensors.get("k_shape").ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
+                            let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
+            
+                            if b_depth == 1 {
+                                self.decompress_from_1bit(packed, scales, &shape)
+                            } else if b_depth == 4 {
+                                // [LEGACY-4BIT-SUPPORT] Keep existing 4-bit logic if needed
+                                let packed_vec = packed.to_vec1::<u8>()?;
+                                let scales_vec = scales.to_vec1::<f32>()?;
+                                let block_size = 32; 
+                                let packed_block_size = (block_size + 1) / 2;
+                                let total_elements: usize = shape.iter().product();
+                                
+                                let mut decoded: Vec<f32> = if mode == 2 {
+                                    let vec_len = shape[shape.len() - 1] / 2;
+                                    packed_vec.par_chunks(vec_len).enumerate().flat_map(|(v_idx, chunk)| {
+                                        let scale = scales_vec[v_idx];
+                                        let mut out = Vec::with_capacity(chunk.len() * 2);
+                                        for &byte in chunk {
+                                            out.push(((byte & 0x0F) as f32 - 8.0) * scale);
+                                            out.push(((byte >> 4) as f32 - 8.0) * scale);
+                                        }
+                                        out.into_par_iter()
+                                    }).collect()
+                                } else {
+                                    packed_vec.par_chunks(packed_block_size).enumerate().flat_map(|(s_idx, chunk)| {
+                                        let scale = scales_vec[s_idx];
+                                        let mut out = Vec::with_capacity(chunk.len() * 2);
+                                        for &byte in chunk {
+                                            out.push(((byte & 0x0F) as f32 - 8.0) * scale);
+                                            out.push(((byte >> 4) as f32 - 8.0) * scale);
+                                        }
+                                        out.into_par_iter()
+                                    }).collect()
+                                };
+                                decoded.truncate(total_elements);
+                                let t = Tensor::from_vec(decoded, shape, &Device::Cpu)?;
+                                Ok(t.to_device(device)?.to_dtype(target_dtype)?)
+                            } else {
+                                Err(anyhow!("Unsupported bit depth: {}", b_depth))
                             }
-                            out.into_par_iter()
-                        }).collect()
-                    } else {
-                        // Standard Disk Packed
-                        packed.par_chunks(packed_block_size).enumerate().flat_map(|(s_idx, chunk)| {
-                            let scale = scales[s_idx];
-                            let mut out = Vec::with_capacity(chunk.len() * 2);
-                            for &byte in chunk {
-                                out.push(((byte & 0x0F) as f32 - 8.0) * scale);
-                                out.push(((byte >> 4) as f32 - 8.0) * scale);
-                            }
-                            out.into_par_iter()
-                        }).collect()
-                    }
-                } else {
-                    packed.par_chunks(block_size).enumerate().flat_map(|(s_idx, chunk)| {
-                        let scale = scales[s_idx];
-                        chunk.par_iter().map(move |&byte| (byte as i8) as f32 * scale)
-                    }).collect()
-                };
-                decoded.truncate(total_elements);
-                let t = Tensor::from_vec(decoded, shape, &Device::Cpu)?;
-                Ok(t.to_device(device)?.to_dtype(target_dtype)?) 
-            };
-            (dequantize_tensor("k", bits)?, dequantize_tensor("v", bits)?)
-        };
-
+                        };
+                        (dequantize_tensor("k", bits)?, dequantize_tensor("v", bits)?)
+                    };
         // [LINEAR-BRIDGE] Convert 0.6B (1024) cache to 2B (2048) cache
         // h: heads, d: head_dim
         let (_b, h, _s, d) = k.dims4()?;
@@ -511,12 +520,12 @@ impl QuantizedQwen3VLTextAttention {
 }
 
 pub struct QuantizedQwen3VLTextDecoderLayer {
-    self_attn: QuantizedQwen3VLTextAttention,
-    mlp_gate: QLinear,
-    mlp_up: QLinear,
-    mlp_down: QLinear,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    pub self_attn: QuantizedQwen3VLTextAttention,
+    pub mlp_gate: QLinear,
+    pub mlp_up: QLinear,
+    pub mlp_down: QLinear,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 impl QuantizedQwen3VLTextDecoderLayer {
@@ -628,10 +637,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
 pub struct QuantizedQwen3VLTextModel {
     pub embed_tokens: Embedding, 
-    layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
-    norm: RmsNorm,
-    rotary_emb: Qwen3VLTextRotaryEmbedding,
-    mrope_section: Vec<usize>,
+    pub layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
+    pub norm: RmsNorm,
+    pub rotary_emb: Qwen3VLTextRotaryEmbedding,
+    pub mrope_section: Vec<usize>,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -1021,13 +1030,13 @@ impl QuantizedQwen3VLTextModel {
 }
 
 pub struct QuantizedQwen3VLModel {
-    config: Qwen3VLConfig,
-    visual: Qwen3VLVisionModel, 
-    language_model: QuantizedQwen3VLTextModel,
-    lm_head: QLinear,
-    rope_deltas: Option<Tensor>,
-    text_device: Device,
-    vision_device: Device,
+    pub config: Qwen3VLConfig,
+    pub visual: Qwen3VLVisionModel, 
+    pub language_model: QuantizedQwen3VLTextModel,
+    pub lm_head: QLinear,
+    pub rope_deltas: Option<Tensor>,
+    pub text_device: Device,
+    pub vision_device: Device,
 }
 
 impl QuantizedQwen3VLModel {
@@ -1510,6 +1519,9 @@ impl QuantizedQwen3TextModel {
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor]) -> Result<()> {
+        self.language_model.inject_live_kv(k_list, v_list)
+    }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
 }

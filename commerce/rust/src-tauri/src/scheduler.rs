@@ -602,7 +602,7 @@ async fn process_task(
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
     };
 
-    let page_type;
+    let mut page_type = String::new();
     let mut selector_info = json!({});
 
     // --- TASK 1: CLASSIFICATION (DUAL-ENGINE STREAMING) ---
@@ -616,14 +616,23 @@ async fn process_task(
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
         let model = model_lock.as_ref().unwrap();
         
-        // Load 2B (Target) first, then 0.6B (Worker)
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
+        // Load Small (Worker) first to move it to secondary slot, then Master (Large)
         model.ensure_generator(crate::model::ModelSize::Small).await?;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         
         let app_handle_clone = app_handle.clone();
         let chunks_len = classify_chunks.len();
 
         for (i, chunk) in classify_chunks.iter().enumerate() {
+            // [CANCELLATION-CHECK] Check at the start of every chunk
+            if cancellation_token.load(Ordering::Relaxed) {
+                println!("[Scheduler] Cancellation detected during streaming loop.");
+                return Err(anyhow::anyhow!("Task cancelled")); 
+            }
+
             let is_last = i == chunks_len - 1;
             let content = if is_last { format!("{}\n\n{}", chunk, task_specific_prompt) } else { chunk.clone() };
 
@@ -696,13 +705,21 @@ async fn process_task(
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
         let model = model_lock.as_ref().unwrap();
         
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
         model.ensure_generator(crate::model::ModelSize::Small).await?;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         
         let app_handle_clone = app_handle.clone();
         let chunks_len = classify_chunks.len();
 
         for (i, chunk) in classify_chunks.iter().enumerate() {
+            if cancellation_token.load(Ordering::Relaxed) {
+                println!("[Scheduler] Cancellation detected during selectors loop.");
+                return Err(anyhow::anyhow!("Task cancelled")); 
+            }
+
             let is_last = i == chunks_len - 1;
             let content = if is_last { format!("{}\n\n{}", chunk, task_specific_prompt) } else { chunk.clone() };
 

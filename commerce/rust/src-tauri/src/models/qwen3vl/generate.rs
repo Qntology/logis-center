@@ -609,23 +609,27 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn get_current_kv(&self) -> (Vec<candle_core::Tensor>, Vec<candle_core::Tensor>) {
-        let mut ks = vec![];
-        let mut vs = vec![];
+        let mut ks: Vec<candle_core::Tensor> = vec![];
+        let mut vs: Vec<candle_core::Tensor> = vec![];
         
         match &self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => {
                 for layer in &m.language_model.layers {
                     if let Some((k, v)) = &layer.self_attn.kv_cache {
-                        ks.push(k.clone());
-                        vs.push(v.clone());
+                        let k_tensor: candle_core::Tensor = k.clone();
+                        let v_tensor: candle_core::Tensor = v.clone();
+                        ks.push(k_tensor);
+                        vs.push(v_tensor);
                     }
                 }
             },
             ModelVariant::QuantizedText(m) => {
                 for layer in &m.language_model.layers {
                     if let Some((k, v)) = &layer.self_attn.kv_cache {
-                        ks.push(k.clone());
-                        vs.push(v.clone());
+                        let k_tensor: candle_core::Tensor = k.clone();
+                        let v_tensor: candle_core::Tensor = v.clone();
+                        ks.push(k_tensor);
+                        vs.push(v_tensor);
                     }
                 }
             },

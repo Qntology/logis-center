@@ -126,29 +126,19 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 
 use tokio::sync::Mutex as TokioMutex;
 
+#[derive(Debug, PartialEq)]
 pub enum ModelSize {
     Small, // 0.6B for Ingestion
     Large, // 2B-VL for Inference
 }
 
-impl PartialEq for ModelSize {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (ModelSize::Small, ModelSize::Small) => true,
-            (ModelSize::Large, ModelSize::Large) => true,
-            _ => false,
-        }
-    }
-}
-
 pub struct LogisModel {
-    generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
-    // [DUAL-ENGINE] Optional second slot for 0.6B to run alongside 2B
-    small_generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
-    embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
+    pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
+    pub small_generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
+    pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
-    pub dual_mode_enabled: bool, // New flag
+    pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
     small_model_path: String,
@@ -280,8 +270,7 @@ impl LogisModel {
         let small_gguf_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
         let large_gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         
-        // [ULTRA-LIGHT] Use IQ1_S for maximum ingestion speed and minimum VRAM
-        let small_model_path = small_gguf_dir.join("Qwen3-0.6B-UD-IQ1_S.gguf").to_str().unwrap().to_string();
+        let small_model_path = small_gguf_dir.to_str().unwrap().to_string();
         let large_model_path = large_gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
