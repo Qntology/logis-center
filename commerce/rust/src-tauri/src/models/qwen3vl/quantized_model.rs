@@ -660,7 +660,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask)?;
         let xs = residual.add(&xs)?;
         
         let residual = xs.clone();

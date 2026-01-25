@@ -243,7 +243,7 @@ impl Qwen3VLGenerateModel {
 
     /// [FAST-RELAY] Processes a slice of pre-tokenized IDs directly. 
     /// This is the "Zero-Text-Overhead" pipeline.
-    pub fn prefill_only_ids(&mut self, token_ids: &[u32], start_pos: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+    pub fn prefill_only_ids(&mut self, token_ids: &[u32], start_pos: usize, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
         if token_ids.is_empty() { return Ok((vec![], vec![])); }
         
         let chunk_size = token_ids.len();
@@ -281,14 +281,18 @@ impl Qwen3VLGenerateModel {
                 new_vs.push(v.narrow(2, start_pos, len)?);
             } else {
                 // If something weird happened and cache didn't grow, push empty or handle error.
-                // For robustness, we push empty slices or skip? 
-                // Best to push 0-length slices to maintain layer count structure.
                 new_ks.push(k.narrow(2, 0, 0)?);
                 new_vs.push(v.narrow(2, 0, 0)?);
             }
         }
 
         Ok((new_ks, new_vs))
+    }
+
+    pub fn tokenize_params(&mut self, params: &ChatCompletionParameters) -> Result<Vec<u32>> {
+        let mes_render = self.chat_template.apply_chat_template(params)?;
+        let input = self.pre_processor.process_info(params, &mes_render)?;
+        self.tokenizer.text_encode_vec(input.replace_text, true)
     }
 
     pub fn prefill_only_chunk(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, start_pos: usize, chunk_size: usize) -> Result<(Vec<Tensor>, Vec<Tensor>)> {

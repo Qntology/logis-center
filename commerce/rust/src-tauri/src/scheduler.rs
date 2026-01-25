@@ -195,6 +195,25 @@ pub fn mark_ui_ready() {
     println!("[Scheduler] UI signaled ready. Background worker woke up.");
 }
 
+fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
+    println!("[Cleanup] Clearing all temporary data directories...");
+    utils::paths::cleanup_temp_dirs(app_handle);
+}
+
+pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_json::Value) {
+    use std::io::Write;
+    let log_path = crate::utils::paths::get_task_log_file(Some(app), task_id);
+    
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path) 
+    {
+        let line = format!("{}\n", payload.to_string());
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
@@ -605,6 +624,24 @@ async fn process_task(
     let mut page_type = String::new();
     let mut selector_info = json!({});
 
+    // --- TASK 1: CLASSIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
+    {
+        println!("[Scheduler] Starting DUAL-ENGINE RELAY (Classification)");
+        let classify_prompt = parsing::page_type_prompt();
+        
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                        text: format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, classify_prompt) 
+                    })
+                ]),
+                name: None,
+            })],
+            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+            ..Default::default()
+        };
+
         // 1. Prepare BOTH models
         {
             let mut model_lock = model_mutex.lock().await;
@@ -627,9 +664,7 @@ async fn process_task(
             {
                 let mut small_gen = small_gen_mutex.lock().await;
                 if let Some(worker) = small_gen.as_mut() {
-                    let mes_render = worker.chat_template.apply_chat_template(&params)?;
-                    let input = worker.pre_processor.process_info(&params, &mes_render)?;
-                    full_token_ids = worker.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+                    full_token_ids = worker.tokenize_params(&params)?;
                 }
             }
             
@@ -650,7 +685,7 @@ async fn process_task(
                 let kv_chunk = {
                     let mut small_gen = small_gen_mutex.lock().await;
                     if let Some(worker) = small_gen.as_mut() {
-                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()))?;
+                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
                         // worker.clear_kv_cache(); // Prevent Small's memory from bloating
                         Some(res)
                     } else { None }
@@ -690,10 +725,12 @@ async fn process_task(
             let mut model_lock = model_mutex.lock().await;
             model_lock.as_mut().unwrap().unload_generator().await; 
         }
+
         if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
 
-
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+
     wait_for_resources_settled(2500, 1500).await;
 
     // --- TASK 2: SELECTOR IDENTIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
@@ -729,9 +766,7 @@ async fn process_task(
             {
                 let mut small_gen = small_gen_mutex.lock().await;
                 if let Some(worker) = small_gen.as_mut() {
-                    let mes_render = worker.chat_template.apply_chat_template(&params)?;
-                    let input = worker.pre_processor.process_info(&params, &mes_render)?;
-                    full_token_ids = worker.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+                    full_token_ids = worker.tokenize_params(&params)?;
                 }
             }
             
@@ -747,7 +782,7 @@ async fn process_task(
                 let kv_chunk = {
                     let mut small_gen = small_gen_mutex.lock().await;
                     if let Some(worker) = small_gen.as_mut() {
-                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()))?;
+                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
                         // worker.clear_kv_cache();
                         Some(res)
                     } else { None }
@@ -1282,9 +1317,7 @@ async fn process_task(
             {
                 let mut small_gen = small_gen_mutex.lock().await;
                 if let Some(worker) = small_gen.as_mut() {
-                    let mes_render = worker.chat_template.apply_chat_template(&params)?;
-                    let input = worker.pre_processor.process_info(&params, &mes_render)?;
-                    full_token_ids = worker.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+                    full_token_ids = worker.tokenize_params(&params)?;
                 }
             }
             
@@ -1302,7 +1335,7 @@ async fn process_task(
                 let kv_chunk = {
                     let mut small_gen = small_gen_mutex.lock().await;
                     if let Some(worker) = small_gen.as_mut() {
-                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()))?;
+                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
                         // worker.clear_kv_cache();
                         Some(res)
                     } else { None }
@@ -1662,9 +1695,8 @@ async fn process_task(
             println!("[PROCESS] Task {} completed. Model unloaded and locks released.", task.id);
         }
         
-        Ok(())
+        return Ok(());
     }
-}
     
     fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) {
         // [FIX] Only remove the specific directory for this task
@@ -1695,25 +1727,6 @@ fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     }
     println!("[PRE-FETCH] Warm-up complete.");
     Ok(())
-}
-
-pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &serde_json::Value) {
-    use std::io::Write;
-    let log_path = crate::utils::paths::get_task_log_file(Some(app), task_id);
-    
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path) 
-    {
-        let line = format!("{}\n", payload.to_string());
-        let _ = file.write_all(line.as_bytes());
-    }
-}
-
-fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
-    println!("[Cleanup] Clearing all temporary data directories...");
-    utils::paths::cleanup_temp_dirs(app_handle);
 }
 
 async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
@@ -1783,4 +1796,6 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64) {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
+}
+
 
