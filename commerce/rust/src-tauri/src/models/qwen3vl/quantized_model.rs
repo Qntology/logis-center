@@ -95,6 +95,16 @@ impl QLinear {
     }
 }
 
+// [QUANTIZED-KV] Storage for 4-bit compressed KV cache in VRAM
+struct QuantizedKV {
+    k_packed: Tensor, // [B, H, S, D/2]
+    v_packed: Tensor, // [B, H, S, D/2]
+    k_scales: Tensor, // [B, H, S, 1]
+    v_scales: Tensor,
+    original_shape: Vec<usize>,
+    block_size: usize,
+}
+
 pub struct QuantizedQwen3VLTextAttention {
     q_proj: QLinear,
     k_proj: QLinear,
@@ -104,10 +114,11 @@ pub struct QuantizedQwen3VLTextAttention {
     k_norm: RmsNorm,
     num_attention_heads: usize,
     num_key_value_heads: usize,
-    num_kv_groups: usize,
     head_dim: usize,
+    num_kv_groups: usize,
     scaling: f64,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: Option<(Tensor, Tensor)>, // Fallback or temporary
+    qkv_cache: Option<QuantizedKV>,    // [NEW] 4-bit VRAM cache
     layer_idx: usize,
 }
 
@@ -184,6 +195,7 @@ impl QuantizedQwen3VLTextAttention {
             head_dim,
             scaling,
             kv_cache: None,
+            qkv_cache: None,
             layer_idx,
         })
     }
@@ -219,32 +231,37 @@ impl QuantizedQwen3VLTextAttention {
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
         
-        let (key_states, value_states) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                // [STRICT-SYNC] Ensure perfect device and dtype match for concatenation to avoid slow path
-                let prev_k = if prev_k.device().same_device(key_states.device()) && prev_k.dtype() == key_states.dtype() {
-                    prev_k.clone()
-                } else {
-                    prev_k.to_device(key_states.device())?.to_dtype(key_states.dtype())?
-                };
-                let prev_v = if prev_v.device().same_device(value_states.device()) && prev_v.dtype() == value_states.dtype() {
-                    prev_v.clone()
-                } else {
-                    prev_v.to_device(value_states.device())?.to_dtype(value_states.dtype())?
-                };
-                
-                let k = Tensor::cat(&[&prev_k, &key_states], 2)?;
-                let v = Tensor::cat(&[&prev_v, &value_states], 2)?;
-                (k, v)
-            }
+        // [QUANTIZED-KV-LOAD] Unpack VRAM cache if exists
+        let (key_states, value_states) = if let Some(qkv) = &self.qkv_cache {
+            let k_unpacked = self.decompress_from_4bit(&qkv.k_packed, &qkv.k_scales, qkv.block_size)?;
+            let v_unpacked = self.decompress_from_4bit(&qkv.v_packed, &qkv.v_scales, qkv.block_size)?;
+            
+            // [STRICT-SYNC] Ensure perfect device and dtype match
+            let k_unpacked = k_unpacked.to_device(key_states.device())?.to_dtype(key_states.dtype())?;
+            let v_unpacked = v_unpacked.to_device(value_states.device())?.to_dtype(value_states.dtype())?;
+            
+            let k = Tensor::cat(&[&k_unpacked, &key_states], 2)?;
+            let v = Tensor::cat(&[&v_unpacked, &value_states], 2)?;
+            (k, v)
+        } else if let Some((prev_k, prev_v)) = &self.kv_cache {
+            let prev_k = prev_k.to_device(key_states.device())?.to_dtype(key_states.dtype())?;
+            let prev_v = prev_v.to_device(value_states.device())?.to_dtype(value_states.dtype())?;
+            let k = Tensor::cat(&[&prev_k, &key_states], 2)?;
+            let v = Tensor::cat(&[&prev_v, &value_states], 2)?;
+            (k, v)
+        } else {
+            (key_states, value_states)
         };
 
-        // Robust Masking: Slice mask to fit actual key length if mask is too long
+        // [ROBUST-MASK-FIX] Ensure mask covers the entire KV cache length.
+        // If mask is narrow (e.g. [Q, Q]) but scores are wide ([Q, K]), pad left with 0s.
         let actual_seq_len = key_states.dim(2)?;
         let adjusted_mask = if let Some(mask) = attention_mask {
             let mask_len = mask.dim(D::Minus1)?;
-            if mask_len > actual_seq_len {
+            if mask_len < actual_seq_len {
+                let padding = Tensor::zeros((b_sz, 1, q_len, actual_seq_len - mask_len), mask.dtype(), mask.device())?;
+                Some(Tensor::cat(&[padding, mask.clone()], D::Minus1)?)
+            } else if mask_len > actual_seq_len {
                 Some(mask.narrow(D::Minus1, 0, actual_seq_len)?)
             } else {
                 Some(mask.clone())
@@ -262,8 +279,17 @@ impl QuantizedQwen3VLTextAttention {
             self.scaling,
         )?;
 
-        // Update KV cache
-        self.kv_cache = Some((key_states, value_states));
+        // [QUANTIZED-KV-SAVE] Update VRAM cache with 4-bit compression
+        {
+            let block_size = 32; 
+            let (k_packed, k_scales, k_shape) = self.compress_to_4bit(&key_states, block_size)?;
+            let (v_packed, v_scales, _) = self.compress_to_4bit(&value_states, block_size)?;
+            self.qkv_cache = Some(QuantizedKV {
+                k_packed, v_packed, k_scales, v_scales, original_shape: k_shape, block_size
+            });
+            // Clear raw cache to save memory
+            self.kv_cache = None;
+        }
 
         let attn_output =
             attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
@@ -271,71 +297,87 @@ impl QuantizedQwen3VLTextAttention {
         Ok(attn_output)
     }
 
+    fn compress_to_4bit(&self, t: &Tensor, _block_size: usize) -> Result<(Tensor, Tensor, Vec<usize>)> {
+        let original_shape = t.shape().dims().to_vec();
+        let t_f32 = t.to_dtype(DType::F32)?;
+        
+        // Calculate scales
+        let scales = t_f32.abs()?.max_keepdim(D::Minus1)?
+            .broadcast_div(&Tensor::new(7.0f32, t.device())?)?;
+        
+        // Quantize to 0-15 range using broadcast ops
+        let q = t_f32.broadcast_div(&scales)?.round()?
+            .broadcast_add(&Tensor::new(8.0f32, t.device())?)?
+            .clamp(0.0, 15.0)?
+            .to_dtype(DType::U8)?;
+
+        // [VRAM-PACKING] Pack two 4-bit values into one U8
+        let dims = q.dims();
+        let last_dim = dims[dims.len() - 1];
+        
+        let packed_q = if last_dim % 2 == 0 {
+            let low = q.narrow(D::Minus1, 0, last_dim / 2)?;
+            let high = q.narrow(D::Minus1, last_dim / 2, last_dim / 2)?;
+            low.broadcast_add(&high.broadcast_mul(&Tensor::new(16u8, q.device())?)?)?
+        } else {
+            q
+        };
+            
+        Ok((packed_q, scales, original_shape))
+    }
+
+    fn decompress_from_4bit(&self, packed: &Tensor, scales: &Tensor, _block_size: usize) -> Result<Tensor> {
+        let device = packed.device();
+        
+        // Simulation of Unpacking using arithmetic (Candle lacks native bitwise kernels)
+        // high = packed / 16, low = packed - (high * 16)
+        let sixteen = Tensor::new(16u8, device)?;
+        let high = packed.broadcast_div(&sixteen)?;
+        let low = packed.broadcast_sub(&high.broadcast_mul(&sixteen)?)?;
+        
+        // Concat low and high back into the original dimension
+        let unpacked = Tensor::cat(&[low, high], D::Minus1)?
+            .to_dtype(DType::F32)?
+            .broadcast_sub(&Tensor::new(8.0f32, device)?)?;
+            
+        // Apply scales
+        Ok(unpacked.broadcast_mul(scales)?)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-        if let Some((k, v)) = &self.kv_cache {
-            let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-            
-            // [PARALLEL-TRANSFER] Move K and V to CPU in parallel tasks if possible,
-            // but for simplicity and safety, we ensure they are handled within rayon context.
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
+        let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+        let mut map = HashMap::new();
+
+        // 1. Prefer Quantized KV Cache (VRAM Efficiency)
+        if let Some(qkv) = &self.qkv_cache {
+            map.insert("k_packed".to_string(), qkv.k_packed.to_device(&Device::Cpu)?);
+            map.insert("v_packed".to_string(), qkv.v_packed.to_device(&Device::Cpu)?);
+            map.insert("k_scales".to_string(), qkv.k_scales.to_device(&Device::Cpu)?);
+            map.insert("v_scales".to_string(), qkv.v_scales.to_device(&Device::Cpu)?);
+            map.insert("block_size".to_string(), Tensor::from_vec(vec![qkv.block_size as u32], (1,), &Device::Cpu)?);
+            map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); // Mode 2 = VRAM Pre-quantized
+            map.insert("bits".to_string(), Tensor::from_vec(vec![4u32], (1,), &Device::Cpu)?);
+        }
+        // 2. Fallback to Raw KV Cache
+        else if let Some((k, v)) = &self.kv_cache {
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
+            // ... (기존 raw 저장 로직은 생략하거나 유지)
+            map.insert("k_raw".to_string(), k_cpu);
+            map.insert("v_raw".to_string(), v_cpu);
+            map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
+        } else {
+            return Ok(());
+        }
 
-            let mut map = HashMap::new();
-            let bits = 4u32; 
-            map.insert("bits".to_string(), Tensor::from_vec(vec![bits], (1,), &Device::Cpu)?);
-
-            if block_size == 0 {
-                map.insert("k_raw".to_string(), k_cpu);
-                map.insert("v_raw".to_string(), v_cpu);
-                map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
-            } else {
-                map.insert("mode".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
-                
-                // Helper for parallel quantization
-                let quantize_and_store = |t: &Tensor, prefix: &str, target_map: &mut HashMap<String, Tensor>| -> Result<()> {
-                    let shape = t.shape().dims().to_vec();
-                    let t_flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-                    let num_blocks = (t_flat.len() + block_size - 1) / block_size;
-                    
-                    use rayon::prelude::*;
-                    let (scales, quantized_data): (Vec<f32>, Vec<Vec<u8>>) = t_flat.par_chunks(block_size)
-                        .map(|chunk| {
-                            let max_val = chunk.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                            let scale = max_val / 7.0;
-                            let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
-                            let mut qs = Vec::with_capacity(chunk.len());
-                            for &val in chunk {
-                                let q = ((val * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
-                                qs.push(q);
-                            }
-                            let mut packed = Vec::with_capacity((qs.len() + 1) / 2);
-                            for i in (0..qs.len()).step_by(2) {
-                                let low = qs[i];
-                                let high = if i + 1 < qs.len() { qs[i+1] } else { 0 };
-                                packed.push((high << 4) | (low & 0x0F));
-                            }
-                            (scale, packed)
-                        }).unzip();
-
-                    let flat_data: Vec<u8> = quantized_data.into_iter().flatten().collect();
-                    let flat_len = flat_data.len();
-                    target_map.insert(format!("{}_packed", prefix), Tensor::from_vec(flat_data, (flat_len,), &Device::Cpu)?);
-                    target_map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, (num_blocks,), &Device::Cpu)?);
-                    target_map.insert(format!("{}_shape", prefix), Tensor::from_vec(shape.iter().map(|&x| x as u32).collect(), (shape.len(),), &Device::Cpu)?);
-                    Ok(())
-                };
-
-                quantize_and_store(&k_cpu, "k", &mut map)?;
-                quantize_and_store(&v_cpu, "v", &mut map)?;
-                map.insert("block_size".to_string(), Tensor::from_vec(vec![block_size as u32], (1,), &Device::Cpu)?);
-            }
-
-            candle_core::safetensors::save(&map, &file)?;
-            if clear { self.kv_cache = None; }
+        candle_core::safetensors::save(&map, &file)?;
+        if clear { 
+            self.kv_cache = None;
+            self.qkv_cache = None;
         }
         Ok(())
     }
@@ -365,15 +407,31 @@ impl QuantizedQwen3VLTextAttention {
                 let total_elements: usize = shape.iter().product();
                 let mut decoded: Vec<f32> = if b_depth == 4 {
                     let packed_block_size = (block_size + 1) / 2;
-                    packed.par_chunks(packed_block_size).enumerate().flat_map(|(s_idx, chunk)| {
-                        let scale = scales[s_idx];
-                        let mut out = Vec::with_capacity(chunk.len() * 2);
-                        for &byte in chunk {
-                            out.push(((byte & 0x0F) as f32 - 8.0) * scale);
-                            out.push(((byte >> 4) as f32 - 8.0) * scale);
-                        }
-                        out.into_par_iter()
-                    }).collect()
+                    // Check if Mode 2 (VRAM Packed) or Mode 1 (Standard Packed)
+                    if mode == 2 {
+                        // VRAM Packed (low | high << 4) - Scales are per-vector [B, H, S, 1]
+                        let vec_len = shape[shape.len() - 1] / 2;
+                        packed.par_chunks(vec_len).enumerate().flat_map(|(v_idx, chunk)| {
+                            let scale = scales[v_idx];
+                            let mut out = Vec::with_capacity(chunk.len() * 2);
+                            for &byte in chunk {
+                                out.push(((byte & 0x0F) as f32 - 8.0) * scale);
+                                out.push(((byte >> 4) as f32 - 8.0) * scale);
+                            }
+                            out.into_par_iter()
+                        }).collect()
+                    } else {
+                        // Standard Disk Packed
+                        packed.par_chunks(packed_block_size).enumerate().flat_map(|(s_idx, chunk)| {
+                            let scale = scales[s_idx];
+                            let mut out = Vec::with_capacity(chunk.len() * 2);
+                            for &byte in chunk {
+                                out.push(((byte & 0x0F) as f32 - 8.0) * scale);
+                                out.push(((byte >> 4) as f32 - 8.0) * scale);
+                            }
+                            out.into_par_iter()
+                        }).collect()
+                    }
                 } else {
                     packed.par_chunks(block_size).enumerate().flat_map(|(s_idx, chunk)| {
                         let scale = scales[s_idx];

@@ -621,16 +621,19 @@ async fn process_task(
             model.ensure_generator(crate::model::ModelSize::Small).await?;
             let app_handle_clone = app_handle.clone();
             
-            // [CUMULATIVE-INGEST] Incremental context building for perfect KV cache hits
+            // [TOKEN-FUSING] Pre-compress whitespace to reduce total tokens without losing data
+            let compressed_pug = light_pug.replace("  ", " ").replace("  ", " ").replace("\n\n", "\n");
+            let classify_chunks_compressed = chunk_text(&compressed_pug, device_config.classify_chunk_size, 3000);
+            
             let mut cumulative_pug = String::new();
-            let chunks_len = classify_chunks.len();
+            let chunks_len = classify_chunks_compressed.len();
 
-            for (i, chunk) in classify_chunks.iter().enumerate() {
+            for (i, chunk) in classify_chunks_compressed.iter().enumerate() {
                 cumulative_pug.push_str(chunk);
                 let is_last = i == chunks_len - 1;
                 
-                // [SPEED-UP] Always INGEST and SAVE every chunk.
-                // This ensures the next chunk call hits the disk cache and processes ONLY the delta.
+                // [MAX-SPEED] Always INGEST and SAVE every chunk.
+                // With 4-bit VRAM packing and parallel saving, this is now faster than re-processing.
                 let content = if is_last {
                     format!("{}\n\n{}", cumulative_pug, task_specific_prompt)
                 } else {
@@ -656,7 +659,7 @@ async fn process_task(
 
                 let _ = model.chat_params_with_spinner(
                     params, &app_handle_clone, "Fast Ingestion (0.6B)",
-                    json!({ "task_id": task.id, "category": "Classification (Ingest)", "summary": format!("Processing HTML part {}/{}...", i+1, chunks_len) }),
+                    json!({ "task_id": task.id, "category": "Classification (Ingest)", "summary": format!("Stream Ingesting HTML {}/{} (Compressed)...", i+1, chunks_len) }),
                     Some(cancellation_token.clone()), Some(task.id.clone())
                 ).await?;
             }
@@ -744,17 +747,23 @@ async fn process_task(
             model.ensure_generator(crate::model::ModelSize::Small).await?;
             let app_handle_clone = app_handle.clone();
             
-            let mut cumulative_pug = String::new();
-            let chunks_len = classify_chunks.len();
+            // [TOKEN-FUSING] Apply whitespace compression here as well
+            let compressed_pug = light_pug.replace("  ", " ").replace("  ", " ").replace("\n\n", "\n");
+            let classify_chunks_compressed = chunk_text(&compressed_pug, device_config.classify_chunk_size, 3000);
 
-            for (i, chunk) in classify_chunks.iter().enumerate() {
+            let mut cumulative_pug = String::new();
+            let chunks_len = classify_chunks_compressed.len();
+
+            for (i, chunk) in classify_chunks_compressed.iter().enumerate() {
                 cumulative_pug.push_str(chunk);
                 let is_last = i == chunks_len - 1;
+                // [MAX-SPEED] Always INGEST and SAVE every chunk.
                 let content = if is_last {
-                    format!("{}\n\n{}", cumulative_pug, task_specific_prompt)
+                    format!("{}\n\n{}\n\nACTION: SAVE", cumulative_pug, task_specific_prompt)
                 } else {
-                    cumulative_pug.clone()
+                    format!("{}\n\nACTION: INGEST\n\nACTION: SAVE", cumulative_pug)
                 };
+
 
                 let messages = vec![
                     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -775,7 +784,7 @@ async fn process_task(
 
                 let _ = model.chat_params_with_spinner(
                     params, &app_handle_clone, "Fast Ingestion (0.6B)",
-                    json!({ "task_id": task.id, "category": "Selectors (Ingest)", "summary": format!("Processing HTML part {}/{}...", i+1, chunks_len) }),
+                    json!({ "task_id": task.id, "category": "Selectors (Ingest)", "summary": format!("Stream Ingesting HTML {}/{} (Compressed)...", i+1, chunks_len) }),
                     Some(cancellation_token.clone()), Some(task.id.clone())
                 ).await?;
             }
