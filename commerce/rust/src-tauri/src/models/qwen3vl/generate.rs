@@ -249,21 +249,24 @@ impl Qwen3VLGenerateModel {
 
         let seqlen_offset = self.get_kv_len();
         let mut current_pos = seqlen_offset;
-        // [SMOOTH-RELAY] Reduce chunk size to 128 for more frequent updates and lower peak CPU/VRAM pressure
-        let prefill_chunk_size = 128; 
+        // [STABILITY-FIX] 512 is the sweet spot for CPU. 10k at once causes N^2 RAM explosion.
+        let prefill_chunk_size = 512; 
 
-        println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);
+        println!("[PREFILL] Starting optimized relay: 0/{} tokens (0%)", total_tokens);
 
         while current_pos < total_tokens {
+            let now = std::time::Instant::now();
             let remaining = total_tokens - current_pos;
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             
-            // [CRITICAL] Leave at least 1 token for the generate() call
+            // [MAX-SPEED-RELAY] Leave only the absolute minimum (1 token) for 2B. 
+            // 0.6B handles everything else.
             if current_pos + chunk_size >= total_tokens { 
                 chunk_size = (total_tokens - current_pos).saturating_sub(1); 
             }
             if chunk_size == 0 { break; }
 
+            // Step 1: Tensor Prep
             let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
             let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
@@ -272,24 +275,28 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
             }
 
+            // Step 2: Forward Pass (No Sleep for maximum performance)
             match &mut self.qwen3_vl {
                 ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
             };
+            let forward_time = now.elapsed().as_millis();
             
-            // [STREAMING-RELAY] Immediately push to 2B and clear local RAM
+            // Step 3: Relay
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
                 target.inject_kv(&ks, &vs)?;
-                self.clear_kv_cache(); // Empty the 0.6B cup into the 2B cup
+                self.clear_kv_cache(); 
             }
+            let total_time = now.elapsed().as_millis();
 
             current_pos += chunk_size;
             
-            // [AGGRESSIVE-LOGGING] Log every chunk for real-time feedback
+            // [DETAILED-LOGGING] Log progress with time metrics
             let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
-            println!("[RELAY] Pushed {}/{} tokens to 2B ({:.1}%)", current_pos, total_tokens, progress);
+            println!("[RELAY] Pushed {}/{} tokens ({:.1}%) | Forward: {}ms | Total: {}ms", 
+                current_pos, total_tokens, progress, forward_time, total_time);
         }
 
         // Save progress if session_id is provided (for CPU sequential mode)
@@ -376,9 +383,8 @@ impl Qwen3VLGenerateModel {
 
                                      if match_len > 50 {
                                          println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
-                                         // [ZERO-REFILL] 2B inherits 0.6B cache perfectly via Linear Bridge. No need to re-read.
-                                         // [UPSCALE-REFILL] Let 2B re-refine the last 64 tokens for better quality.
-                                         let refill_len = 64;
+                                         // [EXTREME-SPEED] Minimum 1 token refill.
+                                         let refill_len = 1;
                                          if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
                                              seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                              loaded = true;
@@ -404,8 +410,8 @@ impl Qwen3VLGenerateModel {
                                      if match_len > 50 {
                                          println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
                                          // [ZERO-REFILL] Skip redundant re-processing
-                                         // [UPSCALE-REFILL] Let 2B re-refine the last 64 tokens for better quality.
-                                         let refill_len = 64;
+                                         // [EXTREME-SPEED] Minimum 1 token refill.
+                                         let refill_len = 1;
                                          if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
                                              seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                              loaded = true;
@@ -422,17 +428,13 @@ impl Qwen3VLGenerateModel {
         }
         
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
-        let mut current_pos = seqlen_offset;
+        let current_pos = seqlen_offset;
         let prefill_chunk_size = 256; // Lowered to 256 to minimize 'cat' peak VRAM spikes
         let newline_token_id = 198; // Fallback for '\n'
 
         while current_pos < total_tokens {
+            let now = std::time::Instant::now();
             let remaining = total_tokens - current_pos;
-            
-            // If this is the very last token, we let the generation loop handle it
-            if remaining == 1 && current_pos < total_tokens { break; }
-
-            // Determine chunk size (256 or remaining)
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             
             // If not the final chunk of the whole input, try to align to newline for stability
@@ -463,9 +465,9 @@ impl Qwen3VLGenerateModel {
 
             // [CANCELLATION-CHECK] Check if user clicked stop between chunks
             if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) {
-                    println!("[GENERATE] Generation cancelled during prefill.");
-                    return Err(anyhow!("Generation cancelled during prefill"));
+                if flag.load(Ordering::Relaxed) { 
+                    println!("[GENERATE] Prefill Stop Requested.");
+                    return Err(anyhow!("Generation cancelled during prefill")); 
                 }
             }
 
@@ -475,10 +477,10 @@ impl Qwen3VLGenerateModel {
                 ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
             };
             
-            // [SPEED-UP] Drastically reduced delay to speed up prefilling
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Allow other tasks (like the Stop command) to run on the executor
+            std::thread::yield_now(); 
             
-            current_pos += chunk_size;
+            let _ = now.elapsed().as_millis();
         }
 
         // Finalize state for generation loop
@@ -539,6 +541,7 @@ impl Qwen3VLGenerateModel {
             for _i in 0..sample_len {
                 if let Some(flag) = &cancel_flag {
                     if flag.load(Ordering::Relaxed) {
+                        println!("[GENERATE] Stop Requested during sampling.");
                         return Err(anyhow!("Generation cancelled"));
                     }
                 }

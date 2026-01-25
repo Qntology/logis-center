@@ -1174,127 +1174,57 @@ async fn process_task(
                         let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                         let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
                 
-                                // [HYBRID] Detail Extraction (REAL-TIME RELAY MODE)
-                
-                                let mut extracted_data_temp = json!({});
-                
-                                let extraction_instruction = parsing::item2json(page_type, &url, language);
-                
-                                let detail_session_id = format!("{}_detail", task.id); 
-                
-                        
-                
-                                // 1. Prepare Unified Parameters for Detail
-                
-                                let params = ChatCompletionParameters {
-                
-                                    messages: vec![
-                
-                                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                
-                                            content: extraction_instruction.clone(),
-                
-                                            name: None,
-                
-                                        }),
-                
-                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                
-                                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                
-                                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                
-                                                    text: format!("{}\n\nTASK: JSON ONLY\n\nACTION: SAVE", content_pug) 
-                
-                                                })
-                
-                                            ]),
-                
-                                            name: None,
-                
-                                        })
-                
-                                    ],
-                
-                                    model: "qwen3vl".to_string(), max_tokens: Some(8192), temperature: Some(0.1),
-                
-                                    ..Default::default()
-                
-                                };
-                
-                        
-                
-                                        // 2. Real-time Stream from 0.6B to 2B
-                
-                        
-                
-                                        {
-                
-                        
-                
-                                            let mut model_lock = model_mutex.lock().await;
-                
-                        
-                
-                                            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-                
-                        
-                
-                                            let model = model_lock.as_ref().unwrap();
-                
-                        
-                
-                                
-                
-                        
-                
-                                            // [FIX] Correct Order: Load Small FIRST, then Large
-                
-                        
-                
-                                            model.ensure_generator(crate::model::ModelSize::Small).await?;
-                
-                        
-                
-                                            model.ensure_generator(crate::model::ModelSize::Large).await?;
-                
-                        
-                
-                                
-                
-                        
-                
-                                            {
-                
-                                        let mut large_gen_lock = model.generator.lock().await;
-                
-                                        let mut small_gen_lock = model.small_generator.lock().await;
-                
-                                        if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                
-                                            println!("[Scheduler] Detail Ingestion (Relay) Started...");
-                
-                                            let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(detail_session_id.clone()), Some(target))?;
-                
-                                        }
-                
-                                    }
-                
-                                    model.unload_generator().await; // Unload Small
-                
-                                }
-                
-                                
-                
-                                wait_for_resources_settled(2500, 1500).await;
-                
-                        
-                
+        // [HYBRID] Detail Extraction (REAL-TIME RELAY MODE)
+        let extraction_instruction = parsing::item2json(page_type, &url, language);
+        let detail_session_id = format!("{}_detail", task.id); 
+
+        // 1. Prepare Unified Parameters for Detail
+        let params = ChatCompletionParameters {
+            messages: vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: extraction_instruction.clone(),
+                    name: None,
+                }),
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                            text: format!("{}\n\nTASK: JSON ONLY\n\nACTION: SAVE", content_pug) 
+                        })
+                    ]),
+                    name: None,
+                })
+            ],
+            model: "qwen3vl".to_string(), max_tokens: Some(8192), temperature: Some(0.1),
+            ..Default::default()
+        };
+
+        // 2. Real-time Stream from 0.6B to 2B
+        {
+            let mut model_lock = model_mutex.lock().await;
+            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+            let model = model_lock.as_ref().unwrap();
+
+            model.ensure_generator(crate::model::ModelSize::Small).await?;
+            model.ensure_generator(crate::model::ModelSize::Large).await?;
+
+            {
+                let mut large_gen_lock = model.generator.lock().await;
+                let mut small_gen_lock = model.small_generator.lock().await;
+                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                    println!("[Scheduler] Detail Ingestion (Relay) Started...");
+                    let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(detail_session_id.clone()), Some(target))?;
+                }
+            }
+            model.unload_generator().await; // Unload Small
+        }
+        
+        wait_for_resources_settled(2500, 1500).await;
+
         // 3. Precise Infer with 2B (Immediate)
         let response = {
             let mut model_lock = model_mutex.lock().await;
             if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-            let model = model_lock.as_ref().unwrap();
+            let _model = model_lock.as_ref().unwrap();
             
             let res = if let Some(model_instance) = model_lock.as_ref() {
                 model_instance.ensure_generator(crate::model::ModelSize::Large).await?;
@@ -1313,7 +1243,9 @@ async fn process_task(
             println!("[EXTRACT-FINAL] Result: {}", response);
             extracted_data = parsing::parse_json_from_llm(&response);
         }
-    }    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    }
+
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     if let Some(obj) = extracted_data.as_object_mut() {
         if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }

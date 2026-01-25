@@ -222,13 +222,20 @@ impl LogisModel {
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
             let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
             
-            // [STRATEGY] Force 0.6B to CPU if GPU exists to save VRAM for 2B
+            // [STRATEGY] Strict VRAM Management for 4GB Cards
+            // Force 0.6B to CPU always to reserve 100% of VRAM for 2B-VL's vision encoder and large context.
             let target_device = if size == ModelSize::Small && self.device_config.device.is_cuda() {
-                println!("[MODEL-CONFIG] Offloading 0.6B to CPU to reserve VRAM for 2B.");
+                println!("[MODEL-CONFIG] Offloading 0.6B to CPU to save VRAM for 2B-VL.");
                 Device::Cpu
             } else {
                 if self.device_config.device.is_cuda() {
-                    println!("[MODEL-CONFIG] Loading {:?} directly into GPU VRAM.", size);
+                    let mut free_vram = 0;
+                    if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                        if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                            if let Ok(mem) = dev.memory_info() { free_vram = mem.free; }
+                        }
+                    }
+                    println!("[MODEL-CONFIG] Loading {:?} directly into GPU VRAM (Free: {:.2} GB).", size, free_vram as f64 / 1e9);
                 }
                 self.device_config.device.clone()
             };
@@ -240,6 +247,13 @@ impl LogisModel {
             let shared_path_clone = shared_path.map(|s| s.to_string());
 
             let gen = tokio::task::spawn_blocking(move || {
+                // [TURBO-THREADS] Force high performance for 0.6B worker
+                if path_clone.contains("0.6B") {
+                    let total_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                    println!("[TURBO] Forcing 0.6B to use {} threads for ingestion.", total_cores);
+                    let _ = rayon::ThreadPoolBuilder::new().num_threads(total_cores).build_global();
+                }
+
                 Qwen3VLGenerateModel::init_with_config(
                     &path_clone, 
                     shared_path_clone.as_deref(), 

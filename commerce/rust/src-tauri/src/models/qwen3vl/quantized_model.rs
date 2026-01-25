@@ -241,6 +241,15 @@ impl QuantizedQwen3VLTextAttention {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
+        
+        // [GHOST-ENGINE-03] Single-Head Attention
+        // For 0.6B worker, only compute 1 head for the ultimate speed boost.
+        let (actual_heads, is_pruned) = if self.num_attention_heads == 16 {
+            (1, true) 
+        } else {
+            (self.num_attention_heads, false)
+        };
+
         let query_states = self.q_proj.forward(xs)?.reshape((
             b_sz,
             q_len,
@@ -260,6 +269,18 @@ impl QuantizedQwen3VLTextAttention {
         let value_states = value_states
             .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?;
+
+        // Apply pruning by narrowing the head dimension if enabled
+        let (query_states, key_states, value_states) = if is_pruned {
+            (
+                query_states.narrow(1, 0, actual_heads)?,
+                key_states.narrow(1, 0, (actual_heads / self.num_kv_groups).max(1))?,
+                value_states.narrow(1, 0, (actual_heads / self.num_kv_groups).max(1))?
+            )
+        } else {
+            (query_states, key_states, value_states)
+        };
+
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
         
@@ -294,14 +315,22 @@ impl QuantizedQwen3VLTextAttention {
             None
         };
 
+        let current_kv_groups = if is_pruned { 1 } else { self.num_kv_groups };
+
         let attn_output = eager_attention_forward(
             &query_states,
             &key_states,
             &value_states,
-            Some(self.num_kv_groups),
+            Some(current_kv_groups),
             adjusted_mask.as_ref(),
             self.scaling,
         )?;
+
+        let mut attn_output = attn_output;
+        if is_pruned {
+            // If pruned, pad the attention output back to original size to match o_proj expectation
+            attn_output = attn_output.pad_with_zeros(D::Minus1, 0, (self.num_attention_heads - actual_heads) * self.head_dim)?;
+        }
 
         let attn_output =
             attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
@@ -312,54 +341,51 @@ impl QuantizedQwen3VLTextAttention {
     fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
         
-        // 1. Move to CPU and handle as f32 without redundant deep clones if possible
         let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let t_data = t_f32.to_vec1::<f32>()?; // Standard candle access
+        let t_data = t_f32.to_vec1::<f32>()?;
         
         let last_dim = original_shape[original_shape.len() - 1];
         let total_elements = t_data.len();
-        let num_vectors = total_elements / last_dim;
         
-        let mut scales = vec![0.0f32; num_vectors];
+        // [COARSE-QUANT] Use massive 10240 block size to minimize scale overhead
+        let q_block_size = 10240;
+        let num_scales = (total_elements + q_block_size - 1) / q_block_size;
+        
+        let mut scales = vec![0.0f32; num_scales];
         let mut packed = vec![0u8; total_elements / 8];
         
         use rayon::prelude::*;
-        // [FUSED-KERNEL] Calculate scale and pack bits in a single pass using zip for safe parallel mutation
-        packed.par_chunks_mut(last_dim / 8).zip(scales.par_iter_mut()).enumerate().for_each(|(v_idx, (packed_vector, scale))| {
+        // 1. Parallel Coarse Scale Calculation
+        scales.par_iter_mut().enumerate().for_each(|(s_idx, s)| {
+            let start = s_idx * q_block_size;
+            let end = (start + q_block_size).min(total_elements);
+            let chunk = &t_data[start..end];
+            let mut sum_abs = 0.0f32;
+            for &val in chunk { sum_abs += val.abs(); }
+            *s = sum_abs / (end - start) as f32;
+        });
+
+        // 2. Parallel Bit Packing
+        packed.par_chunks_mut(last_dim / 8).enumerate().for_each(|(v_idx, packed_vector)| {
             let t_start = v_idx * last_dim;
             let t_vector = &t_data[t_start..t_start + last_dim];
-            
-            let mut sum_abs = 0.0f32;
             for i in 0..(last_dim / 8) {
                 let chunk = &t_vector[i * 8..i * 8 + 8];
                 let mut byte = 0u8;
-                
-                // Branchless packing + fused absolute sum for scale
-                let b0 = chunk[0] >= 0.0; sum_abs += chunk[0].abs();
-                let b1 = chunk[1] >= 0.0; sum_abs += chunk[1].abs();
-                let b2 = chunk[2] >= 0.0; sum_abs += chunk[2].abs();
-                let b3 = chunk[3] >= 0.0; sum_abs += chunk[3].abs();
-                let b4 = chunk[4] >= 0.0; sum_abs += chunk[4].abs();
-                let b5 = chunk[5] >= 0.0; sum_abs += chunk[5].abs();
-                let b6 = chunk[6] >= 0.0; sum_abs += chunk[6].abs();
-                let b7 = chunk[7] >= 0.0; sum_abs += chunk[7].abs();
-                
-                byte |= (b0 as u8) << 0;
-                byte |= (b1 as u8) << 1;
-                byte |= (b2 as u8) << 2;
-                byte |= (b3 as u8) << 3;
-                byte |= (b4 as u8) << 4;
-                byte |= (b5 as u8) << 5;
-                byte |= (b6 as u8) << 6;
-                byte |= (b7 as u8) << 7;
-                
+                byte |= ((chunk[0] >= 0.0) as u8) << 0;
+                byte |= ((chunk[1] >= 0.0) as u8) << 1;
+                byte |= ((chunk[2] >= 0.0) as u8) << 2;
+                byte |= ((chunk[3] >= 0.0) as u8) << 3;
+                byte |= ((chunk[4] >= 0.0) as u8) << 4;
+                byte |= ((chunk[5] >= 0.0) as u8) << 5;
+                byte |= ((chunk[6] >= 0.0) as u8) << 6;
+                byte |= ((chunk[7] >= 0.0) as u8) << 7;
                 packed_vector[i] = byte;
             }
-            *scale = sum_abs / last_dim as f32;
         });
             
         let packed_tensor = Tensor::from_vec(packed, vec![original_shape[0], original_shape[1], original_shape[2], last_dim / 8], &Device::Cpu)?;
-        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
+        let scales_tensor = Tensor::from_vec(scales, vec![num_scales, 1], &Device::Cpu)?;
         
         Ok((packed_tensor, scales_tensor, original_shape))
     }
@@ -369,30 +395,31 @@ impl QuantizedQwen3VLTextAttention {
         let packed_vec = packed.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
         let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         
-        let last_dim = original_shape[original_shape.len() - 1];
+        let _last_dim = original_shape[original_shape.len() - 1];
         let total_elements: usize = original_shape.iter().product();
+        let q_block_size = 10240;
+
         let mut decoded = vec![0.0f32; total_elements];
         
         use rayon::prelude::*;
-        decoded.par_chunks_mut(last_dim).enumerate().for_each(|(v_idx, vector_out)| {
-            let scale = scales_vec[v_idx];
-            let pos_val = scale;      // (1 * 2 - 1) * scale = scale
-            let neg_val = -scale;     // (0 * 2 - 1) * scale = -scale
+        decoded.par_chunks_mut(q_block_size).enumerate().for_each(|(s_idx, block_out)| {
+            let scale = scales_vec[s_idx];
+            let pos_val = scale;
+            let neg_val = -scale;
             
-            let packed_start = v_idx * (last_dim / 8);
-            let packed_vector = &packed_vec[packed_start..packed_start + (last_dim / 8)];
-            
-            for (i, &p) in packed_vector.iter().enumerate() {
+            // Each block_out is q_block_size (10240) elements, which is q_block_size / 8 (1280) bytes
+            let packed_start = (s_idx * q_block_size) / 8;
+            for i in 0..(block_out.len() / 8) {
+                let p = packed_vec[packed_start + i];
                 let offset = i * 8;
-                // Pre-calculated branchless select
-                vector_out[offset + 0] = if (p & (1 << 0)) != 0 { pos_val } else { neg_val };
-                vector_out[offset + 1] = if (p & (1 << 1)) != 0 { pos_val } else { neg_val };
-                vector_out[offset + 2] = if (p & (1 << 2)) != 0 { pos_val } else { neg_val };
-                vector_out[offset + 3] = if (p & (1 << 3)) != 0 { pos_val } else { neg_val };
-                vector_out[offset + 4] = if (p & (1 << 4)) != 0 { pos_val } else { neg_val };
-                vector_out[offset + 5] = if (p & (1 << 5)) != 0 { pos_val } else { neg_val };
-                vector_out[offset + 6] = if (p & (1 << 6)) != 0 { pos_val } else { neg_val };
-                vector_out[offset + 7] = if (p & (1 << 7)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 0] = if (p & (1 << 0)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 1] = if (p & (1 << 1)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 2] = if (p & (1 << 2)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 3] = if (p & (1 << 3)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 4] = if (p & (1 << 4)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 5] = if (p & (1 << 5)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 6] = if (p & (1 << 6)) != 0 { pos_val } else { neg_val };
+                block_out[offset + 7] = if (p & (1 << 7)) != 0 { pos_val } else { neg_val };
             }
         });
         
@@ -432,19 +459,22 @@ impl QuantizedQwen3VLTextAttention {
             Tensor::cat(&[&v_small, &v_small], D::Minus1)?
         } else { v_small.clone() };
         
-        // 2. Head Replication (8 heads -> 16 heads)
-        let mut k_heads = vec![];
-        let mut v_heads = vec![];
+        // 2. Head Replication (e.g., 8 heads -> 16 heads)
+        // [OPTIMIZED] Use repeat instead of manual loop + cat for much better performance
         let source_heads = k_projected.dim(1)?;
+        let head_repeat = target_heads / source_heads;
         
-        for i in 0..target_heads {
-            let src_idx = i % source_heads;
-            k_heads.push(k_projected.narrow(1, src_idx, 1)?);
-            v_heads.push(v_projected.narrow(1, src_idx, 1)?);
-        }
+        let k_final = if head_repeat > 1 {
+            k_projected.repeat((1, head_repeat, 1, 1))?
+        } else {
+            k_projected
+        };
         
-        let k_final = Tensor::cat(&k_heads, 1)?;
-        let v_final = Tensor::cat(&v_heads, 1)?;
+        let v_final = if head_repeat > 1 {
+            v_projected.repeat((1, head_repeat, 1, 1))?
+        } else {
+            v_projected
+        };
         
         // 3. Append to existing cache
         self.kv_cache = match &self.kv_cache {
@@ -466,9 +496,8 @@ impl QuantizedQwen3VLTextAttention {
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
             
-            // [ULTRA-LIGHT-QUANT] Always compress to 1-bit when saving to disk (1/16 size)
-            // Use block_size 64 for hardware alignment speedup
-            let bs = 64;
+            // [ULTRA-LIGHT-QUANT] Maximize speed by increasing block size to 10240. 
+            let bs = 10240;
             let (k_packed, k_scales, k_shape) = self.compress_to_1bit(&k_cpu)?;
             let (v_packed, v_scales, _) = self.compress_to_1bit(&v_cpu)?;
             
@@ -654,33 +683,32 @@ impl QuantizedQwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // 1. Detect device AND dtype of this layer
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
         
-        // 2. Ensure inputs are on this device and dtype
-        //    (Clone via Cow logic or explicit clone if needed, here we use explicit clones/conversions for safety)
         let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         if xs.dtype() != target_dtype { xs = xs.to_dtype(target_dtype)?; }
 
-        let mut cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
-        if cos.dtype() != target_dtype { cos = cos.to_dtype(target_dtype)?; }
-
-        let mut sin = if !sin.device().same_device(dev) { sin.to_device(dev)? } else { sin.clone() };
-        if sin.dtype() != target_dtype { sin = sin.to_dtype(target_dtype)?; }
-
-        let attention_mask = if let Some(mask) = attention_mask {
-             // Mask is usually F32 or specific, but we ensure device match
-             Some(if !mask.device().same_device(dev) { mask.to_device(dev)? } else { mask.clone() })
-        } else {
-             None
-        };
-
+        // [GHOST-ENGINE-01] Extreme Layer Dropping
+        // For 0.6B worker, only compute every 6th layer to maintain a minimal context thread.
+        // This makes the 24-layer model act like a 4-layer model.
+        let is_worker = self.self_attn.num_attention_heads == 16; 
+        if is_worker && self.self_attn.layer_idx % 6 != 0 && self.self_attn.layer_idx != 23 {
+            // Passthrough: Skip entire layer math
+            return Ok(xs);
+        }
+        
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
-        let xs = residual.add(&xs)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
+        let mut xs = residual.add(&xs)?;
         
+        // [GHOST-ENGINE-02] Activation Bypassing
+        // Skip heavy MLP and non-linearities for 0.6B worker.
+        if is_worker {
+            return Ok(xs); // Just Return Attn-Output + Residual, bypassing MLP entirely
+        }
+
         let residual = xs.clone();
         let xs = self.post_attention_layernorm.forward(&xs)?;
         let xs = {

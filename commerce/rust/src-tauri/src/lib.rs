@@ -31,9 +31,19 @@ async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, S
     // 1. Set the flag only. DO NOT try to lock model/store here as it blocks the UI thread.
     state.cancellation_token.store(true, Ordering::SeqCst);
     
-    // 2. Update DB status in a non-blocking way if possible, or just skip for now.
-    // The worker will catch the flag and clean up properly.
-    println!("[STOP] Cancellation signal sent. Waiting for worker to catch it.");
+    // 2. Update DB status aggressively
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        // Find tasks with status 10 (pending) or 1 (progress) and mark as 3 (cancelled)
+        if let Ok(tasks) = db.get_pending_tasks(10).await {
+            for task in tasks {
+                let _ = db.update_task_status(&task.id, 3).await;
+                let _ = db.update_message_status(&task.id, 3, Some("Stopped by user")).await;
+            }
+        }
+    }
+
+    println!("[STOP] Cancellation signal sent and DB status updated.");
     Ok("Stop signal sent.".to_string())
 }
 
