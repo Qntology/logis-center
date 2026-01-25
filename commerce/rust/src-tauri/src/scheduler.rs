@@ -702,7 +702,7 @@ async fn process_task(
             }
 
             // Step 3: Feed slices through the pipeline
-            let prefill_chunk_size = 1024; 
+            let prefill_chunk_size = 512; 
 
             println!("[RELAY] Starting Real-time Pour (Offset: {}/{})...", current_pos, total_tokens);
 
@@ -710,23 +710,24 @@ async fn process_task(
                 if cancellation_token.load(Ordering::Relaxed) { break; }
 
                 let end_pos = (current_pos + prefill_chunk_size).min(total_tokens - 1);
-                let chunk_ids = &full_token_ids[current_pos..end_pos];
+                let chunk_ids = full_token_ids[current_pos..end_pos].to_vec();
                 
-                println!("[RELAY] Processing chunk {}-{} on 0.6B (CPU)...", current_pos, end_pos);
-
-                // Step A: 0.6B calculates (Holding only 0.6B lock)
-                let kv_chunk = {
-                    let mut small_gen = small_gen_mutex.lock().await;
+                // Step A: 0.6B calculates (Offloaded to blocking thread)
+                let small_gen_mutex_clone = small_gen_mutex.clone();
+                let cancel_token_clone = cancellation_token.clone();
+                
+                let kv_chunk = tokio::task::spawn_blocking(move || {
+                    let mut small_gen = small_gen_mutex_clone.blocking_lock();
                     if let Some(worker) = small_gen.as_mut() {
-                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
-                        Some(res)
-                    } else { None }
-                };
+                        worker.prefill_only_ids(&chunk_ids, current_pos, Some(cancel_token_clone), None)
+                    } else { Err(anyhow::anyhow!("Small generator missing")) }
+                }).await??;
 
-                // Step B: 2B Injects (Briefly holding 2B lock)
-                if let Some((ks, vs)) = kv_chunk {
+                // Step B: 2B Injects (GPU)
+                {
                     let mut large_gen = large_gen_mutex.lock().await;
                     if let Some(target) = large_gen.as_mut() {
+                        let (ks, vs) = kv_chunk;
                         target.inject_kv(&ks, &vs)?;
                     }
                 }
@@ -736,7 +737,6 @@ async fn process_task(
                 println!("[RELAY] Progress: {:.1}% ({}/{}) tokens.", progress, current_pos, total_tokens);
                 tokio::task::yield_now().await;
             }
-            println!("[RELAY] Pipeline sync complete.");
         }
 
         // 3. 2B Inference (Immediate)
@@ -823,24 +823,30 @@ async fn process_task(
                 }
             }
 
-            let prefill_chunk_size = 1024;
+            let prefill_chunk_size = 512;
             println!("[RELAY] Starting Task 2 Relay (Offset: {}/{})...", current_pos, total_tokens);
 
             while current_pos < total_tokens - 1 {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
                 let end_pos = (current_pos + prefill_chunk_size).min(total_tokens - 1);
-                let chunk_ids = &full_token_ids[current_pos..end_pos];
+                let chunk_ids = full_token_ids[current_pos..end_pos].to_vec();
 
-                let kv_chunk = {
-                    let mut small_gen = small_gen_mutex.lock().await;
+                let small_gen_mutex_clone = small_gen_mutex.clone();
+                let cancel_token_clone = cancellation_token.clone();
+
+                let kv_chunk = tokio::task::spawn_blocking(move || {
+                    let mut small_gen = small_gen_mutex_clone.blocking_lock();
                     if let Some(worker) = small_gen.as_mut() {
-                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
-                        Some(res)
-                    } else { None }
-                };
-                if let Some((ks, vs)) = kv_chunk {
+                        worker.prefill_only_ids(&chunk_ids, current_pos, Some(cancel_token_clone), None)
+                    } else { Err(anyhow::anyhow!("Small generator missing")) }
+                }).await??;
+
+                {
                     let mut large_gen = large_gen_mutex.lock().await;
-                    if let Some(target) = large_gen.as_mut() { target.inject_kv(&ks, &vs)?; }
+                    if let Some(target) = large_gen.as_mut() { 
+                        let (ks, vs) = kv_chunk;
+                        target.inject_kv(&ks, &vs)?; 
+                    }
                 }
                 current_pos = end_pos;
                 let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
@@ -1394,24 +1400,30 @@ async fn process_task(
                 }
             }
 
-            let prefill_chunk_size = 1024;
-            println!("[RELAY] Starting Detail Relay (Offset: {}/{})…", current_pos, total_tokens);
+            let prefill_chunk_size = 512;
+            println!("[RELAY] Starting Detail Relay (Offset: {}/{})...", current_pos, total_tokens);
 
             while current_pos < total_tokens - 1 {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
                 let end_pos = (current_pos + prefill_chunk_size).min(total_tokens - 1);
-                let chunk_ids = &full_token_ids[current_pos..end_pos];
+                let chunk_ids = full_token_ids[current_pos..end_pos].to_vec();
 
-                let kv_chunk = {
-                    let mut small_gen = small_gen_mutex.lock().await;
+                let small_gen_mutex_clone = small_gen_mutex.clone();
+                let cancel_token_clone = cancellation_token.clone();
+
+                let kv_chunk = tokio::task::spawn_blocking(move || {
+                    let mut small_gen = small_gen_mutex_clone.blocking_lock();
                     if let Some(worker) = small_gen.as_mut() {
-                        let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
-                        Some(res)
-                    } else { None }
-                };
-                if let Some((ks, vs)) = kv_chunk {
+                        worker.prefill_only_ids(&chunk_ids, current_pos, Some(cancel_token_clone), None)
+                    } else { Err(anyhow::anyhow!("Small generator missing")) }
+                }).await??;
+
+                {
                     let mut large_gen = large_gen_mutex.lock().await;
-                    if let Some(target) = large_gen.as_mut() { target.inject_kv(&ks, &vs)?; }
+                    if let Some(target) = large_gen.as_mut() { 
+                        let (ks, vs) = kv_chunk;
+                        target.inject_kv(&ks, &vs)?; 
+                    }
                 }
                 current_pos = end_pos;
                 let progress = (current_pos as f32 / total_tokens as f32) * 100.0;

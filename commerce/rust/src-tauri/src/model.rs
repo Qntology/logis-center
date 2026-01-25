@@ -247,11 +247,13 @@ impl LogisModel {
             let shared_path_clone = shared_path.map(|s| s.to_string());
 
             let gen = tokio::task::spawn_blocking(move || {
-                // [TURBO-THREADS] Force high performance for 0.6B worker
+                // [TURBO-THREADS] Leave 2 cores for OS/Async runtime to prevent hangs
                 if path_clone.contains("0.6B") {
                     let total_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-                    println!("[TURBO] Forcing 0.6B to use {} threads for ingestion.", total_cores);
-                    let _ = rayon::ThreadPoolBuilder::new().num_threads(total_cores).build_global();
+                    let reserved_cores = (total_cores / 4).max(2);
+                    let worker_threads = total_cores.saturating_sub(reserved_cores).max(1);
+                    println!("[TURBO] Forcing 0.6B to use {}/{} threads for ingestion.", worker_threads, total_cores);
+                    let _ = rayon::ThreadPoolBuilder::new().num_threads(worker_threads).build_global();
                 }
 
                 Qwen3VLGenerateModel::init_with_config(
