@@ -753,6 +753,33 @@ impl Qwen3VLGenerateModel {
         }
     }
 
+    pub fn load_kv_cache_native(&mut self, path: &std::path::Path, match_len: usize, refill_len: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, match_len, refill_len),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, match_len, refill_len),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn get_cache_match_len(&self, session_id: &Option<String>, full_input_ids: &[u32]) -> usize {
+        if let Some(sid) = session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(sid).join("tokens.json");
+            if path.exists() {
+                if let Ok(file) = std::fs::File::open(&path) {
+                    let reader = std::io::BufReader::new(file);
+                    if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                        let mut match_len = 0;
+                        for (c, f) in cached_tokens.iter().zip(full_input_ids.iter()) {
+                            if c == f { match_len += 1; } else { break; }
+                        }
+                        return match_len;
+                    }
+                }
+            }
+        }
+        0
+    }
+
     pub fn get_current_kv(&self) -> (Vec<candle_core::Tensor>, Vec<candle_core::Tensor>) {
         let mut ks: Vec<candle_core::Tensor> = vec![];
         let mut vs: Vec<candle_core::Tensor> = vec![];

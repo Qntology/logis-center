@@ -671,9 +671,40 @@ async fn process_task(
             let total_tokens = full_token_ids.len();
             println!("[Scheduler] Global Tokenization Complete: {} tokens.", total_tokens);
 
-            // Step 2: Feed slices through the pipeline
+            // Step 2: [SPEED-FIX] Try to load existing cache for BOTH models to skip relay
             let mut current_pos = 0;
-            let prefill_chunk_size = 1024; // Increased since text overhead is gone
+            {
+                let mut large_gen = large_gen_mutex.lock().await;
+                if let Some(worker) = large_gen.as_mut() {
+                    let sid = Some(task.id.clone());
+                    let match_len = worker.get_cache_match_len(&sid, &full_token_ids);
+                    if match_len > 50 {
+                        // Load Disk Cache with 1-token refill for continuity
+                        let refill_len = 1;
+                        let cache_path = crate::utils::paths::get_kv_dir(None).join(task.id.clone());
+                        if worker.load_kv_cache_native(&cache_path, match_len, refill_len).is_ok() {
+                            current_pos = worker.get_kv_len();
+                            println!("[RELAY-JUMP] Large model loaded cache. Jumping to offset {}.", current_pos);
+                        }
+                    }
+                }
+            }
+            
+            // Also sync Small model's position if it's already in memory from a previous sub-task
+            {
+                let mut small_gen = small_gen_mutex.lock().await;
+                if let Some(worker) = small_gen.as_mut() {
+                    // Small doesn't load from disk (too slow on CPU), but we can skip relay if Large already has it.
+                    // However, Small MUST process the history to maintain its internal state.
+                    // [OPTIMIZATION] If Large has it, we still need Small to reach that point, 
+                    // but we don't need to WAIT for Large's lock during the catch-up phase.
+                }
+            }
+
+            // Step 3: Feed slices through the pipeline
+            let prefill_chunk_size = 1024; 
+
+            println!("[RELAY] Starting Real-time Pour (Offset: {}/{})...", current_pos, total_tokens);
 
             while current_pos < total_tokens - 1 {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -681,12 +712,13 @@ async fn process_task(
                 let end_pos = (current_pos + prefill_chunk_size).min(total_tokens - 1);
                 let chunk_ids = &full_token_ids[current_pos..end_pos];
                 
+                println!("[RELAY] Processing chunk {}-{} on 0.6B (CPU)...", current_pos, end_pos);
+
                 // Step A: 0.6B calculates (Holding only 0.6B lock)
                 let kv_chunk = {
                     let mut small_gen = small_gen_mutex.lock().await;
                     if let Some(worker) = small_gen.as_mut() {
                         let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
-                        // worker.clear_kv_cache(); // Prevent Small's memory from bloating
                         Some(res)
                     } else { None }
                 };
@@ -701,9 +733,10 @@ async fn process_task(
                 
                 current_pos = end_pos;
                 let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
-                println!("[RELAY] Poured {}/{} tokens ({:.1}%) into 2B Cup.", current_pos, total_tokens, progress);
+                println!("[RELAY] Progress: {:.1}% ({}/{}) tokens.", progress, current_pos, total_tokens);
                 tokio::task::yield_now().await;
             }
+            println!("[RELAY] Pipeline sync complete.");
         }
 
         // 3. 2B Inference (Immediate)
@@ -772,7 +805,26 @@ async fn process_task(
             
             let total_tokens = full_token_ids.len();
             let mut current_pos = 0;
+
+            // Step 2: [SPEED-FIX] Try to load existing cache
+            {
+                let mut large_gen = large_gen_mutex.lock().await;
+                if let Some(worker) = large_gen.as_mut() {
+                    let sid = Some(format!("{}_task2", task.id));
+                    let match_len = worker.get_cache_match_len(&sid, &full_token_ids);
+                    if match_len > 50 {
+                        let refill_len = 1;
+                        let cache_path = crate::utils::paths::get_kv_dir(None).join(format!("{}_task2", task.id));
+                        if worker.load_kv_cache_native(&cache_path, match_len, refill_len).is_ok() {
+                            current_pos = worker.get_kv_len();
+                            println!("[RELAY-JUMP] Task 2 loaded cache. Jumping to offset {}.", current_pos);
+                        }
+                    }
+                }
+            }
+
             let prefill_chunk_size = 1024;
+            println!("[RELAY] Starting Task 2 Relay (Offset: {}/{})...", current_pos, total_tokens);
 
             while current_pos < total_tokens - 1 {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -783,7 +835,6 @@ async fn process_task(
                     let mut small_gen = small_gen_mutex.lock().await;
                     if let Some(worker) = small_gen.as_mut() {
                         let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
-                        // worker.clear_kv_cache();
                         Some(res)
                     } else { None }
                 };
@@ -792,6 +843,8 @@ async fn process_task(
                     if let Some(target) = large_gen.as_mut() { target.inject_kv(&ks, &vs)?; }
                 }
                 current_pos = end_pos;
+                let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
+                println!("[RELAY] Task 2 Progress: {:.1}% ({}/{}) tokens.", progress, current_pos, total_tokens);
                 tokio::task::yield_now().await;
             }
         }
@@ -1323,9 +1376,26 @@ async fn process_task(
             
             let total_tokens = full_token_ids.len();
             let mut current_pos = 0;
-            let prefill_chunk_size = 1024;
 
-            println!("[Scheduler] Detail Relay Starting: {} tokens...", total_tokens);
+            // Step 2: [SPEED-FIX] Try to load existing cache
+            {
+                let mut large_gen = large_gen_mutex.lock().await;
+                if let Some(worker) = large_gen.as_mut() {
+                    let sid = Some(detail_session_id.clone());
+                    let match_len = worker.get_cache_match_len(&sid, &full_token_ids);
+                    if match_len > 50 {
+                        let refill_len = 1;
+                        let cache_path = crate::utils::paths::get_kv_dir(None).join(&detail_session_id);
+                        if worker.load_kv_cache_native(&cache_path, match_len, refill_len).is_ok() {
+                            current_pos = worker.get_kv_len();
+                            println!("[RELAY-JUMP] Detail Extraction loaded cache. Jumping to offset {}.", current_pos);
+                        }
+                    }
+                }
+            }
+
+            let prefill_chunk_size = 1024;
+            println!("[RELAY] Starting Detail Relay (Offset: {}/{})…", current_pos, total_tokens);
 
             while current_pos < total_tokens - 1 {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
@@ -1336,7 +1406,6 @@ async fn process_task(
                     let mut small_gen = small_gen_mutex.lock().await;
                     if let Some(worker) = small_gen.as_mut() {
                         let res = worker.prefill_only_ids(chunk_ids, current_pos, Some(cancellation_token.clone()), None)?;
-                        // worker.clear_kv_cache();
                         Some(res)
                     } else { None }
                 };
@@ -1345,6 +1414,8 @@ async fn process_task(
                     if let Some(target) = large_gen.as_mut() { target.inject_kv(&ks, &vs)?; }
                 }
                 current_pos = end_pos;
+                let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
+                println!("[RELAY] Detail Progress: {:.1}% ({}/{}) tokens.", progress, current_pos, total_tokens);
                 tokio::task::yield_now().await;
             }
         }
