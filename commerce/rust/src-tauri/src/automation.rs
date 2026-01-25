@@ -126,82 +126,55 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
     }
 }
 
-// Global storage for the last detected browser state
-pub struct DetectedState {
-    pub url: String,
-    pub is_client: bool,
-    pub is_admin: bool,
-}
-
-pub(crate) static LAST_DETECTED_STATE: Lazy<Arc<tokio::sync::Mutex<DetectedState>>> = Lazy::new(|| {
-    Arc::new(tokio::sync::Mutex::new(DetectedState {
-        url: String::new(),
-        is_client: false,
-        is_admin: false,
-    }))
-});
-
 fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
     tokio::spawn(async move {
         let mut last_detected_url = String::new();
-        let mut last_is_shop = false;
-
         loop {
             let pages = match browser.pages().await {
                 Ok(p) => p,
                 Err(_) => break, 
             };
 
-            let mut active_url = String::new();
-            let mut is_client = false;
-            let mut is_admin = false;
-
-            // [STRICT-DETECTION] Check ONLY the visible (focused) tab
+            let mut active_page = None;
             for page in pages.iter() {
-                let is_visible = page.evaluate("document.visibilityState").await
-                    .map(|v| v.into_value::<String>().unwrap_or_default() == "visible")
-                    .unwrap_or(false);
-
+                let is_visible = match page.evaluate("document.visibilityState").await {
+                    Ok(res) => res.into_value::<String>().unwrap_or_default() == "visible",
+                    Err(_) => false,
+                };
                 if is_visible {
-                    if let Ok(val) = page.evaluate("window.location.href").await {
-                        active_url = val.into_value::<String>().unwrap_or_default();
-                        if active_url.is_empty() || active_url == "about:blank" { break; }
+                    active_page = Some(page);
+                    break;
+                }
+            }
 
-                        is_client = is_shop(&active_url, CLIENT_PATTERNS);
-                        is_admin = is_shop(&active_url, ADMIN_PATTERNS);
+            // Fallback: If no tab is strictly 'visible', use the last one in the list
+            let page_to_check = active_page.or(pages.last());
+
+            if let Some(page) = page_to_check {
+                if let Ok(val) = page.evaluate("window.location.href").await {
+                    let current_url = val.into_value::<String>().unwrap_or_default();
+                    if !current_url.is_empty() && current_url != last_detected_url {
+                        let is_client = is_shop(&current_url, CLIENT_PATTERNS);
+                        let is_admin = is_shop(&current_url, ADMIN_PATTERNS);
+                        
+                        // Always notify frontend of URL change so it can toggle button visibility
+                        let payload = json!({
+                            "url": current_url.clone(),
+                            "is_client": is_client,
+                            "is_admin": is_admin
+                        });
+                        let _ = app_handle.emit("browser-match-found", &payload);
+                        
+                        if is_client || is_admin {
+                            println!("[AUTO] Target Site Detected: {} (Client={}, Admin={})", current_url, is_client, is_admin);
+                        }
+                        last_detected_url = current_url;
                     }
-                    break; // Visible tab found
                 }
             }
-
-            let current_is_shop = is_client || is_admin;
-
-            // Update global state for InitialSyncData
-            {
-                let mut state = LAST_DETECTED_STATE.lock().await;
-                state.url = active_url.clone();
-                state.is_client = is_client;
-                state.is_admin = is_admin;
-            }
-
-            // Notify UI if URL changed OR if shop-status changed
-            if active_url != last_detected_url || current_is_shop != last_is_shop {
-                let payload = json!({
-                    "url": active_url.clone(),
-                    "is_client": is_client,
-                    "is_admin": is_admin
-                });
-                let _ = app_handle.emit("browser-match-found", &payload);
-                
-                last_detected_url = active_url;
-                last_is_shop = current_is_shop;
-                
-                if current_is_shop {
-                    println!("[AUTO] Active Shop Focused: {}", last_detected_url);
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(800)).await; 
+            tokio::time::sleep(Duration::from_millis(1000)).await; 
         }
+        // When loop breaks (browser closed), clear detected URL in frontend
         let _ = app_handle.emit("browser-match-found", json!({ "url": "", "is_client": false, "is_admin": false }));
         println!("[AUTO] Browser monitor exited.");
     });
@@ -255,27 +228,18 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 "--disable-notifications",
                 "--disable-extensions",
                 "--disable-popup-blocking",
-                "--blink-settings=imagesEnabled=false",
-                "--disable-blink-features=AutomationControlled", // [CRITICAL] Hide automation status
-                "--password-store=basic", // Prevent password manager popups
-                "--no-default-browser-check",
+                "--blink-settings=imagesEnabled=false", // 이미지 로딩 비활성화로 자원 절약
                 &port_arg,
                 "--remote-allow-origins=*", 
             ];
-            let mut builder = BrowserConfig::builder()
-                .chrome_executable(&exec_path)
-                .with_head()
-                .no_sandbox()
-                .viewport(None);
-
+            let mut builder = BrowserConfig::builder().chrome_executable(&exec_path).with_head().no_sandbox().viewport(None);
             let tmp_root = crate::utils::paths::get_app_tmp_root(None);
             let profile_dir = tmp_root.join("browser_profiles").join(browser);
             let _ = std::fs::create_dir_all(&profile_dir);
             let mut p_str = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir).to_string_lossy().to_string();
             if p_str.starts_with(r"\\?\") { p_str = p_str[4..].to_string(); }
-            
-            builder = builder.user_data_dir(std::path::PathBuf::from(p_str)).args(args);
-            builder.build().map_err(|e| anyhow!("Config error: {}", e))
+            builder = builder.user_data_dir(std::path::PathBuf::from(p_str));
+            builder.args(args).build().map_err(|e| anyhow!("Config error: {}", e))
         };
 
         // 3. Launch
@@ -299,10 +263,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
     };
 
     println!("[AUTO] Navigating to {}...", url);
-    let page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
-    
-    // [CRITICAL STEALTH] Redefine navigator.webdriver to bypass detection
-    let _ = page.evaluate_on_new_document("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})").await;
+    let _page = browser_arc.new_page(url).await.map_err(|e| anyhow!("Page creation failed: {}", e))?;
     
     Ok(format!("Automation Started."))
 }
@@ -355,23 +316,7 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
     };
     if let Some(browser) = browser_opt {
         let pages = browser.pages().await.map_err(|e| e.to_string())?;
-        
-        let mut active_page = None;
-        for page in pages.iter() {
-            let is_visible = match page.evaluate("document.visibilityState").await {
-                Ok(res) => res.into_value::<String>().unwrap_or_default() == "visible",
-                Err(_) => false,
-            };
-            if is_visible {
-                active_page = Some(page);
-                break;
-            }
-        }
-
-        // Use the active page found, or fallback to the last page if none are strictly 'visible'
-        let target_page = active_page.or(pages.last());
-
-        if let Some(page) = target_page {
+        if let Some(page) = pages.last() {
             let html = page.content().await.map_err(|e| e.to_string())?;
             return Ok(html);
         }

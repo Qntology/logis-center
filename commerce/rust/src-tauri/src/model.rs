@@ -126,19 +126,26 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 
 use tokio::sync::Mutex as TokioMutex;
 
-#[derive(Debug, PartialEq)]
 pub enum ModelSize {
     Small, // 0.6B for Ingestion
     Large, // 2B-VL for Inference
 }
 
+impl PartialEq for ModelSize {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ModelSize::Small, ModelSize::Small) => true,
+            (ModelSize::Large, ModelSize::Large) => true,
+            _ => false,
+        }
+    }
+}
+
 pub struct LogisModel {
-    pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
-    pub small_generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
-    pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
+    generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
+    embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
-    pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
     small_model_path: String,
@@ -152,14 +159,11 @@ pub struct LogisModel {
 impl LogisModel {
     pub async fn unload_generator(&self) {
         let mut gen = self.generator.lock().await;
-        if let Some(mut m) = gen.take() {
-            // [FAST-RELEASE] Explicitly clear cache and drop internal tensors before None-ing
-            m.clear_kv_cache();
-            drop(m); // Triggers immediate drop of internal handles
-            
+        if gen.is_some() {
+            *gen = None;
             let mut size = self.current_size.lock().await;
             *size = None;
-            println!("[MODEL] Generator destroyed and VRAM reclaimed.");
+            println!("[MODEL] Generator unloaded to free VRAM.");
         }
     }
 
@@ -195,8 +199,10 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
+        // 1. Unload Embedding if loaded
         self.unload_embedding().await;
 
+        // 2. Check if we need to switch models
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
 
@@ -206,55 +212,20 @@ impl LogisModel {
         };
 
         if needs_reload || gen_guard.is_none() {
-            println!("[MODEL] Switching/Loading model to size: {:?}...", size);
-            
-            // [DUAL-ENGINE-HANDOVER] 
-            if *current_size_guard == Some(ModelSize::Small) && size == ModelSize::Large && self.dual_mode_enabled {
-                let mut small_slot = self.small_generator.lock().await;
-                if let Some(m) = gen_guard.take() {
-                    println!("[DUAL] Moving 0.6B to secondary background slot.");
-                    *small_slot = Some(m);
-                }
-            } else {
-                *gen_guard = None; 
-            }
+            println!("[MODEL] Switching/Loading model to size: {:?} on GPU-{}", 
+                match size { ModelSize::Small => "Small", ModelSize::Large => "Large" },
+                self.device_config.gpu_id
+            );
+            *gen_guard = None; // Force drop
             
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
+            
+            // [CRITICAL] Both models MUST share the same Config & Tokenizer from the 2B directory
+            // to ensure KV Cache compatibility (Rope scaling, Sliding window, etc.)
             let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
             
-            // [STRATEGY] Strict VRAM Management for 4GB Cards
-            // Force 0.6B to CPU always to reserve 100% of VRAM for 2B-VL's vision encoder and large context.
-            let target_device = if size == ModelSize::Small && self.device_config.device.is_cuda() {
-                println!("[MODEL-CONFIG] Offloading 0.6B to CPU to save VRAM for 2B-VL.");
-                Device::Cpu
-            } else {
-                if self.device_config.device.is_cuda() {
-                    let mut free_vram = 0;
-                    if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                        if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                            if let Ok(mem) = dev.memory_info() { free_vram = mem.free; }
-                        }
-                    }
-                    println!("[MODEL-CONFIG] Loading {:?} directly into GPU VRAM (Free: {:.2} GB).", size, free_vram as f64 / 1e9);
-                }
-                self.device_config.device.clone()
-            };
-
-            let dev_id = self.device_config.gpu_id;
-            let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
-            let limit = self.max_tokens_limit;
-            let path_clone = path.to_string();
-            let shared_path_clone = shared_path.map(|s| s.to_string());
-
-            let gen = tokio::task::spawn_blocking(move || {
-                Qwen3VLGenerateModel::init_with_config(
-                    &path_clone, 
-                    shared_path_clone.as_deref(), 
-                    shared_path_clone.as_deref(), 
-                    Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize)
-                )
-            }).await??;
-
+            let gen = self.load_generator_internal(path, shared_path).await?;
+            
             *gen_guard = Some(gen);
             *current_size_guard = Some(size);
         }
@@ -309,10 +280,8 @@ impl LogisModel {
 
         Ok(Self {
             generator: Arc::new(TokioMutex::new(None)),
-            small_generator: Arc::new(TokioMutex::new(None)), // [DUAL]
             embedding_model: Arc::new(TokioMutex::new(None)),
             is_cpu_mode: config.is_cpu,
-            dual_mode_enabled: true, // [NEW] Enable by default for fastest PUG analysis
             small_model_path,
             large_model_path,
             embedding_path,
@@ -536,12 +505,7 @@ impl LogisModel {
         }
 
         // Emit initial status once (Frontend will handle continuous spinner animation via .active-spinner class)
-        let _ = app_handle.emit(event_name, &base_payload);
-        
-        // [LOG] Save to task history if task_id exists
-        if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
-            crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
-        }
+        let _ = app_handle.emit(event_name, base_payload);
 
         let self_clone = self.generator.clone();
         

@@ -149,57 +149,24 @@ impl Qwen3VLGenerateModel {
                 // CASE 1: Vision-Language Model
                 let mmproj = mmproj_path.ok_or(anyhow!("Missing mmproj GGUF"))?;
                 let main = model_path.ok_or(anyhow!("Missing main GGUF for VL model"))?;
+                let mut mmproj_file = std::fs::File::open(&mmproj)?;
+                let mmproj_content = gguf_file::Content::read(&mut mmproj_file)?;
+                let mut main_file = std::fs::File::open(&main)?;
+                let main_content = gguf_file::Content::read(&mut main_file)?;
                 
-                // [MMAP-OPTIMIZATION] Use Mmap for GGUF to support Parallel Loading and Prefetching
-                let main_file = std::fs::File::open(&main)?;
-                let main_mmap = unsafe { memmap2::MmapOptions::new().map(&main_file)? };
-                let mmproj_file = std::fs::File::open(&mmproj)?;
-                let mmproj_mmap = unsafe { memmap2::MmapOptions::new().map(&mmproj_file)? };
-
-                // [PREFETCH] Hint OS to load weights into memory immediately
-                #[cfg(unix)]
-                {
-                    use memmap2::Advice;
-                    let _ = main_mmap.advise(Advice::WillNeed);
-                    let _ = mmproj_mmap.advise(Advice::WillNeed);
-                }
-
-                let mut main_cursor = std::io::Cursor::new(&main_mmap[..]);
-                let main_content = gguf_file::Content::read(&mut main_cursor)?;
-                let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
-                let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
-                
-                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, &main_mmap, &mmproj_content, &mmproj_mmap, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
+                let model = QuantizedQwen3VLModel::new(&cfg, &main_content, &mut main_file, &mmproj_content, &mut mmproj_file, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedVL(model)
             } else {
                 // CASE 2: Pure Text Model (0.6B etc.)
                 let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
-                
-                let file = std::fs::File::open(&main)?;
-                let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-                
-                #[cfg(unix)]
-                {
-                    use memmap2::Advice;
-                    let _ = mmap.advise(Advice::WillNeed);
-                }
-
-                let mut cursor = std::io::Cursor::new(&mmap[..]);
-                let content = gguf_file::Content::read(&mut cursor)?;
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, &mmap, &text_dev, text_device_id, dtype, kv_reserve)?;
+                let mut file = std::fs::File::open(&main)?;
+                let content = gguf_file::Content::read(&mut file)?;
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new(&cfg, &content, &mut file, &text_dev, text_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedText(model)
             }
         } else {
-            // CASE 3: Standard Safetensors with mmap for instant loading
+            // ... (standard/safetensors branch)
             let model_list = find_type_files(path, "safetensors")?;
-            
-            // [MMAP-OPTIMIZATION] Option 1: Parallel Loading using rayon
-            use rayon::prelude::*;
-            let _handles: Vec<_> = model_list.par_iter().map(|p| {
-                let file = std::fs::File::open(p)?;
-                unsafe { memmap2::MmapOptions::new().map(&file) }
-            }).collect::<Result<Vec<_>, _>>()?;
-            
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, &text_dev)? };
             let model = Qwen3VLModel::new(cfg, vb)?;
             ModelVariant::Standard(model)
@@ -241,133 +208,6 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    /// [FAST-RELAY] Processes a slice of pre-tokenized IDs directly. 
-    /// This is the "Zero-Text-Overhead" pipeline.
-    pub fn prefill_only_ids(&mut self, token_ids: &[u32], start_pos: usize, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
-        if token_ids.is_empty() { return Ok((vec![], vec![])); }
-        
-        let chunk_size = token_ids.len();
-        let end_pos = start_pos + chunk_size;
-
-        let chunk_ids = Tensor::from_vec(token_ids.to_vec(), (1, chunk_size), &self.text_device)?;
-        let chunk_pos = Tensor::arange(start_pos as u32, end_pos as u32, &self.text_device)?;
-
-        if let Some(flag) = &cancel_flag {
-            if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
-        }
-
-        // [OPTIMIZATION] Directly call forward. It uses the CPU threads already assigned to Rayon
-        // during model creation (or standard Rayon threads) without nesting pools.
-        match &mut self.qwen3_vl {
-            ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
-            ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
-            ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), start_pos)?; },
-        };
-
-        let (full_ks, full_vs) = self.get_current_kv();
-        
-        // [INCREMENTAL-FLOW] Use contiguous() to ensure the tensors are NOT views.
-        // This prevents synchronization issues between CPU/GPU model instances.
-        let mut new_ks = Vec::with_capacity(full_ks.len());
-        let mut new_vs = Vec::with_capacity(full_vs.len());
-
-        for (k, v) in full_ks.iter().zip(full_vs.iter()) {
-            let seq_len = k.dim(2)?;
-            if start_pos < seq_len {
-                let len = usize::min(chunk_size, seq_len - start_pos);
-                // [STRICT-COPY] contiguous().copy() ensures these are not views.
-                // This allows 2B to process them on GPU without locking the 0.6B CPU cache.
-                new_ks.push(k.narrow(2, start_pos, len)?.contiguous()?.copy()?);
-                new_vs.push(v.narrow(2, start_pos, len)?.contiguous()?.copy()?);
-            } else {
-                new_ks.push(k.narrow(2, 0, 0)?.contiguous()?.copy()?);
-                new_vs.push(v.narrow(2, 0, 0)?.contiguous()?.copy()?);
-            }
-        }
-
-        Ok((new_ks, new_vs))
-    }
-
-    pub fn tokenize_params(&mut self, params: &ChatCompletionParameters) -> Result<Vec<u32>> {
-        let mes_render = self.chat_template.apply_chat_template(params)?;
-        let input = self.pre_processor.process_info(params, &mes_render)?;
-        self.tokenizer.text_encode_vec(input.replace_text, true)
-    }
-
-    pub fn prefill_only_chunk(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, start_pos: usize, chunk_size: usize) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
-        let total_tokens = full_input_ids_vec.len();
-
-        let end_pos = (start_pos + chunk_size).min(total_tokens - 1);
-        if start_pos >= end_pos { return Ok((vec![], vec![])); }
-
-        let actual_chunk_size = end_pos - start_pos;
-        let chunk_vec = &full_input_ids_vec[start_pos..end_pos];
-        let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, actual_chunk_size), &self.text_device)?;
-        let chunk_pos = Tensor::arange(start_pos as u32, end_pos as u32, &self.text_device)?;
-
-        if let Some(flag) = &cancel_flag {
-            if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
-        }
-
-        match &mut self.qwen3_vl {
-            ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
-            ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
-            ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), start_pos)?; },
-        };
-
-        let (ks, vs) = self.get_current_kv();
-        // Return only the NEWLY added KV parts if possible, or just the whole set
-        // For simplicity and since we clear after each push, this returns the current chunk's KV.
-        Ok((ks, vs))
-    }
-
-    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
-        let total_tokens = full_input_ids_vec.len();
-
-        let mut current_pos = self.get_kv_len();
-        let prefill_chunk_size = 512; 
-
-        println!("[PREFILL] Starting non-blocking prefill: {}/{} tokens", current_pos, total_tokens);
-
-        while current_pos < total_tokens {
-            let remaining = total_tokens - current_pos;
-            let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
-            
-            if current_pos + chunk_size >= total_tokens { 
-                chunk_size = (total_tokens - current_pos).saturating_sub(1); 
-            }
-            if chunk_size == 0 { break; }
-
-            let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
-            let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
-
-            if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
-            }
-
-            match &mut self.qwen3_vl {
-                ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
-                ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
-                ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
-            };
-            
-            current_pos += chunk_size;
-            if current_pos % 2048 == 0 {
-                println!("[PREFILL] Processed {}/{} tokens...", current_pos, total_tokens);
-            }
-        }
-
-        let (ks, vs) = self.get_current_kv();
-        Ok((ks, vs))
-    }
-
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
         let temperature = match mes.temperature {
             None => self.generation_config.temperature,
@@ -400,13 +240,9 @@ impl Qwen3VLGenerateModel {
         let is_ingest = input.replace_text.contains("ACTION: INGEST");
         let is_save = input.replace_text.contains("ACTION: SAVE");
         
-        // [FIX] CHECK LIVE CACHE FIRST: If 0.6B just injected KV, detect it here.
-        let live_kv_len = self.get_kv_len();
-        if live_kv_len > 0 {
-            println!("[KV-BRIDGE] Detected Live Injected KV: {} tokens. Skipping redundant prefill.", live_kv_len);
-        }
+        let mut seqlen_offset = 0;
 
-        // KV Cache Disk Loading (Only if live cache is empty)
+        // KV Cache Disk Loading
         let cache_path = if let Some(sid) = &session_id {
              let p = crate::utils::paths::get_kv_dir(None).join(sid);
              if !p.exists() { let _ = fs::create_dir_all(&p); }
@@ -415,76 +251,74 @@ impl Qwen3VLGenerateModel {
              None
         };
 
-        let mut seqlen_offset = live_kv_len; 
-        if seqlen_offset == 0 {
-            if let Some(path) = &cache_path {
-                 match &mut self.qwen3_vl {
-                     ModelVariant::QuantizedVL(m) => {
-                         let token_path = path.join("tokens.json");
-                         let mut loaded = false;
-                         if token_path.exists() {
-                             if let Ok(file) = fs::File::open(&token_path) {
-                                 let reader = std::io::BufReader::new(file);
-                                 if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                     let mut match_len = 0;
-                                     for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
-                                         if c == f { match_len += 1; } else { break; }
-                                     }
+        if let Some(path) = &cache_path {
+             match &mut self.qwen3_vl {
+                 ModelVariant::QuantizedVL(m) => {
+                     let token_path = path.join("tokens.json");
+                     let mut loaded = false;
+                     if token_path.exists() {
+                         if let Ok(file) = fs::File::open(&token_path) {
+                             let reader = std::io::BufReader::new(file);
+                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 let mut match_len = 0;
+                                 for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
+                                     if c == f { match_len += 1; } else { break; }
+                                 }
 
-                                     if match_len > 50 {
-                                         println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
-                                         // [EXTREME-SPEED] Minimum 1 token refill.
-                                         let refill_len = 1;
-                                         if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
-                                             seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
-                                             loaded = true;
-                                         }
+                                 if match_len > 50 {
+                                     println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
+                                     let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
+                                     if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
+                                         seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
+                                         loaded = true;
                                      }
                                  }
                              }
                          }
-                         if !loaded { m.clear_kv_cache(); }
-                     },
-                     ModelVariant::QuantizedText(m) => {
-                         let token_path = path.join("tokens.json");
-                         let mut loaded = false;
-                         if token_path.exists() {
-                             if let Ok(file) = fs::File::open(&token_path) {
-                                 let reader = std::io::BufReader::new(file);
-                                 if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                     let mut match_len = 0;
-                                     for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
-                                         if c == f { match_len += 1; } else { break; }
-                                     }
+                     }
+                     if !loaded { m.clear_kv_cache(); }
+                 },
+                 ModelVariant::QuantizedText(m) => {
+                     let token_path = path.join("tokens.json");
+                     let mut loaded = false;
+                     if token_path.exists() {
+                         if let Ok(file) = fs::File::open(&token_path) {
+                             let reader = std::io::BufReader::new(file);
+                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                 let mut match_len = 0;
+                                 for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
+                                     if c == f { match_len += 1; } else { break; }
+                                 }
 
-                                     if match_len > 50 {
-                                         println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
-                                         // [ZERO-REFILL] Skip redundant re-processing
-                                         // [EXTREME-SPEED] Minimum 1 token refill.
-                                         let refill_len = 1;
-                                         if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
-                                             seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
-                                             loaded = true;
-                                         }
+                                 if match_len > 50 {
+                                     println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
+                                     let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
+                                     if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
+                                         seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
+                                         loaded = true;
                                      }
                                  }
                              }
                          }
-                         if !loaded { m.clear_kv_cache(); }
-                     },
-                     _ => {} 
-                 }
-            }
+                     }
+                     if !loaded { m.clear_kv_cache(); }
+                 },
+                 _ => {} 
+             }
         }
         
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
-        let current_pos = seqlen_offset;
+        let mut current_pos = seqlen_offset;
         let prefill_chunk_size = 256; // Lowered to 256 to minimize 'cat' peak VRAM spikes
         let newline_token_id = 198; // Fallback for '\n'
 
         while current_pos < total_tokens {
-            let now = std::time::Instant::now();
             let remaining = total_tokens - current_pos;
+            
+            // If this is the very last token, we let the generation loop handle it
+            if remaining == 1 && seqlen_offset < total_tokens { break; }
+
+            // Determine chunk size (256 or remaining)
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             
             // If not the final chunk of the whole input, try to align to newline for stability
@@ -501,7 +335,7 @@ impl Qwen3VLGenerateModel {
             // [CRITICAL] Final token of the entire input must be processed by the generation loop 
             // to get the first predicted token logits.
             if current_pos + chunk_size >= total_tokens {
-                chunk_size = (total_tokens - current_pos).saturating_sub(1); 
+                chunk_size = total_tokens - current_pos - 1; 
             }
 
             if chunk_size == 0 { break; }
@@ -513,24 +347,16 @@ impl Qwen3VLGenerateModel {
             
             print!(">"); use std::io::Write; std::io::stdout().flush().ok();
 
-            // [CANCELLATION-CHECK] Check if user clicked stop between chunks
-            if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) { 
-                    println!("[GENERATE] Prefill Stop Requested.");
-                    return Err(anyhow!("Generation cancelled during prefill")); 
-                }
-            }
-
             match &mut self.qwen3_vl {
                 ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
                 ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
             };
             
-            // Allow other tasks (like the Stop command) to run on the executor
-            std::thread::yield_now(); 
+            // [OOM-PREVENTION] Small delay between chunks to let driver settle memory
+            std::thread::sleep(std::time::Duration::from_millis(150));
             
-            let _ = now.elapsed().as_millis();
+            current_pos += chunk_size;
         }
 
         // Finalize state for generation loop
@@ -539,14 +365,10 @@ impl Qwen3VLGenerateModel {
         let last_tokens_vec = &full_input_ids_vec[seqlen_offset..];
         let mut input_ids = Tensor::from_vec(last_tokens_vec.to_vec(), (1, seq_len), &self.text_device)?;
         
-        if seqlen_offset < total_tokens {
-            println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
-        } else {
-            println!("\n[KV-BRIDGE] Context fully matched in cache. Starting generation immediately.");
-        }
+        println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
 
         // Save progress if requested
-        if is_save && seqlen_offset > 0 {
+        if is_save && !is_ingest && seqlen_offset > 0 {
             if let Some(path) = &cache_path {
                 let res = match &mut self.qwen3_vl {
                     ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 0),
@@ -591,7 +413,6 @@ impl Qwen3VLGenerateModel {
             for _i in 0..sample_len {
                 if let Some(flag) = &cancel_flag {
                     if flag.load(Ordering::Relaxed) {
-                        println!("[GENERATE] Stop Requested during sampling.");
                         return Err(anyhow!("Generation cancelled"));
                     }
                 }
@@ -738,108 +559,9 @@ impl Qwen3VLGenerateModel {
 
     pub fn clear_kv_cache(&mut self) {
         match &mut self.qwen3_vl {
-            ModelVariant::Standard(_) => {},
+            ModelVariant::Standard(m) => m.clear_kv_cache(),
             ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
             ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
         }
     }
-
-    pub fn get_kv_len(&self) -> usize {
-        match &self.qwen3_vl {
-            ModelVariant::Standard(_) => 0,
-            ModelVariant::QuantizedVL(m) => m.get_kv_len(),
-            ModelVariant::QuantizedText(m) => m.get_kv_len(),
-        }
-    }
-
-    pub fn load_kv_cache_native(&mut self, path: &std::path::Path, match_len: usize, refill_len: usize) -> Result<()> {
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, match_len, refill_len),
-            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, match_len, refill_len),
-            _ => Ok(()),
-        }
-    }
-
-    pub fn get_cache_match_len(&self, session_id: &Option<String>, full_input_ids: &[u32]) -> usize {
-        if let Some(sid) = session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(sid).join("tokens.json");
-            if path.exists() {
-                if let Ok(file) = std::fs::File::open(&path) {
-                    let reader = std::io::BufReader::new(file);
-                    if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                        let mut match_len = 0;
-                        for (c, f) in cached_tokens.iter().zip(full_input_ids.iter()) {
-                            if c == f { match_len += 1; } else { break; }
-                        }
-                        return match_len;
-                    }
-                }
-            }
-        }
-        0
-    }
-
-    pub fn get_current_kv(&self) -> (Vec<candle_core::Tensor>, Vec<candle_core::Tensor>) {
-        let mut ks: Vec<candle_core::Tensor> = vec![];
-        let mut vs: Vec<candle_core::Tensor> = vec![];
-        
-        match &self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => {
-                for layer in &m.language_model.layers {
-                    if let Some((k, v)) = &layer.self_attn.kv_cache {
-                        let k_tensor: candle_core::Tensor = k.clone();
-                        let v_tensor: candle_core::Tensor = v.clone();
-                        ks.push(k_tensor);
-                        vs.push(v_tensor);
-                    }
-                }
-            },
-            ModelVariant::QuantizedText(m) => {
-                for layer in &m.language_model.layers {
-                    if let Some((k, v)) = &layer.self_attn.kv_cache {
-                        let k_tensor: candle_core::Tensor = k.clone();
-                        let v_tensor: candle_core::Tensor = v.clone();
-                        ks.push(k_tensor);
-                        vs.push(v_tensor);
-                    }
-                }
-            },
-            _ => {}
-        }
-        (ks, vs)
-    }
-
-    pub fn inject_kv(&mut self, ks: &[candle_core::Tensor], vs: &[candle_core::Tensor]) -> anyhow::Result<()> {
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.inject_live_kv(ks, vs)?,
-            ModelVariant::QuantizedText(m) => m.inject_live_kv(ks, vs)?,
-            _ => return Err(anyhow::anyhow!("KV Injection not supported for this model variant")),
-        }
-        Ok(())
-    }
-
-
-
-    
-
-            /// [ASSISTANT-MODE] Ingest context using Small (0.6B) model and return KV Cache metadata
-
-    
-
-            pub fn prefill_assistant(&mut self, _full_input_ids: &[u32], _sid: &Option<String>) -> Result<usize> {
-
-    
-
-                println!("[ASSISTANT] Rapid Ingestion using 0.6B...");
-
-            // This is essentially the same as the prefill part of generate, but forced for Small variant
-
-            // and specifically tuned for speed.
-
-            Ok(0) // Logic to be integrated into main loop
-
-        }
-
-    }
-
-    
+}
