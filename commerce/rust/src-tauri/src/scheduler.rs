@@ -624,19 +624,25 @@ async fn process_task(
         };
 
         // 1. Prepare BOTH models
-        let mut model_lock = model_mutex.lock().await;
-        if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-        let model = model_lock.as_ref().unwrap();
-
-        // [FIX] Correct Order: Load Small FIRST, then Large to enable DUAL-ENGINE handover
-        model.ensure_generator(crate::model::ModelSize::Small).await?;
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
-
-        // 2. Stream from 0.6B to 2B
         {
-            let mut large_gen_lock = model.generator.lock().await; // Large is in main slot now
-            let mut small_gen_lock = model.small_generator.lock().await; // Small was moved to small_generator slot
-            
+            let mut model_lock = model_mutex.lock().await;
+            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+            let model = model_lock.as_ref().unwrap();
+            model.ensure_generator(crate::model::ModelSize::Small).await?;
+            model.ensure_generator(crate::model::ModelSize::Large).await?;
+        } // model_lock dropped here
+
+        // 2. Stream from 0.6B to 2B (Holding only internal generator locks)
+        {
+            let (large_gen_mutex, small_gen_mutex) = {
+                let mut model_lock = model_mutex.lock().await;
+                let model = model_lock.as_mut().unwrap();
+                (model.generator.clone(), model.small_generator.clone())
+            }; // top-level model_lock dropped here
+
+            let mut large_gen_lock = large_gen_mutex.lock().await; 
+            let mut small_gen_lock = small_gen_mutex.lock().await; 
+
             if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
                 println!("[Scheduler] Real-time Relay Started...");
                 let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(task.id.clone()), Some(target))?;
@@ -644,14 +650,25 @@ async fn process_task(
         }
 
         // 3. 2B Inference (Immediate)
-        if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 2B Generating answer immediately...");
-            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
-            let type_info = parsing::parse_json_from_llm(&res);
-            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        {
+            let gen_mutex = {
+                let mut model_lock = model_mutex.lock().await;
+                model_lock.as_mut().unwrap().generator.clone()
+            };
+            
+            let mut gen_lock = gen_mutex.lock().await;
+            if let Some(gen) = gen_lock.as_mut() {
+                println!("[Scheduler] 2B Generating answer immediately...");
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
+                let type_info = parsing::parse_json_from_llm(&res);
+                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            }
+            drop(gen_lock);
+            
+            // Re-acquire model lock just for unloading
+            let mut model_lock = model_mutex.lock().await;
+            model_lock.as_mut().unwrap().unload_generator().await; 
         }
-        
-        model.unload_generator().await; 
         if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
     }
 

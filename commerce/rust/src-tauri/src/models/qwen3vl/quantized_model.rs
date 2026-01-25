@@ -242,10 +242,12 @@ impl QuantizedQwen3VLTextAttention {
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
         
-        // [GHOST-ENGINE-03] Single-Head Attention
-        // For 0.6B worker, only compute 1 head for the ultimate speed boost.
-        let (actual_heads, is_pruned) = if self.num_attention_heads == 16 {
-            (1, true) 
+        // [TURBO-RELAY-03] Head Pruning
+        // Identify 0.6B worker by its hidden dimension (1024)
+        let is_worker = self.q_proj.device().is_cpu() || (self.num_attention_heads * self.head_dim == 1024);
+        
+        let (actual_heads, is_pruned) = if is_worker {
+            (1, true) // Force 1 head for ghost engine
         } else {
             (self.num_attention_heads, false)
         };
@@ -690,9 +692,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         if xs.dtype() != target_dtype { xs = xs.to_dtype(target_dtype)?; }
 
         // [GHOST-ENGINE-01] Extreme Layer Dropping
-        // For 0.6B worker, only compute every 6th layer to maintain a minimal context thread.
-        // This makes the 24-layer model act like a 4-layer model.
-        let is_worker = self.self_attn.num_attention_heads == 16; 
+        // Identify worker by device (CPU) or hidden size (1024)
+        let is_worker = dev.is_cpu() || (self.self_attn.num_attention_heads * self.self_attn.head_dim == 1024);
+        
         if is_worker && self.self_attn.layer_idx % 6 != 0 && self.self_attn.layer_idx != 23 {
             // Passthrough: Skip entire layer math
             return Ok(xs);
@@ -701,7 +703,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
         let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
-        let mut xs = residual.add(&xs)?;
+        let xs = residual.add(&xs)?;
         
         // [GHOST-ENGINE-02] Activation Bypassing
         // Skip heavy MLP and non-linearities for 0.6B worker.
