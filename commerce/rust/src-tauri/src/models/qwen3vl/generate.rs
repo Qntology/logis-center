@@ -300,7 +300,8 @@ impl Qwen3VLGenerateModel {
 
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
-                                     let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
+                                     // [ZERO-REFILL] 2B inherits 0.6B cache perfectly via Linear Bridge. No need to re-read.
+                                     let refill_len = 0;
                                      if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
                                          seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                          loaded = true;
@@ -325,7 +326,8 @@ impl Qwen3VLGenerateModel {
 
                                  if match_len > 50 {
                                      println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
-                                     let refill_len = if self.model_name.contains("-2B") { 128 } else { 0 };
+                                     // [ZERO-REFILL] Skip redundant re-processing
+                                     let refill_len = 0;
                                      if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
                                          seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                          loaded = true;

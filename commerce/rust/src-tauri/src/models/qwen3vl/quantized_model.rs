@@ -117,8 +117,7 @@ pub struct QuantizedQwen3VLTextAttention {
     head_dim: usize,
     num_kv_groups: usize,
     scaling: f64,
-    kv_cache: Option<(Tensor, Tensor)>, // Fallback or temporary
-    qkv_cache: Option<QuantizedKV>,    // [NEW] 4-bit VRAM cache
+    kv_cache: Option<(Tensor, Tensor)>,
     layer_idx: usize,
 }
 
@@ -195,7 +194,6 @@ impl QuantizedQwen3VLTextAttention {
             head_dim,
             scaling,
             kv_cache: None,
-            qkv_cache: None,
             layer_idx,
         })
     }
@@ -214,7 +212,6 @@ impl QuantizedQwen3VLTextAttention {
             self.num_attention_heads,
             self.head_dim,
         ))?;
-        // Norms are also on specific device
         let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
         
         let key_states = self.k_proj.forward(xs)?.reshape((
@@ -231,30 +228,22 @@ impl QuantizedQwen3VLTextAttention {
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
         
-        // [QUANTIZED-KV-LOAD] Unpack VRAM cache if exists
-        let (key_states, value_states) = if let Some(qkv) = &self.qkv_cache {
-            let k_unpacked = self.decompress_from_4bit(&qkv.k_packed, &qkv.k_scales, qkv.block_size)?;
-            let v_unpacked = self.decompress_from_4bit(&qkv.v_packed, &qkv.v_scales, qkv.block_size)?;
-            
-            // [STRICT-SYNC] Ensure perfect device and dtype match
-            let k_unpacked = k_unpacked.to_device(key_states.device())?.to_dtype(key_states.dtype())?;
-            let v_unpacked = v_unpacked.to_device(value_states.device())?.to_dtype(value_states.dtype())?;
-            
-            let k = Tensor::cat(&[&k_unpacked, &key_states], 2)?;
-            let v = Tensor::cat(&[&v_unpacked, &value_states], 2)?;
-            (k, v)
-        } else if let Some((prev_k, prev_v)) = &self.kv_cache {
-            let prev_k = prev_k.to_device(key_states.device())?.to_dtype(key_states.dtype())?;
-            let prev_v = prev_v.to_device(value_states.device())?.to_dtype(value_states.dtype())?;
-            let k = Tensor::cat(&[&prev_k, &key_states], 2)?;
-            let v = Tensor::cat(&[&prev_v, &value_states], 2)?;
-            (k, v)
-        } else {
-            (key_states, value_states)
+        // [HIGH-SPEED-KV] Use standard BF16 cache during active inference/ingestion
+        let (key_states, value_states) = match &self.kv_cache {
+            None => (key_states, value_states),
+            Some((prev_k, prev_v)) => {
+                let prev_k = prev_k.to_device(key_states.device())?.to_dtype(key_states.dtype())?;
+                let prev_v = prev_v.to_device(value_states.device())?.to_dtype(value_states.dtype())?;
+                let k = Tensor::cat(&[&prev_k, &key_states], 2)?;
+                let v = Tensor::cat(&[&prev_v, &value_states], 2)?;
+                (k, v)
+            }
         };
 
-        // [ROBUST-MASK-FIX] Ensure mask covers the entire KV cache length.
-        // If mask is narrow (e.g. [Q, Q]) but scores are wide ([Q, K]), pad left with 0s.
+        // Update working cache
+        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+
+        // Robust Masking
         let actual_seq_len = key_states.dim(2)?;
         let adjusted_mask = if let Some(mask) = attention_mask {
             let mask_len = mask.dim(D::Minus1)?;
@@ -278,18 +267,6 @@ impl QuantizedQwen3VLTextAttention {
             adjusted_mask.as_ref(),
             self.scaling,
         )?;
-
-        // [QUANTIZED-KV-SAVE] Update VRAM cache with 4-bit compression
-        {
-            let block_size = 32; 
-            let (k_packed, k_scales, k_shape) = self.compress_to_4bit(&key_states, block_size)?;
-            let (v_packed, v_scales, _) = self.compress_to_4bit(&value_states, block_size)?;
-            self.qkv_cache = Some(QuantizedKV {
-                k_packed, v_packed, k_scales, v_scales, original_shape: k_shape, block_size
-            });
-            // Clear raw cache to save memory
-            self.kv_cache = None;
-        }
 
         let attn_output =
             attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
@@ -348,37 +325,39 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_cache = None
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         let mut map = HashMap::new();
 
-        // 1. Prefer Quantized KV Cache (VRAM Efficiency)
-        if let Some(qkv) = &self.qkv_cache {
-            map.insert("k_packed".to_string(), qkv.k_packed.to_device(&Device::Cpu)?);
-            map.insert("v_packed".to_string(), qkv.v_packed.to_device(&Device::Cpu)?);
-            map.insert("k_scales".to_string(), qkv.k_scales.to_device(&Device::Cpu)?);
-            map.insert("v_scales".to_string(), qkv.v_scales.to_device(&Device::Cpu)?);
-            map.insert("block_size".to_string(), Tensor::from_vec(vec![qkv.block_size as u32], (1,), &Device::Cpu)?);
-            map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); // Mode 2 = VRAM Pre-quantized
-            map.insert("bits".to_string(), Tensor::from_vec(vec![4u32], (1,), &Device::Cpu)?);
-        }
-        // 2. Fallback to Raw KV Cache
-        else if let Some((k, v)) = &self.kv_cache {
+        if let Some((k, v)) = &self.kv_cache {
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
-            // ... (기존 raw 저장 로직은 생략하거나 유지)
-            map.insert("k_raw".to_string(), k_cpu);
-            map.insert("v_raw".to_string(), v_cpu);
-            map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
+            
+            if block_size == 0 {
+                // [DEFAULT-QUANT] Always compress to 4-bit when saving to disk to save space (1/16 size)
+                let bs = 32;
+                let (k_packed, k_scales, k_shape) = self.compress_to_4bit(&k_cpu, bs)?;
+                let (v_packed, v_scales, _) = self.compress_to_4bit(&v_cpu, bs)?;
+                
+                map.insert("k_packed".to_string(), k_packed);
+                map.insert("v_packed".to_string(), v_packed);
+                map.insert("k_scales".to_string(), k_scales);
+                map.insert("v_scales".to_string(), v_scales);
+                map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
+                map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
+                map.insert("bits".to_string(), Tensor::from_vec(vec![4u32], (1,), &Device::Cpu)?);
+                map.insert("block_size".to_string(), Tensor::from_vec(vec![bs as u32], (1,), &Device::Cpu)?);
+            } else {
+                map.insert("k_raw".to_string(), k_cpu);
+                map.insert("v_raw".to_string(), v_cpu);
+                map.insert("mode".to_string(), Tensor::from_vec(vec![0u32], (1,), &Device::Cpu)?);
+            }
         } else {
             return Ok(());
         }
 
         candle_core::safetensors::save(&map, &file)?;
-        if clear { 
-            self.kv_cache = None;
-            self.qkv_cache = None;
-        }
+        if clear { self.kv_cache = None; }
         Ok(())
     }
 
@@ -402,7 +381,7 @@ impl QuantizedQwen3VLTextAttention {
                 use rayon::prelude::*;
                 let packed = tensors.get(&format!("{}_packed", prefix)).ok_or(anyhow!("Missing packed"))?.to_vec1::<u8>()?;
                 let scales = tensors.get(&format!("{}_scales", prefix)).ok_or(anyhow!("Missing scales"))?.to_vec1::<f32>()?;
-                let shape_u32 = tensors.get(&format!("{}_shape", prefix)).ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
+                let shape_u32 = tensors.get("k_shape").ok_or(anyhow!("Missing shape"))?.to_vec1::<u32>()?;
                 let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
                 let total_elements: usize = shape.iter().product();
                 let mut decoded: Vec<f32> = if b_depth == 4 {
@@ -445,19 +424,37 @@ impl QuantizedQwen3VLTextAttention {
             (dequantize_tensor("k", bits)?, dequantize_tensor("v", bits)?)
         };
 
-        // [FAST-TRANSFORM] Sync architecture: 0.6B Heads -> 2B Heads
+        // [LINEAR-BRIDGE] Convert 0.6B (1024) cache to 2B (2048) cache
+        // h: heads, d: head_dim
         let (_b, h, _s, d) = k.dims4()?;
         let target_heads = self.num_key_value_heads;
         let target_dim = self.head_dim;
 
         if h != target_heads || d != target_dim {
-            if d != target_dim {
-                k = k.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(d))?.narrow(D::Minus1, 0, target_dim)?;
-                v = v.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(d))?.narrow(D::Minus1, 0, target_dim)?;
+            if self.layer_idx == 0 {
+                println!("[KV-BRIDGE] Projecting 0.6B cache ({}, {}) to 2B architecture ({}, {})", h, d, target_heads, target_dim);
             }
+            
+            // 1. Dimension Projection (1024 -> 2048)
+            if d != target_dim {
+                // Instead of just zeros, we ensure the 1024 info is preserved in the first half of 2048.
+                // This is based on the 'Dimension Inheritance' principle.
+                k = k.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(d))?;
+                v = v.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(d))?;
+            }
+            
+            // 2. Head Alignment
             if h != target_heads {
-                k = k.pad_with_zeros(1, 0, target_heads.saturating_sub(h))?.narrow(1, 0, target_heads)?;
-                v = v.pad_with_zeros(1, 0, target_heads.saturating_sub(h))?.narrow(1, 0, target_heads)?;
+                // If head counts differ, we replicate or pad heads to match 2B's attention map.
+                let mut k_heads = vec![];
+                let mut v_heads = vec![];
+                for i in 0..target_heads {
+                    let source_idx = i % h; // Round-robin mapping if 2B has more heads
+                    k_heads.push(k.narrow(1, source_idx, 1)?);
+                    v_heads.push(v.narrow(1, source_idx, 1)?);
+                }
+                k = Tensor::cat(&k_heads, 1)?;
+                v = Tensor::cat(&v_heads, 1)?;
             }
         }
 
