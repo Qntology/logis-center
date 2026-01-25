@@ -120,6 +120,13 @@ async fn move_to_top_center(app_handle: tauri::AppHandle) {
 }
 
 #[tauri::command]
+async fn set_ignore_cursor_events(app_handle: tauri::AppHandle, ignore: bool) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.set_ignore_cursor_events(ignore);
+    }
+}
+
+#[tauri::command]
 async fn launch_browser(
     app_handle: tauri::AppHandle,
     browser: String,
@@ -825,7 +832,7 @@ pub fn run() {
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
-            upsert_items
+            upsert_items, set_ignore_cursor_events
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

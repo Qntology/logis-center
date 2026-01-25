@@ -185,9 +185,35 @@ function collapseWidget() {
     settingsBtn?.classList.remove("active-emoji", "active");
 }
 
+// --- Mouse Passthrough Logic ---
+const interactiveElements = ['.pill-nav', '#content-panel'];
+
+function setupMousePassthrough() {
+    interactiveElements.forEach(selector => {
+        const el = document.querySelector(selector);
+        if (el) {
+            el.addEventListener('mouseenter', () => {
+                invoke('set_ignore_cursor_events', { ignore: false }).catch(console.error);
+            });
+            el.addEventListener('mouseleave', (e: any) => {
+                // Only ignore if we are not moving into another interactive element
+                const relatedTarget = e.relatedTarget as HTMLElement;
+                const isStillInside = interactiveElements.some(s => relatedTarget?.closest(s));
+                if (!isStillInside) {
+                    invoke('set_ignore_cursor_events', { ignore: true }).catch(console.error);
+                }
+            });
+        }
+    });
+
+    // Initial state: ignore if not hovering
+    invoke('set_ignore_cursor_events', { ignore: true }).catch(console.error);
+}
+
 // Drag Logic
 const pillNav = document.querySelector('.pill-nav') as HTMLElement;
 if (pillNav) {
+    setupMousePassthrough(); // Initialize passthrough with the nav
     let isMouseDown = false;
     let startX = 0, startY = 0;
     const DRAG_THRESHOLD = 5;
