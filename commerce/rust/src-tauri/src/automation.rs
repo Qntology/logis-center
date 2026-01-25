@@ -355,7 +355,23 @@ pub async fn extract_html_from_current_tab() -> Result<String, String> {
     };
     if let Some(browser) = browser_opt {
         let pages = browser.pages().await.map_err(|e| e.to_string())?;
-        if let Some(page) = pages.last() {
+        
+        let mut active_page = None;
+        for page in pages.iter() {
+            let is_visible = match page.evaluate("document.visibilityState").await {
+                Ok(res) => res.into_value::<String>().unwrap_or_default() == "visible",
+                Err(_) => false,
+            };
+            if is_visible {
+                active_page = Some(page);
+                break;
+            }
+        }
+
+        // Use the active page found, or fallback to the last page if none are strictly 'visible'
+        let target_page = active_page.or(pages.last());
+
+        if let Some(page) = target_page {
             let html = page.content().await.map_err(|e| e.to_string())?;
             return Ok(html);
         }
