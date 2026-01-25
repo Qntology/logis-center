@@ -605,163 +605,100 @@ async fn process_task(
     let mut page_type = String::new();
     let mut selector_info = json!({});
 
-    // --- TASK 1: CLASSIFICATION (DUAL-ENGINE STREAMING) ---
+    // --- TASK 1: CLASSIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
     {
-        println!("[Scheduler] Starting DUAL-ENGINE STREAMING (0.6B -> 2B Live Bridge)");
+        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
         let type_prompt = parsing::page_type_prompt();
-        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY", type_prompt);
+        
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                        text: format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt) 
+                    })
+                ]),
+                name: None,
+            })],
+            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+            ..Default::default()
+        };
 
-        // [SYNC-START] Ensure BOTH models are ready in memory
+        // 1. Prepare BOTH models
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
         let model = model_lock.as_ref().unwrap();
-        
-        // Load Small (Worker) first to move it to secondary slot, then Master (Large)
+
+        // [FIX] Correct Order: Load Small FIRST, then Large to enable DUAL-ENGINE handover
         model.ensure_generator(crate::model::ModelSize::Small).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        
         model.ensure_generator(crate::model::ModelSize::Large).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        
-        let app_handle_clone = app_handle.clone();
-        let chunks_len = classify_chunks.len();
 
-        for (i, chunk) in classify_chunks.iter().enumerate() {
-            // [CANCELLATION-CHECK] Check at the start of every chunk
-            if cancellation_token.load(Ordering::Relaxed) {
-                println!("[Scheduler] Cancellation detected during streaming loop.");
-                return Err(anyhow::anyhow!("Task cancelled")); 
-            }
-
-            let is_last = i == chunks_len - 1;
-            let content = if is_last { format!("{}\n\n{}", chunk, task_specific_prompt) } else { chunk.clone() };
-
-            // 1. Ingest with 0.6B (Fast Worker)
-            let res = {
-                let mut small_gen_lock = model.small_generator.lock().await;
-                let gen = small_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Small generator not active"))?;
-                
-                let params = ChatCompletionParameters {
-                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                        content: ChatCompletionRequestUserMessageContent::Array(vec![
-                            ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
-                        ]),
-                        name: None,
-                    })],
-                    model: "qwen3vl".to_string(), max_tokens: Some(16), temperature: Some(0.1),
-                    ..Default::default()
-                };
-                
-                // Generate chunk-wise
-                let result = gen.generate(params, Some(cancellation_token.clone()), None)?;
-                
-                // 2. Extract 0.6B KV memory and Inject into 2B memory IMMEDIATELY (VRAM-to-VRAM)
-                let (ks, vs) = gen.get_current_kv();
-                let mut large_gen_lock = model.generator.lock().await;
-                let target = large_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Large generator not active"))?;
-                target.inject_kv(&ks, &vs)?;
-                
-                // [SPEED-UP] Clear 0.6B cache after transfer to keep it fast for the next chunk
-                gen.clear_kv_cache();
-                
-                result
-            };
-
-            let payload = json!({ 
-                "task_id": task.id, 
-                "category": "PUG Analysis", 
-                "summary": format!("Streaming PUG Context {}/{}...", i+1, chunks_len) 
-            });
-            let _ = app_handle.emit("extraction-progress", &payload);
-            
-            if is_last {
-                let type_info = parsing::parse_json_from_llm(&res);
-                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            }
-        }
-        
-        // Release Small generator to free VRAM for 2B's final inference
+        // 2. Stream from 0.6B to 2B
         {
-            let mut small_slot = model.small_generator.lock().await;
-            *small_slot = None; 
+            let mut large_gen_lock = model.generator.lock().await; // Large is in main slot now
+            let mut small_gen_lock = model.small_generator.lock().await; // Small was moved to small_generator slot
+            
+            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                println!("[Scheduler] Real-time Relay Started...");
+                let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(task.id.clone()), Some(target))?;
+            }
+        }
+
+        // 3. 2B Inference (Immediate)
+        if let Some(gen) = model.generator.lock().await.as_mut() {
+            println!("[Scheduler] 2B Generating answer immediately...");
+            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
+            let type_info = parsing::parse_json_from_llm(&res);
+            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
         }
         
-        if page_type.is_empty() || page_type == "unknown" {
-            return Ok(());
-        }
+        model.unload_generator().await; 
+        if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
     }
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
     wait_for_resources_settled(2500, 1500).await;
 
-    // --- TASK 2: SELECTOR IDENTIFICATION (DUAL-ENGINE STREAMING) ---
+    // --- TASK 2: SELECTOR IDENTIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
     {
-        println!("[Scheduler] Starting DUAL-ENGINE STREAMING (0.6B -> 2B Live Bridge)");
+        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let task_specific_prompt = format!("TASK: {}\n\nACTION: JSON ONLY", selector_prompt);
+        
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Array(vec![
+                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                        text: format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, selector_prompt) 
+                    })
+                ]),
+                name: None,
+            })],
+            model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
+            ..Default::default()
+        };
 
-        // Ensure models are active
         let mut model_lock = model_mutex.lock().await;
         if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
         let model = model_lock.as_ref().unwrap();
-        
+
+        // [FIX] Correct Order: Load Small FIRST, then Large
         model.ensure_generator(crate::model::ModelSize::Small).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
         model.ensure_generator(crate::model::ModelSize::Large).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        
-        let app_handle_clone = app_handle.clone();
-        let chunks_len = classify_chunks.len();
 
-        for (i, chunk) in classify_chunks.iter().enumerate() {
-            if cancellation_token.load(Ordering::Relaxed) {
-                println!("[Scheduler] Cancellation detected during selectors loop.");
-                return Err(anyhow::anyhow!("Task cancelled")); 
-            }
-
-            let is_last = i == chunks_len - 1;
-            let content = if is_last { format!("{}\n\n{}", chunk, task_specific_prompt) } else { chunk.clone() };
-
-            // 1. Ingest with 0.6B
-            let res = {
-                let mut small_gen_lock = model.small_generator.lock().await;
-                let gen = small_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Small generator not active"))?;
-                
-                let params = ChatCompletionParameters {
-                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                        content: ChatCompletionRequestUserMessageContent::Array(vec![
-                            ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: content })
-                        ]),
-                        name: None,
-                    })],
-                    model: "qwen3vl".to_string(), max_tokens: Some(16), temperature: Some(0.1),
-                    ..Default::default()
-                };
-                
-                let result = gen.generate(params, Some(cancellation_token.clone()), None)?;
-                
-                // 2. Inject into 2B
-                let (ks, vs) = gen.get_current_kv();
-                let mut large_gen_lock = model.generator.lock().await;
-                let target = large_gen_lock.as_mut().ok_or_else(|| anyhow::anyhow!("Large generator not active"))?;
-                target.inject_kv(&ks, &vs)?;
-                
-                gen.clear_kv_cache();
-                result
-            };
-
-            let payload = json!({ "task_id": task.id, "category": "Selectors Identification", "summary": format!("Streaming Context {}/{}...", i+1, chunks_len) });
-            let _ = app_handle.emit("extraction-progress", &payload);
-            
-            if is_last {
-                selector_info = parsing::parse_json_from_llm(&res);
-                println!("[Scheduler] Selectors Identified: {}", selector_info);
+        {
+            let mut large_gen_lock = model.generator.lock().await;
+            let mut small_gen_lock = model.small_generator.lock().await;
+            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)), Some(target))?;
             }
         }
-        
-        let mut small_slot = model.small_generator.lock().await;
-        *small_slot = None; 
+
+        if let Some(gen) = model.generator.lock().await.as_mut() {
+            println!("[Scheduler] 2B Identifying selectors immediately...");
+            let res = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)))?;
+            selector_info = parsing::parse_json_from_llm(&res);
+            println!("[Scheduler] Selectors Identified: {}", selector_info);
+        }
+        model.unload_generator().await;
     }
 
     let mut final_page_info = json!({ "type": page_type });
@@ -1233,130 +1170,150 @@ async fn process_task(
             return Ok(());
         }
 
-        // [DEBUG-LOG] Save content pug
-        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
-
-        // CHUNKING: Split huge content into chunks (24000 chars to be safe for details)
-        let device_config = utils::get_optimal_device_config();
-        let chunks = chunk_text(&content_pug, device_config.extract_chunk_size, 3000);
-        let chunks_len = chunks.len();
-        
-        let extraction_instruction = parsing::item2json(page_type, &url, language);
-        let detail_session_id = format!("{}_detail", task.id); // Separate session
-
-        // [HYBRID] Detail Extraction
-        let mut extracted_data_temp = json!({});
-
-        // 1. Fast Ingest with 0.6B
-        {
-            let mut model_lock = model_mutex.lock().await;
-            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
-            if let Some(model) = model_lock.as_ref() {
-                model.ensure_generator(crate::model::ModelSize::Small).await?;
-                let app_handle_clone = app_handle.clone();
+                        // [DEBUG-LOG] Save content pug
+                        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                        let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
                 
-                for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                    let is_last = chunk_idx == chunks_len - 1;
-                    let action_flag = if is_last { 
-                        format!("\n\nACTION: JSON ONLY\n\nACTION: SAVE") 
-                    } else { 
-                        format!("\n\nACTION: INGEST") 
-                    };
-                    let effective_prompt = format!("{}{}", chunk, action_flag);
-
-                    // [CLEAN-LOOP] Do not accumulate system/user history in RAM.
-                    let messages = vec![
-                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            content: extraction_instruction.clone(),
-                            name: None,
-                        }),
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: effective_prompt })
-                            ]),
-                            name: None,
-                        })
-                    ];
-
-                    let params = ChatCompletionParameters {
-                        messages,
-                        model: "qwen3vl".to_string(),
-                        max_tokens: Some(16), 
-                        temperature: Some(0.1),
-                        ..Default::default()
-                    };
-
-                    let _ = model.chat_params_with_spinner(
-                        params, &app_handle_clone, "Fast Ingestion (0.6B)",
-                        json!({ "task_id": task.id, "category": "Detail Ingestion", "summary": format!("Recording part {}/{}...", chunk_idx + 1, chunks_len) }),
-                        Some(cancellation_token.clone()), Some(detail_session_id.clone())
-                    ).await?;
-                }
-                model.unload_generator().await;
-            }
-            *model_lock = None; 
-            drop(model_lock);
-        }
-        
-        wait_for_resources_settled(2500, 1500).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-        // 2. Precise Infer with 2B
+                                // [HYBRID] Detail Extraction (REAL-TIME RELAY MODE)
+                
+                                let mut extracted_data_temp = json!({});
+                
+                                let extraction_instruction = parsing::item2json(page_type, &url, language);
+                
+                                let detail_session_id = format!("{}_detail", task.id); 
+                
+                        
+                
+                                // 1. Prepare Unified Parameters for Detail
+                
+                                let params = ChatCompletionParameters {
+                
+                                    messages: vec![
+                
+                                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                
+                                            content: extraction_instruction.clone(),
+                
+                                            name: None,
+                
+                                        }),
+                
+                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                
+                                            content: ChatCompletionRequestUserMessageContent::Array(vec![
+                
+                                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                
+                                                    text: format!("{}\n\nTASK: JSON ONLY\n\nACTION: SAVE", content_pug) 
+                
+                                                })
+                
+                                            ]),
+                
+                                            name: None,
+                
+                                        })
+                
+                                    ],
+                
+                                    model: "qwen3vl".to_string(), max_tokens: Some(8192), temperature: Some(0.1),
+                
+                                    ..Default::default()
+                
+                                };
+                
+                        
+                
+                                        // 2. Real-time Stream from 0.6B to 2B
+                
+                        
+                
+                                        {
+                
+                        
+                
+                                            let mut model_lock = model_mutex.lock().await;
+                
+                        
+                
+                                            if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+                
+                        
+                
+                                            let model = model_lock.as_ref().unwrap();
+                
+                        
+                
+                                
+                
+                        
+                
+                                            // [FIX] Correct Order: Load Small FIRST, then Large
+                
+                        
+                
+                                            model.ensure_generator(crate::model::ModelSize::Small).await?;
+                
+                        
+                
+                                            model.ensure_generator(crate::model::ModelSize::Large).await?;
+                
+                        
+                
+                                
+                
+                        
+                
+                                            {
+                
+                                        let mut large_gen_lock = model.generator.lock().await;
+                
+                                        let mut small_gen_lock = model.small_generator.lock().await;
+                
+                                        if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                
+                                            println!("[Scheduler] Detail Ingestion (Relay) Started...");
+                
+                                            let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(detail_session_id.clone()), Some(target))?;
+                
+                                        }
+                
+                                    }
+                
+                                    model.unload_generator().await; // Unload Small
+                
+                                }
+                
+                                
+                
+                                wait_for_resources_settled(2500, 1500).await;
+                
+                        
+                
+        // 3. Precise Infer with 2B (Immediate)
         let response = {
             let mut model_lock = model_mutex.lock().await;
             if model_lock.is_none() { *model_lock = Some(LogisModel::new(None).await?); }
+            let model = model_lock.as_ref().unwrap();
             
-            let res = if let Some(model) = model_lock.as_ref() {
-                model.ensure_generator(crate::model::ModelSize::Large).await?;
-                let app_handle_clone = app_handle.clone();
-                
-                let final_prompt = format!("TASK: JSON ONLY\n\nACTION: SAVE");
-
-                let messages = vec![
-                    ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                        content: extraction_instruction.clone(),
-                        name: None,
-                    }),
-                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                        content: ChatCompletionRequestUserMessageContent::Array(vec![
-                            ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: final_prompt })
-                        ]),
-                        name: None,
-                    })
-                ];
-
-                let params = ChatCompletionParameters {
-                    messages,
-                    model: "qwen3vl".to_string(),
-                    max_tokens: Some(8192),
-                    temperature: Some(0.1),
-                    ..Default::default()
-                };
-
-                model.chat_params_with_spinner(
-                    params, &app_handle_clone, "Precise Analysis (2B)",
-                    json!({ "task_id": task.id, "category": "Detail Extraction", "summary": "Finalizing data extraction..." }),
-                    Some(cancellation_token.clone()), Some(detail_session_id.clone())
-                ).await?
+            let res = if let Some(model_instance) = model_lock.as_ref() {
+                model_instance.ensure_generator(crate::model::ModelSize::Large).await?;
+                if let Some(gen) = model_instance.generator.lock().await.as_mut() {
+                    println!("[Scheduler] 2B Extracting details immediately...");
+                    gen.generate(params, Some(cancellation_token.clone()), Some(detail_session_id.clone()))?
+                } else { "{}".to_string() }
             } else { "{}".to_string() };
             
-            // Unload 2B
             if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
             *model_lock = None; 
-            drop(model_lock);
             res
         };
 
         if !response.is_empty() {
             println!("[EXTRACT-FINAL] Result: {}", response);
-            extracted_data_temp = parsing::parse_json_from_llm(&response);
+            extracted_data = parsing::parse_json_from_llm(&response);
         }
-        
-        extracted_data = extracted_data_temp;
-    }
-    
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    }    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     if let Some(obj) = extracted_data.as_object_mut() {
         if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }

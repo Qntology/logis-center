@@ -92,8 +92,8 @@ pub fn get_memory_usage() -> (u64, u64) {
 /// * `timeout_ms`: Max time to wait (e.g., 5000ms)
 pub async fn wait_for_memory_release(baseline_ram: u64, baseline_vram: u64, timeout_ms: u64) {
     let start = Instant::now();
-    let margin_ram = 1024 * 1024 * 1024; // 1GB tolerance (OS memory management is lazy)
-    let margin_vram = 400 * 1024 * 1024; // 400MB tolerance
+    let margin_ram = 1536 * 1024 * 1024; // 1.5GB tolerance (Windows memory management can be very slow)
+    let margin_vram = 600 * 1024 * 1024; // 600MB tolerance
     
     println!("[MEM-WATCH] Waiting for release... Target RAM < {:.2} GB, VRAM < {:.2} GB", 
         (baseline_ram + margin_ram) as f64 / 1e9, (baseline_vram + margin_vram) as f64 / 1e9);

@@ -8517,6 +8517,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
+ "safetensors",
  "scraper",
  "serde",
  "serde_json",

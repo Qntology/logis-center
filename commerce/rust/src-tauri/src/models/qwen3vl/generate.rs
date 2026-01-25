@@ -241,6 +241,76 @@ impl Qwen3VLGenerateModel {
         })
     }
 
+    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let input = self.pre_processor.process_info(&mes, &mes_render)?;
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+        let total_tokens = full_input_ids_vec.len();
+
+        let seqlen_offset = self.get_kv_len();
+        let mut current_pos = seqlen_offset;
+        // [SMOOTH-RELAY] Reduce chunk size to 128 for more frequent updates and lower peak CPU/VRAM pressure
+        let prefill_chunk_size = 128; 
+
+        println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);
+
+        while current_pos < total_tokens {
+            let remaining = total_tokens - current_pos;
+            let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+            
+            // [CRITICAL] Leave at least 1 token for the generate() call
+            if current_pos + chunk_size >= total_tokens { 
+                chunk_size = (total_tokens - current_pos).saturating_sub(1); 
+            }
+            if chunk_size == 0 { break; }
+
+            let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
+            let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
+            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
+            }
+
+            match &mut self.qwen3_vl {
+                ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
+            };
+            
+            // [STREAMING-RELAY] Immediately push to 2B and clear local RAM
+            if let Some(ref mut target) = relay_target {
+                let (ks, vs) = self.get_current_kv();
+                target.inject_kv(&ks, &vs)?;
+                self.clear_kv_cache(); // Empty the 0.6B cup into the 2B cup
+            }
+
+            current_pos += chunk_size;
+            
+            // [AGGRESSIVE-LOGGING] Log every chunk for real-time feedback
+            let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
+            println!("[RELAY] Pushed {}/{} tokens to 2B ({:.1}%)", current_pos, total_tokens, progress);
+        }
+
+        // Save progress if session_id is provided (for CPU sequential mode)
+        if let Some(sid) = &session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            if !path.exists() { let _ = fs::create_dir_all(&path); }
+            
+            match &mut self.qwen3_vl {
+                ModelVariant::QuantizedVL(m) => { let _ = m.save_kv_cache(&path, false, 1024); },
+                ModelVariant::QuantizedText(m) => { let _ = m.save_kv_cache(&path, false, 1024); },
+                _ => {},
+            }
+            let token_path = path.join("tokens.json");
+            if let Ok(file) = fs::File::create(&token_path) {
+                let _ = serde_json::to_writer(file, &full_input_ids_vec);
+            }
+        }
+
+        Ok(current_pos)
+    }
+
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
         let temperature = match mes.temperature {
             None => self.generation_config.temperature,
@@ -273,9 +343,13 @@ impl Qwen3VLGenerateModel {
         let is_ingest = input.replace_text.contains("ACTION: INGEST");
         let is_save = input.replace_text.contains("ACTION: SAVE");
         
-        let mut seqlen_offset = 0;
+        // [FIX] CHECK LIVE CACHE FIRST: If 0.6B just injected KV, detect it here.
+        let live_kv_len = self.get_kv_len();
+        if live_kv_len > 0 {
+            println!("[KV-BRIDGE] Detected Live Injected KV: {} tokens. Skipping redundant prefill.", live_kv_len);
+        }
 
-        // KV Cache Disk Loading
+        // KV Cache Disk Loading (Only if live cache is empty)
         let cache_path = if let Some(sid) = &session_id {
              let p = crate::utils::paths::get_kv_dir(None).join(sid);
              if !p.exists() { let _ = fs::create_dir_all(&p); }
@@ -284,62 +358,67 @@ impl Qwen3VLGenerateModel {
              None
         };
 
-        if let Some(path) = &cache_path {
-             match &mut self.qwen3_vl {
-                 ModelVariant::QuantizedVL(m) => {
-                     let token_path = path.join("tokens.json");
-                     let mut loaded = false;
-                     if token_path.exists() {
-                         if let Ok(file) = fs::File::open(&token_path) {
-                             let reader = std::io::BufReader::new(file);
-                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                 let mut match_len = 0;
-                                 for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
-                                     if c == f { match_len += 1; } else { break; }
-                                 }
+        let mut seqlen_offset = live_kv_len; 
+        if seqlen_offset == 0 {
+            if let Some(path) = &cache_path {
+                 match &mut self.qwen3_vl {
+                     ModelVariant::QuantizedVL(m) => {
+                         let token_path = path.join("tokens.json");
+                         let mut loaded = false;
+                         if token_path.exists() {
+                             if let Ok(file) = fs::File::open(&token_path) {
+                                 let reader = std::io::BufReader::new(file);
+                                 if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                     let mut match_len = 0;
+                                     for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
+                                         if c == f { match_len += 1; } else { break; }
+                                     }
 
-                                 if match_len > 50 {
-                                     println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
-                                     // [ZERO-REFILL] 2B inherits 0.6B cache perfectly via Linear Bridge. No need to re-read.
-                                     let refill_len = 0;
-                                     if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
-                                         seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
-                                         loaded = true;
+                                     if match_len > 50 {
+                                         println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
+                                         // [ZERO-REFILL] 2B inherits 0.6B cache perfectly via Linear Bridge. No need to re-read.
+                                         // [UPSCALE-REFILL] Let 2B re-refine the last 64 tokens for better quality.
+                                         let refill_len = 64;
+                                         if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
+                                             seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
+                                             loaded = true;
+                                         }
                                      }
                                  }
                              }
                          }
-                     }
-                     if !loaded { m.clear_kv_cache(); }
-                 },
-                 ModelVariant::QuantizedText(m) => {
-                     let token_path = path.join("tokens.json");
-                     let mut loaded = false;
-                     if token_path.exists() {
-                         if let Ok(file) = fs::File::open(&token_path) {
-                             let reader = std::io::BufReader::new(file);
-                             if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
-                                 let mut match_len = 0;
-                                 for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
-                                     if c == f { match_len += 1; } else { break; }
-                                 }
+                         if !loaded { m.clear_kv_cache(); }
+                     },
+                     ModelVariant::QuantizedText(m) => {
+                         let token_path = path.join("tokens.json");
+                         let mut loaded = false;
+                         if token_path.exists() {
+                             if let Ok(file) = fs::File::open(&token_path) {
+                                 let reader = std::io::BufReader::new(file);
+                                 if let Ok(cached_tokens) = serde_json::from_reader::<_, Vec<u32>>(reader) {
+                                     let mut match_len = 0;
+                                     for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
+                                         if c == f { match_len += 1; } else { break; }
+                                     }
 
-                                 if match_len > 50 {
-                                     println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
-                                     // [ZERO-REFILL] Skip redundant re-processing
-                                     let refill_len = 0;
-                                     if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
-                                         seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
-                                         loaded = true;
+                                     if match_len > 50 {
+                                         println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
+                                         // [ZERO-REFILL] Skip redundant re-processing
+                                         // [UPSCALE-REFILL] Let 2B re-refine the last 64 tokens for better quality.
+                                         let refill_len = 64;
+                                         if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
+                                             seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
+                                             loaded = true;
+                                         }
                                      }
                                  }
                              }
                          }
-                     }
-                     if !loaded { m.clear_kv_cache(); }
-                 },
-                 _ => {} 
-             }
+                         if !loaded { m.clear_kv_cache(); }
+                     },
+                     _ => {} 
+                 }
+            }
         }
         
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
@@ -351,7 +430,7 @@ impl Qwen3VLGenerateModel {
             let remaining = total_tokens - current_pos;
             
             // If this is the very last token, we let the generation loop handle it
-            if remaining == 1 && seqlen_offset < total_tokens { break; }
+            if remaining == 1 && current_pos < total_tokens { break; }
 
             // Determine chunk size (256 or remaining)
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
@@ -370,7 +449,7 @@ impl Qwen3VLGenerateModel {
             // [CRITICAL] Final token of the entire input must be processed by the generation loop 
             // to get the first predicted token logits.
             if current_pos + chunk_size >= total_tokens {
-                chunk_size = total_tokens - current_pos - 1; 
+                chunk_size = (total_tokens - current_pos).saturating_sub(1); 
             }
 
             if chunk_size == 0 { break; }
@@ -385,7 +464,7 @@ impl Qwen3VLGenerateModel {
             // [CANCELLATION-CHECK] Check if user clicked stop between chunks
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) {
-                    println!("[GENERATE] Cancellation detected during prefill.");
+                    println!("[GENERATE] Generation cancelled during prefill.");
                     return Err(anyhow!("Generation cancelled during prefill"));
                 }
             }
@@ -408,7 +487,11 @@ impl Qwen3VLGenerateModel {
         let last_tokens_vec = &full_input_ids_vec[seqlen_offset..];
         let mut input_ids = Tensor::from_vec(last_tokens_vec.to_vec(), (1, seq_len), &self.text_device)?;
         
-        println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
+        if seqlen_offset < total_tokens {
+            println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
+        } else {
+            println!("\n[KV-BRIDGE] Context fully matched in cache. Starting generation immediately.");
+        }
 
         // Save progress if requested
         if is_save && seqlen_offset > 0 {
@@ -605,6 +688,14 @@ impl Qwen3VLGenerateModel {
             ModelVariant::Standard(_) => {},
             ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
             ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
+        }
+    }
+
+    pub fn get_kv_len(&self) -> usize {
+        match &self.qwen3_vl {
+            ModelVariant::Standard(_) => 0,
+            ModelVariant::QuantizedVL(m) => m.get_kv_len(),
+            ModelVariant::QuantizedText(m) => m.get_kv_len(),
         }
     }
 

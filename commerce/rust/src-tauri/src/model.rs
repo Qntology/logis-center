@@ -227,6 +227,9 @@ impl LogisModel {
                 println!("[MODEL-CONFIG] Offloading 0.6B to CPU to reserve VRAM for 2B.");
                 Device::Cpu
             } else {
+                if self.device_config.device.is_cuda() {
+                    println!("[MODEL-CONFIG] Loading {:?} directly into GPU VRAM.", size);
+                }
                 self.device_config.device.clone()
             };
 
