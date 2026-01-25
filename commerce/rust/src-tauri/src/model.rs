@@ -209,7 +209,6 @@ impl LogisModel {
             println!("[MODEL] Switching/Loading model to size: {:?}...", size);
             
             // [DUAL-ENGINE-HANDOVER] 
-            // If switching from Small to Large, move Small to the secondary slot instead of dropping.
             if *current_size_guard == Some(ModelSize::Small) && size == ModelSize::Large && self.dual_mode_enabled {
                 let mut small_slot = self.small_generator.lock().await;
                 if let Some(m) = gen_guard.take() {
@@ -217,13 +216,35 @@ impl LogisModel {
                     *small_slot = Some(m);
                 }
             } else {
-                *gen_guard = None; // Normal drop
+                *gen_guard = None; 
             }
             
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
             let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
             
-            let gen = self.load_generator_internal(path, shared_path).await?;
+            // [STRATEGY] Force 0.6B to CPU if GPU exists to save VRAM for 2B
+            let target_device = if size == ModelSize::Small && self.device_config.device.is_cuda() {
+                println!("[MODEL-CONFIG] Offloading 0.6B to CPU to reserve VRAM for 2B.");
+                Device::Cpu
+            } else {
+                self.device_config.device.clone()
+            };
+
+            let dev_id = self.device_config.gpu_id;
+            let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+            let limit = self.max_tokens_limit;
+            let path_clone = path.to_string();
+            let shared_path_clone = shared_path.map(|s| s.to_string());
+
+            let gen = tokio::task::spawn_blocking(move || {
+                Qwen3VLGenerateModel::init_with_config(
+                    &path_clone, 
+                    shared_path_clone.as_deref(), 
+                    shared_path_clone.as_deref(), 
+                    Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize)
+                )
+            }).await??;
+
             *gen_guard = Some(gen);
             *current_size_guard = Some(size);
         }

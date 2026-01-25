@@ -38,26 +38,17 @@ impl RmsNorm {
     pub fn weight(&self) -> &Tensor {
         &self.weight
     }
-}
 
-impl Module for RmsNorm {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
-        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let hidden_states = hidden_states.to_dtype(dtype)?;
-        hidden_states.broadcast_mul(&self.weight)
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if !self.weight.device().same_device(device) {
+            self.weight = self.weight.to_device(device)?;
+        }
+        Ok(())
     }
 }
 
-// Wrapper for QMatMul to act like Linear
-pub struct QLinear {
-    inner: QMatMul,
-    bias: Option<Tensor>,
-    device: Device, // Track device explicitly
-}
-
+impl Module for RmsNorm {
+// ... (중략) ...
 impl QLinear {
     pub fn new(inner: QMatMul, bias: Option<Tensor>, device: Device) -> Self {
         Self { inner, bias, device }
@@ -65,6 +56,20 @@ impl QLinear {
     
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if !self.device.same_device(device) {
+            // Move bias
+            if let Some(b) = &self.bias {
+                self.bias = Some(b.to_device(device)?);
+            }
+            // Move inner QMatMul (Note: Candle QMatMul handles device internally or needs recreation)
+            // For now, we update the tracked device. 
+            // In a strict sense, we might need to move the inner tensors of QMatMul.
+            self.device = device.clone();
+        }
+        Ok(())
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -122,6 +127,19 @@ pub struct QuantizedQwen3VLTextAttention {
 }
 
 impl QuantizedQwen3VLTextAttention {
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.q_proj.to_device(device)?;
+        self.k_proj.to_device(device)?;
+        self.v_proj.to_device(device)?;
+        self.o_proj.to_device(device)?;
+        self.q_norm.to_device(device)?;
+        self.k_norm.to_device(device)?;
+        if let Some((k, v)) = &self.kv_cache {
+            self.kv_cache = Some((k.to_device(device)?, v.to_device(device)?));
+        }
+        Ok(())
+    }
+
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
         ct: &gguf_file::Content,
@@ -339,8 +357,13 @@ impl QuantizedQwen3VLTextAttention {
     pub fn inject_live_kv(&mut self, k_small: &Tensor, v_small: &Tensor) -> Result<()> {
         let target_heads = self.num_key_value_heads;
         let target_dim = self.head_dim;
+        let target_device = self.q_proj.device(); // 2B model's device (GPU)
         
-        // 1. Dimension Projection (1024 -> 2048)
+        // 1. Move to target device if needed (CPU -> GPU Transfer)
+        let k_small = if !k_small.device().same_device(target_device) { k_small.to_device(target_device)? } else { k_small.clone() };
+        let v_small = if !v_small.device().same_device(target_device) { v_small.to_device(target_device)? } else { v_small.clone() };
+
+        // 2. Dimension Projection (1024 -> 2048)
         let k_projected = k_small.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(k_small.dim(D::Minus1)?))?;
         let v_projected = v_small.pad_with_zeros(D::Minus1, 0, target_dim.saturating_sub(v_small.dim(D::Minus1)?))?;
         
@@ -529,6 +552,16 @@ pub struct QuantizedQwen3VLTextDecoderLayer {
 }
 
 impl QuantizedQwen3VLTextDecoderLayer {
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.self_attn.to_device(device)?;
+        self.mlp_gate.to_device(device)?;
+        self.mlp_up.to_device(device)?;
+        self.mlp_down.to_device(device)?;
+        self.input_layernorm.to_device(device)?;
+        self.post_attention_layernorm.to_device(device)?;
+        Ok(())
+    }
+
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
         ct: &gguf_file::Content,
