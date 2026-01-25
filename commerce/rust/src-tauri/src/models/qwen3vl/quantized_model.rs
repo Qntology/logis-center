@@ -48,7 +48,23 @@ impl RmsNorm {
 }
 
 impl Module for RmsNorm {
-// ... (중략) ...
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let hidden_states = hidden_states.to_dtype(dtype)?;
+        hidden_states.broadcast_mul(&self.weight)
+    }
+}
+
+// Wrapper for QMatMul to act like Linear
+pub struct QLinear {
+    inner: QMatMul,
+    bias: Option<Tensor>,
+    device: Device, // Track device explicitly
+}
+
 impl QLinear {
     pub fn new(inner: QMatMul, bias: Option<Tensor>, device: Device) -> Self {
         Self { inner, bias, device }
@@ -62,7 +78,8 @@ impl QLinear {
         if !self.device.same_device(device) {
             // Move bias
             if let Some(b) = &self.bias {
-                self.bias = Some(b.to_device(device)?);
+                let moved_b: Tensor = b.to_device(device)?;
+                self.bias = Some(moved_b);
             }
             // Move inner QMatMul (Note: Candle QMatMul handles device internally or needs recreation)
             // For now, we update the tracked device. 
@@ -89,7 +106,7 @@ impl QLinear {
         let out = self.inner.forward(&xs_f32_flat)?;
         let out = out.reshape((b, s, ()))?;
         
-        let target_dtype = self.bias.as_ref().map(|b| b.dtype()).unwrap_or(xs.dtype());
+        let target_dtype = self.bias.as_ref().map(|b: &Tensor| b.dtype()).unwrap_or(xs.dtype());
         let out = out.to_dtype(target_dtype)?;
 
         if let Some(bias) = &self.bias {
@@ -247,7 +264,7 @@ impl QuantizedQwen3VLTextAttention {
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
         
         // [HIGH-SPEED-KV] Use standard BF16 cache during active inference/ingestion
-        let (key_states, value_states) = match &self.kv_cache {
+        let (key_states, value_states): (Tensor, Tensor) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
                 let prev_k = prev_k.to_device(key_states.device())?.to_dtype(key_states.dtype())?;
@@ -639,7 +656,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let gate = self.mlp_gate.forward(&xs)?;
             let up = self.mlp_up.forward(&xs)?;
             let gate = candle_nn::ops::silu(&gate)?;
-            let hidden = (gate * up)?;
+            let hidden = gate.mul(&up)?;
             self.mlp_down.forward(&hidden)?
         };
         let xs = residual.add(&xs)?;
