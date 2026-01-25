@@ -256,6 +256,8 @@ impl Qwen3VLGenerateModel {
             if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
         }
 
+        // [OPTIMIZATION] Directly call forward. It uses the CPU threads already assigned to Rayon
+        // during model creation (or standard Rayon threads) without nesting pools.
         match &mut self.qwen3_vl {
             ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
             ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), start_pos)?; },
@@ -264,25 +266,22 @@ impl Qwen3VLGenerateModel {
 
         let (full_ks, full_vs) = self.get_current_kv();
         
-        // [INCREMENTAL-FLOW] Slice to return only the NEW KVs for this chunk
-        // This allows 0.6B to keep its full context (essential for correctness) 
-        // while sending only the delta to 2B (essential for efficiency/correctness).
+        // [INCREMENTAL-FLOW] Use contiguous() to ensure the tensors are NOT views.
+        // This prevents synchronization issues between CPU/GPU model instances.
         let mut new_ks = Vec::with_capacity(full_ks.len());
         let mut new_vs = Vec::with_capacity(full_vs.len());
 
         for (k, v) in full_ks.iter().zip(full_vs.iter()) {
-            // KV Cache Shape: [Batch, Heads, SeqLen, HeadDim]
-            // We slice on Dim 2 (SeqLen)
             let seq_len = k.dim(2)?;
             if start_pos < seq_len {
                 let len = usize::min(chunk_size, seq_len - start_pos);
-                // Ensure we don't slice out of bounds
-                new_ks.push(k.narrow(2, start_pos, len)?);
-                new_vs.push(v.narrow(2, start_pos, len)?);
+                // [STRICT-COPY] contiguous().copy() ensures these are not views.
+                // This allows 2B to process them on GPU without locking the 0.6B CPU cache.
+                new_ks.push(k.narrow(2, start_pos, len)?.contiguous()?.copy()?);
+                new_vs.push(v.narrow(2, start_pos, len)?.contiguous()?.copy()?);
             } else {
-                // If something weird happened and cache didn't grow, push empty or handle error.
-                new_ks.push(k.narrow(2, 0, 0)?);
-                new_vs.push(v.narrow(2, 0, 0)?);
+                new_ks.push(k.narrow(2, 0, 0)?.contiguous()?.copy()?);
+                new_vs.push(v.narrow(2, 0, 0)?.contiguous()?.copy()?);
             }
         }
 

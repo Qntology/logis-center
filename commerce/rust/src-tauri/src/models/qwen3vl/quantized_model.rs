@@ -413,29 +413,20 @@ impl QuantizedQwen3VLTextAttention {
 
     // [LIVE-BRIDGE] Inject 1024-dim KV from 0.6B into 2048-dim VRAM of 2B
     pub fn inject_live_kv(&mut self, k_small: &Tensor, v_small: &Tensor) -> Result<()> {
-        // [VRAM-LOG] Starting Vision Encoder...
-        let target_heads = self.num_key_value_heads;
-        let target_dim = self.head_dim;
-        let target_device = self.q_proj.device(); // 2B model's device (GPU)
+        let target_device = self.q_proj.device(); // 2B 모델의 GPU 장치
         
-        // [FORCE-VRAM] Move to target device immediately to show VRAM usage
+        // 1. 1024 데이터를 안전하게 GPU로 이동 (충돌 방지된 복사본 사용)
         let k_small = k_small.to_device(target_device)?;
         let v_small = v_small.to_device(target_device)?;
 
-        // 2. Dimension Replication (1024 -> 2048)
-        // Instead of zero padding, we duplicate the signal to keep the 2B model's attention active.
-        let k_projected = if k_small.dim(D::Minus1)? < target_dim {
-            Tensor::cat(&[&k_small, &k_small], D::Minus1)?
-        } else { k_small.clone() };
+        // 2. [유지] 1024 -> 2048 차원 복제 (사용자 핵심 요구사항)
+        // 브릿지 역할 수행: 신호를 두 배로 확장하여 2B 규격에 맞춤
+        let k_projected = Tensor::cat(&[&k_small, &k_small], D::Minus1)?;
+        let v_projected = Tensor::cat(&[&v_small, &v_small], D::Minus1)?;
         
-        let v_projected = if v_small.dim(D::Minus1)? < target_dim {
-            Tensor::cat(&[&v_small, &v_small], D::Minus1)?
-        } else { v_small.clone() };
-        
-        // 2. Head Replication (e.g., 8 heads -> 16 heads)
-        // [OPTIMIZED] Use repeat instead of manual loop + cat for much better performance
+        // 3. 헤드 개수 정렬 (8개 -> 16개 등)
         let source_heads = k_projected.dim(1)?;
-        let head_repeat = target_heads / source_heads;
+        let head_repeat = self.num_key_value_heads / source_heads;
         
         let k_final = if head_repeat > 1 {
             k_projected.repeat((1, head_repeat, 1, 1))?
@@ -449,7 +440,7 @@ impl QuantizedQwen3VLTextAttention {
             v_projected
         };
         
-        // 3. Append to existing cache
+        // 4. 2B 모델의 캐시에 최종 병합
         self.kv_cache = match &self.kv_cache {
             None => Some((k_final, v_final)),
             Some((prev_k, prev_v)) => {
