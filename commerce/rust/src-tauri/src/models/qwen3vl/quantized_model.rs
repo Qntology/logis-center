@@ -7,6 +7,7 @@ use nvml_wrapper::Nvml;
 use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
+use memmap2::Mmap;
 
 use crate::{
     models::{
@@ -698,19 +699,21 @@ pub struct QuantizedQwen3VLTextModel {
     pub norm: RmsNorm,
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
+    pub mmap: Option<Mmap>, // Keep mmap alive for tensors
 }
 
 impl QuantizedQwen3VLTextModel {
     pub fn new_with_mmap(
         config: &Qwen3VLTextConfig,
         ct: &gguf_file::Content,
-        mmap: &[u8],
+        mmap_handle: Option<Mmap>,
         base_name: &str,
         device: &Device,
         device_id: usize,
         dtype: DType,
         kv_reserve: u64,
     ) -> Result<Self> {
+        let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
@@ -820,7 +823,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -966,6 +969,7 @@ impl QuantizedQwen3VLTextModel {
             norm,
             rotary_emb,
             mrope_section,
+            mmap: None,
         })
     }
 
@@ -1130,15 +1134,17 @@ pub struct QuantizedQwen3VLModel {
     pub rope_deltas: Option<Tensor>,
     pub text_device: Device,
     pub vision_device: Device,
+    pub mmap: Option<Mmap>,
+    pub mmproj_mmap: Option<Mmap>,
 }
 
 impl QuantizedQwen3VLModel {
     pub fn new_with_mmap(
         config: &Qwen3VLConfig,
         ct_main: &gguf_file::Content,
-        main_mmap: &[u8],
+        main_mmap_handle: Option<Mmap>,
         ct_vision: &gguf_file::Content,
-        mmproj_mmap: &[u8],
+        mmproj_mmap_handle: Option<Mmap>,
         text_device: &Device,
         text_device_id: usize,
         vision_device: &Device,
@@ -1146,6 +1152,8 @@ impl QuantizedQwen3VLModel {
         dtype: DType,
         kv_reserve: u64,
     ) -> Result<Self> {
+        let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+        let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let nvml = Nvml::init().ok();
         
         let mut vision_weight_size = 0_u64;
@@ -1187,7 +1195,7 @@ impl QuantizedQwen3VLModel {
 
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            t_config, ct_main, main_mmap, "model", text_device, text_device_id, dtype, kv_reserve
+            t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve
         )?;
 
         let mut reader_main = std::io::Cursor::new(main_mmap);
@@ -1234,6 +1242,8 @@ impl QuantizedQwen3VLModel {
             rope_deltas: None,
             text_device: text_device.clone(),
             vision_device: actual_vision_device,
+            mmap: main_mmap_handle,
+            mmproj_mmap: mmproj_mmap_handle,
         })
     }
     pub fn new<R: std::io::Seek + std::io::Read, R2: std::io::Seek + std::io::Read>(
@@ -1537,13 +1547,14 @@ pub struct QuantizedQwen3TextModel {
     pub language_model: QuantizedQwen3VLTextModel,
     pub lm_head: QLinear,
     pub text_device: Device,
+    pub mmap: Option<Mmap>,
 }
 
 impl QuantizedQwen3TextModel {
     pub fn new_with_mmap(
         config: &Qwen3VLConfig,
         ct_main: &gguf_file::Content,
-        mmap: &[u8],
+        mmap_handle: Option<Mmap>,
         text_device: &Device,
         text_device_id: usize,
         dtype: DType,
@@ -1555,7 +1566,7 @@ impl QuantizedQwen3TextModel {
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
             t_config, 
             ct_main, 
-            mmap, 
+            mmap_handle.clone(), 
             "model", 
             text_device, 
             text_device_id, 
@@ -1563,6 +1574,7 @@ impl QuantizedQwen3TextModel {
             kv_reserve
         )?;
 
+        let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) {
@@ -1577,6 +1589,7 @@ impl QuantizedQwen3TextModel {
             language_model,
             lm_head,
             text_device: text_device.clone(),
+            mmap: mmap_handle,
         })
     }
 
@@ -1617,6 +1630,7 @@ impl QuantizedQwen3TextModel {
             language_model,
             lm_head,
             text_device: text_device.clone(),
+            mmap: None,
         })
     }
 
