@@ -43,13 +43,7 @@ impl RmsNorm {
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.weight.device().same_device(device) {
-            let mut w = self.weight.to_device(device)?;
-            if device.is_cpu() {
-                w = w.to_dtype(DType::F32)?;
-            } else if device.is_cuda() {
-                w = w.to_dtype(DType::BF16)?;
-            }
-            self.weight = w;
+            self.weight = self.weight.to_device(device)?;
         }
         Ok(())
     }
@@ -84,25 +78,25 @@ impl QLinear {
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
-            // [CRITICAL-FIX] Handle DType parity during device transfer
-            let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
-
+            // [CRITICAL-FIX] QMatMul is an enum (QTensor or Tensor). 
+            // QTensor doesn't have to_device in this version, so we dequantize to the target device.
             self.inner = match &self.inner {
                 QMatMul::QTensor(q) => {
                     let t = q.dequantize(device)?;
-                    QMatMul::Tensor(t.to_dtype(target_dtype)?)
+                    QMatMul::Tensor(t)
                 },
                 QMatMul::Tensor(t) => {
-                    QMatMul::Tensor(t.to_device(device)?.to_dtype(target_dtype)?)
+                    QMatMul::Tensor(t.to_device(device)?)
                 },
                 QMatMul::TensorF16(t) => {
-                    QMatMul::Tensor(t.to_device(device)?.to_dtype(target_dtype)?)
+                    QMatMul::TensorF16(t.to_device(device)?)
                 }
             };
 
             // Move bias if exists
             if let Some(b) = &self.bias {
-                self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
+                let moved_b: Tensor = b.to_device(device)?;
+                self.bias = Some(moved_b);
             }
             self.device = device.clone();
         }
@@ -172,11 +166,7 @@ impl QuantizedQwen3VLTextAttention {
         self.q_norm.to_device(device)?;
         self.k_norm.to_device(device)?;
         if let Some((k, v)) = &self.kv_cache {
-            let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
-            self.kv_cache = Some((
-                k.to_device(device)?.to_dtype(target_dtype)?, 
-                v.to_device(device)?.to_dtype(target_dtype)?
-            ));
+            self.kv_cache = Some((k.to_device(device)?, v.to_device(device)?));
         }
         Ok(())
     }
@@ -570,14 +560,8 @@ impl QuantizedQwen3VLTextAttention {
         }
 
         // [UPSCALE-REFILL] Drop last N tokens from cache to let 2B re-refine the most critical context.
-        // [FIX] If expected_len is 0, we want the FULL loaded cache.
-        let final_len = if expected_len == 0 {
-            k.dim(2)?
-        } else if expected_len > upscale_refill_len {
-            expected_len - upscale_refill_len
-        } else {
-            expected_len
-        };
+        // [FIX] Must use EXACTLY the same logic as seqlen_offset calculation in generate.rs to avoid shape mismatches.
+        let final_len = if expected_len > upscale_refill_len { expected_len - upscale_refill_len } else { expected_len };
 
         if final_len > 0 {
             // Ensure we don't try to narrow more than what is available in the loaded tensor
@@ -1046,7 +1030,7 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-        let _total_layers = self.layers.len();
+        let total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
@@ -1139,9 +1123,8 @@ impl QuantizedQwen3VLTextModel {
 
     /// [SLEEP-MODE] Moves all model weights and KV cache between CPU and GPU
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        // [MEMORY-FIX] Re-create Embedding with moved weights and correct DType
-        let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
-        let e_w = self.embed_tokens.embeddings().to_device(device)?.to_dtype(target_dtype)?;
+        // [MEMORY-FIX] Re-create Embedding with moved weights
+        let e_w = self.embed_tokens.embeddings().to_device(device)?;
         self.embed_tokens = Embedding::new(e_w, self.embed_tokens.hidden_size());
 
         for layer in self.layers.iter_mut() {
@@ -1563,10 +1546,9 @@ impl QuantizedQwen3VLModel {
         // 3. Move LM Head
         self.lm_head.to_device(device)?;
 
-        // 4. [FIX] Move RoPE Deltas if they exist with correct DType
+        // 4. [FIX] Move RoPE Deltas if they exist
         if let Some(deltas) = &self.rope_deltas {
-            let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
-            self.rope_deltas = Some(deltas.to_device(device)?.to_dtype(target_dtype)?);
+            self.rope_deltas = Some(deltas.to_device(device)?);
         }
         
         // Update device trackers

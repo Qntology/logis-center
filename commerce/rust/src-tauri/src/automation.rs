@@ -261,6 +261,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 "--no-default-browser-check",
                 "--force-dark-mode", // [THEME] Enable Dark Mode by default
                 "--enable-features=WebUIDarkMode", // Ensure UI elements are dark
+                "--app=data:text/html,<html></html>", // [UI] App mode for cleaner window
                 &port_arg,
                 "--remote-allow-origins=*", 
             ];

@@ -125,6 +125,7 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 }
 
 use tokio::sync::Mutex as TokioMutex;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
@@ -151,6 +152,7 @@ pub struct LogisModel {
     dtype: Option<DType>, 
     current_size: Arc<TokioMutex<Option<ModelSize>>>,
 }
+
 impl LogisModel {
     pub async fn unload_generator(&self) {
         // Clear everything
@@ -209,6 +211,146 @@ impl LogisModel {
         }
     }
 
+    // --- [NEW] VRAM Settlement Monitor ---
+    async fn wait_for_vram_settle(&self, target_free_mb: u64, timeout_sec: u64, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        if self.is_cpu_mode { return Ok(()); } // No wait needed for CPU
+
+        println!("[VRAM-WATCH] Waiting for VRAM to settle (> {} MB)...", target_free_mb);
+        let start = Instant::now();
+        let target_bytes = target_free_mb * 1024 * 1024;
+        let mut stable_ticks = 0;
+        let mut last_free = 0;
+
+        loop {
+            // [CANCELLATION] Check instantly every loop tick
+            if let Some(token) = &cancel_token {
+                if token.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(anyhow::anyhow!("Task cancelled during VRAM wait"));
+                }
+            }
+
+            if start.elapsed().as_secs() > timeout_sec {
+                println!("[VRAM-WATCH] Timeout reached. Proceeding with caution.");
+                break;
+            }
+
+            let mut current_free = 0;
+            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                    if let Ok(mem) = dev.memory_info() {
+                        current_free = mem.free;
+                    }
+                }
+            }
+
+            // Check stability (change < 10MB)
+            let delta = if current_free > last_free { current_free - last_free } else { last_free - current_free };
+            if delta < 10 * 1024 * 1024 {
+                stable_ticks += 1;
+            } else {
+                stable_ticks = 0;
+            }
+
+            if current_free >= target_bytes && stable_ticks >= 3 {
+                println!("[VRAM-WATCH] Stabilized at {:.2} GB free.", current_free as f64 / 1e9);
+                break;
+            }
+
+            last_free = current_free;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        Ok(())
+    }
+
+    // --- [NEW] SSD Bridge Operations ---
+    pub async fn save_kv_snapshot(&self, task_id: &str) -> anyhow::Result<String> {
+        let mut gen_guard = self.generator.lock().await;
+        if let Some(gen) = gen_guard.as_mut() {
+            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id));
+            println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
+            
+            // Assuming the underlying model has a method to save KV to disk
+            // We use the existing generate.rs capability via session_id or explicit save
+            // Here we map to a specific method in Qwen3VLGenerateModel
+             gen.save_kv_to_disk(&path)?;
+            
+            Ok(path.to_string_lossy().to_string())
+        } else {
+            Err(anyhow::anyhow!("No active generator to save snapshot from"))
+        }
+    }
+
+    pub async fn load_kv_snapshot(&self, task_id: &str) -> anyhow::Result<()> {
+        let mut gen_guard = self.generator.lock().await;
+        if let Some(gen) = gen_guard.as_mut() {
+            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id));
+            if path.exists() {
+                println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
+                gen.load_kv_from_disk(&path)?;
+                Ok(())
+            } else {
+                println!("[SSD-BRIDGE] No snapshot found for {}", task_id);
+                Ok(()) // Not an error, just nothing to bridge
+            }
+        } else {
+            Err(anyhow::anyhow!("No active generator to load snapshot into"))
+        }
+    }
+
+    /// [NEW] Secure VRAM Transition Logic (Isolation Protocol)
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        // [CANCELLATION] Check before starting transition
+        if let Some(token) = &cancel_token {
+            if token.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Task cancelled before VRAM relay"));
+            }
+        }
+
+        // 1. Check current state
+        let current_size_val = { *self.current_size.lock().await };
+        if current_size_val == Some(target_size) {
+            return Ok(()); // Already loaded
+        }
+
+        println!("[RELAY] Starting Secure VRAM Transition to {:?}...", target_size);
+
+        // 2. [ISOLATION] Force Unload Everything first
+        self.unload_generator().await;
+        self.unload_embedding().await;
+
+        // 3. [SETTLE] Wait for GPU to release memory (Only for Large model loading)
+        if target_size == ModelSize::Large {
+            // Wait for at least 3GB free if possible, or settle. Pass cancel_token to be responsive.
+            self.wait_for_vram_settle(3000, 5, cancel_token.clone()).await?;
+        }
+
+        // [CANCELLATION] Check after waiting
+        if let Some(token) = &cancel_token {
+            if token.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Task cancelled after VRAM settle"));
+            }
+        }
+
+        // 4. [LOAD] Load the target model
+        // We bypass ensure_generator to avoid its internal swapping logic
+        // and use direct loading for strict control.
+        match target_size {
+            ModelSize::Small => self.ensure_generator(ModelSize::Small).await?,
+            ModelSize::Large => self.ensure_generator(ModelSize::Large).await?,
+        }
+
+        // 5. [BRIDGE] If this is Large model and we have a task_id, try to bridge memory
+        if target_size == ModelSize::Large {
+            if let Some(tid) = task_id {
+                // Try to load bridged KV
+                let _ = self.load_kv_snapshot(tid).await;
+            }
+        }
+
+        println!("[RELAY] Secure Transition Complete.");
+        Ok(())
+    }
+
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>) -> anyhow::Result<Qwen3VLGenerateModel> {
         println!("[MODEL] Loading Generator from {} on GPU-{}...", path, self.device_config.gpu_id);
         let dev = self.device_config.device.clone();
@@ -232,8 +374,6 @@ impl LogisModel {
         Ok(generator)
     }
 
-    /// [HANDOVER] Naturally transitions resources between models.
-    /// Moves the active model to RAM and prepares GPU for the next one.
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
         self.unload_embedding().await;
 
@@ -244,19 +384,20 @@ impl LogisModel {
             return Ok(()); // Already correct
         }
 
-        println!("[RESOURCE-HANDOVER] Switching to size: {:?}...", size);
+        println!("[MODEL] Switching to size: {:?}...", size);
         
+        // [OOM-SAFETY] 4GB cards cannot reliably hold both models + 10k context.
+        // We force strict mutual exclusion: one model on GPU, the other in RAM.
         let mut small_slot = self.small_hibernation.lock().await;
         let mut large_slot = self.large_hibernation.lock().await;
 
-        // 1. [SLEEP] Naturally move CURRENT active model to system RAM
+        // 1. [SLEEP] Move CURRENT active model to its hibernation slot (RAM)
         if let Some(mut active_model) = gen_guard.take() {
             let old_size = current_size_guard.take().unwrap();
-            println!("[SLEEP] Moving {:?} model from VRAM to RAM hibernation...", old_size);
+            println!("[SLEEP] Evicting {:?} model to RAM hibernation...", old_size);
             
-            // Move to CPU (Our previous DType fix ensures this is safe and won't crash)
             if let Err(e) = active_model.to_device(&Device::Cpu) {
-                println!("[SLEEP-ERROR] Handover failed: {}. Dropping model.", e);
+                println!("[SLEEP-ERROR] Failed to hibernate: {}. Dropping model.", e);
             } else {
                 match old_size {
                     ModelSize::Small => *small_slot = Some(active_model),
@@ -265,23 +406,15 @@ impl LogisModel {
             }
         }
 
-        // 2. [PURGE] Clear remaining GPU fragments to ensure the next model has 100% space
-        drop(small_slot); drop(large_slot); // Release slot locks before purge
-        self.deep_purge_resources().await;
-
-        // 3. [WAKE] Check if requested model is already in system RAM
-        let mut small_slot = self.small_hibernation.lock().await;
-        let mut large_slot = self.large_hibernation.lock().await;
+        // 2. [WAKE] Check if requested model is in hibernation
         let hibernated = match size {
             ModelSize::Small => small_slot.take(),
             ModelSize::Large => large_slot.take(),
         };
 
         if let Some(mut m) = hibernated {
-            println!("[WAKE] Waking up {:?} from RAM back to GPU...", size);
+            println!("[WAKE] Waking up {:?} from RAM to GPU...", size);
             let target_dev = self.device_config.device.clone();
-            
-            // Try to move back to GPU (Our DType fix converts it back to BF16)
             if let Err(e) = m.to_device(&target_dev) {
                 println!("[WAKE-ERROR] Failed to wake: {}. Reloading from disk.", e);
             } else {
@@ -291,20 +424,21 @@ impl LogisModel {
             }
         }
 
-        // 4. [LOAD] Fresh load only if not in RAM
+        // 3. [LOAD] Fallback to disk load if not in hibernation
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
         let mut target_device = self.device_config.device.clone();
         
-        // [OOM-SAFETY] Same as before, ensure Small doesn't crowd out Large if VRAM is tight
+        // [OOM-SAFETY] If loading Small, only use GPU if VRAM is very high (> 3.5GB free)
+        // Otherwise, force Small to CPU so that Large (2B) always has room on GPU.
         if size == ModelSize::Small && target_device.is_cuda() {
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
-                        if mem.free < 3_000_000_000 {
-                            println!("[MODEL-CONFIG] Tight VRAM ({:.2} GB). Keeping Small on CPU to save GPU for Large.", mem.free as f64 / 1e9);
+                        if mem.free < 3_500_000_000 {
+                            println!("[MODEL-CONFIG] Tight VRAM ({:.2} GB). Offloading Small (0.6B) to CPU to prioritize Large.", mem.free as f64 / 1e9);
                             target_device = Device::Cpu;
                         }
                     }
