@@ -285,7 +285,23 @@ impl LogisModel {
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
-        let target_device = self.device_config.device.clone();
+        let mut target_device = self.device_config.device.clone();
+        
+        // [OOM-SAFETY] If loading Small, only use GPU if VRAM is very high (> 3.5GB free)
+        // Otherwise, force Small to CPU so that Large (2B) always has room on GPU.
+        if size == ModelSize::Small && target_device.is_cuda() {
+            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                    if let Ok(mem) = dev.memory_info() {
+                        if mem.free < 3_500_000_000 {
+                            println!("[MODEL-CONFIG] Tight VRAM ({:.2} GB). Offloading Small (0.6B) to CPU to prioritize Large.", mem.free as f64 / 1e9);
+                            target_device = Device::Cpu;
+                        }
+                    }
+                }
+            }
+        }
+
         let dev_id = self.device_config.gpu_id;
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;

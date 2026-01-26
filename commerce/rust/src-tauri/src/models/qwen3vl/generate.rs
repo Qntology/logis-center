@@ -151,10 +151,11 @@ impl Qwen3VLGenerateModel {
             }
 
             // [OPTIMIZATION] Realistic KV Cache Reservation
-            // Standard tasks rarely hit 32k. Reserving for 8k-16k is safer for long pages.
+            // For 4GB cards, we must be very careful. 
+            // 8k tokens is usually enough for most web pages.
             let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;
-            let reserve_tokens = limit_tokens.min(16384); 
-            let kv_reserve = reserve_tokens * 70000; // Optimized overhead with driver cleanup delay
+            let reserve_tokens = limit_tokens.min(8192); 
+            let kv_reserve = reserve_tokens * 40000; // Optimized for 2B models
 
             if is_vision_model {
                 // CASE 1: Vision-Language Model

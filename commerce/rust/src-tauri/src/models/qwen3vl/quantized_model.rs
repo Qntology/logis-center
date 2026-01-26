@@ -768,7 +768,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let estimated_activation_buffer = 400_000_000; // Increased to 400MB
+        let estimated_activation_buffer = 150_000_000; // Reduced to 150MB
         let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 };
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
@@ -780,7 +780,7 @@ impl QuantizedQwen3VLTextModel {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         let os_reserve = 150_000_000; // Increased to 150MB
+                         let os_reserve = 50_000_000; // Reduced to 50MB
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -1032,11 +1032,6 @@ impl QuantizedQwen3VLTextModel {
 
         let total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // [DEBUG-LOG] Track CPU inference progress
-            if layer_idx % 4 == 0 {
-                println!("[CPU-INFER] Processing Layer {}/{}...", layer_idx, total_layers);
-            }
-
             // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             

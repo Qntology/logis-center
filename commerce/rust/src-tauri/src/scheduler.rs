@@ -543,73 +543,49 @@ async fn process_task(
                         println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
                         let type_prompt = parsing::page_type_prompt();
                         
-                        // [FIX] Correct Order: Load Small FIRST, then Large to enable DUAL-ENGINE handover
                         model.ensure_generator(crate::model::ModelSize::Small).await?;
-                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                        
-                        // [INTERRUPTIBLE-LOAD] Race loading against cancellation
-                        tokio::select! {
-                            res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
-                            _ = async {
-                                loop {
-                                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                }
-                            } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
-                        }
+                        model.ensure_generator(crate::model::ModelSize::Large).await?;
                         
                         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                         println!("[작업내용]");
-                
-                                // [LOOP-RELAY] Process each chunk individually
-                                for (i, chunk) in pug_chunks.iter().enumerate() {
-                                    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                                    
-                                    let is_last = i == pug_chunks_len - 1;
-                                    let chunk_text = chunk.clone();
-                        
-                                    {
-                                        let model_clone = model.clone();
-                                        let token_clone = cancellation_token.clone();
-                                        let chunk_to_send = chunk_text.clone();
-                        
-                                        use std::io::Write;
-                                        print!(".");
-                                        std::io::stdout().flush().ok();
-                                        
-                                        tokio::task::spawn_blocking(move || -> Result<()> {
-                                            crate::utils::resources::set_current_thread_low_priority();
-                                            let mut large_gen_lock = model_clone.generator.blocking_lock(); 
-                                            let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
-                                            
-                                            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                                                // [LIGHTWEIGHT-RELAY] No chat templates, just raw snippet prefill
-                                                let worker: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = worker;
-                                                let target: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = target;
-                                                worker.prefill_chunk(chunk_to_send, Some(token_clone), Some(target))?;
-                                            }
-                                            Ok(())
-                                        }).await??;
-                                    }
-                        
-                                    if is_last {
-                                        // 3. 2B Inference (Final Question)
-                                        if let Some(gen) = model.generator.lock().await.as_mut() {
-                                            println!("[Scheduler] 2B Generating final classification answer...");
-                                            let params = ChatCompletionParameters {
-                                                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                                    content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", type_prompt)),
-                                                    name: None,
-                                                })],
-                                                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
-                                                ..Default::default()
-                                            };
-                                            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
-                                            let type_info = parsing::parse_json_from_llm(&res);
-                                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                        }
-                                    }
-                                }                        
+
+                        let params = ChatCompletionParameters {
+                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                content: ChatCompletionRequestUserMessageContent::Text(format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt)),
+                                name: None,
+                            })],
+                            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                            ..Default::default()
+                        };
+
+                        // [FULL-STACK PREFILL] Let 0.6B handle EVERYTHING including chat formatting
+                        {
+                            let model_clone = model.clone();
+                            let params_clone = params.clone();
+                            let token_clone = cancellation_token.clone();
+                            let task_id_clone = task.id.clone();
+
+                            tokio::task::spawn_blocking(move || -> Result<()> {
+                                crate::utils::resources::set_current_thread_low_priority();
+                                let mut large_gen_lock = model_clone.generator.blocking_lock(); 
+                                let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
+                                
+                                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                                    let worker: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = worker;
+                                    let target: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = target;
+                                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+                                }
+                                Ok(())
+                            }).await??;
+                        }
+
+                        // 3. 2B Inference (Instant)
+                        if let Some(gen) = model.generator.lock().await.as_mut() {
+                            println!("[Scheduler] 2B Generating final classification answer...");
+                            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
+                            let type_info = parsing::parse_json_from_llm(&res);
+                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        }
                         
                         if page_type.is_empty() || page_type == "unknown" { 
                             model.unload_generator().await;
@@ -629,70 +605,45 @@ async fn process_task(
         println!("[작업내용]");
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         
-        // [FIX] Using cloned model
         model.ensure_generator(crate::model::ModelSize::Small).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        
-        // [INTERRUPTIBLE-LOAD] Race loading against cancellation
-        tokio::select! {
-            res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
-            _ = async {
-                loop {
-                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
-        }
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
         
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        // [LOOP-RELAY] Process each chunk individually
-        for (i, chunk) in pug_chunks.iter().enumerate() {
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-            
-            let is_last = i == pug_chunks_len - 1;
-            let chunk_text = chunk.clone();
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                content: ChatCompletionRequestUserMessageContent::Text(format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, selector_prompt)),
+                name: None,
+            })],
+            model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
+            ..Default::default()
+        };
 
-            {
-                let model_clone = model.clone();
-                let token_clone = cancellation_token.clone();
-                let chunk_to_send = chunk_text.clone();
+        // [FULL-STACK PREFILL] Let 0.6B handle EVERYTHING including chat formatting
+        {
+            let model_clone = model.clone();
+            let params_clone = params.clone();
+            let token_clone = cancellation_token.clone();
+            let task_id_clone = format!("{}_task2", task.id);
 
-                use std::io::Write;
-                print!(".");
-                std::io::stdout().flush().ok();
-
-            // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
-            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+            tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();
-                let mut large_gen_lock = model_clone.generator.blocking_lock(); 
+                let mut large_gen_lock = model_clone.generator.blocking_lock();
                 let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
-                    
-                    if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                        let worker: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = worker;
-                        let target: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = target;
-                        worker.prefill_chunk(chunk_to_send, Some(token_clone), Some(target))?;
-                    }
-                    Ok(())
-                }).await??;
-            }
-
-            if is_last {
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 2B Identifying selectors immediately...");
-                    let params = ChatCompletionParameters {
-                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                            content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", selector_prompt)),
-                            name: None,
-                        })],
-                        model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
-                        ..Default::default()
-                    };
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)))?;
-                    selector_info = parsing::parse_json_from_llm(&res);
-                    println!("[Scheduler] Selectors Identified: {}", selector_info);
+                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                    let worker: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = worker;
+                    let target: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = target;
+                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
                 }
-            }
+                Ok(())
+            }).await??;
+        }
+
+        if let Some(gen) = model.generator.lock().await.as_mut() {
+            println!("[Scheduler] 2B Identifying selectors immediately...");
+            let res = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)))?;
+            selector_info = parsing::parse_json_from_llm(&res);
+            println!("[Scheduler] Selectors Identified: {}", selector_info);
         }
     }
 
@@ -1250,7 +1201,7 @@ async fn process_task(
                                                 let token_clone = cancellation_token.clone();
                                                 let task_id_clone = detail_session_id.clone();
 
-                                                println!("[Scheduler] Detail Ingestion (Blocking Thread)...");
+                                                println!("[작업내용]");
 
                                                 let _ = tokio::task::spawn_blocking(move || -> Result<()> {
                                                     crate::utils::resources::set_current_thread_low_priority();
