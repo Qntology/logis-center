@@ -126,7 +126,7 @@ pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
 
 use tokio::sync::Mutex as TokioMutex;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
     Small, // 0.6B for Ingestion
     Large, // 2B-VL for Inference
@@ -134,8 +134,9 @@ pub enum ModelSize {
 
 #[derive(Clone)]
 pub struct LogisModel {
-    pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
-    pub small_generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>,
+    pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
+    pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
+    pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
@@ -152,26 +153,17 @@ pub struct LogisModel {
 }
 impl LogisModel {
     pub async fn unload_generator(&self) {
-        // 1. Clear Main Generator
+        // Clear everything
         let mut gen = self.generator.lock().await;
-        if let Some(mut m) = gen.take() {
-            m.clear_kv_cache();
-            drop(m);
-            println!("[MODEL] Main Generator destroyed.");
-        }
-
-        // 2. [CRITICAL] Clear Small Generator (Hibernated model)
-        let mut small_gen = self.small_generator.lock().await;
-        if let Some(mut m) = small_gen.take() {
-            m.clear_kv_cache();
-            drop(m);
-            println!("[MODEL] Hibernated Small Generator destroyed.");
-        }
+        *gen = None;
+        let mut s_hib = self.small_hibernation.lock().await;
+        *s_hib = None;
+        let mut l_hib = self.large_hibernation.lock().await;
+        *l_hib = None;
         
         let mut size = self.current_size.lock().await;
         *size = None;
-
-        println!("[MODEL] All generators destroyed and VRAM reclaimed.");
+        println!("[MODEL] All generators (Active & Hibernated) destroyed.");
     }
 
     pub async fn unload_embedding(&self) {
@@ -184,28 +176,28 @@ impl LogisModel {
 
     /// [CLEANUP] Adaptive resource management based on system stress
     pub async fn deep_purge_resources(&self) {
-        let (ram_used, vram_used) = utils::resources::get_memory_usage();
-        
-        // Simple heuristic: Get total VRAM to calculate free percentage
-        let mut vram_free = 4_000_000_000; // Default assumption 4GB
+        let mut vram_free = 0;
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                if let Ok(mem) = dev.memory_info() {
-                    vram_free = mem.free;
-                }
+                if let Ok(mem) = dev.memory_info() { vram_free = mem.free; }
             }
         }
 
-        println!("[RESOURCE-CHECK] Current Free VRAM: {:.2} GB", vram_free as f64 / 1e9);
-
-        // 1. CRITICAL STRESS (< 1GB Free) -> Heavy Purge
-        if vram_free < 1_000_000_000 {
-            println!("[MEMORY] High Stress Detected. Performing Aggressive Deep Purge.");
+        // [ADAPTIVE] Only purge if really needed, as it can be slow
+        if vram_free < 1_200_000_000 {
+            println!("[MEMORY] High Stress ({:.2} GB Free). Purging ALL caches...", vram_free as f64 / 1e9);
+            
+            // 1. Clear Active Slot
             if let Some(gen) = self.generator.lock().await.as_mut() {
                 gen.clear_kv_cache();
             }
-            if let Some(small_gen) = self.small_generator.lock().await.as_mut() {
-                small_gen.clear_kv_cache();
+            
+            // 2. [CRITICAL-FIX] Clear Hibernation Slots (RAM leaks often happen here)
+            if let Some(s_hib) = self.small_hibernation.lock().await.as_mut() {
+                s_hib.clear_kv_cache();
+            }
+            if let Some(l_hib) = self.large_hibernation.lock().await.as_mut() {
+                l_hib.clear_kv_cache();
             }
 
             #[cfg(target_os = "windows")]
@@ -214,17 +206,6 @@ impl LogisModel {
                 let current_process = GetCurrentProcess();
                 windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, 0);
             }
-        } 
-        // 2. MODERATE STRESS (< 1.8GB Free) -> Light Purge (Caches only)
-        else if vram_free < 1_800_000_000 {
-            println!("[MEMORY] Moderate Stress. Clearing inactive caches.");
-            if let Some(gen) = self.generator.lock().await.as_mut() {
-                gen.clear_kv_cache();
-            }
-        }
-        // 3. HEALTHY -> Skip purge to maintain performance
-        else {
-            println!("[MEMORY] Resources healthy. Skipping purge to maximize speed.");
         }
     }
 
@@ -257,122 +238,72 @@ impl LogisModel {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
 
-        let needs_reload = match *current_size_guard {
-            Some(ref s) => s != &size,
-            None => true,
+        if *current_size_guard == Some(size.clone()) && gen_guard.is_some() {
+            return Ok(()); // Already correct
+        }
+
+        println!("[MODEL] Switching to size: {:?}...", size);
+        
+        // 1. [SLEEP] Move CURRENT active model to its hibernation slot (RAM)
+        if let Some(mut active_model) = gen_guard.take() {
+            let old_size = current_size_guard.take().unwrap();
+            println!("[SLEEP] Moving {:?} model to RAM hibernation...", old_size);
+            
+            if let Err(e) = active_model.to_device(&Device::Cpu) {
+                println!("[SLEEP-ERROR] Failed to hibernate: {}. Dropping model.", e);
+                // If hibernation fails, we must ensure memory is released before loading the next one
+                let (base_ram, base_vram) = utils::resources::get_memory_usage();
+                utils::resources::wait_for_memory_release(base_ram, base_vram, 2000).await;
+            } else {
+                match old_size {
+                    ModelSize::Small => *self.small_hibernation.lock().await = Some(active_model),
+                    ModelSize::Large => *self.large_hibernation.lock().await = Some(active_model),
+                }
+            }
+        }
+
+        // 2. [WAKE] Check if requested model is in hibernation
+        let hibernated = match size {
+            ModelSize::Small => self.small_hibernation.lock().await.take(),
+            ModelSize::Large => self.large_hibernation.lock().await.take(),
         };
 
-        if needs_reload || gen_guard.is_none() {
-            println!("[MODEL] Switching/Loading model to size: {:?}...", size);
-            
-            // [SLEEP-MODE] Optimized Switching: Check if we can keep both in VRAM
-            let mut small_slot = self.small_generator.lock().await;
-            
-            let mut can_keep_both = false;
-            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                    if let Ok(mem) = dev.memory_info() {
-                        // [OOM-PREVENTION] 4GB cards are too tight for dual-model resonance during heavy tasks.
-                        // Require at least 3.5GB free to even consider keeping both.
-                        if mem.free > 3_500_000_000 {
-                            can_keep_both = true;
-                            println!("[MODEL-CONFIG] Very High VRAM detected ({:.2} GB free). Enabling Dual-Model GPU resonance.", mem.free as f64 / 1e9);
-                        }
-                    }
-                }
+        if let Some(mut m) = hibernated {
+            println!("[WAKE] Waking up {:?} from RAM to GPU...", size);
+            let target_dev = self.device_config.device.clone();
+            if let Err(e) = m.to_device(&target_dev) {
+                println!("[WAKE-ERROR] Failed to wake: {}. Reloading from disk.", e);
+            } else {
+                *gen_guard = Some(m);
+                *current_size_guard = Some(size);
+                return Ok(());
             }
-
-            // Scenario A: Loading Large, Small is on GPU
-            if size == ModelSize::Large && *current_size_guard == Some(ModelSize::Small) {
-                if let Some(mut m) = gen_guard.take() {
-                    if can_keep_both {
-                        println!("[RESONANCE] Keeping 0.6B on GPU while loading 2B.");
-                        *small_slot = Some(m);
-                    } else {
-                        println!("[SLEEP] Sending 0.6B to Hibernation (RAM)...");
-                        if let Err(e) = m.to_device(&Device::Cpu) {
-                            println!("[SLEEP-ERROR] Failed to hibernate 0.6B: {}. Dropping.", e);
-                        } else {
-                            *small_slot = Some(m);
-                        }
-                    }
-                }
-            }
-            
-            // Scenario B: Waking up Small
-            if size == ModelSize::Small && small_slot.is_some() {
-                let mut m = small_slot.take().unwrap();
-                let current_dev = m.device().clone();
-                let target_dev = self.device_config.device.clone();
-
-                if current_dev.same_device(&target_dev) {
-                    println!("[WAKE] 0.6B already on GPU. Instant switch!");
-                    *gen_guard = Some(m);
-                    *current_size_guard = Some(ModelSize::Small);
-                    return Ok(());
-                } else {
-                    println!("[WAKE] Waking up 0.6B from RAM to GPU...");
-                    if let Err(e) = m.to_device(&target_dev) {
-                        println!("[WAKE-ERROR] Failed to wake 0.6B: {}. Reloading.", e);
-                    } else {
-                        *gen_guard = Some(m);
-                        *current_size_guard = Some(ModelSize::Small);
-                        return Ok(());
-                    }
-                }
-            }
-
-            // [FALLBACK] If not in hibernation, proceed with standard hard reset and disk load
-            if gen_guard.is_none() {
-                let (base_ram, base_vram) = utils::resources::get_memory_usage();
-                // ... (existing flush logic)
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::*;
-                    let current_process = GetCurrentProcess();
-                    windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, 0);
-                }
-                utils::resources::wait_for_memory_release(base_ram, base_vram, 2000).await;
-            }
-            
-            let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-            let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
-            
-            // [STRATEGY] Only offload to CPU if VRAM is actually low (< 1GB free)
-            let mut target_device = self.device_config.device.clone();
-            if size == ModelSize::Small && target_device.is_cuda() {
-                if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                    if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                        if let Ok(mem) = dev.memory_info() {
-                            if mem.free < 1_000_000_000 {
-                                println!("[MODEL-CONFIG] Low VRAM ({:.2} GB). Offloading 0.6B to CPU.", mem.free as f64 / 1e9);
-                                target_device = Device::Cpu;
-                            } else {
-                                println!("[MODEL-CONFIG] Sufficient VRAM ({:.2} GB). Keeping 0.6B on GPU.", mem.free as f64 / 1e9);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let dev_id = self.device_config.gpu_id;
-            let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
-            let limit = self.max_tokens_limit;
-            let path_clone = path.to_string();
-            let shared_path_clone = shared_path.map(|s| s.to_string());
-
-            let gen = tokio::task::spawn_blocking(move || {
-                Qwen3VLGenerateModel::init_with_config(
-                    &path_clone, 
-                    shared_path_clone.as_deref(), 
-                    shared_path_clone.as_deref(), 
-                    Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize)
-                )
-            }).await??;
-
-            *gen_guard = Some(gen);
-            *current_size_guard = Some(size);
         }
+
+        // 3. [LOAD] Fallback to disk load if not in hibernation
+        println!("[LOAD] Fresh loading {:?} from disk...", size);
+        let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
+        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+        
+        let target_device = self.device_config.device.clone();
+        let dev_id = self.device_config.gpu_id;
+        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+        let limit = self.max_tokens_limit;
+        let path_clone = path.to_string();
+        let shared_path_clone = shared_path.map(|s| s.to_string());
+
+        let gen = tokio::task::spawn_blocking(move || {
+            Qwen3VLGenerateModel::init_with_config(
+                &path_clone, 
+                shared_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
+                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize)
+            )
+        }).await??;
+
+        *gen_guard = Some(gen);
+        *current_size_guard = Some(size);
+        
         Ok(())
     }
 
@@ -424,10 +355,11 @@ impl LogisModel {
 
         Ok(Self {
             generator: Arc::new(TokioMutex::new(None)),
-            small_generator: Arc::new(TokioMutex::new(None)), // [DUAL]
+            small_hibernation: Arc::new(TokioMutex::new(None)),
+            large_hibernation: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             is_cpu_mode: config.is_cpu,
-            dual_mode_enabled: true, // [NEW] Enable by default for fastest PUG analysis
+            dual_mode_enabled: true, 
             small_model_path,
             large_model_path,
             embedding_path,

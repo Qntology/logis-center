@@ -519,7 +519,15 @@ impl Qwen3VLGenerateModel {
         
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
         let mut current_pos = seqlen_offset;
-        let prefill_chunk_size = 256; // Lowered to 256 to minimize 'cat' peak VRAM spikes
+        
+        // [CPU-OPTIMIZATION] CPUs love big batches. GPUs love small chunks for VRAM safety.
+        let prefill_chunk_size = if self.text_device.is_cpu() {
+            println!("[CPU-BOOST] Using Big-Batch Prefilling (Size: 2048)");
+            2048 // Full power for CPU SIMD
+        } else {
+            256 // VRAM safety for GPU
+        };
+        
         let newline_token_id = 198; // Fallback for '\n'
 
         while current_pos < total_tokens {

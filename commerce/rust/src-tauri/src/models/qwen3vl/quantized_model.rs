@@ -1550,6 +1550,11 @@ impl QuantizedQwen3VLModel {
         
         // 3. Move LM Head
         self.lm_head.to_device(device)?;
+
+        // 4. [FIX] Move RoPE Deltas if they exist
+        if let Some(deltas) = &self.rope_deltas {
+            self.rope_deltas = Some(deltas.to_device(device)?);
+        }
         
         // Update device trackers
         self.text_device = device.clone();

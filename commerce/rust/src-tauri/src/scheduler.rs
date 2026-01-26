@@ -580,10 +580,12 @@ async fn process_task(
                                         tokio::task::spawn_blocking(move || -> Result<()> {
                                             crate::utils::resources::set_current_thread_low_priority();
                                             let mut large_gen_lock = model_clone.generator.blocking_lock(); 
-                                            let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                                            let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
                                             
                                             if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
                                                 // [LIGHTWEIGHT-RELAY] No chat templates, just raw snippet prefill
+                                                let worker: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = worker;
+                                                let target: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = target;
                                                 worker.prefill_chunk(chunk_to_send, Some(token_clone), Some(target))?;
                                             }
                                             Ok(())
@@ -664,9 +666,11 @@ async fn process_task(
             let _ = tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();
                 let mut large_gen_lock = model_clone.generator.blocking_lock(); 
-                let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
                     
                     if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                        let worker: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = worker;
+                        let target: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = target;
                         worker.prefill_chunk(chunk_to_send, Some(token_clone), Some(target))?;
                     }
                     Ok(())
@@ -1251,8 +1255,10 @@ async fn process_task(
                                                 let _ = tokio::task::spawn_blocking(move || -> Result<()> {
                                                     crate::utils::resources::set_current_thread_low_priority();
                                                     let mut large_gen_lock = model_clone.generator.blocking_lock();
-                                                    let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                                                    let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
                                                     if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                                                        let worker: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = worker;
+                                                        let target: &mut crate::models::qwen3vl::generate::Qwen3VLGenerateModel = target;
                                                         worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
                                                     }
                                                     Ok(())
