@@ -1110,7 +1110,10 @@ impl QuantizedQwen3VLTextModel {
 
     /// [SLEEP-MODE] Moves all model weights and KV cache between CPU and GPU
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        self.embed_tokens.to_device(device)?;
+        // [MEMORY-FIX] Re-create Embedding with moved weights
+        let e_w = self.embed_tokens.embeddings().to_device(device)?;
+        self.embed_tokens = Embedding::new(e_w, self.embed_tokens.hidden_size());
+
         for layer in self.layers.iter_mut() {
             layer.to_device(device)?;
         }

@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{D, DType, IndexOp, Shape, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
 use candle_nn::{
     Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
     linear_no_bias, rms_norm,
@@ -60,6 +60,12 @@ impl Qwen3VLVisionPatchEmbed {
         })
     }
 
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.conv3d_weight = self.conv3d_weight.to_device(device)?;
+        self.conv3d_bias = self.conv3d_bias.to_device(device)?;
+        Ok(())
+    }
+
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
         // hidden_states shape:  (grid_t*grid_h*grid_w, c*temporal_patch_size*patch_size*patch_size)
         // ((), 1536) matmul (1536, 1024) -> ((), 1024)
@@ -104,7 +110,22 @@ impl Qwen3VLVisionPatchMerger {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        // [MEMORY-FIX] LayerNorm/Linear don't have to_device, so we recreate with moved tensors
+        let n_w = self.norm.weight().to_device(device)?;
+        let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm = LayerNorm::new(n_w, n_b, 1e-6);
+    
+        let l1_w = self.linear_fc1.weight().to_device(device)?;
+        let l1_b = self.linear_fc1.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear_fc1 = Linear::new(l1_w, l1_b);
+    
+        let l2_w = self.linear_fc2.weight().to_device(device)?;
+        let l2_b = self.linear_fc2.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear_fc2 = Linear::new(l2_w, l2_b);
+        Ok(())
+    }
+        pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = if self.use_postshuffle_norm {
             xs.reshape(((), self.hidden_size))?
         } else {
@@ -140,6 +161,17 @@ impl Qwen3VLVisionAttention {
             proj,
             scaling,
         })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let qkv_w = self.qkv.weight().to_device(device)?;
+        let qkv_b = self.qkv.bias().map(|b| b.to_device(device)).transpose()?;
+        self.qkv = Linear::new(qkv_w, qkv_b);
+
+        let proj_w = self.proj.weight().to_device(device)?;
+        let proj_b = self.proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.proj = Linear::new(proj_w, proj_b);
+        Ok(())
     }
 
     pub fn forward(
@@ -207,8 +239,8 @@ impl Qwen3VLVisionBlock {
             vb.pp("mlp"),
             config.hidden_size,
             config.intermediate_size,
-            config.hidden_act,
-            true,
+            Activation::Gelu,
+            false,
             "linear_fc1",
             "linear_fc2",
         )?;
@@ -218,6 +250,20 @@ impl Qwen3VLVisionBlock {
             attn,
             mlp,
         })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let n1_w = self.norm1.weight().to_device(device)?;
+        let n1_b = self.norm1.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm1 = LayerNorm::new(n1_w, n1_b, 1e-6);
+
+        let n2_w = self.norm2.weight().to_device(device)?;
+        let n2_b = self.norm2.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm2 = LayerNorm::new(n2_w, n2_b, 1e-6);
+
+        self.attn.to_device(device)?;
+        self.mlp.to_device(device)?;
+        Ok(())
     }
 
     pub fn forward(
@@ -289,6 +335,22 @@ impl Qwen3VLVisionModel {
             deepstack_merger_list,
             dtype: vb.dtype(),
         })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.patch_embed.to_device(device)?;
+        
+        let p_w = self.pos_embed.embeddings().to_device(device)?;
+        self.pos_embed = Embedding::new(p_w, self.pos_embed.hidden_size());
+
+        for block in self.blocks.iter_mut() {
+            block.to_device(device)?;
+        }
+        self.merger.to_device(device)?;
+        for merger in self.deepstack_merger_list.iter_mut() {
+            merger.to_device(device)?;
+        }
+        Ok(())
     }
 
     pub fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {

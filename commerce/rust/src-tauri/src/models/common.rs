@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{D, Tensor};
+use candle_core::{D, Device, Tensor};
 use candle_nn::{
     Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig,
     Linear, Module, RmsNorm, VarBuilder, batch_norm, conv2d, conv2d_no_bias, layer_norm, linear,
@@ -44,6 +44,21 @@ impl GateUpDownMLP {
             act_fn,
         })
     }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let g_w = self.gate_proj.weight().to_device(device)?;
+        let g_b = self.gate_proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.gate_proj = Linear::new(g_w, g_b);
+
+        let u_w = self.up_proj.weight().to_device(device)?;
+        let u_b = self.up_proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.up_proj = Linear::new(u_w, u_b);
+
+        let d_w = self.down_proj.weight().to_device(device)?;
+        let d_b = self.down_proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.down_proj = Linear::new(d_w, d_b);
+        Ok(())
+    }
 }
 
 impl Module for GateUpDownMLP {
@@ -87,6 +102,18 @@ impl TwoLinearMLP {
             act,
         })
     }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let l1_w = self.linear1.weight().to_device(device)?;
+        let l1_b = self.linear1.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear1 = Linear::new(l1_w, l1_b);
+
+        let l2_w = self.linear2.weight().to_device(device)?;
+        let l2_b = self.linear2.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear2 = Linear::new(l2_w, l2_b);
+        Ok(())
+    }
+
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = xs
             .apply(&self.linear1)?
@@ -163,6 +190,29 @@ impl NaiveAttention {
             middle_size: num_attention_heads * head_dim,
             kv_cache: None,
         })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let q_w = self.q_proj.weight().to_device(device)?;
+        let q_b = self.q_proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.q_proj = Linear::new(q_w, q_b);
+
+        let k_w = self.k_proj.weight().to_device(device)?;
+        let k_b = self.k_proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.k_proj = Linear::new(k_w, k_b);
+
+        let v_w = self.v_proj.weight().to_device(device)?;
+        let v_b = self.v_proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.v_proj = Linear::new(v_w, v_b);
+
+        let o_w = self.o_proj.weight().to_device(device)?;
+        let o_b = self.o_proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.o_proj = Linear::new(o_w, o_b);
+
+        if let Some((k, v)) = &self.kv_cache {
+            self.kv_cache = Some((k.to_device(device)?, v.to_device(device)?));
+        }
+        Ok(())
     }
 
     pub fn forward(
