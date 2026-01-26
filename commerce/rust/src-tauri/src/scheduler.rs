@@ -612,13 +612,23 @@ async fn process_task(
 
         // 2. Stream from 0.6B to 2B
         {
-            let mut large_gen_lock = model.generator.lock().await; 
-            let mut small_gen_lock = model.small_generator.lock().await;
+            let model_clone = model.clone();
+            let params_clone = params.clone();
+            let token_clone = cancellation_token.clone();
+            let task_id_clone = task.id.clone();
+
+            println!("[Scheduler] Real-time Relay Started (Blocking Thread)...");
             
-            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                println!("[Scheduler] Real-time Relay Started...");
-                let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(task.id.clone()), Some(target))?;
-            }
+            // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
+            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut large_gen_lock = model_clone.generator.blocking_lock(); 
+                let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                
+                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+                }
+                Ok(())
+            }).await??;
         }
 
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -675,11 +685,23 @@ async fn process_task(
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         {
-            let mut large_gen_lock = model.generator.lock().await;
-            let mut small_gen_lock = model.small_generator.lock().await;
-            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)), Some(target))?;
-            }
+            let model_clone = model.clone();
+            let params_clone = params.clone();
+            let token_clone = cancellation_token.clone();
+            let task_id_clone = format!("{}_task2", task.id);
+
+            println!("[Scheduler] Real-time Relay Started (Blocking Thread)...");
+
+            // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
+            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut large_gen_lock = model_clone.generator.blocking_lock();
+                let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                
+                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+                }
+                Ok(())
+            }).await??;
         }
 
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -1242,12 +1264,21 @@ async fn process_task(
                                             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
                                             {
-                                                let mut large_gen_lock = model.generator.lock().await;
-                                                let mut small_gen_lock = model.small_generator.lock().await;
-                                                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                                                    println!("[Scheduler] Detail Ingestion (Relay) Started...");
-                                                    let _ = worker.prefill_only(params.clone(), Some(cancellation_token.clone()), Some(detail_session_id.clone()), Some(target))?;
-                                                }
+                                                let model_clone = model.clone();
+                                                let params_clone = params.clone();
+                                                let token_clone = cancellation_token.clone();
+                                                let task_id_clone = detail_session_id.clone();
+
+                                                println!("[Scheduler] Detail Ingestion (Blocking Thread)...");
+
+                                                let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                                                    let mut large_gen_lock = model_clone.generator.blocking_lock();
+                                                    let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                                                    if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                                                        worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+                                                    }
+                                                    Ok(())
+                                                }).await??;
                                             }
                                             model.unload_generator().await; // Unload Small
                                         }

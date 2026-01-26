@@ -309,7 +309,7 @@ impl QuantizedQwen3VLTextAttention {
         Ok(attn_output)
     }
 
-    fn compress_to_4bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
+    fn compress_to_8bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
         let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let t_data = t_f32.to_vec1::<f32>()?;
@@ -319,10 +319,10 @@ impl QuantizedQwen3VLTextAttention {
         let num_vectors = total_elements / last_dim;
         
         let mut scales = vec![0.0f32; num_vectors];
-        let mut packed = vec![0u8; total_elements / 2];
+        let mut packed = vec![0u8; total_elements];
         
         use rayon::prelude::*;
-        packed.par_chunks_mut(last_dim / 2).zip(scales.par_iter_mut()).enumerate().for_each(|(v_idx, (packed_vector, scale))| {
+        packed.par_chunks_mut(last_dim).zip(scales.par_iter_mut()).enumerate().for_each(|(v_idx, (packed_vector, scale))| {
             let t_start = v_idx * last_dim;
             let t_vector = &t_data[t_start..t_start + last_dim];
             
@@ -332,30 +332,23 @@ impl QuantizedQwen3VLTextAttention {
                 if abs_v > max_abs { max_abs = abs_v; }
             }
             
-            let s = max_abs / 7.0;
+            let s = max_abs / 127.0;
             *scale = s;
             
             if s > 0.0 {
-                for i in 0..(last_dim / 2) {
-                    let v1 = t_vector[i * 2];
-                    let v2 = t_vector[i * 2 + 1];
-                    
-                    // Symmetric quant to [-8, 7] and shift to [0, 15]
-                    let q1 = ((v1 / s).round().clamp(-8.0, 7.0) + 8.0) as u8;
-                    let q2 = ((v2 / s).round().clamp(-8.0, 7.0) + 8.0) as u8;
-                    
-                    packed_vector[i] = (q1 << 4) | (q2 & 0x0F);
+                for i in 0..last_dim {
+                    packed_vector[i] = (t_vector[i] / s).round().clamp(-127.0, 127.0) as i8 as u8;
                 }
             }
         });
             
-        let packed_tensor = Tensor::from_vec(packed, vec![original_shape[0], original_shape[1], original_shape[2], last_dim / 2], &Device::Cpu)?;
+        let packed_tensor = Tensor::from_vec(packed, vec![original_shape[0], original_shape[1], original_shape[2], last_dim], &Device::Cpu)?;
         let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
         
         Ok((packed_tensor, scales_tensor, original_shape))
     }
 
-    fn decompress_from_4bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+    fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
         let device = packed.device();
         let packed_vec = packed.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
         let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
@@ -367,15 +360,11 @@ impl QuantizedQwen3VLTextAttention {
         use rayon::prelude::*;
         decoded.par_chunks_mut(last_dim).enumerate().for_each(|(v_idx, vector_out)| {
             let s = scales_vec[v_idx];
-            let packed_start = v_idx * (last_dim / 2);
-            let packed_vector = &packed_vec[packed_start..packed_start + (last_dim / 2)];
+            let packed_start = v_idx * last_dim;
+            let packed_vector = &packed_vec[packed_start..packed_start + last_dim];
             
             for (i, &p) in packed_vector.iter().enumerate() {
-                let q1 = (p >> 4) as f32 - 8.0;
-                let q2 = (p & 0x0F) as f32 - 8.0;
-                
-                vector_out[i * 2] = q1 * s;
-                vector_out[i * 2 + 1] = q2 * s;
+                vector_out[i] = (p as i8) as f32 * s;
             }
         });
         
@@ -449,11 +438,10 @@ impl QuantizedQwen3VLTextAttention {
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
             
-            // [BALANCED-QUANT] Switch to 4-bit quantization for higher precision (1/4 size)
-            // Use block_size 64 for hardware alignment speedup
+            // [HIGH-PRECISION-QUANT] Standardize on 8-bit (i8) for best CPU stability and precision
             let bs = 64;
-            let (k_packed, k_scales, k_shape) = self.compress_to_4bit(&k_cpu)?;
-            let (v_packed, v_scales, _) = self.compress_to_4bit(&v_cpu)?;
+            let (k_packed, k_scales, k_shape) = self.compress_to_8bit(&k_cpu)?;
+            let (v_packed, v_scales, _) = self.compress_to_8bit(&v_cpu)?;
             
             map.insert("k_packed".to_string(), k_packed);
             map.insert("v_packed".to_string(), v_packed);
@@ -461,7 +449,7 @@ impl QuantizedQwen3VLTextAttention {
             map.insert("v_scales".to_string(), v_scales);
             map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
             map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-            map.insert("bits".to_string(), Tensor::from_vec(vec![4u32], (1,), &Device::Cpu)?);
+            map.insert("bits".to_string(), Tensor::from_vec(vec![8u32], (1,), &Device::Cpu)?);
             map.insert("block_size".to_string(), Tensor::from_vec(vec![bs as u32], (1,), &Device::Cpu)?);
         } else {
             return Ok(());
@@ -513,11 +501,11 @@ impl QuantizedQwen3VLTextAttention {
                 };
                 let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
 
-                if bits == 4 {
-                    let t = self.decompress_from_4bit(&packed, &scales, &shape)?;
+                if bits == 8 {
+                    let t = self.decompress_from_8bit(&packed, &scales, &shape)?;
                     Ok(t.to_dtype(target_dtype)?)
                 } else {
-                    Err(anyhow!("Unsupported bit depth: {}. Standardized to 4-bit only.", bits))
+                    Err(anyhow!("Unsupported bit depth: {}. Standardized to 8-bit only.", bits))
                 }
             };
             (dequantize_tensor("k")?, dequantize_tensor("v")?)
@@ -1025,9 +1013,7 @@ impl QuantizedQwen3VLTextModel {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // [DEBUG-LOG] Track CPU inference progress
             if layer_idx % 4 == 0 {
-                use std::io::Write;
-                print!("\r[CPU-INFER] Layer {}/{}...", layer_idx, total_layers);
-                std::io::stdout().flush().ok();
+                println!("[CPU-INFER] Processing Layer {}/{}...", layer_idx, total_layers);
             }
 
             // Layer handles device transfer internally
