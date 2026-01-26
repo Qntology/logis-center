@@ -41,6 +41,12 @@ pub fn get_pug_logs_dir(app: Option<&AppHandle>, task_id: &str) -> PathBuf {
     path
 }
 
+pub fn get_task_log_file(app: Option<&AppHandle>, task_id: &str) -> PathBuf {
+    let path = get_logs_dir(app).join("tasks");
+    if !path.exists() { let _ = fs::create_dir_all(&path); }
+    path.join(format!("{}.jsonl", task_id))
+}
+
 /// Initialize all necessary directories
 pub fn init_directories(app: Option<&AppHandle>) {
     let _ = get_kv_dir(app);

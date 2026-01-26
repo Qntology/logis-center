@@ -28,40 +28,34 @@ pub struct AppState {
 
 #[tauri::command]
 async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, String> {
+    // 1. Set the flag immediately. This is the primary signal for all loops and model inference.
     state.cancellation_token.store(true, Ordering::SeqCst);
     
-    // 1. Update DB to clear active tasks so they reflect as 'Cancelled' in UI
-    {
-        let store_guard = state.store.lock().await;
-        if let Some(db) = store_guard.as_ref() {
-            if let Ok(active_tasks) = db.get_pending_tasks(50).await {
-                for task in active_tasks {
-                    let _ = db.update_task_status(&task.id, 3).await; // 3 = Cancelled
-                    let _ = db.update_message_status(&task.id, 3, Some("Force stopped by user")).await;
-                }
-            }
+    // 2. Aggressively try to clear model/store if the lock is available.
+    // By using try_lock, we can clear the global state instantly if the worker is between tasks.
+    if let Ok(mut model_guard) = state.model.try_lock() {
+        if let Some(m) = model_guard.as_ref() {
+            // [NON-BLOCKING] We don't await here to avoid UI hang, just drop the reference.
+            // The worker holding its own clone will handle the internal stop.
+            println!("[STOP] Clearing global model reference.");
         }
-    }
-
-    // 2. Force drop model and store to release VRAM/RAM immediately
-    {
-        let mut model_guard = state.model.lock().await;
         *model_guard = None;
     }
-    
-    {
-        let mut store_guard = state.store.lock().await;
-        *store_guard = None;
-    }
 
-    println!("[STOP] Cancellation signal sent, DB updated, and model/store dropped.");
-    Ok("Stop signal sent and resources released.".to_string())
+    // [KEEP-STORE] We do NOT clear the store here. 
+    // The worker needs it to mark the task as 'cancelled' in the DB.
+    
+    println!("[STOP] Cancellation signal sent. Background worker will detect and exit.");
+    Ok("Stop signal sent.".to_string())
 }
 
 #[tauri::command]
 async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
     {
         let mut model_guard = state.model.lock().await;
+        if let Some(m) = model_guard.as_ref() {
+            m.unload_generator().await;
+        }
         *model_guard = None;
     }
     
@@ -70,7 +64,9 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
         *store_guard = None;
     }
 
-    println!("[UNLOAD] Model and Store explicitly dropped from memory.");
+    state.cancellation_token.store(false, Ordering::SeqCst);
+
+    println!("[UNLOAD] Model, Store and Cancellation flag cleared.");
     Ok("Memory cleared.".to_string())
 }
 
@@ -116,6 +112,13 @@ async fn move_to_top_center(app_handle: tauri::AppHandle) {
                 }
             }
         }
+    }
+}
+
+#[tauri::command]
+async fn set_ignore_cursor_events(app_handle: tauri::AppHandle, ignore: bool) {
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = window.set_ignore_cursor_events(ignore);
     }
 }
 
@@ -182,11 +185,11 @@ async fn summarize_image(
         let task = crate::store::Task {
             id: task_id.clone(),
             r#type: "image_extraction".to_string(),
-            from_source: "manual_upload".to_string(),
-            to_dest: "local".to_string(),
+            from: "manual_upload".to_string(),
+            to: "local".to_string(),
             cc: "".to_string(),
             bcc: "".to_string(),
-            ref_id: "manual".to_string(),
+            r#ref: "manual".to_string(),
             data_json: task_data.to_string(),
             created_at: now,
             updated_at: now,
@@ -207,12 +210,9 @@ async fn search_documents(
     state: State<'_, AppState>,
     query: String,
     limit: usize,
-    offset: usize,
+    _offset: usize,
+    filter: Option<String>,
 ) -> Result<Vec<(String, String, f32)>, String> {
-    let mut store_guard = state.model.lock().await; // Using model lock or store lock based on current usage
-    // Actually search_documents uses store, let's re-verify the lock usage from the file.
-    // Based on the previous read_file of lib.rs:
-    
     let mut store_guard = state.store.lock().await;
     if store_guard.is_none() {
         let db_path = "data/lancedb";
@@ -230,7 +230,7 @@ async fn search_documents(
     };
 
     if let Some(store) = store_guard.as_ref() {
-        store.search_items("items", &query, query_vec, limit, None).await.map_err(|e| e.to_string())
+        store.search_items("items", &query, query_vec, limit, filter).await.map_err(|e| e.to_string())
     } else {
         Err("DB not initialized".to_string())
     }
@@ -261,10 +261,11 @@ async fn get_all_documents(
     state: State<'_, AppState>,
     limit: usize,
     offset: usize,
+    filter: Option<String>,
 ) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let mut results = store.get_all_items("items", limit, offset).await.map_err(|e| e.to_string())?;
+        let mut results = store.get_all_items("items", limit, offset, filter).await.map_err(|e| e.to_string())?;
         
         // [DYNAMIC] Convert JSON to Natural Language for UI display only
         for doc in results.iter_mut() {
@@ -497,8 +498,20 @@ async fn proxy_fetch(
 
 
 
-    for (k, v) in headers { req_builder = req_builder.header(k, v); }
-    if let Some(b) = body { req_builder = req_builder.json(&b); }
+    for (k, v) in headers.iter() { req_builder = req_builder.header(k, v); }
+    
+    if let Some(b) = body { 
+        if headers.get("Content-Encoding").map(|v| v.as_str()) == Some("gzip") {
+            // [STRICT PARITY] Compress body if Gzip is requested
+            if let Ok(compressed) = crate::utils::compression::compress_value(&b) {
+                req_builder = req_builder.body(compressed);
+            } else {
+                req_builder = req_builder.json(&b);
+            }
+        } else {
+            req_builder = req_builder.json(&b); 
+        }
+    }
 
     let response = req_builder.send().await.map_err(|e| e.to_string())?;
     let status = response.status();
@@ -533,14 +546,14 @@ async fn proxy_fetch(
 struct ActiveTaskQuery {
     cc: String,
     #[serde(alias = "refId")]
-    ref_id: String,
+    r#ref: String,
 }
 
 #[tauri::command]
 async fn check_active_task(state: State<'_, AppState>, payload: ActiveTaskQuery) -> Result<bool, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
-        db.has_active_task(&payload.cc, &payload.ref_id).await.map_err(|e| e.to_string())
+        db.has_active_task(&payload.cc, &payload.r#ref).await.map_err(|e| e.to_string())
     } else { Ok(false) }
 }
 
@@ -565,10 +578,15 @@ async fn initialize_hub(
 }
 
 #[tauri::command]
-async fn get_chat_messages(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+async fn get_chat_messages(
+    state: State<'_, AppState>,
+    limit: usize,
+    offset: usize,
+    filter: Option<String>,
+) -> Result<Vec<Value>, String> {
     let store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
-        db.get_all_messages(50).await.map_err(|e| e.to_string())
+        db.get_all_messages(limit, offset, filter).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -578,7 +596,7 @@ async fn get_chat_messages(state: State<'_, AppState>) -> Result<Vec<Value>, Str
 async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("pages", 20, 0).await.map_err(|e| e.to_string())
+        store.get_all_items("pages", 100, 0, None).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -586,7 +604,7 @@ async fn get_known_pages(state: State<'_, AppState>) -> Result<Vec<TradeDocument
 async fn get_known_users(state: State<'_, AppState>) -> Result<Vec<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        store.get_all_items("users", 20, 0).await.map_err(|e| e.to_string())
+        store.get_all_items("users", 20, 0, None).await.map_err(|e| e.to_string())
     } else { Ok(vec![]) }
 }
 
@@ -652,6 +670,132 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
     }
 }
 
+#[tauri::command]
+async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<Vec<Value>, String> {
+    let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task_id);
+    if !log_path.exists() { return Ok(vec![]); }
+
+    let content = std::fs::read_to_string(log_path).map_err(|e| e.to_string())?;
+    let logs = content.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    Ok(logs)
+}
+
+#[tauri::command]
+async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<String, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        let mut count = 0;
+        for item in items {
+            // Basic parsing to determine ID and Table
+            // In content.js structure: id, type are top level or in data
+            let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let type_str = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            
+            // Determine table based on type
+            let _table = match type_str.as_str() {
+                "sales" | "goods" | "order" => "sales",
+                "tracking" | "receiving" | "shipping" => "tracking",
+                "event" | "coupon" => "event",
+                "member" | "team" | "user" => "users",
+                "talk" => "talks",
+                // Pages are stored in 'items' table with type='pages' in some contexts, 
+                // or 'pages' table if strictly separated. The store supports "pages".
+                // Based on previous context, page navigation items are usually type='order'/'goods' but acting as navigation nodes.
+                // However, we want to store them where 'get_known_pages' looks. 
+                // 'get_known_pages' looks at "pages" table.
+                // Let's assume the sync sends items intended for the "pages" table if they are nav items.
+                _ => {
+                    // Fallback: If it looks like a page (has origin/link), put in pages
+                    if item.get("origin").is_some() || item.get("link").is_some() {
+                        "pages"
+                    } else {
+                        "items" 
+                    }
+                }
+            };
+
+            // Handling the "pages" and "users" specifically for the sync request
+            // If the frontend sends explicit table hint, we could use that, but for now infer from type.
+            let final_table = if type_str == "team" || type_str == "user" || type_str == "member" {
+                "users"
+            } else if item.get("data").and_then(|d| d.get("origin")).is_some() {
+                "pages"
+            } else {
+                "items" // Default bucket
+            };
+
+            // Prepare fields
+            let from = item.get("from").and_then(|v| v.as_str());
+            let to = item.get("to").and_then(|v| v.as_str());
+            let cc = item.get("cc").and_then(|v| v.as_str());
+            let bcc = item.get("bcc").and_then(|v| v.as_str());
+            let r#ref = item.get("ref").and_then(|v| v.as_str());
+            let digest = item.get("digest").and_then(|v| v.as_str());
+
+            if !id.is_empty() {
+                let _ = db.upsert_item(final_table, &id, &type_str, item.clone(), None, from, to, cc, bcc, r#ref, digest).await;
+                count += 1;
+            }
+        }
+        Ok(format!("Synced {} items", count))
+    } else {
+        Err("DB not initialized".to_string())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct InitialSyncData {
+    tasks: Vec<store::Task>,
+    pages: Vec<store::TradeDocument>,
+    users: Vec<store::TradeDocument>,
+    items: Vec<store::TradeDocument>,
+    browser_status: String,
+    current_url: String,
+    is_client: bool,
+    is_admin: bool,
+}
+
+#[tauri::command]
+async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, String> {
+    scheduler::mark_ui_ready();
+    
+    let store_guard = state.store.lock().await;
+    let mut tasks = Vec::new();
+    let mut pages = Vec::new();
+    let mut users = Vec::new();
+    let mut items = Vec::new();
+    
+    if let Some(db) = store_guard.as_ref() {
+        tasks = db.get_pending_tasks(10).await.unwrap_or_default();
+        pages = db.get_all_items("pages", 50, 0, None).await.unwrap_or_default();
+        users = db.get_all_items("users", 20, 0, None).await.unwrap_or_default();
+        items = db.get_all_items("items", 10, 0, None).await.unwrap_or_default();
+    }
+    
+    let browser_status = {
+        let guard = automation::GLOBAL_BROWSER.lock().await;
+        if guard.is_some() { "running".to_string() } else { "stopped".to_string() }
+    };
+
+    let (current_url, is_client, is_admin) = {
+        let state = automation::LAST_DETECTED_STATE.lock().await;
+        (state.url.clone(), state.is_client, state.is_admin)
+    };
+
+    Ok(InitialSyncData {
+        tasks,
+        pages,
+        users,
+        items,
+        browser_status,
+        current_url,
+        is_client,
+        is_admin,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let model = Arc::new(TokioMutex::new(None));
@@ -661,6 +805,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             model: model.clone(),
             store: store.clone(),
@@ -706,14 +851,23 @@ pub fn run() {
                             let task = crate::store::Task {
                                 id: payload_val.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                                 r#type: payload_val.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                                from_source: from_addr, to_dest: team_id,
+                                from: from_addr, to: team_id,
                                 cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                ref_id: payload_val.get("ref_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                r#ref: payload_val.get("r#ref").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 data_json: payload_val.to_string(), created_at: now, updated_at: now, status: 10,
                             };
                             let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
-                            let _ = db.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", &msg_content, Some(&task.id), Some(1)).await;
+                            let _ = db.add_message(
+                                &uuid::Uuid::new_v4().to_string(), 
+                                "system_task", 
+                                &msg_content, 
+                                Some(&task.id), 
+                                Some(1),
+                                Some(&task.cc),
+                                Some(&task.bcc),
+                                Some(&task.r#ref)
+                            ).await;
                             let _ = db.add_task(task).await;
                         }
                     });
@@ -725,7 +879,8 @@ pub fn run() {
             summarize_image, search_documents, get_all_documents, get_document, check_query_intent, deep_research_command, ai_search_complex,
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
-            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model
+            get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
+            upsert_items, set_ignore_cursor_events, mark_ui_ready
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

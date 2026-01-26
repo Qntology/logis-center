@@ -2,6 +2,8 @@ pub mod img_utils;
 pub mod tensor_utils;
 pub mod hash;
 pub mod paths;
+pub mod compression;
+pub mod resources;
 
 use candle_core::{Device, DType};
 use anyhow::Result;
