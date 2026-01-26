@@ -445,8 +445,6 @@ impl LogisModel {
             
             // We use prefill_only via a manual chat construct or direct access if possible
             // Reusing chat_params_with_spinner for convenience but with empty generation
-            let app_handle_dummy = tauri::AppHandle::current(); // Not available here, need refactor?
-            // Actually, we can just use the generator directly.
             
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut gen_guard = gen_clone.blocking_lock();
