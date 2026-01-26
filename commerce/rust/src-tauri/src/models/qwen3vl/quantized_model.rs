@@ -7,6 +7,7 @@ use nvml_wrapper::Nvml;
 use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
+use std::sync::Arc;
 use memmap2::Mmap;
 
 use crate::{
@@ -699,7 +700,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub norm: RmsNorm,
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
-    pub mmap: Option<Mmap>, // Keep mmap alive for tensors
+    pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -1134,8 +1135,8 @@ pub struct QuantizedQwen3VLModel {
     pub rope_deltas: Option<Tensor>,
     pub text_device: Device,
     pub vision_device: Device,
-    pub mmap: Option<Mmap>,
-    pub mmproj_mmap: Option<Mmap>,
+    pub mmap: Option<Arc<Mmap>>,
+    pub mmproj_mmap: Option<Arc<Mmap>>,
 }
 
 impl QuantizedQwen3VLModel {
