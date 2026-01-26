@@ -373,6 +373,8 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn clear_kv_cache(&mut self) {
+        self.kv_cache = None;
+    }
 
     pub fn get_kv_len(&self) -> usize {
         match &self.kv_cache {
@@ -381,42 +383,49 @@ impl QuantizedQwen3VLTextAttention {
         }
     }
 
-    // [LIVE-BRIDGE] Inject 1024-dim KV from 0.6B into 2048-dim VRAM of 2B
+    // [LIVE-BRIDGE] Inject 512-dim KV from 0.6B into 2048-dim VRAM of 2B
     pub fn inject_live_kv(&mut self, k_small: &Tensor, v_small: &Tensor) -> Result<()> {
-        // [VRAM-LOG] Starting Vision Encoder...
-        let target_heads = self.num_key_value_heads;
-        let target_dim = self.head_dim;
-        let target_device = self.q_proj.device(); // 2B model's device (GPU)
+        let target_heads = self.num_key_value_heads; // 16 heads
+        let target_dim = self.head_dim;             // 128 dim
+        let target_device = self.q_proj.device(); 
         
-        // [FORCE-VRAM] Move to target device immediately to show VRAM usage
         let k_small = k_small.to_device(target_device)?;
         let v_small = v_small.to_device(target_device)?;
 
-        // 2. Dimension Replication (1024 -> 2048)
-        // Instead of zero padding, we duplicate the signal to keep the 2B model's attention active.
-        let k_projected = if k_small.dim(D::Minus1)? < target_dim {
+        let (_b, h, _s, d) = k_small.dims4()?;
+        
+        // 1. Dimension Alignment (e.g. 64 -> 128 if needed)
+        let mut k = if d < target_dim {
             Tensor::cat(&[&k_small, &k_small], D::Minus1)?
         } else { k_small.clone() };
         
-        let v_projected = if v_small.dim(D::Minus1)? < target_dim {
+        let mut v = if d < target_dim {
             Tensor::cat(&[&v_small, &v_small], D::Minus1)?
         } else { v_small.clone() };
-        
-        // 2. Head Replication (8 heads -> 16 heads)
-        let mut k_heads = vec![];
-        let mut v_heads = vec![];
-        let source_heads = k_projected.dim(1)?;
-        
-        for i in 0..target_heads {
-            let src_idx = i % source_heads;
-            k_heads.push(k_projected.narrow(1, src_idx, 1)?);
-            v_heads.push(v_projected.narrow(1, src_idx, 1)?);
+
+        // 2. Head Alignment (e.g. 4 heads -> 16 heads)
+        // Replicate heads to match the 2048-dim space (16 * 128)
+        if k.dim(1)? != target_heads {
+            let mut k_heads = vec![];
+            let mut v_heads = vec![];
+            let current_h = k.dim(1)?;
+            for i in 0..target_heads {
+                let src_idx = i % current_h;
+                k_heads.push(k.narrow(1, src_idx, 1)?);
+                v_heads.push(v.narrow(1, src_idx, 1)?);
+            }
+            k = Tensor::cat(&k_heads, 1)?;
+            v = Tensor::cat(&v_heads, 1)?;
         }
         
-        let k_final = Tensor::cat(&k_heads, 1)?;
-        let v_final = Tensor::cat(&v_heads, 1)?;
+        let k_final = k;
+        let v_final = v;
+
+        if self.layer_idx == 0 {
+            println!("[KV-BRIDGE] Projecting 0.6B cache (512) to 2B architecture (2048) using Replication");
+        }
         
-        // 3. Append to existing cache
+        // Append to existing cache
         self.kv_cache = match &self.kv_cache {
             None => Some((k_final, v_final)),
             Some((prev_k, prev_v)) => {
@@ -499,31 +508,28 @@ impl QuantizedQwen3VLTextAttention {
             (dequantize_tensor("k")?, dequantize_tensor("v")?)
         };
 
-        // [LINEAR-BRIDGE] Convert 0.6B (1024) cache to 2B (2048) cache
+        // [LINEAR-BRIDGE] Convert 0.6B (512) cache to 2B (2048) cache
         let (_b, h, _s, d) = k.dims4()?;
-
         let target_heads = self.num_key_value_heads;
         let target_dim = self.head_dim;
 
         if h != target_heads || d != target_dim {
             if self.layer_idx == 0 {
-                println!("[KV-BRIDGE] Projecting 0.6B cache ({}, {}) to 2B architecture ({}, {}) using Replication", h, d, target_heads, target_dim);
+                println!("[LINEAR-BRIDGE] Convert 0.6B (512) cache to 2B (2048) cache");
             }
             
-            // 1. Dimension Replication (1024 -> 2048)
+            // 1. Dimension Replication (e.g. 64 -> 128)
             if d < target_dim {
-                // Duplicate the signal to fill the 2048-dim space.
                 k = Tensor::cat(&[&k, &k], D::Minus1)?;
                 v = Tensor::cat(&[&v, &v], D::Minus1)?;
             }
             
-            // 2. Head Alignment
+            // 2. Head Alignment (e.g. 4 heads -> 16 heads)
             if h != target_heads {
-                // If head counts differ, we replicate or pad heads to match 2B's attention map.
                 let mut k_heads = vec![];
                 let mut v_heads = vec![];
                 for i in 0..target_heads {
-                    let source_idx = i % h; // Round-robin mapping if 2B has more heads
+                    let source_idx = i % h;
                     k_heads.push(k.narrow(1, source_idx, 1)?);
                     v_heads.push(v.narrow(1, source_idx, 1)?);
                 }

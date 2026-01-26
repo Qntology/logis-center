@@ -1057,7 +1057,7 @@ async fn process_task(
                     ];
 
                     let res = model.chat_params_with_spinner(
-                        ChatCompletionParameters { messages, model: "qwen3vl".to_string(), max_tokens: Some(4096), temperature: Some(0.95), ..Default::default() },
+                        ChatCompletionParameters { messages, model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.95), ..Default::default() },
                         &app_handle_clone, "Refinement (Large)",
                         json!({ "task_id": task.id, "category": "Refinement (Infer)", "summary": format!("Refining items {}-{}...", start_item, end_item) }),
                         Some(cancellation_token.clone()), Some(task.id.clone())
@@ -1233,7 +1233,7 @@ async fn process_task(
                 
                                     ],
                 
-                                    model: "qwen3vl".to_string(), max_tokens: Some(8192), temperature: Some(0.1),
+                                    model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
                 
                                     ..Default::default()
                 

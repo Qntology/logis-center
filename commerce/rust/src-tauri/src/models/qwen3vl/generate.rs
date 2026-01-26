@@ -258,13 +258,12 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
         let total_tokens = full_input_ids_vec.len();
 
-                        let seqlen_offset = self.get_kv_len();
-                        let mut current_pos = seqlen_offset;
-                        // [SMOOTH-RELAY] Set chunk size to 256 for balanced CPU inference and PCIe transfer
-                        let prefill_chunk_size = 256; 
-                
-                        println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);        
-                while current_pos < total_tokens {
+                                let seqlen_offset = self.get_kv_len();
+                                let mut current_pos = seqlen_offset;
+                                // [SMOOTH-RELAY] Set chunk size to 512 for optimized 0.6B CPU prefill and PCIe relay
+                                let prefill_chunk_size = 512; 
+                        
+                                println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);                while current_pos < total_tokens {
                     let remaining = total_tokens - current_pos;
                     let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
         
