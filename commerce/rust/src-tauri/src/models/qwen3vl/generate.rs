@@ -137,12 +137,12 @@ impl Qwen3VLGenerateModel {
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
         
         let qwen3_vl = if !gguf_files.is_empty() {
-            // [PRIORITY] Look for specific 8-bit quantized file first
-            let mut model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
+            // [PRIORITY] Look for the specific base IQ1_S file as requested
+            let mut model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Base.i1-IQ1_S.gguf")).cloned();
             
-            // Fallback to any non-mmproj gguf if not found
+            // Fallback to 8-bit if not found
             if model_path.is_none() {
-                model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned();
+                model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
             }
 
             // [OPTIMIZATION] Realistic KV Cache Reservation
