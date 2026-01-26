@@ -520,8 +520,16 @@ impl Qwen3VLGenerateModel {
         
         // [FIX] CHECK LIVE CACHE FIRST: If 0.6B just injected KV, detect it here.
         let live_kv_len = self.get_kv_len();
+        let mut seqlen_offset = live_kv_len; 
+
         if live_kv_len > 0 {
-            println!("[KV-BRIDGE] Detected Live Injected KV: {} tokens. Skipping redundant prefill.", live_kv_len);
+            // [STRICT-RELAY-MATCH] If we have at least total_tokens - 1, it's a perfect relay match.
+            if live_kv_len >= total_tokens.saturating_sub(1) && total_tokens > 0 {
+                println!("[KV-BRIDGE] Perfect Relay Match ({} tokens). Direct Inference Start!", live_kv_len);
+                seqlen_offset = total_tokens - 1; 
+            } else {
+                println!("[KV-BRIDGE] Partial Cache Match ({} tokens). Prefilling remaining.", live_kv_len);
+            }
         }
 
         // KV Cache Disk Loading (Only if live cache is empty)
@@ -533,7 +541,6 @@ impl Qwen3VLGenerateModel {
              None
         };
 
-        let mut seqlen_offset = live_kv_len; 
         if seqlen_offset == 0 {
             if let Some(path) = &cache_path {
                  match &mut self.qwen3_vl {
