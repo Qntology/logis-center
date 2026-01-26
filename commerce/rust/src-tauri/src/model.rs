@@ -232,6 +232,8 @@ impl LogisModel {
         Ok(generator)
     }
 
+    /// [HANDOVER] Naturally transitions resources between models.
+    /// Moves the active model to RAM and prepares GPU for the next one.
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
         self.unload_embedding().await;
 
@@ -242,20 +244,19 @@ impl LogisModel {
             return Ok(()); // Already correct
         }
 
-        println!("[MODEL] Switching to size: {:?}...", size);
+        println!("[RESOURCE-HANDOVER] Switching to size: {:?}...", size);
         
-        // [OOM-SAFETY] 4GB cards cannot reliably hold both models + 10k context.
-        // We force strict mutual exclusion: one model on GPU, the other in RAM.
         let mut small_slot = self.small_hibernation.lock().await;
         let mut large_slot = self.large_hibernation.lock().await;
 
-        // 1. [SLEEP] Move CURRENT active model to its hibernation slot (RAM)
+        // 1. [SLEEP] Naturally move CURRENT active model to system RAM
         if let Some(mut active_model) = gen_guard.take() {
             let old_size = current_size_guard.take().unwrap();
-            println!("[SLEEP] Evicting {:?} model to RAM hibernation...", old_size);
+            println!("[SLEEP] Moving {:?} model from VRAM to RAM hibernation...", old_size);
             
+            // Move to CPU (Our previous DType fix ensures this is safe and won't crash)
             if let Err(e) = active_model.to_device(&Device::Cpu) {
-                println!("[SLEEP-ERROR] Failed to hibernate: {}. Dropping model.", e);
+                println!("[SLEEP-ERROR] Handover failed: {}. Dropping model.", e);
             } else {
                 match old_size {
                     ModelSize::Small => *small_slot = Some(active_model),
@@ -264,15 +265,23 @@ impl LogisModel {
             }
         }
 
-        // 2. [WAKE] Check if requested model is in hibernation
+        // 2. [PURGE] Clear remaining GPU fragments to ensure the next model has 100% space
+        drop(small_slot); drop(large_slot); // Release slot locks before purge
+        self.deep_purge_resources().await;
+
+        // 3. [WAKE] Check if requested model is already in system RAM
+        let mut small_slot = self.small_hibernation.lock().await;
+        let mut large_slot = self.large_hibernation.lock().await;
         let hibernated = match size {
             ModelSize::Small => small_slot.take(),
             ModelSize::Large => large_slot.take(),
         };
 
         if let Some(mut m) = hibernated {
-            println!("[WAKE] Waking up {:?} from RAM to GPU...", size);
+            println!("[WAKE] Waking up {:?} from RAM back to GPU...", size);
             let target_dev = self.device_config.device.clone();
+            
+            // Try to move back to GPU (Our DType fix converts it back to BF16)
             if let Err(e) = m.to_device(&target_dev) {
                 println!("[WAKE-ERROR] Failed to wake: {}. Reloading from disk.", e);
             } else {
@@ -282,21 +291,20 @@ impl LogisModel {
             }
         }
 
-        // 3. [LOAD] Fallback to disk load if not in hibernation
+        // 4. [LOAD] Fresh load only if not in RAM
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
         let mut target_device = self.device_config.device.clone();
         
-        // [OOM-SAFETY] If loading Small, only use GPU if VRAM is very high (> 3.5GB free)
-        // Otherwise, force Small to CPU so that Large (2B) always has room on GPU.
+        // [OOM-SAFETY] Same as before, ensure Small doesn't crowd out Large if VRAM is tight
         if size == ModelSize::Small && target_device.is_cuda() {
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
-                        if mem.free < 3_500_000_000 {
-                            println!("[MODEL-CONFIG] Tight VRAM ({:.2} GB). Offloading Small (0.6B) to CPU to prioritize Large.", mem.free as f64 / 1e9);
+                        if mem.free < 3_000_000_000 {
+                            println!("[MODEL-CONFIG] Tight VRAM ({:.2} GB). Keeping Small on CPU to save GPU for Large.", mem.free as f64 / 1e9);
                             target_device = Device::Cpu;
                         }
                     }

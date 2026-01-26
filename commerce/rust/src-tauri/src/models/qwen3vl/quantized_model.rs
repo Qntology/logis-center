@@ -1046,7 +1046,7 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-        let total_layers = self.layers.len();
+        let _total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;

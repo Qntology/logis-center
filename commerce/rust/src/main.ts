@@ -1088,7 +1088,7 @@ function startPolling() {
     }, 3000);
 }
 
-function renderMessage(msg: any) {
+function renderMessage(msg: any, shouldScroll: boolean = true) {
     if (!chatTalks) return;
     const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
     let existing = document.getElementById(msgId);
@@ -1130,7 +1130,8 @@ function renderMessage(msg: any) {
         }
         chatTalks.insertAdjacentElement('beforeend', messageDiv);
     }
-    const scroll = document.getElementById("chat-scroll"); if (scroll && !existing) scroll.scrollTop = scroll.scrollHeight;
+    const scroll = document.getElementById("chat-scroll"); 
+    if (scroll && shouldScroll && !existing) scroll.scrollTop = scroll.scrollHeight;
 }
 
 function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
@@ -1191,13 +1192,31 @@ async function syncBrowserStatus() { try { const s = await invoke<string>("get_b
 initSession(); setWindowSize(false); syncBrowserStatus();
 const talksScroll = document.getElementById("chat-scroll");
 if (talksScroll) {
-    talksScroll.addEventListener('wheel', (e: WheelEvent) => { talksScroll.scrollTop -= e.deltaY; e.preventDefault(); }, { passive: false });
-    talksScroll.addEventListener('scroll', () => { if (talksScroll.scrollTop + talksScroll.clientHeight >= talksScroll.scrollHeight - 20) loadMoreChat(); });
+    talksScroll.addEventListener('wheel', (e: WheelEvent) => { 
+        // [FIX] Prevent jumping by checking boundaries and using standard direction
+        const delta = e.deltaY;
+        const isScrollingDown = delta > 0;
+        const isScrollingUp = delta < 0;
+        const canScrollDown = talksScroll.scrollHeight - talksScroll.scrollTop > talksScroll.clientHeight;
+        const canScrollUp = talksScroll.scrollTop > 0;
+
+        if ((isScrollingDown && canScrollDown) || (isScrollingUp && canScrollUp)) {
+            talksScroll.scrollTop -= delta; 
+            e.preventDefault(); 
+        }
+
+    }, { passive: false });
+    talksScroll.addEventListener('scroll', async () => { 
+        if (!isChatLoading && talksScroll.scrollTop + talksScroll.clientHeight >= talksScroll.scrollHeight - 100) {
+            await loadMoreChat(); 
+        }
+    });
 }
 async function fetchChatHistory(reset: boolean = true) { if (reset) { chatPage = 0; chatHasMore = true; if (chatTalks) chatTalks.innerHTML = ""; } await loadMoreChat(); }
 async function loadMoreChat() {
     if (isChatLoading || !chatHasMore) return;
     isChatLoading = true;
+
     try {
         let sqlFilter = null;
         if (activeContext.ref) sqlFilter = `ref = '${activeContext.ref}'`;
@@ -1208,7 +1227,7 @@ async function loadMoreChat() {
             if (messages && messages.length > 0) {
                 if (messages.length < pageSize) chatHasMore = false;
                 messages.sort((a, b) => a.created_at - b.created_at);
-                messages.forEach(msg => renderMessage(msg)); chatPage++;
+                messages.forEach(msg => renderMessage(msg, false)); chatPage++;
             } else { chatHasMore = false; if (chatPage === 0) chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>"; }
             if (!currentSession.email && currentTab === "settings" && chatPage === 1) performQrAuth();
         }

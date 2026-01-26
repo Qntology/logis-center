@@ -6,6 +6,7 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
+use crate::openai_types::ChatCompletionParameters;
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
@@ -309,44 +310,17 @@ async fn process_task(
     // [NEW] Clear any leftover resources from previous failed attempts at the START
     cleanup_task_resources(&task.id, Some(app_handle));
 
-    // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
+    // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately
     let payload = json!({ 
         "task_id": task.id,
-        "category": "Processing", "summary": "Resuming task...", "spinner": "⠋" 
+        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋" 
     });
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-
-
-        let payload = json!({ 
-
-
-
-            "task_id": task.id,
-
-
-
-            "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
-
-
-
-        });
-
-
-
-        let _ = app_handle.emit("extraction-progress", &payload);
-
-
-
-        log_task_progress(app_handle, &task.id, &payload);
-
-
-
     // [MEMORY] Initialize Data Manager for this task scope with AppHandle for dynamic paths
-
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
 
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
@@ -356,71 +330,46 @@ async fn process_task(
     if task.r#type == "image_extraction" {
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         
-                let mut model_lock = model_mutex.lock().await;
-        
-                if model_lock.is_none() {
+        let mut model_lock = model_mutex.lock().await;
+        if model_lock.is_none() {
+            let payload = json!({ 
+               "task_id": task.id,
+               "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
+            });
+            let _ = app_handle.emit("extraction-progress", &payload);
+            log_task_progress(app_handle, &task.id, &payload);
+
+            // [RESTORED] Thread priority for model loading
+            let model_res = tokio::task::spawn_blocking(move || {
+                crate::utils::resources::set_current_thread_low_priority();
+                futures::executor::block_on(LogisModel::new(None))
+            }).await?;
+
+            match model_res {
+                Ok(m) => *model_lock = Some(m),
+                Err(e) => {
                     let payload = json!({ 
                        "task_id": task.id,
-                       "category": "Loading Model", "summary": "Loading Vision Model...", "spinner": "⠋"
+                       "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
                     });
                     let _ = app_handle.emit("extraction-progress", &payload);
-                    log_task_progress(app_handle, &task.id, &payload);
-        
-                    match LogisModel::new(None).await {
-        
-                        Ok(m) => *model_lock = Some(m),
-        
-                        Err(e) => {
-                            let payload = json!({ 
-                               "task_id": task.id,
-                               "category": "Error", "summary": format!("Model Load Failed: {}", e), "spinner": "❌"
-                            });
-                            let _ = app_handle.emit("extraction-progress", &payload);
-                            log_task_progress(app_handle, &task.id, &payload);
-        
-                            if let Some(m) = model_lock.as_ref() {
-        
-                                m.unload_generator().await;
-        
-                            }
-        
-                            return Ok(());
-        
-                        }
-        
-                    }
-        
+                    return Ok(());
                 }
+            }
+        }
         
-                
-        
-                if let Some(model) = model_lock.as_ref() {
-        
-                    let res = model.extract_from_image(
-        
-                        task.id.clone(),
-        
-                        image_path,
-        
-                        language.to_string(),
-        
-                        app_handle,
-        
-                        Some(cancellation_token.clone()),
-        
-                        store_mutex
-        
-                    ).await;
-        
-                    
-        
-                    drop(model_lock);
-        
-                    return res;
-        
-                }
-        
-        
+        if let Some(model) = model_lock.as_ref() {
+            let res = model.extract_from_image(
+                task.id.clone(),
+                image_path,
+                language.to_string(),
+                app_handle,
+                Some(cancellation_token.clone()),
+                store_mutex
+            ).await;
+            drop(model_lock);
+            return res;
+        }
         return Ok(());
     }
 
@@ -504,54 +453,165 @@ async fn process_task(
             model_lock.as_ref().unwrap().clone()
         };
     
-        // ==================================================================================
-        // [STRATEGY: ONE-TIME BAKE & STITCH]
-        // 1. Bake HTML into KV Cache once (0.6B -> 2B Relay)
-        // 2. For each task, reload HTML base and only prefill the specific query.
-        // ==================================================================================
+            // ==================================================================================
     
-        println!("[Scheduler] Phase 0: Baking HTML into persistent KV Cache...");
-        let pug_session_id = format!("{}_pug_base", task.id);
+            // [STRATEGY: ONE-TIME BAKE & STITCH]
     
-        {
-            model.ensure_generator(crate::model::ModelSize::Small).await?;
-            model.ensure_generator(crate::model::ModelSize::Large).await?;
-            
-            let model_clone = model.clone();
-            let pug_clone = light_pug.clone();
-            let token_clone = cancellation_token.clone();
-            let sid_clone = pug_session_id.clone();
+            // 1. Bake HTML into KV Cache once (0.6B -> 2B Relay)
     
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                crate::utils::resources::set_current_thread_low_priority(); // [RESTORED] Keep UI alive
-                let mut large_gen_lock = model_clone.generator.blocking_lock();
-                let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
-                            if let (Some(small), Some(large)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                                small.clear_kv_cache();
-                                large.clear_kv_cache();
-                                println!("[Scheduler] Prefilling HTML ({} chars)...", pug_clone.len());
-                                let tokens = small.text_encode_vec(pug_clone.clone(), true)?;
-                                small.prefill_text(&pug_clone, Some(token_clone), Some(large))?;
-                                
-                                // Save this base state to disk for absolute recovery
-                                let cache_path = crate::utils::paths::get_kv_dir(None).join(&sid_clone);
+            // 2. For each task, reload HTML base and only prefill the specific query.
+    
+            // ==================================================================================
+    
+        
+    
+            println!("[Scheduler] Phase 0: Baking HTML into persistent KV Cache...");
+    
+            let pug_session_id = format!("{}_pug_base", task.id);
+    
+        
+    
+            {
+    
+                // 1. Step 1: Ingest HTML using Small (0.6B) model on GPU
+    
+                model.ensure_generator(crate::model::ModelSize::Small).await?;
+    
                 
-                    let _ = std::fs::create_dir_all(&cache_path);
-                    let _ = small.save_kv_cache(&cache_path, false, 1024);
-                    let _ = large.save_kv_cache(&cache_path, false, 1024);
-                    
-                    // [RESTORED] Save tokens.json for cache matching
-                    let token_path = cache_path.join("tokens.json");
-                    if let Ok(file) = std::fs::File::create(&token_path) {
-                        let _ = serde_json::to_writer(file, &tokens);
-                    }
-                }
-                Ok(())
-            }).await??;
-        }
     
-
-    use crate::openai_types::ChatCompletionParameters;
+                let model_clone = model.clone();
+    
+                let pug_clone = light_pug.clone();
+    
+                let token_clone = cancellation_token.clone();
+    
+                let sid_clone = pug_session_id.clone();
+    
+        
+    
+                tokio::task::spawn_blocking(move || -> Result<()> {
+    
+                    crate::utils::resources::set_current_thread_low_priority();
+    
+                    let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
+    
+                    let mut active_gen_lock = model_clone.generator.blocking_lock();
+    
+                    
+    
+                    let small = small_gen_lock.as_mut().or(active_gen_lock.as_mut())
+    
+                        .ok_or_else(|| anyhow::anyhow!("Small model not loaded"))?;
+    
+        
+    
+                    small.clear_kv_cache();
+    
+                    println!("[Scheduler] GPU-Accelerated Prefilling ({} chars)...", pug_clone.len());
+    
+                    let tokens = small.text_encode_vec(pug_clone.clone(), true)?;
+    
+                    small.prefill_text(&pug_clone, Some(token_clone), None)?;
+    
+                    
+    
+                    let cache_path = crate::utils::paths::get_kv_dir(None).join(&sid_clone);
+    
+                    let _ = std::fs::create_dir_all(&cache_path);
+    
+                    let _ = small.save_kv_cache(&cache_path, false, 1024);
+    
+                    
+    
+                    let token_path = cache_path.join("tokens.json");
+    
+                    if let Ok(file) = std::fs::File::create(&token_path) {
+    
+                        let _ = serde_json::to_writer(file, &tokens);
+    
+                    }
+    
+                    Ok(())
+    
+                }).await??;
+    
+        
+    
+                // 2. Step 2: Transition to Large (2B) model and Relay the cache
+    
+                model.ensure_generator(crate::model::ModelSize::Large).await?;
+    
+                
+    
+                let model_clone_v2 = model.clone();
+    
+                let sid_clone_v2 = pug_session_id.clone();
+    
+                
+    
+                tokio::task::spawn_blocking(move || -> Result<()> {
+    
+                    crate::utils::resources::set_current_thread_low_priority();
+    
+                    let mut large_gen_lock = model_clone_v2.generator.blocking_lock();
+    
+                    let mut small_gen_lock = model_clone_v2.small_hibernation.blocking_lock();
+    
+                    
+    
+                    if let (Some(small), Some(large)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+    
+                        let cache_path = crate::utils::paths::get_kv_dir(None).join(&sid_clone_v2);
+    
+                        let small_dev = small.device().clone();
+    
+                        small.load_kv_cache(&cache_path, &small_dev, 0, 0)?;
+    
+                        
+    
+                        let (ks, vs) = small.get_current_kv();
+    
+                        let mut ks_i8 = Vec::new();
+    
+                        let mut vs_i8 = Vec::new();
+    
+                        let mut k_s = Vec::new();
+    
+                        let mut v_s = Vec::new();
+    
+        
+    
+                        for (k, v) in ks.iter().zip(vs.iter()) {
+    
+                            let ki8 = k.to_dtype(candle_core::DType::U8)?;
+    
+                            let vi8 = v.to_dtype(candle_core::DType::U8)?;
+    
+                            ks_i8.push(ki8); vs_i8.push(vi8);
+    
+                            k_s.push(1.0); v_s.push(1.0);
+    
+                        }
+    
+                        large.inject_kv_quantized(&ks_i8, &vs_i8, &k_s, &v_s)?;
+    
+                        let _ = large.save_kv_cache(&cache_path, false, 1024);
+    
+                    }
+    
+                    Ok(())
+    
+                }).await??;
+    
+        
+    
+        let done_payload = json!({ 
+            "task_id": task.id,
+            "category": "Baking", "summary": "HTML Base baked on GPU.", "spinner": "✅" 
+        });
+        let _ = app_handle.emit("extraction-progress", &done_payload);
+        log_task_progress(app_handle, &task.id, &done_payload);
+    }
 
     let mut page_type = String::new();
     let mut selector_info = json!({});
@@ -563,6 +623,13 @@ async fn process_task(
         let type_prompt = parsing::page_type_prompt();
         let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
 
+        let payload = json!({ 
+            "task_id": task.id,
+            "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋" 
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        log_task_progress(app_handle, &task.id, &payload);
+
         let model_clone = model.clone();
         let token_clone = cancellation_token.clone();
 
@@ -571,8 +638,6 @@ async fn process_task(
             let mut large_gen_lock = model_clone.generator.blocking_lock();
             let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
             if let (Some(small), Some(large)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                // IMPORTANT: In real stitching, we'd need to revert to pug_base before each query.
-                // For Task 1, we are already at pug_base.
                 small.prefill_text(&query_text, Some(token_clone), Some(large))?;
             }
             Ok(())
@@ -587,10 +652,21 @@ async fn process_task(
             println!("[Scheduler] 2B Classification Result: {}", res);
             let type_info = parsing::parse_json_from_llm(&res);
             page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+
+            let done_payload = json!({ 
+                "task_id": task.id,
+                "category": "Classification", "summary": format!("Identified as {}", page_type), "spinner": "✅" 
+            });
+            let _ = app_handle.emit("extraction-progress", &done_payload);
+            log_task_progress(app_handle, &task.id, &done_payload);
         }
         
         if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
     }
+
+    // [RESTORED] Stabilize resources between Classification and Selector ID
+    model.deep_purge_resources().await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
     // --- TASK 2: SELECTOR IDENTIFICATION ---
     {
@@ -598,6 +674,13 @@ async fn process_task(
         println!("[Scheduler] Phase 2: Selector ID (Incremental Query)");
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
         let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
+
+        let payload = json!({ 
+            "task_id": task.id,
+            "category": "Selectors", "summary": "Analyzing structural selectors...", "spinner": "⠋" 
+        });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        log_task_progress(app_handle, &task.id, &payload);
 
         let model_clone = model.clone();
         let token_clone = cancellation_token.clone();
@@ -628,6 +711,13 @@ async fn process_task(
             let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
             println!("[Scheduler] 2B Selector Result: {}", res);
             selector_info = parsing::parse_json_from_llm(&res);
+
+            let done_payload = json!({ 
+                "task_id": task.id,
+                "category": "Selectors", "summary": "Selectors identified.", "spinner": "✅", "data": selector_info 
+            });
+            let _ = app_handle.emit("extraction-progress", &done_payload);
+            log_task_progress(app_handle, &task.id, &done_payload);
         }
     }
 
@@ -706,6 +796,10 @@ async fn process_task(
         return Ok (());
     }
     
+    // [RESTORED] Stabilize resources before major extraction
+    model.deep_purge_resources().await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [SELECTOR-COMBINATION] Robustly combine node and item selectors, handling comma-separated groups in both.
@@ -751,6 +845,7 @@ async fn process_task(
     log_task_progress(app_handle, &task.id, &payload);
 
     let mut extracted_data = json!({});
+    let mut all_extracted_items = Vec::new();
 
     if !is_detail {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -760,8 +855,6 @@ async fn process_task(
         });
         let _ = app_handle.emit("extraction-progress", &payload);
         log_task_progress(app_handle, &task.id, &payload);
-
-        let mut all_extracted_items = Vec::new();
 
         // [3번 가속: PRE-FETCH] 리스트 처리를 시작하기 전에 백그라운드에서 Large 모델의 무게추를 미리 로드함
         {
@@ -920,6 +1013,9 @@ async fn process_task(
                     Ok(())
                 }).await??;
 
+                // [RESTORED] Give GPU breathing room during batch loop
+                wait_for_resources_settled(2000, 1200, Some(cancellation_token)).await?;
+
                 // 2. Infer with 2B
                 let refine_res_str = if let Some(gen) = model.generator.lock().await.as_mut() {
                     let params = ChatCompletionParameters {
@@ -930,6 +1026,10 @@ async fn process_task(
                 } else { String::new() };
 
                 println!("[Scheduler] 2B Refinement Result (Batch {}): {}", batch_idx + 1, refine_res_str);
+
+                // [RESTORED SAFETY] Explicitly clear resources after heavy inference to prevent VRAM bloat
+                model.deep_purge_resources().await;
+                wait_for_resources_settled(1500, 1000, Some(cancellation_token)).await?;
 
                 if !refine_res_str.is_empty() {
                      let parsed = parsing::parse_json_from_llm(&refine_res_str);
@@ -1427,9 +1527,9 @@ async fn process_task(
                 }
         }
     }
-        // Final Done Emission
+    // Final Done Emission
     let final_summary = if !is_detail {
-        let count = extracted_data.get("items").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let count = all_extracted_items.len();
         format!("Extraction Complete ({} items saved)", count)
     } else {
         "Extraction Complete".to_string()
@@ -1438,21 +1538,19 @@ async fn process_task(
     // [STRICT PARITY] Update Chat Message in DB using integer status
     {
         let db = &store;
-        {
-            let status_code = logic::parse_status("complete");
-            let _ = db.update_message_status(&task.id, status_code, Some(&final_summary)).await;
-        }
+        let status_code = logic::parse_status("complete");
+        let _ = db.update_message_status(&task.id, status_code, Some(&final_summary)).await;
     }
 
-        let payload = json!({
-            "task_id": task.id,
-            "category": "Done",
-            "summary": "Extraction complete.",
-            "spinner": "✅",
-            "data": if !is_detail { json!(null) } else { extracted_data }
-        });
-        let _ = app_handle.emit("extraction-progress", &payload);
-        log_task_progress(app_handle, &task.id, &payload);
+    let payload = json!({
+        "task_id": task.id,
+        "category": "Done",
+        "summary": final_summary,
+        "spinner": "✅",
+        "data": if !is_detail { json!(null) } else { extracted_data }
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &payload);
     
         // [LOCK-RELEASE] 정상 종료 시 모델 및 리소스 완전 해제
         {
