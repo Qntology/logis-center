@@ -543,8 +543,19 @@ async fn process_task(
                         println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
                         let type_prompt = parsing::page_type_prompt();
                         
-                        model.ensure_generator(crate::model::ModelSize::Small).await?;
-                        model.ensure_generator(crate::model::ModelSize::Large).await?;
+                        // [INTERRUPTIBLE-LOAD] Race loading against cancellation
+                        tokio::select! {
+                            res = async {
+                                model.ensure_generator(crate::model::ModelSize::Small).await?;
+                                model.ensure_generator(crate::model::ModelSize::Large).await
+                            } => res?,
+                            _ = async {
+                                loop {
+                                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+                        }
                         
                         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                         println!("[작업내용]");
@@ -605,10 +616,20 @@ async fn process_task(
         println!("[작업내용]");
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         
-        model.ensure_generator(crate::model::ModelSize::Small).await?;
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
-        
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                // [INTERRUPTIBLE-LOAD] Race loading against cancellation
+                tokio::select! {
+                    res = async {
+                        model.ensure_generator(crate::model::ModelSize::Small).await?;
+                        model.ensure_generator(crate::model::ModelSize::Large).await
+                    } => res?,
+                    _ = async {
+                        loop {
+                            if cancellation_token.load(Ordering::Relaxed) { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+                }
+                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1178,13 +1199,12 @@ async fn process_task(
                         
                 
                                         {
-                                            // Using the cloned model reference (lock is free)
-                                            model.ensure_generator(crate::model::ModelSize::Small).await?;
-                                            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                
                                             // [INTERRUPTIBLE-LOAD] Race loading against cancellation
                                             tokio::select! {
-                                                res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
+                                                res = async {
+                                                    model.ensure_generator(crate::model::ModelSize::Small).await?;
+                                                    model.ensure_generator(crate::model::ModelSize::Large).await
+                                                } => res?,
                                                 _ = async {
                                                     loop {
                                                         if cancellation_token.load(Ordering::Relaxed) { break; }
