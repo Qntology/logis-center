@@ -707,7 +707,7 @@ impl QuantizedQwen3VLTextModel {
     pub fn new_with_mmap(
         config: &Qwen3VLTextConfig,
         ct: &gguf_file::Content,
-        mmap_handle: Option<Mmap>,
+        mmap_handle: Option<Arc<Mmap>>,
         base_name: &str,
         device: &Device,
         device_id: usize,
@@ -1143,9 +1143,9 @@ impl QuantizedQwen3VLModel {
     pub fn new_with_mmap(
         config: &Qwen3VLConfig,
         ct_main: &gguf_file::Content,
-        main_mmap_handle: Option<Mmap>,
+        main_mmap_handle: Option<Arc<Mmap>>,
         ct_vision: &gguf_file::Content,
-        mmproj_mmap_handle: Option<Mmap>,
+        mmproj_mmap_handle: Option<Arc<Mmap>>,
         text_device: &Device,
         text_device_id: usize,
         vision_device: &Device,
@@ -1350,6 +1350,8 @@ impl QuantizedQwen3VLModel {
             rope_deltas: None,
             text_device: text_device.clone(),
             vision_device: actual_vision_device,
+            mmap: None,
+            mmproj_mmap: None,
         })
     }
     
@@ -1548,14 +1550,14 @@ pub struct QuantizedQwen3TextModel {
     pub language_model: QuantizedQwen3VLTextModel,
     pub lm_head: QLinear,
     pub text_device: Device,
-    pub mmap: Option<Mmap>,
+    pub mmap: Option<Arc<Mmap>>,
 }
 
 impl QuantizedQwen3TextModel {
     pub fn new_with_mmap(
         config: &Qwen3VLConfig,
         ct_main: &gguf_file::Content,
-        mmap_handle: Option<Mmap>,
+        mmap_handle: Option<Arc<Mmap>>,
         text_device: &Device,
         text_device_id: usize,
         dtype: DType,
