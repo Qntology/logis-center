@@ -591,15 +591,15 @@ async fn process_task(
 
                         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after VRAM relay")); }
 
-                        // 3. [2B Phase] Generate Answer
-                        if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[Scheduler] 2B Generating final classification answer (Bridged)...");
-                            // 2B uses the loaded KV cache naturally via session_id or just resident memory
-                            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
-                            let type_info = parsing::parse_json_from_llm(&res);
-                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                        }
-                        
+                                                // 3. [2B Phase] Generate Answer
+                                                if let Some(gen) = model.generator.lock().await.as_mut() {
+                                                    println!("[Scheduler] 2B Generating final classification answer (Bridged)...");
+                                                    // 2B uses the loaded KV cache naturally via session_id or just resident memory
+                                                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
+                                                    println!("[Scheduler] 2B Raw Classification Output: {}", res);
+                                                    let type_info = parsing::parse_json_from_llm(&res); 
+                                                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                                }                        
                         if page_type.is_empty() || page_type == "unknown" { 
                             model.unload_generator().await;
                             return Ok(()); 
@@ -654,14 +654,14 @@ async fn process_task(
         model.secure_vram_relay(crate::model::ModelSize::Large, Some(&task2_id), Some(cancellation_token.clone())).await?;
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after VRAM relay")); }
 
-        // 2. [2B Phase]
-        if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 2B Identifying selectors immediately...");
-            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task2_id))?;
-            selector_info = parsing::parse_json_from_llm(&res);
-            println!("[Scheduler] Selectors Identified: {}", selector_info);
-        }
-    }
+                // 2. [2B Phase]
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[Scheduler] 2B Identifying selectors immediately...");    
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task2_id))?;
+                    println!("[Scheduler] 2B Raw Selector Output: {}", res);
+                    selector_info = parsing::parse_json_from_llm(&res);
+                    println!("[Scheduler] Selectors Identified: {}", selector_info);    
+                }    }
 
     let mut final_page_info = json!({ "type": page_type });
     let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -986,12 +986,14 @@ async fn process_task(
                         })
                     ];
 
-                    model.chat_params_with_spinner(
+                    let res = model.chat_params_with_spinner(
                         ChatCompletionParameters { messages, model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.95), ..Default::default() },
                         &app_handle_clone, "Refinement (Large)",
-                        json!({ "task_id": task.id, "category": "Refinement (Infer)", "summary": format!("Refining items {}-{}...", start_item, end_item) }),
+                        json!({ "task_id": task.id, "category": "Refinement (Infer)", "summary": format!("Refining items {}-{}...", start_item, end_item) }),   
                         Some(cancellation_token.clone()), Some(refine_session)
-                    ).await?
+                    ).await?;
+                    println!("[Scheduler] 2B Raw Refinement Output: {}", res);
+                    res
                 };
 
                 if !refine_res_str.is_empty() {
@@ -1202,14 +1204,13 @@ async fn process_task(
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&detail_session_id), Some(cancellation_token.clone())).await?;
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after VRAM relay")); }
             
-            let res = if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Extracting details immediately...");
-                gen.generate(params, Some(cancellation_token.clone()), Some(detail_session_id.clone()))?
-            } else { "{}".to_string() };
-            
-            res
-        };
-
+                        let res = if let Some(gen) = model.generator.lock().await.as_mut() {
+                            println!("[Scheduler] 2B Extracting details immediately...");   
+                            gen.generate(params, Some(cancellation_token.clone()), Some(detail_session_id.clone()))?
+                        } else { "{}".to_string() };
+                        println!("[Scheduler] 2B Raw Detail Output: {}", res);
+                        res
+                    };
         if !response.is_empty() {
             println!("[EXTRACT-FINAL] Result: {}", response);
             extracted_data = parsing::parse_json_from_llm(&response);
