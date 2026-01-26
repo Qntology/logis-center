@@ -257,85 +257,163 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
-        let total_tokens = full_input_ids_vec.len();
+        pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
 
-                                let seqlen_offset = self.get_kv_len();
-                                let mut current_pos = seqlen_offset;
-                                // [SMOOTH-RELAY] Set chunk size to 512 for optimized 0.6B CPU prefill and PCIe relay
-                                let prefill_chunk_size = 512; 
-                        
-                                println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);                while current_pos < total_tokens {
-                    let remaining = total_tokens - current_pos;
-                    let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
-        
-                    // [CRITICAL] Leave at least 1 token for the generate() call
-                    if current_pos + chunk_size >= total_tokens { 
-                        chunk_size = (total_tokens - current_pos).saturating_sub(1); 
+            let mes_render = self.chat_template.apply_chat_template(&mes)?;
+
+            let input = self.pre_processor.process_info(&mes, &mes_render)?;
+
+            // [FIX] Use CPU-bound tokenization for stability
+
+            let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+
+            let total_tokens = full_input_ids_vec.len();
+
+    
+
+            let seqlen_offset = self.get_kv_len();
+
+            let mut current_pos = seqlen_offset;
+
+            // [CPU-BOOST] Use larger chunks for CPU-based relay prefill
+
+            let prefill_chunk_size = if self.text_device.is_cpu() { 1024 } else { 512 }; 
+
+                            
+
+            println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);
+
+            while current_pos < total_tokens {
+
+                let remaining = total_tokens - current_pos;
+
+                let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+
+    
+
+                // [CRITICAL] Leave at least 1 token for the generate() call
+
+                if current_pos + chunk_size >= total_tokens { 
+
+                    chunk_size = (total_tokens - current_pos).saturating_sub(1); 
+
+                }
+
+                if chunk_size == 0 { break; }
+
+    
+
+                let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
+
+                let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
+
+                let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+
+    
+
+                if let Some(flag) = &cancel_flag {
+
+                    if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }    
+
+                }
+
+    
+
+                match &mut self.qwen3_vl {
+
+                    ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+
+                    ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+
+                    ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
+
+                };
+
+    
+
+                // [STREAMING-RELAY] Incrementally inject ONLY the new chunk to 2B
+
+                if let Some(ref mut target) = relay_target {
+
+                    // 1. Get Shallow Copy of 0.6B's Full Cache
+
+                    let (ks, vs) = self.get_current_kv();
+
+                    
+
+                    // 2. Slice and Quantize the NEW chunk
+
+                    let mut new_ks_i8 = Vec::with_capacity(ks.len());
+
+                    let mut new_vs_i8 = Vec::with_capacity(vs.len());
+
+                    let mut k_scales = Vec::with_capacity(ks.len());
+
+                    let mut v_scales = Vec::with_capacity(vs.len());
+
+                    
+
+                    for (k, v) in ks.iter().zip(vs.iter()) {
+
+                         let seq_len = k.dim(candle_core::D::Minus2)?; 
+
+                         let start = seq_len.saturating_sub(chunk_size);
+
+                         let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
+
+                         let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
+
+                         
+
+                         // [QUANTIZE-ON-CPU] Reduce to 8-bit before PCIe transfer
+
+                         let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
+
+                         let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
+
+                         let k_s = k_max / 127.0;
+
+                         let v_s = v_max / 127.0;
+
+                         
+
+                         let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
+
+                         let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
+
+                         
+
+                         new_ks_i8.push(k_i8);
+
+                         new_vs_i8.push(v_i8);
+
+                         k_scales.push(k_s);
+
+                         v_scales.push(v_s);
+
                     }
-                    if chunk_size == 0 { break; }
-        
-                    let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
-                    let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
-                                let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
-                    
-                                if let Some(flag) = &cancel_flag {
-                                    if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }    
-                                }
-                    
-                                println!("[DEBUG] Forwarding chunk... (Size: {})", chunk_size);
-                                match &mut self.qwen3_vl {
-                                    ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
-                                    ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
-                                    ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
-                                };
-                                println!("[DEBUG] Forward complete.");
-                    
-                                            // [STREAMING-RELAY] Incrementally inject ONLY the new chunk to 2B
-                                            if let Some(ref mut target) = relay_target {
-                                                println!("[DEBUG] Slicing, Quantizing and Injecting KV...");
-                                                // 1. Get Shallow Copy of 0.6B's Full Cache
-                                                let (ks, vs) = self.get_current_kv();
-                                                
-                                                // 2. Slice and Quantize the NEW chunk
-                                                let mut new_ks_i8 = Vec::with_capacity(ks.len());
-                                                let mut new_vs_i8 = Vec::with_capacity(vs.len());
-                                                let mut k_scales = Vec::with_capacity(ks.len());
-                                                let mut v_scales = Vec::with_capacity(vs.len());
-                                                
-                                                for (k, v) in ks.iter().zip(vs.iter()) {
-                                                     let seq_len = k.dim(candle_core::D::Minus2)?; 
-                                                     let start = seq_len.saturating_sub(chunk_size);
-                                                     let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
-                                                     let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
-                                                     
-                                                     // [QUANTIZE-ON-CPU] Reduce to 8-bit before PCIe transfer
-                                                     let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
-                                                     let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
-                                                     
-                                                                          let k_s = k_max / 127.0;
-                                                                          let v_s = v_max / 127.0;
-                                                                          
-                                                                          let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
-                                                                          let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
-                                                                          
-                                                                          new_ks_i8.push(k_i8);                                                     new_vs_i8.push(v_i8);
-                                                     k_scales.push(k_s);
-                                                     v_scales.push(v_s);
-                                                }
-                                
-                                                // 3. Inject Quantized Slice
-                                                target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
-                                                println!("[DEBUG] Quantized Injection complete.");
-                                            }                    
-                                current_pos += chunk_size;                    
-                                // [AGGRESSIVE-LOGGING] Log every chunk for real-time feedback
-                                let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
-                                println!("[RELAY] Pushed {}/{} tokens to 2B ({:.1}%)", current_pos, total_tokens, progress);
-                            }        // Save progress if session_id is provided (for CPU sequential mode)
+
+    
+
+                    // 3. Inject Quantized Slice
+
+                    target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+
+                }                    
+
+                current_pos += chunk_size;                    
+
+                // [SILENT-PROGRESS] Just print dots for relay progress
+
+                use std::io::Write;
+
+                print!(".");
+
+                std::io::stdout().flush().ok();
+
+            }
+
+            // Save progress if session_id is provided (for CPU sequential mode)
         if let Some(sid) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if !path.exists() { let _ = fs::create_dir_all(&path); }

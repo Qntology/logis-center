@@ -244,20 +244,22 @@ impl LogisModel {
 
         println!("[MODEL] Switching to size: {:?}...", size);
         
+        // [OOM-SAFETY] 4GB cards cannot reliably hold both models + 10k context.
+        // We force strict mutual exclusion: one model on GPU, the other in RAM.
+        let mut small_slot = self.small_hibernation.lock().await;
+        let mut large_slot = self.large_hibernation.lock().await;
+
         // 1. [SLEEP] Move CURRENT active model to its hibernation slot (RAM)
         if let Some(mut active_model) = gen_guard.take() {
             let old_size = current_size_guard.take().unwrap();
-            println!("[SLEEP] Moving {:?} model to RAM hibernation...", old_size);
+            println!("[SLEEP] Evicting {:?} model to RAM hibernation...", old_size);
             
             if let Err(e) = active_model.to_device(&Device::Cpu) {
                 println!("[SLEEP-ERROR] Failed to hibernate: {}. Dropping model.", e);
-                // If hibernation fails, we must ensure memory is released before loading the next one
-                let (base_ram, base_vram) = utils::resources::get_memory_usage();
-                utils::resources::wait_for_memory_release(base_ram, base_vram, 2000).await;
             } else {
                 match old_size {
-                    ModelSize::Small => *self.small_hibernation.lock().await = Some(active_model),
-                    ModelSize::Large => *self.large_hibernation.lock().await = Some(active_model),
+                    ModelSize::Small => *small_slot = Some(active_model),
+                    ModelSize::Large => *large_slot = Some(active_model),
                 }
             }
         }
