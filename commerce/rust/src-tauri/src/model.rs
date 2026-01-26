@@ -318,10 +318,18 @@ impl LogisModel {
         self.unload_generator().await;
         self.unload_embedding().await;
 
+        // [HARD-PURGE] Force CUDA to synchronize and actually release memory pointers
+        if self.device_config.device.is_cuda() {
+            println!("[RELAY] Forcing CUDA device synchronization...");
+            let _ = self.device_config.device.synchronize();
+            // Tiny sleep to give WDDM driver a breath
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
         // 3. [SETTLE] Wait for GPU to release memory (Only for Large model loading)
         if target_size == ModelSize::Large {
-            // Wait for at least 3GB free if possible, or settle. Pass cancel_token to be responsive.
-            self.wait_for_vram_settle(3000, 5, cancel_token.clone()).await?;
+            // Lower target to 2500MB to be more realistic for 4GB cards and avoid timeouts
+            self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
         }
 
         // [CANCELLATION] Check after waiting
@@ -332,8 +340,6 @@ impl LogisModel {
         }
 
         // 4. [LOAD] Load the target model
-        // We bypass ensure_generator to avoid its internal swapping logic
-        // and use direct loading for strict control.
         match target_size {
             ModelSize::Small => self.ensure_generator(ModelSize::Small).await?,
             ModelSize::Large => self.ensure_generator(ModelSize::Large).await?,

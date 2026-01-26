@@ -326,7 +326,7 @@ impl QuantizedQwen3VLTextAttention {
     fn compress_to_8bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
         let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let t_data = t_f32.to_vec1::<f32>()?;
+        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
         
         let last_dim = original_shape[original_shape.len() - 1];
         let total_elements = t_data.len();
@@ -364,8 +364,8 @@ impl QuantizedQwen3VLTextAttention {
 
     fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
         let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         
         let last_dim = original_shape[original_shape.len() - 1];
         let total_elements: usize = original_shape.iter().product();
@@ -1030,7 +1030,7 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-        let total_layers = self.layers.len();
+        let _total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
