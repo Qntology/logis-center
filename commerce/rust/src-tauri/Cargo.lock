@@ -8509,6 +8509,7 @@ dependencies = [
  "futures",
  "image",
  "lancedb",
+ "libc",
  "memmap2",
  "minijinja",
  "num",

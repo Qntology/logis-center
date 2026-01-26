@@ -839,6 +839,16 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
+    /// [SLEEP-MODE] Moves the underlying model to a new device (e.g. CPU for hibernation)
+    pub fn to_device(&mut self, device: &candle_core::Device) -> anyhow::Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::Standard(_) => return Err(anyhow::anyhow!("to_device not implemented for Standard variant")),
+            ModelVariant::QuantizedVL(m) => m.to_device(device)?,
+            ModelVariant::QuantizedText(m) => m.to_device(device)?,
+        }
+        Ok(())
+    }
+
 
 
     

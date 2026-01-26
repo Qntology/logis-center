@@ -1107,6 +1107,16 @@ impl QuantizedQwen3VLTextModel {
             Ok(())
         }
     }
+
+    /// [SLEEP-MODE] Moves all model weights and KV cache between CPU and GPU
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.embed_tokens.to_device(device)?;
+        for layer in self.layers.iter_mut() {
+            layer.to_device(device)?;
+        }
+        self.norm.to_device(device)?;
+        Ok(())
+    }
 }
 
 pub struct QuantizedQwen3VLModel {
@@ -1482,6 +1492,24 @@ impl QuantizedQwen3VLModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
         self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len)
     }
+
+    /// [SLEEP-MODE] Moves full Vision-Language model between devices
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        // 1. Move Vision Encoder (always move to ensure no VRAM leaks)
+        self.visual.to_device(device)?;
+        
+        // 2. Move Language Model
+        self.language_model.to_device(device)?;
+        
+        // 3. Move LM Head
+        self.lm_head.to_device(device)?;
+        
+        // Update device trackers
+        self.text_device = device.clone();
+        self.vision_device = device.clone();
+        
+        Ok(())
+    }
 }
 
 pub struct QuantizedQwen3TextModel {
@@ -1617,6 +1645,14 @@ impl QuantizedQwen3TextModel {
     }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
+
+    /// [SLEEP-MODE] Moves text-only model between devices
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.language_model.to_device(device)?;
+        self.lm_head.to_device(device)?;
+        self.text_device = device.clone();
+        Ok(())
+    }
 }
 
 // Helper functions

@@ -209,33 +209,46 @@ impl LogisModel {
         if needs_reload || gen_guard.is_none() {
             println!("[MODEL] Switching/Loading model to size: {:?}...", size);
             
-            // [FORCE-FREE] Hard Sequential Switching (RAM + VRAM)
-            // 1. Snapshot baseline
-            let (base_ram, base_vram) = utils::resources::get_memory_usage();
-
-            // 2. Aggressive Drop
-            {
-                let mut small_slot = self.small_generator.lock().await;
-                let m1 = small_slot.take();
-                let m2 = gen_guard.take();
-                
-                if m1.is_some() || m2.is_some() {
-                    println!("[MODEL-MEMORY] FORCING IMMEDIATE DROP of all GPU/RAM handles...");
-                    drop(m1); 
-                    drop(m2); 
-                    
-                    // [OS-SIGNAL] Explicitly hint OS to reclaim RAM from dropped handles
-                    #[cfg(target_os = "windows")]
-                    unsafe {
-                        use windows_sys::Win32::System::Memory::*;
-                        // Flush the working set to push OS to reclaim RAM immediately
-                        let current_process = windows_sys::Win32::System::Threading::GetCurrentProcess();
-                        SetProcessWorkingSetSize(current_process, usize::MAX, usize::MAX);
+            // [SLEEP-MODE] Check if the requested model is already in RAM (Hibernating)
+            let mut small_slot = self.small_generator.lock().await;
+            
+            // Scenario A: Loading Large, but Small is currently on GPU
+            if size == ModelSize::Large && *current_size_guard == Some(ModelSize::Small) {
+                if let Some(mut m) = gen_guard.take() {
+                    println!("[SLEEP] Sending 0.6B to Hibernation (RAM)...");
+                    if let Err(e) = m.to_device(&Device::Cpu) {
+                        println!("[SLEEP-ERROR] Failed to hibernate 0.6B: {}. Dropping.", e);
+                    } else {
+                        *small_slot = Some(m);
                     }
-
-                    // 3. Fast-Check release
-                    utils::resources::wait_for_memory_release(base_ram, base_vram, 3000).await;
                 }
+            }
+            
+            // Scenario B: Loading Small, and it is currently in Hibernation (RAM)
+            if size == ModelSize::Small && small_slot.is_some() {
+                println!("[WAKE] Waking up 0.6B from RAM to GPU...");
+                let mut m = small_slot.take().unwrap();
+                let target_dev = self.device_config.device.clone();
+                if let Err(e) = m.to_device(&target_dev) {
+                    println!("[WAKE-ERROR] Failed to wake 0.6B: {}. Reloading from disk.", e);
+                } else {
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(ModelSize::Small);
+                    return Ok(()); // Instant switch success!
+                }
+            }
+
+            // [FALLBACK] If not in hibernation, proceed with standard hard reset and disk load
+            if gen_guard.is_none() {
+                let (base_ram, base_vram) = utils::resources::get_memory_usage();
+                // ... (existing flush logic)
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::*;
+                    let current_process = GetCurrentProcess();
+                    windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, 0);
+                }
+                utils::resources::wait_for_memory_release(base_ram, base_vram, 2000).await;
             }
             
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
