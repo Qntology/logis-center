@@ -560,61 +560,50 @@ async fn process_task(
                         
                         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
-                        // [LOOP-RELAY] Process each chunk individually
-                        for (i, chunk) in pug_chunks.iter().enumerate() {
-                            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                            
-                            let is_last = i == pug_chunks_len - 1;
-                            let prompt_text = if is_last {
-                                format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", chunk, type_prompt)
-                            } else {
-                                format!("{}\n\nACTION: INGEST", chunk)
-                            };
-                
-                            let params = ChatCompletionParameters {
-                                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                                    content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                                            text: prompt_text
-                                        })
-                                    ]),
-                                    name: None,
-                                })],
-                                model: "qwen3vl".to_string(), max_tokens: Some(if is_last { 128 } else { 16 }), temperature: Some(0.1),
-                                ..Default::default()
-                            };
-                
-                            // 2. Stream from 0.6B to 2B
-                            {
-                                let model_clone = model.clone();
-                                let params_clone = params.clone();
-                                let token_clone = cancellation_token.clone();
-                                let task_id_clone = task.id.clone();
-                
-                                println!("[Scheduler] Relay Part {}/{} (Blocking Thread)...", i + 1, pug_chunks_len);
-                                
-                                tokio::task::spawn_blocking(move || -> Result<()> {
-                                    let mut large_gen_lock = model_clone.generator.blocking_lock(); 
-                                    let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                                // [LOOP-RELAY] Process each chunk individually
+                                for (i, chunk) in pug_chunks.iter().enumerate() {
+                                    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                                     
-                                    if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                                        worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
-                                    }
-                                    Ok(())
-                                }).await??;
-                            }
-                
-                            if is_last {
-                                // 3. 2B Inference (Immediate)
-                                if let Some(gen) = model.generator.lock().await.as_mut() {
-                                    println!("[Scheduler] 2B Generating final classification answer...");
-                                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
-                                    let type_info = parsing::parse_json_from_llm(&res);
-                                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                }
-                            }
-                        }
+                                    let is_last = i == pug_chunks_len - 1;
+                                    let chunk_text = chunk.clone();
                         
+                                    {
+                                        let model_clone = model.clone();
+                                        let token_clone = cancellation_token.clone();
+                                        let chunk_to_send = chunk_text.clone();
+                        
+                                        println!("[Scheduler] Relay Part {}/{} ({} chars)...", i + 1, pug_chunks_len, chunk_to_send.len());
+                                        
+                                        tokio::task::spawn_blocking(move || -> Result<()> {
+                                            let mut large_gen_lock = model_clone.generator.blocking_lock(); 
+                                            let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                                            
+                                            if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                                                // [LIGHTWEIGHT-RELAY] No chat templates, just raw snippet prefill
+                                                worker.prefill_chunk(chunk_to_send, Some(token_clone), Some(target))?;
+                                            }
+                                            Ok(())
+                                        }).await??;
+                                    }
+                        
+                                    if is_last {
+                                        // 3. 2B Inference (Final Question)
+                                        if let Some(gen) = model.generator.lock().await.as_mut() {
+                                            println!("[Scheduler] 2B Generating final classification answer...");
+                                            let params = ChatCompletionParameters {
+                                                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                                    content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", type_prompt)),
+                                                    name: None,
+                                                })],
+                                                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                                                ..Default::default()
+                                            };
+                                            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
+                                            let type_info = parsing::parse_json_from_llm(&res);
+                                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                        }
+                                    }
+                                }                        
                         model.unload_generator().await; 
                         if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
                     }
@@ -649,32 +638,14 @@ async fn process_task(
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             
             let is_last = i == pug_chunks_len - 1;
-            let prompt_text = if is_last {
-                format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", chunk, selector_prompt)
-            } else {
-                format!("{}\n\nACTION: INGEST", chunk)
-            };
-
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Array(vec![
-                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                            text: prompt_text
-                        })
-                    ]),
-                    name: None,
-                })],
-                model: "qwen3vl".to_string(), max_tokens: Some(if is_last { 512 } else { 16 }), temperature: Some(0.1),
-                ..Default::default()
-            };
+            let chunk_text = chunk.clone();
 
             {
                 let model_clone = model.clone();
-                let params_clone = params.clone();
                 let token_clone = cancellation_token.clone();
-                let task_id_clone = format!("{}_task2", task.id);
+                let chunk_to_send = chunk_text.clone();
 
-                println!("[Scheduler] Relay Part {}/{} (Blocking Thread)...", i + 1, pug_chunks_len);
+                println!("[Scheduler] Relay Part {}/{} ({} chars)...", i + 1, pug_chunks_len, chunk_to_send.len());
 
                 // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -682,7 +653,7 @@ async fn process_task(
                     let mut small_gen_lock = model_clone.small_generator.blocking_lock();
                     
                     if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                        worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+                        worker.prefill_chunk(chunk_to_send, Some(token_clone), Some(target))?;
                     }
                     Ok(())
                 }).await??;
@@ -691,6 +662,14 @@ async fn process_task(
             if is_last {
                 if let Some(gen) = model.generator.lock().await.as_mut() {
                     println!("[Scheduler] 2B Identifying selectors immediately...");
+                    let params = ChatCompletionParameters {
+                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", selector_prompt)),
+                            name: None,
+                        })],
+                        model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
+                        ..Default::default()
+                    };
                     let res = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)))?;
                     selector_info = parsing::parse_json_from_llm(&res);
                     println!("[Scheduler] Selectors Identified: {}", selector_info);

@@ -349,6 +349,58 @@ impl Qwen3VLGenerateModel {
         Ok(current_pos)
     }
 
+    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+        let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
+        let chunk_size = chunk_ids_vec.len();
+        let current_pos = self.get_kv_len();
+
+        let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
+        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+
+        if let Some(flag) = &cancel_flag {
+            if flag.load(Ordering::Relaxed) { return Err(anyhow!("Chunk prefill cancelled")); }    
+        }
+
+        // 1. Compute KV for this chunk only
+        match &mut self.qwen3_vl {
+            ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+            ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+            ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
+        };
+
+        // 2. Inject to 2B immediately
+        if let Some(target) = relay_target {
+            let (ks, vs) = self.get_current_kv();
+            let mut new_ks_i8 = Vec::with_capacity(ks.len());
+            let mut new_vs_i8 = Vec::with_capacity(vs.len());
+            let mut k_scales = Vec::with_capacity(ks.len());
+            let mut v_scales = Vec::with_capacity(vs.len());
+            
+            for (k, v) in ks.iter().zip(vs.iter()) {
+                 let seq_len = k.dim(candle_core::D::Minus2)?; 
+                 let start = seq_len.saturating_sub(chunk_size);
+                 let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                 let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                 
+                 let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                 let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                 let k_s = k_max / 127.0;
+                 let v_s = v_max / 127.0;
+                 
+                 let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
+                 let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
+                 
+                 new_ks_i8.push(k_i8);
+                 new_vs_i8.push(v_i8);
+                 k_scales.push(k_s);
+                 v_scales.push(v_s);
+            }
+            target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+        }
+
+        Ok(chunk_size)
+    }
+
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
         let temperature = match mes.temperature {
             None => self.generation_config.temperature,
