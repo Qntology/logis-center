@@ -354,6 +354,8 @@ impl Qwen3VLGenerateModel {
         let chunk_size = chunk_ids_vec.len();
         let current_pos = self.get_kv_len();
 
+        println!("[PREFILL] Processing Chunk: {} tokens at pos {}", chunk_size, current_pos);
+
         let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
         let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
 

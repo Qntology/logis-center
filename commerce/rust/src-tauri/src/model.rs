@@ -223,16 +223,22 @@ impl LogisModel {
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
             let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
             
-            // [STRATEGY] Force 0.6B to CPU if GPU exists to save VRAM for 2B
-            let target_device = if size == ModelSize::Small && self.device_config.device.is_cuda() {
-                println!("[MODEL-CONFIG] Offloading 0.6B to CPU to reserve VRAM for 2B.");
-                Device::Cpu
-            } else {
-                if self.device_config.device.is_cuda() {
-                    println!("[MODEL-CONFIG] Loading {:?} directly into GPU VRAM.", size);
+            // [STRATEGY] Only offload to CPU if VRAM is actually low (< 1GB free)
+            let mut target_device = self.device_config.device.clone();
+            if size == ModelSize::Small && target_device.is_cuda() {
+                if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                    if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                        if let Ok(mem) = dev.memory_info() {
+                            if mem.free < 1_000_000_000 {
+                                println!("[MODEL-CONFIG] Low VRAM ({:.2} GB). Offloading 0.6B to CPU.", mem.free as f64 / 1e9);
+                                target_device = Device::Cpu;
+                            } else {
+                                println!("[MODEL-CONFIG] Sufficient VRAM ({:.2} GB). Keeping 0.6B on GPU.", mem.free as f64 / 1e9);
+                            }
+                        }
+                    }
                 }
-                self.device_config.device.clone()
-            };
+            }
 
             let dev_id = self.device_config.gpu_id;
             let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
