@@ -108,30 +108,33 @@ pub fn get_memory_usage() -> (u64, u64) {
 /// * `timeout_ms`: Max time to wait (e.g., 5000ms)
 pub async fn wait_for_memory_release(baseline_ram: u64, baseline_vram: u64, timeout_ms: u64) {
     let start = Instant::now();
-    let margin_ram = 1536 * 1024 * 1024; // 1.5GB tolerance (Windows memory management can be very slow)
-    let margin_vram = 600 * 1024 * 1024; // 600MB tolerance
+    // RAM tolerance is stricter because OS RAM management is more fluid.
+    // We expect RAM to drop by at least 100MB to signal release start.
+    let margin_ram = 100 * 1024 * 1024; 
+    let margin_vram = 200 * 1024 * 1024;
     
-    println!("[MEM-WATCH] Waiting for release... Target RAM < {:.2} GB, VRAM < {:.2} GB", 
-        (baseline_ram + margin_ram) as f64 / 1e9, (baseline_vram + margin_vram) as f64 / 1e9);
+    println!("[MEM-WATCH] Waiting for release... Baseline RAM: {:.2} GB, VRAM: {:.2} GB", 
+        baseline_ram as f64 / 1e9, baseline_vram as f64 / 1e9);
 
     loop {
         let (curr_ram, curr_vram) = get_memory_usage();
         
-        let ram_ok = curr_ram <= (baseline_ram + margin_ram);
-        let vram_ok = curr_vram <= (baseline_vram + margin_vram);
+        // Check if memory has started dropping
+        let ram_dropped = curr_ram < baseline_ram.saturating_sub(margin_ram);
+        let vram_dropped = curr_vram < baseline_vram.saturating_sub(margin_vram);
 
-        if ram_ok && vram_ok {
-            println!("[MEM-WATCH] ✅ Release Verified! RAM: {:.2} GB, VRAM: {:.2} GB. Took {}ms", 
+        if ram_dropped || vram_dropped {
+            println!("[MEM-WATCH] ✅ Memory Drop Detected! RAM: {:.2} GB, VRAM: {:.2} GB. Took {}ms", 
                 curr_ram as f64 / 1e9, curr_vram as f64 / 1e9, start.elapsed().as_millis());
             break;
         }
 
         if start.elapsed().as_millis() as u64 > timeout_ms {
-            println!("[MEM-WATCH] ⚠️ Timeout waiting for memory release. Proceeding anyway. Current RAM: {:.2} GB, VRAM: {:.2} GB", 
+            println!("[MEM-WATCH] ⚠️ Timeout. Proceeding with current RAM: {:.2} GB, VRAM: {:.2} GB", 
                 curr_ram as f64 / 1e9, curr_vram as f64 / 1e9);
             break;
         }
 
-        sleep(Duration::from_millis(250)).await;
+        sleep(Duration::from_millis(150)).await; // Faster polling (0.15s)
     }
 }

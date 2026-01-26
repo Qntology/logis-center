@@ -873,7 +873,9 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let estimated_activation_buffer = 200_000_000; // 200MB is sufficient for a 2048-token prefill window
+        // [OOM-SAFETY] Increase activation buffer reserve for Vision-Language tasks.
+        // 800MB is safer for the initial forward pass overhead on 4GB cards.
+        let estimated_activation_buffer = 800_000_000; 
         let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 }; // Use only weight size
 
         let mut simulated_free_vram: u64 = 0;
@@ -1144,14 +1146,19 @@ impl QuantizedQwen3VLModel {
         let mut actual_vision_device = vision_device.clone();
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
 
+        // [OOM-SAFETY] Conservative VRAM allocation for 4GB GPUs
+        let estimated_activation_buffer = 1_000_000_000; // 1GB reserved for forward pass activations
+        
         if actual_vision_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(vision_device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
                          let total_vram = mem.total;
-                         let os_reserve = (total_vram as f64 * 0.02) as u64; 
-                         let vision_safety_floor = os_reserve.max(100_000_000); 
-                         if mem.free < (vision_weight_size + vision_overhead + vision_safety_floor) {
+                         let os_reserve = (total_vram as f64 * 0.05) as u64; // 5% OS reserve
+                         let safety_floor = os_reserve.max(500_000_000) + estimated_activation_buffer; 
+                         
+                         if mem.free < (vision_weight_size + vision_overhead + safety_floor) {
+                             println!("[MODEL-CONFIG] Insufficient VRAM for Vision Encoder. Offloading to CPU.");
                              actual_vision_device = Device::Cpu;
                          }
                      }

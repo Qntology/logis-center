@@ -209,15 +209,33 @@ impl LogisModel {
         if needs_reload || gen_guard.is_none() {
             println!("[MODEL] Switching/Loading model to size: {:?}...", size);
             
-            // [DUAL-ENGINE-HANDOVER] 
-            if *current_size_guard == Some(ModelSize::Small) && size == ModelSize::Large && self.dual_mode_enabled {
+            // [FORCE-FREE] Hard Sequential Switching (RAM + VRAM)
+            // 1. Snapshot baseline
+            let (base_ram, base_vram) = utils::resources::get_memory_usage();
+
+            // 2. Aggressive Drop
+            {
                 let mut small_slot = self.small_generator.lock().await;
-                if let Some(m) = gen_guard.take() {
-                    println!("[DUAL] Moving 0.6B to secondary background slot.");
-                    *small_slot = Some(m);
+                let m1 = small_slot.take();
+                let m2 = gen_guard.take();
+                
+                if m1.is_some() || m2.is_some() {
+                    println!("[MODEL-MEMORY] FORCING IMMEDIATE DROP of all GPU/RAM handles...");
+                    drop(m1); 
+                    drop(m2); 
+                    
+                    // [OS-SIGNAL] Explicitly hint OS to reclaim RAM from dropped handles
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        use windows_sys::Win32::System::Memory::*;
+                        // Flush the working set to push OS to reclaim RAM immediately
+                        let current_process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+                        SetProcessWorkingSetSize(current_process, usize::MAX, usize::MAX);
+                    }
+
+                    // 3. Fast-Check release
+                    utils::resources::wait_for_memory_release(base_ram, base_vram, 3000).await;
                 }
-            } else {
-                *gen_guard = None; 
             }
             
             let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };

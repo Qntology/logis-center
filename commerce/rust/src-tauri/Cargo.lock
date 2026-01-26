@@ -8533,6 +8533,7 @@ dependencies = [
  "url",
  "uuid 1.19.0",
  "which 6.0.3",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
