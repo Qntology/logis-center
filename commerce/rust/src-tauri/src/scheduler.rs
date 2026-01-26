@@ -527,262 +527,351 @@ async fn process_task(
                     // Release the initial locks so tasks can re-acquire them as needed (e.g. stop command)
                     // Both 'store' and 'model' are now local clones (Arc-based).
                 
-                    // ==================================================================================
-                    // [STRICT SWITCHING PATTERN]
-                    // 1. Ingest content + Question with 0.6B (Save Cache)
-                    // 2. Load 2B (Load Cache) -> Answer
-                    // Repeat for each distinct task to ensure perfect cache alignment.
-                    // ==================================================================================
+                                        // ==================================================================================
                 
-                    use crate::openai_types::{
-                        ChatCompletionParameters, ChatCompletionRequestMessage, 
-                        ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
-                        ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
-                        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
-                    };
+                                        // [OPTIMIZED PIPELINE] One-time Base Baking + Continuous 2B Inference
                 
-                    let mut page_type = String::new();
-                    let mut selector_info = json!({});
+                                        // 1. Bake PUG with 0.6B -> SSD
                 
-                    // --- TASK 1: CLASSIFICATION (SSD-BRIDGE RELAY) ---
-                    {
-                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-                        println!("[Scheduler] Starting SSD-BRIDGE RELAY (0.6B -> SSD -> 2B)");
-                        let type_prompt = parsing::page_type_prompt();
-                        
-                        // 1. [0.6B Phase] Ingest & Save
-                        model.ensure_generator(crate::model::ModelSize::Small).await?;
-                        
-                        let params = ChatCompletionParameters {
-                            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt)),
-                                name: None,
-                            })],
-                            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
-                            ..Default::default()
-                        };
-
+                                        // 2. Load 2B with SSD Context
+                
+                                        // 3. Chat Q1, Q2, Q3... sequentially without reloading
+                
+                                        // ==================================================================================
+                
+                                    
+                
+                                        use crate::openai_types::{
+                
+                                            ChatCompletionParameters, ChatCompletionRequestMessage, 
+                
+                                            ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
+                
+                                            ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
+                
+                                            ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
+                
+                                        };
+                
+                                    
+                
+                                        // --- STEP 1: BASE BAKING (0.6B) ---
+                
+                                        let payload = json!({ 
+                
+                                            "task_id": task.id,
+                
+                                            "category": "Analysis", "summary": "Baking base context...", "spinner": "⠋" 
+                
+                                        });
+                
+                                        let _ = app_handle.emit("extraction-progress", &payload);
+                
+                                        
+                
+                                        model.ingest_pug_to_ssd(&task.id, &light_pug, Some(cancellation_token.clone())).await?;
+                
+                                        
+                
+                                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after baking")); }
+                
+                    
+                
+                                        // --- STEP 2: LOAD 2B WITH CONTEXT ---
+                
+                                        let payload = json!({ 
+                
+                                            "task_id": task.id,
+                
+                                            "category": "Loading", "summary": "Loading 2B Reasoner...", "spinner": "⠋" 
+                
+                                        });
+                
+                                        let _ = app_handle.emit("extraction-progress", &payload);
+                
+                                        
+                
+                                        model.ensure_large_with_base(&task.id, Some(cancellation_token.clone())).await?;
+                
+                                        
+                
+                                        // --- STEP 3: SEQUENTIAL INFERENCE ---
+                
+                                        let mut page_type = String::new();
+                
+                                        let mut selector_info = json!({});
+                
+                                        
+                
+                                        // Q1: Classification
+                
+                                        {
+                
+                                            println!("[Scheduler] 2B Q1: Classification");
+                
+                                            let type_prompt = parsing::page_type_prompt();
+                
+                                            let params = ChatCompletionParameters {
+                
+                                                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                
+                                                    content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", type_prompt)),
+                
+                                                    name: None,
+                
+                                                })],
+                
+                                                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1), ..Default::default()
+                
+                                            };
+                
+                                            
+                
+                                            if let Some(gen) = model.generator.lock().await.as_mut() {
+                
+                                                let res = gen.generate(params, Some(cancellation_token.clone()), None)?; // None session to use current context
+                
+                                                println!("[Scheduler] 2B Q1 Output: {}", res);
+                
+                                                let type_info = parsing::parse_json_from_llm(&res);
+                
+                                                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                
+                                            }
+                
+                                        }
+                
+                                        
+                
+                                        if page_type.is_empty() || page_type == "unknown" { 
+                
+                                            model.unload_generator().await;
+                
+                                            return Ok(()); 
+                
+                                        }
+    
+                        // Q2: Selector Identification
+    
                         {
-                            let model_clone = model.clone();
-                            let params_clone = params.clone();
-                            let token_clone = cancellation_token.clone();
-                            let task_id_clone = task.id.clone();
-
-                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                crate::utils::resources::set_current_thread_low_priority();
-                                let mut small_gen_lock = model_clone.generator.blocking_lock();
+    
+                            println!("[Scheduler] 2B Q2: Selector ID");
+    
+                            let selector_prompt = parsing::page_selectors_prompt(&page_type);
+    
+                            let params = ChatCompletionParameters {
+    
+                                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+    
+                                    content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", selector_prompt)),
+    
+                                    name: None,
+    
+                                })],
+    
+                                model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1), ..Default::default()
+    
+                            };
+    
+                            
+    
+                            if let Some(gen) = model.generator.lock().await.as_mut() {
+    
+                                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+    
+                                println!("[Scheduler] 2B Q2 Output: {}", res);
+    
+                                selector_info = parsing::parse_json_from_llm(&res);
+    
+                            }
+    
+                        }
+    
+    
+    
+                        let mut final_page_info = json!({ "type": page_type });
+    
+                        let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+    
+                        
+    
+                        // [STRICT PARITY] Logic for Origin & Page Learning
+    
+                        {
+    
+                            let db = &store;
+    
+                            let team_id = if task.to.is_empty() { 
+    
+                                crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
+    
+                            } else { task.to.clone() };
+    
+    
+    
+                            // [FIX] Handle missing origin more gracefully or try to infer from link
+    
+                            let origin_str = task_data.get("origin").and_then(|s| s.as_str())
+    
+                                .or_else(|| {
+    
+                                    // Try to extract origin from the link itself
+    
+                                    if let Ok(u) = url::Url::parse(&url) {
+    
+                                        Some(u.origin().ascii_serialization()).filter(|_| true)
+    
+                                    } else { None }
+    
+                                });
+    
                                 
-                                if let Some(worker) = small_gen_lock.as_mut() {
-                                    // 0.6B ingests and fills its own KV cache
-                                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), None)?;
+    
+                            let origin_final = if let Some(o) = origin_str {
+    
+                                o.to_string()
+    
+                            } else if let Ok(u) = url::Url::parse(&url) {
+    
+                                u.origin().ascii_serialization()
+    
+                            } else {
+    
+                                "http://unknown.com".to_string()
+    
+                            };
+    
+    
+    
+                            if let Ok(base_url) = url::Url::parse(&origin_final) {
+    
+                                let url_obj = match url::Url::parse(&url) {
+    
+                                    Ok(parsed) => parsed,
+    
+                                    Err(url::ParseError::RelativeUrlWithoutBase) => {
+    
+                                        if let Ok(joined) = base_url.join(&url) { joined } else { base_url.clone() }
+    
+                                    },
+    
+                                    Err(_) => base_url.clone(), // Fallback
+    
+                                };
+    
+                                
+    
+                                let raw_path = url_obj.path();
+    
+                                let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+    
+                                let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+    
+                                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+    
+    
+    
+                                let mut page_data = selector_info.clone();
+    
+                                if let Some(obj) = page_data.as_object_mut() {
+    
+                                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+    
+                                    obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
+    
+                                    obj.insert("type".to_string(), json!(page_type));
+    
                                 }
-                                Ok(())
-                            }).await??;
+    
+    
+    
+                                let _ = db.upsert_item(
+    
+                                    "pages", &page_id, "pages", page_data, None,
+    
+                                    Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None
+    
+                                ).await;
+    
+                            }
+    
+                        } 
+    
+    
+    
+                        // Merge selectors
+    
+                        if let Some(obj) = selector_info.as_object() {
+    
+                            for (k, v) in obj {
+    
+                                final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone());
+    
+                            }
+    
                         }
+    
                         
-                        // Save KV to SSD
-                        model.save_kv_snapshot(&task.id).await?;
+    
+                        let page_info = final_page_info;
+    
+                        let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
+    
+                        let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
+    
+                        let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
+    
+    
+    
+                        if page_type == "" || page_type == "unknown" { return Ok(()); }
+    
                         
-                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after snapshot save")); }
-
-                        // 2. [Transition] Unload Small, Wait, Load Large, Bridge KV
-                        // This single call handles the secure transition protocol
-                        model.secure_vram_relay(crate::model::ModelSize::Large, Some(&task.id), Some(cancellation_token.clone())).await?;
-
-                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after VRAM relay")); }
-
-                                                // 3. [2B Phase] Generate Answer
-                                                if let Some(gen) = model.generator.lock().await.as_mut() {
-                                                    println!("[Scheduler] 2B Generating final classification answer (Bridged)...");
-                                                    // 2B uses the loaded KV cache naturally via session_id or just resident memory
-                                                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
-                                                    println!("[Scheduler] 2B Raw Classification Output: {}", res);
-                                                    let type_info = parsing::parse_json_from_llm(&res); 
-                                                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                                                }                        
-                        if page_type.is_empty() || page_type == "unknown" { 
-                            model.unload_generator().await;
-                            return Ok(()); 
-                        }
-                    }
     
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        // Selector Combination Logic
     
-    // [CRITICAL-CLEANUP] Clear resources between major tasks
-    model.deep_purge_resources().await;
-    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
-
-    // --- TASK 2: SELECTOR IDENTIFICATION (SSD-BRIDGE RELAY) ---
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[작업내용] Selector Identification via SSD Bridge");
-        let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let task2_id = format!("{}_task2", task.id);
-
-        // 1. [0.6B Phase]
-        model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
-        
-        let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                content: ChatCompletionRequestUserMessageContent::Text(format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, selector_prompt)),
-                name: None,
-            })],
-            model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
-            ..Default::default()
-        };
-
-        {
-            let model_clone = model.clone();
-            let params_clone = params.clone();
-            let token_clone = cancellation_token.clone();
-            let tid_clone = task2_id.clone();
-
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                crate::utils::resources::set_current_thread_low_priority();
-                let mut small_gen_lock = model_clone.generator.blocking_lock();
-                if let Some(worker) = small_gen_lock.as_mut() {
-                    worker.prefill_only(params_clone, Some(token_clone), Some(tid_clone), None)?;
-                }
-                Ok(())
-            }).await??;
-        }
-
-        // Save & Transition
-        model.save_kv_snapshot(&task2_id).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after snapshot save")); }
-
-        model.secure_vram_relay(crate::model::ModelSize::Large, Some(&task2_id), Some(cancellation_token.clone())).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after VRAM relay")); }
-
-                // 2. [2B Phase]
-                if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 2B Identifying selectors immediately...");    
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task2_id))?;
-                    println!("[Scheduler] 2B Raw Selector Output: {}", res);
-                    selector_info = parsing::parse_json_from_llm(&res);
-                    println!("[Scheduler] Selectors Identified: {}", selector_info);    
-                }    }
-
-    let mut final_page_info = json!({ "type": page_type });
-    let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-    println!("[Scheduler] is_detail determined: {}", is_detail);
-
-    // [STRICT PARITY] Ported from proxy/src/index.ts mechanism
-    {
-        let db = &store;
-        {
-            let team_id = if task.to.is_empty() { 
-                crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") 
-            } else { task.to.clone() };
-
-            // [STRICT PARITY] Ported from proxy/src/index.ts mechanism
-            // If URL is relative, it MUST have a valid origin to combine with.
-            let origin_str = task_data.get("origin").and_then(|s| s.as_str()).ok_or_else(|| anyhow::anyhow!("Missing origin in task data"))?;
-            let base_url = url::Url::parse(origin_str).map_err(|e| anyhow::anyhow!("Invalid origin URL: {}", e))?;
-
-            let url_obj = match url::Url::parse(&url) {
-                Ok(parsed) => parsed,
-                Err(url::ParseError::RelativeUrlWithoutBase) => {
-                    base_url.join(&url).map_err(|e| anyhow::anyhow!("Failed to join relative URL: {}", e))?
-                },
-                Err(e) => return Err(anyhow::anyhow!("Invalid target URL: {}", e)),
-            };
-            
-            let raw_path = url_obj.path();
-            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
-            
-            // 2. bcc = hashId(type + (isDetail ? cc.toUpperCase() : cc)) - Crucial for Tree grouping
-            let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
-
-            // 3. Prepare data exactly as proxy does
-            let mut page_data = selector_info.clone();
-            if let Some(obj) = page_data.as_object_mut() {
-                obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
-                obj.insert("type".to_string(), json!(page_type));
-            }
-
-            let _ = db.upsert_item(
-                "pages", 
-                &page_id, 
-                "pages", 
-                page_data, 
-                None,
-                Some(&task.from),
-                Some(&team_id),
-                Some(&task.cc),
-                Some(&bcc),
-                Some(raw_path), // ref stored as path for lookup parity
-                None
-            ).await;
-            println!("[Scheduler] Page learned with Proxy parity: {}", page_id);
-        }
-    } 
-
-    // Merge selectors into final_page_info
-
-    if let Some(obj) = selector_info.as_object() {
-        for (k, v) in obj {
-            final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone());
-        }
-    }
+                        let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() {
     
-    let page_info = final_page_info; // Re-alias for original logic
+                            let nodes: Vec<&str> = node_selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     
-    let page_type = page_info.get("type").and_then(|s| s.as_str()).unwrap_or("");
-    let node_selector = page_info.get("node").and_then(|s| s.as_str()).unwrap_or("");
-    let item_selector = page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
-
-    if page_type == "" || page_type == "unknown" {
-        return Ok (());
-    }
+                            let items: Vec<&str> = item_selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-    // [SELECTOR-COMBINATION] Robustly combine node and item selectors, handling comma-separated groups in both.
-    let target_selector = if !node_selector.is_empty() && !item_selector.is_empty() {
-        let nodes: Vec<&str> = node_selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        let items: Vec<&str> = item_selector.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        
-        let mut combined = Vec::new();
-        for node in &nodes {
-            for item in &items {
-                combined.push(format!("{} {}", node, item));
-            }
-        }
-        combined.join(", ")
-    } else if !item_selector.is_empty() {
-        item_selector.to_string()
-    } else if !node_selector.is_empty() {
-        node_selector.to_string()
-    } else {
-        "body".to_string()
-    };
-
-    // [COUNT] Calculate actual matches for transparency
-    let match_count = {
-        if let Ok(content) = data_manager.load(&clean_html_path) {
-            let doc = scraper::Html::parse_document(&content);
-            scraper::Selector::parse(&target_selector).map(|s| doc.select(&s).count()).unwrap_or(0)
-        } else { 0 }
-    };
-
-    let payload = json!({ 
-        "task_id": task.id,
-        "category": "Classification", 
-        "summary": format!("Type: {}, Detail: {} ({} matches found)", 
-            page_type, 
-            is_detail,
-            match_count
-        ), 
-        "spinner": "✅", 
-        "data": page_info
-    });
-    let _ = app_handle.emit("extraction-progress", &payload);
-    log_task_progress(app_handle, &task.id, &payload);
-
-    let mut extracted_data = json!({});
+                            let mut combined = Vec::new();
+    
+                            for node in &nodes { for item in &items { combined.push(format!("{} {}", node, item)); } }
+    
+                            combined.join(", ")
+    
+                        } else if !item_selector.is_empty() { item_selector.to_string() }
+    
+                        else if !node_selector.is_empty() { node_selector.to_string() }
+    
+                        else { "body".to_string() };
+    
+    
+    
+                        // Report Progress
+    
+                        let payload = json!({ 
+    
+                            "task_id": task.id,
+    
+                            "category": "Classification", 
+    
+                            "summary": format!("Type: {}, Detail: {}", page_type, is_detail), 
+    
+                            "spinner": "✅", 
+    
+                            "data": page_info
+    
+                        });
+    
+                        let _ = app_handle.emit("extraction-progress", &payload);
+    
+                        log_task_progress(app_handle, &task.id, &payload);
+    
+    
+    
+                        let mut extracted_data = json!({});
 
     if !is_detail {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -914,7 +1003,6 @@ async fn process_task(
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 let start_item = batch_idx * batch_size + 1;
                 let end_item = std::cmp::min(start_item + batch.len() - 1, total_refine_count);
-                let is_last_batch = end_item == total_refine_count;
 
                 // Construct prompt with indexed items
                 let batch_text: String = batch.iter().enumerate().map(|(i, item)| {
@@ -922,85 +1010,29 @@ async fn process_task(
                 }).collect::<Vec<_>>().join("\n\n");
 
                 let instruction = parsing::list2json(&page_type, &language);
-                let action_flag = if is_last_batch { "ACTION: SAVE" } else { "ACTION: INGEST" };
-                let pure_data_input = format!("[RAW ITEMS]\n{}\n\n{}", batch_text, action_flag);
                 
-                // [SSD-BRIDGE RELAY] Refinement
-                let refine_session = format!("{}_refine_{}", task.id, batch_idx);
-
-                // 1. 0.6B Ingest
-                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
-                {
-                    let app_handle_clone = app_handle.clone();
-                    let messages = vec![
-                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            content: "You are a data recording assistant.".to_string(),
-                            name: None,
-                        }),
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: pure_data_input.clone() })
-                            ]),
-                            name: None,
-                        })
-                    ];
-
-                    let _ = model.chat_params_with_spinner(
-                        ChatCompletionParameters { messages, model: "qwen3vl".to_string(), max_tokens: Some(16), temperature: Some(0.1), ..Default::default() },
-                        &app_handle_clone, "Refinement (Small)",
-                        json!({ "task_id": task.id, "category": "Refinement (Ingest)", "summary": format!("Ingesting batch {}/{}...", batch_idx + 1, (total_refine_count + batch_size - 1) / batch_size) }),
-                        Some(cancellation_token.clone()), Some(refine_session.clone())
-                    ).await?;
-                }
-                
-                model.save_kv_snapshot(&refine_session).await?;
-                if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after snapshot save")); }
-                
-                wait_for_resources_settled(2500, 1500, Some(cancellation_token)).await?;
-
-                // 2. 2B Infer
+                // [2B CONTINUOUS] Use the already active Large model
                 let refine_res_str = {
-                    model.secure_vram_relay(crate::model::ModelSize::Large, Some(&refine_session), Some(cancellation_token.clone())).await?;
-                    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled during VRAM relay")); }
                     let app_handle_clone = app_handle.clone();
-                    
-                    let messages = vec![
-                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                            content: "You are a data recording assistant.".to_string(),
+                    let params = ChatCompletionParameters {
+                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                            content: ChatCompletionRequestUserMessageContent::Text(format!("CONVERT THESE ITEMS TO JSON:\n{}\n\nTASK: {}\n\nACTION: JSON ONLY", batch_text, instruction)),
                             name: None,
-                        }),
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { text: pure_data_input })
-                            ]),
-                            name: None,
-                        }),
-                        ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage { content: Some("".to_string()), ..Default::default() }),
-                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                                    text: format!("TASK: {}\n\nACTION: JSON ONLY", instruction) 
-                                })
-                            ]),
-                            name: None,
-                        })
-                    ];
+                        })],
+                        model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1), ..Default::default()
+                    };
 
-                    let res = model.chat_params_with_spinner(
-                        ChatCompletionParameters { messages, model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.95), ..Default::default() },
-                        &app_handle_clone, "Refinement (Large)",
-                        json!({ "task_id": task.id, "category": "Refinement (Infer)", "summary": format!("Refining items {}-{}...", start_item, end_item) }),   
-                        Some(cancellation_token.clone()), Some(refine_session)
-                    ).await?;
-                    println!("[Scheduler] 2B Raw Refinement Output: {}", res);
-                    res
+                    model.chat_params_with_spinner(
+                        params, &app_handle_clone, "Refinement (2B)",
+                        json!({ "task_id": task.id, "category": "Refinement", "summary": format!("Refining items {}-{}...", start_item, end_item) }),
+                        Some(cancellation_token.clone()), None // None session to use current context
+                    ).await?
                 };
 
                 if !refine_res_str.is_empty() {
+                     println!("[Scheduler] 2B Batch Refinement Output: {}", refine_res_str);
                      let parsed = parsing::parse_json_from_llm(&refine_res_str);
-                     // Expecting { "items": [...] } or just an array
-                     let items_array = parsed.get("items").and_then(|v| v.as_array())
-                                        .or_else(|| parsed.as_array());
+                     let items_array = parsed.get("items").and_then(|v| v.as_array()).or_else(|| parsed.as_array());
                                         
                      if let Some(arr) = items_array {
                          let mut batch_refined = Vec::new();
@@ -1013,24 +1045,15 @@ async fn process_task(
                              }
                          }
                          
-                         // Emit the batch results to be appended in the UI
                          let payload = json!({
                              "task_id": task.id,
                              "category": "Data Refinement",
                              "data": batch_refined,
-                             "summary": format!("Refining items {}-{} of {}...", start_item, end_item, total_refine_count)
+                             "summary": format!("Refined items {}-{} of {}...", start_item, end_item, total_refine_count)
                          });
                          let _ = app_handle.emit("extraction-progress", &payload);
                          log_task_progress(app_handle, &task.id, &payload);
-
-                         // If LLM returned fewer items than batch, fill with remaining originals
-                         if arr.len() < batch.len() {
-                             for i in arr.len()..batch.len() {
-                                 refined_items.push(batch[i].clone());
-                             }
-                         }
                      } else {
-                         // Fallback: keep original
                          refined_items.extend_from_slice(batch);
                      }
                 } else {
@@ -1091,126 +1114,43 @@ async fn process_task(
             "node": node_selector,
             "detail": false
         });
-    } else {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        // [RESTORED] Detail Extraction Logic (Parity with a60f234b)
-        // Instead of reusing StructureOnly cache, we extract specific FullContent for the target selector.
-        let content_pug = {
-            let clean_content = data_manager.load(&clean_html_path)?;
-            let document = scraper::Html::parse_document(&clean_content);
-            let mut pug_output = String::new();
-            
-            if let Ok(selector) = scraper::Selector::parse(&target_selector) {
-                for node in document.tree.root().descendants() {
-                    if let Some(element_ref) = scraper::ElementRef::wrap(node) {
-                        if selector.matches(&element_ref) {
-                             parsing::generate_pug_lines(node, 0, &mut pug_output, &PugMode::FullContent);
-                             break;
+                    } else {
+                        // Detail Extraction (2B Continuous)
+                        println!("[Scheduler] 2B Q3: Detail Extraction (Active Model)");
+                        let content_pug = {
+                            let clean_content = data_manager.load(&clean_html_path)?;
+                            let document = scraper::Html::parse_document(&clean_content);
+                            let mut pug_output = String::new();
+                            if let Ok(sel) = scraper::Selector::parse(&target_selector) {
+                                for node in document.tree.root().descendants() {
+                                    if let Some(element_ref) = scraper::ElementRef::wrap(node) {
+                                        if sel.matches(&element_ref) {
+                                             parsing::generate_pug_lines(node, 0, &mut pug_output, &PugMode::FullContent);
+                                             break;
+                                        }
+                                    }
+                                }
+                            }
+                            parsing::sanitize_llm_input(&pug_output)
+                        };
+                        
+                        if !content_pug.trim().is_empty() {
+                            let extraction_instruction = parsing::item2json(page_type, &url, language);
+                            let params = ChatCompletionParameters {
+                                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                                    content: ChatCompletionRequestUserMessageContent::Text(format!("CONTEXT:\n{}\n\nTASK: {}\n\nACTION: JSON ONLY", content_pug, extraction_instruction)),
+                                    name: None,
+                                })],
+                                model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1), ..Default::default()
+                            };
+                            
+                            if let Some(gen) = model.generator.lock().await.as_mut() {
+                                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                                println!("[Scheduler] 2B Q3 Output: {}", res);
+                                extracted_data = parsing::parse_json_from_llm(&res);
+                            }
                         }
                     }
-                }
-            }
-            parsing::sanitize_llm_input(&pug_output)
-        };
-
-        if content_pug.trim().is_empty() {
-            println!("[Scheduler] Error: No content found with selector '{}'", target_selector);
-            return Ok(());
-        }
-
-                        // [DEBUG-LOG] Save content pug
-                        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
-                
-                                // [SSD-BRIDGE RELAY] Detail Extraction
-                
-                                let extraction_instruction = parsing::item2json(page_type, &url, language);
-                
-                                let detail_session_id = format!("{}_detail", task.id); 
-                
-                        
-                
-                                // 1. Prepare Unified Parameters for Detail
-                
-                                let params = ChatCompletionParameters {
-                
-                                    messages: vec![
-                
-                                        ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                
-                                            content: extraction_instruction.clone(),
-                
-                                            name: None,
-                
-                                        }),
-                
-                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                
-                                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                
-                                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                
-                                                    text: format!("{}\n\nTASK: JSON ONLY\n\nACTION: SAVE", content_pug) 
-                
-                                                })
-                
-                                            ]),
-                
-                                            name: None,
-                
-                                        })
-                
-                                    ],
-                
-                                    model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
-                
-                                    ..Default::default()
-                
-                                };
-                
-                        
-                
-                                        // 2. 0.6B Ingest & Save
-                
-                                        model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
-                
-                                        {
-                                            let model_clone = model.clone();
-                                            let params_clone = params.clone();
-                                            let token_clone = cancellation_token.clone();
-                                            let task_id_clone = detail_session_id.clone();
-
-                                            println!("[작업내용]");
-
-                                            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-                                                crate::utils::resources::set_current_thread_low_priority();
-                                                let mut small_gen_lock = model_clone.generator.blocking_lock();
-                                                if let Some(worker) = small_gen_lock.as_mut() {
-                                                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), None)?;
-                                                }
-                                                Ok(())
-                                            }).await??;
-                                        }
-
-                                        model.save_kv_snapshot(&detail_session_id).await?;
-                                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after snapshot save")); }
-                                        
-                                        wait_for_resources_settled(2500, 1500, Some(cancellation_token)).await?;
-                
-                        
-                
-        // 3. Precise Infer with 2B (Immediate)
-        let response = {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&detail_session_id), Some(cancellation_token.clone())).await?;
-            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after VRAM relay")); }
-            
-                        let res = if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[Scheduler] 2B Extracting details immediately...");   
-                            gen.generate(params, Some(cancellation_token.clone()), Some(detail_session_id.clone()))?
-                        } else { "{}".to_string() };
-                        println!("[Scheduler] 2B Raw Detail Output: {}", res);
-                        res
-                    };
         if !response.is_empty() {
             println!("[EXTRACT-FINAL] Result: {}", response);
             extracted_data = parsing::parse_json_from_llm(&response);

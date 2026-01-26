@@ -429,6 +429,66 @@ impl LogisModel {
         Ok(())
     }
 
+    // --- [NEW] Base Context Baking (One-time Heavy Lifting) ---
+    pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        let base_session = format!("{}_base", task_id);
+        
+        // 1. Load Small Model Isolated
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone()).await?;
+
+        // 2. Ingest PUG content
+        {
+            let gen_clone = self.generator.clone();
+            let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
+            let token_clone = cancel_token.clone();
+            let sid_clone = base_session.clone();
+            
+            // We use prefill_only via a manual chat construct or direct access if possible
+            // Reusing chat_params_with_spinner for convenience but with empty generation
+            let app_handle_dummy = tauri::AppHandle::current(); // Not available here, need refactor?
+            // Actually, we can just use the generator directly.
+            
+            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let mut gen_guard = gen_clone.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    // Just prefill, no generation needed for base context
+                    gen.prefill_chunk(prompt, token_clone, None)?;
+                }
+                Ok(())
+            }).await??;
+        }
+
+        // 3. Save Base Snapshot
+        self.save_kv_snapshot(&base_session).await?;
+        
+        // 4. Unload immediately to free VRAM for 2B
+        self.unload_generator().await;
+        
+        Ok(())
+    }
+
+    // --- [NEW] 2B Continuous Inference Helper ---
+    pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        let base_session = format!("{}_base", task_id);
+        
+        // Only load if not already loaded or if current loaded session is different?
+        // secure_vram_relay checks size but not session content.
+        // We force a relay if we are not Large. If we are Large, we assume we might need to reset or just continue.
+        // For safety in this new flow, we can check if we need to load.
+        
+        {
+            let current_size = *self.current_size.lock().await;
+            if current_size == Some(ModelSize::Large) {
+                // Already Large. Assuming context is preserved or we manage it.
+                // But if we just switched from Small, we need to load base.
+                // The safest is to rely on secure_vram_relay's logic:
+                // If we pass the base_session as task_id, it will load that snapshot.
+            }
+        }
+
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token).await
+    }
+
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>) -> anyhow::Result<Qwen3VLGenerateModel> {
         println!("[MODEL] Loading Generator from {} on GPU-{}...", path, self.device_config.gpu_id);
         let dev = self.device_config.device.clone();
