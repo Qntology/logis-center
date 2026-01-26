@@ -673,22 +673,60 @@ impl Qwen3VLGenerateModel {
 
         // Finalize state for generation loop
         let mut seqlen_offset = current_pos;
-        let mut seq_len;
         let mut input_ids;
+        let mut cache_position;
 
         if seqlen_offset >= total_tokens && total_tokens > 0 {
             println!("\n[KV-BRIDGE] Context fully matched in cache. Starting generation immediately.");
             seqlen_offset = total_tokens - 1;
-            seq_len = 1;
             input_ids = Tensor::from_vec(vec![full_input_ids_vec[seqlen_offset]], (1, 1), &self.text_device)?;
+            cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.text_device)?;
         } else {
-            seq_len = total_tokens - seqlen_offset;
+            let seq_len = total_tokens - seqlen_offset;
             println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
+            
+            // The last chunk should end exactly at the last token of the prompt
             let last_tokens_vec = &full_input_ids_vec[seqlen_offset..];
             input_ids = Tensor::from_vec(last_tokens_vec.to_vec(), (1, seq_len), &self.text_device)?;
+            cache_position = Tensor::arange(seqlen_offset as u32, total_tokens as u32, &self.text_device)?;
         }
 
-        // Save progress if requested
+        // 1. Process the final prompt tokens to get the starting logits
+        let mut pixel_values = input.pixel_values.take();
+        let image_grid_thw_tensor = input.image_grid_thw.take(); 
+        let mut pixel_values_video = input.pixel_values_video.take();
+        let video_grid_thw_tensor = input.video_grid_thw.take();
+
+        let mut logits = match &mut self.qwen3_vl {
+            ModelVariant::Standard(m) => m.forward(
+                &input_ids,
+                pixel_values.as_ref(),
+                image_grid_thw_tensor.as_ref(),
+                pixel_values_video.as_ref(),
+                video_grid_thw_tensor.as_ref(),
+                Some(&cache_position),
+                seqlen_offset,
+            )?,
+            ModelVariant::QuantizedVL(m) => m.forward(
+                &input_ids,
+                pixel_values.as_ref(),
+                image_grid_thw_tensor.as_ref(),
+                pixel_values_video.as_ref(),
+                video_grid_thw_tensor.as_ref(),
+                Some(&cache_position),
+                seqlen_offset,
+            )?,
+            ModelVariant::QuantizedText(m) => m.forward(
+                &input_ids,
+                Some(&cache_position),
+                seqlen_offset,
+            )?,
+        };
+
+        // Advance offset
+        seqlen_offset = total_tokens;
+
+        // Save progress if requested (at the end of prompt)
         if is_save && seqlen_offset > 0 {
             if let Some(path) = &cache_path {
                 let res = match &mut self.qwen3_vl {
@@ -705,23 +743,15 @@ impl Qwen3VLGenerateModel {
             }
         }
         
-        let mut pixel_values = input.pixel_values.take();
-        let image_grid_thw_tensor = input.image_grid_thw.take(); 
-        let mut pixel_values_video = input.pixel_values_video.take();
-        let video_grid_thw_tensor = input.video_grid_thw.take();
-        
-        let mut cache_position = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?;
-        
         let requested_tokens = mes.max_tokens.unwrap_or(2048);
         let mut sample_len = requested_tokens;
         
         if let Some(limit) = self.hard_token_limit {
-            let current_usage = seq_len;
-            if current_usage >= limit {
-                 println!("[WARN] Input length {} exceeds hard limit {}. Truncating generation.", current_usage, limit);
+            if seqlen_offset >= limit {
+                 println!("[WARN] Input length {} exceeds hard limit {}. Truncating generation.", seqlen_offset, limit);
                  sample_len = 16; 
             } else {
-                 let available = limit - current_usage;
+                 let available = limit - seqlen_offset;
                  if (sample_len as usize) > available {
                       println!("[CONFIG] Clamping generation: Requested {} -> Available {} (Total Limit: {})", sample_len, available, limit);
                       sample_len = available as u32;
@@ -731,6 +761,13 @@ impl Qwen3VLGenerateModel {
 
         let generation_result: Result<Vec<u32>> = (|| {
             let mut generate = Vec::new();
+            
+            // Turn off vision inputs after first pass
+            if matches!(self.qwen3_vl, ModelVariant::Standard(_) | ModelVariant::QuantizedVL(_)) {
+                pixel_values = None;
+                pixel_values_video = None;
+            }
+
             for _i in 0..sample_len {
                 if let Some(flag) = &cancel_flag {
                     if flag.load(Ordering::Relaxed) {
@@ -738,26 +775,41 @@ impl Qwen3VLGenerateModel {
                     }
                 }
                 
+                let mut logits_vec = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                
+                // Apply Repetition Penalty
+                if repetition_penalty != 1.0 {
+                    let mut context = full_input_ids_vec.clone();
+                    context.extend(&generate);
+                    let penalty_context = if context.len() > 512 { &context[context.len()-512..] } else { &context[..] };
+                    logits_vec = apply_repeat_penalty(&logits_vec, repetition_penalty, penalty_context)?;
+                }
+
+                let next_token = logit_processor.sample(&logits_vec)?;
+                generate.push(next_token);
+                
+                if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
+                    break;
+                }
+                
                 use std::io::Write;
                 print!(".");
                 std::io::stdout().flush().ok();
 
-                let logits = match &mut self.qwen3_vl {
+                // Prepare next input
+                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.text_device)?;
+                cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.text_device)?;
+
+                logits = match &mut self.qwen3_vl {
                     ModelVariant::Standard(m) => m.forward(
                         &input_ids,
-                        pixel_values.as_ref(),
-                        image_grid_thw_tensor.as_ref(),
-                        pixel_values_video.as_ref(),
-                        video_grid_thw_tensor.as_ref(),
+                        None, None, None, None,
                         Some(&cache_position),
                         seqlen_offset,
                     )?,
                     ModelVariant::QuantizedVL(m) => m.forward(
                         &input_ids,
-                        pixel_values.as_ref(),
-                        image_grid_thw_tensor.as_ref(),
-                        pixel_values_video.as_ref(),
-                        video_grid_thw_tensor.as_ref(),
+                        None, None, None, None,
                         Some(&cache_position),
                         seqlen_offset,
                     )?,
@@ -767,58 +819,9 @@ impl Qwen3VLGenerateModel {
                         seqlen_offset,
                     )?,
                 };
-                let mut logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
-                
-                // [FIX] Apply Repetition Penalty to prevent loops
-                if repetition_penalty != 1.0 {
-                    // Combine prompt tokens and generated tokens for context
-                    let mut context = full_input_ids_vec.clone();
-                    context.extend(&generate);
-                    
-                    // Only use the last N tokens for penalty to keep performance
-                    let penalty_context = if context.len() > 512 {
-                        &context[context.len()-512..]
-                    } else {
-                        &context[..]
-                    };
-                    
-                    logits = apply_repeat_penalty(&logits, repetition_penalty, penalty_context)?;
-                }
 
-                let next_token = logit_processor.sample(&logits)?;
-                                generate.push(next_token);
-                                
-                                if next_token == self.eos_token_id1 || next_token == self.eos_token_id2 {
-                                    break;
-                                }
-                                
-                                                seqlen_offset += seq_len;
-                                
-                                                seq_len = 1;
-                                
-                                                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.text_device)?;
-                                
-                                                cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.text_device)?;
-                                
-                                                                
-                                
-                                                // [BRANCH] Only reset vision inputs if the model variant actually supports vision
-                                
-                                                if matches!(self.qwen3_vl, ModelVariant::Standard(_) | ModelVariant::QuantizedVL(_)) {
-                                
-                                                    if pixel_values.is_some() {
-                                
-                                                        pixel_values = None;
-                                
-                                                        pixel_values_video = None;
-                                
-                                                    }
-                                
-                                                }
-                                
-                                            }
-                                
-                                
+                seqlen_offset += 1;
+            }
             Ok(generate)
         })();
 
