@@ -30,8 +30,7 @@ pub fn set_current_thread_low_priority() {
         use windows_sys::Win32::System::Threading::*;
         unsafe {
             let handle = GetCurrentProcess();
-            // BELOW_NORMAL_PRIORITY_CLASS (0x00004000) or IDLE_PRIORITY_CLASS (0x00000040)
-            // We use BELOW_NORMAL to keep it responsive but less aggressive than normal apps.
+            // BELOW_NORMAL_PRIORITY_CLASS (0x00004000)
             SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS);
             
             let thread_handle = GetCurrentThread();
