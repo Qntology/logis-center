@@ -846,6 +846,9 @@ impl Qwen3VLGenerateModel {
             ModelVariant::QuantizedVL(m) => m.to_device(device)?,
             ModelVariant::QuantizedText(m) => m.to_device(device)?,
         }
+        // Update device trackers to ensure inputs (input_ids, etc) match weights
+        self.text_device = device.clone();
+        self.vision_device = device.clone();
         Ok(())
     }
 
