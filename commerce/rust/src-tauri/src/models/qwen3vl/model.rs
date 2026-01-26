@@ -61,8 +61,9 @@ impl Qwen3VLVisionPatchEmbed {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        self.conv3d_weight = self.conv3d_weight.to_device(device)?;
-        self.conv3d_bias = self.conv3d_bias.to_device(device)?;
+        let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
+        self.conv3d_weight = self.conv3d_weight.to_device(device)?.to_dtype(target_dtype)?;
+        self.conv3d_bias = self.conv3d_bias.to_device(device)?.to_dtype(target_dtype)?;
         Ok(())
     }
 
@@ -111,17 +112,18 @@ impl Qwen3VLVisionPatchMerger {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
         // [MEMORY-FIX] LayerNorm/Linear don't have to_device, so we recreate with moved tensors
-        let n_w = self.norm.weight().to_device(device)?;
-        let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        let n_w = self.norm.weight().to_device(device)?.to_dtype(target_dtype)?;
+        let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required").to_dtype(target_dtype)?;
         self.norm = LayerNorm::new(n_w, n_b, 1e-6);
     
-        let l1_w = self.linear_fc1.weight().to_device(device)?;
-        let l1_b = self.linear_fc1.bias().map(|b| b.to_device(device)).transpose()?;
+        let l1_w = self.linear_fc1.weight().to_device(device)?.to_dtype(target_dtype)?;
+        let l1_b = self.linear_fc1.bias().map(|b| b.to_device(device)).transpose()?.map(|b| b.to_dtype(target_dtype)).transpose()?;
         self.linear_fc1 = Linear::new(l1_w, l1_b);
     
-        let l2_w = self.linear_fc2.weight().to_device(device)?;
-        let l2_b = self.linear_fc2.bias().map(|b| b.to_device(device)).transpose()?;
+        let l2_w = self.linear_fc2.weight().to_device(device)?.to_dtype(target_dtype)?;
+        let l2_b = self.linear_fc2.bias().map(|b| b.to_device(device)).transpose()?.map(|b| b.to_dtype(target_dtype)).transpose()?;
         self.linear_fc2 = Linear::new(l2_w, l2_b);
         Ok(())
     }
@@ -164,12 +166,13 @@ impl Qwen3VLVisionAttention {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let qkv_w = self.qkv.weight().to_device(device)?;
-        let qkv_b = self.qkv.bias().map(|b| b.to_device(device)).transpose()?;
+        let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
+        let qkv_w = self.qkv.weight().to_device(device)?.to_dtype(target_dtype)?;
+        let qkv_b = self.qkv.bias().map(|b| b.to_device(device)).transpose()?.map(|b| b.to_dtype(target_dtype)).transpose()?;
         self.qkv = Linear::new(qkv_w, qkv_b);
 
-        let proj_w = self.proj.weight().to_device(device)?;
-        let proj_b = self.proj.bias().map(|b| b.to_device(device)).transpose()?;
+        let proj_w = self.proj.weight().to_device(device)?.to_dtype(target_dtype)?;
+        let proj_b = self.proj.bias().map(|b| b.to_device(device)).transpose()?.map(|b| b.to_dtype(target_dtype)).transpose()?;
         self.proj = Linear::new(proj_w, proj_b);
         Ok(())
     }
@@ -253,12 +256,13 @@ impl Qwen3VLVisionBlock {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let n1_w = self.norm1.weight().to_device(device)?;
-        let n1_b = self.norm1.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
+        let n1_w = self.norm1.weight().to_device(device)?.to_dtype(target_dtype)?;
+        let n1_b = self.norm1.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required").to_dtype(target_dtype)?;
         self.norm1 = LayerNorm::new(n1_w, n1_b, 1e-6);
 
-        let n2_w = self.norm2.weight().to_device(device)?;
-        let n2_b = self.norm2.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        let n2_w = self.norm2.weight().to_device(device)?.to_dtype(target_dtype)?;
+        let n2_b = self.norm2.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required").to_dtype(target_dtype)?;
         self.norm2 = LayerNorm::new(n2_w, n2_b, 1e-6);
 
         self.attn.to_device(device)?;
@@ -338,9 +342,10 @@ impl Qwen3VLVisionModel {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let target_dtype = if device.is_cpu() { DType::F32 } else { DType::BF16 };
         self.patch_embed.to_device(device)?;
         
-        let p_w = self.pos_embed.embeddings().to_device(device)?;
+        let p_w = self.pos_embed.embeddings().to_device(device)?.to_dtype(target_dtype)?;
         self.pos_embed = Embedding::new(p_w, self.pos_embed.hidden_size());
 
         for block in self.blocks.iter_mut() {

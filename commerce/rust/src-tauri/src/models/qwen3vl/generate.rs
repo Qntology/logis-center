@@ -886,6 +886,26 @@ impl Qwen3VLGenerateModel {
         }
     }
 
+    pub fn save_kv_cache(&mut self, path: &std::path::Path, clear: bool, block_size: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, clear, block_size),
+            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, clear, block_size),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn load_kv_cache(&mut self, path: &std::path::Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, device, expected_len, upscale_refill_len),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, device, expected_len, upscale_refill_len),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn text_encode_vec(&self, text: String, add_special_tokens: bool) -> Result<Vec<u32>> {
+        self.tokenizer.text_encode_vec(text, add_special_tokens)
+    }
+
     pub fn get_kv_len(&self) -> usize {
         match &self.qwen3_vl {
             ModelVariant::Standard(_) => 0,
@@ -968,19 +988,69 @@ impl Qwen3VLGenerateModel {
     
 
             pub fn prefill_assistant(&mut self, _full_input_ids: &[u32], _sid: &Option<String>) -> Result<usize> {
-
-    
-
-                println!("[ASSISTANT] Rapid Ingestion using 0.6B...");
-
-            // This is essentially the same as the prefill part of generate, but forced for Small variant
-
-            // and specifically tuned for speed.
-
-            Ok(0) // Logic to be integrated into main loop
-
-        }
-
+        println!("[ASSISTANT] Rapid Ingestion using 0.6B...");
+        Ok(0) // Logic to be integrated into main loop
     }
+
+    /// [STITCHING] Prefills a raw string and optionally relays to a target model.
+    /// Returns the number of tokens processed.
+    pub fn prefill_text(&mut self, text: &str, cancel_flag: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+        let tokens = self.tokenizer.text_encode_vec(text.to_string(), false)?;
+        let token_count = tokens.len();
+        let mut current_pos = self.get_kv_len();
+        
+        let dev = self.text_device.clone();
+        // Use a safe chunk size for incremental prefill
+        let chunk_size = if dev.is_cpu() { 1024 } else { 512 };
+
+        for chunk in tokens.chunks(chunk_size) {
+            if let Some(ref flag) = cancel_flag {
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
+            }
+
+            let len = chunk.len();
+            let ids = Tensor::from_vec(chunk.to_vec(), (1, len), &dev)?;
+            let pos = Tensor::arange(current_pos as u32, (current_pos + len) as u32, &dev)?;
+
+            match &mut self.qwen3_vl {
+                ModelVariant::Standard(m) => { m.forward(&ids, None, None, None, None, Some(&pos), current_pos)?; },
+                ModelVariant::QuantizedVL(m) => { m.forward(&ids, None, None, None, None, Some(&pos), current_pos)?; },
+                ModelVariant::QuantizedText(m) => { m.forward(&ids, Some(&pos), current_pos)?; },
+            }
+
+            // Relay to target if provided
+            if let Some(ref mut target) = relay_target {
+                let (ks, vs) = self.get_current_kv();
+                let mut ks_i8 = Vec::new();
+                let mut vs_i8 = Vec::new();
+                let mut k_s = Vec::new();
+                let mut v_s = Vec::new();
+
+                for (k, v) in ks.iter().zip(vs.iter()) {
+                    let s_len = k.dim(2)?;
+                    let k_new = k.narrow(2, s_len - len, len)?;
+                    let v_new = v.narrow(2, s_len - len, len)?;
+
+                    let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                    let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                    let sk = k_max / 127.0;
+                    let sv = v_max / 127.0;
+
+                    let ki8 = if sk > 0.0 { (k_new.to_dtype(DType::F32)? / sk as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
+                    let vi8 = if sv > 0.0 { (v_new.to_dtype(DType::F32)? / sv as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
+
+                    ks_i8.push(ki8); vs_i8.push(vi8);
+                    k_s.push(sk); v_s.push(sv);
+                }
+                target.inject_kv_quantized(&ks_i8, &vs_i8, &k_s, &v_s)?;
+            }
+
+            current_pos += len;
+            print!("."); use std::io::Write; std::io::stdout().flush().ok();
+        }
+        
+        Ok(token_count)
+    }
+}
 
     
