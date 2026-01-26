@@ -24,6 +24,23 @@ pub struct ThreadConfig {
     pub description: String,
 }
 
+pub fn set_current_thread_low_priority() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Threading::*;
+        unsafe {
+            let handle = GetCurrentProcess();
+            // BELOW_NORMAL_PRIORITY_CLASS (0x00004000) or IDLE_PRIORITY_CLASS (0x00000040)
+            // We use BELOW_NORMAL to keep it responsive but less aggressive than normal apps.
+            SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS);
+            
+            let thread_handle = GetCurrentThread();
+            SetThreadPriority(thread_handle, THREAD_PRIORITY_BELOW_NORMAL);
+        }
+        println!("[RESOURCES] Thread priority set to BELOW_NORMAL.");
+    }
+}
+
 pub fn get_optimal_thread_config() -> ThreadConfig {
     let mut sys = SYSTEM_MONITOR.lock().unwrap();
     

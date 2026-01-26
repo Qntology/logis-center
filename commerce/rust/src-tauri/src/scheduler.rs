@@ -575,6 +575,7 @@ async fn process_task(
                                         println!("[Scheduler] Relay Part {}/{} ({} chars)...", i + 1, pug_chunks_len, chunk_to_send.len());
                                         
                                         tokio::task::spawn_blocking(move || -> Result<()> {
+                                            crate::utils::resources::set_current_thread_low_priority();
                                             let mut large_gen_lock = model_clone.generator.blocking_lock(); 
                                             let mut small_gen_lock = model_clone.small_generator.blocking_lock();
                                             
@@ -647,10 +648,11 @@ async fn process_task(
 
                 println!("[Scheduler] Relay Part {}/{} ({} chars)...", i + 1, pug_chunks_len, chunk_to_send.len());
 
-                // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut large_gen_lock = model_clone.generator.blocking_lock();
-                    let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+            // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
+            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                crate::utils::resources::set_current_thread_low_priority();
+                let mut large_gen_lock = model_clone.generator.blocking_lock(); 
+                let mut small_gen_lock = model_clone.small_generator.blocking_lock();
                     
                     if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
                         worker.prefill_chunk(chunk_to_send, Some(token_clone), Some(target))?;
@@ -1236,6 +1238,7 @@ async fn process_task(
                                                 println!("[Scheduler] Detail Ingestion (Blocking Thread)...");
 
                                                 let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                                                    crate::utils::resources::set_current_thread_low_priority();
                                                     let mut large_gen_lock = model_clone.generator.blocking_lock();
                                                     let mut small_gen_lock = model_clone.small_generator.blocking_lock();
                                                     if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
