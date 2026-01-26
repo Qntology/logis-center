@@ -266,8 +266,8 @@ impl LogisModel {
 
         // 2. [WAKE] Check if requested model is in hibernation
         let hibernated = match size {
-            ModelSize::Small => self.small_hibernation.lock().await.take(),
-            ModelSize::Large => self.large_hibernation.lock().await.take(),
+            ModelSize::Small => small_slot.take(),
+            ModelSize::Large => large_slot.take(),
         };
 
         if let Some(mut m) = hibernated {
