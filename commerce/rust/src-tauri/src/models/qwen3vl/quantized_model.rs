@@ -768,7 +768,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let estimated_activation_buffer = 200_000_000; 
+        let estimated_activation_buffer = 400_000_000; // Increased to 400MB
         let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 };
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
@@ -780,7 +780,7 @@ impl QuantizedQwen3VLTextModel {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         let os_reserve = 80_000_000; 
+                         let os_reserve = 150_000_000; // Increased to 150MB
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -792,7 +792,8 @@ impl QuantizedQwen3VLTextModel {
 
         for _ in 0..config.num_hidden_layers {
             if current_device.is_cuda() && is_vram_checked {
-                 if simulated_free_vram > ( (effective_cost as f64 * 1.02) as u64 + safety_floor ) {
+                 // Use 1.05x margin for safer buffer
+                 if simulated_free_vram > ( (effective_cost as f64 * 1.05) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(effective_cost);
                  } else {
                      current_device = Device::Cpu;

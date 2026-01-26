@@ -182,6 +182,52 @@ impl LogisModel {
         }
     }
 
+    /// [CLEANUP] Adaptive resource management based on system stress
+    pub async fn deep_purge_resources(&self) {
+        let (ram_used, vram_used) = utils::resources::get_memory_usage();
+        
+        // Simple heuristic: Get total VRAM to calculate free percentage
+        let mut vram_free = 4_000_000_000; // Default assumption 4GB
+        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                if let Ok(mem) = dev.memory_info() {
+                    vram_free = mem.free;
+                }
+            }
+        }
+
+        println!("[RESOURCE-CHECK] Current Free VRAM: {:.2} GB", vram_free as f64 / 1e9);
+
+        // 1. CRITICAL STRESS (< 1GB Free) -> Heavy Purge
+        if vram_free < 1_000_000_000 {
+            println!("[MEMORY] High Stress Detected. Performing Aggressive Deep Purge.");
+            if let Some(gen) = self.generator.lock().await.as_mut() {
+                gen.clear_kv_cache();
+            }
+            if let Some(small_gen) = self.small_generator.lock().await.as_mut() {
+                small_gen.clear_kv_cache();
+            }
+
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::*;
+                let current_process = GetCurrentProcess();
+                windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, 0);
+            }
+        } 
+        // 2. MODERATE STRESS (< 1.8GB Free) -> Light Purge (Caches only)
+        else if vram_free < 1_800_000_000 {
+            println!("[MEMORY] Moderate Stress. Clearing inactive caches.");
+            if let Some(gen) = self.generator.lock().await.as_mut() {
+                gen.clear_kv_cache();
+            }
+        }
+        // 3. HEALTHY -> Skip purge to maintain performance
+        else {
+            println!("[MEMORY] Resources healthy. Skipping purge to maximize speed.");
+        }
+    }
+
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>) -> anyhow::Result<Qwen3VLGenerateModel> {
         println!("[MODEL] Loading Generator from {} on GPU-{}...", path, self.device_config.gpu_id);
         let dev = self.device_config.device.clone();
@@ -226,10 +272,11 @@ impl LogisModel {
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
-                        // If we have > 2.5GB free, we can likely keep both 0.6B and 2B on GPU
-                        if mem.free > 2_500_000_000 {
+                        // [OOM-PREVENTION] 4GB cards are too tight for dual-model resonance during heavy tasks.
+                        // Require at least 3.5GB free to even consider keeping both.
+                        if mem.free > 3_500_000_000 {
                             can_keep_both = true;
-                            println!("[MODEL-CONFIG] High VRAM detected ({:.2} GB free). Enabling Dual-Model GPU resonance.", mem.free as f64 / 1e9);
+                            println!("[MODEL-CONFIG] Very High VRAM detected ({:.2} GB free). Enabling Dual-Model GPU resonance.", mem.free as f64 / 1e9);
                         }
                     }
                 }
