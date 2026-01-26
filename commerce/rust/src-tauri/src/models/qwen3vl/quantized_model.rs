@@ -384,13 +384,20 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     // [LIVE-BRIDGE] Inject 512-dim KV from 0.6B into 2048-dim VRAM of 2B
-    pub fn inject_live_kv(&mut self, k_small: &Tensor, v_small: &Tensor) -> Result<()> {
+    // [QUANTIZED-RELAY] Receives 8-bit data to minimize PCIe traffic
+    pub fn inject_live_kv(&mut self, k_i8: &Tensor, v_i8: &Tensor, k_scale: f32, v_scale: f32) -> Result<()> {
         let target_heads = self.num_key_value_heads; // 16 heads
         let target_dim = self.head_dim;             // 128 dim
         let target_device = self.q_proj.device(); 
+        let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        let k_small = k_small.to_device(target_device)?;
-        let v_small = v_small.to_device(target_device)?;
+        // 1. Transfer tiny 8-bit data to GPU (Fast PCIe Path)
+        let k_gpu_i8 = k_i8.to_device(target_device)?;
+        let v_gpu_i8 = v_i8.to_device(target_device)?;
+
+        // 2. High-speed Dequantization on GPU
+        let k_small = (k_gpu_i8.to_dtype(DType::F32)? * k_scale as f64)?.to_dtype(target_dtype)?;
+        let v_small = (v_gpu_i8.to_dtype(DType::F32)? * v_scale as f64)?.to_dtype(target_dtype)?;
 
         let (_b, h, _s, d) = k_small.dims4()?;
         
@@ -422,7 +429,7 @@ impl QuantizedQwen3VLTextAttention {
         let v_final = v;
 
         if self.layer_idx == 0 {
-            println!("[KV-BRIDGE] Projecting 0.6B cache (512) to 2B architecture (2048) using Replication");
+            println!("[KV-BRIDGE] Quantized Relay: 8-bit PCIe transfer -> GPU Dequantization");
         }
         
         // Append to existing cache
@@ -1052,10 +1059,21 @@ impl QuantizedQwen3VLTextModel {
         self.layers.get(0).map(|l| l.get_kv_len()).unwrap_or(0)
     }
 
-    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor]) -> Result<()> {
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if i < k_list.len() {
-                layer.self_attn.inject_live_kv(&k_list[i], &v_list[i])?;
+                layer.self_attn.inject_live_kv(&k_list[i], &v_list[i], k_scale, v_scale)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if i < k_list.len() {
+                let ks = k_scales.get(i).cloned().unwrap_or(1.0);
+                let vs = v_scales.get(i).cloned().unwrap_or(1.0);
+                layer.self_attn.inject_live_kv(&k_list[i], &v_list[i], ks, vs)?;
             }
         }
         Ok(())
@@ -1438,12 +1456,12 @@ impl QuantizedQwen3VLModel {
         self.language_model.clear_kv_cache();
     }
 
-    pub fn get_kv_len(&self) -> usize {
-        self.language_model.get_kv_len()
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
+        self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale)
     }
 
-    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor]) -> Result<()> {
-        self.language_model.inject_live_kv(k_list, v_list)
+    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
+        self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales)
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
@@ -1584,8 +1602,11 @@ impl QuantizedQwen3TextModel {
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
     pub fn get_kv_len(&self) -> usize { self.language_model.get_kv_len() }
-    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor]) -> Result<()> {
-        self.language_model.inject_live_kv(k_list, v_list)
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
+        self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale)
+    }
+    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
+        self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales)
     }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }

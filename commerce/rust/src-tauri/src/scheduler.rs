@@ -60,90 +60,41 @@ impl Drop for TaskDataManager {
     }
 }
 
-// Helper to chunk text with overlap, strictly respecting newlines and char boundaries for Pug     
-fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
-    if text.len() <= chunk_size {
-        return vec![text.to_string()];
-    }
-
+// Helper to chunk text, strictly respecting Pug line boundaries (\n)
+fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut start = 0;
+    let bytes = text.as_bytes();
 
     while start < text.len() {
-        let mut target_end = (start + chunk_size).min(text.len());
+        let mut end = (start + target_size).min(text.len());
 
-        // Ensure target_end is a valid char boundary
-        while !text.is_char_boundary(target_end) {
-            target_end -= 1;
-        }
-
-        let mut end = target_end;
-
-        // Find the NEXT newline after target_end to include the current line fully
-        // [SAFETY] Limit search to 2000 chars to avoid oversized chunks from single long lines
-        if target_end < text.len() {
-            let window_end = (target_end + 2000).min(text.len());
-            let mut safe_window_end = window_end;
+        // [BACKTRACKING] If mid-line, move back until we find a newline
+        if end < text.len() {
+            let mut temp_end = end;
+            while temp_end > start && bytes[temp_end] != b'\n' {
+                temp_end -= 1;
+            }
             
-            // Ensure safe_window_end is a valid char boundary
-            while safe_window_end > target_end && !text.is_char_boundary(safe_window_end) {
-                safe_window_end -= 1;
-            }
-
-            let search_window = &text[target_end..safe_window_end];
-            if let Some(next_newline_offset) = search_window.find('\n') {
-                end = target_end + next_newline_offset + 1;
+            // If found a newline, use it as the end
+            if temp_end > start {
+                end = temp_end + 1; // Include the \n
             } else {
-                // If no newline found in window, just use target_end to avoid VRAM spikes
-                end = target_end;
+                // No newline found in the whole chunk? Force char boundary to avoid hang
+                while end < text.len() && !text.is_char_boundary(end) {
+                    end += 1;
+                }
             }
+        } else {
+            // Reached the end of string
+            end = text.len();
         }
 
-        // Safety check for end boundary
-        while !text.is_char_boundary(end) {
-            end -= 1;
+        let slice = &text[start..end];
+        if !slice.trim().is_empty() {
+            chunks.push(slice.to_string());
         }
-
-        chunks.push(text[start..end].to_string());
-
-        if end >= text.len() {
-            break;
-        }
-
-        // Calculate next start with overlap
-        let mut next_start = end.saturating_sub(overlap);
-
-        // Ensure next_start is a valid char boundary
-        while !text.is_char_boundary(next_start) {
-            next_start -= 1;
-        }
-
-        // Align next_start to the START of a line (find the first newline in the overlap zone)    
-        if next_start > start && next_start < end {
-             if let Some(line_start) = text[next_start..end].find('\n') {
-                 next_start = next_start + line_start + 1;
-             }
-        }
-
-        // Final safety for next_start
-        while !text.is_char_boundary(next_start) {
-            next_start += 1; // Move forward to find valid char
-        }
-
-        // Prevent infinite loops or zero progress
-        if next_start >= end {
-            next_start = end;
-        }
-
-        // Absolute safety check to ensure progress
-        if next_start <= start {
-             next_start = start + 1; // Force progress by at least 1 byte (might panic on utf8, but better than loop)
-             while !text.is_char_boundary(next_start) && next_start < text.len() {
-                 next_start += 1;
-             }
-        }
-
-        start = next_start;
+        start = end;
     }
     chunks
 }
@@ -523,128 +474,154 @@ async fn process_task(
         // [ADAPTIVE] Increased to 12000 chars to speed up ingestion and improve context coherence.
         let device_config = utils::get_optimal_device_config();
     
-                // [REVISED] Restore turn-based chunked ingestion for classification.
-                // This is the original stable logic.
-                let classify_chunks = chunk_text(&light_pug, device_config.classify_chunk_size, 3000); 
-                let classify_chunks_len = classify_chunks.len(); 
-                println!("[Scheduler] Ingestion: {} chunks created.", classify_chunks_len);
-
-    // [LOCK-MINIMIZATION] Acquire clones and release locks immediately.
-    // This allows stop_current_extraction to clear global references without deadlocking.
-    
-    let store = {
-        let store_guard = store_mutex.lock().await;
-        store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
-    };
-
-    let model = {
-        let mut model_lock = model_mutex.lock().await;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        if model_lock.is_none() {
-            let payload = json!({ 
-               "task_id": task.id,
-               "category": "Loading Model", "summary": "Loading Model for Analysis...", "spinner": "⠋"
-            });
-            let _ = app_handle.emit("extraction-progress", &payload);
-            match LogisModel::new(None).await {
-                Ok(m) => *model_lock = Some(m),
-                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
-            }
-        }
-        model_lock.as_ref().unwrap().clone()
-    };
-
-    // Release the initial locks so tasks can re-acquire them as needed (e.g. stop command)
-    // Both 'store' and 'model' are now local clones (Arc-based).
-
-    // ==================================================================================
-    // [STRICT SWITCHING PATTERN]
-    // 1. Ingest content + Question with 0.6B (Save Cache)
-    // 2. Load 2B (Load Cache) -> Answer
-    // Repeat for each distinct task to ensure perfect cache alignment.
-    // ==================================================================================
-
-    use crate::openai_types::{
-        ChatCompletionParameters, ChatCompletionRequestMessage, 
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
-        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
-    };
-
-    let mut page_type = String::new();
-    let mut selector_info = json!({});
-
-    // --- TASK 1: CLASSIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
-        let type_prompt = parsing::page_type_prompt();
-        
-        let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                        text: format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt) 
-                    })
-                ]),
-                name: None,
-            })],
-            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
-            ..Default::default()
-        };
-
-        // [FIX] Using the cloned model reference (lock is free)
-        model.ensure_generator(crate::model::ModelSize::Small).await?;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        
-        // [INTERRUPTIBLE-LOAD] Race loading against cancellation
-        tokio::select! {
-            res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
-            _ = async {
-                loop {
-                    if cancellation_token.load(Ordering::Relaxed) { break; }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
-        }
-        
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        // 2. Stream from 0.6B to 2B
-        {
-            let model_clone = model.clone();
-            let params_clone = params.clone();
-            let token_clone = cancellation_token.clone();
-            let task_id_clone = task.id.clone();
-
-            println!("[Scheduler] Real-time Relay Started (Blocking Thread)...");
-            
-            // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
-            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut large_gen_lock = model_clone.generator.blocking_lock(); 
-                let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                    // [REVISED] Split Pug into line-based chunks (approx 1024 tokens ~ 3000 chars)
+                    // and save each to log/pug directory for indexing.
+                    let pug_chunks = chunk_text(&light_pug, 3072); 
+                    let pug_chunks_len = pug_chunks.len(); 
+                    println!("[Scheduler] Pug split into {} line-based chunks.", pug_chunks_len);
                 
-                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
-                }
-                Ok(())
-            }).await??;
-        }
-
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        // 3. 2B Inference (Immediate)
-        if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 2B Generating answer immediately...");
-            let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
-            let type_info = parsing::parse_json_from_llm(&res);
-            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        }
-        
-        model.unload_generator().await; 
-        if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
-    }
-
+                    // Save chunks and create index
+                    let mut chunk_index = Vec::new();
+                    for (i, chunk) in pug_chunks.iter().enumerate() {
+                        let chunk_filename = format!("chunk_{}.pug", i);
+                        let chunk_path = pug_logs_dir.join(&chunk_filename);
+                        if let Err(e) = std::fs::write(&chunk_path, chunk) {
+                            println!("[ERROR] Failed to save pug chunk {}: {}", i, e);
+                        }
+                        chunk_index.push(json!({
+                            "index": i,
+                            "file": chunk_filename,
+                            "size": chunk.len()
+                        }));
+                    }
+                    let _ = std::fs::write(pug_logs_dir.join("index.json"), json!(chunk_index).to_string());
+                
+                    // [LOCK-MINIMIZATION] Acquire clones and release locks immediately.
+                    // This allows stop_current_extraction to clear global references without deadlocking.
+                    
+                    let store = {
+                        let store_guard = store_mutex.lock().await;
+                        store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
+                    };
+                
+                    let model = {
+                        let mut model_lock = model_mutex.lock().await;
+                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        if model_lock.is_none() {
+                            let payload = json!({
+                               "task_id": task.id,
+                               "category": "Loading Model", "summary": "Loading Model for Analysis...", "spinner": "⠋"
+                            });
+                            let _ = app_handle.emit("extraction-progress", &payload);
+                            match LogisModel::new(None).await {
+                                Ok(m) => *model_lock = Some(m),
+                                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
+                            }
+                        }
+                        model_lock.as_ref().unwrap().clone()
+                    };
+                
+                    // Release the initial locks so tasks can re-acquire them as needed (e.g. stop command)
+                    // Both 'store' and 'model' are now local clones (Arc-based).
+                
+                    // ==================================================================================
+                    // [STRICT SWITCHING PATTERN]
+                    // 1. Ingest content + Question with 0.6B (Save Cache)
+                    // 2. Load 2B (Load Cache) -> Answer
+                    // Repeat for each distinct task to ensure perfect cache alignment.
+                    // ==================================================================================
+                
+                    use crate::openai_types::{
+                        ChatCompletionParameters, ChatCompletionRequestMessage, 
+                        ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
+                        ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart,
+                        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestAssistantMessage
+                    };
+                
+                    let mut page_type = String::new();
+                    let mut selector_info = json!({});
+                
+                    // --- TASK 1: CLASSIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
+                    {
+                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
+                        let type_prompt = parsing::page_type_prompt();
+                        
+                        // [FIX] Correct Order: Load Small FIRST, then Large to enable DUAL-ENGINE handover
+                        model.ensure_generator(crate::model::ModelSize::Small).await?;
+                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        
+                        // [INTERRUPTIBLE-LOAD] Race loading against cancellation
+                        tokio::select! {
+                            res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
+                            _ = async {
+                                loop {
+                                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                }
+                            } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+                        }
+                        
+                        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                
+                        // [LOOP-RELAY] Process each chunk individually
+                        for (i, chunk) in pug_chunks.iter().enumerate() {
+                            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                            
+                            let is_last = i == pug_chunks_len - 1;
+                            let prompt_text = if is_last {
+                                format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", chunk, type_prompt)
+                            } else {
+                                format!("{}\n\nACTION: INGEST", chunk)
+                            };
+                
+                            let params = ChatCompletionParameters {
+                                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                                            text: prompt_text
+                                        })
+                                    ]),
+                                    name: None,
+                                })],
+                                model: "qwen3vl".to_string(), max_tokens: Some(if is_last { 128 } else { 16 }), temperature: Some(0.1),
+                                ..Default::default()
+                            };
+                
+                            // 2. Stream from 0.6B to 2B
+                            {
+                                let model_clone = model.clone();
+                                let params_clone = params.clone();
+                                let token_clone = cancellation_token.clone();
+                                let task_id_clone = task.id.clone();
+                
+                                println!("[Scheduler] Relay Part {}/{} (Blocking Thread)...", i + 1, pug_chunks_len);
+                                
+                                tokio::task::spawn_blocking(move || -> Result<()> {
+                                    let mut large_gen_lock = model_clone.generator.blocking_lock(); 
+                                    let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                                    
+                                    if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                                        worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+                                    }
+                                    Ok(())
+                                }).await??;
+                            }
+                
+                            if is_last {
+                                // 3. 2B Inference (Immediate)
+                                if let Some(gen) = model.generator.lock().await.as_mut() {
+                                    println!("[Scheduler] 2B Generating final classification answer...");
+                                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(task.id.clone()))?;
+                                    let type_info = parsing::parse_json_from_llm(&res);
+                                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                                }
+                            }
+                        }
+                        
+                        model.unload_generator().await; 
+                        if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
+                    }
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
     wait_for_resources_settled(2500, 1500, Some(cancellation_token)).await?;
 
@@ -654,19 +631,6 @@ async fn process_task(
         println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         
-        let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(vec![
-                    ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
-                        text: format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, selector_prompt) 
-                    })
-                ]),
-                name: None,
-            })],
-            model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
-            ..Default::default()
-        };
-
         // [FIX] Using cloned model
         model.ensure_generator(crate::model::ModelSize::Small).await?;
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -684,33 +648,58 @@ async fn process_task(
         
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        {
-            let model_clone = model.clone();
-            let params_clone = params.clone();
-            let token_clone = cancellation_token.clone();
-            let task_id_clone = format!("{}_task2", task.id);
+        // [LOOP-RELAY] Process each chunk individually
+        for (i, chunk) in pug_chunks.iter().enumerate() {
+            if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+            
+            let is_last = i == pug_chunks_len - 1;
+            let prompt_text = if is_last {
+                format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", chunk, selector_prompt)
+            } else {
+                format!("{}\n\nACTION: INGEST", chunk)
+            };
 
-            println!("[Scheduler] Real-time Relay Started (Blocking Thread)...");
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                    content: ChatCompletionRequestUserMessageContent::Array(vec![
+                        ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText { 
+                            text: prompt_text
+                        })
+                    ]),
+                    name: None,
+                })],
+                model: "qwen3vl".to_string(), max_tokens: Some(if is_last { 512 } else { 16 }), temperature: Some(0.1),
+                ..Default::default()
+            };
 
-            // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
-            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut large_gen_lock = model_clone.generator.blocking_lock();
-                let mut small_gen_lock = model_clone.small_generator.blocking_lock();
-                
-                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+            {
+                let model_clone = model.clone();
+                let params_clone = params.clone();
+                let token_clone = cancellation_token.clone();
+                let task_id_clone = format!("{}_task2", task.id);
+
+                println!("[Scheduler] Relay Part {}/{} (Blocking Thread)...", i + 1, pug_chunks_len);
+
+                // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut large_gen_lock = model_clone.generator.blocking_lock();
+                    let mut small_gen_lock = model_clone.small_generator.blocking_lock();
+                    
+                    if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                        worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), Some(target))?;
+                    }
+                    Ok(())
+                }).await??;
+            }
+
+            if is_last {
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[Scheduler] 2B Identifying selectors immediately...");
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)))?;
+                    selector_info = parsing::parse_json_from_llm(&res);
+                    println!("[Scheduler] Selectors Identified: {}", selector_info);
                 }
-                Ok(())
-            }).await??;
-        }
-
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 2B Identifying selectors immediately...");
-            let res = gen.generate(params, Some(cancellation_token.clone()), Some(format!("{}_task2", task.id)))?;
-            selector_info = parsing::parse_json_from_llm(&res);
-            println!("[Scheduler] Selectors Identified: {}", selector_info);
+            }
         }
         model.unload_generator().await;
     }

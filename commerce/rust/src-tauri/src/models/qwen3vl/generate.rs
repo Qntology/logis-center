@@ -289,34 +289,44 @@ impl Qwen3VLGenerateModel {
                                 };
                                 println!("[DEBUG] Forward complete.");
                     
-                                // [STREAMING-RELAY] Incrementally inject ONLY the new chunk to 2B
-                                if let Some(ref mut target) = relay_target {
-                                    println!("[DEBUG] Slicing and Injecting KV...");
-                                    // 1. Get Shallow Copy of 0.6B's Full Cache
-                                    let (ks, vs) = self.get_current_kv();
-                                    
-                                    // 2. Slice only the NEW chunk (last chunk_size elements)
-                                    // This avoids re-sending the entire history over PCIe every time.
-                                    let mut new_ks = Vec::with_capacity(ks.len());
-                                    let mut new_vs = Vec::with_capacity(vs.len());
-                                    
-                                    for (k, v) in ks.iter().zip(vs.iter()) {
-                                         let seq_len = k.dim(candle_core::D::Minus2)?; // [B, H, S, D] -> Dim 2 is Seq
-                                         let start = seq_len.saturating_sub(chunk_size);
-                                         let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
-                                         let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
-                                         new_ks.push(k_new);
-                                         new_vs.push(v_new);
-                                    }
-                    
-                                    // 3. Inject Slice
-                                    target.inject_kv(&new_ks, &new_vs)?;
-                                    println!("[DEBUG] Injection complete.");
-                                    
-                                    // [CRITICAL] Do NOT clear 0.6B cache! 
-                                    // It needs history to compute the NEXT chunk correctly.
-                                }
-                    
+                                            // [STREAMING-RELAY] Incrementally inject ONLY the new chunk to 2B
+                                            if let Some(ref mut target) = relay_target {
+                                                println!("[DEBUG] Slicing, Quantizing and Injecting KV...");
+                                                // 1. Get Shallow Copy of 0.6B's Full Cache
+                                                let (ks, vs) = self.get_current_kv();
+                                                
+                                                // 2. Slice and Quantize the NEW chunk
+                                                let mut new_ks_i8 = Vec::with_capacity(ks.len());
+                                                let mut new_vs_i8 = Vec::with_capacity(vs.len());
+                                                let mut k_scales = Vec::with_capacity(ks.len());
+                                                let mut v_scales = Vec::with_capacity(vs.len());
+                                                
+                                                for (k, v) in ks.iter().zip(vs.iter()) {
+                                                     let seq_len = k.dim(candle_core::D::Minus2)?; 
+                                                     let start = seq_len.saturating_sub(chunk_size);
+                                                     let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                                                     let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                                                     
+                                                     // [QUANTIZE-ON-CPU] Reduce to 8-bit before PCIe transfer
+                                                     let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                                                     let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                                                     
+                                                     let k_s = k_max / 127.0;
+                                                     let v_s = v_max / 127.0;
+                                                     
+                                                     let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::I8)? } else { k_new.to_dtype(DType::I8)? };
+                                                     let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::I8)? } else { v_new.to_dtype(DType::I8)? };
+                                                     
+                                                     new_ks_i8.push(k_i8);
+                                                     new_vs_i8.push(v_i8);
+                                                     k_scales.push(k_s);
+                                                     v_scales.push(v_s);
+                                                }
+                                
+                                                // 3. Inject Quantized Slice
+                                                target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+                                                println!("[DEBUG] Quantized Injection complete.");
+                                            }                    
                                 current_pos += chunk_size;                    
                                 // [AGGRESSIVE-LOGGING] Log every chunk for real-time feedback
                                 let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
@@ -760,8 +770,17 @@ impl Qwen3VLGenerateModel {
 
     pub fn inject_kv(&mut self, ks: &[candle_core::Tensor], vs: &[candle_core::Tensor]) -> anyhow::Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.inject_live_kv(ks, vs)?,
-            ModelVariant::QuantizedText(m) => m.inject_live_kv(ks, vs)?,
+            ModelVariant::QuantizedVL(m) => m.inject_live_kv(ks, vs, 1.0, 1.0)?,
+            ModelVariant::QuantizedText(m) => m.inject_live_kv(ks, vs, 1.0, 1.0)?,
+            _ => return Err(anyhow::anyhow!("KV Injection not supported for this model variant")),
+        }
+        Ok(())
+    }
+
+    pub fn inject_kv_quantized(&mut self, ks: &[candle_core::Tensor], vs: &[candle_core::Tensor], k_scales: &[f32], v_scales: &[f32]) -> anyhow::Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.inject_live_kv_quantized(ks, vs, k_scales, v_scales)?,
+            ModelVariant::QuantizedText(m) => m.inject_live_kv_quantized(ks, vs, k_scales, v_scales)?,
             _ => return Err(anyhow::anyhow!("KV Injection not supported for this model variant")),
         }
         Ok(())
