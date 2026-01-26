@@ -180,7 +180,10 @@ impl Qwen3VLGenerateModel {
                 let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
                 
-                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(main_mmap), &mmproj_content, Some(mmproj_mmap), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
+                let main_mmap_arc = Arc::new(main_mmap);
+                let mmproj_mmap_arc = Arc::new(mmproj_mmap);
+
+                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(main_mmap_arc), &mmproj_content, Some(mmproj_mmap_arc), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedVL(model)
             } else {
                 // CASE 2: Pure Text Model (0.6B etc.)
@@ -197,7 +200,8 @@ impl Qwen3VLGenerateModel {
 
                 let mut cursor = std::io::Cursor::new(&mmap[..]);
                 let content = gguf_file::Content::read(&mut cursor)?;
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(mmap), &text_dev, text_device_id, dtype, kv_reserve)?;
+                let mmap_arc = Arc::new(mmap);
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(mmap_arc), &text_dev, text_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedText(model)
             }
         } else {
