@@ -1411,14 +1411,32 @@ impl QuantizedQwen3VLModel {
 
     pub fn forward(
         &mut self,
-        input_ids: &Tensor,
+        input_ids_in: &Tensor,
         pixel_values: Option<&Tensor>,
         image_grid_thw: Option<&Tensor>,
         _pixel_values_video: Option<&Tensor>,
         video_grid_thw: Option<&Tensor>,
-        cache_position: Option<&Tensor>,
+        cache_position_in: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        // [MEMORY-FIX] Ensure inputs are on the correct device for the model
+        let input_ids = if !input_ids_in.device().same_device(&self.text_device) {
+            input_ids_in.to_device(&self.text_device)?
+        } else {
+            input_ids_in.clone()
+        };
+        
+        let cache_position_owned = if let Some(cp) = cache_position_in {
+            if !cp.device().same_device(&self.text_device) {
+                Some(cp.to_device(&self.text_device)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let cache_position = cache_position_owned.as_ref().or(cache_position_in);
+
         // Flatten input_ids to Rank 1 for Embedding, then reshape back to Rank 3
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
@@ -1431,14 +1449,14 @@ impl QuantizedQwen3VLModel {
                  let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?;
                  
                  let image_embeds = Tensor::cat(&image_embeds, 0)?;
-                 let vision_mask = self.get_placeholder_mask(input_ids, true)?;
+                 let vision_mask = self.get_placeholder_mask(&input_ids, true)?;
                  inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
             }
         }
 
         // Position IDs logic (simplified for quantized model)
         // Note: Full logic requires image/video grid awareness for mrope.
-        let (position_ids, _) = self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+        let (position_ids, _) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
         let position_ids = if let Some(cache_pos) = cache_position {
              // Basic relative position for cache (needs improvement for mrope)
              let start = cache_pos.i(0)?.to_scalar::<u32>()?;
@@ -1604,10 +1622,28 @@ impl QuantizedQwen3TextModel {
 
     pub fn forward(
         &mut self,
-        input_ids: &Tensor,
-        cache_position: Option<&Tensor>,
+        input_ids_in: &Tensor,
+        cache_position_in: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        // [MEMORY-FIX] Ensure inputs are on the correct device for the model
+        let input_ids = if !input_ids_in.device().same_device(&self.text_device) {
+            input_ids_in.to_device(&self.text_device)?
+        } else {
+            input_ids_in.clone()
+        };
+        
+        let cache_position_owned = if let Some(cp) = cache_position_in {
+            if !cp.device().same_device(&self.text_device) {
+                Some(cp.to_device(&self.text_device)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let cache_position = cache_position_owned.as_ref().or(cache_position_in);
+
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
