@@ -21,6 +21,7 @@ use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use sysinfo::System;
 
 pub struct Spinner {
     pub frames: Vec<&'static str>,
@@ -176,6 +177,34 @@ impl LogisModel {
         }
     }
 
+    // --- [NEW] CPU System RAM Optimizer ---
+    async fn optimize_system_ram(&self) {
+        if !self.is_cpu_mode { return; }
+
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let free_ram = sys.total_memory().saturating_sub(sys.used_memory()); // Bytes in sysinfo 0.30
+
+        // Threshold: 4GB
+        if free_ram < 4 * 1024 * 1024 * 1024 {
+            println!("[RAM-WATCH] Low System Memory ({:.2} GB). Flushing Working Set...", free_ram as f64 / 1024.0 / 1024.0 / 1024.0);
+            
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
+                use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MIN_DISABLE;
+                use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MAX_DISABLE;
+                let process = GetCurrentProcess();
+                let _ = SetProcessWorkingSetSizeEx(process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            }
+            
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        } else {
+            println!("[RAM-WATCH] Sufficient Memory ({:.2} GB). Skipping flush.", free_ram as f64 / 1024.0 / 1024.0 / 1024.0);
+        }
+    }
+
     /// [CLEANUP] Adaptive resource management based on system stress
     pub async fn deep_purge_resources(&self) {
         let mut vram_free = 0;
@@ -211,29 +240,27 @@ impl LogisModel {
         }
     }
 
-    // --- [NEW] VRAM Settlement Monitor ---
+    // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
     async fn wait_for_vram_settle(&self, target_free_mb: u64, timeout_sec: u64, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        if self.is_cpu_mode { return Ok(()); } // No wait needed for CPU
+        if self.is_cpu_mode { return Ok(()); } 
 
-        println!("[VRAM-WATCH] Waiting for VRAM to settle (> {} MB)...", target_free_mb);
+        println!("[VRAM-WATCH] Monitoring VRAM (Target > {} MB)...", target_free_mb);
         let start = Instant::now();
         let target_bytes = target_free_mb * 1024 * 1024;
-        let mut stable_ticks = 0;
         let mut last_free = 0;
+        let mut stable_ticks = 0;
+        let mut increasing_ticks = 0;
+        let mut has_flushed_ram = false;
 
         loop {
-            // [CANCELLATION] Check instantly every loop tick
+            // 1. Cancellation Check
             if let Some(token) = &cancel_token {
                 if token.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(anyhow::anyhow!("Task cancelled during VRAM wait"));
                 }
             }
 
-            if start.elapsed().as_secs() > timeout_sec {
-                println!("[VRAM-WATCH] Timeout reached. Proceeding with caution.");
-                break;
-            }
-
+            // 2. Measure VRAM
             let mut current_free = 0;
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
@@ -243,16 +270,55 @@ impl LogisModel {
                 }
             }
 
-            // Check stability (change < 10MB)
-            let delta = if current_free > last_free { current_free - last_free } else { last_free - current_free };
-            if delta < 10 * 1024 * 1024 {
+            // [FAST-PATH] Immediate Success
+            if current_free >= target_bytes {
+                if stable_ticks >= 2 { // Confirm stability for 1 sec
+                    println!("[VRAM-WATCH] Success! VRAM Secured: {:.2} GB", current_free as f64 / 1e9);
+                    break;
+                }
                 stable_ticks += 1;
             } else {
                 stable_ticks = 0;
             }
 
-            if current_free >= target_bytes && stable_ticks >= 3 {
-                println!("[VRAM-WATCH] Stabilized at {:.2} GB free.", current_free as f64 / 1e9);
+            // [ADAPTIVE-LOGIC] Analyze Trend
+            if current_free > last_free + (50 * 1024 * 1024) { // Increased by > 50MB
+                increasing_ticks += 1;
+                if increasing_ticks > 0 {
+                    println!("[VRAM-WATCH] Reclaiming... ({:.2} GB -> {:.2} GB)", last_free as f64/1e9, current_free as f64/1e9);
+                }
+            } else {
+                increasing_ticks = 0;
+            }
+
+            // [ACTIVE-FLUSH] If stuck for > 1.5s, trigger OS RAM cleanup
+            if start.elapsed().as_secs_f32() > 1.5 && !has_flushed_ram && current_free < target_bytes {
+                println!("[VRAM-WATCH] Triggering OS Working Set Trim...");
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
+                    use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MIN_DISABLE;
+                    use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MAX_DISABLE;
+                    let process = GetCurrentProcess();
+                    let _ = SetProcessWorkingSetSizeEx(process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+                has_flushed_ram = true;
+                // Give it a moment to reflect
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+
+            // [TIMEOUT-HANDLER]
+            if start.elapsed().as_secs() > timeout_sec {
+                // If memory is still actively freeing up, extend timeout dynamically
+                if increasing_ticks > 0 {
+                    println!("[VRAM-WATCH] Timeout reached but memory is freeing up. Extending wait...");
+                    increasing_ticks = 0; // Reset to avoid infinite loop
+                    continue; 
+                }
+                
+                println!("[VRAM-WATCH] Timeout reached. Proceeding with {:.2} GB (Target: {:.2} GB)", current_free as f64/1e9, target_free_mb as f64/1024.0);
                 break;
             }
 
@@ -312,30 +378,36 @@ impl LogisModel {
             return Ok(()); // Already loaded
         }
 
-        println!("[RELAY] Starting Secure VRAM Transition to {:?}...", target_size);
+        println!("[RELAY] Starting Secure Transition to {:?} (Mode: {})...", target_size, if self.is_cpu_mode { "CPU" } else { "GPU" });
 
         // 2. [ISOLATION] Force Unload Everything first
         self.unload_generator().await;
         self.unload_embedding().await;
 
-        // [HARD-PURGE] Force CUDA to synchronize and actually release memory pointers
-        if self.device_config.device.is_cuda() {
-            println!("[RELAY] Forcing CUDA device synchronization...");
-            let _ = self.device_config.device.synchronize();
-            // Tiny sleep to give WDDM driver a breath
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        if self.is_cpu_mode {
+            // [CPU-OPTIMIZATION] Reclaim RAM after drop
+            self.optimize_system_ram().await;
+        } else {
+            // [GPU-OPTIMIZATION]
+            // [HARD-PURGE] Force CUDA to synchronize and actually release memory pointers
+            if self.device_config.device.is_cuda() {
+                println!("[RELAY] Forcing CUDA device synchronization...");
+                let _ = self.device_config.device.synchronize();
+                // Tiny sleep to give WDDM driver a breath
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
 
-        // 3. [SETTLE] Wait for GPU to release memory (Only for Large model loading)
-        if target_size == ModelSize::Large {
-            // Lower target to 2500MB to be more realistic for 4GB cards and avoid timeouts
-            self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
+            // 3. [SETTLE] Wait for GPU to release memory (Only for Large model loading)
+            if target_size == ModelSize::Large {
+                // Lower target to 2500MB to be more realistic for 4GB cards and avoid timeouts
+                self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
+            }
         }
 
         // [CANCELLATION] Check after waiting
         if let Some(token) = &cancel_token {
             if token.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(anyhow::anyhow!("Task cancelled after VRAM settle"));
+                return Err(anyhow::anyhow!("Task cancelled after resource settle"));
             }
         }
 
