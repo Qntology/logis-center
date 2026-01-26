@@ -470,10 +470,6 @@ async fn process_task(
         println!("[DEBUG] Saved light pug to: {:?}", log_path);
     }
     
-        // Determine optimal chunk sizes based on hardware
-        // [ADAPTIVE] Increased to 12000 chars to speed up ingestion and improve context coherence.
-        let device_config = utils::get_optimal_device_config();
-    
                     // [REVISED] Split Pug into line-based chunks (approx 1024 tokens ~ 3000 chars)
                     // and save each to log/pug directory for indexing.
                     let pug_chunks = chunk_text(&light_pug, 3072); 

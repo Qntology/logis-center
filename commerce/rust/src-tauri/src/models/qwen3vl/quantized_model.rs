@@ -399,7 +399,7 @@ impl QuantizedQwen3VLTextAttention {
         let k_small = (k_gpu_i8.to_dtype(DType::F32)? * k_scale as f64)?.to_dtype(target_dtype)?;
         let v_small = (v_gpu_i8.to_dtype(DType::F32)? * v_scale as f64)?.to_dtype(target_dtype)?;
 
-        let (_b, h, _s, d) = k_small.dims4()?;
+        let (_b, _h, _s, d) = k_small.dims4()?;
         
         // 1. Dimension Alignment (e.g. 64 -> 128 if needed)
         let mut k = if d < target_dim {

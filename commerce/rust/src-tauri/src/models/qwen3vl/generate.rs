@@ -311,14 +311,13 @@ impl Qwen3VLGenerateModel {
                                                      let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
                                                      let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
                                                      
-                                                     let k_s = k_max / 127.0;
-                                                     let v_s = v_max / 127.0;
-                                                     
-                                                     let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::I8)? } else { k_new.to_dtype(DType::I8)? };
-                                                     let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::I8)? } else { v_new.to_dtype(DType::I8)? };
-                                                     
-                                                     new_ks_i8.push(k_i8);
-                                                     new_vs_i8.push(v_i8);
+                                                                          let k_s = k_max / 127.0;
+                                                                          let v_s = v_max / 127.0;
+                                                                          
+                                                                          let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
+                                                                          let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
+                                                                          
+                                                                          new_ks_i8.push(k_i8);                                                     new_vs_i8.push(v_i8);
                                                      k_scales.push(k_s);
                                                      v_scales.push(v_s);
                                                 }
@@ -733,8 +732,8 @@ impl Qwen3VLGenerateModel {
     pub fn get_kv_len(&self) -> usize {
         match &self.qwen3_vl {
             ModelVariant::Standard(_) => 0,
-            ModelVariant::QuantizedVL(m) => m.get_kv_len(),
-            ModelVariant::QuantizedText(m) => m.get_kv_len(),
+            ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(),
+            ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(),
         }
     }
 
