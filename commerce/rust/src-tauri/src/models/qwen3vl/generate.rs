@@ -253,52 +253,71 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
         let total_tokens = full_input_ids_vec.len();
 
-        let seqlen_offset = self.get_kv_len();
-        let mut current_pos = seqlen_offset;
-        // [SMOOTH-RELAY] Reduce chunk size to 128 for more frequent updates and lower peak CPU/VRAM pressure
-        let prefill_chunk_size = 128; 
-
-        println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);
-
-        while current_pos < total_tokens {
-            let remaining = total_tokens - current_pos;
-            let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
-            
-            // [CRITICAL] Leave at least 1 token for the generate() call
-            if current_pos + chunk_size >= total_tokens { 
-                chunk_size = (total_tokens - current_pos).saturating_sub(1); 
-            }
-            if chunk_size == 0 { break; }
-
-            let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
-            let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
-
-            if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }
-            }
-
-            match &mut self.qwen3_vl {
-                ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
-                ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
-                ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
-            };
-            
-            // [STREAMING-RELAY] Immediately push to 2B and clear local RAM
-            if let Some(ref mut target) = relay_target {
-                let (ks, vs) = self.get_current_kv();
-                target.inject_kv(&ks, &vs)?;
-                self.clear_kv_cache(); // Empty the 0.6B cup into the 2B cup
-            }
-
-            current_pos += chunk_size;
-            
-            // [AGGRESSIVE-LOGGING] Log every chunk for real-time feedback
-            let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
-            println!("[RELAY] Pushed {}/{} tokens to 2B ({:.1}%)", current_pos, total_tokens, progress);
-        }
-
-        // Save progress if session_id is provided (for CPU sequential mode)
+                        let seqlen_offset = self.get_kv_len();
+                        let mut current_pos = seqlen_offset;
+                        // [SMOOTH-RELAY] Set chunk size to 256 for balanced CPU inference and PCIe transfer
+                        let prefill_chunk_size = 256; 
+                
+                        println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);        
+                while current_pos < total_tokens {
+                    let remaining = total_tokens - current_pos;
+                    let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+        
+                    // [CRITICAL] Leave at least 1 token for the generate() call
+                    if current_pos + chunk_size >= total_tokens { 
+                        chunk_size = (total_tokens - current_pos).saturating_sub(1); 
+                    }
+                    if chunk_size == 0 { break; }
+        
+                    let chunk_vec = &full_input_ids_vec[current_pos..current_pos + chunk_size];
+                    let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
+                                let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+                    
+                                if let Some(flag) = &cancel_flag {
+                                    if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }    
+                                }
+                    
+                                println!("[DEBUG] Forwarding chunk... (Size: {})", chunk_size);
+                                match &mut self.qwen3_vl {
+                                    ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                                    ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                                    ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
+                                };
+                                println!("[DEBUG] Forward complete.");
+                    
+                                // [STREAMING-RELAY] Incrementally inject ONLY the new chunk to 2B
+                                if let Some(ref mut target) = relay_target {
+                                    println!("[DEBUG] Slicing and Injecting KV...");
+                                    // 1. Get Shallow Copy of 0.6B's Full Cache
+                                    let (ks, vs) = self.get_current_kv();
+                                    
+                                    // 2. Slice only the NEW chunk (last chunk_size elements)
+                                    // This avoids re-sending the entire history over PCIe every time.
+                                    let mut new_ks = Vec::with_capacity(ks.len());
+                                    let mut new_vs = Vec::with_capacity(vs.len());
+                                    
+                                    for (k, v) in ks.iter().zip(vs.iter()) {
+                                         let seq_len = k.dim(candle_core::D::Minus2)?; // [B, H, S, D] -> Dim 2 is Seq
+                                         let start = seq_len.saturating_sub(chunk_size);
+                                         let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                                         let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                                         new_ks.push(k_new);
+                                         new_vs.push(v_new);
+                                    }
+                    
+                                    // 3. Inject Slice
+                                    target.inject_kv(&new_ks, &new_vs)?;
+                                    println!("[DEBUG] Injection complete.");
+                                    
+                                    // [CRITICAL] Do NOT clear 0.6B cache! 
+                                    // It needs history to compute the NEXT chunk correctly.
+                                }
+                    
+                                current_pos += chunk_size;                    
+                                // [AGGRESSIVE-LOGGING] Log every chunk for real-time feedback
+                                let progress = (current_pos as f32 / total_tokens as f32) * 100.0;
+                                println!("[RELAY] Pushed {}/{} tokens to 2B ({:.1}%)", current_pos, total_tokens, progress);
+                            }        // Save progress if session_id is provided (for CPU sequential mode)
         if let Some(sid) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if !path.exists() { let _ = fs::create_dir_all(&path); }

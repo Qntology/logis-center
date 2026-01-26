@@ -1021,7 +1021,15 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
+        let total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // [DEBUG-LOG] Track CPU inference progress
+            if layer_idx % 4 == 0 {
+                use std::io::Write;
+                print!("\r[CPU-INFER] Layer {}/{}...", layer_idx, total_layers);
+                std::io::stdout().flush().ok();
+            }
+
             // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             

@@ -596,7 +596,18 @@ async fn process_task(
         // [FIX] Using the cloned model reference (lock is free)
         model.ensure_generator(crate::model::ModelSize::Small).await?;
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
+        
+        // [INTERRUPTIBLE-LOAD] Race loading against cancellation
+        tokio::select! {
+            res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
+            _ = async {
+                loop {
+                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+        }
+        
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         // 2. Stream from 0.6B to 2B
@@ -649,7 +660,18 @@ async fn process_task(
         // [FIX] Using cloned model
         model.ensure_generator(crate::model::ModelSize::Small).await?;
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        model.ensure_generator(crate::model::ModelSize::Large).await?;
+        
+        // [INTERRUPTIBLE-LOAD] Race loading against cancellation
+        tokio::select! {
+            res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
+            _ = async {
+                loop {
+                    if cancellation_token.load(Ordering::Relaxed) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+        }
+        
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         {
@@ -978,7 +1000,15 @@ async fn process_task(
 
                 // [STRICT RELAY] 2. Infer with 2B
                 let refine_res_str = {
-                    model.ensure_generator(crate::model::ModelSize::Large).await?;
+                    tokio::select! {
+                        res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
+                        _ = async {
+                            loop {
+                                if cancellation_token.load(Ordering::Relaxed) { break; }
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+                    }
                     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                     let app_handle_clone = app_handle.clone();
                     
@@ -1198,7 +1228,17 @@ async fn process_task(
                                             model.ensure_generator(crate::model::ModelSize::Small).await?;
                                             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
-                                            model.ensure_generator(crate::model::ModelSize::Large).await?;
+                                            // [INTERRUPTIBLE-LOAD] Race loading against cancellation
+                                            tokio::select! {
+                                                res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
+                                                _ = async {
+                                                    loop {
+                                                        if cancellation_token.load(Ordering::Relaxed) { break; }
+                                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                                    }
+                                                } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+                                            }
+                                            
                                             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
                 
                                             {
@@ -1220,7 +1260,16 @@ async fn process_task(
                 
         // 3. Precise Infer with 2B (Immediate)
         let response = {
-            model.ensure_generator(crate::model::ModelSize::Large).await?;
+            tokio::select! {
+                res = model.ensure_generator(crate::model::ModelSize::Large) => res?,
+                _ = async {
+                    loop {
+                        if cancellation_token.load(Ordering::Relaxed) { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                } => return Err(anyhow::anyhow!("Task cancelled during model loading")),
+            }
+            
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             
             let res = if let Some(gen) = model.generator.lock().await.as_mut() {
