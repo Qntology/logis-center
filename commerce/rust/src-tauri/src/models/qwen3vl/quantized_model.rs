@@ -78,14 +78,16 @@ impl QLinear {
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
+            // [CRITICAL-FIX] Move the underlying quantized tensor to the new device
+            let qtensor = self.inner.qtensor();
+            let moved_qtensor = qtensor.to_device(device)?;
+            self.inner = QMatMul::from_qtensor(moved_qtensor)?;
+
             // Move bias
             if let Some(b) = &self.bias {
                 let moved_b: Tensor = b.to_device(device)?;
                 self.bias = Some(moved_b);
             }
-            // Move inner QMatMul (Note: Candle QMatMul handles device internally or needs recreation)
-            // For now, we update the tracked device. 
-            // In a strict sense, we might need to move the inner tensors of QMatMul.
             self.device = device.clone();
         }
         Ok(())

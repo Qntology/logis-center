@@ -1649,12 +1649,13 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
     let nvml = Nvml::init().ok();
     
     let target_vram_bytes = target_vram_mb * 1024 * 1024;
-    // Lower default RAM threshold slightly for better compatibility (1000MB)
     let adjusted_ram_target = if target_ram_mb > 1000 { 1000 } else { target_ram_mb };
     let target_ram_bytes = adjusted_ram_target * 1024 * 1024;
 
     let mut stable_count = 0;
     let mut last_report = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
 
     println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB, RAM > {}MB)...", target_vram_mb, adjusted_ram_target);
 
@@ -1665,39 +1666,52 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             }
         }
 
-        sys.refresh_memory(); // Only refresh memory for speed
+        // [EXIT-CONDITION] Total timeout to prevent infinite hang
+        if start_time.elapsed() > timeout {
+            println!("[RESOURCE-WATCH] ⚠️ Timeout reached. Proceeding with current resources.");
+            break;
+        }
+
+        sys.refresh_memory(); 
         let current_ram = sys.available_memory();
         let mut max_free_vram = 0;
-        let mut _best_gpu_id = 0;
-        let mut _gpu_count = 0;
+        let mut has_gpu = false;
 
-        let has_gpu = if let Some(ref nvml_inst) = nvml {
+        if let Some(ref nvml_inst) = nvml {
             if let Ok(count) = nvml_inst.device_count() {
-                _gpu_count = count;
                 for i in 0..count {
                     if let Ok(dev) = nvml_inst.device_by_index(i) {
                         if let Ok(mem) = dev.memory_info() {
                             if mem.free > max_free_vram {
                                 max_free_vram = mem.free;
-                                _best_gpu_id = i;
                             }
+                            has_gpu = true;
                         }
                     }
                 }
-                _gpu_count > 0
-            } else { false }
-        } else { false };
+            }
+        }
 
         let meets_vram = !has_gpu || max_free_vram >= target_vram_bytes;
         let meets_ram = current_ram >= target_ram_bytes;
         
         if meets_vram && meets_ram {
             stable_count += 1;
-            if stable_count >= 2 { // Reduced from 3 to 2 for faster transition
+            if stable_count >= 2 { 
                 break;
             }
         } else {
-            stable_count = 0;
+            // [RELAXATION] If memory usage is stable but below target after 15s, relax the target
+            if start_time.elapsed().as_secs() > 15 {
+                stable_count += 1;
+                if stable_count >= 5 { 
+                    println!("[RESOURCE-WATCH] Resources stable but below target. Proceeding anyway.");
+                    break; 
+                }
+            } else {
+                stable_count = 0;
+            }
+
             if last_report.elapsed().as_secs() >= 5 {
                 let vram_status = if has_gpu {
                     format!("VRAM: {:.2} / {:.2} GB", max_free_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0)

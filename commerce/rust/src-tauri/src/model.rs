@@ -152,16 +152,26 @@ pub struct LogisModel {
 }
 impl LogisModel {
     pub async fn unload_generator(&self) {
+        // 1. Clear Main Generator
         let mut gen = self.generator.lock().await;
         if let Some(mut m) = gen.take() {
-            // [FAST-RELEASE] Explicitly clear cache and drop internal tensors before None-ing
             m.clear_kv_cache();
-            drop(m); // Triggers immediate drop of internal handles
-            
-            let mut size = self.current_size.lock().await;
-            *size = None;
-            println!("[MODEL] Generator destroyed and VRAM reclaimed.");
+            drop(m);
+            println!("[MODEL] Main Generator destroyed.");
         }
+
+        // 2. [CRITICAL] Clear Small Generator (Hibernated model)
+        let mut small_gen = self.small_generator.lock().await;
+        if let Some(mut m) = small_gen.take() {
+            m.clear_kv_cache();
+            drop(m);
+            println!("[MODEL] Hibernated Small Generator destroyed.");
+        }
+        
+        let mut size = self.current_size.lock().await;
+        *size = None;
+
+        println!("[MODEL] All generators destroyed and VRAM reclaimed.");
     }
 
     pub async fn unload_embedding(&self) {
