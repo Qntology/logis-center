@@ -78,12 +78,22 @@ impl QLinear {
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
-            // [CRITICAL-FIX] Move the underlying quantized tensor to the new device
-            let qtensor = self.inner.qtensor();
-            let moved_qtensor = qtensor.to_device(device)?;
-            self.inner = QMatMul::from_qtensor(moved_qtensor)?;
+            // [CRITICAL-FIX] QMatMul is an enum (QTensor or Tensor). 
+            // QTensor doesn't have to_device in this version, so we dequantize to the target device.
+            self.inner = match &self.inner {
+                QMatMul::QTensor(q) => {
+                    let t = q.dequantize(device)?;
+                    QMatMul::Tensor(t)
+                },
+                QMatMul::Tensor(t) => {
+                    QMatMul::Tensor(t.to_device(device)?)
+                },
+                QMatMul::TensorF16(t) => {
+                    QMatMul::TensorF16(t.to_device(device)?)
+                }
+            };
 
-            // Move bias
+            // Move bias if exists
             if let Some(b) = &self.bias {
                 let moved_b: Tensor = b.to_device(device)?;
                 self.bias = Some(moved_b);
