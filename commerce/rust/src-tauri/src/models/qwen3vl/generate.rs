@@ -578,15 +578,20 @@ impl Qwen3VLGenerateModel {
         }
 
         // Finalize state for generation loop
-        seqlen_offset = current_pos;
-        let mut seq_len = total_tokens - seqlen_offset;
-        let last_tokens_vec = &full_input_ids_vec[seqlen_offset..];
-        let mut input_ids = Tensor::from_vec(last_tokens_vec.to_vec(), (1, seq_len), &self.text_device)?;
-        
-        if seqlen_offset < total_tokens {
-            println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
-        } else {
+        let mut seqlen_offset = current_pos;
+        let mut seq_len;
+        let mut input_ids;
+
+        if seqlen_offset >= total_tokens && total_tokens > 0 {
             println!("\n[KV-BRIDGE] Context fully matched in cache. Starting generation immediately.");
+            seqlen_offset = total_tokens - 1;
+            seq_len = 1;
+            input_ids = Tensor::from_vec(vec![full_input_ids_vec[seqlen_offset]], (1, 1), &self.text_device)?;
+        } else {
+            seq_len = total_tokens - seqlen_offset;
+            println!("\n[PREFILL] Ingested up to offset {}. Processing final {} tokens.", seqlen_offset, seq_len);
+            let last_tokens_vec = &full_input_ids_vec[seqlen_offset..];
+            input_ids = Tensor::from_vec(last_tokens_vec.to_vec(), (1, seq_len), &self.text_device)?;
         }
 
         // Save progress if requested
@@ -841,6 +846,10 @@ impl Qwen3VLGenerateModel {
             _ => return Err(anyhow::anyhow!("KV Injection not supported for this model variant")),
         }
         Ok(())
+    }
+
+    pub fn device(&self) -> &candle_core::Device {
+        &self.text_device
     }
 
     /// [SLEEP-MODE] Moves the underlying model to a new device (e.g. CPU for hibernation)

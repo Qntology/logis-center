@@ -36,7 +36,6 @@ pub fn set_current_thread_low_priority() {
             let thread_handle = GetCurrentThread();
             SetThreadPriority(thread_handle, THREAD_PRIORITY_BELOW_NORMAL);
         }
-        println!("[RESOURCES] Windows thread priority set to BELOW_NORMAL.");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -47,7 +46,6 @@ pub fn set_current_thread_low_priority() {
             // PRIO_PROCESS = 0
             libc::setpriority(libc::PRIO_PROCESS, 0, 10);
         }
-        println!("[RESOURCES] Unix thread priority set to 10 (Nice).");
     }
 }
 

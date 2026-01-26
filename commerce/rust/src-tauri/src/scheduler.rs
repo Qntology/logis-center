@@ -559,6 +559,7 @@ async fn process_task(
                         }
                         
                         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+                        println!("[작업내용]");
                 
                                 // [LOOP-RELAY] Process each chunk individually
                                 for (i, chunk) in pug_chunks.iter().enumerate() {
@@ -572,7 +573,9 @@ async fn process_task(
                                         let token_clone = cancellation_token.clone();
                                         let chunk_to_send = chunk_text.clone();
                         
-                                        println!("[Scheduler] Relay Part {}/{} ({} chars)...", i + 1, pug_chunks_len, chunk_to_send.len());
+                                        use std::io::Write;
+                                        print!(".");
+                                        std::io::stdout().flush().ok();
                                         
                                         tokio::task::spawn_blocking(move || -> Result<()> {
                                             crate::utils::resources::set_current_thread_low_priority();
@@ -618,7 +621,7 @@ async fn process_task(
     // --- TASK 2: SELECTOR IDENTIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
+        println!("[작업내용]");
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         
         // [FIX] Using cloned model
@@ -650,7 +653,9 @@ async fn process_task(
                 let token_clone = cancellation_token.clone();
                 let chunk_to_send = chunk_text.clone();
 
-                println!("[Scheduler] Relay Part {}/{} ({} chars)...", i + 1, pug_chunks_len, chunk_to_send.len());
+                use std::io::Write;
+                print!(".");
+                std::io::stdout().flush().ok();
 
             // [THREAD-ISOLATION] Move heavy CPU work to a dedicated OS thread
             let _ = tokio::task::spawn_blocking(move || -> Result<()> {
