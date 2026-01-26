@@ -1649,15 +1649,14 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
     let nvml = Nvml::init().ok();
     
     let target_vram_bytes = target_vram_mb * 1024 * 1024;
-    let adjusted_ram_target = if target_ram_mb > 1000 { 1000 } else { target_ram_mb };
-    let target_ram_bytes = adjusted_ram_target * 1024 * 1024;
+    let target_ram_bytes = target_ram_mb * 1024 * 1024;
 
-    let mut stable_count = 0;
+    let mut last_vram = 0;
+    let mut stable_ticks = 0;
     let mut last_report = std::time::Instant::now();
     let start_time = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(30);
 
-    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB, RAM > {}MB)...", target_vram_mb, adjusted_ram_target);
+    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB)...", target_vram_mb);
 
     loop {
         if let Some(token) = cancellation_token {
@@ -1666,15 +1665,9 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             }
         }
 
-        // [EXIT-CONDITION] Total timeout to prevent infinite hang
-        if start_time.elapsed() > timeout {
-            println!("[RESOURCE-WATCH] ⚠️ Timeout reached. Proceeding with current resources.");
-            break;
-        }
-
         sys.refresh_memory(); 
         let current_ram = sys.available_memory();
-        let mut max_free_vram = 0;
+        let mut current_vram = 0;
         let mut has_gpu = false;
 
         if let Some(ref nvml_inst) = nvml {
@@ -1682,9 +1675,7 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
                 for i in 0..count {
                     if let Ok(dev) = nvml_inst.device_by_index(i) {
                         if let Ok(mem) = dev.memory_info() {
-                            if mem.free > max_free_vram {
-                                max_free_vram = mem.free;
-                            }
+                            if mem.free > current_vram { current_vram = mem.free; }
                             has_gpu = true;
                         }
                     }
@@ -1692,39 +1683,41 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             }
         }
 
-        let meets_vram = !has_gpu || max_free_vram >= target_vram_bytes;
+        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
         let meets_ram = current_ram >= target_ram_bytes;
         
         if meets_vram && meets_ram {
-            stable_count += 1;
-            if stable_count >= 2 { 
-                break;
-            }
-        } else {
-            // [RELAXATION] If memory usage is stable but below target after 15s, relax the target
-            if start_time.elapsed().as_secs() > 15 {
-                stable_count += 1;
-                if stable_count >= 5 { 
-                    println!("[RESOURCE-WATCH] Resources stable but below target. Proceeding anyway.");
-                    break; 
-                }
-            } else {
-                stable_count = 0;
-            }
-
-            if last_report.elapsed().as_secs() >= 5 {
-                let vram_status = if has_gpu {
-                    format!("VRAM: {:.2} / {:.2} GB", max_free_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0)
-                } else {
-                    "VRAM: N/A".to_string()
-                };
-                let ram_status = format!("RAM: {:.2} / {:.2} GB", current_ram as f64 / 1e9, adjusted_ram_target as f64 / 1024.0);
-                
-                println!("[RESOURCE-DIAG] Still waiting... {} | {}", vram_status, ram_status);
-                last_report = std::time::Instant::now();
-            }
+            break; // Perfect state reached
         }
 
+        // [STABILITY-LOGIC] Even if below target, if memory release has STstopped changing,
+        // it means we've recovered all we can. Don't wait forever.
+        let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
+        if delta < 5_000_000 { // Change < 5MB
+            stable_ticks += 1;
+        } else {
+            stable_ticks = 0;
+        }
+
+        // If stable for 3 seconds AND we have at least 1.2GB free (enough for Large model weights)
+        if stable_ticks >= 6 && current_vram > 1_200_000_000 {
+            println!("[RESOURCE-WATCH] Memory stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
+            break;
+        }
+
+        if last_report.elapsed().as_secs() >= 5 {
+            println!("[RESOURCE-DIAG] Waiting... VRAM: {:.2} GB free (Target: {:.2} GB)", 
+                current_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0);
+            last_report = std::time::Instant::now();
+        }
+
+        // Absolute maximum wait 20s
+        if start_time.elapsed().as_secs() > 20 {
+            println!("[RESOURCE-WATCH] Max wait reached. Proceeding anyway.");
+            break;
+        }
+
+        last_vram = current_vram;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Ok(())
