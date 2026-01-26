@@ -1449,9 +1449,7 @@ async fn process_task(
                     text_to_embed = text_to_embed.chars().take(3000).collect();
                 }
                 
-                drop(store_guard);
-
-                            let vector = if let Some(v) = existing_vector {
+                let vector = if let Some(v) = existing_vector {
                                 Some(v)
                             } else {
                                 let text_clone = text_to_embed.clone();

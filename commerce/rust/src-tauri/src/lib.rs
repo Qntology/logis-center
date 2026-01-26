@@ -34,7 +34,7 @@ async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, S
     // 2. Aggressively try to clear model/store if the lock is available.
     // By using try_lock, we can clear the global state instantly if the worker is between tasks.
     if let Ok(mut model_guard) = state.model.try_lock() {
-        if let Some(m) = model_guard.as_ref() {
+        if let Some(_m) = model_guard.as_ref() {
             // [NON-BLOCKING] We don't await here to avoid UI hang, just drop the reference.
             // The worker holding its own clone will handle the internal stop.
             println!("[STOP] Clearing global model reference.");
