@@ -219,32 +219,59 @@ impl LogisModel {
         if needs_reload || gen_guard.is_none() {
             println!("[MODEL] Switching/Loading model to size: {:?}...", size);
             
-            // [SLEEP-MODE] Check if the requested model is already in RAM (Hibernating)
+            // [SLEEP-MODE] Optimized Switching: Check if we can keep both in VRAM
             let mut small_slot = self.small_generator.lock().await;
             
-            // Scenario A: Loading Large, but Small is currently on GPU
+            let mut can_keep_both = false;
+            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                    if let Ok(mem) = dev.memory_info() {
+                        // If we have > 2.5GB free, we can likely keep both 0.6B and 2B on GPU
+                        if mem.free > 2_500_000_000 {
+                            can_keep_both = true;
+                            println!("[MODEL-CONFIG] High VRAM detected ({:.2} GB free). Enabling Dual-Model GPU resonance.", mem.free as f64 / 1e9);
+                        }
+                    }
+                }
+            }
+
+            // Scenario A: Loading Large, Small is on GPU
             if size == ModelSize::Large && *current_size_guard == Some(ModelSize::Small) {
                 if let Some(mut m) = gen_guard.take() {
-                    println!("[SLEEP] Sending 0.6B to Hibernation (RAM)...");
-                    if let Err(e) = m.to_device(&Device::Cpu) {
-                        println!("[SLEEP-ERROR] Failed to hibernate 0.6B: {}. Dropping.", e);
-                    } else {
+                    if can_keep_both {
+                        println!("[RESONANCE] Keeping 0.6B on GPU while loading 2B.");
                         *small_slot = Some(m);
+                    } else {
+                        println!("[SLEEP] Sending 0.6B to Hibernation (RAM)...");
+                        if let Err(e) = m.to_device(&Device::Cpu) {
+                            println!("[SLEEP-ERROR] Failed to hibernate 0.6B: {}. Dropping.", e);
+                        } else {
+                            *small_slot = Some(m);
+                        }
                     }
                 }
             }
             
-            // Scenario B: Loading Small, and it is currently in Hibernation (RAM)
+            // Scenario B: Waking up Small
             if size == ModelSize::Small && small_slot.is_some() {
-                println!("[WAKE] Waking up 0.6B from RAM to GPU...");
                 let mut m = small_slot.take().unwrap();
+                let current_dev = m.device().clone();
                 let target_dev = self.device_config.device.clone();
-                if let Err(e) = m.to_device(&target_dev) {
-                    println!("[WAKE-ERROR] Failed to wake 0.6B: {}. Reloading from disk.", e);
-                } else {
+
+                if current_dev.same_device(&target_dev) {
+                    println!("[WAKE] 0.6B already on GPU. Instant switch!");
                     *gen_guard = Some(m);
                     *current_size_guard = Some(ModelSize::Small);
-                    return Ok(()); // Instant switch success!
+                    return Ok(());
+                } else {
+                    println!("[WAKE] Waking up 0.6B from RAM to GPU...");
+                    if let Err(e) = m.to_device(&target_dev) {
+                        println!("[WAKE-ERROR] Failed to wake 0.6B: {}. Reloading.", e);
+                    } else {
+                        *gen_guard = Some(m);
+                        *current_size_guard = Some(ModelSize::Small);
+                        return Ok(());
+                    }
                 }
             }
 

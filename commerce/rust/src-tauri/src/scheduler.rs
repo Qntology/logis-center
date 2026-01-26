@@ -605,11 +605,15 @@ async fn process_task(
                                         }
                                     }
                                 }                        
-                        model.unload_generator().await; 
-                        if page_type.is_empty() || page_type == "unknown" { return Ok(()); }
+                        // [OPTIMIZATION] Keep model loaded for the next sub-task
+                        if page_type.is_empty() || page_type == "unknown" { 
+                            model.unload_generator().await;
+                            return Ok(()); 
+                        }
                     }
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-    wait_for_resources_settled(2500, 1500, Some(cancellation_token)).await?;
+    // [REDUCED-WAIT] Only wait very briefly if we didn't unload
+    wait_for_resources_settled(1500, 1000, Some(cancellation_token)).await?;
 
     // --- TASK 2: SELECTOR IDENTIFICATION (DUAL-ENGINE REAL-TIME RELAY) ---
     {
@@ -678,7 +682,6 @@ async fn process_task(
                 }
             }
         }
-        model.unload_generator().await;
     }
 
     let mut final_page_info = json!({ "type": page_type });
