@@ -441,7 +441,6 @@ impl LogisModel {
             let gen_clone = self.generator.clone();
             let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
             let token_clone = cancel_token.clone();
-            let sid_clone = base_session.clone();
             
             // We use prefill_only via a manual chat construct or direct access if possible
             // Reusing chat_params_with_spinner for convenience but with empty generation
