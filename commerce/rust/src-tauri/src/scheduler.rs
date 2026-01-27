@@ -403,7 +403,12 @@ async fn process_task(
     
     let light_pug = {
         let clean_content = data_manager.load(&clean_html_path)?;
-        parsing::convert_to_clean_pug(&clean_content, PugMode::FullContent)
+        let pug = parsing::convert_to_clean_pug(&clean_content, PugMode::FullContent);
+        println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
+            pug.len(), 
+            if pug.len() > 100 { &pug[..100] } else { &pug }.replace("\n", " ")
+        );
+        pug
     }; 
     
     // [DEBUG-LOG] Save generated Pug
@@ -489,13 +494,12 @@ async fn process_task(
             ..Default::default()
         };
 
-        if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 2B Step A: Asking classification question...");
-            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
-            println!("[Scheduler] 2B Step A Raw Response: {}", res);
-            let type_info = parsing::parse_json_from_llm(&res); 
-            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                        
+                if let Some(gen) = model.generator.lock().await.as_mut() {
+                    println!("[Scheduler] 2B Step A: Asking classification question...");
+                    let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                    println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                    let type_info = parsing::parse_json_from_llm(&res);
+                    page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                        
                         if page_type.is_empty() {
                             println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
                             page_type = match task.r#type.as_str() {
@@ -563,6 +567,7 @@ async fn process_task(
         if let Some(gen) = model.generator.lock().await.as_mut() {
             println!("[Scheduler] 2B Step B: Asking selector question...");
             let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+            println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
             selector_info = parsing::parse_json_from_llm(&res);
             println!("[Scheduler] Selectors Identified.");
         }

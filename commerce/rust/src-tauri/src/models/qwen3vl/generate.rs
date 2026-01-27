@@ -221,7 +221,8 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<()> {
-        let token_ids = self.tokenizer.text_encode_vec(text.to_string(), true)?;
+        // [FIX] add_special_tokens를 false로 설정하여 중간에 종료 토큰이 삽입되는 것 방지
+        let token_ids = self.tokenizer.text_encode_vec(text.to_string(), false)?;
         let total_tokens = token_ids.len();
         let chunk_size = 512;
         let mut current_pos = 0;

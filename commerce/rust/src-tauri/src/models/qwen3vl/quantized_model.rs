@@ -1184,11 +1184,15 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
+        let incoming_count = k_list.len();
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            if i < k_list.len() {
-                let ks = k_scales.get(i).cloned().unwrap_or(1.0);
-                let vs = v_scales.get(i).cloned().unwrap_or(1.0);
-                layer.self_attn.inject_live_kv(&k_list[i], &v_list[i], ks, vs)?;
+            // [FIX] 만약 들어온 데이터가 1개뿐이라면 (0.6B Single-Layer 모드), 모든 레이어에 복제해서 주입
+            let src_idx = if incoming_count == 1 { 0 } else { i };
+            
+            if src_idx < incoming_count {
+                let ks = k_scales.get(src_idx).cloned().unwrap_or(1.0);
+                let vs = v_scales.get(src_idx).cloned().unwrap_or(1.0);
+                layer.self_attn.inject_live_kv(&k_list[src_idx], &v_list[src_idx], ks, vs)?;
             }
         }
         Ok(())
