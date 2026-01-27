@@ -462,11 +462,9 @@ async fn process_task(
                 let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
 
                 if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                    // [CRITICAL] Clear previous context to prevent unknown result
+                    // [STRICT PARITY] Clear BOTH contexts before relay to prevent 'unknown'
                     worker.clear_kv_cache();
                     target.clear_kv_cache();
-                    
-                    // Streaming Relay: 0.6B reads and pushes to 2B VRAM directly
                     worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
                 }
                 Ok(())
@@ -535,6 +533,7 @@ async fn process_task(
                 let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
 
                 if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                    // [STRICT PARITY] Clear BOTH
                     worker.clear_kv_cache();
                     target.clear_kv_cache();
                     worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
@@ -667,6 +666,7 @@ async fn process_task(
                     let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
 
                     if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                        // [STRICT PARITY] Clear BOTH
                         worker.clear_kv_cache();
                         target.clear_kv_cache();
                         worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;

@@ -42,20 +42,20 @@ impl RmsNorm {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        if !self.weight.device().same_device(device) {
-            self.weight = self.weight.to_device(device)?;
-        }
+        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        self.weight = self.weight.to_device(device)?.to_dtype(target_dtype)?;
         Ok(())
     }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let dtype = x.dtype();
+        let _dtype = x.dtype();
+        let target_dtype = self.weight.dtype();
         let x = x.to_dtype(DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let hidden_states = hidden_states.to_dtype(dtype)?;
+        let hidden_states = hidden_states.to_dtype(target_dtype)?;
         hidden_states.broadcast_mul(&self.weight)
     }
 }
@@ -78,25 +78,23 @@ impl QLinear {
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
-            // [CRITICAL-FIX] QMatMul is an enum (QTensor or Tensor). 
-            // QTensor doesn't have to_device in this version, so we dequantize to the target device.
+            let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+            
             self.inner = match &self.inner {
                 QMatMul::QTensor(q) => {
-                    let t = q.dequantize(device)?;
+                    let t = q.dequantize(device)?.to_dtype(target_dtype)?;
                     QMatMul::Tensor(t)
                 },
                 QMatMul::Tensor(t) => {
-                    QMatMul::Tensor(t.to_device(device)?)
+                    QMatMul::Tensor(t.to_device(device)?.to_dtype(target_dtype)?)
                 },
                 QMatMul::TensorF16(t) => {
-                    QMatMul::TensorF16(t.to_device(device)?)
+                    QMatMul::TensorF16(t.to_device(device)?.to_dtype(target_dtype)?)
                 }
             };
 
-            // Move bias if exists
             if let Some(b) = &self.bias {
-                let moved_b: Tensor = b.to_device(device)?;
-                self.bias = Some(moved_b);
+                self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
             }
             self.device = device.clone();
         }
@@ -104,15 +102,13 @@ impl QLinear {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // [OPTIMIZATION] Seamless Device Transfer
-        // If input tensor is on a different device than this layer, move it.
-        // This is the core of Layer-wise Offloading.
-        let xs = if !xs.device().same_device(&self.device) {
-            xs.to_device(&self.device)?
-        } else {
-            xs.clone()
-        };
-
+        let dev = &self.device;
+        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
+        
+        // Ensure input matches layer device and target internal dtype
+        let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        
+        // QMatMul typically performs better/required F32 for the math part in some kernels
         let xs_f32 = xs.to_dtype(DType::F32)?;
         let (b, s, h) = xs_f32.dims3()?;
         let xs_f32_flat = xs_f32.reshape((b * s, h))?;
@@ -120,11 +116,12 @@ impl QLinear {
         let out = self.inner.forward(&xs_f32_flat)?;
         let out = out.reshape((b, s, ()))?;
         
-        let target_dtype = self.bias.as_ref().map(|b: &Tensor| b.dtype()).unwrap_or(xs.dtype());
+        // Cast output to the expected model dtype (BF16 for GPU)
         let out = out.to_dtype(target_dtype)?;
 
         if let Some(bias) = &self.bias {
-            Ok(out.broadcast_add(bias)?)
+            let b = if bias.dtype() != target_dtype { bias.to_dtype(target_dtype)? } else { bias.clone() };
+            Ok(out.broadcast_add(&b)?)
         } else {
             Ok(out)
         }
@@ -463,18 +460,83 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
+    fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
+        let original_shape = t.shape().dims().to_vec();
+        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
+        
+        let last_dim = original_shape[original_shape.len() - 1];
+        let total_elements = t_data.len();
+        let num_vectors = total_elements / last_dim;
+        
+        // 1-bit requires packing 8 elements into 1 byte
+        let packed_size = (total_elements + 7) / 8;
+        let mut packed = vec![0u8; packed_size];
+        let mut scales = vec![0.0f32; num_vectors];
+        
+        for v_idx in 0..num_vectors {
+            let t_start = v_idx * last_dim;
+            let t_vector = &t_data[t_start..t_start + last_dim];
+            
+            // Calculate scale: mean of absolute values
+            let mut abs_sum = 0.0f32;
+            for &val in t_vector { abs_sum += val.abs(); }
+            let s = abs_sum / (last_dim as f32);
+            scales[v_idx] = s;
+            
+            // Pack bits
+            for (i, &val) in t_vector.iter().enumerate() {
+                if val >= 0.0 {
+                    let bit_pos = (t_start + i) % 8;
+                    let byte_pos = (t_start + i) / 8;
+                    packed[byte_pos] |= 1 << bit_pos;
+                }
+            }
+        }
+            
+        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
+        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
+        
+        Ok((packed_tensor, scales_tensor, original_shape))
+    }
+
+    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+        let device = packed.device();
+        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        
+        let last_dim = original_shape[original_shape.len() - 1];
+        let total_elements: usize = original_shape.iter().product();
+        let mut decoded = vec![0.0f32; total_elements];
+        
+        for v_idx in 0..(total_elements / last_dim) {
+            let s = scales_vec[v_idx];
+            let t_start = v_idx * last_dim;
+            
+            for i in 0..last_dim {
+                let global_idx = t_start + i;
+                let byte_pos = global_idx / 8;
+                let bit_pos = global_idx % 8;
+                let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
+                decoded[global_idx] = if is_set { s } else { -s };
+            }
+        }
+        
+        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
+        Ok(t.to_device(device)?)
+    }
+
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [BALANCED-STABILITY] Use 8-bit (i8) for KV storage. 
-            // Better precision than 4-bit, faster I/O than F16, and proven stable on CPU.
+            // [EXTREME-BAKING] Use 1-bit for maximum VRAM savings
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
             
-            let (k_packed, k_scales, k_shape) = self.compress_to_8bit(&k_cpu)?;
-            let (v_packed, v_scales, _) = self.compress_to_8bit(&v_cpu)?;
+            let (k_packed, k_scales, k_shape) = self.compress_to_1bit(&k_cpu)?;
+            let (v_packed, v_scales, _) = self.compress_to_1bit(&v_cpu)?;
             
             map.insert("k_packed".to_string(), k_packed);
             map.insert("v_packed".to_string(), v_packed);
@@ -482,7 +544,7 @@ impl QuantizedQwen3VLTextAttention {
             map.insert("v_scales".to_string(), v_scales);
             map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
             map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-            map.insert("bits".to_string(), Tensor::from_vec(vec![8u32], (1,), &Device::Cpu)?);
+            map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
         } else {
             return Ok(());
         }
@@ -524,11 +586,14 @@ impl QuantizedQwen3VLTextAttention {
                 };
                 let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
 
-                if bits == 8 {
+                if bits == 1 {
+                    let t = self.decompress_from_1bit(&packed, &scales, &shape)?;
+                    Ok(t.to_dtype(target_dtype)?)
+                } else if bits == 8 {
                     let t = self.decompress_from_8bit(&packed, &scales, &shape)?;
                     Ok(t.to_dtype(target_dtype)?)
                 } else {
-                    Err(anyhow!("Unsupported bit depth: {}. Expected 8.", bits))
+                    Err(anyhow!("Unsupported bit depth: {}", bits))
                 }
             };
             (dequantize_tensor("k")?, dequantize_tensor("v")?)
@@ -653,8 +718,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         
         // 2. Ensure inputs are on this device and dtype
         //    (Clone via Cow logic or explicit clone if needed, here we use explicit clones/conversions for safety)
-        let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
-        if xs.dtype() != target_dtype { xs = xs.to_dtype(target_dtype)?; }
+        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
 
         let mut cos = if !cos.device().same_device(dev) { cos.to_device(dev)? } else { cos.clone() };
         if cos.dtype() != target_dtype { cos = cos.to_dtype(target_dtype)?; }
@@ -1061,26 +1126,97 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
+    fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
+        let original_shape = t.shape().dims().to_vec();
+        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
+        
+        let last_dim = original_shape[original_shape.len() - 1];
+        let total_elements = t_data.len();
+        let num_vectors = total_elements / last_dim;
+        
+        let packed_size = (total_elements + 7) / 8;
+        let mut packed = vec![0u8; packed_size];
+        let mut scales = vec![0.0f32; num_vectors];
+        
+        for v_idx in 0..num_vectors {
+            let t_start = v_idx * last_dim;
+            let t_vector = &t_data[t_start..t_start + last_dim];
+            
+            let mut abs_sum = 0.0f32;
+            for &val in t_vector { abs_sum += val.abs(); }
+            let s = abs_sum / (last_dim as f32);
+            scales[v_idx] = s;
+            
+            for (i, &val) in t_vector.iter().enumerate() {
+                if val >= 0.0 {
+                    let bit_pos = (t_start + i) % 8;
+                    let byte_pos = (t_start + i) / 8;
+                    packed[byte_pos] |= 1 << bit_pos;
+                }
+            }
+        }
+            
+        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
+        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
+        
+        Ok((packed_tensor, scales_tensor, original_shape))
+    }
+
+    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+        let device = packed.device();
+        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        
+        let last_dim = original_shape[original_shape.len() - 1];
+        let total_elements: usize = original_shape.iter().product();
+        let mut decoded = vec![0.0f32; total_elements];
+        
+        for v_idx in 0..(total_elements / last_dim) {
+            let s = scales_vec[v_idx];
+            let t_start = v_idx * last_dim;
+            
+            for i in 0..last_dim {
+                let global_idx = t_start + i;
+                let byte_pos = global_idx / 8;
+                let bit_pos = global_idx % 8;
+                let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
+                decoded[global_idx] = if is_set { s } else { -s };
+            }
+        }
+        
+        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
+        Ok(t.to_device(device)?)
+    }
+
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
 
         if self.single_layer_mode {
-            // [EXTREME-BAKING] Replicate first layer KV to all 28 layers for the 2B model
+            // [EXTREME-BAKING] Replicate first layer KV to all 28 layers using 1-bit
             if let Some(layer0) = self.layers.get_mut(0) {
-                // Pre-compress once to save CPU
-                let (k_packed, k_scales, k_shape, v_packed, v_scales) = if let Some((k, v)) = &layer0.self_attn.kv_cache {
+                // Use explicit types to help the compiler
+                let mut kp_opt: Option<Tensor> = None;
+                let mut ks_opt: Option<Tensor> = None;
+                let mut ksh_opt: Option<Vec<usize>> = None;
+                let mut vp_opt: Option<Tensor> = None;
+                let mut vs_opt: Option<Tensor> = None;
+
+                if let Some((k, v)) = &layer0.self_attn.kv_cache {
                     let k_cpu = k.to_device(&Device::Cpu)?;
                     let v_cpu = v.to_device(&Device::Cpu)?;
-                    let (kp, ks, ksh) = layer0.self_attn.compress_to_8bit(&k_cpu)?;
-                    let (vp, vs, _) = layer0.self_attn.compress_to_8bit(&v_cpu)?;
-                    (Some(kp), Some(ks), Some(ksh), Some(vp), Some(vs))
-                } else {
-                    (None, None, None, None, None)
-                };
+                    let (kp, ks, ksh) = self.compress_to_1bit(&k_cpu)?;
+                    let (vp, vs, _) = self.compress_to_1bit(&v_cpu)?;
+                    kp_opt = Some(kp);
+                    ks_opt = Some(ks);
+                    ksh_opt = Some(ksh);
+                    vp_opt = Some(vp);
+                    vs_opt = Some(vs);
+                }
 
-                if let (Some(kp), Some(ks), Some(ksh), Some(vp), Some(vs)) = (k_packed, k_scales, k_shape, v_packed, v_scales) {
+                if let (Some(kp), Some(ks), Some(ksh), Some(vp), Some(vs)) = (kp_opt, ks_opt, ksh_opt, vp_opt, vs_opt) {
                     for i in 0..28 {
                         let file = path.join(format!("layer_{}_kv.safetensors", i));
                         let mut map = HashMap::new();
@@ -1090,7 +1226,7 @@ impl QuantizedQwen3VLTextModel {
                         map.insert("v_scales".to_string(), vs.clone());
                         map.insert("k_shape".to_string(), Tensor::from_vec(ksh.iter().map(|&x| x as u32).collect(), (ksh.len(),), &Device::Cpu)?);
                         map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-                        map.insert("bits".to_string(), Tensor::from_vec(vec![8u32], (1,), &Device::Cpu)?);
+                        map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
                         candle_core::safetensors::save(&map, &file)?;
                     }
                 }
