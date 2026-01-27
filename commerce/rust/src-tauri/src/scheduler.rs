@@ -259,17 +259,17 @@ pub async fn start_background_worker(
                             
                             // [NEW] Automatic OOM Recovery Logic
                             if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                println!("[Scheduler] OOM Detected! Force unloading model to protect system VRAM.");
-                                let mut model_lock = model.lock().await;
-                                if let Some(m) = model_lock.as_ref() {
-                                    m.unload_generator().await;
-                                }
-                                *model_lock = None; // Explicitly drop model from GPU
+                                println!("[Scheduler] OOM Detected! But we will NOT kill the model. Fallback logic should handle it.");
+                                // *model_lock = None; // [FIX] 모델을 죽이지 않고 유지함
                                 
                                 let _ = app_handle.emit("extraction-progress", json!({ 
                                     "task_id": task.id,
-                                    "category": "Error", "summary": "GPU Memory Full (OOM). Task stopped.", "spinner": "❌"
+                                    "category": "Warning", "summary": "Memory pressure detected. Switching to Safe Mode...", "spinner": "⚠️"
                                 }));
+                                
+                                // 잠시 대기 후 재시도 기회 제공
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                continue; 
                             }
 
                             let store_guard = store.lock().await;

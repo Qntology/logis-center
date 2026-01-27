@@ -1200,15 +1200,25 @@ impl QuantizedQwen3VLTextModel {
             let target_count = self.layers.len(); // [FIX] 누락된 변수 정의 추가
             
             // 미리 모든 입력 레이어를 GPU/BF16으로 변환하여 OOM 방지 및 속도 향상
-            let target_device = self.layers[0].device().clone();
-            let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+            // [OOM-PROOF] 할당 실패 시 CPU로 자동 전환 (Fallback)
+            let mut target_device = self.layers[0].device().clone();
+            let mut target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
             
             let mut prepared_ks = Vec::with_capacity(incoming_count);
             let mut prepared_vs = Vec::with_capacity(incoming_count);
             
             for j in 0..incoming_count {
-                let k_gpu = k_list[j].to_device(&target_device)?;
-                let v_gpu = v_list[j].to_device(&target_device)?;
+                // K 텐서 할당 시도
+                let k_res = k_list[j].to_device(&target_device);
+                if k_res.is_err() && target_device.is_cuda() {
+                    println!("[OOM-GUARD] GPU allocation failed. Falling back to CPU for safety.");
+                    target_device = Device::Cpu;
+                    target_dtype = DType::F32;
+                }
+                // 재시도 (CPU일 수도 있고 GPU일 수도 있음)
+                let k_gpu = if target_device.is_cpu() { k_list[j].to_device(&Device::Cpu)? } else { k_list[j].to_device(&target_device)? };
+                let v_gpu = if target_device.is_cpu() { v_list[j].to_device(&Device::Cpu)? } else { v_list[j].to_device(&target_device)? };
+
                 prepared_ks.push((k_gpu.to_dtype(DType::F32)? * k_scales[j] as f64)?.to_dtype(target_dtype)?);
                 prepared_vs.push((v_gpu.to_dtype(DType::F32)? * v_scales[j] as f64)?.to_dtype(target_dtype)?);
             }
