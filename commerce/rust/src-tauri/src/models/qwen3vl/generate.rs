@@ -189,7 +189,7 @@ impl Qwen3VLGenerateModel {
                 let is_06b = path.contains("0.6B");
                 let baking_only = is_06b;
                 // [FIX] 레이어 풀(Full) 가동 요청 반영
-                let single_layer_mode = false; 
+                let single_layer_mode = true; 
                 
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
