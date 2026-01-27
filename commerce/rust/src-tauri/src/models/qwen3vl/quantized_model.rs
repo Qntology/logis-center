@@ -1381,7 +1381,7 @@ impl QuantizedQwen3VLTextModel {
 
         // 임계값 설정
         let danger_zone = 300_000_000; // 300MB 이하: 위험 (내리기)
-        let safe_zone = 1_500_000_000; // 1.5GB 이상: 여유 (올리기)
+        let safe_zone = 800_000_000;   // 800MB 이상: 여유 (올리기)
 
         if free_vram > 0 && free_vram < danger_zone {
             // [OFFLOAD] GPU -> CPU (뒤쪽 레이어부터)
