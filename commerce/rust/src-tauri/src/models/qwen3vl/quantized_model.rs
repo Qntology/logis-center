@@ -436,6 +436,21 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_cache = None;
     }
 
+    pub fn drop_kv_storage(&mut self) -> Result<()> {
+        // [MEMORY-RELEASE] 텐서의 데이터를 비워서 메모리 포지션을 해제함
+        // 텐서 자체를 None으로 만들면 이후 연산 구조가 깨질 수 있으므로, 
+        // 데이터가 없는 빈 텐서로 교체하여 OS가 실제 메모리를 즉시 회수하게 유도
+        if let Some((k, v)) = self.kv_cache.take() {
+            let dev = k.device();
+            let dtype = k.dtype();
+            // 빈 텐서로 교체 (Storage 해제)
+            drop(k);
+            drop(v);
+            // self.kv_cache = Some((Tensor::zeros((1,1,0,1), dtype, dev)?, Tensor::zeros((1,1,0,1), dtype, dev)?));
+        }
+        Ok(())
+    }
+
     pub fn get_kv_len(&self) -> usize {
         match &self.kv_cache {
             None => 0,
@@ -510,20 +525,26 @@ impl QuantizedQwen3VLTextAttention {
         let device = packed.device();
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
         let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        
         let last_dim = original_shape[original_shape.len() - 1];
         let total_elements: usize = original_shape.iter().product();
         let mut decoded = vec![0.0f32; total_elements];
-        for v_idx in 0..(total_elements / last_dim) {
+        
+        // [OPTIMIZATION] Rayon을 사용하여 병렬 압축 해제 (CPU 가속)
+        use rayon::prelude::*;
+        decoded.par_chunks_mut(last_dim).enumerate().for_each(|(v_idx, vector_out)| {
             let s = scales_vec[v_idx];
             let t_start = v_idx * last_dim;
+            
             for i in 0..last_dim {
                 let global_idx = t_start + i;
                 let byte_pos = global_idx / 8;
                 let bit_pos = global_idx % 8;
                 let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
-                decoded[global_idx] = if is_set { s } else { -s };
+                vector_out[i] = if is_set { s } else { -s };
             }
-        }
+        });
+        
         let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
         Ok(t.to_device(device)?)
     }
@@ -1139,6 +1160,13 @@ impl QuantizedQwen3VLTextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+
+    pub fn drop_kv_storage(&mut self) -> Result<()> {
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.drop_kv_storage()?;
+        }
+        Ok(())
     }
 
     pub fn get_kv_len(&self) -> usize {

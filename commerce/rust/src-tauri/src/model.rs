@@ -207,37 +207,29 @@ impl LogisModel {
 
     /// [CLEANUP] Adaptive resource management based on system stress
     pub async fn deep_purge_resources(&self) {
-        let mut vram_free = 0;
-        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-            if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                if let Ok(mem) = dev.memory_info() { vram_free = mem.free; }
-            }
+        if !self.is_cpu_mode {
+            let dev = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev.is_cuda() { let _ = dev.synchronize(); }
+            }).await;
         }
 
-        // [ADAPTIVE] Only purge if really needed, as it can be slow
-        if vram_free < 1_200_000_000 {
-            println!("[MEMORY] High Stress ({:.2} GB Free). Purging ALL caches...", vram_free as f64 / 1e9);
-            
-            // 1. Clear Active Slot
-            if let Some(gen) = self.generator.lock().await.as_mut() {
-                gen.clear_kv_cache();
-            }
-            
-            // 2. [CRITICAL-FIX] Clear Hibernation Slots (RAM leaks often happen here)
-            if let Some(s_hib) = self.small_hibernation.lock().await.as_mut() {
-                s_hib.clear_kv_cache();
-            }
-            if let Some(l_hib) = self.large_hibernation.lock().await.as_mut() {
-                l_hib.clear_kv_cache();
-            }
-
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::*;
-                let current_process = GetCurrentProcess();
-                windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, 0);
-            }
+        // 1. Clear Active Slots
+        if let Ok(mut gen) = self.generator.try_lock() { *gen = None; }
+        if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
+        if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
+        
+        // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::*;
+            use windows_sys::Win32::System::Memory::*;
+            let current_process = GetCurrentProcess();
+            // 강제로 Working Set을 비워 OS가 VRAM/RAM을 즉시 수거하게 함
+            let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
+        
+        println!("[MEMORY] Deep Purge Complete. VRAM/RAM released to OS.");
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
@@ -372,26 +364,17 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // 1. [SYNC] 언로드 전 현재 작업을 안전하게 마무리
-        if !self.is_cpu_mode {
-            let dev_clone = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if dev_clone.is_cuda() { let _ = dev_clone.synchronize(); }
-            }).await;
-        }
-
-        // 2. [CLEANUP] 기존 모델과 메모리를 완전히 비움
-        println!("[RELAY] Purging current resources to prepare for {:?}...", target_size);
-        self.unload_generator().await;
-        self.unload_embedding().await;
+        // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
+        println!("[RELAY] Performing Deep Purge before loading {:?}...", target_size);
+        self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
-            // VRAM이 실제로 비워질 때까지 대기 (직접적인 CUDA 호출 자제)
+            // VRAM이 실제로 비워질 때까지 대기
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 3. [LOAD] 새 모델 로드
+        // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
         self.ensure_generator(target_size).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드

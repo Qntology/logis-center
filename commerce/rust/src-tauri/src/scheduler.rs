@@ -462,7 +462,10 @@ async fn process_task(
 
         // 1. [0.6B] Bake PUG & Save to Disk
         {
-            println!("[Scheduler] Phase 1: Baking PUG with 0.6B...");
+            println!("[Scheduler] Phase 1: Baking PUG with 0.6B (Streaming Mode)...");
+            let snapshot_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+            if !snapshot_path.exists() { let _ = std::fs::create_dir_all(&snapshot_path); }
+
             // [DEBUG] PUG 저장
             let _ = data_manager.offload(&pug_content, "step_a_pug");
             let _ = data_manager.offload(&task_question, "step_a_task");
@@ -473,6 +476,7 @@ async fn process_task(
             let model_clone = model.clone();
             let pug_clone = pug_content.clone();
             let token_clone = cancellation_token.clone();
+            let path_clone = snapshot_path.clone();
 
             // [FIX] 한글 등 멀티바이트 문자가 깨지지 않도록 chars() 단위로 안전하게 자름
             let snippet: String = pug_clone.chars().take(50).collect();
@@ -483,13 +487,13 @@ async fn process_task(
                 let mut gen_guard = model_clone.generator.blocking_lock();
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
-                    // [DISK-BRIDGE] Relay target을 None으로 설정하여 메모리 직접 인계 중단
-                    worker.prefill_text_only(&pug_clone, Some(token_clone), None)?;
+                    // [STREAMING] path_clone을 전달하여 주기적으로 저장 수행
+                    worker.prefill_text_only(&pug_clone, Some(token_clone), None, Some(&path_clone))?;
                 }
                 Ok(())
             }).await??;
 
-            // [CRITICAL] 디스크에 safetensors 파일 생성
+            // 최종 스냅샷 저장 (이미 주기적으로 저장되었으므로 마무리 확인용)
             model.save_kv_snapshot(&snapshot_id).await?;
         }
 
@@ -550,6 +554,9 @@ async fn process_task(
 
         // 1. [0.6B] Bake PUG & Save
         {
+            let snapshot_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+            if !snapshot_path.exists() { let _ = std::fs::create_dir_all(&snapshot_path); }
+
             // [DEBUG] PUG 저장
             let _ = data_manager.offload(&pug_content, "step_b_pug");
             let _ = data_manager.offload(&task_question, "step_b_task");
@@ -558,13 +565,14 @@ async fn process_task(
             let model_clone = model.clone();
             let pug_clone = pug_content.clone();
             let token_clone = cancellation_token.clone();
+            let path_clone = snapshot_path.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();
                 let mut gen_guard = model_clone.generator.blocking_lock();
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
-                    worker.prefill_text_only(&pug_clone, Some(token_clone), None)?;
+                    worker.prefill_text_only(&pug_clone, Some(token_clone), None, Some(&path_clone))?;
                 }
                 Ok(())
             }).await??;
@@ -691,6 +699,9 @@ async fn process_task(
 
             // 1. [0.6B] Bake Detail PUG & Save
             {
+                let snapshot_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+                if !snapshot_path.exists() { let _ = std::fs::create_dir_all(&snapshot_path); }
+
                 // [DEBUG] PUG 저장
                 let _ = data_manager.offload(&pug_content, "step_c_pug");
                 let _ = data_manager.offload(&task_question, "step_c_task");
@@ -699,13 +710,14 @@ async fn process_task(
                 let model_clone = model.clone();
                 let pug_clone = pug_content.clone();
                 let token_clone = cancellation_token.clone();
+                let path_clone = snapshot_path.clone();
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     crate::utils::resources::set_current_thread_low_priority();
                     let mut gen_guard = model_clone.generator.blocking_lock();
                     if let Some(worker) = gen_guard.as_mut() {
                         worker.clear_kv_cache();
-                        worker.prefill_text_only(&pug_clone, Some(token_clone), None)?;
+                        worker.prefill_text_only(&pug_clone, Some(token_clone), None, Some(&path_clone))?;
                     }
                     Ok(())
                 }).await??;

@@ -49,6 +49,14 @@ impl ModelVariant {
             Self::QuantizedText(m) => m.rebalance_layers(device_id),
         }
     }
+
+    pub fn drop_kv_storage(&mut self) -> Result<()> {
+        match self {
+            Self::Standard(_) => Ok(()),
+            Self::QuantizedVL(m) => m.language_model.drop_kv_storage(),
+            Self::QuantizedText(m) => m.language_model.drop_kv_storage(),
+        }
+    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -229,8 +237,7 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<()> {
-        // [FIX] add_special_tokens를 false로 설정하여 중간에 종료 토큰이 삽입되는 것 방지
+    pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
         let token_ids = self.tokenizer.text_encode_vec(text.to_string(), false)?;
         let total_tokens = token_ids.len();
         let chunk_size = 512;
@@ -249,8 +256,15 @@ impl Qwen3VLGenerateModel {
 
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
 
+            // [STREAMING] 주기적으로 디스크에 중간 결과 저장
+            if let Some(path) = auto_save_path {
+                let _ = self.save_kv_to_disk(path);
+                // println!("[STREAM-SAVE] Progress: {}/{} tokens saved.", end, total_tokens);
+            }
+
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
+                // ... (기존 Relay 로직 동일) ...
                 let mut new_ks_i8 = Vec::with_capacity(ks.len());
                 let mut new_vs_i8 = Vec::with_capacity(vs.len());
                 let mut k_scales = Vec::with_capacity(ks.len());
@@ -272,6 +286,13 @@ impl Qwen3VLGenerateModel {
             }
             current_pos = end;
         }
+
+        // [MEMORY-FIX] 저장이 완료되었으므로 메모리 포지션을 해제함
+        if auto_save_path.is_some() {
+            println!("[STREAMING] Disk save complete. Dropping KV storage from memory.");
+            let _ = self.qwen3_vl.drop_kv_storage();
+        }
+
         Ok(())
     }
 
