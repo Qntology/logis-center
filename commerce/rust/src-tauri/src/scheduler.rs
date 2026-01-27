@@ -435,25 +435,17 @@ async fn process_task(
         println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
         
         let type_prompt = parsing::page_type_prompt();
-        let prompt_a = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt);
+        // [FIX] Split PUG and TASK to prevent double-ingestion
+        let pug_content = light_pug.clone();
+        let task_question = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
 
-        // 1. Ensure BOTH models are prepared (Resident Coexistence)
         model.ensure_generator(crate::model::ModelSize::Small).await?;
         model.ensure_generator(crate::model::ModelSize::Large).await?;
 
-        let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                content: ChatCompletionRequestUserMessageContent::Text(prompt_a),
-                name: None,
-            })],
-            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
-            ..Default::default()
-        };
-
-        // 2. Real-time Memory-to-Memory Relay
+        // 1. 0.6B Prefills only the HEAVY content (PUG)
         {
             let model_clone = model.clone();
-            let params_clone = params.clone();
+            let pug_clone = pug_content.clone();
             let token_clone = cancellation_token.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
@@ -462,38 +454,47 @@ async fn process_task(
                 let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
 
                 if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                    // [STRICT PARITY] Clear BOTH contexts before relay to prevent 'unknown'
                     worker.clear_kv_cache();
                     target.clear_kv_cache();
-                    worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
+                    // Relay ONLY the PUG content
+                    worker.prefill_text_only(&pug_clone, Some(token_clone), Some(target))?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 3. 2B Inference (Instant response from relay context)
+        // 2. 2B asks the QUESTION on top of the prefilled PUG
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                name: None,
+            })],
+            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+            ..Default::default()
+        };
+
         if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 2B Step A: Instant Classification...");
+            println!("[Scheduler] 2B Step A: Asking classification question...");
             let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
-            let type_info = parsing::parse_json_from_llm(&res); 
-            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            
-            if page_type.is_empty() {
-                println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
-                page_type = match task.r#type.as_str() {
-                    "image_extraction" => "tracking".to_string(),
-                    _ => "unknown".to_string(),
-                };
-            }
-            println!("[Scheduler] Classified as: {}", page_type);
-        }
-
-        if page_type.is_empty() || page_type == "unknown" { 
-            model.unload_generator().await;
-            return Ok(()); 
-        }
-    }
-
+                        let type_info = parsing::parse_json_from_llm(&res); 
+                        page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        
+                        if page_type.is_empty() {
+                            println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
+                            page_type = match task.r#type.as_str() {
+                                "image_extraction" => "tracking".to_string(),
+                                _ => "unknown".to_string(),
+                            };
+                        }
+                                    println!("[Scheduler] Classified as: {}", page_type);
+                                }
+                        
+                                if page_type.is_empty() || page_type == "unknown" { 
+                                    model.unload_generator().await;
+                                    return Ok(()); 
+                                }
+                            }
+                        
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
@@ -506,25 +507,16 @@ async fn process_task(
         println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY for Selectors");
         
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let prompt_b = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, selector_prompt);
+        let pug_content = light_pug.clone();
+        let task_question = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
 
-        // 1. Models should already be in memory from Step A, but ensure anyway
         model.ensure_generator(crate::model::ModelSize::Small).await?;
         model.ensure_generator(crate::model::ModelSize::Large).await?;
 
-        let params = ChatCompletionParameters {
-            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                content: ChatCompletionRequestUserMessageContent::Text(prompt_b),
-                name: None,
-            })],
-            model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
-            ..Default::default()
-        };
-
-        // 2. Real-time Relay
+        // 1. 0.6B Relay PUG
         {
             let model_clone = model.clone();
-            let params_clone = params.clone();
+            let pug_clone = pug_content.clone();
             let token_clone = cancellation_token.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
@@ -533,18 +525,26 @@ async fn process_task(
                 let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
 
                 if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
-                    // [STRICT PARITY] Clear BOTH
                     worker.clear_kv_cache();
                     target.clear_kv_cache();
-                    worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
+                    worker.prefill_text_only(&pug_clone, Some(token_clone), Some(target))?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 3. 2B Instant Inference
+        // 2. 2B asks Selector Question
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                name: None,
+            })],
+            model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
+            ..Default::default()
+        };
+
         if let Some(gen) = model.generator.lock().await.as_mut() {
-            println!("[Scheduler] 2B Step B: Instant Selector Extraction...");
+            println!("[Scheduler] 2B Step B: Asking selector question...");
             let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
             selector_info = parsing::parse_json_from_llm(&res);
             println!("[Scheduler] Selectors Identified.");
@@ -641,23 +641,16 @@ async fn process_task(
 
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
-            let prompt_c = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", content_pug, extraction_instruction);
+            let pug_content = content_pug.clone();
+            let task_question = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", extraction_instruction);
 
             model.ensure_generator(crate::model::ModelSize::Small).await?;
             model.ensure_generator(crate::model::ModelSize::Large).await?;
 
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(prompt_c),
-                    name: None,
-                })],
-                model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
-                ..Default::default()
-            };
-
+            // 1. 0.6B Relay Detail PUG
             {
                 let model_clone = model.clone();
-                let params_clone = params.clone();
+                let pug_clone = pug_content.clone();
                 let token_clone = cancellation_token.clone();
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -669,15 +662,25 @@ async fn process_task(
                         // [STRICT PARITY] Clear BOTH
                         worker.clear_kv_cache();
                         target.clear_kv_cache();
-                        worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
+                        worker.prefill_text_only(&pug_clone, Some(token_clone), Some(target))?;
                     }
                     Ok(())
                 }).await??;
             }
 
+            // 2. 2B asks Extraction Question
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                    content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                    name: None,
+                })],
+                model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
+                ..Default::default()
+            };
+
             // 3. 2B Instant Inference
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step C: Instant Detail Extraction...");
+                println!("[Scheduler] 2B Step C: Asking extraction question...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                 extracted_data = parsing::parse_json_from_llm(&res);
             }

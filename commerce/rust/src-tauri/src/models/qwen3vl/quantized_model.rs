@@ -52,9 +52,9 @@ impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let target_dtype = self.weight.dtype();
         
-        if x.device().is_cpu() && (x.dtype() == DType::BF16 || target_dtype == DType::BF16) {
-            println!("[TRACE-NORM-VIOLATION] CPU Norm with BF16! x: {:?}, weight: {:?}", x.dtype(), target_dtype);
-        }
+        // if x.device().is_cpu() && (x.dtype() == DType::BF16 || target_dtype == DType::BF16) {
+        //     println!("[TRACE-NORM-VIOLATION] CPU Norm with BF16! x: {:?}, weight: {:?}", x.dtype(), target_dtype);
+        // }
 
         let x = x.to_dtype(DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
@@ -112,9 +112,9 @@ impl QLinear {
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
 
-        if xs.device().is_cpu() && xs.dtype() == DType::BF16 {
-            println!("[TRACE-LINEAR-VIOLATION] CPU Linear with BF16 input!");
-        }
+        // if xs.device().is_cpu() && xs.dtype() == DType::BF16 {
+        //     println!("[TRACE-LINEAR-VIOLATION] CPU Linear with BF16 input!");
+        // }
 
         let xs_f32 = xs.to_dtype(DType::F32)?;
         let (b, s, h) = xs_f32.dims3()?;
