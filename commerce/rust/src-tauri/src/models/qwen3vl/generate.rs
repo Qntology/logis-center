@@ -172,7 +172,7 @@ impl Qwen3VLGenerateModel {
                 
                 let is_06b = path.contains("0.6B");
                 let baking_only = is_06b;
-                let single_layer_mode = is_06b;
+                let single_layer_mode = false; // [FIX] 1개 레이어만 굽는 대신 전체 레이어를 사용하여 맥락 유지
                 
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
