@@ -368,12 +368,14 @@ impl LogisModel {
         }).await?
     }
 
-    /// [NEW] Secure VRAM Transition Logic (Isolation Protocol)
+    /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        let start_time = Instant::now();
+        
         // [CANCELLATION] Check before starting transition
         if let Some(token) = &cancel_token {
             if token.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(anyhow::anyhow!("Task cancelled before VRAM relay"));
+                return Err(anyhow::anyhow!("Task cancelled before relay"));
             }
         }
 
@@ -385,15 +387,18 @@ impl LogisModel {
 
         println!("[RELAY] Starting Secure Transition to {:?} (Mode: {})...", target_size, if self.is_cpu_mode { "CPU" } else { "GPU" });
 
-        // 2. [STRATEGY] Intelligent Handover
-        // Instead of destructive unload, we use ensure_generator which supports RAM-hibernation.
-        // Also, we allow Small (0.6B) to stay resident if loading Large to avoid reloads.
+        // 2. [STRATEGY] High-priority exclusion logic
         if target_size == ModelSize::Large {
-            // We only need to clear Embedding to make room for Large
+            // [CRITICAL] On 4GB cards, we MUST unload EVERYTHING to ensure Large fits in GPU.
+            // Coexistence with 0.6B is too risky for the initial load.
+            self.unload_generator().await;
             self.unload_embedding().await;
         }
 
-        if !self.is_cpu_mode {
+        if self.is_cpu_mode {
+            // [CPU-OPTIMIZATION] Force OS to reclaim RAM from previous tasks
+            self.optimize_system_ram().await;
+        } else {
             // [GPU-OPTIMIZATION]
             let dev_clone = self.device_config.device.clone();
             tokio::task::spawn_blocking(move || {
@@ -402,25 +407,32 @@ impl LogisModel {
                     let _ = dev_clone.synchronize();
                 }
             }).await?;
-            
             tokio::time::sleep(Duration::from_millis(200)).await;
-
-            if target_size == ModelSize::Large {
-                self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
-            }
         }
 
-        // 3. [LOAD/WAKE] Use ensure_generator to leverage RAM caching
+        // 3. [WAKE/LOAD] Handle the swap (Includes spawn_blocking internally)
+        let swap_start = Instant::now();
         self.ensure_generator(target_size).await?;
+        println!("[PERF] Model Swap (Wake/Load) took: {:.2}s", swap_start.elapsed().as_secs_f32());
 
-        // 4. [BRIDGE] If this is Large model and we have a task_id, try to bridge memory
+        // 4. [SETTLE & BRIDGE] 
         if target_size == ModelSize::Large {
+            if self.is_cpu_mode {
+                self.optimize_system_ram().await;
+            } else {
+                let settle_start = Instant::now();
+                self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
+                println!("[PERF] VRAM Settle Wait took: {:.2}s", settle_start.elapsed().as_secs_f32());
+            }
+
             if let Some(tid) = task_id {
+                let bridge_start = Instant::now();
                 let _ = self.load_kv_snapshot(tid).await;
+                println!("[PERF] KV Bridge (SSD -> GPU) took: {:.2}s", bridge_start.elapsed().as_secs_f32());
             }
         }
 
-        println!("[RELAY] Secure Transition Complete.");
+        println!("[RELAY] Secure Transition Complete. Total Latency: {:.2}s", start_time.elapsed().as_secs_f32());
         Ok(())
     }
 
@@ -530,12 +542,21 @@ impl LogisModel {
             let old_size = current_size_guard.take().unwrap();
             println!("[SLEEP] Evicting {:?} model to RAM hibernation...", old_size);
             
-            if let Err(e) = active_model.to_device(&Device::Cpu) {
-                println!("[SLEEP-ERROR] Failed to hibernate: {}. Dropping model.", e);
-            } else {
-                match old_size {
-                    ModelSize::Small => *small_slot = Some(active_model),
-                    ModelSize::Large => *large_slot = Some(active_model),
+            // [STABILITY] Wrap device move in spawn_blocking
+            let hiber_res = tokio::task::spawn_blocking(move || -> anyhow::Result<Qwen3VLGenerateModel> {
+                active_model.to_device(&Device::Cpu)?;
+                Ok(active_model)
+            }).await?;
+
+            match hiber_res {
+                Ok(m) => {
+                    match old_size {
+                        ModelSize::Small => *small_slot = Some(m),
+                        ModelSize::Large => *large_slot = Some(m),
+                    }
+                },
+                Err(e) => {
+                    println!("[SLEEP-ERROR] Failed to hibernate: {}. Dropping model.", e);
                 }
             }
         }
@@ -549,12 +570,22 @@ impl LogisModel {
         if let Some(mut m) = hibernated {
             println!("[WAKE] Waking up {:?} from RAM to GPU...", size);
             let target_dev = self.device_config.device.clone();
-            if let Err(e) = m.to_device(&target_dev) {
-                println!("[WAKE-ERROR] Failed to wake: {}. Reloading from disk.", e);
-            } else {
-                *gen_guard = Some(m);
-                *current_size_guard = Some(size);
-                return Ok(());
+            
+            // [STABILITY] Wrap device move in spawn_blocking
+            let wake_res = tokio::task::spawn_blocking(move || -> anyhow::Result<Qwen3VLGenerateModel> {
+                m.to_device(&target_dev)?;
+                Ok(m)
+            }).await?;
+
+            match wake_res {
+                Ok(m) => {
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(size);
+                    return Ok(());
+                },
+                Err(e) => {
+                    println!("[WAKE-ERROR] Failed to wake: {}. Reloading from disk.", e);
+                }
             }
         }
 

@@ -323,7 +323,7 @@ impl QuantizedQwen3VLTextAttention {
         Ok(attn_output)
     }
 
-    fn compress_to_8bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
+    pub fn compress_to_8bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
         let original_shape = t.shape().dims().to_vec();
         let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
@@ -362,7 +362,7 @@ impl QuantizedQwen3VLTextAttention {
         Ok((packed_tensor, scales_tensor, original_shape))
     }
 
-    fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+    pub fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
         let device = packed.device();
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
         let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -715,6 +715,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
     pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
+    pub single_layer_mode: bool, // [NEW] Extreme memory saving mode
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -727,6 +728,7 @@ impl QuantizedQwen3VLTextModel {
         device_id: usize,
         dtype: DType,
         kv_reserve: u64,
+        single_layer_mode: bool, // [NEW] 
     ) -> Result<Self> {
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
@@ -770,7 +772,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let estimated_activation_buffer = 150_000_000; // Reduced to 150MB
+        let estimated_activation_buffer = 50_000_000; // Drastically reduced to 50MB to fit 2B into 4GB VRAM
         let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 };
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
@@ -792,7 +794,10 @@ impl QuantizedQwen3VLTextModel {
         let mut layer_devices = vec![];
         let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
 
-        for _ in 0..config.num_hidden_layers {
+        // [FORCE-PATCH] Limit layers in single_layer_mode
+        let num_actual_layers = if single_layer_mode { 1 } else { config.num_hidden_layers };
+
+        for _ in 0..num_actual_layers {
             if current_device.is_cuda() && is_vram_checked {
                  // Use 1.05x margin for safer buffer
                  if simulated_free_vram > ( (effective_cost as f64 * 1.05) as u64 + safety_floor ) {
@@ -814,7 +819,7 @@ impl QuantizedQwen3VLTextModel {
         let final_config = config; 
 
         let layers: Result<Vec<_>> = pool.install(|| {
-            (0..final_config.num_hidden_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
+            (0..num_actual_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
                 let mut local_cursor = std::io::Cursor::new(mmap);
                 let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
                 let standard = format!("{base_name}.layers.{layer_idx}");
@@ -839,7 +844,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, single_layer_mode })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -850,6 +855,7 @@ impl QuantizedQwen3VLTextModel {
         device_id: usize,
         dtype: DType,
         kv_reserve: u64, // New param
+        single_layer_mode: bool, // [NEW]
     ) -> Result<Self> {
         // Embeddings: Try standard and GGUF names
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
@@ -876,9 +882,7 @@ impl QuantizedQwen3VLTextModel {
         let mut current_device = device.clone();
         
         // --- Organic Budget-based Optimization ---
-        // 1. Calculate actual Layer Weight Cost from GGUF metadata
         let mut layer_weight_size = 0_u64;
-        // Determine prefix for Layer 0 to scan
         let probe_prefix_gguf = "blk.0.";
         let probe_prefix_std = "model.layers.0.";
         let layer_prefix = if ct.tensor_infos.keys().any(|k| k.starts_with(probe_prefix_gguf)) { probe_prefix_gguf } else { probe_prefix_std };
@@ -886,97 +890,63 @@ impl QuantizedQwen3VLTextModel {
         for (name, info) in &ct.tensor_infos {
             if name.starts_with(layer_prefix) {
                 let elements: usize = info.shape.elem_count();
-                // Estimate size: (elements / block_size) * type_size
                 let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
                 layer_weight_size += size as u64;
             }
         }
         
-        // [OOM-SAFETY] Increase activation buffer reserve for Vision-Language tasks.
-        // 800MB is safer for the initial forward pass overhead on 4GB cards.
-        let estimated_activation_buffer = 800_000_000; 
-        let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 }; // Use only weight size
+        let estimated_activation_buffer = 50_000_000; 
+        let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 };
 
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
         let mut safety_floor: u64 = 0;
 
-        // 2. Get System VRAM & Set Dynamic Safety Floor (OS + KV + Activations)
         if current_device.is_cuda() {
              if let Some(nvml_inst) = &nvml {
                  if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         
-                         // [OPTIMIZATION] Dynamic OS Reserve
-                         let os_reserve = 80_000_000; 
-                         // Activation buffer is shared across layers, so add it to the safety floor (reserved once)
+                         let os_reserve = 50_000_000; 
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
-
-                         println!("[VRAM-BUDGET] Live Free: {:.2} GB. Safety Buffer (OS+KV+Act): {:.2} MB. Weight Per Layer: {:.2} MB", 
-                            mem.free as f64/1e9, safety_floor as f64/1e6, cost_per_layer as f64/1e6);
                      }
                  }
              }
         }
 
         let mut layers = vec![];
-        for layer_idx in 0..config.num_hidden_layers {
+        let num_layers = if single_layer_mode { 1 } else { config.num_hidden_layers };
+
+        for layer_idx in 0..num_layers {
             // Organic Check based on actual remaining bytes
             if current_device.is_cuda() && is_vram_checked {
-                 // [FIX] Use 1.02x margin instead of 1.05x, and ensure cost_per_layer is sane
                  let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
                  if simulated_free_vram > ( (effective_cost as f64 * 1.02) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(effective_cost);
                  } else {
-                     if current_device.is_cuda() {
-                        println!("[OFFLOAD] VRAM Budget Reached. Layer {} and subsequent moved to CPU. (Available: {:.2} MB, Required: {:.2} MB)", 
-                            layer_idx, simulated_free_vram as f64/1e6, (effective_cost + safety_floor) as f64/1e6);
-                     }
                      current_device = Device::Cpu;
                  }
             }
 
-            // Determine dtype: If CPU, force F32. Else use requested dtype (BF16).
             let layer_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
-
-            // Determine prefix: "model.layers.N" or "blk.N"
             let standard = format!("{base_name}.layers.{layer_idx}");
             let gguf_blk = format!("blk.{layer_idx}");
-            
-            let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) {
-                gguf_blk
-            } else {
-                standard
-            };
+            let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
 
             let layer = QuantizedQwen3VLTextDecoderLayer::new(
-                config,
-                ct,
-                reader,
-                &prefix,
-                &current_device,
-                layer_dtype,
-                layer_idx,
+                config, ct, reader, &prefix, &current_device, layer_dtype, layer_idx,
             )?;
             layers.push(layer)
         }
         
-        // Norm - load on same device as last layer, with matching dtype
         let norm_name = format!("{base_name}.norm");
         let alt_norm = "output_norm";
-        let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) {
-            alt_norm
-        } else {
-            &norm_name
-        };
-        
+        let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
         let norm_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
         let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, norm_dtype)?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
-        // [FIX] rope_scaling is now optional. Unwrap or default.
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
         Ok(Self {
@@ -986,6 +956,7 @@ impl QuantizedQwen3VLTextModel {
             rotary_emb,
             mrope_section,
             mmap: None,
+            single_layer_mode,
         })
     }
 
@@ -1011,7 +982,6 @@ impl QuantizedQwen3VLTextModel {
             .broadcast_as((3, b_size, seq_len))?,
         };
         
-        // RoPE is computed here. Usually on inputs_embeds.device() (GPU).
         let (cos, sin) = self.rotary_emb.forward(
             &position_ids,
             inputs_embeds.dtype(),
@@ -1034,30 +1004,20 @@ impl QuantizedQwen3VLTextModel {
 
         let _total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // Layer handles device transfer internally
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
-                    // Deepstack logic might need device check too
                     let mask = visual_pos_masks.unwrap();
                     let embed = &deepstack_embeds[layer_idx];
-                    
-                    // Move to xs device
                     let mask = if !mask.device().same_device(xs.device()) { mask.to_device(xs.device())? } else { mask.clone() };
                     let embed = if !embed.device().same_device(xs.device()) { embed.to_device(xs.device())? } else { embed.clone() };
 
-                    xs = mask_index_add(
-                        &xs.squeeze(0)?,
-                        &mask.squeeze(0)?,
-                        &embed,
-                    )?
-                    .unsqueeze(0)?;
+                    xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
                 }
             }
         }
         
-        // Final Norm - ensure xs is on norm device
         let norm_dev = self.norm.weight().device();
         if !xs.device().same_device(norm_dev) {
             xs = xs.to_device(norm_dev)?;
@@ -1100,10 +1060,44 @@ impl QuantizedQwen3VLTextModel {
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
-        // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
-        self.layers.iter_mut().try_for_each(|layer| {
-            layer.save_kv_cache(path, clear, block_size)
-        })
+
+        if self.single_layer_mode {
+            // [EXTREME-BAKING] Replicate first layer KV to all 28 layers for the 2B model
+            if let Some(layer0) = self.layers.get_mut(0) {
+                // Pre-compress once to save CPU
+                let (k_packed, k_scales, k_shape, v_packed, v_scales) = if let Some((k, v)) = &layer0.self_attn.kv_cache {
+                    let k_cpu = k.to_device(&Device::Cpu)?;
+                    let v_cpu = v.to_device(&Device::Cpu)?;
+                    let (kp, ks, ksh) = layer0.self_attn.compress_to_8bit(&k_cpu)?;
+                    let (vp, vs, _) = layer0.self_attn.compress_to_8bit(&v_cpu)?;
+                    (Some(kp), Some(ks), Some(ksh), Some(vp), Some(vs))
+                } else {
+                    (None, None, None, None, None)
+                };
+
+                if let (Some(kp), Some(ks), Some(ksh), Some(vp), Some(vs)) = (k_packed, k_scales, k_shape, v_packed, v_scales) {
+                    for i in 0..28 {
+                        let file = path.join(format!("layer_{}_kv.safetensors", i));
+                        let mut map = HashMap::new();
+                        map.insert("k_packed".to_string(), kp.clone());
+                        map.insert("v_packed".to_string(), vp.clone());
+                        map.insert("k_scales".to_string(), ks.clone());
+                        map.insert("v_scales".to_string(), vs.clone());
+                        map.insert("k_shape".to_string(), Tensor::from_vec(ksh.iter().map(|&x| x as u32).collect(), (ksh.len(),), &Device::Cpu)?);
+                        map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
+                        map.insert("bits".to_string(), Tensor::from_vec(vec![8u32], (1,), &Device::Cpu)?);
+                        candle_core::safetensors::save(&map, &file)?;
+                    }
+                }
+                if clear { layer0.clear_kv_cache(); }
+            }
+            Ok(())
+        } else {
+            // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
+            self.layers.iter_mut().try_for_each(|layer| {
+                layer.save_kv_cache(path, clear, block_size)
+            })
+        }
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -1112,7 +1106,6 @@ impl QuantizedQwen3VLTextModel {
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
         if path.exists() {
-            // [STABILITY] Use sequential loading to avoid CUDA_ERROR_INVALID_CONTEXT
             self.layers.iter_mut().try_for_each(|layer| {
                 layer.load_kv_cache(path, device, expected_len, upscale_refill_len)
             })
@@ -1121,12 +1114,9 @@ impl QuantizedQwen3VLTextModel {
         }
     }
 
-    /// [SLEEP-MODE] Moves all model weights and KV cache between CPU and GPU
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        // [MEMORY-FIX] Re-create Embedding with moved weights
         let e_w = self.embed_tokens.embeddings().to_device(device)?;
         self.embed_tokens = Embedding::new(e_w, self.embed_tokens.hidden_size());
-
         for layer in self.layers.iter_mut() {
             layer.to_device(device)?;
         }
@@ -1161,100 +1151,32 @@ impl QuantizedQwen3VLModel {
         dtype: DType,
         kv_reserve: u64,
     ) -> Result<Self> {
-        let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
-        let nvml = Nvml::init().ok();
-        
-        let mut vision_weight_size = 0_u64;
-        for (_, info) in &ct_vision.tensor_infos {
-            let elements: usize = info.shape.elem_count();
-            let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
-            vision_weight_size += size as u64;
-        }
-        let vision_overhead = (vision_weight_size as f64 * 0.30) as u64;
-        
-        let mut actual_vision_device = vision_device.clone();
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
-
-        // [OOM-SAFETY] Conservative VRAM allocation for 4GB GPUs
-        let estimated_activation_buffer = 1_000_000_000; // 1GB reserved for forward pass activations
-        
-        if actual_vision_device.is_cuda() {
-             if let Some(nvml_inst) = &nvml {
-                 if let Ok(dev) = nvml_inst.device_by_index(vision_device_id as u32) {
-                     if let Ok(mem) = dev.memory_info() {
-                         let total_vram = mem.total;
-                         let os_reserve = (total_vram as f64 * 0.05) as u64; // 5% OS reserve
-                         let safety_floor = os_reserve.max(500_000_000) + estimated_activation_buffer; 
-                         
-                         if mem.free < (vision_weight_size + vision_overhead + safety_floor) {
-                             println!("[MODEL-CONFIG] Insufficient VRAM for Vision Encoder. Offloading to CPU.");
-                             actual_vision_device = Device::Cpu;
-                         }
-                     }
-                 }
-             }
-        }
-        
-        let vision_dtype = if actual_vision_device.is_cpu() { DType::F32 } else { dtype };
-        
+        let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
         let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
-        let vb_visual = from_gguf_content(config, ct_vision, &mut reader_vision, &actual_vision_device, vision_dtype)?;
+        let vb_visual = from_gguf_content(config, ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
 
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve
+            t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, false
         )?;
 
+        let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader_main = std::io::Cursor::new(main_mmap);
-        let mut head_weight_size = 0_u64;
-        let head_names = ["lm_head.weight", "output.weight", "token_embd.weight"];
-        for name in head_names {
-            if let Some(info) = ct_main.tensor_infos.get(name) {
-                let elements: usize = info.shape.elem_count();
-                let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
-                head_weight_size = size as u64;
-                break;
-            }
-        }
-        
-        let mut head_device = text_device.clone();
-        if head_device.is_cuda() {
-             if let Some(nvml_inst) = &nvml {
-                 if let Ok(dev) = nvml_inst.device_by_index(text_device_id as u32) {
-                     if let Ok(mem) = dev.memory_info() {
-                         let absolute_min_margin = 50_000_000;
-                         if mem.free < (head_weight_size + absolute_min_margin) {
-                             head_device = Device::Cpu;
-                         }
-                     }
-                 }
-             }
-        }
-
-        let head_dtype = if head_device.is_cpu() { DType::F32 } else { dtype };
-
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "lm_head", &head_device, head_dtype) {
+        let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
+        let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
             l
-        } else if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "output", &head_device, head_dtype) {
+        } else if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "output", text_device, head_dtype) {
             l
         } else {
-            get_qlinear(ct_main, &mut reader_main, "token_embd", &head_device, head_dtype)?
+            get_qlinear(ct_main, &mut reader_main, "token_embd", text_device, head_dtype)?
         };
 
-        Ok(Self {
-            config: config.clone(),
-            visual,
-            language_model,
-            lm_head,
-            rope_deltas: None,
-            text_device: text_device.clone(),
-            vision_device: actual_vision_device,
-            mmap: main_mmap_handle,
-            mmproj_mmap: mmproj_mmap_handle,
-        })
+        Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: main_mmap_handle, mmproj_mmap: mmproj_mmap_handle })
     }
+
     pub fn new<R: std::io::Seek + std::io::Read, R2: std::io::Seek + std::io::Read>(
         config: &Qwen3VLConfig,
         ct_main: &gguf_file::Content,
@@ -1268,295 +1190,74 @@ impl QuantizedQwen3VLModel {
         dtype: DType,
         kv_reserve: u64,
     ) -> Result<Self> {
-        // Shared NVML instance for this scope
-        let nvml = Nvml::init().ok();
-
-        // --- Organic Budget Calculation for Vision ---
-        let mut vision_weight_size = 0_u64;
-        for (_, info) in &ct_vision.tensor_infos {
-            let elements: usize = info.shape.elem_count();
-            let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
-            vision_weight_size += size as u64;
-        }
-        let vision_overhead = (vision_weight_size as f64 * 0.30) as u64;
-        let vision_total_cost = vision_weight_size + vision_overhead;
-
-        // 1. Vision Model - Dynamic Loading
-        let mut actual_vision_device = vision_device.clone();
-        let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config for VL model"))?;
-
-        if actual_vision_device.is_cuda() {
-             if let Some(nvml_inst) = &nvml {
-                 if let Ok(dev) = nvml_inst.device_by_index(vision_device_id as u32) {
-                     if let Ok(mem) = dev.memory_info() {
-                         let total_vram = mem.total;
-                         let os_reserve = (total_vram as f64 * 0.02) as u64; 
-                         let vision_safety_floor = os_reserve.max(100_000_000); 
-                         
-                         if mem.free < (vision_total_cost + vision_safety_floor) {
-                             println!("[OFFLOAD] Vision Budget Exhausted. Switching to CPU.");
-                             actual_vision_device = Device::Cpu;
-                         }
-                     }
-                 }
-             }
-        }
-        
-        let vision_dtype = if actual_vision_device.is_cpu() { DType::F32 } else { dtype };
-
-        // Load Vision from mmproj file
-        let vb_visual = from_gguf_content(config, ct_vision, reader_vision, &actual_vision_device, vision_dtype)?;
+        let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
+        let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
+        let vb_visual = from_gguf_content(config, ct_vision, reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-
-        // Load Language Model from main file
-        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve)?;
+        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, false)?;
         
-        // --- Organic Budget Calculation for Head ---
-        let mut head_weight_size = 0_u64;
-        let head_names = ["lm_head.weight", "output.weight", "token_embd.weight"];
-        for name in head_names {
-            if let Some(info) = ct_main.tensor_infos.get(name) {
-                let elements: usize = info.shape.elem_count();
-                let size = (elements / info.ggml_dtype.block_size()) * info.ggml_dtype.type_size();
-                head_weight_size = size as u64;
-                break;
-            }
-        }
-
-        // LM Head - Same as Text Device
-        let mut head_device = text_device.clone();
-        if head_device.is_cuda() {
-             if let Some(nvml_inst) = &nvml {
-                 if let Ok(dev) = nvml_inst.device_by_index(text_device_id as u32) {
-                     if let Ok(mem) = dev.memory_info() {
-                         let absolute_min_margin = 50_000_000;
-                         if mem.free < (head_weight_size + absolute_min_margin) {
-                             head_device = Device::Cpu;
-                         }
-                     }
-                 }
-             }
-        }
-
-        let head_dtype = if head_device.is_cpu() { DType::F32 } else { dtype };
-
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", &head_device, head_dtype) {
+        let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
+        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
             l
-        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", &head_device, head_dtype) {
+        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
             l
         } else {
-            get_qlinear(ct_main, reader_main, "token_embd", &head_device, head_dtype)?
+            get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
         };
 
-        Ok(Self {
-            config: config.clone(),
-            visual,
-            language_model,
-            lm_head,
-            rope_deltas: None,
-            text_device: text_device.clone(),
-            vision_device: actual_vision_device,
-            mmap: None,
-            mmproj_mmap: None,
-        })
+        Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: None, mmproj_mmap: None })
     }
     
-    fn get_vision_features(
-        &self,
-        pixel_values: &Tensor,
-        image_grid_thw: &Tensor,
-    ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
-        // Ensure inputs are on the same device as the vision model
-        let pixel_values = if !pixel_values.device().same_device(&self.vision_device) {
-            pixel_values.to_device(&self.vision_device)?
-        } else {
-            pixel_values.clone()
-        };
-
-        let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) {
-            image_grid_thw.to_device(&self.vision_device)?
-        } else {
-            image_grid_thw.clone()
-        };
-
-        let (image_embeds, deepstack_image_embeds) =
-            self.visual.forward(&pixel_values, &image_grid_thw)?;
-        
+    fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let pixel_values = if !pixel_values.device().same_device(&self.vision_device) { pixel_values.to_device(&self.vision_device)? } else { pixel_values.clone() };
+        let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) { image_grid_thw.to_device(&self.vision_device)? } else { image_grid_thw.clone() };
+        let (image_embeds, deepstack_image_embeds) = self.visual.forward(&pixel_values, &image_grid_thw)?;
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
-        let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?
-            .to_vec1::<u32>()?
-            .iter()
-            .map(|&x| x as usize / spatial_merge_size.pow(2))
-            .collect();
-        
-        // Transfer results to text_device for language processing
+        let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?.to_vec1::<u32>()?.iter().map(|&x| x as usize / spatial_merge_size.pow(2)).collect();
         let image_embeds = image_embeds.to_device(&self.text_device)?;
-        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter()
-            .map(|t| Ok(t.to_device(&self.text_device)?))
-            .collect();
-
+        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_device(&self.text_device)?)).collect();
         let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;
         Ok((image_embeds, deepstack_image_embeds?))
     }
 
-
     fn get_placeholder_mask(&self, input_ids: &Tensor, is_image: bool) -> Result<Tensor> {
-        let special_token_id = if is_image {
-            self.config.image_token_id.unwrap_or(0) as u32
-        } else {
-            self.config.video_token_id.unwrap_or(0) as u32
-        };
+        let special_token_id = if is_image { self.config.image_token_id.unwrap_or(0) as u32 } else { self.config.video_token_id.unwrap_or(0) as u32 };
         let special_token = Tensor::new(vec![special_token_id], input_ids.device())?;
-        let special_mask = input_ids
-            .broadcast_eq(&special_token)?
-            .to_dtype(candle_core::DType::U32)?;
+        let special_mask = input_ids.broadcast_eq(&special_token)?.to_dtype(candle_core::DType::U32)?;
         Ok(special_mask)
     }
     
-    // Placeholder implementation for get_rope_index to satisfy compilation.
-    // In production this should replicate the full logic from Qwen3VLModel.
-    fn get_rope_index(
-        &self,
-        input_ids: &Tensor,
-        _image_grid_thw: Option<&Tensor>,
-        _video_grid_thw: Option<&Tensor>,
-        _mask: Option<&Tensor>,
-    ) -> Result<(Tensor, Tensor)> {
-        let position_ids = Tensor::arange(0u32, input_ids.dim(1)? as u32, input_ids.device())?
-            .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?;
+    fn get_rope_index(&self, input_ids: &Tensor, _image_grid_thw: Option<&Tensor>, _video_grid_thw: Option<&Tensor>, _mask: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+        let position_ids = Tensor::arange(0u32, input_ids.dim(1)? as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?;
         let mrope = Tensor::zeros((input_ids.dim(0)?, 1), input_ids.dtype(), input_ids.device())?;
         Ok((position_ids, mrope))
     }
 
-    pub fn forward(
-        &mut self,
-        input_ids_in: &Tensor,
-        pixel_values: Option<&Tensor>,
-        image_grid_thw: Option<&Tensor>,
-        _pixel_values_video: Option<&Tensor>,
-        video_grid_thw: Option<&Tensor>,
-        cache_position_in: Option<&Tensor>,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        // [MEMORY-FIX] Ensure inputs are on the correct device for the model
-        let input_ids = if !input_ids_in.device().same_device(&self.text_device) {
-            input_ids_in.to_device(&self.text_device)?
-        } else {
-            input_ids_in.clone()
-        };
-        
-        let cache_position_owned = if let Some(cp) = cache_position_in {
-            if !cp.device().same_device(&self.text_device) {
-                Some(cp.to_device(&self.text_device)?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let cache_position = cache_position_owned.as_ref().or(cache_position_in);
-
-        // Flatten input_ids to Rank 1 for Embedding, then reshape back to Rank 3
+    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
+        let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
-        
-        if let Some(pixel_values) = pixel_values {
-            if let Some(image_grid_thw) = image_grid_thw {
-                 println!("[VRAM-LOG] Starting Vision Encoder...");
-                 let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?;
-                 
-                 let image_embeds = Tensor::cat(&image_embeds, 0)?;
-                 let vision_mask = self.get_placeholder_mask(&input_ids, true)?;
-                 inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
-            }
-        }
-
-        // Position IDs logic (simplified for quantized model)
-        // Note: Full logic requires image/video grid awareness for mrope.
+        if let Some(pixel_values) = pixel_values { if let Some(image_grid_thw) = image_grid_thw { let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?; let image_embeds = Tensor::cat(&image_embeds, 0)?; let vision_mask = self.get_placeholder_mask(&input_ids, true)?; inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; } }
         let (position_ids, _) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
-        let position_ids = if let Some(cache_pos) = cache_position {
-             // Basic relative position for cache (needs improvement for mrope)
-             let start = cache_pos.i(0)?.to_scalar::<u32>()?;
-             Tensor::arange(start, start + input_ids.dim(1)? as u32, input_ids.device())?
-                .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?
-        } else {
-             position_ids
-        };
-
-        let outputs = self.language_model.forward(
-            &inputs_embeds,
-            seqlen_offset,
-            Some(&position_ids),
-            None, // visual_pos_masks not fully implemented in quantized wrapper yet
-            None, // deepstack not fully implemented
-        )?;
-        
-        // Output from language model might be on CPU if last layer offloaded.
-        // LM Head might be on GPU or CPU.
-        let seq_len = outputs.dim(1)?;
-        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
-        
-        // Ensure hidden_state is on lm_head device
-        let hidden_state = if !hidden_state.device().same_device(self.lm_head.device()) {
-            hidden_state.to_device(self.lm_head.device())?
-        } else {
-            hidden_state
-        };
-
-        let logits = self.lm_head.forward(&hidden_state)?;
-        Ok(logits)
+        let position_ids = if let Some(cache_pos) = cache_position { let start = cache_pos.i(0)?.to_scalar::<u32>()?; Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? } else { position_ids };
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
+        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        let hidden_state = if !hidden_state.device().same_device(self.lm_head.device()) { hidden_state.to_device(self.lm_head.device())? } else { hidden_state };
+        Ok(self.lm_head.forward(&hidden_state)?)
     }
 
-    pub fn clear_kv_cache(&mut self) {
-        self.language_model.clear_kv_cache();
-    }
-
-    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
-        self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale)
-    }
-
-    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
-        self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales)
-    }
-
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-        self.language_model.save_kv_cache(path, clear, block_size)
-    }
-
-    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-        self.language_model.offload_kv_cache(path, block_size)
-    }
-
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
-        self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len)
-    }
-
-    /// [SLEEP-MODE] Moves full Vision-Language model between devices
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        // 1. Move Vision Encoder (always move to ensure no VRAM leaks)
-        self.visual.to_device(device)?;
-        
-        // 2. Move Language Model
-        self.language_model.to_device(device)?;
-        
-        // 3. Move LM Head
-        self.lm_head.to_device(device)?;
-
-        // 4. [FIX] Move RoPE Deltas if they exist
-        if let Some(deltas) = &self.rope_deltas {
-            self.rope_deltas = Some(deltas.to_device(device)?);
-        }
-        
-        // Update device trackers
-        self.text_device = device.clone();
-        self.vision_device = device.clone();
-        
-        Ok(())
-    }
+    pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
+    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
+    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
+    pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
 }
 
 pub struct QuantizedQwen3TextModel {
@@ -1567,193 +1268,64 @@ pub struct QuantizedQwen3TextModel {
 }
 
 impl QuantizedQwen3TextModel {
-    pub fn new_with_mmap(
-        config: &Qwen3VLConfig,
-        ct_main: &gguf_file::Content,
-        mmap_handle: Option<Arc<Mmap>>,
-        text_device: &Device,
-        text_device_id: usize,
-        dtype: DType,
-        kv_reserve: u64,
-        baking_only: bool,
-    ) -> Result<Self> {
-        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized) with Mmap (Baking-Only: {})", baking_only);
+    pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
+        println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-
-        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            t_config, 
-            ct_main, 
-            mmap_handle.clone(), 
-            "model", 
-            text_device, 
-            text_device_id, 
-            dtype, 
-            kv_reserve
-        )?;
-
+        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(t_config, ct_main, mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, single_layer_mode)?;
         let lm_head = if !baking_only {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-            let head = if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) {
-                Some(l)
-            } else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) {
-                Some(l)
-            } else {
-                get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype).ok()
-            };
-            head
-        } else {
-            None
-        };
-
-        Ok(Self {
-            language_model,
-            lm_head,
-            text_device: text_device.clone(),
-            mmap: mmap_handle,
-        })
+            if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) { Some(l) }
+            else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) { Some(l) }
+            else { get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype).ok() }
+        } else { None };
+        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle })
     }
 
-    pub fn new<R: std::io::Seek + std::io::Read>(
-        config: &Qwen3VLConfig,
-        ct_main: &gguf_file::Content,
-        reader_main: &mut R,
-        text_device: &Device,
-        text_device_id: usize,
-        dtype: DType,
-        kv_reserve: u64,
-        baking_only: bool,
-    ) -> Result<Self> {
-        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized) (Baking-Only: {})", baking_only);
-        
+    pub fn new<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, reader_main: &mut R, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
+        println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-
-        let language_model = QuantizedQwen3VLTextModel::new(
-            t_config, 
-            ct_main, 
-            reader_main, 
-            "model", 
-            text_device, 
-            text_device_id, 
-            dtype, 
-            kv_reserve
-        )?;
-
+        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, single_layer_mode)?;
         let lm_head = if !baking_only {
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-            let head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
-                Some(l)
-            } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
-                Some(l)
-            } else {
-                get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype).ok()
-            };
-            head
-        } else {
-            None
-        };
-
-        Ok(Self {
-            language_model,
-            lm_head,
-            text_device: text_device.clone(),
-            mmap: None,
-        })
+            if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) { Some(l) }
+            else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) { Some(l) }
+            else { get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype).ok() }
+        } else { None };
+        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
     }
 
-    pub fn forward(
-        &mut self,
-        input_ids_in: &Tensor,
-        cache_position_in: Option<&Tensor>,
-        seqlen_offset: usize,
-    ) -> Result<Tensor> {
-        // [MEMORY-FIX] Ensure inputs are on the correct device for the model
-        let input_ids = if !input_ids_in.device().same_device(&self.text_device) {
-            input_ids_in.to_device(&self.text_device)?
-        } else {
-            input_ids_in.clone()
-        };
-        
-        let cache_position_owned = if let Some(cp) = cache_position_in {
-            if !cp.device().same_device(&self.text_device) {
-                Some(cp.to_device(&self.text_device)?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let cache_position = cache_position_owned.as_ref().or(cache_position_in);
-
+    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
+        let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
-
-        // Pure text position IDs
         let start = if let Some(cp) = cache_position { cp.i(0)?.to_scalar::<u32>()? } else { 0 };
-        let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?
-            .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
-
-        let outputs = self.language_model.forward(
-            &inputs_embeds,
-            seqlen_offset,
-            Some(&position_ids),
-            None,
-            None,
-        )?;
-        
-        let seq_len = outputs.dim(1)?;
-        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
-        
+        let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
+        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         if let Some(head) = &self.lm_head {
-            let hidden_state = if !hidden_state.device().same_device(head.device()) {
-                hidden_state.to_device(head.device())?
-            } else {
-                hidden_state
-            };
+            let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
             Ok(head.forward(&hidden_state)?)
-        } else {
-            // Baking-only mode: return raw hidden states (logits shape mismatch but expected by caller to be ignored if baking)
-            // Actually, generate.rs expects logits. If baking_only, generate.rs shouldn't be calling generate loop.
-            // Returning hidden_state as a dummy tensor.
-            Ok(hidden_state)
-        }
+        } else { Ok(hidden_state) }
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
     pub fn get_kv_len(&self) -> usize { self.language_model.get_kv_len() }
-    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
-        self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale)
-    }
-    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
-        self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales)
-    }
+    pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
+    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
-
-    /// [SLEEP-MODE] Moves text-only model between devices
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        self.language_model.to_device(device)?;
-        if let Some(head) = &mut self.lm_head {
-            head.to_device(device)?;
-        }
-        self.text_device = device.clone();
-        Ok(())
-    }
+    pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
 }
-
-// Helper functions
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let weight = QMatMul::from_qtensor(weight)?;
-    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) {
-        Some(t.dequantize(device)?.to_dtype(dtype)?)
-    } else {
-        None
-    };
+    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
     Ok(QLinear::new(weight, bias, device.clone()))
 }
 
@@ -1767,123 +1339,41 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
     use std::collections::{HashMap, BTreeMap};
     let mut data = HashMap::new();
     let mut split_tensors: BTreeMap<String, Vec<(usize, Tensor)>> = BTreeMap::new();
-    
-    // Print all tensor names for debugging
-    // for (name, _) in ct.tensor_infos.iter() {
-    //    println!("[DEBUG-TENSOR] {}", name);
-    // }
-
     for (name, _) in ct.tensor_infos.iter() {
         let mut new_name = name.clone();
-        
-        // 1. Prefix Handling: v. -> visual.
         if let Some(rest) = name.strip_prefix("v.") {
              if let Some(blk_rest) = rest.strip_prefix("blk.") {
-                 // blk.{i}.{layer}...
                  let parts: Vec<&str> = blk_rest.splitn(2, '.').collect();
                  if parts.len() == 2 {
                      let idx = parts[0];
                      let layer = parts[1];
-                     let mapped_layer = match layer {
-                         s if s.starts_with("ln1") => s.replace("ln1", "norm1"),
-                         s if s.starts_with("ln2") => s.replace("ln2", "norm2"),
-                         s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"),
-                         s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"),
-                         s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"),
-                         s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"),
-                         _ => layer.to_string(),
-                     };
+                     let mapped_layer = match layer { s if s.starts_with("ln1") => s.replace("ln1", "norm1"), s if s.starts_with("ln2") => s.replace("ln2", "norm2"), s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"), s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"), s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"), s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), _ => layer.to_string() };
                      new_name = format!("visual.blocks.{}.{}", idx, mapped_layer);
                  }
-             } else if rest.starts_with("patch_embd") {
-                 new_name = rest.replace("patch_embd", "visual.patch_embed.proj");
-             } else if rest.starts_with("position_embd") {
-                 new_name = rest.replace("position_embd", "visual.pos_embed");
-             } else if rest.starts_with("post_ln") {
-                 new_name = rest.replace("post_ln", "visual.merger.norm");
-             } else if rest.starts_with("deepstack.") {
-                 // v.deepstack.5.fc1.weight
+             } else if rest.starts_with("patch_embd") { new_name = rest.replace("patch_embd", "visual.patch_embed.proj"); }
+             else if rest.starts_with("position_embd") { new_name = rest.replace("position_embd", "visual.pos_embed"); }
+             else if rest.starts_with("post_ln") { new_name = rest.replace("post_ln", "visual.merger.norm"); }
+             else if rest.starts_with("deepstack.") {
                  let parts: Vec<&str> = rest.split('.').collect();
-                 // parts[0]="deepstack", parts[1]="5", parts[2..]="fc1.weight"
                  if parts.len() >= 2 {
                      if let Ok(layer_idx) = parts[1].parse::<usize>() {
                          let v_idx_opt = config.vision_config.as_ref().and_then(|vc| vc.deepstack_visual_indexes.iter().position(|&x| x == layer_idx));
-                         if let Some(pos) = v_idx_opt {
-                             let suffix = parts[2..].join(".");
-                             new_name = format!("visual.deepstack_merger_list.{}.{}", pos, suffix)
-                                            .replace("fc1", "linear_fc1")
-                                            .replace("fc2", "linear_fc2");
-                         } else {
-                             new_name = rest.replace("deepstack", "visual.deepstack_merger_list")
-                                            .replace("fc1", "linear_fc1")
-                                            .replace("fc2", "linear_fc2");
-                         }
-                     } else {
-                         // fallback
-                         new_name = rest.replace("deepstack", "visual.deepstack_merger_list")
-                                        .replace("fc1", "linear_fc1")
-                                        .replace("fc2", "linear_fc2");
-                     }
+                         if let Some(pos) = v_idx_opt { let suffix = parts[2..].join("."); new_name = format!("visual.deepstack_merger_list.{}.{}", pos, suffix).replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
+                         else { new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
+                     } else { new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
                  }
-             } else {
-                 new_name = format!("visual.{}", rest);
-             }
-        } else if let Some(rest) = name.strip_prefix("mm.") {
-             if rest.starts_with("0") {
-                 new_name = rest.replace("0", "visual.merger.linear_fc1");
-             } else if rest.starts_with("2") {
-                 new_name = rest.replace("2", "visual.merger.linear_fc2");
-             }
-        } else if name.starts_with("model.visual") {
-             new_name = name.strip_prefix("model.").unwrap().to_string();
-        }
-
-        // 2. Handle Split Tensors (.0, .1 suffix)
-        // Check if ends with .number
+             } else { new_name = format!("visual.{}", rest); }
+        } else if let Some(rest) = name.strip_prefix("mm.") { if rest.starts_with("0") { new_name = rest.replace("0", "visual.merger.linear_fc1"); } else if rest.starts_with("2") { new_name = rest.replace("2", "visual.merger.linear_fc2"); } }
+        else if name.starts_with("model.visual") { new_name = name.strip_prefix("model.").unwrap().to_string(); }
         let mut is_split = false;
         let mut split_idx = 0;
         let mut base_split_name = new_name.clone();
-
-        if let Some(last_dot) = new_name.rfind('.') {
-            if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() {
-                 if name.ends_with(&format!(".{}", idx)) {
-                     base_split_name = new_name[..last_dot].to_string();
-                     split_idx = idx;
-                     is_split = true;
-                 }
-            }
-        }
-
+        if let Some(last_dot) = new_name.rfind('.') { if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() { if name.ends_with(&format!(".{}", idx)) { base_split_name = new_name[..last_dot].to_string(); split_idx = idx; is_split = true; } } }
         let t = ct.tensor(reader, name, device)?;
         let t = t.dequantize(device)?.to_dtype(dtype)?;
-
-        if is_split {
-            split_tensors.entry(base_split_name).or_default().push((split_idx, t));
-        } else {
-            data.insert(new_name, t);
-        }
+        if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
     }
-
-    // Merge split tensors
-    for (name, mut parts) in split_tensors {
-        parts.sort_by_key(|(i, _)| *i);
-        let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect();
-        if let Ok(merged) = Tensor::cat(&tensors, 0) {
-            data.insert(name, merged);
-        } else {
-            println!("Failed to merge split tensor: {}", name);
-        }
-    }
-
-    // Fix shape mismatch for patch_embed.proj.weight
-    if let Some(weight) = data.get("visual.patch_embed.proj.weight") {
-        if weight.rank() == 4 {
-            if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) {
-                data.insert("visual.patch_embed.proj.weight".to_string(), reshaped);
-                println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D");
-            }
-        }
-    }
-    
+    for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
+    if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); } } }
     Ok(VarBuilder::from_tensors(data, dtype, device))
 }

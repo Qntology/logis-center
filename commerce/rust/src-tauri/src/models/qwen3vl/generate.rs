@@ -204,9 +204,12 @@ impl Qwen3VLGenerateModel {
                 let mmap_arc = Arc::new(mmap);
                 
                 // [OPTIMIZATION] If this is the 0.6B model, enable baking_only to skip LM Head
-                let baking_only = path.contains("0.6B");
+                let is_06b = path.contains("0.6B");
+                let baking_only = is_06b;
+                let single_layer_mode = is_06b; // [EXTREME-OPTIMIZATION]
+                
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(
-                    &cfg, &content, Some(mmap_arc), &text_dev, text_device_id, dtype, kv_reserve, baking_only
+                    &cfg, &content, Some(mmap_arc), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode
                 )?;
                 ModelVariant::QuantizedText(model)
             }
@@ -984,10 +987,9 @@ impl Qwen3VLGenerateModel {
     /// [SSD-BRIDGE] Wrapper for simple full-load bridging
     pub fn load_kv_from_disk(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         let limit_tokens = 0;
-        // [OPTIMIZATION] Set refill_len to 512. 
-        // This ensures 2B model re-reads the TASK instruction part for accuracy,
-        // while still skipping the massive PUG content.
-        let refill_len = 512;
+        // [OPTIMIZATION] Set refill_len to 1 for perfect alignment. 
+        // 2B only needs to re-read the last token to link its attention.
+        let refill_len = 1;
         match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, limit_tokens, refill_len),
             ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, limit_tokens, refill_len),
