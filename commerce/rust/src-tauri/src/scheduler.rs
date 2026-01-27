@@ -505,6 +505,9 @@ async fn process_task(
         // --- Step B: Selectors ---
         {
             println!("[Scheduler] 2B Step B: Selector Identification...");
+            // [REWIND] Reset memory to base PUG state (Remove Classification QA)
+            model.load_kv_snapshot(&task.id).await?;
+            
             let selector_prompt = parsing::page_selectors_prompt(&page_type); 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -615,12 +618,10 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             
-            // Note: We are appending the *specific content PUG* to the *base PUG session*.
-            // This might duplicate context if the specific content is already in base PUG.
-            // However, the base PUG was "Full Page". The specific content is "Focused".
-            // To avoid token overflow, ideally we should RESET to Base Snapshot + Append specific.
-            // Since we are resident, we can just append.
-            
+            // [REWIND] Reset memory to base PUG state (Remove previous QA)
+            // Note: Since we are loading PUG snapshot, we append SPECIFIC content pug + Instruction.
+            model.load_kv_snapshot(&task.id).await?;
+
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                     content: ChatCompletionRequestUserMessageContent::Text(format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", content_pug, extraction_instruction)),

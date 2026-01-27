@@ -1563,7 +1563,7 @@ impl QuantizedQwen3VLModel {
 
 pub struct QuantizedQwen3TextModel {
     pub language_model: QuantizedQwen3VLTextModel,
-    pub lm_head: QLinear,
+    pub lm_head: Option<QLinear>,
     pub text_device: Device,
     pub mmap: Option<Arc<Mmap>>,
 }
@@ -1577,8 +1577,9 @@ impl QuantizedQwen3TextModel {
         text_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
+        baking_only: bool,
     ) -> Result<Self> {
-        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized) with Mmap");
+        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized) with Mmap (Baking-Only: {})", baking_only);
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
 
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
@@ -1592,15 +1593,20 @@ impl QuantizedQwen3TextModel {
             kv_reserve
         )?;
 
-        let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
-        let mut reader = std::io::Cursor::new(mmap);
-        let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) {
-            l
-        } else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) {
-            l
+        let lm_head = if !baking_only {
+            let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+            let mut reader = std::io::Cursor::new(mmap);
+            let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
+            let head = if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) {
+                Some(l)
+            } else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) {
+                Some(l)
+            } else {
+                get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype).ok()
+            };
+            head
         } else {
-            get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype)?
+            None
         };
 
         Ok(Self {
@@ -1619,8 +1625,9 @@ impl QuantizedQwen3TextModel {
         text_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
+        baking_only: bool,
     ) -> Result<Self> {
-        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized)");
+        println!("[MODEL] Loading as Pure Text Model (0.6B Optimized) (Baking-Only: {})", baking_only);
         
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
 
@@ -1635,13 +1642,18 @@ impl QuantizedQwen3TextModel {
             kv_reserve
         )?;
 
-        let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
-            l
-        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
-            l
+        let lm_head = if !baking_only {
+            let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
+            let head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
+                Some(l)
+            } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
+                Some(l)
+            } else {
+                get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype).ok()
+            };
+            head
         } else {
-            get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+            None
         };
 
         Ok(Self {
@@ -1697,13 +1709,19 @@ impl QuantizedQwen3TextModel {
         let seq_len = outputs.dim(1)?;
         let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
         
-        let hidden_state = if !hidden_state.device().same_device(self.lm_head.device()) {
-            hidden_state.to_device(self.lm_head.device())?
+        if let Some(head) = &self.lm_head {
+            let hidden_state = if !hidden_state.device().same_device(head.device()) {
+                hidden_state.to_device(head.device())?
+            } else {
+                hidden_state
+            };
+            Ok(head.forward(&hidden_state)?)
         } else {
-            hidden_state
-        };
-
-        Ok(self.lm_head.forward(&hidden_state)?)
+            // Baking-only mode: return raw hidden states (logits shape mismatch but expected by caller to be ignored if baking)
+            // Actually, generate.rs expects logits. If baking_only, generate.rs shouldn't be calling generate loop.
+            // Returning hidden_state as a dummy tensor.
+            Ok(hidden_state)
+        }
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
@@ -1720,7 +1738,9 @@ impl QuantizedQwen3TextModel {
     /// [SLEEP-MODE] Moves text-only model between devices
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         self.language_model.to_device(device)?;
-        self.lm_head.to_device(device)?;
+        if let Some(head) = &mut self.lm_head {
+            head.to_device(device)?;
+        }
         self.text_device = device.clone();
         Ok(())
     }
