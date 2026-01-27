@@ -407,35 +407,36 @@ async fn process_task(
     };
 
     let mut page_type = String::new();
-    let mut selector_info = json!({});
+    let mut selector_info: serde_json::Value = json!({});
 
     // ==================================================================================
-    // [OPTIMIZED PIPELINE]
-    // Phase 1: Baking (0.6B) -> Ingest PUG & Save Context
-    // Phase 2: Inference (2B) -> Load Context & Run Sequential Tasks (Classify -> Selector -> Detail)
-    // Phase 3: Handover -> Unload 2B, Load Embedding Model for DB Ops
+    // [ULTRA-OPTIMIZED PIPELINE]
+    // Step 1: 0.6B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
+    // Step 2: 2B Loads SNAPSHOT_A -> Instant Generation
+    // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
+    // Step 4: 2B Loads SNAPSHOT_B -> Instant Generation
+    // ...
     // ==================================================================================
 
-    // --- PHASE 1: BAKING (0.6B) ---
+    // --- STEP A: CLASSIFICATION (Bake with 0.6B -> Infer with 2B) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] PHASE 1: Baking PUG Context with 0.6B...");
+        println!("[Scheduler] STEP A: Classification Baking...");
         
-        let payload = json!({ 
-            "task_id": task.id, "category": "Context Baking", "summary": "Optimizing context...", "spinner": "⠋" 
-        });
-        let _ = app_handle.emit("extraction-progress", &payload);
+        let type_prompt = parsing::page_type_prompt();
+        let prompt_a = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt);
+        let session_a = format!("{}_a", task.id);
 
-        // 1. Ensure Small Model
+        // 1. Ensure Small Model (Resident)
         model.ensure_generator(crate::model::ModelSize::Small).await?;
 
-        // 2. Prefill PUG Only (No specific task yet)
+        // 2. Prefill Entire Prompt (PUG + Task)
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                content: ChatCompletionRequestUserMessageContent::Text(light_pug.clone()),
+                content: ChatCompletionRequestUserMessageContent::Text(prompt_a),
                 name: None,
             })],
-            model: "qwen3vl".to_string(), max_tokens: Some(1), temperature: Some(0.1), // minimal generation
+            model: "qwen3vl".to_string(), max_tokens: Some(1), temperature: Some(0.1),
             ..Default::default()
         };
 
@@ -443,98 +444,94 @@ async fn process_task(
             let model_clone = model.clone();
             let params_clone = params.clone();
             let token_clone = cancellation_token.clone();
-            let task_id_clone = task.id.clone();
+            let sid_clone = session_a.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();
                 let mut small_gen_lock = model_clone.generator.blocking_lock();
                 if let Some(worker) = small_gen_lock.as_mut() {
-                    // Just prefill the PUG. This sets up the base KV.
-                    worker.prefill_only(params_clone, Some(token_clone), Some(task_id_clone), None)?;
+                    // 0.6B bakes the entire context including the task
+                    worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 3. Save Snapshot (Base for 2B)
-        model.save_kv_snapshot(&task.id).await?;
-        
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled after baking")); }
-    }
+        // 3. Transition to 2B (Save is handled implicitly by prefill_only)
+        model.secure_vram_relay(crate::model::ModelSize::Large, Some(&session_a), Some(cancellation_token.clone())).await?;
 
-    // --- PHASE 2: INFERENCE (2B Resident) ---
-    // [CRITICAL] 2B is loaded ONCE here and stays resident until explicit unload in Phase 3.
-    {
-        println!("[Scheduler] PHASE 2: Starting 2B Resident Inference Session...");
-        
-        // 1. Secure Transition to 2B (Loads Model + Loads Base Snapshot)
-        model.secure_vram_relay(crate::model::ModelSize::Large, Some(&task.id), Some(cancellation_token.clone())).await?;
-        
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled during VRAM relay")); }
-
-        // --- Step A: Classification ---
-        {
-            println!("[Scheduler] 2B Step A: Classification...");
-            let type_prompt = parsing::page_type_prompt();
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", type_prompt)),
-                    name: None,
-                })],
-                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
-                ..Default::default()
-            };
-
-            let res = model.chat_params_with_spinner(
-                params, app_handle, "extraction-progress",
-                json!({ "task_id": task.id, "category": "Classification", "summary": "Identifying page type..." }),
-                Some(cancellation_token.clone()), Some(task.id.clone()) // Reuse Session
-            ).await?;
-            
+        // 4. 2B Instant Inference
+        if let Some(gen) = model.generator.lock().await.as_mut() {
+            println!("[Scheduler] 2B Step A: Instant Classification...");
+            let res = gen.generate(params, Some(cancellation_token.clone()), Some(session_a))?;
             let type_info = parsing::parse_json_from_llm(&res); 
             page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            
             println!("[Scheduler] Classified as: {}", page_type);
         }
 
         if page_type.is_empty() || page_type == "unknown" { 
-            model.unload_generator().await; // Early exit cleanup
+            model.unload_generator().await;
             return Ok(()); 
         }
+    }
 
-        // --- Step B: Selectors ---
+    // --- STEP B: SELECTORS (Bake with 0.6B -> Infer with 2B) ---
+    {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        println!("[Scheduler] STEP B: Selector Baking...");
+        
+        let selector_prompt = parsing::page_selectors_prompt(&page_type); 
+        let prompt_b = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, selector_prompt);
+        let session_b = format!("{}_b", task.id);
+
+        // 1. Transition back to 0.6B (Fast Resident)
+        model.ensure_generator(crate::model::ModelSize::Small).await?;
+
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                content: ChatCompletionRequestUserMessageContent::Text(prompt_b),
+                name: None,
+            })],
+            model: "qwen3vl".to_string(), max_tokens: Some(1), temperature: Some(0.1),
+            ..Default::default()
+        };
+
         {
-            println!("[Scheduler] 2B Step B: Selector Identification...");
-            // [REWIND] Reset memory to base PUG state (Remove Classification QA)
-            model.load_kv_snapshot(&task.id).await?;
-            
-            let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(format!("TASK: {}\n\nACTION: JSON ONLY", selector_prompt)),
-                    name: None,
-                })],
-                model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
-                ..Default::default()
-            };
+            let model_clone = model.clone();
+            let params_clone = params.clone();
+            let token_clone = cancellation_token.clone();
+            let sid_clone = session_b.clone();
 
-            let res = model.chat_params_with_spinner(
-                params, app_handle, "extraction-progress",
-                json!({ "task_id": task.id, "category": "Selector Analysis", "summary": "Finding data structures..." }),
-                Some(cancellation_token.clone()), Some(task.id.clone()) // Reuse Session (Append)
-            ).await?;
-            
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                crate::utils::resources::set_current_thread_low_priority();
+                let mut small_gen_lock = model_clone.generator.blocking_lock();
+                if let Some(worker) = small_gen_lock.as_mut() {
+                    worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
+                }
+                Ok(())
+            }).await??;
+        }
+
+        // 2. Transition to 2B
+        model.secure_vram_relay(crate::model::ModelSize::Large, Some(&session_b), Some(cancellation_token.clone())).await?;
+
+        // 3. 2B Instant Inference
+        if let Some(gen) = model.generator.lock().await.as_mut() {
+            println!("[Scheduler] 2B Step B: Instant Selector Extraction...");
+            let res = gen.generate(params, Some(cancellation_token.clone()), Some(session_b))?;
             selector_info = parsing::parse_json_from_llm(&res);
             println!("[Scheduler] Selectors Identified.");
         }
-    } // End of 2B Block Scope (Note: Model is NOT unloaded yet)
+    }
 
     // [INTERMEDIATE PARITY LOGIC] Save Page Info
     let mut final_page_info = json!({ "type": page_type });
     if let Some(obj) = selector_info.as_object() {
-        for (k, v) in obj { final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone()); }
+        for (k, v) in obj { 
+            final_page_info.as_object_mut().unwrap().insert(k.clone(), v.clone()); 
+        }
     }
-    let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_detail = selector_info.get("detail").and_then(|v: &serde_json::Value| v.as_bool()).unwrap_or(false);
     
     // [PARITY] Store 'Page' Entity
     {
@@ -553,7 +550,7 @@ async fn process_task(
         let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
         let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
 
-        let mut page_data = selector_info.clone();
+        let mut page_data: serde_json::Value = selector_info.clone();
         if let Some(obj) = page_data.as_object_mut() {
             obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
             obj.insert("link".to_string(), json!(url_obj.path().to_string() + url_obj.query().map(|q| format!("?{}", q)).unwrap_or_default().as_str()));
@@ -601,7 +598,7 @@ async fn process_task(
 
     } else {
         // [DETAIL MODE] LLM Extraction required
-        println!("[Scheduler] 2B Step C: Detail Extraction...");
+        println!("[Scheduler] STEP C: Detail Extraction Baking...");
         
         let content_pug = {
             let clean_content = data_manager.load(&clean_html_path)?;
@@ -617,27 +614,46 @@ async fn process_task(
 
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
-            
-            // [REWIND] Reset memory to base PUG state (Remove previous QA)
-            // Note: Since we are loading PUG snapshot, we append SPECIFIC content pug + Instruction.
-            model.load_kv_snapshot(&task.id).await?;
+            let prompt_c = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", content_pug, extraction_instruction);
+            let session_c = format!("{}_c", task.id);
+
+            // 1. Transition back to 0.6B
+            model.ensure_generator(crate::model::ModelSize::Small).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", content_pug, extraction_instruction)),
+                    content: ChatCompletionRequestUserMessageContent::Text(prompt_c),
                     name: None,
                 })],
                 model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
                 ..Default::default()
             };
 
-            let res = model.chat_params_with_spinner(
-                params, app_handle, "extraction-progress",
-                json!({ "task_id": task.id, "category": "Detail Extraction", "summary": "Extracting fields..." }),
-                Some(cancellation_token.clone()), Some(task.id.clone())
-            ).await?;
-            
-            extracted_data = parsing::parse_json_from_llm(&res);
+            {
+                let model_clone = model.clone();
+                let params_clone = params.clone();
+                let token_clone = cancellation_token.clone();
+                let sid_clone = session_c.clone();
+
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    crate::utils::resources::set_current_thread_low_priority();
+                    let mut small_gen_lock = model_clone.generator.blocking_lock();
+                    if let Some(worker) = small_gen_lock.as_mut() {
+                        worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
+                    }
+                    Ok(())
+                }).await??;
+            }
+
+            // 2. Transition to 2B
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&session_c), Some(cancellation_token.clone())).await?;
+
+            // 3. 2B Instant Inference
+            if let Some(gen) = model.generator.lock().await.as_mut() {
+                println!("[Scheduler] 2B Step C: Instant Detail Extraction...");
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(session_c))?;
+                extracted_data = parsing::parse_json_from_llm(&res);
+            }
         }
     }
 

@@ -1097,12 +1097,11 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-        use rayon::prelude::*;
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
-        // [PARALLEL] Save all 28 layers in parallel to maximize Disk/CPU throughput
-        self.layers.par_iter_mut().try_for_each(|layer| {
+        // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
+        self.layers.iter_mut().try_for_each(|layer| {
             layer.save_kv_cache(path, clear, block_size)
         })
     }
@@ -1112,10 +1111,9 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
-        use rayon::prelude::*;
         if path.exists() {
-            // [PARALLEL] Load all 28 layers in parallel
-            self.layers.par_iter_mut().try_for_each(|layer| {
+            // [STABILITY] Use sequential loading to avoid CUDA_ERROR_INVALID_CONTEXT
+            self.layers.iter_mut().try_for_each(|layer| {
                 layer.load_kv_cache(path, device, expected_len, upscale_refill_len)
             })
         } else {

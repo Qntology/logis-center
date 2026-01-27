@@ -202,7 +202,12 @@ impl Qwen3VLGenerateModel {
                 let mut cursor = std::io::Cursor::new(&mmap[..]);
                 let content = gguf_file::Content::read(&mut cursor)?;
                 let mmap_arc = Arc::new(mmap);
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(mmap_arc), &text_dev, text_device_id, dtype, kv_reserve)?;
+                
+                // [OPTIMIZATION] If this is the 0.6B model, enable baking_only to skip LM Head
+                let baking_only = path.contains("0.6B");
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(
+                    &cfg, &content, Some(mmap_arc), &text_dev, text_device_id, dtype, kv_reserve, baking_only
+                )?;
                 ModelVariant::QuantizedText(model)
             }
         } else {
@@ -284,21 +289,9 @@ impl Qwen3VLGenerateModel {
             println!("[PREFILL] Starting real-time relay: 0/{} tokens (0%)", total_tokens);
 
             while current_pos < total_tokens {
-
                 let remaining = total_tokens - current_pos;
-
-                let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
-
+                let chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
     
-
-                // [CRITICAL] Leave at least 1 token for the generate() call
-
-                if current_pos + chunk_size >= total_tokens { 
-
-                    chunk_size = (total_tokens - current_pos).saturating_sub(1); 
-
-                }
-
                 if chunk_size == 0 { break; }
 
     
@@ -415,7 +408,8 @@ impl Qwen3VLGenerateModel {
 
             // Save progress if session_id is provided (for CPU sequential mode)
         if let Some(sid) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            // [FIX] Match the path convention expected by load_kv_snapshot (folder ending in .safetensors)
+            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", sid));
             if !path.exists() { let _ = fs::create_dir_all(&path); }
             
             match &mut self.qwen3_vl {
@@ -518,16 +512,22 @@ impl Qwen3VLGenerateModel {
         let is_ingest = input.replace_text.contains("ACTION: INGEST");
         let is_save = input.replace_text.contains("ACTION: SAVE");
         
-        // [FIX] CHECK LIVE CACHE FIRST: If 0.6B just injected KV, detect it here.
+        // [FIX] CHECK LIVE CACHE FIRST: Verify tokens actually match the prompt prefix.
         let live_kv_len = self.get_kv_len();
-        let mut seqlen_offset = live_kv_len; 
+        let mut seqlen_offset = 0; 
 
         if live_kv_len > 0 {
-            // [STRICT-RELAY-MATCH] If we have at least total_tokens - 1, it's a perfect relay match.
-            if live_kv_len >= total_tokens.saturating_sub(1) && total_tokens > 0 {
-                println!("[KV-BRIDGE] Perfect Relay Match ({} tokens). Direct Inference Start!", live_kv_len);
-                seqlen_offset = total_tokens - 1; 
-            } else {
+            // [STRICT-RELAY-MATCH] We must verify that the tokens in the cache match the prompt.
+            // Since we don't store the tokens in the live cache struct directly, 
+            // we rely on the session logic or assume the caller has ensured compatibility.
+            // However, we can check if it's a "Full Match" (all prompt tokens already in cache).
+            if live_kv_len >= total_tokens && total_tokens > 0 {
+                println!("[KV-BRIDGE] Full Prompt Match ({} tokens). Instant Generation!", live_kv_len);
+                seqlen_offset = total_tokens; 
+            } else if live_kv_len > 0 {
+                // If it's a partial match, we start from where we left off.
+                // Note: The caller must ensure that the tokens up to live_kv_len match.
+                seqlen_offset = live_kv_len;
                 println!("[KV-BRIDGE] Partial Cache Match ({} tokens). Prefilling remaining.", live_kv_len);
             }
         }
@@ -678,6 +678,7 @@ impl Qwen3VLGenerateModel {
 
         if seqlen_offset >= total_tokens && total_tokens > 0 {
             println!("\n[KV-BRIDGE] Context fully matched in cache. Starting generation immediately.");
+            // We start the generation loop with the LAST token of the prompt to get the first predicted token
             seqlen_offset = total_tokens - 1;
             input_ids = Tensor::from_vec(vec![full_input_ids_vec[seqlen_offset]], (1, 1), &self.text_device)?;
             cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.text_device)?;
