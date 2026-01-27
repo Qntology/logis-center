@@ -758,6 +758,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(&xs)?;
         let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+        
+        // [HARDENING] Residual Addition DType Guard
+        let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
         let xs = residual.add(&xs)?;
         
         let residual = xs.clone();
@@ -769,6 +772,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let hidden = gate.mul(&up)?;
             self.mlp_down.forward(&hidden)?
         };
+        // [HARDENING] Second Residual Addition DType Guard
+        let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
         let xs = residual.add(&xs)?;
         Ok(xs)
     }
@@ -1079,9 +1084,9 @@ impl QuantizedQwen3VLTextModel {
             self.mrope_section.clone(),
         )?;
         
-        let mut xs = inputs_embeds.clone();
+        let xs = inputs_embeds.clone();
         let target_dtype = if xs.device().is_cuda() { DType::BF16 } else { DType::F32 };
-        let xs = xs.to_dtype(target_dtype)?.contiguous()?;
+        let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
 
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
@@ -1104,10 +1109,14 @@ impl QuantizedQwen3VLTextModel {
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
-                    let mask = visual_pos_masks.unwrap();
-                    let embed = &deepstack_embeds[layer_idx];
-                    let mask = if !mask.device().same_device(xs.device()) { mask.to_device(xs.device())? } else { mask.clone() };
-                    let embed = if !embed.device().same_device(xs.device()) { embed.to_device(xs.device())? } else { embed.clone() };
+                    let m_orig = visual_pos_masks.unwrap();
+                    let e_orig = &deepstack_embeds[layer_idx];
+                    
+                    let mask = if !m_orig.device().same_device(xs.device()) { m_orig.to_device(xs.device())? } else { m_orig.clone() };
+                    let embed = if !e_orig.device().same_device(xs.device()) { e_orig.to_device(xs.device())? } else { e_orig.clone() };
+                    
+                    // [HARDENING] Visual Merge DType Guard
+                    let embed = if embed.dtype() != xs.dtype() { embed.to_dtype(xs.dtype())? } else { embed };
 
                     xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
                 }
@@ -1413,7 +1422,12 @@ impl QuantizedQwen3VLModel {
         let position_ids = if let Some(cache_pos) = cache_position { let start = cache_pos.i(0)?.to_scalar::<u32>()?; Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? } else { position_ids };
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
-        let hidden_state = if !hidden_state.device().same_device(self.lm_head.device()) { hidden_state.to_device(self.lm_head.device())? } else { hidden_state };
+        let head_dev = self.lm_head.device();
+        let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
+        
+        let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
+        let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
+        
         Ok(self.lm_head.forward(&hidden_state)?)
     }
 
