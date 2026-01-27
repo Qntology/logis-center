@@ -106,7 +106,7 @@ impl QLinear {
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
         // Ensure input matches layer device and target internal dtype
-        let mut xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         
         // QMatMul typically performs better/required F32 for the math part in some kernels
         let xs_f32 = xs.to_dtype(DType::F32)?;
@@ -1196,41 +1196,40 @@ impl QuantizedQwen3VLTextModel {
 
         if self.single_layer_mode {
             // [EXTREME-BAKING] Replicate first layer KV to all 28 layers using 1-bit
-            if let Some(layer0) = self.layers.get_mut(0) {
-                // Use explicit types to help the compiler
-                let mut kp_opt: Option<Tensor> = None;
-                let mut ks_opt: Option<Tensor> = None;
-                let mut ksh_opt: Option<Vec<usize>> = None;
-                let mut vp_opt: Option<Tensor> = None;
-                let mut vs_opt: Option<Tensor> = None;
+            // 1. Extract the KV cache from the first layer
+            let kv_data = if let Some(layer0) = self.layers.get(0) {
+                layer0.self_attn.kv_cache.clone()
+            } else {
+                None
+            };
 
-                if let Some((k, v)) = &layer0.self_attn.kv_cache {
-                    let k_cpu = k.to_device(&Device::Cpu)?;
-                    let v_cpu = v.to_device(&Device::Cpu)?;
-                    let (kp, ks, ksh) = self.compress_to_1bit(&k_cpu)?;
-                    let (vp, vs, _) = self.compress_to_1bit(&v_cpu)?;
-                    kp_opt = Some(kp);
-                    ks_opt = Some(ks);
-                    ksh_opt = Some(ksh);
-                    vp_opt = Some(vp);
-                    vs_opt = Some(vs);
-                }
+            if let Some((k, v)) = kv_data {
+                // 2. Compress the data using self methods (no longer overlapping with layers borrow)
+                let k_cpu = k.to_device(&Device::Cpu)?;
+                let v_cpu = v.to_device(&Device::Cpu)?;
+                let (kp, ks, ksh) = self.compress_to_1bit(&k_cpu)?;
+                let (vp, vs, _) = self.compress_to_1bit(&v_cpu)?;
 
-                if let (Some(kp), Some(ks), Some(ksh), Some(vp), Some(vs)) = (kp_opt, ks_opt, ksh_opt, vp_opt, vs_opt) {
-                    for i in 0..28 {
-                        let file = path.join(format!("layer_{}_kv.safetensors", i));
-                        let mut map = HashMap::new();
-                        map.insert("k_packed".to_string(), kp.clone());
-                        map.insert("v_packed".to_string(), vp.clone());
-                        map.insert("k_scales".to_string(), ks.clone());
-                        map.insert("v_scales".to_string(), vs.clone());
-                        map.insert("k_shape".to_string(), Tensor::from_vec(ksh.iter().map(|&x| x as u32).collect(), (ksh.len(),), &Device::Cpu)?);
-                        map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-                        map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
-                        candle_core::safetensors::save(&map, &file)?;
-                    }
+                // 3. Save to disk 28 times
+                for i in 0..28 {
+                    let file = path.join(format!("layer_{}_kv.safetensors", i));
+                    let mut map = HashMap::new();
+                    map.insert("k_packed".to_string(), kp.clone());
+                    map.insert("v_packed".to_string(), vp.clone());
+                    map.insert("k_scales".to_string(), ks.clone());
+                    map.insert("v_scales".to_string(), vs.clone());
+                    map.insert("k_shape".to_string(), Tensor::from_vec(ksh.iter().map(|&x| x as u32).collect(), (ksh.len(),), &Device::Cpu)?);
+                    map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
+                    map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
+                    candle_core::safetensors::save(&map, &file)?;
                 }
-                if clear { layer0.clear_kv_cache(); }
+            }
+
+            // 4. Clear cache if requested
+            if clear {
+                if let Some(layer0) = self.layers.get_mut(0) {
+                    layer0.clear_kv_cache();
+                }
             }
             Ok(())
         } else {
