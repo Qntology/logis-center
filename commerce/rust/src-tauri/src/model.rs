@@ -642,7 +642,7 @@ impl LogisModel {
                 println!("[MODEL] Large model active. Forcing Embedding to CPU to prevent swapping.");
             },
             Some(ModelSize::Small) => {
-                // Small and Embedding can coexist. Do nothing (don't unload).
+                // Small and Embedding can coexist. 
                 println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
             },
             None => {
@@ -664,8 +664,9 @@ impl LogisModel {
             
             println!("[MODEL] Loading Embedding Model on {:?}...", if target_device.is_cpu() { "CPU" } else { "GPU" });
             
+            let target_device_clone = target_device.clone();
             let emb = tokio::task::spawn_blocking(move || {
-                EmbeddingModel::new_with_device(&self_clone, &target_device)
+                EmbeddingModel::new_with_device(&self_clone, &target_device_clone)
             }).await??;
             
             *emb_guard = Some(emb);
