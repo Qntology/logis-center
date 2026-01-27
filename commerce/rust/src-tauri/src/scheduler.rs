@@ -463,6 +463,10 @@ async fn process_task(
         // 1. [0.6B] Bake PUG & Save to Disk
         {
             println!("[Scheduler] Phase 1: Baking PUG with 0.6B...");
+            // [DEBUG] PUG 저장
+            let _ = data_manager.offload(&pug_content, "step_a_pug");
+            let _ = data_manager.offload(&task_question, "step_a_task");
+
             // [ISOLATION] 0.6B를 깨끗한 상태에서 로드
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             
@@ -546,6 +550,10 @@ async fn process_task(
 
         // 1. [0.6B] Bake PUG & Save
         {
+            // [DEBUG] PUG 저장
+            let _ = data_manager.offload(&pug_content, "step_b_pug");
+            let _ = data_manager.offload(&task_question, "step_b_task");
+
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             let model_clone = model.clone();
             let pug_clone = pug_content.clone();
@@ -683,6 +691,10 @@ async fn process_task(
 
             // 1. [0.6B] Bake Detail PUG & Save
             {
+                // [DEBUG] PUG 저장
+                let _ = data_manager.offload(&pug_content, "step_c_pug");
+                let _ = data_manager.offload(&task_question, "step_c_task");
+
                 model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
                 let model_clone = model.clone();
                 let pug_clone = pug_content.clone();

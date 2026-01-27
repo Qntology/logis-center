@@ -372,24 +372,29 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // 1. [CLEANUP] 기존 모델과 메모리를 완전히 비우고 시작
+        // 1. [SYNC] 언로드 전 현재 작업을 안전하게 마무리
+        if !self.is_cpu_mode {
+            let dev_clone = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev_clone.is_cuda() { let _ = dev_clone.synchronize(); }
+            }).await;
+        }
+
+        // 2. [CLEANUP] 기존 모델과 메모리를 완전히 비움
         println!("[RELAY] Purging current resources to prepare for {:?}...", target_size);
         self.unload_generator().await;
         self.unload_embedding().await;
         
         if !self.is_cpu_mode {
-            let dev_clone = self.device_config.device.clone();
-            tokio::task::spawn_blocking(move || {
-                if dev_clone.is_cuda() { let _ = dev_clone.synchronize(); }
-            }).await?;
-            // VRAM이 실제로 비워질 때까지 충분히 대기 (안정 마진 확보)
+            // VRAM이 실제로 비워질 때까지 대기 (직접적인 CUDA 호출 자제)
+            tokio::time::sleep(Duration::from_millis(500)).await;
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 2. [LOAD] 새 모델 로드
+        // 3. [LOAD] 새 모델 로드
         self.ensure_generator(target_size).await?;
 
-        // 3. [RESTORE] 디스크 스냅샷이 있다면 로드 (Disk Bridge)
+        // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
             self.load_kv_snapshot(tid).await?;
         }
