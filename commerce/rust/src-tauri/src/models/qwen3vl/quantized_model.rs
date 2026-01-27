@@ -165,8 +165,13 @@ impl QuantizedQwen3VLTextAttention {
         self.o_proj.to_device(device)?;
         self.q_norm.to_device(device)?;
         self.k_norm.to_device(device)?;
+        
         if let Some((k, v)) = &self.kv_cache {
-            self.kv_cache = Some((k.to_device(device)?, v.to_device(device)?));
+            let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+            self.kv_cache = Some((
+                k.to_device(device)?.to_dtype(target_dtype)?, 
+                v.to_device(device)?.to_dtype(target_dtype)?
+            ));
         }
         Ok(())
     }

@@ -496,6 +496,12 @@ async fn process_task(
         }
     }
 
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+    // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
+    model.deep_purge_resources().await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+
     // --- STEP B: SELECTORS (Dual-Engine Real-Time Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }

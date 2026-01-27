@@ -381,18 +381,29 @@ impl LogisModel {
 
         // 1. Check current state
         let current_size_val = { *self.current_size.lock().await };
-        if current_size_val == Some(target_size) {
-            return Ok(()); // Already loaded
-        }
-
+        
         println!("[RELAY] Starting Secure Transition to {:?} (Mode: {})...", target_size, if self.is_cpu_mode { "CPU" } else { "GPU" });
 
-        // 2. [STRATEGY] High-priority exclusion logic
+        // 2. [STRATEGY] Handover
         if target_size == ModelSize::Large {
-            // [CRITICAL] On 4GB cards, we MUST unload EVERYTHING to ensure Large fits in GPU.
-            // Coexistence with 0.6B is too risky for the initial load.
-            self.unload_generator().await;
+            // Force clean everything to give 2B maximum room
             self.unload_embedding().await;
+            
+            if !self.is_cpu_mode {
+                let dev_clone = self.device_config.device.clone();
+                tokio::task::spawn_blocking(move || {
+                    if dev_clone.is_cuda() { let _ = dev_clone.synchronize(); }
+                }).await?;
+                self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
+            }
+        }
+
+        if current_size_val == Some(target_size) {
+            let gen_guard = self.generator.lock().await;
+            if gen_guard.is_some() {
+                println!("[RELAY] Already correct size and loaded.");
+                return Ok(());
+            }
         }
 
         if self.is_cpu_mode {
