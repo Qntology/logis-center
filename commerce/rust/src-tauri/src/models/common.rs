@@ -69,6 +69,7 @@ impl Module for GateUpDownMLP {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct TwoLinearMLP {
     linear1: Linear,
     linear2: Linear,

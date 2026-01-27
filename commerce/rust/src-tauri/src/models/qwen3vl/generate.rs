@@ -1,19 +1,36 @@
 use anyhow::{Result, anyhow};
-use candle_core::{DType, Device, Tensor, IndexOp};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
+use candle_nn::VarBuilder;
+use candle_transformers::utils::apply_repeat_penalty;
+
+use crate::{
+    chat_template::ChatTemplate,
+    models::{
+        qwen3vl::{
+            config::{Qwen3VLConfig, Qwen3VLGenerationConfig},
+            model::Qwen3VLModel,
+            quantized_model::QuantizedQwen3VLModel,
+            processor::Qwen3VLProcessor,
+        },
+    },
+    tokenizer::TokenizerModel,
+    utils::{
+        find_type_files,
+        get_device,
+        get_dtype,
+        get_logit_processor,
+    },
+    openai_types::ChatCompletionParameters,
+};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::fs;
 use std::path::Path;
 
-use crate::models::qwen3vl::config::Qwen3VLConfig;
-use crate::models::qwen3vl::quantized_model::{QuantizedQwen3VLModel, QuantizedQwen3TextModel};
-use crate::openai_types::ChatCompletionParameters;
-
 #[derive(Clone)]
 pub enum ModelVariant {
-    Standard(Box<crate::models::qwen3vl::model::Qwen3VLModel>),
+    Standard(crate::models::qwen3vl::model::Qwen3VLModel),
     QuantizedVL(QuantizedQwen3VLModel),
-    QuantizedText(QuantizedQwen3TextModel),
+    QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel),
 }
 
 impl ModelVariant {
@@ -27,109 +44,165 @@ impl ModelVariant {
 }
 
 pub struct Qwen3VLGenerateModel {
-    pub chat_template: crate::chat_template::ChatTemplate,
-    pub tokenizer: crate::tokenizer::Qwen3Tokenizer,
-    pub pre_processor: crate::parsing::Qwen3VLPreProcessor,
-    pub qwen3_vl: ModelVariant, // Restore original name
+    pub chat_template: ChatTemplate,
+    pub tokenizer: TokenizerModel,
+    pub pre_processor: Qwen3VLProcessor,
+    pub qwen3_vl: ModelVariant,
     pub text_device: Device,
     pub vision_device: Device,
     pub eos_token_id1: u32,
     pub eos_token_id2: u32,
-    pub generation_config: crate::models::qwen3vl::config::Qwen3VLGenerationConfig,
+    pub generation_config: Qwen3VLGenerationConfig,
     pub model_name: String,
-    pub hard_token_limit: usize,
+    pub hard_token_limit: Option<usize>,
 }
 
 impl Qwen3VLGenerateModel {
+    pub fn init(
+        path: &str,
+        text_device: Option<&Device>,
+        text_device_id: usize,
+        vision_device: Option<&Device>,
+        vision_device_id: usize,
+        dtype: Option<DType>,
+        hard_token_limit: Option<usize>
+    ) -> Result<Self> {
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit)
+    }
+
+    pub fn init_with_tokenizer(
+        path: &str,
+        tokenizer_path: Option<&str>,
+        text_device: Option<&Device>,
+        text_device_id: usize,
+        vision_device: Option<&Device>,
+        vision_device_id: usize,
+        dtype: Option<DType>,
+        hard_token_limit: Option<usize>
+    ) -> Result<Self> {
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit) 
+    }
+
     pub fn init_with_config(
         path: &str,
-        mmproj_path: Option<&str>,
+        tokenizer_path: Option<&str>,
         config_path: Option<&str>,
         text_device: Option<&Device>,
         text_device_id: usize,
         vision_device: Option<&Device>,
         vision_device_id: usize,
         dtype: Option<DType>,
-        max_tokens: Option<usize>,
+        hard_token_limit: Option<usize>
     ) -> Result<Self> {
-        let text_dev = text_device.cloned().unwrap_or(Device::Cpu);
-        let vision_dev = vision_device.cloned().unwrap_or(Device::Cpu);
-        let dtype = dtype.unwrap_or(DType::F32);
-        
-        let model_path = Path::new(path);
-        let config_file = config_path.map(Path::new).unwrap_or(&model_path.join("config.json")).to_path_buf();
-        let config_str = fs::read_to_string(&config_file)?;
-        let cfg: Qwen3VLConfig = serde_json::from_str(&config_str)?;
-        
-        let tokenizer_file = model_path.join("tokenizer.json");
-        let tokenizer = crate::tokenizer::Qwen3Tokenizer::new(&tokenizer_file.to_string_lossy())?;
-        
-        let chat_template_file = model_path.join("chat_template.json");
-        let chat_template = crate::chat_template::ChatTemplate::new(&chat_template_file.to_string_lossy())?;
-        
-        let pre_processor = crate::parsing::Qwen3VLPreProcessor::new(&cfg)?;
-        
-        let eos_token_id1 = cfg.text_config.as_ref().and_then(|c| c.eos_token_id).unwrap_or(151643) as u32;
-        let eos_token_id2 = 151645;
-        
-        let generation_config = crate::models::qwen3vl::config::Qwen3VLGenerationConfig {
-            max_new_tokens: 2048,
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: 40,
-            repetition_penalty: 1.1,
-            eos_token_id: vec![eos_token_id1, eos_token_id2],
+        let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
+        let tok_path = tokenizer_path.unwrap_or(path);
+        let tok_path = if let Some(stripped) = tok_path.strip_prefix(r"\\?\") { stripped } else { tok_path };
+
+        let cfg_path = config_path.unwrap_or(path);
+        let cfg_path = if let Some(stripped) = cfg_path.strip_prefix(r"\\?\") { stripped } else { cfg_path };
+
+        let chat_template = ChatTemplate::init(tok_path)?;
+        let tokenizer = TokenizerModel::init(tok_path)?;
+        let final_config_path = std::path::Path::new(cfg_path).join("config.json");
+
+        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&final_config_path)?)?;
+
+        let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() {
+            serde_json::from_value(raw_config)?
+        } else {
+            let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
+            crate::models::qwen3vl::config::Qwen3VLConfig {
+                architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                hidden_size: raw_config.get("hidden_size").and_then(|v| v.as_u64()).map(|v| v as usize),
+                image_token_id: raw_config.get("image_token_id").and_then(|v| v.as_u64()).map(|v| v as usize),
+                model_type: raw_config.get("model_type").and_then(|v| v.as_str()).unwrap_or("qwen2").to_string(),
+                text_config: Some(text_config),
+                tie_word_embeddings: raw_config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(true),
+                torch_dtype: raw_config.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                transformers_version: raw_config.get("transformers_version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                video_token_id: raw_config.get("video_token_id").and_then(|v| v.as_u64()).map(|v| v as usize),
+                vision_config: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+            }
         };
 
-        let model_name = path.to_string();
-        let hard_token_limit = max_tokens.unwrap_or(32768);
-        let kv_reserve = 100_000_000;
+        let text_dev = get_device(text_device);
+        let vision_dev = get_device(vision_device);
+        let cfg_dtype = cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16");
+        let dtype = get_dtype(dtype, cfg_dtype);
 
-        let qwen3_vl = if path.ends_with(".gguf") {
-            let file = std::fs::File::open(path)?;
-            let mut reader = std::io::BufReader::new(file);
-            let ct = candle_core::quantized::gguf_file::Content::read(&mut reader)?;
-            
-            if let Some(mm_path) = mmproj_path {
-                let mm_file = std::fs::File::open(mm_path)?;
-                let mut mm_reader = std::io::BufReader::new(mm_file);
-                let ct_mm = candle_core::quantized::gguf_file::Content::read(&mut mm_reader)?;
-                let m = QuantizedQwen3VLModel::new(&cfg, &ct, &mut reader, &ct_mm, &mut mm_reader, &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
-                ModelVariant::QuantizedVL(m)
-            } else {
-                let is_06b = path.contains("0.6B");
-                let baking_only = is_06b;
-                let single_layer_mode = is_06b;
-                let m = QuantizedQwen3TextModel::new(&cfg, &ct, &mut reader, &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
-                ModelVariant::QuantizedText(m)
-            }
-        } else {
-            let file = std::fs::File::open(path)?;
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-            let mut cursor = std::io::Cursor::new(&mmap[..]);
-            let content = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
-            let mmap_arc = Arc::new(mmap);
-            
-            if let Some(mm_path) = mmproj_path {
-                let mm_file = std::fs::File::open(mm_path)?;
-                let mm_mmap = unsafe { memmap2::MmapOptions::new().map(&mm_file)? };
-                let mut mm_cursor = std::io::Cursor::new(&mm_mmap[..]);
-                let mm_content = candle_core::quantized::gguf_file::Content::read(&mut mm_cursor)?;
-                let mm_mmap_arc = Arc::new(mm_mmap);
-                
-                let model = QuantizedQwen3VLModel::new_with_mmap(
-                    &cfg, &content, Some(mmap_arc), &mm_content, Some(mm_mmap_arc), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve
-                )?;
+        let gguf_files = find_type_files(path, "gguf")?;
+        let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
+        let is_vision_model = mmproj_path.is_some();
+
+        let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
+
+        let qwen3_vl = if !gguf_files.is_empty() {
+            let mut model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
+
+            let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;  
+            let reserve_tokens = limit_tokens.min(8192);
+            let kv_reserve = reserve_tokens * 40000;
+
+            if is_vision_model {
+                let mmproj = mmproj_path.ok_or(anyhow!("Missing mmproj GGUF"))?;
+                let main = model_path.ok_or(anyhow!("Missing main GGUF for VL model"))?;
+                let main_file = std::fs::File::open(&main)?;
+                let main_mmap = unsafe { memmap2::MmapOptions::new().map(&main_file)? };
+                let mmproj_file = std::fs::File::open(&mmproj)?;
+                let mmproj_mmap = unsafe { memmap2::MmapOptions::new().map(&mmproj_file)? };
+
+                let mut main_cursor = std::io::Cursor::new(&main_mmap[..]);
+                let main_content = gguf_file::Content::read(&mut main_cursor)?;
+                let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
+                let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
+
+                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedVL(model)
             } else {
+                let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
+                let file = std::fs::File::open(&main)?;
+                let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                let mut cursor = std::io::Cursor::new(&mmap[..]);        
+                let content = gguf_file::Content::read(&mut cursor)?;
+                
                 let is_06b = path.contains("0.6B");
                 let baking_only = is_06b;
                 let single_layer_mode = is_06b;
-                let model = QuantizedQwen3TextModel::new_with_mmap(
-                    &cfg, &content, Some(mmap_arc), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode
-                )?;
+                
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
             }
+        } else {
+            let model_list = find_type_files(path, "safetensors")?      ;
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&model_list, dtype, &text_dev)? };
+            let model = Qwen3VLModel::new(cfg, vb)?;
+            ModelVariant::Standard(model)
+        };
+
+        let generation_config_path = std::path::Path::new(cfg_path).join("generation_config.json");
+        let generation_config: Qwen3VLGenerationConfig = if generation_config_path.exists() {
+            serde_json::from_slice(&std::fs::read(generation_config_path)?)? 
+        } else {
+            Qwen3VLGenerationConfig::default()
+        };
+        let model_name = if path.contains("0.6B") { "qwen3vl-0.6B".to_string() } else { "qwen3vl-2B".to_string() };
+
+        let (eos_token_id1, eos_token_id2) = match &generation_config.eos_token_id {
+            serde_json::Value::Number(n) => {
+                let id = n.as_u64().unwrap_or(151645) as u32;
+                (id, id)
+            },
+            serde_json::Value::Array(arr) => {
+                let id1 = arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32;
+                let id2 = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(id1 as u64) as u32;
+                (id1, id2)
+            },
+            _ => (151643, 151643),
         };
 
         Ok(Self {
@@ -147,93 +220,16 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn prefill_text_only(
-        &mut self,
-        text: &str,
-        cancel_token: Option<Arc<AtomicBool>>,
-        mut relay_target: Option<&mut Qwen3VLGenerateModel>,
-    ) -> Result<()> {
-        let tokens = self.tokenizer.encode(text, true).map_err(|e| anyhow!(e))?;
-        let token_ids = tokens.get_ids();
+    pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<()> {
+        let token_ids = self.tokenizer.text_encode_vec(text.to_string(), true)?;
         let total_tokens = token_ids.len();
         let chunk_size = 512;
         let mut current_pos = 0;
 
-        println!("[PREFILL-TEXT] Starting raw relay: {} tokens", total_tokens);
-
         while current_pos < total_tokens {
-            if let Some(token) = &cancel_token {
-                if token.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
-            }
-
+            if let Some(token) = &cancel_token { if token.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             let end = (current_pos + chunk_size).min(total_tokens);
             let chunk = &token_ids[current_pos..end];
-            let chunk_ids = Tensor::new(chunk, &self.text_device)?.unsqueeze(0)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
-
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
-
-            if let Some(ref mut target) = relay_target {
-                let (ks, vs) = self.get_current_kv();
-                let mut new_ks_i8 = Vec::with_capacity(ks.len());
-                let mut new_vs_i8 = Vec::with_capacity(vs.len());
-                let mut k_scales = Vec::with_capacity(ks.len());
-                let mut v_scales = Vec::with_capacity(vs.len());
-
-                for (k, v) in ks.iter().zip(vs.iter()) {
-                    let seq_len = k.dim(candle_core::D::Minus2)?; 
-                    let start = seq_len.saturating_sub(chunk.len());
-                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk.len())?;
-                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk.len())?;
-                    
-                    let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    let k_s = k_max / 127.0;
-                    let v_s = v_max / 127.0;
-                    
-                    let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
-                    let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
-                    
-                    new_ks_i8.push(k_i8);
-                    new_vs_i8.push(v_i8);
-                    k_scales.push(k_s);
-                    v_scales.push(v_s);
-                }
-                target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
-            }
-            current_pos = end;
-        }
-        Ok(())
-    }
-
-    pub fn prefill_only(
-        &mut self,
-        params: ChatCompletionParameters,
-        cancel_token: Option<Arc<AtomicBool>>,
-        session_id: Option<String>,
-        mut relay_target: Option<&mut Qwen3VLGenerateModel>,
-    ) -> Result<usize> {
-        let mes = params.messages;
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
-        let total_tokens = full_input_ids_vec.len();
-
-        let mut current_pos = self.get_kv_len();
-        let chunk_size = 512;
-
-        println!("[PREFILL] Starting relay: {} tokens", total_tokens);
-
-        while current_pos < total_tokens {
-            if let Some(token) = &cancel_token {
-                if token.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
-            }
-
-            let end = (current_pos + chunk_size).min(total_tokens);
-            let end = if end == total_tokens { total_tokens - 1 } else { end };
-            if end <= current_pos { break; }
-
-            let chunk = &full_input_ids_vec[current_pos..end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
 
@@ -247,23 +243,60 @@ impl Qwen3VLGenerateModel {
                 let mut v_scales = Vec::with_capacity(vs.len());
 
                 for (k, v) in ks.iter().zip(vs.iter()) {
-                    let s_len = k.dim(candle_core::D::Minus2)?; 
+                    let seq_len = k.dim(candle_core::D::Minus2)?;
+                    let start = seq_len.saturating_sub(chunk.len());
+                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk.len())?;
+                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk.len())?;
+                    let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+                    let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+                    let k_s = k_max / 127.0; let v_s = v_max / 127.0;
+                    let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
+                    let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
+                    new_ks_i8.push(k_i8); new_vs_i8.push(v_i8); k_scales.push(k_s); v_scales.push(v_s);
+                }
+                target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+            }
+            current_pos = end;
+        }
+        Ok(())
+    }
+
+    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let input = self.pre_processor.process_info(&mes, &mes_render)?;
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+        let total_tokens = full_input_ids_vec.len();
+        let mut current_pos = self.get_kv_len();
+        let prefill_chunk_size = 512;
+
+        while current_pos < total_tokens {
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); } }
+            let end = (current_pos + prefill_chunk_size).min(total_tokens);
+            let end = if end == total_tokens { total_tokens - 1 } else { end };
+            if end <= current_pos { break; }
+            let chunk = &full_input_ids_vec[current_pos..end];
+            let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
+            let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
+
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
+
+            if let Some(ref mut target) = relay_target {
+                let (ks, vs) = self.get_current_kv();
+                let mut new_ks_i8 = Vec::with_capacity(ks.len());
+                let mut new_vs_i8 = Vec::with_capacity(vs.len());
+                let mut k_scales = Vec::with_capacity(ks.len());
+                let mut v_scales = Vec::with_capacity(vs.len());
+                for (k, v) in ks.iter().zip(vs.iter()) {
+                    let s_len = k.dim(candle_core::D::Minus2)?;
                     let start = s_len.saturating_sub(chunk.len());
                     let k_new = k.narrow(candle_core::D::Minus2, start, chunk.len())?;
                     let v_new = v.narrow(candle_core::D::Minus2, start, chunk.len())?;
-                    
                     let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
                     let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    let k_s = k_max / 127.0;
-                    let v_s = v_max / 127.0;
-                    
+                    let k_s = k_max / 127.0; let v_s = v_max / 127.0;
                     let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
                     let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
-                    
-                    new_ks_i8.push(k_i8);
-                    new_vs_i8.push(v_i8);
-                    k_scales.push(k_s);
-                    v_scales.push(v_s);
+                    new_ks_i8.push(k_i8); new_vs_i8.push(v_i8); k_scales.push(k_s); v_scales.push(v_s);
                 }
                 target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
             }
@@ -271,86 +304,119 @@ impl Qwen3VLGenerateModel {
         }
 
         if let Some(sid) = session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", sid));
-            if !path.exists() { let _ = fs::create_dir_all(&path); }
+            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            if !path.exists() { let _ = fs::create_dir_all(&path); }     
             self.save_kv_to_disk(&path)?;
             let token_path = path.join("tokens.json");
             if let Ok(file) = fs::File::create(&token_path) {
                 let _ = serde_json::to_writer(file, &full_input_ids_vec);
             }
         }
-
         Ok(current_pos)
     }
 
-    pub fn generate(
-        &mut self,
-        params: ChatCompletionParameters,
-        cancel_token: Option<Arc<AtomicBool>>,
-        session_id: Option<String>,
-    ) -> Result<String> {
-        let mes = params.messages;
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
-        
-        let mut current_pos = self.get_kv_len();
-        
-        if let Some(sid) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", sid));
-            if path.exists() {
-                let token_path = path.join("tokens.json");
-                if let Ok(file) = fs::File::open(token_path) {
-                    let cached_tokens: Vec<u32> = serde_json::from_reader(file)?;
-                    let mut match_len = 0;
-                    for (c, f) in cached_tokens.iter().zip(full_input_ids_vec.iter()) {
-                        if c == f { match_len += 1; } else { break; }
-                    }
-                    if match_len > 0 {
-                        println!("[KV-BRIDGE] Partial Match ({} tokens). Prefilling remaining.", match_len);
-                        self.load_kv_from_disk(&path)?;
-                        current_pos = self.get_kv_len();
-                    }
-                }
+    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+        let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
+        let chunk_size = chunk_ids_vec.len();
+        let current_pos = self.get_kv_len();
+        let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
+        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+        if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
+        if let Some(target) = relay_target {
+            let (ks, vs) = self.get_current_kv();
+            let mut new_ks_i8 = Vec::with_capacity(ks.len());
+            let mut new_vs_i8 = Vec::with_capacity(vs.len());
+            let mut k_scales = Vec::with_capacity(ks.len());
+            let mut v_scales = Vec::with_capacity(vs.len());
+            for (k, v) in ks.iter().zip(vs.iter()) {
+                 let s_len = k.dim(candle_core::D::Minus2)?;
+                 let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
+                 let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
+                 let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+                 let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+                 let k_s = k_max / 127.0; let v_s = v_max / 127.0;
+                 let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
+                 let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
+                 new_ks_i8.push(k_i8); new_vs_i8.push(v_i8); k_scales.push(k_s); v_scales.push(v_s);
             }
+            target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+        }
+        Ok(chunk_size)
+    }
+
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
+        let temperature = mes.temperature.unwrap_or(0.7) as f32;
+        let top_p = mes.top_p.unwrap_or(0.9) as f32;
+        let top_k = 40;
+        let seed = mes.seed.unwrap_or(34562) as u64;
+        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(top_k), seed);
+        let repetition_penalty = 1.1;
+
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+        let total_tokens = full_input_ids_vec.len();
+        let mut seqlen_offset = self.get_kv_len();
+
+        if seqlen_offset == 0 {
+            if let Some(sid) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                if path.exists() { self.load_kv_from_disk(&path)?; seqlen_offset = self.get_kv_len(); }
+            }
+        }
+
+        let mut current_pos = seqlen_offset;
+        let prefill_chunk_size = if self.text_device.is_cpu() { 1024 } else { 256 };
+
+        while current_pos < total_tokens {
+            let remaining = total_tokens - current_pos;
+            if remaining == 1 { break; }
+            let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+            if current_pos + chunk_size >= total_tokens { chunk_size = (total_tokens - current_pos).saturating_sub(1); }
+            if chunk_size == 0 { break; }
+
+            let chunk = &full_input_ids_vec[current_pos..current_pos + chunk_size];
+            let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
+            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
+            current_pos += chunk_size;
         }
 
         let mut all_ids = full_input_ids_vec.clone();
         let mut generated_text = String::new();
-        let max_new_tokens = params.max_tokens.unwrap_or(2048);
+        let max_new_tokens = mes.max_tokens.unwrap_or(2048);
 
-        for i in 0..max_new_tokens {
-            if let Some(token) = &cancel_token {
-                if token.load(Ordering::Relaxed) { break; }
-            }
+        let mut pixel_values = input.pixel_values.take();
+        let image_grid_thw = input.image_grid_thw.take();
 
-            let input_ids = if i == 0 {
+        for _i in 0..max_new_tokens {
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
+            let input_ids = if generated_text.is_empty() {
                 let start = current_pos;
-                let end = full_input_ids_vec.len();
-                if start >= end {
-                    let last = *full_input_ids_vec.last().unwrap();
-                    Tensor::new(vec![last], &self.text_device)?.unsqueeze(0)?
-                } else {
-                    Tensor::new(&full_input_ids_vec[start..end], &self.text_device)?.unsqueeze(0)?
-                }
+                let end = total_tokens;
+                Tensor::new(&full_input_ids_vec[start..end], &self.text_device)?.unsqueeze(0)?
             } else {
-                let last = *all_ids.last().unwrap();
-                Tensor::new(vec![last], &self.text_device)?.unsqueeze(0)?
+                Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?
             };
 
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
-            
-            let logits = self.qwen3_vl.forward(&input_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
-            let logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?;
-            let next_id = logits.argmax(candle_core::D::Minus1)?.to_scalar::<u32>()?;
-            
+            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), current_pos)?;
+            let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
+
+            if repetition_penalty != 1.0 {
+                let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] };
+                logits = apply_repeat_penalty(&logits, repetition_penalty, penalty_context)?;
+            }
+
+            let next_id = logit_processor.sample(&logits)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
-            
             all_ids.push(next_id);
-            let next_token = self.tokenizer.decode(&[next_id], true).map_err(|e| anyhow!(e))?;
-            generated_text.push_str(&next_token);
+            generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
             current_pos += seq_len;
+            pixel_values = None;
         }
 
         Ok(generated_text)
@@ -365,26 +431,11 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
-        let mut ks = vec![];
-        let mut vs = vec![];
+        let mut ks = vec![]; let mut vs = vec![];
         match &self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => {
-                for layer in &m.language_model.layers {
-                    if let Some((k, v)) = &layer.self_attn.kv_cache {
-                        ks.push(k.clone());
-                        vs.push(v.clone());
-                    }
-                }
-            },
-            ModelVariant::QuantizedText(m) => {
-                for layer in &m.language_model.layers {
-                    if let Some((k, v)) = &layer.self_attn.kv_cache {
-                        ks.push(k.clone());
-                        vs.push(v.clone());
-                    }
-                }
-            },
-            _ => {}
+            ModelVariant::QuantizedVL(m) => { for layer in &m.language_model.layers { if let Some((k, v)) = &layer.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            ModelVariant::QuantizedText(m) => { for layer in &m.language_model.layers { if let Some((k, v)) = &layer.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            _ => {} 
         }
         (ks, vs)
     }
@@ -399,16 +450,16 @@ impl Qwen3VLGenerateModel {
 
     pub fn save_kv_to_disk(&mut self, path: &Path) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.language_model.save_kv_cache(path, false, 1024),
-            ModelVariant::QuantizedText(m) => m.language_model.save_kv_cache(path, false, 1024),
+            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 1024),
+            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, 1024),
             _ => Ok(()),
         }
     }
 
     pub fn load_kv_from_disk(&mut self, path: &Path) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 1),
-            ModelVariant::QuantizedText(m) => m.language_model.load_kv_cache(path, &self.text_device, 0, 1),
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 1),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 1),
             _ => Ok(()),
         }
     }
@@ -426,8 +477,8 @@ impl Qwen3VLGenerateModel {
 
     pub fn clear_kv_cache(&mut self) {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.language_model.clear_kv_cache(),
-            ModelVariant::QuantizedText(m) => m.language_model.clear_kv_cache(),
+            ModelVariant::QuantizedVL(m) => m.clear_kv_cache(),
+            ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
             _ => {},
         }
     }

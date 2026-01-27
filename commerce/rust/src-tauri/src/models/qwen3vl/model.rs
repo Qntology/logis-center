@@ -21,6 +21,7 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLVisionPatchEmbed {
     conv3d_weight: Tensor,
     conv3d_bias: Tensor,
@@ -75,6 +76,7 @@ impl Qwen3VLVisionPatchEmbed {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLVisionPatchMerger {
     hidden_size: usize,
     use_postshuffle_norm: bool,
@@ -139,6 +141,7 @@ impl Qwen3VLVisionPatchMerger {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLVisionAttention {
     num_heads: usize,
     qkv: Linear,
@@ -223,6 +226,7 @@ impl Qwen3VLVisionAttention {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLVisionBlock {
     norm1: LayerNorm,
     norm2: LayerNorm,
@@ -284,17 +288,18 @@ impl Qwen3VLVisionBlock {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLVisionModel {
-    spatial_merge_size: usize,
-    patch_embed: Qwen3VLVisionPatchEmbed,
-    pos_embed: Embedding,
-    num_grid_per_side: u32,
-    rotary_pos_emb: Qwen2_5VisionRotaryEmbedding,
-    blocks: Vec<Qwen3VLVisionBlock>,
-    merger: Qwen3VLVisionPatchMerger,
-    deepstack_visual_indexes: Vec<usize>,
-    deepstack_merger_list: Vec<Qwen3VLVisionPatchMerger>,
-    dtype: DType,
+    pub spatial_merge_size: usize,
+    pub patch_embed: Qwen3VLVisionPatchEmbed,
+    pub pos_embed: Embedding,
+    pub num_grid_per_side: u32,
+    pub rotary_pos_emb: Qwen2_5VisionRotaryEmbedding,
+    pub blocks: Vec<Qwen3VLVisionBlock>,
+    pub merger: Qwen3VLVisionPatchMerger,
+    pub deepstack_visual_indexes: Vec<usize>,
+    pub deepstack_merger_list: Vec<Qwen3VLVisionPatchMerger>,
+    pub dtype: DType,
 }
 
 impl Qwen3VLVisionModel {
@@ -582,19 +587,20 @@ impl Qwen3VLVisionModel {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLTextAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    num_kv_groups: usize,
-    head_dim: usize,
-    scaling: f64,
-    kv_cache: Option<(Tensor, Tensor)>,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
+    pub q_norm: RmsNorm,
+    pub k_norm: RmsNorm,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub num_kv_groups: usize,
+    pub scaling: f64,
+    pub kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl Qwen3VLTextAttention {
@@ -696,11 +702,12 @@ impl Qwen3VLTextAttention {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLTextDecoderLayer {
-    self_attn: Qwen3VLTextAttention,
-    mlp: GateUpDownMLP,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    pub self_attn: Qwen3VLTextAttention,
+    pub mlp: GateUpDownMLP,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 impl Qwen3VLTextDecoderLayer {
@@ -754,12 +761,13 @@ impl Qwen3VLTextDecoderLayer {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLTextModel {
-    embed_tokens: Embedding,
-    layers: Vec<Qwen3VLTextDecoderLayer>,
-    norm: RmsNorm,
-    rotary_emb: Qwen3VLTextRotaryEmbedding,
-    mrope_section: Vec<usize>,
+    pub embed_tokens: Embedding,
+    pub layers: Vec<Qwen3VLTextDecoderLayer>,
+    pub norm: RmsNorm,
+    pub rotary_emb: Qwen3VLTextRotaryEmbedding,
+    pub mrope_section: Vec<usize>,
 }
 
 impl Qwen3VLTextModel {
@@ -849,6 +857,7 @@ impl Qwen3VLTextModel {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Qwen3VLModel {
     config: Qwen3VLConfig,
     visual: Qwen3VLVisionModel,

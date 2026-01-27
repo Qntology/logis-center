@@ -65,6 +65,7 @@ impl Module for RmsNorm {
 }
 
 // Wrapper for QMatMul to act like Linear
+#[derive(Clone)]
 pub struct QLinear {
     inner: QMatMul,
     bias: Option<Tensor>,
@@ -144,6 +145,7 @@ struct QuantizedKV {
     block_size: usize,
 }
 
+#[derive(Clone)]
 pub struct QuantizedQwen3VLTextAttention {
     pub q_proj: QLinear,
     pub k_proj: QLinear,
@@ -692,6 +694,7 @@ impl QuantizedQwen3VLTextAttention {
                     }
 }
 
+#[derive(Clone)]
 pub struct QuantizedQwen3VLTextDecoderLayer {
     pub self_attn: QuantizedQwen3VLTextAttention,
     pub mlp_gate: QLinear,
@@ -830,6 +833,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
     }
 }
 
+#[derive(Clone)]
 pub struct QuantizedQwen3VLTextModel {
     pub embed_tokens: Embedding, 
     pub layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
@@ -1328,6 +1332,7 @@ impl QuantizedQwen3VLTextModel {
     }
 }
 
+#[derive(Clone)]
 pub struct QuantizedQwen3VLModel {
     pub config: Qwen3VLConfig,
     pub visual: Qwen3VLVisionModel, 
@@ -1468,6 +1473,7 @@ impl QuantizedQwen3VLModel {
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
 }
 
+#[derive(Clone)]
 pub struct QuantizedQwen3TextModel {
     pub language_model: QuantizedQwen3VLTextModel,
     pub lm_head: Option<QLinear>,
