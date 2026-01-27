@@ -1147,7 +1147,7 @@ impl QuantizedQwen3VLModel {
         text_device: &Device,
         text_device_id: usize,
         vision_device: &Device,
-        vision_device_id: usize,
+        _vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
     ) -> Result<Self> {
@@ -1186,7 +1186,7 @@ impl QuantizedQwen3VLModel {
         text_device: &Device,
         text_device_id: usize,
         vision_device: &Device,
-        vision_device_id: usize,
+        _vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
     ) -> Result<Self> {

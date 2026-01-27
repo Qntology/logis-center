@@ -568,7 +568,7 @@ impl LogisModel {
         
         // [OOM-SAFETY] Small (0.6B) can stay on CPU if VRAM is tight to keep Large (2B) on GPU.
         if size == ModelSize::Small && target_device.is_cuda() {
-            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+            if let Ok(nvml_inst) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml_inst.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
                         if mem.free < 3_000_000_000 {
