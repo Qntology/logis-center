@@ -227,7 +227,11 @@ impl Qwen3VLGenerateModel {
         let mut current_pos = 0;
 
         while current_pos < total_tokens {
-            if let Some(token) = &cancel_token { if token.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            if let Some(token) = &cancel_token { 
+                if token.load(Ordering::Relaxed) { 
+                    return Err(anyhow!("Task cancelled during prefill_text_only")); 
+                } 
+            }
             let end = (current_pos + chunk_size).min(total_tokens);
             let chunk = &token_ids[current_pos..end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
@@ -408,8 +412,15 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
+        println!("[DEBUG-GEN] Starting token generation loop. Max tokens: {}", max_new_tokens);
+
         for _i in 0..max_new_tokens {
-            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
+            if let Some(flag) = &cancel_flag { 
+                if flag.load(Ordering::Relaxed) { 
+                    println!("[DEBUG-GEN] Cancellation detected at token {}", _i);
+                    return Err(anyhow!("Task cancelled during generation")); 
+                } 
+            }
             
             let input_ids = if generated_text.is_empty() {
                 // Process remaining tokens from prefill
@@ -422,7 +433,11 @@ impl Qwen3VLGenerateModel {
 
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
+            
+            // forward 호출 전 로그
+            // println!("[DEBUG-GEN] Forwarding token {}...", _i);
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
+            
             let mut logits = logits.squeeze(0)?;
             let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
 
@@ -432,13 +447,24 @@ impl Qwen3VLGenerateModel {
             }
 
             let next_id = logit_processor.sample(&logits)?;
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                println!("[DEBUG-GEN] EOS detected at token {}", _i);
+                break; 
+            }
             all_ids.push(next_id);
-            generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
+            let decoded = self.tokenizer.token_decode(vec![next_id])?;
+            generated_text.push_str(&decoded);
+            
+            // 생성된 텍스트 일부 출력
+            if _i % 10 == 0 {
+                println!("[DEBUG-GEN] Generated {} tokens. Current text snippet: ...{}", _i, decoded.replace("\n", " "));
+            }
+
             seqlen_offset += seq_len;
             pixel_values = None;
         }
 
+        println!("[DEBUG-GEN] Generation loop finished. Total length: {}", generated_text.len());
         Ok(generated_text)
     }
 

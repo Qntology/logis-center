@@ -248,7 +248,22 @@ impl VectorStore {
         let table = self.conn.open_table("tasks").execute().await?;
         if status == 9 || status == 6 || status == 3 {
             table.delete(&format!("id = '{}'", id)).await?;
+        } else {
+            // [FIX] 실제로 DB의 status 값을 업데이트하여 중복 실행 방지
+            table.update()
+                .only_if(format!("id = '{}'", id))
+                .column("status", status.to_string())
+                .execute()
+                .await?;
         }
+        Ok(())
+    }
+
+    pub async fn cleanup_zombie_tasks(&self) -> Result<()> {
+        let table = self.conn.open_table("tasks").execute().await?;
+        // 앱 시작 시 '진행 중(1)' 또는 '대기 중(10)' 상태인 모든 작업을 삭제하여 좀비 방지
+        table.delete("status = 1 OR status = 10").await?;
+        println!("[Store] All zombie tasks cleared on startup.");
         Ok(())
     }
     

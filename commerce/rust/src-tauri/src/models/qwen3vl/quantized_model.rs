@@ -759,12 +759,13 @@ impl QuantizedQwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        if self.self_attn.layer_idx == 0 {
-            println!("[TRACE-LAYER] L0 In: {:?} {:?}", xs.device(), xs.dtype());
-        }
-        // 1. Detect device AND dtype of this layer
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
+
+        if self.self_attn.layer_idx % 5 == 0 || dev.is_cpu() {
+            println!("[TRACE-LAYER-{}] Device: {:?}, DType: {:?}, In: {:?}", 
+                self.self_attn.layer_idx, dev, target_dtype, xs.dtype());
+        }
         
         // 2. Ensure inputs are on this device and dtype
         //    (Clone via Cow logic or explicit clone if needed, here we use explicit clones/conversions for safety)

@@ -155,6 +155,22 @@ pub async fn start_background_worker(
     println!("[Scheduler] Background worker waiting for UI Ready signal...");
     
     clear_all_temp_data(Some(&app_handle));
+
+    // [NEW] 앱 시작 시 즉시 좀비 작업 정리 (잠금 획득 시도)
+    {
+        let store_clone = store.clone();
+        tauri::async_runtime::spawn(async move {
+            for _ in 0..10 { // 최대 5초간 대기하며 시도
+                if let Ok(guard) = store_clone.try_lock() {
+                    if let Some(db) = guard.as_ref() {
+                        let _ = db.cleanup_zombie_tasks().await;
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
     
     tokio::spawn(async move {
         // [EVENT-DRIVEN-WAIT] Zero CPU usage, zero delay. 
@@ -476,8 +492,9 @@ async fn process_task(
         if let Some(gen) = model.generator.lock().await.as_mut() {
             println!("[Scheduler] 2B Step A: Asking classification question...");
             let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
-                        let type_info = parsing::parse_json_from_llm(&res); 
-                        page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            println!("[Scheduler] 2B Step A Raw Response: {}", res);
+            let type_info = parsing::parse_json_from_llm(&res); 
+            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         
                         if page_type.is_empty() {
                             println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");

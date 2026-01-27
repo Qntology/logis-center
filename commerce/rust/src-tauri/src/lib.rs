@@ -31,6 +31,14 @@ async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, S
     // 1. Set the flag immediately. This is the primary signal for all loops and model inference.
     state.cancellation_token.store(true, Ordering::SeqCst);
     
+    // [NEW] DB에서도 즉시 모든 대기/진행 중인 작업을 취소(삭제) 처리
+    if let Ok(store_guard) = state.store.try_lock() {
+        if let Some(db) = store_guard.as_ref() {
+            let _ = db.cleanup_zombie_tasks().await;
+            println!("[STOP] Tasks cleared from DB.");
+        }
+    }
+
     // 2. Aggressively try to clear model/store if the lock is available.
     // By using try_lock, we can clear the global state instantly if the worker is between tasks.
     if let Ok(mut model_guard) = state.model.try_lock() {
