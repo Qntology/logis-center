@@ -500,7 +500,12 @@ pub fn eager_attention_forward(
             let attn_weights = (attn_weights * scaling)?;
             let attn_weights = match attention_mask {
                 None => attn_weights,
-                Some(mask) => attn_weights.broadcast_add(&mask.to_dtype(attn_weights.dtype())?)?,
+                Some(mask) => {
+                    // [FIX] Force both to F32 for the mask addition to avoid BF16 CPU errors
+                    let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
+                    let weights_f32 = attn_weights.to_dtype(candle_core::DType::F32)?;
+                    weights_f32.broadcast_add(&mask_f32)?.to_dtype(attn_weights.dtype())?
+                },
             };
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&value_states)?

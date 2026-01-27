@@ -256,37 +256,56 @@ impl QuantizedQwen3VLTextAttention {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let dev = self.q_proj.device();
+        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
+
+        // 1. [HARDENING] Inbound Input Alignment
+        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
+
         let (b_sz, q_len, _) = xs.dims3()?;
-        let query_states = self.q_proj.forward(xs)?.reshape((
+        
+        let query_states = self.q_proj.forward(&xs)?.reshape((
             b_sz,
             q_len,
             self.num_attention_heads,
             self.head_dim,
         ))?;
-        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
+        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
         
-        let key_states = self.k_proj.forward(xs)?.reshape((
+        let key_states = self.k_proj.forward(&xs)?.reshape((
             b_sz,
             q_len,
             self.num_key_value_heads,
             self.head_dim,
         ))?;
-        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
-        let value_states = self.v_proj.forward(xs)?;
-        let value_states = value_states
-            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let (query_states, key_states) =
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
         
-        // [HIGH-SPEED-KV] Use standard BF16 cache during active inference/ingestion
+        let value_states = self.v_proj.forward(&xs)?
+            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
+            .transpose(1, 2)?.contiguous()?;
+
+        // 2. [HARDENING] RoPE Alignment
+        let cos = if cos.dtype() != target_dtype { cos.to_dtype(target_dtype)? } else { cos.clone() };
+        let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin.clone() };
+        
+        let (query_states, key_states) =
+            apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
+        
+        // 3. [HARDENING] KV Cache Concatenation Guard
         let (key_states, value_states): (Tensor, Tensor) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let prev_k = prev_k.to_device(key_states.device())?.to_dtype(key_states.dtype())?;
-                let prev_v = prev_v.to_device(value_states.device())?.to_dtype(value_states.dtype())?;
-                let k = Tensor::cat(&[&prev_k, &key_states], 2)?;
-                let v = Tensor::cat(&[&prev_v, &value_states], 2)?;
+                // Key Cache Alignment
+                let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
+                let pk = if pk.dtype() != target_dtype { pk.to_dtype(target_dtype)? } else { pk }.contiguous()?;
+                
+                // Value Cache Alignment
+                let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v.clone() };
+                let pv = if pv.dtype() != target_dtype { pv.to_dtype(target_dtype)? } else { pv }.contiguous()?;
+                
+                let k = Tensor::cat(&[&pk, &key_states.contiguous()?], 2)?.contiguous()?;
+                let v = Tensor::cat(&[&pv, &value_states.contiguous()?], 2)?.contiguous()?;
                 (k, v)
             }
         };
@@ -294,15 +313,15 @@ impl QuantizedQwen3VLTextAttention {
         // Update working cache
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
 
-        // Robust Masking
+        // 4. [HARDENING] Adjusted Mask Logic
         let actual_seq_len = key_states.dim(2)?;
         let adjusted_mask = if let Some(mask) = attention_mask {
-            let mask_len = mask.dim(D::Minus1)?;
+            let mask_len = mask.dim(candle_core::D::Minus1)?;
             if mask_len < actual_seq_len {
                 let padding = Tensor::zeros((b_sz, 1, q_len, actual_seq_len - mask_len), mask.dtype(), mask.device())?;
-                Some(Tensor::cat(&[padding, mask.clone()], D::Minus1)?)
+                Some(Tensor::cat(&[padding, mask.clone()], candle_core::D::Minus1)?)
             } else if mask_len > actual_seq_len {
-                Some(mask.narrow(D::Minus1, 0, actual_seq_len)?)
+                Some(mask.narrow(candle_core::D::Minus1, 0, actual_seq_len)?)
             } else {
                 Some(mask.clone())
             }
@@ -452,8 +471,10 @@ impl QuantizedQwen3VLTextAttention {
         self.kv_cache = match &self.kv_cache {
             None => Some((k_final, v_final)),
             Some((prev_k, prev_v)) => {
-                let k = Tensor::cat(&[prev_k, &k_final], 2)?;
-                let v = Tensor::cat(&[prev_v, &v_final], 2)?;
+                let pk = if prev_k.dtype() != target_dtype { prev_k.to_dtype(target_dtype)? } else { prev_k.clone() };
+                let pv = if prev_v.dtype() != target_dtype { prev_v.to_dtype(target_dtype)? } else { prev_v.clone() };
+                let k = Tensor::cat(&[&pk, &k_final], 2)?;
+                let v = Tensor::cat(&[&pv, &v_final], 2)?;
                 Some((k, v))
             }
         };
@@ -1059,16 +1080,21 @@ impl QuantizedQwen3VLTextModel {
         )?;
         
         let mut xs = inputs_embeds.clone();
+        let target_dtype = if xs.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let xs = xs.to_dtype(target_dtype)?.contiguous()?;
+
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
                 None
             } else {
-                Some(prepare_causal_attention_mask(
+                let mask = prepare_causal_attention_mask(
                     b_size,
                     seq_len,
                     seqlen_offset,
-                    inputs_embeds.device(),
-                )?)
+                    xs.device(),
+                )?;
+                // [HARDENING] Mask DType Guard
+                Some(mask.to_dtype(DType::F32)?.contiguous()?)
             }
         };
 
