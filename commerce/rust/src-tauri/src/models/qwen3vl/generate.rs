@@ -387,15 +387,27 @@ impl Qwen3VLGenerateModel {
 
                          
 
-                         // [QUANTIZE-ON-CPU] Reduce to 8-bit before PCIe transfer
+                                                  // [QUANTIZE-ON-CPU] Reduce to 8-bit before PCIe transfer
 
-                         let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                         
 
-                         let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                                                  let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
 
-                         let k_s = k_max / 127.0;
+                         
 
-                         let v_s = v_max / 127.0;
+                                                  let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+
+                         
+
+                                                  let k_s = k_max / 127.0;
+
+                         
+
+                                                  let v_s = v_max / 127.0;
+
+                         
+
+                         
 
                          
 
@@ -484,13 +496,16 @@ impl Qwen3VLGenerateModel {
             let mut k_scales = Vec::with_capacity(ks.len());
             let mut v_scales = Vec::with_capacity(vs.len());
             
-            for (k, v) in ks.iter().zip(vs.iter()) {
-                 let seq_len = k.dim(candle_core::D::Minus2)?; 
-                 let start = seq_len.saturating_sub(chunk_size);
-                 let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
-                 let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
-                 
-                 let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
+                                for (k, v) in ks.iter().zip(vs.iter()) {
+                                     let seq_len = k.dim(candle_core::D::Minus2)?; 
+                                     let start = seq_len.saturating_sub(chunk_size);
+                                     let k_new = k.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                                     let v_new = v.narrow(candle_core::D::Minus2, start, chunk_size)?;
+                                     
+                                     if current_pos == 0 {
+                                         println!("[TRACE-RELAY] chunk: {} at {}, k_new: {:?} {:?}", chunk_size, current_pos, k_new.device(), k_new.dtype());
+                                     }
+                             let k_max = k_new.abs()?.max_all()?.to_scalar::<f32>()?;
                  let v_max = v_new.abs()?.max_all()?.to_scalar::<f32>()?;
                  let k_s = k_max / 127.0;
                  let v_s = v_max / 127.0;

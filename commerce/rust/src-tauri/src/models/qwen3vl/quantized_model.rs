@@ -50,8 +50,12 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let _dtype = x.dtype();
         let target_dtype = self.weight.dtype();
+        
+        if x.device().is_cpu() && (x.dtype() == DType::BF16 || target_dtype == DType::BF16) {
+            println!("[TRACE-NORM-VIOLATION] CPU Norm with BF16! x: {:?}, weight: {:?}", x.dtype(), target_dtype);
+        }
+
         let x = x.to_dtype(DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
         let hidden_states = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
@@ -105,10 +109,13 @@ impl QLinear {
         let dev = &self.device;
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        // Ensure input matches layer device and target internal dtype
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
-        
-        // QMatMul typically performs better/required F32 for the math part in some kernels
+        let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
+
+        if xs.device().is_cpu() && xs.dtype() == DType::BF16 {
+            println!("[TRACE-LINEAR-VIOLATION] CPU Linear with BF16 input!");
+        }
+
         let xs_f32 = xs.to_dtype(DType::F32)?;
         let (b, s, h) = xs_f32.dims3()?;
         let xs_f32_flat = xs_f32.reshape((b * s, h))?;
@@ -116,7 +123,6 @@ impl QLinear {
         let out = self.inner.forward(&xs_f32_flat)?;
         let out = out.reshape((b, s, ()))?;
         
-        // Cast output to the expected model dtype (BF16 for GPU)
         let out = out.to_dtype(target_dtype)?;
 
         if let Some(bias) = &self.bias {
@@ -259,9 +265,22 @@ impl QuantizedQwen3VLTextAttention {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
+        if self.layer_idx == 0 {
+            println!("[TRACE-L0] xs: {:?} {:?}, cos: {:?}, target: {:?}", xs.device(), xs.dtype(), cos.dtype(), target_dtype);
+        }
+
         // 1. [HARDENING] Inbound Input Alignment
-        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
-        let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
+        let xs = if !xs.device().same_device(dev) { 
+            let moved = xs.to_device(dev)?;
+            if self.layer_idx == 0 { println!("[TRACE-MOVE] xs moved to {:?}", dev); }
+            moved
+        } else { xs.clone() };
+        
+        let xs = if xs.dtype() != target_dtype { 
+            let casted = xs.to_dtype(target_dtype)?;
+            if self.layer_idx == 0 { println!("[TRACE-CAST] xs casted to {:?}", target_dtype); }
+            casted
+        } else { xs };
 
         let (b_sz, q_len, _) = xs.dims3()?;
         
@@ -296,6 +315,9 @@ impl QuantizedQwen3VLTextAttention {
         let (key_states, value_states): (Tensor, Tensor) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
+                if self.layer_idx == 0 {
+                    println!("[TRACE-KV] prev_k: {:?} {:?}, new_k: {:?} {:?}", prev_k.device(), prev_k.dtype(), key_states.device(), key_states.dtype());
+                }
                 // Key Cache Alignment
                 let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
                 let pk = if pk.dtype() != target_dtype { pk.to_dtype(target_dtype)? } else { pk }.contiguous()?;
@@ -316,6 +338,7 @@ impl QuantizedQwen3VLTextAttention {
         // 4. [HARDENING] Adjusted Mask Logic
         let actual_seq_len = key_states.dim(2)?;
         let adjusted_mask = if let Some(mask) = attention_mask {
+            if self.layer_idx == 0 { println!("[TRACE-MASK] mask: {:?} {:?}", mask.device(), mask.dtype()); }
             let mask_len = mask.dim(candle_core::D::Minus1)?;
             if mask_len < actual_seq_len {
                 let padding = Tensor::zeros((b_sz, 1, q_len, actual_seq_len - mask_len), mask.dtype(), mask.device())?;
@@ -733,6 +756,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        if self.self_attn.layer_idx == 0 {
+            println!("[TRACE-LAYER] L0 In: {:?} {:?}", xs.device(), xs.dtype());
+        }
         // 1. Detect device AND dtype of this layer
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
@@ -1065,6 +1091,8 @@ impl QuantizedQwen3VLTextModel {
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
+        let target_dtype = if inputs_embeds.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        println!("[TRACE-MODEL] Start forward. Input: {:?} {:?}, Target: {:?}", inputs_embeds.device(), inputs_embeds.dtype(), target_dtype);
         
         let position_ids = match position_ids {
             Some(ids) => ids.clone(),
