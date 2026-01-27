@@ -517,93 +517,62 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        // [OPTIMIZATION] Only unload embedding if we REALLY need the VRAM (for Large model)
-        // Small (0.6B) and Embedding (300M) can usually coexist in 4GB VRAM.
-        if size == ModelSize::Large {
-            self.unload_embedding().await;
-        }
-
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
-
-        if *current_size_guard == Some(size.clone()) && gen_guard.is_some() {
-            return Ok(()); // Already correct
-        }
-
-        println!("[MODEL] Switching to size: {:?}...", size);
-        
-        // [OOM-SAFETY] 4GB cards cannot reliably hold both models + 10k context.
-        // We force strict mutual exclusion: one model on GPU, the other in RAM.
         let mut small_slot = self.small_hibernation.lock().await;
         let mut large_slot = self.large_hibernation.lock().await;
 
-        // 1. [SLEEP] Move CURRENT active model to its hibernation slot (RAM)
-        if let Some(mut active_model) = gen_guard.take() {
-            let old_size = current_size_guard.take().unwrap();
-            println!("[SLEEP] Evicting {:?} model to RAM hibernation...", old_size);
-            
-            // [STABILITY] Wrap device move in spawn_blocking
-            let hiber_res = tokio::task::spawn_blocking(move || -> anyhow::Result<Qwen3VLGenerateModel> {
-                active_model.to_device(&Device::Cpu)?;
-                Ok(active_model)
-            }).await?;
-
-            match hiber_res {
-                Ok(m) => {
-                    match old_size {
-                        ModelSize::Small => *small_slot = Some(m),
-                        ModelSize::Large => *large_slot = Some(m),
-                    }
-                },
-                Err(e) => {
-                    println!("[SLEEP-ERROR] Failed to hibernate: {}. Dropping model.", e);
-                }
-            }
+        if *current_size_guard == Some(size) && gen_guard.is_some() {
+            return Ok(());
         }
 
-        // 2. [WAKE] Check if requested model is in hibernation
-        let hibernated = match size {
-            ModelSize::Small => small_slot.take(),
-            ModelSize::Large => large_slot.take(),
+        println!("[MODEL] Activating engine for size: {:?}...", size);
+
+        // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
+        let found_in_slot = match size {
+            ModelSize::Small => {
+                if let Some(m) = small_slot.take() {
+                    if let Some(old_m) = gen_guard.take() {
+                        if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
+                    }
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(ModelSize::Small);
+                    true
+                } else { false }
+            },
+            ModelSize::Large => {
+                if let Some(m) = large_slot.take() {
+                    if let Some(old_m) = gen_guard.take() {
+                        if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
+                        else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
+                    }
+                    *gen_guard = Some(m);
+                    *current_size_guard = Some(ModelSize::Large);
+                    true
+                } else { false }
+            }
         };
 
-        if let Some(mut m) = hibernated {
-            println!("[WAKE] Waking up {:?} from RAM to GPU...", size);
-            let target_dev = self.device_config.device.clone();
-            
-            // [STABILITY] Wrap device move in spawn_blocking
-            let wake_res = tokio::task::spawn_blocking(move || -> anyhow::Result<Qwen3VLGenerateModel> {
-                m.to_device(&target_dev)?;
-                Ok(m)
-            }).await?;
-
-            match wake_res {
-                Ok(m) => {
-                    *gen_guard = Some(m);
-                    *current_size_guard = Some(size);
-                    return Ok(());
-                },
-                Err(e) => {
-                    println!("[WAKE-ERROR] Failed to wake: {}. Reloading from disk.", e);
-                }
-            }
+        if found_in_slot {
+            println!("[MODEL] Switched to cached {:?} engine.", size);
+            return Ok(());
         }
 
-        // 3. [LOAD] Fallback to disk load if not in hibernation
+        // 2. [LOAD] Load from disk if not found in any slot
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
         let mut target_device = self.device_config.device.clone();
         
-        // [OOM-SAFETY] If loading Small, only use GPU if VRAM is very high (> 3.5GB free)
-        // Otherwise, force Small to CPU so that Large (2B) always has room on GPU.
+        // [OOM-SAFETY] Small (0.6B) can stay on CPU if VRAM is tight to keep Large (2B) on GPU.
         if size == ModelSize::Small && target_device.is_cuda() {
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
-                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                if let Ok(dev) = nvml_inst.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
-                        if mem.free < 3_500_000_000 {
-                            println!("[MODEL-CONFIG] Tight VRAM ({:.2} GB). Offloading Small (0.6B) to CPU to prioritize Large.", mem.free as f64 / 1e9);
+                        if mem.free < 3_000_000_000 {
+                            println!("[MODEL-CONFIG] Tight VRAM. Loading Small (0.6B) on CPU.");
                             target_device = Device::Cpu;
                         }
                     }
@@ -625,6 +594,16 @@ impl LogisModel {
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize)
             )
         }).await??;
+
+        // Move current main to slot
+        if let Some(old_m) = gen_guard.take() {
+            if let Some(old_size) = *current_size_guard {
+                match old_size {
+                    ModelSize::Small => *small_slot = Some(old_m),
+                    ModelSize::Large => *large_slot = Some(old_m),
+                }
+            }
+        }
 
         *gen_guard = Some(gen);
         *current_size_guard = Some(size);

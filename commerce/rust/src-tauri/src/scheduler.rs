@@ -429,54 +429,54 @@ async fn process_task(
     // ...
     // ==================================================================================
 
-    // --- STEP A: CLASSIFICATION (Bake with 0.6B -> Infer with 2B) ---
+    // --- STEP A: CLASSIFICATION (Dual-Engine Real-Time Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] STEP A: Classification Baking...");
+        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
         
         let type_prompt = parsing::page_type_prompt();
         let prompt_a = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, type_prompt);
-        let session_a = format!("{}_a", task.id);
 
-        // 1. Ensure Small Model (Resident)
+        // 1. Ensure BOTH models are prepared (Resident Coexistence)
         model.ensure_generator(crate::model::ModelSize::Small).await?;
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
 
-        // 2. Prefill Entire Prompt (PUG + Task)
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                 content: ChatCompletionRequestUserMessageContent::Text(prompt_a),
                 name: None,
             })],
-            model: "qwen3vl".to_string(), max_tokens: Some(1), temperature: Some(0.1),
+            model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
             ..Default::default()
         };
 
+        // 2. Real-time Memory-to-Memory Relay
         {
             let model_clone = model.clone();
             let params_clone = params.clone();
             let token_clone = cancellation_token.clone();
-            let sid_clone = session_a.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();
-                let mut small_gen_lock = model_clone.generator.blocking_lock();
-                if let Some(worker) = small_gen_lock.as_mut() {
-                    // [CRITICAL] Clear previous task memory to prevent context stacking
+                let mut large_gen_lock = model_clone.generator.blocking_lock();
+                let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
+
+                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
+                    // [CRITICAL] Clear previous context to prevent unknown result
                     worker.clear_kv_cache();
-                    // 0.6B bakes the entire context including the task
-                    worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
+                    target.clear_kv_cache();
+                    
+                    // Streaming Relay: 0.6B reads and pushes to 2B VRAM directly
+                    worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 3. Transition to 2B (Save is handled implicitly by prefill_only)
-        model.secure_vram_relay(crate::model::ModelSize::Large, Some(&session_a), Some(cancellation_token.clone())).await?;
-
-        // 4. 2B Instant Inference
+        // 3. 2B Inference (Instant response from relay context)
         if let Some(gen) = model.generator.lock().await.as_mut() {
             println!("[Scheduler] 2B Step A: Instant Classification...");
-            let res = gen.generate(params, Some(cancellation_token.clone()), Some(session_a))?;
+            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
             let type_info = parsing::parse_json_from_llm(&res); 
             page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
             
@@ -496,52 +496,51 @@ async fn process_task(
         }
     }
 
-    // --- STEP B: SELECTORS (Bake with 0.6B -> Infer with 2B) ---
+    // --- STEP B: SELECTORS (Dual-Engine Real-Time Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[Scheduler] STEP B: Selector Baking...");
+        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY for Selectors");
         
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         let prompt_b = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", light_pug, selector_prompt);
-        let session_b = format!("{}_b", task.id);
 
-        // 1. Transition back to 0.6B (Fast Resident)
+        // 1. Models should already be in memory from Step A, but ensure anyway
         model.ensure_generator(crate::model::ModelSize::Small).await?;
+        model.ensure_generator(crate::model::ModelSize::Large).await?;
 
         let params = ChatCompletionParameters {
             messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                 content: ChatCompletionRequestUserMessageContent::Text(prompt_b),
                 name: None,
             })],
-            model: "qwen3vl".to_string(), max_tokens: Some(1), temperature: Some(0.1),
+            model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
             ..Default::default()
         };
 
+        // 2. Real-time Relay
         {
             let model_clone = model.clone();
             let params_clone = params.clone();
             let token_clone = cancellation_token.clone();
-            let sid_clone = session_b.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();
-                let mut small_gen_lock = model_clone.generator.blocking_lock();
-                if let Some(worker) = small_gen_lock.as_mut() {
-                    // [CRITICAL] Clear previous memory
+                let mut large_gen_lock = model_clone.generator.blocking_lock();
+                let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
+
+                if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
                     worker.clear_kv_cache();
-                    worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
+                    target.clear_kv_cache();
+                    worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 2. Transition to 2B
-        model.secure_vram_relay(crate::model::ModelSize::Large, Some(&session_b), Some(cancellation_token.clone())).await?;
-
         // 3. 2B Instant Inference
         if let Some(gen) = model.generator.lock().await.as_mut() {
             println!("[Scheduler] 2B Step B: Instant Selector Extraction...");
-            let res = gen.generate(params, Some(cancellation_token.clone()), Some(session_b))?;
+            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
             selector_info = parsing::parse_json_from_llm(&res);
             println!("[Scheduler] Selectors Identified.");
         }
