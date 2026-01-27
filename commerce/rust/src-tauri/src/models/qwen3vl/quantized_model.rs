@@ -528,89 +528,17 @@ impl QuantizedQwen3VLTextAttention {
         Ok(t.to_device(device)?)
     }
 
-    fn compress_to_4bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
-        let original_shape = t.shape().dims().to_vec();
-        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements = t_data.len();
-        let num_vectors = total_elements / last_dim;
-        
-        let mut scales = vec![0.0f32; num_vectors];
-        let packed_size = (total_elements + 1) / 2;
-        let mut packed = vec![0u8; packed_size];
-        
-        for v_idx in 0..num_vectors {
-            let t_start = v_idx * last_dim;
-            let t_vector = &t_data[t_start..t_start + last_dim];
-            
-            let mut max_abs = 0.0f32;
-            for &val in t_vector {
-                let abs_v = val.abs();
-                if abs_v > max_abs { max_abs = abs_v; }
-            }
-            
-            let s = max_abs / 7.0; // 4-bit signed range: [-7, 7]
-            scales[v_idx] = s;
-            
-            if s > 0.0 {
-                for i in 0..last_dim {
-                    let q = (t_vector[i] / s).round().clamp(-7.0, 7.0) as i8;
-                    let u4 = (q + 8) as u8; // offset to unsigned 0-15
-                    let pos = t_start + i;
-                    if pos % 2 == 0 {
-                        packed[pos / 2] |= u4 << 4;
-                    } else {
-                        packed[pos / 2] |= u4 & 0x0F;
-                    }
-                }
-            }
-        }
-            
-        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
-        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
-        
-        Ok((packed_tensor, scales_tensor, original_shape))
-    }
-
-    fn decompress_from_4bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
-        let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        
-        for v_idx in 0..(total_elements / last_dim) {
-            let s = scales_vec[v_idx];
-            let t_start = v_idx * last_dim;
-            
-            for i in 0..last_dim {
-                let pos = t_start + i;
-                let byte = packed_vec[pos / 2];
-                let u4 = if pos % 2 == 0 { byte >> 4 } else { byte & 0x0F };
-                let q = (u4 as i8) - 8;
-                decoded[pos] = (q as f32) * s;
-            }
-        }
-        
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?)
-    }
-
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [OPTIMIZATION] 4-bit 압축 사용 (품질과 용량의 절충안)
+            // [OPTIMIZATION] 1-bit 압축 사용 (VRAM 최소화)
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
             
-            let (k_packed, k_scales, k_shape) = self.compress_to_4bit(&k_cpu)?;
-            let (v_packed, v_scales, _) = self.compress_to_4bit(&v_cpu)?;
+            let (k_packed, k_scales, k_shape) = self.compress_to_1bit(&k_cpu)?;
+            let (v_packed, v_scales, _) = self.compress_to_1bit(&v_cpu)?;
             
             map.insert("k_packed".to_string(), k_packed);
             map.insert("v_packed".to_string(), v_packed);
@@ -618,7 +546,7 @@ impl QuantizedQwen3VLTextAttention {
             map.insert("v_scales".to_string(), v_scales);
             map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
             map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-            map.insert("bits".to_string(), Tensor::from_vec(vec![4u32], (1,), &Device::Cpu)?);
+            map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
         } else {
             return Ok(());
         }
@@ -662,9 +590,6 @@ impl QuantizedQwen3VLTextAttention {
 
                 if bits == 1 {
                     let t = self.decompress_from_1bit(&packed, &scales, &shape)?;
-                    Ok(t.to_dtype(target_dtype)?)
-                } else if bits == 4 {
-                    let t = self.decompress_from_4bit(&packed, &scales, &shape)?;
                     Ok(t.to_dtype(target_dtype)?)
                 } else if bits == 8 {
                     let t = self.decompress_from_8bit(&packed, &scales, &shape)?;
@@ -951,23 +876,36 @@ impl QuantizedQwen3VLTextModel {
 
         let mut layer_devices = vec![];
         
-        // [OPTIMIZATION] Use actual cost instead of capped effective_cost
-        let actual_cost = cost_per_layer; 
+        // [FORCE-OPTIMIZATION] 4GB 내외의 VRAM 환경에서는 2B 모델이 충분히 들어갑니다.
+        let force_gpu = if current_device.is_cuda() && is_vram_checked {
+            simulated_free_vram > 3_000_000_000 
+        } else {
+            false
+        };
 
-        // [FORCE-PATCH] Limit layers in single_layer_mode
-        let num_actual_layers = if single_layer_mode { 1 } else { config.num_hidden_layers };
+        // [FIX] 0.6B 모델일 경우 레이어 수를 2개로 제한 (테스트용)
+        let num_actual_layers = if single_layer_mode { 1 } 
+                                else if ct.tensor_infos.keys().any(|k| k.contains("0.6B")) || ct.tensor_infos.keys().any(|k| k.contains("blk.1.")) {
+                                    if ct.tensor_infos.keys().any(|k| k.contains("blk.2.")) { config.num_hidden_layers } else { 2 }
+                                } else { config.num_hidden_layers };
 
         for _ in 0..num_actual_layers {
+            let actual_cost = cost_per_layer;
             if current_device.is_cuda() && is_vram_checked {
-                 // [FIX] 4-bit 압축 덕분에 메모리가 충분하므로, 더 공격적으로 GPU 할당
-                 let buffer_factor = 1.005; // 1% 여유만 둠
+                 // [SAFE-ALLOC] 가용 VRAM에서 20% 여유를 두고 할당 (OOM 방지)
+                 // buffer_factor 1.2 = 레이어 크기의 1.2배 공간이 있어야 할당함
+                 let buffer_factor = 1.2; 
                  if simulated_free_vram > ( (actual_cost as f64 * buffer_factor) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
+                     layer_devices.push(current_device.clone());
                  } else {
-                     current_device = Device::Cpu;
+                     // 공간 부족 시 CPU로 할당 (속도는 조금 느려지지만 절대 죽지 않음)
+                     layer_devices.push(Device::Cpu);
                  }
+            } else {
+                // CPU 모드거나 VRAM 확인 불가 시 기본 장치 사용
+                layer_devices.push(current_device.clone());
             }
-            layer_devices.push(current_device.clone());
         }
 
         // [ORGANIC] Dynamic Threading for Parallel Loading
@@ -1257,17 +1195,33 @@ impl QuantizedQwen3VLTextModel {
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
             
         } else {
-            // [FIX] 여러 레이어가 들어올 경우 (0.6B Full-Layer 모드)
-            // 0.6B의 레이어 수와 2B의 레이어 수가 다를 수 있으므로 인덱스를 매핑
-            for (i, layer) in self.layers.iter_mut().enumerate() {
-                // incoming_count가 28보다 작을 경우 마지막 레이어 데이터를 반복 사용하거나
-                // 단순히 i % incoming_count를 사용하여 대응
-                let src_idx = if i < incoming_count { i } else { incoming_count - 1 };
-                
-                let ks = k_scales.get(src_idx).cloned().unwrap_or(1.0);
-                let vs = v_scales.get(src_idx).cloned().unwrap_or(1.0);
-                layer.self_attn.inject_live_kv(&k_list[src_idx], &v_list[src_idx], ks, vs)?;
+            // [FIX] 여러 레이어가 들어올 경우 (예: 2개 레이어 테스트)
+            // 들어온 레이어들을 대상 모델의 전체 레이어에 균등하게 분배하여 주입
+            let target_count = self.layers.len(); // [FIX] 누락된 변수 정의 추가
+            
+            // 미리 모든 입력 레이어를 GPU/BF16으로 변환하여 OOM 방지 및 속도 향상
+            let target_device = self.layers[0].device().clone();
+            let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+            
+            let mut prepared_ks = Vec::with_capacity(incoming_count);
+            let mut prepared_vs = Vec::with_capacity(incoming_count);
+            
+            for j in 0..incoming_count {
+                let k_gpu = k_list[j].to_device(&target_device)?;
+                let v_gpu = v_list[j].to_device(&target_device)?;
+                prepared_ks.push((k_gpu.to_dtype(DType::F32)? * k_scales[j] as f64)?.to_dtype(target_dtype)?);
+                prepared_vs.push((v_gpu.to_dtype(DType::F32)? * v_scales[j] as f64)?.to_dtype(target_dtype)?);
             }
+
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                // 인덱스 매핑: i / (28 / incoming_count)
+                // 예: 2개 들어오면 0~13번 레이어는 0번 데이터, 14~27번 레이어는 1번 데이터 사용
+                let src_idx = (i * incoming_count) / target_count;
+                let src_idx = src_idx.min(incoming_count - 1);
+                
+                layer.self_attn.inject_live_kv_direct(&prepared_ks[src_idx], &prepared_vs[src_idx])?;
+            }
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
         }
         Ok(())
     }
@@ -1407,6 +1361,53 @@ impl QuantizedQwen3VLTextModel {
             layer.to_device(device)?;
         }
         self.norm.to_device(device)?;
+        Ok(())
+    }
+
+    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
+        use nvml_wrapper::Nvml;
+        
+        // VRAM 체크 (NVML 사용)
+        let nvml = Nvml::init().ok();
+        let mut free_vram = 0;
+        
+        if let Some(nvml_inst) = &nvml {
+            if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                if let Ok(mem) = dev.memory_info() {
+                    free_vram = mem.free;
+                }
+            }
+        }
+
+        // 임계값 설정
+        let danger_zone = 300_000_000; // 300MB 이하: 위험 (내리기)
+        let safe_zone = 1_500_000_000; // 1.5GB 이상: 여유 (올리기)
+
+        if free_vram > 0 && free_vram < danger_zone {
+            // [OFFLOAD] GPU -> CPU (뒤쪽 레이어부터)
+            for layer in self.layers.iter_mut().rev() {
+                if layer.device().is_cuda() {
+                    println!("[REBALANCE] Low VRAM ({:.2} MB). Offloading Layer {} to CPU.", free_vram as f64 / 1e6, layer.self_attn.layer_idx);
+                    layer.to_device(&Device::Cpu)?;
+                    break; // 한 번에 하나씩만 이동 (급격한 변화 방지)
+                }
+            }
+        } else if free_vram > safe_zone {
+            // [UPLOAD] CPU -> GPU (앞쪽 레이어부터)
+            // 주의: self.layers[0]의 디바이스가 GPU여야 업로드 대상 장치를 알 수 있음
+            // 또는 generate 시점에 저장해둔 메인 디바이스 정보를 활용해야 함.
+            // 여기서는 첫 번째 레이어의 디바이스가 CPU일 경우를 대비해, 
+            // 외부에서 주입받거나, 혹은 임시로 CUDA:0 (또는 device_id)를 타겟으로 함.
+            let target_device = Device::new_cuda(device_id)?;
+            
+            for layer in self.layers.iter_mut() {
+                if layer.device().is_cpu() {
+                    println!("[REBALANCE] Free VRAM ({:.2} GB). Uploading Layer {} to GPU.", free_vram as f64 / 1e9, layer.self_attn.layer_idx);
+                    layer.to_device(&target_device)?;
+                    break; 
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1553,6 +1554,7 @@ impl QuantizedQwen3VLModel {
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
+    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
 }
 
 #[derive(Clone)]
@@ -1616,6 +1618,7 @@ impl QuantizedQwen3TextModel {
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
+    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {

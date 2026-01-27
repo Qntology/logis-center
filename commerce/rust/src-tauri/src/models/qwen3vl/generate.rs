@@ -41,6 +41,14 @@ impl ModelVariant {
             Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset),
         }
     }
+
+    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
+        match self {
+            Self::Standard(_) => Ok(()), // Standard model doesn't support dynamic rebalancing yet
+            Self::QuantizedVL(m) => m.rebalance_layers(device_id),
+            Self::QuantizedText(m) => m.rebalance_layers(device_id),
+        }
+    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -172,7 +180,8 @@ impl Qwen3VLGenerateModel {
                 
                 let is_06b = path.contains("0.6B");
                 let baking_only = is_06b;
-                let single_layer_mode = is_06b; // [REVERT] 사용자의 요청에 따라 다시 1개 레이어 모드로 복구
+                // [FIX] 레이어 풀(Full) 가동 요청 반영
+                let single_layer_mode = false; 
                 
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
@@ -451,24 +460,21 @@ impl Qwen3VLGenerateModel {
             }
 
             let next_id = logit_processor.sample(&logits)?;
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
-                println!("[DEBUG-GEN] EOS detected at token {}", _i);
-                break; 
-            }
+            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             all_ids.push(next_id);
-            let decoded = self.tokenizer.token_decode(vec![next_id])?;
-            generated_text.push_str(&decoded);
+            generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
             
-            // 생성된 텍스트 일부 출력
-            if _i % 10 == 0 {
-                println!("[DEBUG-GEN] Generated {} tokens. Current text snippet: ...{}", _i, decoded.replace("\n", " "));
+            // [REBALANCE] 512 토큰마다 VRAM 상태 체크하여 레이어 재배치
+            if _i > 0 && _i % 512 == 0 {
+                if let Err(e) = self.qwen3_vl.rebalance_layers(0) {
+                    println!("[REBALANCE] Failed: {}", e);
+                }
             }
 
             seqlen_offset += seq_len;
             pixel_values = None;
         }
 
-        println!("[DEBUG-GEN] Generation loop finished. Total length: {}", generated_text.len());
         Ok(generated_text)
     }
 
