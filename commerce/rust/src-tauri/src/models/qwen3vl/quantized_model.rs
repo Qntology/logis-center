@@ -1155,14 +1155,15 @@ impl QuantizedQwen3VLTextModel {
 
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
         let incoming_count = k_list.len();
+        let target_count = self.layers.len();
         
         if incoming_count == 1 {
+            // ... (기존 Single-layer 최적화 유지)
             let target_device = self.layers[0].device().clone();
             let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
             let target_heads = self.layers[0].self_attn.num_key_value_heads;
             let target_dim = self.layers[0].self_attn.head_dim;
 
-            // 1. 단 한번만 GPU 업로드 및 Dequantization
             let k_gpu_i8 = k_list[0].to_device(&target_device)?;
             let v_gpu_i8 = v_list[0].to_device(&target_device)?;
             let k_base = (k_gpu_i8.to_dtype(DType::F32)? * k_scales[0] as f64)?.to_dtype(target_dtype)?;
@@ -1170,15 +1171,9 @@ impl QuantizedQwen3VLTextModel {
 
             let (_b, h, _s, d) = k_base.dims4()?;
 
-            // 2. 단 한번만 차원 맞춤 (64 -> 128)
-            let mut k_aligned = if d < target_dim {
-                Tensor::cat(&[&k_base, &k_base], D::Minus1)?
-            } else { k_base };
-            let mut v_aligned = if d < target_dim {
-                Tensor::cat(&[&v_base, &v_base], D::Minus1)?
-            } else { v_base };
+            let mut k_aligned = if d < target_dim { Tensor::cat(&[&k_base, &k_base], D::Minus1)? } else { k_base };
+            let mut v_aligned = if d < target_dim { Tensor::cat(&[&v_base, &v_base], D::Minus1)? } else { v_base };
 
-            // 3. 단 한번만 헤드 맞춤 (4 -> 16)
             if h != target_heads {
                 let mut k_heads = Vec::with_capacity(target_heads);
                 let mut v_heads = Vec::with_capacity(target_heads);
@@ -1194,21 +1189,22 @@ impl QuantizedQwen3VLTextModel {
             let k_final = k_aligned.contiguous()?;
             let v_final = v_aligned.contiguous()?;
 
-            // 4. 완성된 텐서를 모든 레이어에 단순 주입 (추가 연산 없음)
             for layer in self.layers.iter_mut() {
                 layer.self_attn.inject_live_kv_direct(&k_final, &v_final)?;
             }
-            
-            // [HARDENING] GPU 동기화로 메모리 해제 및 안정성 보장
             if target_device.is_cuda() { let _ = target_device.synchronize(); }
             
         } else {
+            // [FIX] 여러 레이어가 들어올 경우 (0.6B Full-Layer 모드)
+            // 0.6B의 레이어 수와 2B의 레이어 수가 다를 수 있으므로 인덱스를 매핑
             for (i, layer) in self.layers.iter_mut().enumerate() {
-                if i < incoming_count {
-                    let ks = k_scales.get(i).cloned().unwrap_or(1.0);
-                    let vs = v_scales.get(i).cloned().unwrap_or(1.0);
-                    layer.self_attn.inject_live_kv(&k_list[i], &v_list[i], ks, vs)?;
-                }
+                // incoming_count가 28보다 작을 경우 마지막 레이어 데이터를 반복 사용하거나
+                // 단순히 i % incoming_count를 사용하여 대응
+                let src_idx = if i < incoming_count { i } else { incoming_count - 1 };
+                
+                let ks = k_scales.get(src_idx).cloned().unwrap_or(1.0);
+                let vs = v_scales.get(src_idx).cloned().unwrap_or(1.0);
+                layer.self_attn.inject_live_kv(&k_list[src_idx], &v_list[src_idx], ks, vs)?;
             }
         }
         Ok(())
