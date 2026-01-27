@@ -446,60 +446,30 @@ impl QuantizedQwen3VLTextAttention {
     // [LIVE-BRIDGE] Inject 512-dim KV from 0.6B into 2048-dim VRAM of 2B
     // [QUANTIZED-RELAY] Receives 8-bit data to minimize PCIe traffic
     pub fn inject_live_kv(&mut self, k_i8: &Tensor, v_i8: &Tensor, k_scale: f32, v_scale: f32) -> Result<()> {
-        let target_heads = self.num_key_value_heads; // 16 heads
-        let target_dim = self.head_dim;             // 128 dim
         let target_device = self.q_proj.device(); 
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        // 1. Transfer tiny 8-bit data to GPU (Fast PCIe Path)
         let k_gpu_i8 = k_i8.to_device(target_device)?;
         let v_gpu_i8 = v_i8.to_device(target_device)?;
-
-        // 2. High-speed Dequantization on GPU
         let k_small = (k_gpu_i8.to_dtype(DType::F32)? * k_scale as f64)?.to_dtype(target_dtype)?;
         let v_small = (v_gpu_i8.to_dtype(DType::F32)? * v_scale as f64)?.to_dtype(target_dtype)?;
 
-        let (_b, _h, _s, d) = k_small.dims4()?;
-        
-        // 1. Dimension Alignment (e.g. 64 -> 128 if needed)
-        let mut k = if d < target_dim {
-            Tensor::cat(&[&k_small, &k_small], D::Minus1)?
-        } else { k_small.clone() };
-        
-        let mut v = if d < target_dim {
-            Tensor::cat(&[&v_small, &v_small], D::Minus1)?
-        } else { v_small.clone() };
+        self.inject_live_kv_direct(&k_small, &v_small)
+    }
 
-        // 2. Head Alignment (e.g. 4 heads -> 16 heads)
-        // Replicate heads to match the 2048-dim space (16 * 128)
-        if k.dim(1)? != target_heads {
-            let mut k_heads = vec![];
-            let mut v_heads = vec![];
-            let current_h = k.dim(1)?;
-            for i in 0..target_heads {
-                let src_idx = i % current_h;
-                k_heads.push(k.narrow(1, src_idx, 1)?);
-                v_heads.push(v.narrow(1, src_idx, 1)?);
-            }
-            k = Tensor::cat(&k_heads, 1)?;
-            v = Tensor::cat(&v_heads, 1)?;
-        }
+    pub fn inject_live_kv_direct(&mut self, k_final: &Tensor, v_final: &Tensor) -> Result<()> {
+        let dev = self.q_proj.device();
         
-        let k_final = k;
-        let v_final = v;
+        // [HARDENING] 장치 일치 보장 (이미 맞춰서 오지만 방어적 코드)
+        let k_final = if !k_final.device().same_device(dev) { k_final.to_device(dev)? } else { k_final.clone() };
+        let v_final = if !v_final.device().same_device(dev) { v_final.to_device(dev)? } else { v_final.clone() };
 
-        if self.layer_idx == 0 {
-            println!("[KV-BRIDGE] Quantized Relay: 8-bit PCIe transfer -> GPU Dequantization");
-        }
-        
         // Append to existing cache
         self.kv_cache = match &self.kv_cache {
             None => Some((k_final, v_final)),
             Some((prev_k, prev_v)) => {
-                let pk = if prev_k.dtype() != target_dtype { prev_k.to_dtype(target_dtype)? } else { prev_k.clone() };
-                let pv = if prev_v.dtype() != target_dtype { prev_v.to_dtype(target_dtype)? } else { prev_v.clone() };
-                let k = Tensor::cat(&[&pk, &k_final], 2)?;
-                let v = Tensor::cat(&[&pv, &v_final], 2)?;
+                let k = Tensor::cat(&[prev_k, &k_final], 2)?;
+                let v = Tensor::cat(&[prev_v, &v_final], 2)?;
                 Some((k, v))
             }
         };
@@ -1185,14 +1155,60 @@ impl QuantizedQwen3VLTextModel {
 
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
         let incoming_count = k_list.len();
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            // [FIX] 만약 들어온 데이터가 1개뿐이라면 (0.6B Single-Layer 모드), 모든 레이어에 복제해서 주입
-            let src_idx = if incoming_count == 1 { 0 } else { i };
+        
+        if incoming_count == 1 {
+            let target_device = self.layers[0].device().clone();
+            let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+            let target_heads = self.layers[0].self_attn.num_key_value_heads;
+            let target_dim = self.layers[0].self_attn.head_dim;
+
+            // 1. 단 한번만 GPU 업로드 및 Dequantization
+            let k_gpu_i8 = k_list[0].to_device(&target_device)?;
+            let v_gpu_i8 = v_list[0].to_device(&target_device)?;
+            let k_base = (k_gpu_i8.to_dtype(DType::F32)? * k_scales[0] as f64)?.to_dtype(target_dtype)?;
+            let v_base = (v_gpu_i8.to_dtype(DType::F32)? * v_scales[0] as f64)?.to_dtype(target_dtype)?;
+
+            let (_b, h, _s, d) = k_base.dims4()?;
+
+            // 2. 단 한번만 차원 맞춤 (64 -> 128)
+            let mut k_aligned = if d < target_dim {
+                Tensor::cat(&[&k_base, &k_base], D::Minus1)?
+            } else { k_base };
+            let mut v_aligned = if d < target_dim {
+                Tensor::cat(&[&v_base, &v_base], D::Minus1)?
+            } else { v_base };
+
+            // 3. 단 한번만 헤드 맞춤 (4 -> 16)
+            if h != target_heads {
+                let mut k_heads = Vec::with_capacity(target_heads);
+                let mut v_heads = Vec::with_capacity(target_heads);
+                for i in 0..target_heads {
+                    let src_idx = i % h;
+                    k_heads.push(k_aligned.narrow(1, src_idx, 1)?);
+                    v_heads.push(v_aligned.narrow(1, src_idx, 1)?);
+                }
+                k_aligned = Tensor::cat(&k_heads, 1)?;
+                v_aligned = Tensor::cat(&v_heads, 1)?;
+            }
+
+            let k_final = k_aligned.contiguous()?;
+            let v_final = v_aligned.contiguous()?;
+
+            // 4. 완성된 텐서를 모든 레이어에 단순 주입 (추가 연산 없음)
+            for layer in self.layers.iter_mut() {
+                layer.self_attn.inject_live_kv_direct(&k_final, &v_final)?;
+            }
             
-            if src_idx < incoming_count {
-                let ks = k_scales.get(src_idx).cloned().unwrap_or(1.0);
-                let vs = v_scales.get(src_idx).cloned().unwrap_or(1.0);
-                layer.self_attn.inject_live_kv(&k_list[src_idx], &v_list[src_idx], ks, vs)?;
+            // [HARDENING] GPU 동기화로 메모리 해제 및 안정성 보장
+            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+            
+        } else {
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                if i < incoming_count {
+                    let ks = k_scales.get(i).cloned().unwrap_or(1.0);
+                    let vs = v_scales.get(i).cloned().unwrap_or(1.0);
+                    layer.self_attn.inject_live_kv(&k_list[i], &v_list[i], ks, vs)?;
+                }
             }
         }
         Ok(())
