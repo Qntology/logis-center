@@ -412,14 +412,18 @@ pub struct EmbeddingModel {
 
 impl EmbeddingModel {
     pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self> {
+        // Default to CPU for safety on 4GB cards
+        Self::new_with_device(model_path, &Device::Cpu)
+    }
+
+    pub fn new_with_device<P: AsRef<Path>>(model_path: P, device: &Device) -> Result<Self> {
         let model_path = model_path.as_ref();
         let config_path = model_path.join("config.json");
         let tokenizer_path = model_path.join("tokenizer.json");
         let weights_path = model_path.join("model.safetensors");
         let gguf_path = model_path.join("embeddinggemma-300m-Q4_0.gguf");
 
-        let device = Device::Cpu;
-        println!("[EmbeddingModel] Forcing CPU to save VRAM for Vision Model.");
+        println!("[EmbeddingModel] Loading on {:?}...", device);
 
         let config_str = std::fs::read_to_string(config_path)?;
         let config: Config = serde_json::from_str(&config_str)?;
@@ -429,18 +433,18 @@ impl EmbeddingModel {
             println!("[EmbeddingModel] Loading GGUF model from {:?}", gguf_path);
             let mut file = std::fs::File::open(&gguf_path)?;
             let content = gguf_file::Content::read(&mut file)?;
-            let model = QuantizedModel::new(&config, &content, &mut file, &device)?;
+            let model = QuantizedModel::new(&config, &content, &mut file, device)?;
             ModelEnum::Quantized(model)
         } else if weights_path.exists() {
              println!("[EmbeddingModel] Loading Safetensors model from {:?}", weights_path);
-             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device).map_err(anyhow::Error::msg)? };
-             let model = FloatModel::new(&config, vb, &device).map_err(anyhow::Error::msg)?;
+             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device).map_err(anyhow::Error::msg)? };
+             let model = FloatModel::new(&config, vb, device).map_err(anyhow::Error::msg)?;
              ModelEnum::Float(model)
         } else {
             return Err(anyhow!("No valid model found (looked for model.safetensors or embeddinggemma-300m-Q4_0.gguf)"));
         };
 
-        Ok(Self { model: model_enum, tokenizer, device })
+        Ok(Self { model: model_enum, tokenizer, device: device.clone() })
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {

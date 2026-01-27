@@ -9,9 +9,22 @@ pub enum PugMode {
 }
 
 pub fn sanitize_llm_input(text: &str) -> String {
-    // [CRITICAL] Prevent internal special tokens like <|vision_start|> 
-    // from being interpreted as control signals by breaking the sequence.
-    text.replace("<|", "< |").replace("|>", "| >")
+    // 1. Filter out non-printable and non-ASCII/Korean characters if they are broken
+    // But we want to keep Korean. Let's filter out known problematic control codes.
+    let cleaned: String = text.chars()
+        .filter(|c| {
+            let u = *c as u32;
+            // Keep: standard ASCII, Korean Hangul Jamo/Syllables, Common Punctuation
+            (u >= 32 && u <= 126) || // Basic ASCII
+            (u >= 0xAC00 && u <= 0xD7A3) || // Hangul Syllables
+            (u >= 0x1100 && u <= 0x11FF) || // Hangul Jamo
+            (u >= 0x3130 && u <= 0x318F) || // Hangul Compatibility Jamo
+            u == 10 || u == 13 || u == 9     // \n, \r, \t
+        })
+        .collect();
+
+    // 2. Prevent internal special tokens from being interpreted
+    cleaned.replace("<|", "< |").replace("|>", "| >")
 }
 
 pub fn pre_clean_html(html: &str) -> String {
@@ -90,19 +103,21 @@ pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
 
     }
 
-    if !found_body {
+        if !found_body {
 
-        for child in document.tree.root().children() {
+            for child in document.tree.root().children() {
 
-            generate_pug_lines(child, 0, &mut pug_output, &mode);
+                generate_pug_lines(child, 0, &mut pug_output, &mode);
+
+            }
 
         }
 
+        sanitize_llm_input(&pug_output)
+
     }
 
-    pug_output
-
-}
+    
 
 
 

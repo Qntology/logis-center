@@ -290,8 +290,12 @@ impl Qwen3VLGenerateModel {
 
             while current_pos < total_tokens {
                 let remaining = total_tokens - current_pos;
-                let chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+                let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
     
+                // [CRITICAL] Leave at least 1 token for the generate() call
+                if current_pos + chunk_size >= total_tokens { 
+                    chunk_size = (total_tokens - current_pos).saturating_sub(1); 
+                }
                 if chunk_size == 0 { break; }
 
     
@@ -300,31 +304,53 @@ impl Qwen3VLGenerateModel {
 
                 let chunk_ids = Tensor::from_vec(chunk_vec.to_vec(), (1, chunk_size), &self.text_device)?;
 
-                let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+                                let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
 
-    
+                    
 
-                if let Some(flag) = &cancel_flag {
+                                if let Some(flag) = &cancel_flag {
 
-                    if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }    
+                                    if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); }    
 
-                }
+                                }
 
-    
+                    
 
-                match &mut self.qwen3_vl {
+                                                println!("[DEBUG] Forwarding chunk {} at {}", chunk_size, current_pos);
 
-                    ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                    
 
-                    ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+                                                match &mut self.qwen3_vl {
 
-                    ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
+                    
 
-                };
+                                                    ModelVariant::Standard(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
 
-    
+                    
 
-                // [STREAMING-RELAY] Incrementally inject ONLY the new chunk to 2B
+                                                    ModelVariant::QuantizedVL(m) => { m.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?; },
+
+                    
+
+                                                    ModelVariant::QuantizedText(m) => { m.forward(&chunk_ids, Some(&chunk_pos), current_pos)?; },
+
+                    
+
+                                                };
+
+                    
+
+                                                println!("[DEBUG] Forward complete");
+
+                    
+
+                                
+
+                    
+
+                                // [STREAMING-RELAY] Incrementally inject ONLY the new chunk to 2B
+
+                
 
                 if let Some(ref mut target) = relay_target {
 
@@ -517,18 +543,13 @@ impl Qwen3VLGenerateModel {
         let mut seqlen_offset = 0; 
 
         if live_kv_len > 0 {
-            // [STRICT-RELAY-MATCH] We must verify that the tokens in the cache match the prompt.
-            // Since we don't store the tokens in the live cache struct directly, 
-            // we rely on the session logic or assume the caller has ensured compatibility.
-            // However, we can check if it's a "Full Match" (all prompt tokens already in cache).
-            if live_kv_len >= total_tokens && total_tokens > 0 {
-                println!("[KV-BRIDGE] Full Prompt Match ({} tokens). Instant Generation!", live_kv_len);
-                seqlen_offset = total_tokens; 
+            // [STRICT-RELAY-MATCH] If we have at least total_tokens - 1, it's a perfect relay match.
+            if live_kv_len >= total_tokens.saturating_sub(1) && total_tokens > 0 {
+                println!("[KV-BRIDGE] Full/Near Match ({} tokens). Instant Generation!", live_kv_len);
+                seqlen_offset = total_tokens - 1; 
             } else if live_kv_len > 0 {
-                // If it's a partial match, we start from where we left off.
-                // Note: The caller must ensure that the tokens up to live_kv_len match.
                 seqlen_offset = live_kv_len;
-                println!("[KV-BRIDGE] Partial Cache Match ({} tokens). Prefilling remaining.", live_kv_len);
+                println!("[KV-BRIDGE] Partial Match ({} tokens). Prefilling remaining.", live_kv_len);
             }
         }
 
@@ -560,7 +581,7 @@ impl Qwen3VLGenerateModel {
                                          println!("[KV-HIERARCHY] Cache Hit (VL)! Using prefix: {} tokens.", match_len);
                                          // [ZERO-REFILL] 2B inherits 0.6B cache perfectly via Linear Bridge. No need to re-read.
                                          // [UPSCALE-REFILL] Let 2B re-refine the last 64 tokens for better quality.
-                                         let refill_len = 64;
+                                         let refill_len = 256;
                                          if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
                                              seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                              loaded = true;
@@ -587,7 +608,7 @@ impl Qwen3VLGenerateModel {
                                          println!("[KV-HIERARCHY] Cache Hit (Text)! Using prefix: {} tokens.", match_len);
                                          // [ZERO-REFILL] Skip redundant re-processing
                                          // [UPSCALE-REFILL] Let 2B re-refine the last 64 tokens for better quality.
-                                         let refill_len = 64;
+                                         let refill_len = 256;
                                          if m.load_kv_cache(path, &self.text_device, match_len, refill_len).is_ok() {
                                              seqlen_offset = if match_len > refill_len { match_len - refill_len } else { match_len };
                                              loaded = true;
@@ -963,7 +984,10 @@ impl Qwen3VLGenerateModel {
     /// [SSD-BRIDGE] Wrapper for simple full-load bridging
     pub fn load_kv_from_disk(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         let limit_tokens = 0;
-        let refill_len = 64;
+        // [OPTIMIZATION] Set refill_len to 512. 
+        // This ensures 2B model re-reads the TASK instruction part for accuracy,
+        // while still skipping the massive PUG content.
+        let refill_len = 512;
         match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, limit_tokens, refill_len),
             ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, limit_tokens, refill_len),

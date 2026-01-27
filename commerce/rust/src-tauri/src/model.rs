@@ -330,37 +330,42 @@ impl LogisModel {
 
     // --- [NEW] SSD Bridge Operations ---
     pub async fn save_kv_snapshot(&self, task_id: &str) -> anyhow::Result<String> {
-        let mut gen_guard = self.generator.lock().await;
-        if let Some(gen) = gen_guard.as_mut() {
-            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id));
-            println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
-            
-            // Assuming the underlying model has a method to save KV to disk
-            // We use the existing generate.rs capability via session_id or explicit save
-            // Here we map to a specific method in Qwen3VLGenerateModel
-             gen.save_kv_to_disk(&path)?;
-            
-            Ok(path.to_string_lossy().to_string())
-        } else {
-            Err(anyhow::anyhow!("No active generator to save snapshot from"))
-        }
+        let generator_arc = self.generator.clone();
+        let task_id_str = task_id.to_string();
+        
+        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let mut gen_guard = generator_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
+                gen.save_kv_to_disk(&path)?;
+                Ok(path.to_string_lossy().to_string())
+            } else {
+                Err(anyhow::anyhow!("No active generator to save snapshot from"))
+            }
+        }).await?
     }
 
     pub async fn load_kv_snapshot(&self, task_id: &str) -> anyhow::Result<()> {
-        let mut gen_guard = self.generator.lock().await;
-        if let Some(gen) = gen_guard.as_mut() {
-            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id));
-            if path.exists() {
-                println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
-                gen.load_kv_from_disk(&path)?;
-                Ok(())
+        let generator_arc = self.generator.clone();
+        let task_id_str = task_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut gen_guard = generator_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                if path.exists() {
+                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
+                    gen.load_kv_from_disk(&path)?;
+                    Ok(())
+                } else {
+                    println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
+                    Ok(())
+                }
             } else {
-                println!("[SSD-BRIDGE] No snapshot found for {}", task_id);
-                Ok(()) // Not an error, just nothing to bridge
+                Err(anyhow::anyhow!("No active generator to load snapshot into"))
             }
-        } else {
-            Err(anyhow::anyhow!("No active generator to load snapshot into"))
-        }
+        }).await?
     }
 
     /// [NEW] Secure VRAM Transition Logic (Isolation Protocol)
@@ -380,47 +385,37 @@ impl LogisModel {
 
         println!("[RELAY] Starting Secure Transition to {:?} (Mode: {})...", target_size, if self.is_cpu_mode { "CPU" } else { "GPU" });
 
-        // 2. [ISOLATION] Force Unload Everything first
-        self.unload_generator().await;
-        self.unload_embedding().await;
+        // 2. [STRATEGY] Intelligent Handover
+        // Instead of destructive unload, we use ensure_generator which supports RAM-hibernation.
+        // Also, we allow Small (0.6B) to stay resident if loading Large to avoid reloads.
+        if target_size == ModelSize::Large {
+            // We only need to clear Embedding to make room for Large
+            self.unload_embedding().await;
+        }
 
-        if self.is_cpu_mode {
-            // [CPU-OPTIMIZATION] Reclaim RAM after drop
-            self.optimize_system_ram().await;
-        } else {
+        if !self.is_cpu_mode {
             // [GPU-OPTIMIZATION]
-            // [HARD-PURGE] Force CUDA to synchronize and actually release memory pointers
-            if self.device_config.device.is_cuda() {
-                println!("[RELAY] Forcing CUDA device synchronization...");
-                let _ = self.device_config.device.synchronize();
-                // Tiny sleep to give WDDM driver a breath
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
+            let dev_clone = self.device_config.device.clone();
+            tokio::task::spawn_blocking(move || {
+                if dev_clone.is_cuda() {
+                    println!("[RELAY] Forcing CUDA device synchronization...");
+                    let _ = dev_clone.synchronize();
+                }
+            }).await?;
+            
+            tokio::time::sleep(Duration::from_millis(200)).await;
 
-            // 3. [SETTLE] Wait for GPU to release memory (Only for Large model loading)
             if target_size == ModelSize::Large {
-                // Lower target to 2500MB to be more realistic for 4GB cards and avoid timeouts
                 self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
             }
         }
 
-        // [CANCELLATION] Check after waiting
-        if let Some(token) = &cancel_token {
-            if token.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(anyhow::anyhow!("Task cancelled after resource settle"));
-            }
-        }
+        // 3. [LOAD/WAKE] Use ensure_generator to leverage RAM caching
+        self.ensure_generator(target_size).await?;
 
-        // 4. [LOAD] Load the target model
-        match target_size {
-            ModelSize::Small => self.ensure_generator(ModelSize::Small).await?,
-            ModelSize::Large => self.ensure_generator(ModelSize::Large).await?,
-        }
-
-        // 5. [BRIDGE] If this is Large model and we have a task_id, try to bridge memory
+        // 4. [BRIDGE] If this is Large model and we have a task_id, try to bridge memory
         if target_size == ModelSize::Large {
             if let Some(tid) = task_id {
-                // Try to load bridged KV
                 let _ = self.load_kv_snapshot(tid).await;
             }
         }
@@ -510,7 +505,11 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.unload_embedding().await;
+        // [OPTIMIZATION] Only unload embedding if we REALLY need the VRAM (for Large model)
+        // Small (0.6B) and Embedding (300M) can usually coexist in 4GB VRAM.
+        if size == ModelSize::Large {
+            self.unload_embedding().await;
+        }
 
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
@@ -603,17 +602,39 @@ impl LogisModel {
     }
 
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
-        // 1. Unload Generator if loaded
-        self.unload_generator().await;
+        let current_size = { *self.current_size.lock().await };
+        
+        // [STRATEGY] High-priority exclusion logic
+        match current_size {
+            Some(ModelSize::Large) => {
+                // If Large is active, Embedding must stay on CPU to avoid OOM
+                println!("[MODEL] Large model active. Forcing Embedding to CPU to prevent swapping.");
+            },
+            Some(ModelSize::Small) => {
+                // Small and Embedding can coexist. Do nothing (don't unload).
+                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
+            },
+            None => {
+                // No generator active, safe to clean up any leftovers
+                self.unload_generator().await;
+            }
+        }
 
-        // 2. Load Embedding if not loaded
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
-            let gpu_id = self.device_config.gpu_id;
-            println!("[MODEL] Loading Embedding Model on GPU-{}...", gpu_id);
+            
+            // Determine target device: CPU if Large is active, else use default GPU
+            let target_device = if current_size == Some(ModelSize::Large) { 
+                candle_core::Device::Cpu 
+            } else { 
+                self.device_config.device.clone() 
+            };
+            
+            println!("[MODEL] Loading Embedding Model on {:?}...", if target_device.is_cpu() { "CPU" } else { "GPU" });
+            
             let emb = tokio::task::spawn_blocking(move || {
-                EmbeddingModel::new(&self_clone)
+                EmbeddingModel::new_with_device(&self_clone, &target_device)
             }).await??;
             
             *emb_guard = Some(emb);

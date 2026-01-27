@@ -358,7 +358,18 @@ async fn process_task(
         if let Some(obj) = task_data.as_object_mut() { obj.remove("html"); }
         p
     } else if !url.is_empty() {
-        let content = reqwest::get(&url).await?.text().await?;
+        let response = reqwest::get(&url).await?;
+        let bytes = response.bytes().await?;
+        
+        // [ENCODING-FIX] Detect and decode Korean encodings (EUC-KR/UTF-8)
+        let (decoded, _, _) = encoding_rs::EUC_KR.decode(&bytes);
+        let decoded_str = decoded.as_ref();
+        let content = if decoded_str.to_lowercase().contains("charset=euc-kr") || decoded_str.to_lowercase().contains("charset=\"euc-kr\"") {
+            decoded.into_owned()
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        
         data_manager.offload(&content, "raw_html")?
     } else {
         return Ok(());
@@ -450,6 +461,8 @@ async fn process_task(
                 crate::utils::resources::set_current_thread_low_priority();
                 let mut small_gen_lock = model_clone.generator.blocking_lock();
                 if let Some(worker) = small_gen_lock.as_mut() {
+                    // [CRITICAL] Clear previous task memory to prevent context stacking
+                    worker.clear_kv_cache();
                     // 0.6B bakes the entire context including the task
                     worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
                 }
@@ -466,6 +479,14 @@ async fn process_task(
             let res = gen.generate(params, Some(cancellation_token.clone()), Some(session_a))?;
             let type_info = parsing::parse_json_from_llm(&res); 
             page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            
+            if page_type.is_empty() {
+                println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
+                page_type = match task.r#type.as_str() {
+                    "image_extraction" => "tracking".to_string(),
+                    _ => "unknown".to_string(),
+                };
+            }
             println!("[Scheduler] Classified as: {}", page_type);
         }
 
@@ -506,6 +527,8 @@ async fn process_task(
                 crate::utils::resources::set_current_thread_low_priority();
                 let mut small_gen_lock = model_clone.generator.blocking_lock();
                 if let Some(worker) = small_gen_lock.as_mut() {
+                    // [CRITICAL] Clear previous memory
+                    worker.clear_kv_cache();
                     worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
                 }
                 Ok(())
@@ -639,6 +662,8 @@ async fn process_task(
                     crate::utils::resources::set_current_thread_low_priority();
                     let mut small_gen_lock = model_clone.generator.blocking_lock();
                     if let Some(worker) = small_gen_lock.as_mut() {
+                        // [CRITICAL] Clear previous memory
+                        worker.clear_kv_cache();
                         worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
                     }
                     Ok(())
