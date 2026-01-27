@@ -480,32 +480,90 @@ impl QuantizedQwen3VLTextAttention {
         let original_shape = t.shape().dims().to_vec();
         let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
-        
         let last_dim = original_shape[original_shape.len() - 1];
         let total_elements = t_data.len();
         let num_vectors = total_elements / last_dim;
-        
-        // 1-bit requires packing 8 elements into 1 byte
         let packed_size = (total_elements + 7) / 8;
         let mut packed = vec![0u8; packed_size];
         let mut scales = vec![0.0f32; num_vectors];
-        
         for v_idx in 0..num_vectors {
             let t_start = v_idx * last_dim;
             let t_vector = &t_data[t_start..t_start + last_dim];
-            
-            // Calculate scale: mean of absolute values
             let mut abs_sum = 0.0f32;
             for &val in t_vector { abs_sum += val.abs(); }
             let s = abs_sum / (last_dim as f32);
             scales[v_idx] = s;
-            
-            // Pack bits
             for (i, &val) in t_vector.iter().enumerate() {
                 if val >= 0.0 {
                     let bit_pos = (t_start + i) % 8;
                     let byte_pos = (t_start + i) / 8;
                     packed[byte_pos] |= 1 << bit_pos;
+                }
+            }
+        }
+        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
+        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
+        Ok((packed_tensor, scales_tensor, original_shape))
+    }
+
+    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+        let device = packed.device();
+        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let last_dim = original_shape[original_shape.len() - 1];
+        let total_elements: usize = original_shape.iter().product();
+        let mut decoded = vec![0.0f32; total_elements];
+        for v_idx in 0..(total_elements / last_dim) {
+            let s = scales_vec[v_idx];
+            let t_start = v_idx * last_dim;
+            for i in 0..last_dim {
+                let global_idx = t_start + i;
+                let byte_pos = global_idx / 8;
+                let bit_pos = global_idx % 8;
+                let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
+                decoded[global_idx] = if is_set { s } else { -s };
+            }
+        }
+        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
+        Ok(t.to_device(device)?)
+    }
+
+    fn compress_to_4bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
+        let original_shape = t.shape().dims().to_vec();
+        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
+        
+        let last_dim = original_shape[original_shape.len() - 1];
+        let total_elements = t_data.len();
+        let num_vectors = total_elements / last_dim;
+        
+        let mut scales = vec![0.0f32; num_vectors];
+        let packed_size = (total_elements + 1) / 2;
+        let mut packed = vec![0u8; packed_size];
+        
+        for v_idx in 0..num_vectors {
+            let t_start = v_idx * last_dim;
+            let t_vector = &t_data[t_start..t_start + last_dim];
+            
+            let mut max_abs = 0.0f32;
+            for &val in t_vector {
+                let abs_v = val.abs();
+                if abs_v > max_abs { max_abs = abs_v; }
+            }
+            
+            let s = max_abs / 7.0; // 4-bit signed range: [-7, 7]
+            scales[v_idx] = s;
+            
+            if s > 0.0 {
+                for i in 0..last_dim {
+                    let q = (t_vector[i] / s).round().clamp(-7.0, 7.0) as i8;
+                    let u4 = (q + 8) as u8; // offset to unsigned 0-15
+                    let pos = t_start + i;
+                    if pos % 2 == 0 {
+                        packed[pos / 2] |= u4 << 4;
+                    } else {
+                        packed[pos / 2] |= u4 & 0x0F;
+                    }
                 }
             }
         }
@@ -516,7 +574,7 @@ impl QuantizedQwen3VLTextAttention {
         Ok((packed_tensor, scales_tensor, original_shape))
     }
 
-    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+    fn decompress_from_4bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
         let device = packed.device();
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
         let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
@@ -530,11 +588,11 @@ impl QuantizedQwen3VLTextAttention {
             let t_start = v_idx * last_dim;
             
             for i in 0..last_dim {
-                let global_idx = t_start + i;
-                let byte_pos = global_idx / 8;
-                let bit_pos = global_idx % 8;
-                let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
-                decoded[global_idx] = if is_set { s } else { -s };
+                let pos = t_start + i;
+                let byte = packed_vec[pos / 2];
+                let u4 = if pos % 2 == 0 { byte >> 4 } else { byte & 0x0F };
+                let q = (u4 as i8) - 8;
+                decoded[pos] = (q as f32) * s;
             }
         }
         
@@ -547,12 +605,12 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [EXTREME-BAKING] Use 1-bit for maximum VRAM savings
+            // [OPTIMIZATION] 4-bit 압축 사용 (품질과 용량의 절충안)
             let k_cpu = k.to_device(&Device::Cpu)?;
             let v_cpu = v.to_device(&Device::Cpu)?;
             
-            let (k_packed, k_scales, k_shape) = self.compress_to_1bit(&k_cpu)?;
-            let (v_packed, v_scales, _) = self.compress_to_1bit(&v_cpu)?;
+            let (k_packed, k_scales, k_shape) = self.compress_to_4bit(&k_cpu)?;
+            let (v_packed, v_scales, _) = self.compress_to_4bit(&v_cpu)?;
             
             map.insert("k_packed".to_string(), k_packed);
             map.insert("v_packed".to_string(), v_packed);
@@ -560,7 +618,7 @@ impl QuantizedQwen3VLTextAttention {
             map.insert("v_scales".to_string(), v_scales);
             map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
             map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-            map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
+            map.insert("bits".to_string(), Tensor::from_vec(vec![4u32], (1,), &Device::Cpu)?);
         } else {
             return Ok(());
         }
@@ -604,6 +662,9 @@ impl QuantizedQwen3VLTextAttention {
 
                 if bits == 1 {
                     let t = self.decompress_from_1bit(&packed, &scales, &shape)?;
+                    Ok(t.to_dtype(target_dtype)?)
+                } else if bits == 4 {
+                    let t = self.decompress_from_4bit(&packed, &scales, &shape)?;
                     Ok(t.to_dtype(target_dtype)?)
                 } else if bits == 8 {
                     let t = self.decompress_from_8bit(&packed, &scales, &shape)?;
@@ -869,7 +930,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
-        let estimated_activation_buffer = 50_000_000; // Drastically reduced to 50MB to fit 2B into 4GB VRAM
+        let estimated_activation_buffer = 30_000_000; // Reduced to 30MB
         let cost_per_layer = if layer_weight_size > 0 { layer_weight_size } else { 30_000_000 };
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
@@ -881,7 +942,7 @@ impl QuantizedQwen3VLTextModel {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         let os_reserve = 50_000_000; // Reduced to 50MB
+                         let os_reserve = 40_000_000; // Reduced reserve
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -889,16 +950,19 @@ impl QuantizedQwen3VLTextModel {
         }
 
         let mut layer_devices = vec![];
-        let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
+        
+        // [OPTIMIZATION] Use actual cost instead of capped effective_cost
+        let actual_cost = cost_per_layer; 
 
         // [FORCE-PATCH] Limit layers in single_layer_mode
         let num_actual_layers = if single_layer_mode { 1 } else { config.num_hidden_layers };
 
         for _ in 0..num_actual_layers {
             if current_device.is_cuda() && is_vram_checked {
-                 // Use 1.05x margin for safer buffer
-                 if simulated_free_vram > ( (effective_cost as f64 * 1.05) as u64 + safety_floor ) {
-                     simulated_free_vram = simulated_free_vram.saturating_sub(effective_cost);
+                 // [FIX] 4-bit 압축 덕분에 메모리가 충분하므로, 더 공격적으로 GPU 할당
+                 let buffer_factor = 1.005; // 1% 여유만 둠
+                 if simulated_free_vram > ( (actual_cost as f64 * buffer_factor) as u64 + safety_floor ) {
+                     simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
                  } else {
                      current_device = Device::Cpu;
                  }
@@ -1153,12 +1217,10 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
-        let incoming_count = k_list.len();
-        let target_count = self.layers.len();
-        
-        if incoming_count == 1 {
-            // ... (기존 Single-layer 최적화 유지)
+        pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
+            let incoming_count = k_list.len();
+            
+            if incoming_count == 1 {            // ... (기존 Single-layer 최적화 유지)
             let target_device = self.layers[0].device().clone();
             let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
             let target_heads = self.layers[0].self_attn.num_key_value_heads;

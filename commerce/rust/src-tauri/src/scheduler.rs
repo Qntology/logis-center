@@ -456,9 +456,9 @@ async fn process_task(
         println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY (0.6B -> 2B Stream)");
         
         let type_prompt = parsing::page_type_prompt();
-        // [FIX] Split PUG and TASK to prevent double-ingestion
-        let pug_content = light_pug.clone();
-        let task_question = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
+        // [FIX] 시스템 지시를 먼저 넣고 유저 데이터를 넣는 정석적인 구조로 변경
+        let pug_content = format!("<|im_start|>system\nYou are a professional logistics data extractor. Return JSON only.<|im_end|>\n<|im_start|>user\nDOCUMENT CONTENT:\n{}\n", light_pug);
+        let task_question = format!("TASK: {}\nACTION: JSON ONLY\n<|im_end|>\n<|im_start|>assistant\n", type_prompt);
 
         model.ensure_generator(crate::model::ModelSize::Small).await?;
         model.ensure_generator(crate::model::ModelSize::Large).await?;
@@ -468,6 +468,10 @@ async fn process_task(
             let model_clone = model.clone();
             let pug_clone = pug_content.clone();
             let token_clone = cancellation_token.clone();
+            
+            println!("[DEBUG-RELAY] Ingesting PUG into 0.6B. First 50 chars: '{}'", 
+                if pug_clone.len() > 50 { &pug_clone[..50] } else { &pug_clone }.replace("\n", " ")
+            );
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();

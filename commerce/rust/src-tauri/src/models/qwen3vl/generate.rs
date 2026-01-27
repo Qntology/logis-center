@@ -172,7 +172,7 @@ impl Qwen3VLGenerateModel {
                 
                 let is_06b = path.contains("0.6B");
                 let baking_only = is_06b;
-                let single_layer_mode = false; // [FIX] 1개 레이어만 굽는 대신 전체 레이어를 사용하여 맥락 유지
+                let single_layer_mode = is_06b; // [REVERT] 사용자의 요청에 따라 다시 1개 레이어 모드로 복구
                 
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
@@ -358,11 +358,14 @@ impl Qwen3VLGenerateModel {
         let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(top_k), seed);
         let repetition_penalty = 1.1;
 
+        let mut seqlen_offset = self.get_kv_len();
+
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+        // [FIX] 릴레이 상황(seqlen_offset > 0)에서는 BOS 토큰을 추가하지 않음
+        let add_bos = seqlen_offset == 0;
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), add_bos)?;
         let total_tokens = full_input_ids_vec.len();
-        let mut seqlen_offset = self.get_kv_len();
 
         if seqlen_offset == 0 {
             if let Some(sid) = &session_id {
@@ -439,7 +442,7 @@ impl Qwen3VLGenerateModel {
             // println!("[DEBUG-GEN] Forwarding token {}...", _i);
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
             
-            let mut logits = logits.squeeze(0)?;
+            let logits = logits.squeeze(0)?;
             let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
 
             if repetition_penalty != 1.0 {
