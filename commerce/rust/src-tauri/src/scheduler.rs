@@ -512,13 +512,16 @@ async fn process_task(
                 ..Default::default()
             };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step A: Asking classification question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
-                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                let type_info = parsing::parse_json_from_llm(&res);
-                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                        
-                
+                        if let Some(gen) = model.generator.lock().await.as_mut() {
+                            println!("[Scheduler] 2B Step A: Asking classification question...");
+                            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                            println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                            
+                            // [DEBUG] AI 응답 저장
+                            let _ = data_manager.offload(&res, "step_a_res");
+            
+                            let type_info = parsing::parse_json_from_llm(&res); 
+                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
                 if page_type.is_empty() {
                     println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
                     page_type = match task.r#type.as_str() {
@@ -597,6 +600,10 @@ async fn process_task(
                 println!("[Scheduler] 2B Step B: Asking selector question...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
+
+                // [DEBUG] AI 응답 저장
+                let _ = data_manager.offload(&res, "step_b_res");
+
                 selector_info = parsing::parse_json_from_llm(&res);
                 println!("[Scheduler] Selectors Identified.");
             }
@@ -743,6 +750,10 @@ async fn process_task(
                     println!("[Scheduler] 2B Step C: Asking extraction question...");
                     let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
+
+                    // [DEBUG] AI 응답 저장
+                    let _ = data_manager.offload(&res, "step_c_res");
+
                     extracted_data = parsing::parse_json_from_llm(&res);
                 }
             }
