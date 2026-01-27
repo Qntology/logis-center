@@ -834,13 +834,12 @@ impl QuantizedQwen3VLTextModel {
             println!("[MODEL-FIX] Hidden Size Mismatch. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_hidden_size);
         }
 
-        // Create a patched config for layer initialization
         let mut patched_config = config.clone();
         patched_config.hidden_size = actual_hidden_size;
-        let config = &patched_config; // Re-alias to use patched version below
+        let config = &patched_config;
 
         let nvml = Nvml::init().ok();
-        let mut current_device = device.clone();
+        let current_device = device.clone(); 
         
         let mut layer_weight_size = 0_u64;
         let probe_prefix_gguf = "blk.0.";
@@ -877,7 +876,7 @@ impl QuantizedQwen3VLTextModel {
         let mut layer_devices = vec![];
         
         // [FORCE-OPTIMIZATION] 4GB 내외의 VRAM 환경에서는 2B 모델이 충분히 들어갑니다.
-        let force_gpu = if current_device.is_cuda() && is_vram_checked {
+        let _force_gpu = if current_device.is_cuda() && is_vram_checked {
             simulated_free_vram > 3_000_000_000 
         } else {
             false

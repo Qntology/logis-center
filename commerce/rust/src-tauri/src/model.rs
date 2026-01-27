@@ -372,78 +372,29 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // [CANCELLATION] Check before starting transition
-        if let Some(token) = &cancel_token {
-            if token.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(anyhow::anyhow!("Task cancelled before relay"));
-            }
-        }
-
-        // 1. Check current state
-        let current_size_val = { *self.current_size.lock().await };
+        // 1. [CLEANUP] 기존 모델과 메모리를 완전히 비우고 시작
+        println!("[RELAY] Purging current resources to prepare for {:?}...", target_size);
+        self.unload_generator().await;
+        self.unload_embedding().await;
         
-        println!("[RELAY] Starting Secure Transition to {:?} (Mode: {})...", target_size, if self.is_cpu_mode { "CPU" } else { "GPU" });
-
-        // 2. [STRATEGY] Handover
-        if target_size == ModelSize::Large {
-            // Force clean everything to give 2B maximum room
-            self.unload_embedding().await;
-            
-            if !self.is_cpu_mode {
-                let dev_clone = self.device_config.device.clone();
-                tokio::task::spawn_blocking(move || {
-                    if dev_clone.is_cuda() { let _ = dev_clone.synchronize(); }
-                }).await?;
-                self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
-            }
-        }
-
-        if current_size_val == Some(target_size) {
-            let gen_guard = self.generator.lock().await;
-            if gen_guard.is_some() {
-                println!("[RELAY] Already correct size and loaded.");
-                return Ok(());
-            }
-        }
-
-        if self.is_cpu_mode {
-            // [CPU-OPTIMIZATION] Force OS to reclaim RAM from previous tasks
-            self.optimize_system_ram().await;
-        } else {
-            // [GPU-OPTIMIZATION]
+        if !self.is_cpu_mode {
             let dev_clone = self.device_config.device.clone();
             tokio::task::spawn_blocking(move || {
-                if dev_clone.is_cuda() {
-                    println!("[RELAY] Forcing CUDA device synchronization...");
-                    let _ = dev_clone.synchronize();
-                }
+                if dev_clone.is_cuda() { let _ = dev_clone.synchronize(); }
             }).await?;
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // VRAM이 실제로 비워질 때까지 충분히 대기 (안정 마진 확보)
+            self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 3. [WAKE/LOAD] Handle the swap (Includes spawn_blocking internally)
-        let swap_start = Instant::now();
+        // 2. [LOAD] 새 모델 로드
         self.ensure_generator(target_size).await?;
-        println!("[PERF] Model Swap (Wake/Load) took: {:.2}s", swap_start.elapsed().as_secs_f32());
 
-        // 4. [SETTLE & BRIDGE] 
-        if target_size == ModelSize::Large {
-            if self.is_cpu_mode {
-                self.optimize_system_ram().await;
-            } else {
-                let settle_start = Instant::now();
-                self.wait_for_vram_settle(2500, 5, cancel_token.clone()).await?;
-                println!("[PERF] VRAM Settle Wait took: {:.2}s", settle_start.elapsed().as_secs_f32());
-            }
-
-            if let Some(tid) = task_id {
-                let bridge_start = Instant::now();
-                let _ = self.load_kv_snapshot(tid).await;
-                println!("[PERF] KV Bridge (SSD -> GPU) took: {:.2}s", bridge_start.elapsed().as_secs_f32());
-            }
+        // 3. [RESTORE] 디스크 스냅샷이 있다면 로드 (Disk Bridge)
+        if let Some(tid) = task_id {
+            self.load_kv_snapshot(tid).await?;
         }
 
-        println!("[RELAY] Secure Transition Complete. Total Latency: {:.2}s", start_time.elapsed().as_secs_f32());
+        println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
         Ok(())
     }
 
