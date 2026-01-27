@@ -320,7 +320,7 @@ impl Qwen3VLGenerateModel {
         let chunk_size = chunk_ids_vec.len();
         let current_pos = self.get_kv_len();
         let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
-        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
         if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
         if let Some(target) = relay_target {
@@ -366,22 +366,39 @@ impl Qwen3VLGenerateModel {
             }
         }
 
-        let mut current_pos = seqlen_offset;
+        // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
+        // [FIX] Distinguish between Relay (prompt is new task) and Resume (prompt is full history)
+        let mut local_pos = if seqlen_offset > 0 && seqlen_offset < total_tokens { 
+            seqlen_offset // Resume case: skip what's already in KV
+        } else { 
+            0 // Relay case: process the whole new task prompt
+        };
+        
         let prefill_chunk_size = if self.text_device.is_cpu() { 1024 } else { 256 };
 
-        while current_pos < total_tokens {
-            let remaining = total_tokens - current_pos;
+        while local_pos < total_tokens {
+            let remaining = total_tokens - local_pos;
             if remaining == 1 { break; }
+            
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
-            if current_pos + chunk_size >= total_tokens { chunk_size = (total_tokens - current_pos).saturating_sub(1); }
+            if local_pos + chunk_size >= total_tokens {
+                chunk_size = (total_tokens - local_pos).saturating_sub(1);
+            }
             if chunk_size == 0 { break; }
 
-            let chunk = &full_input_ids_vec[current_pos..current_pos + chunk_size];
+            // [FIX] Slice relative to local_pos, but use seqlen_offset for the model
+            let chunk = &full_input_ids_vec[local_pos..local_pos + chunk_size];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?;
+            let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
 
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
-            current_pos += chunk_size;
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Generation cancelled during prefill")); }
+            }
+
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset)?;
+            
+            local_pos += chunk_size;
+            seqlen_offset += chunk_size;
         }
 
         let mut all_ids = full_input_ids_vec.clone();
@@ -393,8 +410,10 @@ impl Qwen3VLGenerateModel {
 
         for _i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
+            
             let input_ids = if generated_text.is_empty() {
-                let start = current_pos;
+                // Process remaining tokens from prefill
+                let start = local_pos;
                 let end = total_tokens;
                 Tensor::new(&full_input_ids_vec[start..end], &self.text_device)?.unsqueeze(0)?
             } else {
@@ -402,9 +421,10 @@ impl Qwen3VLGenerateModel {
             };
 
             let seq_len = input_ids.dim(1)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
-            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), current_pos)?;
-            let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
+            let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
+            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
+            let mut logits = logits.squeeze(0)?;
+            let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
 
             if repetition_penalty != 1.0 {
                 let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] };
@@ -415,7 +435,7 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             all_ids.push(next_id);
             generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            current_pos += seq_len;
+            seqlen_offset += seq_len;
             pixel_values = None;
         }
 

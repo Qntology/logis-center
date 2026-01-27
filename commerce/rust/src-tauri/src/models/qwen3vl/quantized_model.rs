@@ -1452,7 +1452,10 @@ impl QuantizedQwen3VLModel {
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
         if let Some(pixel_values) = pixel_values { if let Some(image_grid_thw) = image_grid_thw { let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?; let image_embeds = Tensor::cat(&image_embeds, 0)?; let vision_mask = self.get_placeholder_mask(&input_ids, true)?; inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; } }
         let (position_ids, _) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
-        let position_ids = if let Some(cache_pos) = cache_position { let start = cache_pos.i(0)?.to_scalar::<u32>()?; Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? } else { position_ids };
+        let position_ids = if let Some(cache_pos) = cache_position { 
+            let start = cache_pos.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
+        } else { position_ids };
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         let head_dev = self.lm_head.device();
@@ -1517,7 +1520,7 @@ impl QuantizedQwen3TextModel {
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
-        let start = if let Some(cp) = cache_position { cp.i(0)?.to_scalar::<u32>()? } else { 0 };
+        let start = if let Some(cp) = cache_position { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { 0 };
         let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
