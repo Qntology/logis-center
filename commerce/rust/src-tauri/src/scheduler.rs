@@ -619,8 +619,8 @@ async fn process_task(
         extracted_data = json!({ "items": all_extracted_items, "type": page_type, "detail": false });
 
     } else {
-        // [DETAIL MODE] LLM Extraction required
-        println!("[Scheduler] STEP C: Detail Extraction Baking...");
+        // [DETAIL MODE] Dual-Engine Real-Time Relay
+        println!("[Scheduler] Starting DUAL-ENGINE REAL-TIME RELAY for Details");
         
         let content_pug = {
             let clean_content = data_manager.load(&clean_html_path)?;
@@ -637,10 +637,9 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             let prompt_c = format!("{}\n\nTASK: {}\n\nACTION: JSON ONLY", content_pug, extraction_instruction);
-            let session_c = format!("{}_c", task.id);
 
-            // 1. Transition back to 0.6B
             model.ensure_generator(crate::model::ModelSize::Small).await?;
+            model.ensure_generator(crate::model::ModelSize::Large).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -655,27 +654,25 @@ async fn process_task(
                 let model_clone = model.clone();
                 let params_clone = params.clone();
                 let token_clone = cancellation_token.clone();
-                let sid_clone = session_c.clone();
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     crate::utils::resources::set_current_thread_low_priority();
-                    let mut small_gen_lock = model_clone.generator.blocking_lock();
-                    if let Some(worker) = small_gen_lock.as_mut() {
-                        // [CRITICAL] Clear previous memory
+                    let mut large_gen_lock = model_clone.generator.blocking_lock();
+                    let mut small_gen_lock = model_clone.small_hibernation.blocking_lock();
+
+                    if let (Some(worker), Some(target)) = (small_gen_lock.as_mut(), large_gen_lock.as_mut()) {
                         worker.clear_kv_cache();
-                        worker.prefill_only(params_clone, Some(token_clone), Some(sid_clone), None)?;
+                        target.clear_kv_cache();
+                        worker.prefill_only(params_clone, Some(token_clone), None, Some(target))?;
                     }
                     Ok(())
                 }).await??;
             }
 
-            // 2. Transition to 2B
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&session_c), Some(cancellation_token.clone())).await?;
-
             // 3. 2B Instant Inference
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 2B Step C: Instant Detail Extraction...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(session_c))?;
+                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                 extracted_data = parsing::parse_json_from_llm(&res);
             }
         }
