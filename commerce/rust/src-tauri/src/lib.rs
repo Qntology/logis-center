@@ -475,6 +475,22 @@ async fn check_query_intent(
 }
 
 #[tauri::command]
+async fn set_fast_mode(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    let mut model_guard = state.model.lock().await;
+    if let Some(model) = model_guard.as_mut() {
+        model.fast_mode = enabled;
+        // If mode changed, we might need to reload the generator next time it's used
+        // For now, we'll let the next ensure_generator handle it.
+        println!("[MODE] Fast Mode set to: {}", enabled);
+        Ok(format!("Fast Mode: {}", enabled))
+    } else {
+        // Even if model isn't loaded yet, we can create a shell LogisModel to store the preference
+        // but it's better to just wait until it's initialized.
+        Err("Model not initialized. Please try again after model load.".to_string())
+    }
+}
+
+#[tauri::command]
 async fn deep_research_command(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
@@ -961,7 +977,7 @@ pub fn run() {
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
-            upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message
+            upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, set_fast_mode
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

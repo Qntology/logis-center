@@ -80,7 +80,17 @@ const btnSubmit = document.getElementById("btn-submit") as HTMLButtonElement;
 const btnExtract = document.getElementById("btn-extract") as HTMLButtonElement; 
 const btnAutoLaunch = document.getElementById("btn-auto-launch") as HTMLButtonElement;
 const settingsBtn = document.getElementById("btn-settings") as HTMLButtonElement;
+const fastModeCheck = document.getElementById("fast-mode-check") as HTMLInputElement;
 const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
+
+fastModeCheck?.addEventListener("change", async () => {
+    try {
+        console.log("[WIDGET] Toggling Fast Mode:", fastModeCheck.checked);
+        await invoke("set_fast_mode", { enabled: fastModeCheck.checked });
+    } catch (e) {
+        console.warn("[WIDGET] Model not ready for Fast Mode toggle yet. It will apply upon next load.");
+    }
+});
 
 const navPreviewContainer = document.getElementById("nav-preview-container") as HTMLElement;
 const navImgThumbnail = document.getElementById("nav-img-thumbnail") as HTMLImageElement;

@@ -143,6 +143,7 @@ pub struct LogisModel {
     
     pub is_cpu_mode: bool, 
     pub dual_mode_enabled: bool,
+    pub fast_mode: bool, // [NEW] Toggle 1-layer mode for 2B
     
     // Config for Lazy Reloading
     small_model_path: String,
@@ -446,8 +447,8 @@ impl LogisModel {
         self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, force_single_layer: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator from {} (Text-Only: {}, Fast: {})...", path, force_text_only, force_single_layer);
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
 
@@ -463,7 +464,8 @@ impl LogisModel {
                 shared_path.as_deref(), // Tokenizer path
                 shared_path.as_deref(), // Config path
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
-                force_text_only
+                force_text_only,
+                force_single_layer
             )
         }).await??;
         
@@ -544,6 +546,7 @@ impl LogisModel {
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path_clone = shared_path.map(|s| s.to_string());
+        let fast_mode = self.fast_mode; // [NEW]
 
         let gen = tokio::task::spawn_blocking(move || {
             Qwen3VLGenerateModel::init_with_config(
@@ -551,7 +554,8 @@ impl LogisModel {
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
-                force_text_only
+                force_text_only,
+                fast_mode // Apply Fast Mode (1-layer)
             )
         }).await??;
 
@@ -654,6 +658,7 @@ impl LogisModel {
             max_tokens_limit: max_tokens_limit as u32,
             dtype: None, 
             current_size: Arc::new(TokioMutex::new(None)),
+            fast_mode: true, // Default: High-speed single-layer mode
         })
     }
 

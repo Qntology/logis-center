@@ -83,8 +83,9 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
+        force_single_layer: bool,
     ) -> Result<Self> {
-        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only)
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, force_single_layer)
     }
 
     pub fn init_with_tokenizer(
@@ -97,8 +98,9 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
+        force_single_layer: bool,
     ) -> Result<Self> {
-        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only) 
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, force_single_layer) 
     }
 
     pub fn init_with_config(
@@ -111,7 +113,8 @@ impl Qwen3VLGenerateModel {
         vision_device_id: usize,
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
-        force_text_only: bool, // [NEW] Option to skip vision weights for 2B relay
+        force_text_only: bool,
+        force_single_layer: bool, // [NEW] Option to force 1-layer mode for any model size
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -194,8 +197,8 @@ impl Qwen3VLGenerateModel {
                 
                 let is_06b = path.contains("0.6B");
                 let baking_only = is_06b;
-                // [FIX] 0.6B일 때만 1개 레이어 모드 사용, 2B는 항상 Full 레이어 사용
-                let single_layer_mode = is_06b; 
+                // [FIX] Use 1-layer mode if it is 0.6B OR if Fast Mode (force_single_layer) is requested
+                let single_layer_mode = is_06b || force_single_layer; 
                 
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
