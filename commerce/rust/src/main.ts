@@ -62,6 +62,7 @@ let isChatLoading = false;
 
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
+let activeTaskId: string | null = null; // [NEW] Track current extraction task
 let isExtracting = false; 
 let spinnerInterval: number | null = null;
 let systemLogCount = 0;
@@ -731,6 +732,7 @@ btnExtract?.addEventListener("click", async () => {
     if (currentImage) {
         isExtracting = true;
         const taskId = `img_${Date.now()}`;
+        activeTaskId = taskId; // [NEW]
         try {
             await emit("new-task-from-browser", { id: taskId, type: "image_extraction", image_path: currentImage, ref_id: currentImage, link: "Local Image" });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: Image Analysis`, status: 10, task_id: taskId, created_at: Date.now() });
@@ -746,6 +748,7 @@ btnExtract?.addEventListener("click", async () => {
             const cc = await hashId(urlObj.hostname);
             const rawPath = urlObj.pathname + urlObj.search;
             const hashedRefId = await hashId(cc + rawPath.toLowerCase());
+            activeTaskId = hashedRefId; // [NEW] In case of HTML, we often use the hash as ref
             
             await emit("new-task-from-browser", { 
                 id: taskId, type: "html_extraction", html: html, link: rawPath, 
@@ -778,10 +781,24 @@ async function renderProgressToUI(payload: any) {
 
     if (payload.task_id) {
         let statusCode = 1; 
-        if (payload.category === "Done") statusCode = 9;
-        else if (payload.category === "Error") statusCode = 6;
-        else if (payload.summary?.toLowerCase().includes("cancelled")) statusCode = 3;
-        renderMessage({ id: payload.task_id, role: "system_task", content: payload.summary, status: statusCode, created_at: Date.now() });
+        const summary = (payload.summary || "").toLowerCase();
+        
+        // [FIX] Correctly map status by checking summary text first
+        if (summary.includes("cancelled") || summary.includes("stopped")) {
+            statusCode = 3; // Cancelled
+        } else if (payload.category === "Done") {
+            statusCode = 9; // Success
+        } else if (payload.category === "Error") {
+            statusCode = 6; // Error
+        }
+        
+        renderMessage({ 
+            id: payload.task_id, 
+            role: "system_task", 
+            content: payload.summary, 
+            status: statusCode, 
+            created_at: Date.now() 
+        });
     }
 
     if (extractionLog && detailView.style.display !== "none") {
@@ -842,15 +859,29 @@ async function renderProgressToUI(payload: any) {
 }
 
 btnStopTask?.addEventListener("click", async () => {
-    if (await ask("Stop the current extraction?", { title: "Stop Task", kind: "warning" })) {
+    if (await ask("Stop the current extraction? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
         try {
-            await invoke<string>("stop_current_extraction");
-            isExtracting = false; stopSpinner();
+            console.log("[WIDGET] Stopping task:", activeTaskId);
+            await invoke<string>("stop_current_extraction", { taskId: activeTaskId });
+            
+            // Remove the message bubble immediately from UI
+            if (activeTaskId) {
+                const msgId = `msg-task-${activeTaskId}`;
+                const el = document.getElementById(msgId);
+                if (el) el.remove();
+            }
+
+            isExtracting = false; 
+            stopSpinner();
+            activeTaskId = null;
+
             if (btnStopTask) btnStopTask.style.display = "none";
-            detailTitle.innerText = "Stopped";
-            detailContent.innerHTML = "<div style='color:#ef4444; padding:20px;'>Extraction stopped by user.</div>";
+            detailTitle.innerText = "Cancelled";
+            detailContent.innerHTML = "<div style='color:#ef4444; padding:20px;'>Extraction stopped and deleted by user.</div>";
             await updateExtractButtonVisibility();
-        } catch (e) { console.error("Stop failed:", e); }
+        } catch (e) { 
+            console.error("Stop failed:", e); 
+        }
     }
 });
 
@@ -895,9 +926,29 @@ btnDeleteSelected?.addEventListener("click", async () => {
 });
 
 btnDetailDelete?.addEventListener("click", async () => {
-    if (!currentDetailUuid) return;
-    if (await ask("Delete this document?", { title: "Confirm Delete", kind: "warning" })) {
-        try { await invoke("delete_document", { uuid: currentDetailUuid }); detailView.style.display = "none"; listView.style.display = "block"; refreshList(); } catch (e) { console.error(e); }
+    console.log("[WIDGET] Delete button clicked. UUID:", currentDetailUuid);
+    if (!currentDetailUuid) {
+        console.error("[WIDGET] No document UUID selected for deletion.");
+        return;
+    }
+    
+    try {
+        const confirmed = await ask("Are you sure you want to delete this document?", { 
+            title: "Confirm Delete", 
+            kind: "warning" 
+        });
+
+        if (confirmed) {
+            console.log("[WIDGET] Deletion confirmed for:", currentDetailUuid);
+            const res = await invoke<string>("delete_document", { uuid: currentDetailUuid });
+            console.log("[WIDGET] Delete response:", res);
+            
+            detailView.style.display = "none"; 
+            listView.style.display = "block"; 
+            refreshList(); 
+        }
+    } catch (e) { 
+        console.error("[WIDGET] Deletion process failed:", e); 
     }
 });
 
@@ -957,13 +1008,31 @@ function renderDocs(docs: any[]) {
             lastEl.addEventListener("click", (e) => {
                 const target = e.target as HTMLElement;
                 if (target.closest('.toggle-more') || target.closest('.more-label')) return;
-                if (!target.closest('a') && !target.closest('input')) showDetail(doc.id);
+                
+                // [STRICT-ID] Try every possible ID field name across different data sources
+                const docId = doc.id || doc.uuid || (doc.data && doc.data.id) || doc.uuid_val || doc.ref || doc.index;
+                
+                if (!target.closest('a') && !target.closest('input')) {
+                    if (docId) {
+                        showDetail(String(docId));
+                    } else {
+                        console.warn("[WIDGET] Item clicked but no valid ID found:", doc);
+                        // Fallback: If no ID, but has data.id, use it
+                        const fallbackId = (doc as any).data?.id;
+                        if (fallbackId) showDetail(String(fallbackId));
+                    }
+                }
             });
         }
     });
 }
 
 async function showDetail(uuid: string) {
+    console.log("[WIDGET] Opening detail view for ID:", uuid);
+    if (!uuid) {
+        console.error("[WIDGET] Cannot open detail: ID is undefined");
+        return;
+    }
     currentDetailUuid = uuid;
     listView.style.display = "none";
     detailView.style.display = "flex";
@@ -979,8 +1048,13 @@ async function showDetail(uuid: string) {
             let prettyJson = doc.json_data;
             try { prettyJson = JSON.stringify(JSON.parse(doc.json_data), null, 2); } catch(e) {}
             detailContent.innerHTML = `<div style="margin-bottom:10px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:#444;"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#111; padding:10px;">${prettyJson}</pre>`;
+        } else {
+            detailContent.innerHTML = "Document not found in database.";
         }
-    } catch (e) { detailContent.innerHTML = "Failed: " + e; }
+    } catch (e) { 
+        console.error("[WIDGET] get_document failed:", e);
+        detailContent.innerHTML = "Failed to load document details: " + e; 
+    }
 }
 
 btnDetailBack?.addEventListener("click", () => { detailView.style.display = "none"; listView.style.display = "block"; });

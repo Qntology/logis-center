@@ -806,6 +806,31 @@ async fn process_task(
         store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
     };
 
+    // [PARITY] ID Generation
+    let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
+    let id_val_raw = extracted_data.get("id").or_else(|| extracted_data.get("index")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw).replace("-", "").replace("_", "");
+    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
+    
+    let generated_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
+
+    if let Some(obj) = extracted_data.as_object_mut() {
+        obj.insert("index".to_string(), json!(index_val));
+        obj.insert("id".to_string(), json!(generated_id));
+    }
+
+    let payload = json!({
+        "task_id": task.id, "category": "Saving", "summary": "Syncing to database...", "spinner": "⠋"
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+
+    // [SIDE EFFECTS & UPSERT]
+    // Re-acquire Store for final ops
+    let store = {
+        let store_guard = store_mutex.lock().await;
+        store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
+    };
+
     // (Logic ported from previous implementation - condensed)
     if page_type == "order" {
         if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
@@ -841,7 +866,7 @@ async fn process_task(
     let target_table = page_type.to_string();
     let text_to_embed = parsing::json_to_natural_language(&extracted_data);
     let item_digest = crate::utils::hash::digest(&text_to_embed); 
-    let target_id = task.r#ref.clone(); 
+    let target_id = if !task.r#ref.is_empty() { task.r#ref.clone() } else { generated_id }; 
     
     // Check digest match to skip embedding
     let mut existing_vector = None;

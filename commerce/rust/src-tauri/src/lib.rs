@@ -27,34 +27,47 @@ pub struct AppState {
 }
 
 #[tauri::command]
-async fn stop_current_extraction(state: State<'_, AppState>) -> Result<String, String> {
-    // 1. Set the flag immediately. This is the primary signal for all loops and model inference.
+async fn stop_current_extraction(
+    state: State<'_, AppState>,
+    task_id: Option<String>
+) -> Result<String, String> {
+    // 1. Set the flag immediately.
     state.cancellation_token.store(true, Ordering::SeqCst);
     
-    // [NEW] DB에서도 즉시 모든 대기/진행 중인 작업을 취소(삭제) 처리
+    // 2. Clear from DB
     if let Ok(store_guard) = state.store.try_lock() {
         if let Some(db) = store_guard.as_ref() {
-            let _ = db.cleanup_zombie_tasks().await;
-            println!("[STOP] Tasks cleared from DB.");
+            if let Some(ref id) = task_id {
+                let _ = db.update_task_status(id, crate::logic::parse_status("cancel")).await;
+                let _ = db.delete_message_by_task_id(id).await;
+                println!("[STOP] Task and message {} cleared from DB.", id);
+            } else {
+                let _ = db.cleanup_zombie_tasks().await;
+                println!("[STOP] All pending tasks cleared from DB.");
+            }
         }
     }
 
-    // 2. Aggressively try to clear model/store if the lock is available.
-    // By using try_lock, we can clear the global state instantly if the worker is between tasks.
+    // 3. Try to clear model
     if let Ok(mut model_guard) = state.model.try_lock() {
-        if let Some(_m) = model_guard.as_ref() {
-            // [NON-BLOCKING] We don't await here to avoid UI hang, just drop the reference.
-            // The worker holding its own clone will handle the internal stop.
-            println!("[STOP] Clearing global model reference.");
-        }
         *model_guard = None;
     }
 
-    // [KEEP-STORE] We do NOT clear the store here. 
-    // The worker needs it to mark the task as 'cancelled' in the DB.
-    
-    println!("[STOP] Cancellation signal sent. Background worker will detect and exit.");
     Ok("Stop signal sent.".to_string())
+}
+
+#[tauri::command]
+async fn delete_message(
+    state: State<'_, AppState>,
+    task_id: String
+) -> Result<String, String> {
+    let store_guard = state.store.lock().await;
+    if let Some(db) = store_guard.as_ref() {
+        db.delete_message_by_task_id(&task_id).await.map_err(|e| e.to_string())?;
+        Ok(format!("Message for task {} deleted.", task_id))
+    } else {
+        Err("DB not initialized".to_string())
+    }
 }
 
 #[tauri::command]
@@ -295,18 +308,57 @@ async fn get_document(
 ) -> Result<Option<TradeDocument>, String> {
     let store_guard = state.store.lock().await;
     if let Some(store) = store_guard.as_ref() {
-        let mut doc_opt = store.get_item_by_id("items", &uuid).await.map_err(|e| e.to_string())?;
+        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
         
-        // [OPTIMIZED] Preserve high-quality summary from DB if available
-        if let Some(ref mut doc) = doc_opt {
-            if doc.text.is_empty() {
-                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
-                    doc.text = parsing::json_to_natural_language(&json_val);
+        // 1. Primary search: Exact ID match
+        for table_name in tables.iter() {
+            if let Ok(Some(mut doc)) = store.get_item_by_id(table_name, &uuid).await {
+                if doc.text.is_empty() {
+                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
+                        doc.text = parsing::json_to_natural_language(&json_val);
+                    }
+                }
+                return Ok(Some(doc));
+            }
+        }
+
+        // 2. Fallback search: If uuid is numeric or a hash, look inside the data JSON
+        // This fixes cases where the top-level 'id' column was saved as an empty string.
+        for table_name in tables {
+            // Try matching against "id" field inside JSON
+            if let Ok(Some((_found_id, json_val))) = store.find_item_by_property(table_name, "id", &json!(uuid)).await {
+                if let Ok(doc) = store.get_item_by_id(table_name, "").await { // Get the row with empty ID
+                    // Double check it's the right one by comparing json_data
+                    if let Some(mut d) = doc {
+                        if d.json_data == json_val.to_string() {
+                            if d.text.is_empty() { d.text = parsing::json_to_natural_language(&json_val); }
+                            return Ok(Some(d));
+                        }
+                    }
+                }
+            }
+            
+            // Try matching against "index" field inside JSON
+            let index_query = uuid.parse::<i64>().map(|n| json!(n)).unwrap_or(json!(uuid));
+            if let Ok(Some((_found_id, json_val))) = store.find_item_by_property(table_name, "index", &index_query).await {
+                // To be safe, we perform a broader search for any row where data contains the index
+                // Since find_item_by_property already found it, we just need to reconstruct the TradeDocument
+                if let Ok(all_docs) = store.get_all_items(table_name, 1000, 0, None).await {
+                    for mut d in all_docs {
+                        if d.json_data.contains(&uuid) {
+                            if d.text.is_empty() {
+                                if let Ok(jv) = serde_json::from_str::<Value>(&d.json_data) {
+                                    d.text = parsing::json_to_natural_language(&jv);
+                                }
+                            }
+                            return Ok(Some(d));
+                        }
+                    }
                 }
             }
         }
         
-        Ok(doc_opt)
+        Ok(None)
     } else {
         Err("DB not initialized".to_string())
     }
@@ -909,7 +961,7 @@ pub fn run() {
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
-            upsert_items, set_ignore_cursor_events, mark_ui_ready
+            upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

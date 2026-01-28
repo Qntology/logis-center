@@ -244,6 +244,12 @@ impl VectorStore {
         Ok(())
     }
 
+    pub async fn delete_message_by_task_id(&self, task_id: &str) -> Result<()> {
+        let table = self.conn.open_table("talks").execute().await?;
+        table.delete(&format!("task_id = '{}'", task_id)).await?;
+        Ok(())
+    }
+
     pub async fn update_task_status(&self, id: &str, status: i32) -> Result<()> {
         let table = self.conn.open_table("tasks").execute().await?;
         if status == 9 || status == 6 || status == 3 {
@@ -332,7 +338,19 @@ impl VectorStore {
     ) -> Result<()> {
          let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
          let table = self.conn.open_table(target).execute().await?;
-         let _ = table.delete(&format!("id = '{}'", id)).await;
+         
+         // [SAFETY-FIX] Ensure ID is never empty
+         let mut final_id = id.to_string();
+         if final_id.is_empty() {
+             final_id = data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+         }
+         // Still empty? Use a fallback UUID to prevent database corruption/unreachable rows
+         if final_id.is_empty() {
+             final_id = uuid::Uuid::new_v4().to_string();
+             println!("[Store] Warning: upsert_item called with empty ID. Generated fallback: {}", final_id);
+         }
+
+         let _ = table.delete(&format!("id = '{}'", final_id)).await;
          let mut final_data = data_val.clone();
          if let Some(blob_base64) = final_data.get("data").and_then(|v| v.as_str()) {
              if blob_base64.len() > 50 {
@@ -367,7 +385,7 @@ impl VectorStore {
          let list_field = Field::new("item", DataType::Float32, true);
          let list_array = FixedSizeListArray::try_new(Arc::new(list_field), 768, Arc::new(values_builder), None)?;
          let batch = RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(StringArray::from(vec![id])), Arc::new(StringArray::from(vec![type_])),
+                Arc::new(StringArray::from(vec![final_id])), Arc::new(StringArray::from(vec![type_])),
                 Arc::new(StringArray::from(vec![from.unwrap_or("")])), Arc::new(StringArray::from(vec![to.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![cc.unwrap_or("")])), Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])), Arc::new(StringArray::from(vec![digest.unwrap_or("")])),

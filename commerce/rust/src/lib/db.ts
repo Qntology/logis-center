@@ -75,7 +75,8 @@ Select["items"] = async function(query: DbQuery = {}) {
             
             results = docs.map(doc => {
                 const parsed = parseItemData(doc.json_data);
-                return { ...parsed, ...doc, id: doc.uuid };
+                const docId = doc.id || doc.uuid;
+                return { ...parsed, ...doc, id: docId, uuid: docId };
             });
         } else {
             // [OPTIMIZED] Use search_documents for fuzzy text search

@@ -221,6 +221,7 @@ body {
   font-size: 1.1rem;
   font-family: "Noto Emoji", sans-serif;
   font-weight: 500;
+  pointer-events: auto; /* Ensure buttons capture clicks */
 }
 
 .nav-btn:hover {
