@@ -360,7 +360,7 @@ Analyze the page structure you have already learned and find the repeating patte
 [SCHEMA DEFINITIONS]
 - item: Common CSS1 selector for sibling items (e.g., `tr`, `li`). Match recurring patterns and exclude header, footer, ads, and pagination.
 - node: Common CSS1 selector for the main container wrapping all list items (e.g., tbody, ul). Focus on the direct parent of recurring rows/items, excluding header, footer, ads, and pagination.
-- detail: Boolean. Set to `true` if this is a single item detail page. Set to `false` if it is a list page. Exclude header, footer, ads, pagination.
+- detail: is a detail page or a detail form. Exclude header, footer, ads, pagination.
 
 [OUTPUT FORMAT]
 Return valid JSON only. No explanation.

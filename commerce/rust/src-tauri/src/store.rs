@@ -266,6 +266,21 @@ impl VectorStore {
         println!("[Store] All zombie tasks cleared on startup.");
         Ok(())
     }
+
+    pub async fn delete_item(&self, table_name: &str, id: &str) -> Result<()> {
+        let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+        let table = self.conn.open_table(target).execute().await?;
+        table.delete(&format!("id = '{}'", id)).await?;
+        Ok(())
+    }
+
+    pub async fn delete_items(&self, table_name: &str, ids: Vec<String>) -> Result<()> {
+        let target = if table_name.starts_with("commerce_") { &table_name[9..] } else if table_name.is_empty() { "items" } else { table_name };
+        let table = self.conn.open_table(target).execute().await?;
+        let id_list = ids.iter().map(|id| format!("'{}'", id)).collect::<Vec<_>>().join(",");
+        table.delete(&format!("id IN ({})", id_list)).await?;
+        Ok(())
+    }
     
     pub async fn init_all_tables(&self) -> Result<()> {
         let tables = vec!["items", "sales", "tracking", "event", "users", "talks", "pages"];

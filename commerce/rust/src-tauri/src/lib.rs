@@ -323,18 +323,39 @@ async fn update_document(
 
 #[tauri::command]
 async fn delete_document(
-    _state: State<'_, AppState>,
-    _uuid: String,
+    state: State<'_, AppState>,
+    uuid: String,
 ) -> Result<String, String> {
-    Ok("Not implemented".to_string())
+    let store_guard = state.store.lock().await;
+    if let Some(store) = store_guard.as_ref() {
+        // [DETAIL] 'items' 테이블뿐만 아니라 다른 가능한 테이블에서도 삭제 시도
+        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
+        for table in tables {
+            let _ = store.delete_item(table, &uuid).await;
+        }
+        Ok(format!("Document {} deleted.", uuid))
+    } else {
+        Err("DB not initialized".to_string())
+    }
 }
 
 #[tauri::command]
 async fn delete_documents(
-    _state: State<'_, AppState>,
-    _uuids: Vec<String>,
+    state: State<'_, AppState>,
+    uuids: Vec<String>,
 ) -> Result<String, String> {
-    Ok("Not implemented".to_string())
+    let store_guard = state.store.lock().await;
+    if let Some(store) = store_guard.as_ref() {
+        if uuids.is_empty() { return Ok("No documents to delete.".to_string()); }
+        
+        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
+        for table in tables {
+            let _ = store.delete_items(table, uuids.clone()).await;
+        }
+        Ok(format!("Deleted {} documents.", uuids.len()))
+    } else {
+        Err("DB not initialized".to_string())
+    }
 }
 
 #[tauri::command]

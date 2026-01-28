@@ -480,7 +480,7 @@ async fn process_task(
 
             // [FIX] 한글 등 멀티바이트 문자가 깨지지 않도록 chars() 단위로 안전하게 자름
             let snippet: String = pug_clone.chars().take(50).collect();
-            println!("[DEBUG-RELAY] Ingesting PUG into 0.6B. First 50 chars: '{}...'", snippet.replace("\n", " "));
+            // println!("[DEBUG-RELAY] Ingesting PUG into 0.6B. First 50 chars: '{}...'", snippet.replace("\n", " "));
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 crate::utils::resources::set_current_thread_low_priority();

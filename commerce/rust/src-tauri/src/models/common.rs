@@ -503,10 +503,10 @@ pub fn eager_attention_forward(
                 None => attn_weights,
                 Some(mask) => {
                     // [TRACE] Diagnostic logging
-                    if attn_weights.dim(0)? == 1 {
-                        println!("[TRACE-ATTN] weights: {:?} {:?}, mask: {:?} {:?}", 
-                            attn_weights.device(), attn_weights.dtype(), mask.device(), mask.dtype());
-                    }
+                    // if attn_weights.dim(0)? == 1 {
+                    //     println!("[TRACE-ATTN] weights: {:?} {:?}, mask: {:?} {:?}", 
+                    //         attn_weights.device(), attn_weights.dtype(), mask.device(), mask.dtype());
+                    // }
                     // [FIX] Force both to F32 for the mask addition to avoid BF16 CPU errors
                     let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
                     let weights_f32 = attn_weights.to_dtype(candle_core::DType::F32)?;

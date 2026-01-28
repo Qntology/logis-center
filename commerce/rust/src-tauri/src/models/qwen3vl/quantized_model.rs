@@ -267,20 +267,20 @@ impl QuantizedQwen3VLTextAttention {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
-        if self.layer_idx == 0 {
-            println!("[TRACE-L0] xs: {:?} {:?}, cos: {:?}, target: {:?}", xs.device(), xs.dtype(), cos.dtype(), target_dtype);
-        }
+        // if self.layer_idx == 0 {
+        //     println!("[TRACE-L0] xs: {:?} {:?}, cos: {:?}, target: {:?}", xs.device(), xs.dtype(), cos.dtype(), target_dtype);
+        // }
 
         // 1. [HARDENING] Inbound Input Alignment
         let xs = if !xs.device().same_device(dev) { 
             let moved = xs.to_device(dev)?;
-            if self.layer_idx == 0 { println!("[TRACE-MOVE] xs moved to {:?}", dev); }
+            // if self.layer_idx == 0 { println!("[TRACE-MOVE] xs moved to {:?}", dev); }
             moved
         } else { xs.clone() };
         
         let xs = if xs.dtype() != target_dtype { 
             let casted = xs.to_dtype(target_dtype)?;
-            if self.layer_idx == 0 { println!("[TRACE-CAST] xs casted to {:?}", target_dtype); }
+            // if self.layer_idx == 0 { println!("[TRACE-CAST] xs casted to {:?}", target_dtype); }
             casted
         } else { xs };
 
@@ -318,7 +318,7 @@ impl QuantizedQwen3VLTextAttention {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
                 if self.layer_idx == 0 {
-                    println!("[TRACE-KV] prev_k: {:?} {:?}, new_k: {:?} {:?}", prev_k.device(), prev_k.dtype(), key_states.device(), key_states.dtype());
+                    // println!("[TRACE-KV] prev_k: {:?} {:?}, new_k: {:?} {:?}", prev_k.device(), prev_k.dtype(), key_states.device(), key_states.dtype());
                 }
                 // Key Cache Alignment
                 let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
@@ -340,7 +340,7 @@ impl QuantizedQwen3VLTextAttention {
         // 4. [HARDENING] Adjusted Mask Logic
         let actual_seq_len = key_states.dim(2)?;
         let adjusted_mask = if let Some(mask) = attention_mask {
-            if self.layer_idx == 0 { println!("[TRACE-MASK] mask: {:?} {:?}", mask.device(), mask.dtype()); }
+            // if self.layer_idx == 0 { println!("[TRACE-MASK] mask: {:?} {:?}", mask.device(), mask.dtype()); }
             let mask_len = mask.dim(candle_core::D::Minus1)?;
             if mask_len < actual_seq_len {
                 let padding = Tensor::zeros((b_sz, 1, q_len, actual_seq_len - mask_len), mask.dtype(), mask.device())?;
@@ -739,10 +739,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
 
-        if self.self_attn.layer_idx % 5 == 0 || dev.is_cpu() {
-            println!("[TRACE-LAYER-{}] Device: {:?}, DType: {:?}, In: {:?}", 
-                self.self_attn.layer_idx, dev, target_dtype, xs.dtype());
-        }
+        // if self.self_attn.layer_idx % 5 == 0 || dev.is_cpu() {
+        //     println!("[TRACE-LAYER-{}] Device: {:?}, DType: {:?}, In: {:?}", 
+        //         self.self_attn.layer_idx, dev, target_dtype, xs.dtype());
+        // }
         
         // 2. Ensure inputs are on this device and dtype
         //    (Clone via Cow logic or explicit clone if needed, here we use explicit clones/conversions for safety)
@@ -1089,7 +1089,7 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         let target_dtype = if inputs_embeds.device().is_cuda() { DType::BF16 } else { DType::F32 };
-        println!("[TRACE-MODEL] Start forward. Input: {:?} {:?}, Target: {:?}", inputs_embeds.device(), inputs_embeds.dtype(), target_dtype);
+        // println!("[TRACE-MODEL] Start forward. Input: {:?} {:?}, Target: {:?}", inputs_embeds.device(), inputs_embeds.dtype(), target_dtype);
         
         let position_ids = match position_ids {
             Some(ids) => ids.clone(),
