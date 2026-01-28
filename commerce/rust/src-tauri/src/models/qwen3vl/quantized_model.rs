@@ -375,103 +375,96 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn compress_to_bitkv(&self, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
-        let _device = t.device();
         let original_shape = t.shape().dims().to_vec();
         let (b, h, s, d) = t.dims4()?;
-        
         let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        
-        let anchor_indices: Vec<usize> = (0..s).filter(|&i| i < 4 || i % 8 == 0).collect();
-        let mut anchors = vec![0.0f32; b * h * anchor_indices.len() * d];
-        let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
-        let mut scales = vec![0.0f32; b * h * s]; 
-
         let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
         
-        for batch_idx in 0..b {
-            for head_idx in 0..h {
-                let mut last_anchor_idx = 0;
-                let head_offset = (batch_idx * h * s * d) + (head_idx * s * d);
-                
-                for token_idx in 0..s {
-                    let token_offset = head_offset + (token_idx * d);
-                    let current_vector = &t_data[token_offset..token_offset + d];
-                    
-                    if anchor_indices.contains(&token_idx) {
-                        let anchor_pos = anchor_indices.iter().position(|&x| x == token_idx).unwrap();
-                        let anchor_target_offset = (batch_idx * h * anchor_indices.len() * d) + (head_idx * anchor_indices.len() * d) + (anchor_pos * d);
-                        anchors[anchor_target_offset..anchor_target_offset + d].copy_from_slice(current_vector);
-                        last_anchor_idx = token_idx;
-                    } else {
-                        let anchor_offset = head_offset + (last_anchor_idx * d);
-                        let anchor_vector = &t_data[anchor_offset..anchor_offset + d];
-                        
-                        let mut residual = vec![0.0f32; d];
-                        let mut abs_sum = 0.0f32;
-                        for i in 0..d {
-                            residual[i] = current_vector[i] - anchor_vector[i];
-                            abs_sum += residual[i].abs();
-                        }
-                        
-                        let scale = abs_sum / (d as f32);
-                        scales[(batch_idx * h * s) + (head_idx * s) + token_idx] = scale;
-                        
-                        for i in 0..d {
-                            if residual[i] >= 0.0 {
-                                let global_bit_idx = token_offset + i;
-                                packed_residuals[global_bit_idx / 8] |= 1 << (global_bit_idx % 8);
-                            }
-                        }
-                    }
+        let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+        let mut anchors = vec![0.0f32; b * h * anchor_count * d];
+        let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
+        let mut scales = vec![0.0f32; b * h * s];
+
+        // 1. Parallel pass for Bit Packing (Read-only on t_data)
+        // Since packed_residuals is indexed by global token index, we can safely parallelize by Head
+        let head_token_size = s * d;
+        packed_residuals.par_chunks_mut(head_token_size / 8).enumerate().for_each(|(bh_idx, head_packed)| {
+            let bh_offset = bh_idx * head_token_size;
+            for i in 0..head_token_size {
+                if t_data[bh_offset + i] >= 0.0 {
+                    head_packed[i / 8] |= 1 << (i % 8);
                 }
             }
-        }
+        });
+        
+        // 2. Parallel pass for Anchors and Scales
+        // Group anchors and scales by head to avoid mutable borrow conflicts
+        let anchor_head_size = anchor_count * d;
+        let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
+        let mut scales_heads: Vec<&mut [f32]> = scales.chunks_mut(s).collect();
+
+        // Use zip to process both together in parallel
+        anchors_heads.par_iter_mut().zip(scales_heads.par_iter_mut()).enumerate().for_each(|(bh_idx, (anchor_head, head_scales))| {
+            let bh_offset = bh_idx * head_token_size;
+            for token_idx in 0..s {
+                let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+                
+                // Copy Anchor if index matches
+                if token_idx < 4 || token_idx % 8 == 0 {
+                    let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                    anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
+                }
+                
+                // Calculate Scale (Max Absolute)
+                let mut max_abs = 0.0f32;
+                for &v in token_data {
+                    let a = v.abs();
+                    if a > max_abs { max_abs = a; }
+                }
+                head_scales[token_idx] = max_abs;
+            }
+        });
 
         let packed_len = packed_residuals.len();
-        let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_indices.len(), d], &Device::Cpu)?;
+        let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?;
         let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
         let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?;
-        
         Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
     }
 
     pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
         let device = anchors.device();
         let (b, h, s, d) = (original_shape[0], original_shape[1], original_shape[2], original_shape[3]);
-        
-        let anchor_indices: Vec<usize> = (0..s).filter(|&i| i < 4 || i % 8 == 0).collect();
         let anchors_vec = anchors.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
         let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         
         let mut decoded = vec![0.0f32; b * h * s * d];
-        
-        for batch_idx in 0..b {
-            for head_idx in 0..h {
-                let mut last_anchor_vec = vec![0.0f32; d];
-                let head_offset = (batch_idx * h * s * d) + (head_idx * s * d);
+        let anchor_count = anchors_vec.len() / (b * h * d);
+
+        // [TURBO] Parallel Decompression
+        decoded.par_chunks_mut(s * d).enumerate().for_each(|(bh_idx, head_data)| {
+            let anchor_bh_offset = bh_idx * anchor_count * d;
+            let scale_head_offset = bh_idx * s;
+            let packed_head_offset = bh_idx * s * d;
+
+            for token_idx in 0..s {
+                let target_offset = token_idx * d;
+                let scale = scales_vec[scale_head_offset + token_idx];
                 
-                for token_idx in 0..s {
-                    let target_offset = head_offset + (token_idx * d);
-                    
-                    if anchor_indices.contains(&token_idx) {
-                        let anchor_pos = anchor_indices.iter().position(|&x| x == token_idx).unwrap();
-                        let anchor_src_offset = (batch_idx * h * anchor_indices.len() * d) + (head_idx * anchor_indices.len() * d) + (anchor_pos * d);
-                        let anchor_data = &anchors_vec[anchor_src_offset..anchor_src_offset + d];
-                        decoded[target_offset..target_offset + d].copy_from_slice(anchor_data);
-                        last_anchor_vec.copy_from_slice(anchor_data);
-                    } else {
-                        let scale = scales_vec[(batch_idx * h * s) + (head_idx * s) + token_idx];
-                        for i in 0..d {
-                            let global_bit_idx = target_offset + i;
-                            let is_set = (packed_vec[global_bit_idx / 8] & (1 << (global_bit_idx % 8))) != 0;
-                            let residual = if is_set { scale } else { -scale };
-                            decoded[target_offset + i] = last_anchor_vec[i] + residual;
-                        }
+                if token_idx < 4 || token_idx % 8 == 0 {
+                    let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                    let src = &anchors_vec[anchor_bh_offset + anchor_pos * d .. anchor_bh_offset + (anchor_pos + 1) * d];
+                    head_data[target_offset..target_offset + d].copy_from_slice(src);
+                } else {
+                    for i in 0..d {
+                        let bit_idx = packed_head_offset + token_idx * d + i;
+                        let is_set = (packed_vec[bit_idx / 8] & (1 << (bit_idx % 8))) != 0;
+                        head_data[target_offset + i] = if is_set { scale } else { -scale };
                     }
                 }
             }
-        }
+        });
         
         let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
         Ok(t.to_device(device)?)

@@ -22,6 +22,7 @@ use crate::{
     },
     openai_types::ChatCompletionParameters,
 };
+use rayon::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::fs;
 use std::path::Path;
@@ -277,16 +278,8 @@ impl Qwen3VLGenerateModel {
 
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
-                // [BITKV-LIVE-RELAY] 0.6B -> 2B High Quality Transfer
-                let mut k_anchors = Vec::with_capacity(ks.len());
-                let mut k_packed = Vec::with_capacity(ks.len());
-                let mut k_scales = Vec::with_capacity(ks.len());
-                let mut v_anchors = Vec::with_capacity(vs.len());
-                let mut v_packed = Vec::with_capacity(vs.len());
-                let mut v_scales = Vec::with_capacity(vs.len());
-                let mut original_shape = vec![];
-
-                for (k, v) in ks.iter().zip(vs.iter()) {
+                // [TURBO-RELAY] Parallelize layer compression across ALL CPU cores
+                    let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
                     let seq_len = k.dim(candle_core::D::Minus2)?;
                     let chunk_tokens = end - current_pos;
                     let start = seq_len.saturating_sub(chunk_tokens);
@@ -294,14 +287,28 @@ impl Qwen3VLGenerateModel {
                     let k_new = k.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
                     let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
                     
-                    // BitKV Compression inside Model Variant
                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                        let (ka, kp, ks, shape) = m.language_model.compress_to_bitkv(&k_new)?;
-                        let (va, vp, vs, _) = m.language_model.compress_to_bitkv(&v_new)?;
-                        k_anchors.push(ka); k_packed.push(kp); k_scales.push(ks);
-                        v_anchors.push(va); v_packed.push(vp); v_scales.push(vs);
-                        original_shape = shape;
+                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
+                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
+                        Ok((res_k, res_v))
+                    } else {
+                        Err(anyhow!("Unsupported model variant"))
                     }
+                }).collect();
+
+                let results = results?;
+                let mut k_anchors = Vec::with_capacity(results.len());
+                let mut k_packed = Vec::with_capacity(results.len());
+                let mut k_scales = Vec::with_capacity(results.len());
+                let mut v_anchors = Vec::with_capacity(results.len());
+                let mut v_packed = Vec::with_capacity(results.len());
+                let mut v_scales = Vec::with_capacity(results.len());
+                let mut original_shape = vec![];
+
+                for (res_k, res_v) in results {
+                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
+                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
+                    original_shape = res_k.3;
                 }
                 
                 if !k_anchors.is_empty() {
@@ -342,15 +349,8 @@ impl Qwen3VLGenerateModel {
 
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
-                let mut k_anchors = Vec::with_capacity(ks.len());
-                let mut k_packed = Vec::with_capacity(ks.len());
-                let mut k_scales = Vec::with_capacity(ks.len());
-                let mut v_anchors = Vec::with_capacity(vs.len());
-                let mut v_packed = Vec::with_capacity(vs.len());
-                let mut v_scales = Vec::with_capacity(vs.len());
-                let mut original_shape = vec![];
-
-                for (k, v) in ks.iter().zip(vs.iter()) {
+                // [TURBO-RELAY] Parallelize layer compression
+                    let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
                     let s_len = k.dim(candle_core::D::Minus2)?;
                     let chunk_tokens = end - current_pos;
                     let start = s_len.saturating_sub(chunk_tokens);
@@ -359,12 +359,27 @@ impl Qwen3VLGenerateModel {
                     let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
                     
                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                        let (ka, kp, ks, shape) = m.language_model.compress_to_bitkv(&k_new)?;
-                        let (va, vp, vs, _) = m.language_model.compress_to_bitkv(&v_new)?;
-                        k_anchors.push(ka); k_packed.push(kp); k_scales.push(ks);
-                        v_anchors.push(va); v_packed.push(vp); v_scales.push(vs);
-                        original_shape = shape;
+                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
+                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
+                        Ok((res_k, res_v))
+                    } else {
+                        Err(anyhow!("Unsupported model variant for BitKV relay"))
                     }
+                }).collect();
+
+                let results = results?;
+                let mut k_anchors = Vec::with_capacity(results.len());
+                let mut k_packed = Vec::with_capacity(results.len());
+                let mut k_scales = Vec::with_capacity(results.len());
+                let mut v_anchors = Vec::with_capacity(results.len());
+                let mut v_packed = Vec::with_capacity(results.len());
+                let mut v_scales = Vec::with_capacity(results.len());
+                let mut original_shape = vec![];
+
+                for (res_k, res_v) in results {
+                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
+                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
+                    original_shape = res_k.3;
                 }
                 
                 if !k_anchors.is_empty() {
@@ -397,26 +412,34 @@ impl Qwen3VLGenerateModel {
         
         if let Some(target) = relay_target {
             let (ks, vs) = self.get_current_kv();
-            let mut k_anchors = Vec::with_capacity(ks.len());
-            let mut k_packed = Vec::with_capacity(ks.len());
-            let mut k_scales = Vec::with_capacity(ks.len());
-            let mut v_anchors = Vec::with_capacity(vs.len());
-            let mut v_packed = Vec::with_capacity(vs.len());
-            let mut v_scales = Vec::with_capacity(vs.len());
-            let mut original_shape = vec![];
-
-            for (k, v) in ks.iter().zip(vs.iter()) {
+            // [TURBO-RELAY] Parallelize layer compression
+                let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
                  let s_len = k.dim(candle_core::D::Minus2)?;
                  let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
                  let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
                  
                  if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                    let (ka, kp, ks, shape) = m.language_model.compress_to_bitkv(&k_new)?;
-                    let (va, vp, vs, _) = m.language_model.compress_to_bitkv(&v_new)?;
-                    k_anchors.push(ka); k_packed.push(kp); k_scales.push(ks);
-                    v_anchors.push(va); v_packed.push(vp); v_scales.push(vs);
-                    original_shape = shape;
+                    let res_k = m.language_model.compress_to_bitkv(&k_new)?;
+                    let res_v = m.language_model.compress_to_bitkv(&v_new)?;
+                    Ok((res_k, res_v))
+                } else {
+                    Err(anyhow!("Unsupported variant"))
                 }
+            }).collect();
+
+            let results = results?;
+            let mut k_anchors = Vec::with_capacity(results.len());
+            let mut k_packed = Vec::with_capacity(results.len());
+            let mut k_scales = Vec::with_capacity(results.len());
+            let mut v_anchors = Vec::with_capacity(results.len());
+            let mut v_packed = Vec::with_capacity(results.len());
+            let mut v_scales = Vec::with_capacity(results.len());
+            let mut original_shape = vec![];
+
+            for (res_k, res_v) in results {
+                k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
+                v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
+                original_shape = res_k.3;
             }
             
             if !k_anchors.is_empty() {
