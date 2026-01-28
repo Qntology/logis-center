@@ -57,6 +57,14 @@ impl ModelVariant {
             Self::QuantizedText(m) => m.language_model.drop_kv_storage(),
         }
     }
+
+    pub fn inject_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
+        match self {
+            Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(k_anchors, k_packed, k_scales, v_anchors, v_packed, v_scales, original_shape),
+            Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(k_anchors, k_packed, k_scales, v_anchors, v_packed, v_scales, original_shape),
+            _ => Ok(()),
+        }
+    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -269,25 +277,36 @@ impl Qwen3VLGenerateModel {
 
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
-                // ... (기존 Relay 로직 동일) ...
-                let mut new_ks_i8 = Vec::with_capacity(ks.len());
-                let mut new_vs_i8 = Vec::with_capacity(vs.len());
+                // [BITKV-LIVE-RELAY] 0.6B -> 2B High Quality Transfer
+                let mut k_anchors = Vec::with_capacity(ks.len());
+                let mut k_packed = Vec::with_capacity(ks.len());
                 let mut k_scales = Vec::with_capacity(ks.len());
+                let mut v_anchors = Vec::with_capacity(vs.len());
+                let mut v_packed = Vec::with_capacity(vs.len());
                 let mut v_scales = Vec::with_capacity(vs.len());
+                let mut original_shape = vec![];
 
                 for (k, v) in ks.iter().zip(vs.iter()) {
                     let seq_len = k.dim(candle_core::D::Minus2)?;
-                    let start = seq_len.saturating_sub(chunk.len());
-                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk.len())?;
-                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk.len())?;
-                    let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    let k_s = k_max / 127.0; let v_s = v_max / 127.0;
-                    let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
-                    let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
-                    new_ks_i8.push(k_i8); new_vs_i8.push(v_i8); k_scales.push(k_s); v_scales.push(v_s);
+                    let chunk_tokens = end - current_pos;
+                    let start = seq_len.saturating_sub(chunk_tokens);
+                    
+                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
+                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
+                    
+                    // BitKV Compression inside Model Variant
+                    if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
+                        let (ka, kp, ks, shape) = m.language_model.compress_to_bitkv(&k_new)?;
+                        let (va, vp, vs, _) = m.language_model.compress_to_bitkv(&v_new)?;
+                        k_anchors.push(ka); k_packed.push(kp); k_scales.push(ks);
+                        v_anchors.push(va); v_packed.push(vp); v_scales.push(vs);
+                        original_shape = shape;
+                    }
                 }
-                target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+                
+                if !k_anchors.is_empty() {
+                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
+                }
             }
             current_pos = end;
         }
@@ -323,23 +342,34 @@ impl Qwen3VLGenerateModel {
 
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
-                let mut new_ks_i8 = Vec::with_capacity(ks.len());
-                let mut new_vs_i8 = Vec::with_capacity(vs.len());
+                let mut k_anchors = Vec::with_capacity(ks.len());
+                let mut k_packed = Vec::with_capacity(ks.len());
                 let mut k_scales = Vec::with_capacity(ks.len());
+                let mut v_anchors = Vec::with_capacity(vs.len());
+                let mut v_packed = Vec::with_capacity(vs.len());
                 let mut v_scales = Vec::with_capacity(vs.len());
+                let mut original_shape = vec![];
+
                 for (k, v) in ks.iter().zip(vs.iter()) {
                     let s_len = k.dim(candle_core::D::Minus2)?;
-                    let start = s_len.saturating_sub(chunk.len());
-                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk.len())?;
-                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk.len())?;
-                    let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                    let k_s = k_max / 127.0; let v_s = v_max / 127.0;
-                    let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
-                    let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
-                    new_ks_i8.push(k_i8); new_vs_i8.push(v_i8); k_scales.push(k_s); v_scales.push(v_s);
+                    let chunk_tokens = end - current_pos;
+                    let start = s_len.saturating_sub(chunk_tokens);
+                    
+                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
+                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
+                    
+                    if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
+                        let (ka, kp, ks, shape) = m.language_model.compress_to_bitkv(&k_new)?;
+                        let (va, vp, vs, _) = m.language_model.compress_to_bitkv(&v_new)?;
+                        k_anchors.push(ka); k_packed.push(kp); k_scales.push(ks);
+                        v_anchors.push(va); v_packed.push(vp); v_scales.push(vs);
+                        original_shape = shape;
+                    }
                 }
-                target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+                
+                if !k_anchors.is_empty() {
+                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
+                }
             }
             current_pos = end;
         }
@@ -364,24 +394,34 @@ impl Qwen3VLGenerateModel {
         let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
         if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
+        
         if let Some(target) = relay_target {
             let (ks, vs) = self.get_current_kv();
-            let mut new_ks_i8 = Vec::with_capacity(ks.len());
-            let mut new_vs_i8 = Vec::with_capacity(vs.len());
+            let mut k_anchors = Vec::with_capacity(ks.len());
+            let mut k_packed = Vec::with_capacity(ks.len());
             let mut k_scales = Vec::with_capacity(ks.len());
+            let mut v_anchors = Vec::with_capacity(vs.len());
+            let mut v_packed = Vec::with_capacity(vs.len());
             let mut v_scales = Vec::with_capacity(vs.len());
+            let mut original_shape = vec![];
+
             for (k, v) in ks.iter().zip(vs.iter()) {
                  let s_len = k.dim(candle_core::D::Minus2)?;
                  let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
                  let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                 let k_max = k_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                 let v_max = v_new.abs()?.max_all()?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-                 let k_s = k_max / 127.0; let v_s = v_max / 127.0;
-                 let k_i8 = if k_s > 0.0 { (k_new.to_dtype(DType::F32)? / k_s as f64)?.round()?.to_dtype(DType::U8)? } else { k_new.to_dtype(DType::U8)? };
-                 let v_i8 = if v_s > 0.0 { (v_new.to_dtype(DType::F32)? / v_s as f64)?.round()?.to_dtype(DType::U8)? } else { v_new.to_dtype(DType::U8)? };
-                 new_ks_i8.push(k_i8); new_vs_i8.push(v_i8); k_scales.push(k_s); v_scales.push(v_s);
+                 
+                 if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
+                    let (ka, kp, ks, shape) = m.language_model.compress_to_bitkv(&k_new)?;
+                    let (va, vp, vs, _) = m.language_model.compress_to_bitkv(&v_new)?;
+                    k_anchors.push(ka); k_packed.push(kp); k_scales.push(ks);
+                    v_anchors.push(va); v_packed.push(vp); v_scales.push(vs);
+                    original_shape = shape;
+                }
             }
-            target.inject_kv_quantized(&new_ks_i8, &new_vs_i8, &k_scales, &v_scales)?;
+            
+            if !k_anchors.is_empty() {
+                target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
+            }
         }
         Ok(chunk_size)
     }
@@ -526,12 +566,8 @@ impl Qwen3VLGenerateModel {
         (ks, vs)
     }
 
-    pub fn inject_kv_quantized(&mut self, ks: &[Tensor], vs: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> {
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.language_model.inject_live_kv_quantized(ks, vs, k_scales, v_scales),
-            ModelVariant::QuantizedText(m) => m.language_model.inject_live_kv_quantized(ks, vs, k_scales, v_scales),
-            _ => Ok(()),
-        }
+    pub fn inject_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
+        self.qwen3_vl.inject_kv_bitkv(k_anchors, k_packed, k_scales, v_anchors, v_packed, v_scales, original_shape)
     }
 
     pub fn save_kv_to_disk(&mut self, path: &Path) -> Result<()> {
