@@ -119,6 +119,9 @@ function startSpinner() {
     if (spinnerInterval) clearInterval(spinnerInterval);
     if (globalNavSpinner) {
         globalNavSpinner.style.display = "inline-block";
+        // Ensure the extraction button is hidden while the global spinner is active
+        if (btnExtract) btnExtract.style.display = "none";
+        
         globalNavSpinner.onclick = async () => {
             openWidget("list");
             listView.style.display = "none";
@@ -157,7 +160,15 @@ function stopSpinner() {
         clearInterval(spinnerInterval);
         spinnerInterval = null;
     }
-    if (globalNavSpinner) globalNavSpinner.style.display = "none";
+    if (globalNavSpinner) {
+        globalNavSpinner.style.display = "none";
+        globalNavSpinner.innerText = ""; 
+    }
+    // [FIX] Comprehensive cleanup of all active-spinner classes and flags
+    document.querySelectorAll('.active-spinner').forEach(el => {
+        el.classList.remove('active-spinner');
+    });
+    isExtracting = false;
 }
 
 // --- Layout & Window Logic ---
@@ -248,9 +259,10 @@ if (pillNav) {
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
     
-    // [UI-FIX] If already extracting, keep the button hidden and let the spinner show
-    if (isExtracting) {
+    // [UI-FIX] If already extracting or the global spinner is active, keep the button hidden
+    if (isExtracting || spinnerInterval) {
         btnExtract.style.display = "none";
+        btnExtract.classList.remove("active-spinner");
         return;
     }
 
@@ -784,8 +796,10 @@ async function renderProgressToUI(payload: any) {
 
     if (payload.category === "Done" || payload.category === "Error") {
         stopSpinner();
-        isExtracting = false;
-        if (btnExtract) setTimeout(() => { btnExtract.innerText = "⚡"; }, 2000);
+        if (btnExtract) {
+            btnExtract.classList.remove("active-spinner");
+            btnExtract.innerText = "⚡";
+        }
         await updateExtractButtonVisibility();
     }
 
@@ -870,6 +884,15 @@ async function renderProgressToUI(payload: any) {
 
 btnStopTask?.addEventListener("click", async () => {
     if (await ask("Stop the current extraction? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
+        // [UI-FIRST] Reset everything immediately
+        stopSpinner();
+        if (btnExtract) {
+            btnExtract.classList.remove("active-spinner");
+            btnExtract.innerText = "⚡";
+            btnExtract.style.display = "flex";
+        }
+        if (btnStopTask) btnStopTask.style.display = "none";
+
         try {
             console.log("[WIDGET] Stopping task:", activeTaskId);
             await invoke<string>("stop_current_extraction", { taskId: activeTaskId });
@@ -881,11 +904,7 @@ btnStopTask?.addEventListener("click", async () => {
                 if (el) el.remove();
             }
 
-            isExtracting = false; 
-            stopSpinner();
             activeTaskId = null;
-
-            if (btnStopTask) btnStopTask.style.display = "none";
             detailTitle.innerText = "Cancelled";
             detailContent.innerHTML = "<div style='color:#ef4444; padding:20px;'>Extraction stopped and deleted by user.</div>";
             await updateExtractButtonVisibility();
