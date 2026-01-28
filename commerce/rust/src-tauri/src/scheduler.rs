@@ -474,9 +474,13 @@ async fn process_task(
         let pug_content = light_pug.clone();
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
+        
+        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
+        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
-        // 1. [0.6B] Bake FULL Templated Prompt
-        {
+        if !has_snapshot {
+            // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             
@@ -489,7 +493,6 @@ async fn process_task(
                 let mut gen_guard = model_clone.generator.blocking_lock();
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
-                    // [STRICT-ALIGN] Use prefill_only to ensure ChatML tokens are identical
                     let params = crate::openai_types::ChatCompletionParameters {
                         messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
                             content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
@@ -501,6 +504,8 @@ async fn process_task(
                 }
                 Ok(())
             }).await??;
+        } else {
+            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
         // 2. [2B] Load Snapshot & Bake Task
@@ -559,8 +564,13 @@ async fn process_task(
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
 
-        // 1. [0.6B] Bake Full Context
-        {
+        // [CHECKPOINT] Check if Step B snapshot already exists
+        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+
+        if !has_snapshot {
+            // 1. [0.6B] Bake Full Context
+            println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
@@ -582,6 +592,8 @@ async fn process_task(
                 }
                 Ok(())
             }).await??;
+        } else {
+            println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
         }
 
         // 2. [2B] Load & Generate
@@ -707,8 +719,13 @@ async fn process_task(
             let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
 
-            // 1. [0.6B] Bake Detail Context
-            {
+            // [CHECKPOINT] Check if Detail snapshot already exists
+            let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+            let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+
+            if !has_snapshot {
+                // 1. [0.6B] Bake Detail Context
+                println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
                 model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
                 let model_clone = model.clone();
                 let question_clone = task_question.clone();
@@ -730,6 +747,8 @@ async fn process_task(
                     }
                     Ok(())
                 }).await??;
+            } else {
+                println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B baking.");
             }
 
             // 2. [2B] Load & Generate
