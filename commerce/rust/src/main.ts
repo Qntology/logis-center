@@ -281,10 +281,9 @@ async function updateExtractButtonVisibility() {
         
         btnExtract.title = `Extract from ${hostname}`;
 
-        const isActive = await invoke<boolean>("check_active_task", { 
-            payload: { cc: ccHash, refId: hashedRefId } 
-        });
-
+        const isActive = await invoke<boolean>("check_active_task", {
+                    payload: { cc: ccHash, ref: hashedRefId }
+                });
         if (isActive === true) {
             btnExtract.classList.add("active-spinner");
             btnExtract.title = "Extraction in progress...";
@@ -297,11 +296,18 @@ async function updateExtractButtonVisibility() {
 
 listen("browser-match-found", async (event: any) => {
     const payload = event.payload;
+    console.log("[WIDGET] Browser Match Found:", payload);
+    
     if (payload.is_client || payload.is_admin) {
         currentDetectedUrl = payload.url;
+        // If a match is found, the browser must be running, so hide launch button
+        if (btnAutoLaunch) btnAutoLaunch.style.display = "none";
     } else {
         currentDetectedUrl = "";
+        // If no match but browser was previously 'running', we might need to sync status
+        // syncBrowserStatus() handles the more general 'running' check
     }
+    
     await updateExtractButtonVisibility();
 });
 
@@ -659,7 +665,12 @@ btnSubmit?.addEventListener("click", async () => {
         aiResultsTitle.innerText = "🧠 AI Deep Analysis";
         aiResultsContent.innerHTML = "<div class='spinner'></div> 🤖 Analyzing your query...";
         try {
-            const response = await invoke<any>("ai_search_complex", { query: query, language: "korean" });
+            const devicePref = forceCpuToggle.checked ? "cpu" : null;
+            const response = await invoke<any>("ai_search_complex", { 
+                query: query, 
+                language: "korean",
+                devicePreference: devicePref
+            });
             let html = `<div style="margin-bottom:15px; padding:10px; background:#222; border-left:3px solid var(--primary); font-size:0.75rem;"><strong style="display:block; margin-bottom:5px; color:#aaa;">Query Intent:</strong>`;
             if (response.structured && response.structured.context) {
                 response.structured.context.forEach((ctx: any) => {
@@ -697,10 +708,9 @@ btnExtract?.addEventListener("click", async () => {
             const link = (urlObj.pathname + urlObj.search).toLowerCase();
             const ccHash = await hashId(hostname); 
             const hashedRefId = await hashId(ccHash + link);
-            const isActive = await invoke<boolean>("check_active_task", { 
-                payload: { cc: ccHash, refId: hashedRefId } 
-            });
-            if (isActive) {
+            const isActive = await invoke<boolean>("check_active_task", {
+                        payload: { cc: ccHash, ref: hashedRefId }
+                    });            if (isActive) {
                 alert("This page is already in the queue or being processed.");
                 openWidget("settings");
                 await updateExtractButtonVisibility();
@@ -734,7 +744,7 @@ btnExtract?.addEventListener("click", async () => {
         const taskId = `img_${Date.now()}`;
         activeTaskId = taskId; // [NEW]
         try {
-            await emit("new-task-from-browser", { id: taskId, type: "image_extraction", image_path: currentImage, ref_id: currentImage, link: "Local Image" });
+            await emit("new-task-from-browser", { id: taskId, type: "image_extraction", image_path: currentImage, ref: currentImage, link: "Local Image" });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: Image Analysis`, status: 10, task_id: taskId, created_at: Date.now() });
             await updateExtractButtonVisibility();
         } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
@@ -752,7 +762,7 @@ btnExtract?.addEventListener("click", async () => {
             
             await emit("new-task-from-browser", { 
                 id: taskId, type: "html_extraction", html: html, link: rawPath, 
-                cc: cc, ref_id: hashedRefId, from: currentSession.address, to: currentSession.team
+                cc: cc, ref: hashedRefId, from: currentSession.address, to: currentSession.team
             });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: 10, task_id: hashedRefId, created_at: Date.now() });
             await updateExtractButtonVisibility();
@@ -911,6 +921,7 @@ autoBtn?.addEventListener("click", async () => {
 
 listen("browser-status", async (event: any) => {
     const status = event.payload; 
+    console.log("[WIDGET] Browser Status Changed:", status);
     if (btnAutoLaunch) btnAutoLaunch.style.display = (status === "running") ? "none" : "flex";
     if (status === "stopped") { currentDetectedUrl = ""; await updateExtractButtonVisibility(); }
 });
@@ -1223,7 +1234,9 @@ async function initSession() {
         console.log("[WIDGET] Initial data received:", data);
 
         // 1. Browser & URL Status
-        if (btnAutoLaunch) btnAutoLaunch.style.display = (data.browser_status === "running") ? "none" : "flex";
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = (data.browser_status === "running") ? "none" : "flex";
+        }
         
         if (data.current_url) {
             currentDetectedUrl = data.current_url;
@@ -1263,7 +1276,41 @@ settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && 
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
 document.getElementById("unload-btn")?.addEventListener("click", async () => { try { await invoke("unload_model"); alert("Memory cleared."); } catch (e) {} });
 async function syncBrowserStatus() { try { const s = await invoke<string>("get_browser_status"); if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; } catch (e) {} }
-initSession(); setWindowSize(false); syncBrowserStatus();
+// --- Device Preference Logic ---
+const forceCpuToggle = document.getElementById("force-cpu-toggle") as HTMLInputElement;
+
+async function initDevicePreference() {
+    if (!forceCpuToggle) return;
+
+    // 1. Check GPU Availability
+    try {
+        const hasGpu = await invoke<boolean>("check_gpu_availability");
+        if (!hasGpu) {
+            forceCpuToggle.disabled = true;
+            forceCpuToggle.checked = true;
+            const label = document.querySelector('label[for="force-cpu-toggle"]') as HTMLElement;
+            if (label) label.innerText = "CPU Mode (No GPU detected)";
+        } else {
+            // 2. Load saved preference
+            const savedPref = localStorage.getItem("force_cpu_mode") === "true";
+            forceCpuToggle.checked = savedPref;
+        }
+    } catch (e) {
+        console.error("[WIDGET] Failed to check GPU status:", e);
+    }
+
+    // 3. Save on change
+    forceCpuToggle.addEventListener("change", () => {
+        localStorage.setItem("force_cpu_mode", forceCpuToggle.checked.toString());
+        // [NOTE] The preference will be applied on the next model initialization.
+        // Users can click "Free Memory" to force a reload if they want immediate effect.
+    });
+}
+
+// Call init functions
+// [NOTE] deep_research_command is typically called from the chat interface or specialized AI tools.
+// I will ensure any future calls follow the same pattern as ai_search_complex.
+const getDevicePref = () => forceCpuToggle.checked ? "cpu" : null;
 const talksScroll = document.getElementById("chat-scroll");
 if (talksScroll) {
     talksScroll.addEventListener('wheel', (e: WheelEvent) => { 
@@ -1307,3 +1354,9 @@ async function loadMoreChat() {
         }
     } catch (e) { console.error(e); } finally { isChatLoading = false; }
 }
+
+// --- Initialize ---
+initSession();
+setWindowSize(false);
+syncBrowserStatus();
+initDevicePreference();

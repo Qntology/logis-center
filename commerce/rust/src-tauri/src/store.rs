@@ -82,10 +82,14 @@ impl VectorStore {
         if existing.contains(&"tasks".to_string()) {
             let table = self.conn.open_table("tasks").execute().await?;
             let current_schema = table.schema().await?;
-            let needs_recreate = if let Ok(field) = current_schema.field_with_name("status") {
-                field.data_type() == &DataType::Utf8
-            } else { true };
-            if needs_recreate {
+            // [MIGRATION] Ensure 'ref' field exists and 'status' is Int32
+            let has_ref = current_schema.field_with_name("ref").is_ok();
+            let status_is_int = if let Ok(field) = current_schema.field_with_name("status") {
+                field.data_type() == &DataType::Int32
+            } else { false };
+
+            if !has_ref || !status_is_int {
+                println!("[Store] tasks table schema mismatch. Dropping for recreation.");
                 let _ = self.conn.drop_table("tasks", &[]).await;
             }
         }
@@ -96,21 +100,28 @@ impl VectorStore {
 
         let msg_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
+            Field::new("type", DataType::Utf8, false),
             Field::new("role", DataType::Utf8, false), 
-            Field::new("content", DataType::Utf8, false),
-            Field::new("task_id", DataType::Utf8, true),
-            Field::new("status", DataType::Int32, true), 
+            Field::new("from", DataType::Utf8, true),
+            Field::new("to", DataType::Utf8, true),
             Field::new("cc", DataType::Utf8, true),
             Field::new("bcc", DataType::Utf8, true),
             Field::new("ref", DataType::Utf8, true),
+            Field::new("text", DataType::Utf8, false),
+            Field::new("data", DataType::Utf8, true), 
+            Field::new("task_id", DataType::Utf8, true),
+            Field::new("status", DataType::Int32, true), 
             Field::new("created_at", DataType::Int64, false),
+            Field::new("updated_at", DataType::Int64, false),
         ]));
 
         if existing.contains(&"talks".to_string()) {
             let table = self.conn.open_table("talks").execute().await?;
             let current_schema = table.schema().await?;
-            let needs_recreate = current_schema.field_with_name("ref").is_err();
+            // [MIGRATION] Check for 'text' field to see if it's the old schema
+            let needs_recreate = current_schema.field_with_name("text").is_err();
             if needs_recreate {
+                println!("[Store] talks table schema outdated (missing 'text'). Dropping for migration.");
                 let _ = self.conn.drop_table("talks", &[]).await;
             }
         }
@@ -123,30 +134,39 @@ impl VectorStore {
 
     pub async fn has_active_task(&self, cc: &str, r#ref: &str) -> Result<bool> {
         let table = self.conn.open_table("tasks").execute().await?;
+        // [FIX] Use backticks for 'ref' to avoid reserved keyword conflicts in LanceDB/DataFusion
+        let filter = format!("cc = '{}' AND `ref` = '{}' AND (status = 10 OR status = 1)", cc, r#ref);
         let results = table.query()
-            .only_if(format!("cc = '{}' AND ref = '{}' AND (status = 10 OR status = 1)", cc, r#ref))
+            .only_if(filter)
             .limit(1).execute().await?.try_collect::<Vec<_>>().await?;
         Ok(!results.is_empty())
     }
 
     pub async fn add_message(
-        &self, id: &str, role: &str, content: &str, task_id: Option<&str>, status: Option<i32>,
-        cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>
+        &self, id: &str, role: &str, text: &str, task_id: Option<&str>, status: Option<i32>,
+        cc: Option<&str>, bcc: Option<&str>, r#ref: Option<&str>,
+        from: Option<&str>, to: Option<&str>, type_: Option<&str>, data: Option<&str>
     ) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
         let schema = table.schema().await?;
+        let now = chrono::Utc::now().timestamp_millis();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(vec![id.to_string()])),
+                Arc::new(StringArray::from(vec![type_.unwrap_or("talk").to_string()])),
                 Arc::new(StringArray::from(vec![role.to_string()])),
-                Arc::new(StringArray::from(vec![content.to_string()])),
-                Arc::new(StringArray::from(vec![task_id.unwrap_or("").to_string()])),
-                Arc::new(arrow_array::Int32Array::from(vec![status.unwrap_or(0)])),
+                Arc::new(StringArray::from(vec![from.unwrap_or("").to_string()])),
+                Arc::new(StringArray::from(vec![to.unwrap_or("").to_string()])),
                 Arc::new(StringArray::from(vec![cc.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])),
-                Arc::new(Int64Array::from(vec![chrono::Utc::now().timestamp_millis()])),
+                Arc::new(StringArray::from(vec![text.to_string()])),
+                Arc::new(StringArray::from(vec![data.unwrap_or("").to_string()])),
+                Arc::new(StringArray::from(vec![task_id.unwrap_or("").to_string()])),
+                Arc::new(arrow_array::Int32Array::from(vec![status.unwrap_or(0)])),
+                Arc::new(Int64Array::from(vec![now])),
+                Arc::new(Int64Array::from(vec![0])), // updated_at
             ],
         )?;
         table.add(RecordBatchIterator::new(vec![Ok(batch)], schema)).execute().await?;
@@ -161,20 +181,27 @@ impl VectorStore {
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let roles = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-            let contents = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-            let task_ids = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-            let statuses = batch.column(4).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let types = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let roles = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let froms = batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+            let tos = batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
             let ccs = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
             let bccs = batch.column(6).as_any().downcast_ref::<StringArray>().unwrap();
             let refs = batch.column(7).as_any().downcast_ref::<StringArray>().unwrap();
-            let createds = batch.column(8).as_any().downcast_ref::<Int64Array>().unwrap();
+            let texts = batch.column(8).as_any().downcast_ref::<StringArray>().unwrap();
+            let datas = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
+            let task_ids = batch.column(10).as_any().downcast_ref::<StringArray>().unwrap();
+            let statuses = batch.column(11).as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let createds = batch.column(12).as_any().downcast_ref::<Int64Array>().unwrap();
+            let updateds = batch.column(13).as_any().downcast_ref::<Int64Array>().unwrap();
+
             for i in 0..batch.num_rows() {
                 msgs.push(json!({
-                    "id": ids.value(i), "role": roles.value(i), "content": contents.value(i), 
-                    "task_id": task_ids.value(i), "status": statuses.value(i), 
-                    "cc": ccs.value(i), "bcc": bccs.value(i), "ref": refs.value(i),
-                    "created_at": createds.value(i)
+                    "id": ids.value(i), "type": types.value(i), "role": roles.value(i), 
+                    "from": froms.value(i), "to": tos.value(i), "cc": ccs.value(i), 
+                    "bcc": bccs.value(i), "ref": refs.value(i), "text": texts.value(i), 
+                    "data": datas.value(i), "task_id": task_ids.value(i), "status": statuses.value(i), 
+                    "created_at": createds.value(i), "updated_at": updateds.value(i)
                 }));
             }
         }
@@ -235,11 +262,11 @@ impl VectorStore {
         Ok(tasks)
     }
 
-    pub async fn update_message_status(&self, task_id: &str, status: i32, content: Option<&str>) -> Result<()> {
+    pub async fn update_message_status(&self, task_id: &str, status: i32, text: Option<&str>) -> Result<()> {
         let table = self.conn.open_table("talks").execute().await?;
         table.delete(&format!("task_id = '{}'", task_id)).await?;
-        if let Some(c) = content {
-            self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", c, Some(task_id), Some(status), None, None, None).await?;
+        if let Some(t) = text {
+            self.add_message(&uuid::Uuid::new_v4().to_string(), "system_task", t, Some(task_id), Some(status), None, None, None, None, None, Some("talk"), None).await?;
         }
         Ok(())
     }
@@ -289,7 +316,7 @@ impl VectorStore {
     }
     
     pub async fn init_all_tables(&self) -> Result<()> {
-        let tables = vec!["items", "sales", "tracking", "event", "users", "talks", "pages"];
+        let tables = vec!["items", "sales", "tracking", "event", "users", "pages"];
         let item_field = Field::new("item", DataType::Float32, true);
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),

@@ -326,9 +326,6 @@ impl QuantizedQwen3VLTextAttention {
         let (key_states, value_states): (Tensor, Tensor) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                if self.layer_idx == 0 {
-                    // println!("[TRACE-KV] prev_k: {:?} {:?}, new_k: {:?} {:?}", prev_k.device(), prev_k.dtype(), key_states.device(), key_states.dtype());
-                }
                 // Key Cache Alignment
                 let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
                 let pk = if pk.dtype() != target_dtype { pk.to_dtype(target_dtype)? } else { pk }.contiguous()?;
@@ -349,7 +346,6 @@ impl QuantizedQwen3VLTextAttention {
         // 4. [HARDENING] Adjusted Mask Logic
         let actual_seq_len = key_states.dim(2)?;
         let adjusted_mask = if let Some(mask) = attention_mask {
-            // if self.layer_idx == 0 { println!("[TRACE-MASK] mask: {:?} {:?}", mask.device(), mask.dtype()); }
             let mask_len = mask.dim(candle_core::D::Minus1)?;
             if mask_len < actual_seq_len {
                 let padding = Tensor::zeros((b_sz, 1, q_len, actual_seq_len - mask_len), mask.dtype(), mask.device())?;
@@ -841,7 +837,6 @@ pub struct QuantizedQwen3VLTextModel {
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
     pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
-    pub single_layer_mode: bool, // [NEW] Extreme memory saving mode
     pub baking_only: bool, // [NEW] Skip MLP for KV baking
 }
 
@@ -855,7 +850,6 @@ impl QuantizedQwen3VLTextModel {
         device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        single_layer_mode: bool,
         baking_only: bool, // [NEW]
     ) -> Result<Self> {
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -901,7 +895,7 @@ impl QuantizedQwen3VLTextModel {
         
         // [OPTIMIZATION] If baking only (MLP 0%), we don't need MLP weights, so cost is much lower
         let cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
-        let estimated_activation_buffer = 30_000_000; // Reduced to 30MB
+        let estimated_activation_buffer = 200_000_000; // Increased to 200MB for 28-layer prefill
         let mut simulated_free_vram: u64 = 0;
         let mut is_vram_checked = false;
         let mut safety_floor: u64 = 0;
@@ -912,7 +906,8 @@ impl QuantizedQwen3VLTextModel {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         let os_reserve = 40_000_000; // Reduced reserve
+                         // [FIX] More realistic OS/Driver reserve (100MB)
+                         let os_reserve = 100_000_000; 
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -928,13 +923,7 @@ impl QuantizedQwen3VLTextModel {
             false
         };
 
-        // [FIX] 0.6B 모델일 경우 레이어 수를 2개로 제한 (테스트용)
-        let num_actual_layers = if single_layer_mode { 1 } 
-                                else if ct.tensor_infos.keys().any(|k| k.contains("0.6B")) || ct.tensor_infos.keys().any(|k| k.contains("blk.1.")) {
-                                    if ct.tensor_infos.keys().any(|k| k.contains("blk.2.")) { config.num_hidden_layers } else { 2 }
-                                } else { config.num_hidden_layers };
-
-        for _ in 0..num_actual_layers {
+        for _ in 0..config.num_hidden_layers {
             let actual_cost = cost_per_layer;
             if current_device.is_cuda() && is_vram_checked {
                  // [SAFE-ALLOC] 가용 VRAM에서 20% 여유를 두고 할당 (OOM 방지)
@@ -963,7 +952,7 @@ impl QuantizedQwen3VLTextModel {
         let final_config = config; 
 
         let layers: Result<Vec<_>> = pool.install(|| {
-            (0..num_actual_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
+            (0..final_config.num_hidden_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
                 let mut local_cursor = std::io::Cursor::new(mmap);
                 let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
                 let standard = format!("{base_name}.layers.{layer_idx}");
@@ -988,7 +977,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, single_layer_mode, baking_only })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -999,7 +988,6 @@ impl QuantizedQwen3VLTextModel {
         device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        single_layer_mode: bool,
         baking_only: bool, // [NEW]
     ) -> Result<Self> {
         // ... (previous logic)
@@ -1059,9 +1047,8 @@ impl QuantizedQwen3VLTextModel {
         }
 
         let mut layers = vec![];
-        let num_layers = if single_layer_mode { 1 } else { config.num_hidden_layers };
 
-        for layer_idx in 0..num_layers {
+        for layer_idx in 0..config.num_hidden_layers {
             if current_device.is_cuda() && is_vram_checked {
                  let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
                  if simulated_free_vram > ( (effective_cost as f64 * 1.02) as u64 + safety_floor ) {
@@ -1098,7 +1085,6 @@ impl QuantizedQwen3VLTextModel {
             rotary_emb,
             mrope_section,
             mmap: None,
-            single_layer_mode,
             baking_only,
         })
     }
@@ -1358,50 +1344,10 @@ impl QuantizedQwen3VLTextModel {
             fs::create_dir_all(path)?;
         }
 
-        if self.single_layer_mode {
-            // [EXTREME-BAKING] Replicate first layer KV to all 28 layers using 1-bit
-            // 1. Extract the KV cache from the first layer
-            let kv_data = if let Some(layer0) = self.layers.get(0) {
-                layer0.self_attn.kv_cache.clone()
-            } else {
-                None
-            };
-
-            if let Some((k, v)) = kv_data {
-                // 2. Compress the data using self methods (no longer overlapping with layers borrow)
-                let k_cpu = k.to_device(&Device::Cpu)?;
-                let v_cpu = v.to_device(&Device::Cpu)?;
-                let (kp, ks, ksh) = self.compress_to_1bit(&k_cpu)?;
-                let (vp, vs, _) = self.compress_to_1bit(&v_cpu)?;
-
-                // 3. Save to disk 28 times
-                for i in 0..28 {
-                    let file = path.join(format!("layer_{}_kv.safetensors", i));
-                    let mut map = HashMap::new();
-                    map.insert("k_packed".to_string(), kp.clone());
-                    map.insert("v_packed".to_string(), vp.clone());
-                    map.insert("k_scales".to_string(), ks.clone());
-                    map.insert("v_scales".to_string(), vs.clone());
-                    map.insert("k_shape".to_string(), Tensor::from_vec(ksh.iter().map(|&x| x as u32).collect(), (ksh.len(),), &Device::Cpu)?);
-                    map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?); 
-                    map.insert("bits".to_string(), Tensor::from_vec(vec![1u32], (1,), &Device::Cpu)?);
-                    candle_core::safetensors::save(&map, &file)?;
-                }
-            }
-
-            // 4. Clear cache if requested
-            if clear {
-                if let Some(layer0) = self.layers.get_mut(0) {
-                    layer0.clear_kv_cache();
-                }
-            }
-            Ok(())
-        } else {
-            // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
-            self.layers.iter_mut().try_for_each(|layer| {
-                layer.save_kv_cache(path, clear, block_size)
-            })
-        }
+        // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
+        self.layers.iter_mut().try_for_each(|layer| {
+            layer.save_kv_cache(path, clear, block_size)
+        })
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -1512,7 +1458,7 @@ impl QuantizedQwen3VLModel {
 
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, false, false
+            t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, false
         )?;
 
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -1548,7 +1494,7 @@ impl QuantizedQwen3VLModel {
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, false, false)?;
+        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, false)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
@@ -1632,8 +1578,10 @@ pub struct QuantizedQwen3TextModel {
 impl QuantizedQwen3TextModel {
     pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
-        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(t_config, ct_main, mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, single_layer_mode, baking_only)?;
+        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        if single_layer_mode { t_config.num_hidden_layers = 1; }
+        
+        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&t_config, ct_main, mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         let lm_head = if !baking_only {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
@@ -1647,8 +1595,10 @@ impl QuantizedQwen3TextModel {
 
     pub fn new<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, reader_main: &mut R, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
-        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, single_layer_mode, baking_only)?;
+        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        if single_layer_mode { t_config.num_hidden_layers = 1; }
+
+        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         let lm_head = if !baking_only {
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
             if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) { Some(l) }

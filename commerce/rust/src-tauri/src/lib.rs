@@ -415,10 +415,11 @@ async fn ai_search_complex(
     state: State<'_, AppState>,
     query: String,
     language: String,
+    device_preference: Option<String>,
 ) -> Result<Value, String> {
     let mut model_guard = state.model.lock().await;
     if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(None).await { *model_guard = Some(m); }
+        if let Ok(m) = LogisModel::new(device_preference.as_deref()).await { *model_guard = Some(m); }
         else { return Err("Failed to load model".to_string()); }
     }
     let model = model_guard.as_ref().unwrap();
@@ -475,31 +476,16 @@ async fn check_query_intent(
 }
 
 #[tauri::command]
-async fn set_fast_mode(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
-    let mut model_guard = state.model.lock().await;
-    if let Some(model) = model_guard.as_mut() {
-        model.fast_mode = enabled;
-        // If mode changed, we might need to reload the generator next time it's used
-        // For now, we'll let the next ensure_generator handle it.
-        println!("[MODE] Fast Mode set to: {}", enabled);
-        Ok(format!("Fast Mode: {}", enabled))
-    } else {
-        // Even if model isn't loaded yet, we can create a shell LogisModel to store the preference
-        // but it's better to just wait until it's initialized.
-        Err("Model not initialized. Please try again after model load.".to_string())
-    }
-}
-
-#[tauri::command]
 async fn deep_research_command(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
     query: String,
     _doc_id: Option<String>,
+    device_preference: Option<String>,
 ) -> Result<String, String> {
     let mut model_guard = state.model.lock().await;
     if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(None).await {
+        if let Ok(m) = LogisModel::new(device_preference.as_deref()).await {
             *model_guard = Some(m);
         } else {
             return Err("Failed to load model".to_string());
@@ -642,7 +628,6 @@ async fn proxy_fetch(
 #[derive(serde::Deserialize)]
 struct ActiveTaskQuery {
     cc: String,
-    #[serde(alias = "refId")]
     r#ref: String,
 }
 
@@ -750,7 +735,7 @@ async fn extract_html_from_current_tab() -> Result<String, String> {
 #[tauri::command]
 async fn get_browser_status() -> Result<String, String> {
     let guard = automation::GLOBAL_BROWSER.lock().await;
-    if guard.is_some() { 
+    if guard.is_some() || automation::is_browser_reachable().await { 
         return Ok("running".to_string()); 
     }
     Ok("stopped".to_string())
@@ -873,7 +858,7 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
     
     let browser_status = {
         let guard = automation::GLOBAL_BROWSER.lock().await;
-        if guard.is_some() { "running".to_string() } else { "stopped".to_string() }
+        if guard.is_some() || automation::is_browser_reachable().await { "running".to_string() } else { "stopped".to_string() }
     };
 
     let (current_url, is_client, is_admin) = {
@@ -891,6 +876,12 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, St
         is_client,
         is_admin,
     })
+}
+
+#[tauri::command]
+async fn check_gpu_availability() -> bool {
+    let config = crate::utils::get_optimal_device_config();
+    !config.is_cpu
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -951,21 +942,26 @@ pub fn run() {
                                 from: from_addr, to: team_id,
                                 cc: payload_val.get("cc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 bcc: payload_val.get("bcc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                                r#ref: payload_val.get("r#ref").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                r#ref: payload_val.get("ref").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                                 data_json: payload_val.to_string(), created_at: now, updated_at: now, status: 10,
                             };
-                            let msg_content = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
+                            let msg_text = format!("Task Started: {}", payload_val.get("link").and_then(|v| v.as_str()).unwrap_or("Unknown URL"));
                             let _ = db.add_message(
                                 &uuid::Uuid::new_v4().to_string(), 
                                 "system_task", 
-                                &msg_content, 
+                                &msg_text, 
                                 Some(&task.id), 
                                 Some(1),
                                 Some(&task.cc),
                                 Some(&task.bcc),
-                                Some(&task.r#ref)
+                                Some(&task.r#ref),
+                                Some(&task.from),
+                                Some(&task.to),
+                                Some("talk"),
+                                None
                             ).await;
                             let _ = db.add_task(task).await;
+                            crate::scheduler::notify_new_task();
                         }
                     });
                 }
@@ -977,7 +973,7 @@ pub fn run() {
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
-            upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, set_fast_mode
+            upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

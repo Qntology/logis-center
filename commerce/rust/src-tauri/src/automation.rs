@@ -73,6 +73,10 @@ fn is_shop(url: &str, patterns: &[&str]) -> bool {
     false
 }
 
+pub async fn is_browser_reachable() -> bool {
+    tokio::net::TcpStream::connect(format!("127.0.0.1:{}", CHROME_DEBUG_PORT)).await.is_ok()
+}
+
 // --- Entry Point ---
 pub async fn run_browser_automation(
     browser_type: String,
@@ -156,22 +160,29 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             let mut is_client = false;
             let mut is_admin = false;
 
-            // [STRICT-DETECTION] Check ONLY the visible (focused) tab
+            // 1. [STRICT] Try to find the truly visible/focused tab
             for page in pages.iter() {
-                let is_visible = page.evaluate("document.visibilityState").await
-                    .map(|v| v.into_value::<String>().unwrap_or_default() == "visible")
-                    .unwrap_or(false);
-
-                if is_visible {
-                    if let Ok(val) = page.evaluate("window.location.href").await {
-                        active_url = val.into_value::<String>().unwrap_or_default();
-                        if active_url.is_empty() || active_url == "about:blank" { break; }
-
-                        is_client = is_shop(&active_url, CLIENT_PATTERNS);
-                        is_admin = is_shop(&active_url, ADMIN_PATTERNS);
+                if let Ok(res) = page.evaluate("document.visibilityState").await {
+                    if res.into_value::<String>().unwrap_or_default() == "visible" {
+                        if let Ok(val) = page.evaluate("window.location.href").await {
+                            active_url = val.into_value::<String>().unwrap_or_default();
+                            break;
+                        }
                     }
-                    break; // Visible tab found
                 }
+            }
+
+            // 2. [FALLBACK] If browser is minimized or no tab is 'visible', use the first page
+            if active_url.is_empty() && !pages.is_empty() {
+                if let Ok(val) = pages[0].evaluate("window.location.href").await {
+                    active_url = val.into_value::<String>().unwrap_or_default();
+                }
+            }
+
+            // 3. [JUDGE] Evaluate if the detected URL is a shop admin
+            if !active_url.is_empty() && active_url != "about:blank" {
+                is_client = is_shop(&active_url, CLIENT_PATTERNS);
+                is_admin = is_shop(&active_url, ADMIN_PATTERNS);
             }
 
             let current_is_shop = is_client || is_admin;
@@ -197,7 +208,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 last_is_shop = current_is_shop;
                 
                 if current_is_shop {
-                    println!("[AUTO] Active Shop Focused: {}", last_detected_url);
+                    println!("[AUTO] Active Shop Context Sync: {}", last_detected_url);
                 }
             }
             tokio::time::sleep(Duration::from_millis(800)).await; 

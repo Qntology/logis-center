@@ -473,6 +473,82 @@ impl NaiveAttnGateUpDownMLPBlock {
     }
 }
 
+pub fn decoding_attention_parallel(
+    query_states: &Tensor,
+    key_states: &Tensor,
+    value_states: &Tensor,
+    scaling: f64,
+) -> Result<Tensor> {
+    // Flash-Decoding style optimization for seq_len = 1 (Decoding)
+    // Splits KV into chunks and parallelizes attention calculation
+    let (_b_sz, n_heads, q_len, _head_dim) = query_states.dims4()?;
+    
+    // [FIX] Early exit if not a decoding step (q_len > 1)
+    if q_len != 1 {
+        return eager_attention_forward(query_states, key_states, value_states, None, None, scaling);
+    }
+
+    // [FIX] GQA Support: Repeat KV heads if they are fewer than query heads
+    let n_kv_heads = key_states.dim(1)?;
+    let (key_states, value_states) = if n_heads != n_kv_heads {
+        let groups = n_heads / n_kv_heads;
+        (
+            repeat_kv(key_states.clone(), groups)?.contiguous()?,
+            repeat_kv(value_states.clone(), groups)?.contiguous()?,
+        )
+    } else {
+        (key_states.clone(), value_states.clone())
+    };
+
+    let kv_seq_len = key_states.dim(2)?;
+    let chunk_size = 128; // Optimal chunk size for parallel reduction
+    
+    if kv_seq_len <= chunk_size {
+        // [FIX] Pass by reference to resolve E0308
+        return eager_attention_forward(query_states, &key_states, &value_states, None, None, scaling);
+    }
+
+    let num_chunks = (kv_seq_len + chunk_size - 1) / chunk_size;
+    let mut chunk_outputs = Vec::with_capacity(num_chunks);
+    let mut chunk_logsumexp = Vec::with_capacity(num_chunks);
+
+    for i in 0..num_chunks {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(kv_seq_len);
+        let k_chunk = key_states.narrow(2, start, end - start)?;
+        let v_chunk = value_states.narrow(2, start, end - start)?;
+
+        let attn_weights = (query_states.matmul(&k_chunk.transpose(2, 3)?)? * scaling)?;
+        let max_logits = attn_weights.max_keepdim(D::Minus1)?;
+        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
+        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
+        
+        let out_chunk = exp_weights.matmul(&v_chunk)?;
+        let lse = (sum_exp.log()? + max_logits)?;
+
+        chunk_outputs.push(out_chunk);
+        chunk_logsumexp.push(lse);
+    }
+
+    // Parallel Reduction
+    let mut final_output = chunk_outputs[0].clone();
+    let mut max_lse = chunk_logsumexp[0].clone();
+
+    for i in 1..num_chunks {
+        let lse_i = &chunk_logsumexp[i];
+        let out_i = &chunk_outputs[i];
+
+        let new_max_lse = max_lse.broadcast_maximum(lse_i)?;
+        let exp_a = max_lse.broadcast_sub(&new_max_lse)?.exp()?;
+        let exp_b = lse_i.broadcast_sub(&new_max_lse)?.exp()?;
+
+        final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
+        max_lse = new_max_lse;
+    }
+
+    Ok(final_output)
+}
+
 pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,
