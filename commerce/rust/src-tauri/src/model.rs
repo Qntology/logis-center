@@ -210,6 +210,7 @@ impl LogisModel {
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
+                // Ignore sync errors if context is already gone
                 if dev.is_cuda() { let _ = dev.synchronize(); }
             }).await;
         }
@@ -375,7 +376,9 @@ impl LogisModel {
         }
 
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        self.ensure_generator(target_size).await?;
+        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
+        let text_only = target_size == ModelSize::Large && task_id.is_some();
+        self.ensure_generator_ext(target_size, text_only).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -443,8 +446,8 @@ impl LogisModel {
         self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} on GPU-{}...", path, self.device_config.gpu_id);
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
 
@@ -459,7 +462,8 @@ impl LogisModel {
                 &path_clone, 
                 shared_path.as_deref(), // Tokenizer path
                 shared_path.as_deref(), // Config path
-                Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize)
+                Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
+                force_text_only
             )
         }).await??;
         
@@ -467,6 +471,10 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
+        self.ensure_generator_ext(size, false).await
+    }
+
+    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -476,7 +484,8 @@ impl LogisModel {
             return Ok(());
         }
 
-        println!("[MODEL] Activating engine for size: {:?}...", size);
+        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {})...", size, force_text_only);
+        // ... (rest of the switching logic remains similar but uses the new loading)
 
         // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
         let found_in_slot = match size {
@@ -541,7 +550,8 @@ impl LogisModel {
                 &path_clone, 
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
-                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize)
+                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
+                force_text_only
             )
         }).await??;
 

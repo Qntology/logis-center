@@ -81,9 +81,10 @@ impl Qwen3VLGenerateModel {
         vision_device: Option<&Device>,
         vision_device_id: usize,
         dtype: Option<DType>,
-        hard_token_limit: Option<usize>
+        hard_token_limit: Option<usize>,
+        force_text_only: bool,
     ) -> Result<Self> {
-        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit)
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only)
     }
 
     pub fn init_with_tokenizer(
@@ -94,9 +95,10 @@ impl Qwen3VLGenerateModel {
         vision_device: Option<&Device>,
         vision_device_id: usize,
         dtype: Option<DType>,
-        hard_token_limit: Option<usize>
+        hard_token_limit: Option<usize>,
+        force_text_only: bool,
     ) -> Result<Self> {
-        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit) 
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only) 
     }
 
     pub fn init_with_config(
@@ -108,10 +110,12 @@ impl Qwen3VLGenerateModel {
         vision_device: Option<&Device>,
         vision_device_id: usize,
         dtype: Option<DType>,
-        hard_token_limit: Option<usize>
+        hard_token_limit: Option<usize>,
+        force_text_only: bool, // [NEW] Option to skip vision weights for 2B relay
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
+        // ... (previous logic stays same for path handling)
         let tok_path = if let Some(stripped) = tok_path.strip_prefix(r"\\?\") { stripped } else { tok_path };
 
         let cfg_path = config_path.unwrap_or(path);
@@ -151,7 +155,9 @@ impl Qwen3VLGenerateModel {
 
         let gguf_files = find_type_files(path, "gguf")?;
         let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
-        let is_vision_model = mmproj_path.is_some();
+        
+        // [OPTIMIZATION] If force_text_only is enabled, treat it as a non-vision model
+        let is_vision_model = mmproj_path.is_some() && !force_text_only;
 
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
@@ -188,8 +194,8 @@ impl Qwen3VLGenerateModel {
                 
                 let is_06b = path.contains("0.6B");
                 let baking_only = is_06b;
-                // [FIX] 레이어 풀(Full) 가동 요청 반영
-                let single_layer_mode = true; 
+                // [FIX] 0.6B일 때만 1개 레이어 모드 사용, 2B는 항상 Full 레이어 사용
+                let single_layer_mode = is_06b; 
                 
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
@@ -299,7 +305,8 @@ impl Qwen3VLGenerateModel {
     pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), true)?;
+        // [STRICT-ALIGN] Never add BOS manually; ChatML handles starts.
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
         let mut current_pos = self.get_kv_len();
         let prefill_chunk_size = 512;
@@ -392,9 +399,8 @@ impl Qwen3VLGenerateModel {
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
-        // [FIX] 릴레이 상황(seqlen_offset > 0)에서는 BOS 토큰을 추가하지 않음
-        let add_bos = seqlen_offset == 0;
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), add_bos)?;
+        // [STRICT-ALIGN] Never add BOS manually; parity with prefill_only
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
 
         if seqlen_offset == 0 {
@@ -405,11 +411,15 @@ impl Qwen3VLGenerateModel {
         }
 
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
-        // [FIX] Distinguish between Relay (prompt is new task) and Resume (prompt is full history)
-        let mut local_pos = if seqlen_offset > 0 && seqlen_offset < total_tokens { 
-            seqlen_offset // Resume case: skip what's already in KV
+        // [STRICT-RELAY] Ensure 2B always reads at least the very last token to sync state.
+        let mut local_pos = if seqlen_offset > 0 { 
+            if seqlen_offset >= total_tokens {
+                total_tokens.saturating_sub(1)
+            } else {
+                seqlen_offset
+            }
         } else { 
-            0 // Relay case: process the whole new task prompt
+            0 
         };
         
         let prefill_chunk_size = if self.text_device.is_cpu() { 1024 } else { 256 };
@@ -535,8 +545,8 @@ impl Qwen3VLGenerateModel {
 
     pub fn load_kv_from_disk(&mut self, path: &Path) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 1),
-            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 1),
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128),
             _ => Ok(()),
         }
     }

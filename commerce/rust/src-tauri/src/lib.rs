@@ -340,7 +340,7 @@ async fn get_document(
             
             // Try matching against "index" field inside JSON
             let index_query = uuid.parse::<i64>().map(|n| json!(n)).unwrap_or(json!(uuid));
-            if let Ok(Some((_found_id, json_val))) = store.find_item_by_property(table_name, "index", &index_query).await {
+            if let Ok(Some((_found_id, _json_val))) = store.find_item_by_property(table_name, "index", &index_query).await {
                 // To be safe, we perform a broader search for any row where data contains the index
                 // Since find_item_by_property already found it, we just need to reconstruct the TradeDocument
                 if let Ok(all_docs) = store.get_all_items(table_name, 1000, 0, None).await {

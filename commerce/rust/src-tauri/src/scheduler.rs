@@ -457,55 +457,44 @@ async fn process_task(
         
         let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
-        let task_question = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
 
-        // 1. [0.6B] Bake PUG & Save to Disk
+        // 1. [0.6B] Bake FULL Templated Prompt
         {
-            println!("[Scheduler] Phase 1: Baking PUG with 0.6B (Streaming Mode)...");
-            let snapshot_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-            if !snapshot_path.exists() { let _ = std::fs::create_dir_all(&snapshot_path); }
-
-            // [DEBUG] PUG 저장
-            let _ = data_manager.offload(&pug_content, "step_a_pug");
-            let _ = data_manager.offload(&task_question, "step_a_task");
-
-            // [ISOLATION] 0.6B를 깨끗한 상태에서 로드
+            println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             
             let model_clone = model.clone();
-            let pug_clone = pug_content.clone();
+            let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
-            let path_clone = snapshot_path.clone();
-
-            // [FIX] 한글 등 멀티바이트 문자가 깨지지 않도록 chars() 단위로 안전하게 자름
-            let snippet: String = pug_clone.chars().take(50).collect();
-            // println!("[DEBUG-RELAY] Ingesting PUG into 0.6B. First 50 chars: '{}...'", snippet.replace("\n", " "));
+            let session_clone = Some(snapshot_id.clone());
 
             tokio::task::spawn_blocking(move || -> Result<()> {
-                crate::utils::resources::set_current_thread_low_priority();
                 let mut gen_guard = model_clone.generator.blocking_lock();
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
-                    // [STREAMING] path_clone을 전달하여 주기적으로 저장 수행
-                    worker.prefill_text_only(&pug_clone, Some(token_clone), None, Some(&path_clone))?;
+                    // [STRICT-ALIGN] Use prefill_only to ensure ChatML tokens are identical
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                            name: None,
+                        })],
+                        ..Default::default()
+                    };
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                 }
                 Ok(())
             }).await??;
-
-            // 최종 스냅샷 저장 (이미 주기적으로 저장되었으므로 마무리 확인용)
-            model.save_kv_snapshot(&snapshot_id).await?;
         }
 
-        // 2. [2B] Load from Disk & Generate
+        // 2. [2B] Load Snapshot & Bake Task
         {
-            println!("[Scheduler] Phase 2: Loading 2B & Restoring Snapshot...");
-            // [ISOLATION] 0.6B를 비우고 2B를 로드하며 동시에 스냅샷 복구
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
                 model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
@@ -552,44 +541,41 @@ async fn process_task(
         
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         let pug_content = light_pug.clone();
-        let task_question = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
 
-        // 1. [0.6B] Bake PUG & Save
+        // 1. [0.6B] Bake Full Context
         {
-            let snapshot_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-            if !snapshot_path.exists() { let _ = std::fs::create_dir_all(&snapshot_path); }
-
-            // [DEBUG] PUG 저장
-            let _ = data_manager.offload(&pug_content, "step_b_pug");
-            let _ = data_manager.offload(&task_question, "step_b_task");
-
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             let model_clone = model.clone();
-            let pug_clone = pug_content.clone();
+            let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
-            let path_clone = snapshot_path.clone();
+            let session_clone = Some(snapshot_id.clone());
 
             tokio::task::spawn_blocking(move || -> Result<()> {
-                crate::utils::resources::set_current_thread_low_priority();
                 let mut gen_guard = model_clone.generator.blocking_lock();
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
-                    worker.prefill_text_only(&pug_clone, Some(token_clone), None, Some(&path_clone))?;
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                            name: None,
+                        })],
+                        ..Default::default()
+                    };
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                 }
                 Ok(())
             }).await??;
-
-            model.save_kv_snapshot(&snapshot_id).await?;
         }
 
-        // 2. [2B] Load from Disk & Generate
+        // 2. [2B] Load & Generate
         {
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
                 model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
@@ -701,35 +687,32 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
             let extraction_instruction = parsing::item2json(&page_type, &url, language);
             let pug_content = content_pug.clone();
-            let task_question = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", extraction_instruction);
+            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
 
-            // 1. [0.6B] Bake Detail PUG & Save
+            // 1. [0.6B] Bake Detail Context
             {
-                let snapshot_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-                if !snapshot_path.exists() { let _ = std::fs::create_dir_all(&snapshot_path); }
-
-                // [DEBUG] PUG 저장
-                let _ = data_manager.offload(&pug_content, "step_c_pug");
-                let _ = data_manager.offload(&task_question, "step_c_task");
-
                 model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
                 let model_clone = model.clone();
-                let pug_clone = pug_content.clone();
+                let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
-                let path_clone = snapshot_path.clone();
+                let session_clone = Some(snapshot_id.clone());
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    crate::utils::resources::set_current_thread_low_priority();
                     let mut gen_guard = model_clone.generator.blocking_lock();
                     if let Some(worker) = gen_guard.as_mut() {
                         worker.clear_kv_cache();
-                        worker.prefill_text_only(&pug_clone, Some(token_clone), None, Some(&path_clone))?;
+                        let params = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                                name: None,
+                            })],
+                            ..Default::default()
+                        };
+                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                     }
                     Ok(())
                 }).await??;
-
-                model.save_kv_snapshot(&snapshot_id).await?;
             }
 
             // 2. [2B] Load & Generate
@@ -738,7 +721,7 @@ async fn process_task(
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
                     model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
@@ -783,28 +766,7 @@ async fn process_task(
         if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
     }
     
-    // [PARITY] ID Generation
-    let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
-    let id_val_raw = extracted_data.get("id").or_else(|| extracted_data.get("index")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(&id_val_raw).replace("-", "").replace("_", "");
-    let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
-    
-    if let Some(obj) = extracted_data.as_object_mut() {
-        obj.insert("index".to_string(), json!(index_val));
-        obj.insert("id".to_string(), json!(crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val))));
-    }
-
-    let payload = json!({ 
-        "task_id": task.id, "category": "Saving", "summary": "Syncing to database...", "spinner": "⠋"
-    });
-    let _ = app_handle.emit("extraction-progress", &payload);
-
-    // [SIDE EFFECTS & UPSERT]
-    // Re-acquire Store for final ops
-    let store = {
-        let store_guard = store_mutex.lock().await;
-        store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
-    };
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     // [PARITY] ID Generation
     let team_id = if !task.to.is_empty() { task.to.clone() } else { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") };
@@ -819,7 +781,7 @@ async fn process_task(
         obj.insert("id".to_string(), json!(generated_id));
     }
 
-    let payload = json!({
+    let payload = json!({ 
         "task_id": task.id, "category": "Saving", "summary": "Syncing to database...", "spinner": "⠋"
     });
     let _ = app_handle.emit("extraction-progress", &payload);
