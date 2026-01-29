@@ -978,7 +978,7 @@ btnAutoLaunch?.addEventListener("click", async () => {
     try { 
         // [FIX] Hide immediately on click for better UX
         btnAutoLaunch.style.display = "none";
-        await invoke("launch_best_browser", { url: "https://google.com" }); 
+        await invoke("launch_best_browser", { url: "about:blank" }); 
     } catch (e) { 
         console.error("Launch error:", e); 
         btnAutoLaunch.style.display = "flex"; // Restore on error
