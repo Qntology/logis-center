@@ -142,6 +142,12 @@ function startSpinner() {
     spinnerInterval = window.setInterval(() => {
         const char = spinnerFrames[i % spinnerFrames.length];
         if (settingsBtn) settingsBtn.innerText = char;
+        
+        // [NEW] Update pull-loader spinners
+        document.querySelectorAll('.chat-pull-loader .spinner').forEach(el => {
+            (el as HTMLElement).innerText = char;
+        });
+
         document.querySelectorAll('.active-spinner').forEach(el => {
             (el as HTMLElement).innerText = char;
         });
@@ -1156,19 +1162,17 @@ function renderDocs(docs: any[]) {
         if (lastEl) {
             lastEl.addEventListener("click", (e) => {
                 const target = e.target as HTMLElement;
+                // If user clicked 'toggle-more' or its label, let CSS/HTML handle it
                 if (target.closest('.toggle-more') || target.closest('.more-label')) return;
                 
-                // [STRICT-ID] Try every possible ID field name across different data sources
-                const docId = doc.id || doc.uuid || (doc.data && doc.data.id) || doc.uuid_val || doc.ref || doc.index;
+                // [STRICT-ID] Try every possible ID field name
+                const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
                 
-                if (!target.closest('a') && !target.closest('input')) {
+                if (!target.closest('a') && !target.closest('input') && !target.closest('button')) {
                     if (docId) {
                         showDetail(String(docId));
                     } else {
                         console.warn("[WIDGET] Item clicked but no valid ID found:", doc);
-                        // Fallback: If no ID, but has data.id, use it
-                        const fallbackId = (doc as any).data?.id;
-                        if (fallbackId) showDetail(String(fallbackId));
                     }
                 }
             });
@@ -1453,31 +1457,147 @@ async function initDevicePreference() {
     });
 }
 
+// --- Chat Virtual Scroll & Pull Engine ---
+let currentY = 0; // Standard scroll position (positive)
+let pullY = 0;    // Pull distance (positive for top, negative for bottom)
+let pullTimer: number | null = null;
+const PULL_THRESHOLD = 50;
+const PULL_MAX = 90;
+const FRICTION = 0.3;
+
+function initChatPullLogic() {
+    const container = document.querySelector(".chat-container") as HTMLElement;
+    const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
+    const topLoader = document.getElementById("chat-pull-top") as HTMLElement;
+    const bottomLoader = document.getElementById("chat-pull-bottom") as HTMLElement;
+    
+    if (!container || !scrollEl || !topLoader || !bottomLoader) return;
+
+    const updateTransform = (resetting: boolean = false) => {
+        if (resetting) scrollEl.classList.add("resetting");
+        else scrollEl.classList.remove("resetting");
+
+        // Final Position = -(Scroll Position) + Pull Offset
+        scrollEl.style.transform = `translateY(${-currentY + pullY}px)`;
+
+        // Show/Hide Loaders
+        if (pullY > 0) {
+            topLoader.classList.add("visible");
+            topLoader.style.opacity = Math.min(1, pullY / 20).toString();
+            if (pullY >= PULL_THRESHOLD) topLoader.classList.add("ready");
+            else topLoader.classList.remove("ready");
+        } else if (pullY < 0) {
+            bottomLoader.classList.add("visible");
+            bottomLoader.style.opacity = Math.min(1, Math.abs(pullY) / 20).toString();
+            if (Math.abs(pullY) >= PULL_THRESHOLD) bottomLoader.classList.add("ready");
+            else bottomLoader.classList.remove("ready");
+        } else {
+            topLoader.classList.remove("visible", "ready");
+            bottomLoader.classList.remove("visible", "ready");
+            topLoader.style.opacity = "0";
+            bottomLoader.style.opacity = "0";
+        }
+    };
+
+    const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+
+    const handleDelta = (delta: number) => {
+        const maxScroll = getMaxScroll();
+
+        // 1. Pulling Logic
+        if (pullY !== 0 || (currentY <= 0 && delta < 0) || (currentY >= maxScroll && delta > 0)) {
+            pullY -= delta * FRICTION;
+            if (pullY > PULL_MAX) pullY = PULL_MAX;
+            if (pullY < -PULL_MAX) pullY = -PULL_MAX;
+            if ((pullY < 0 && currentY <= 0) || (pullY > 0 && currentY >= maxScroll)) pullY = 0;
+        } 
+        // 2. Normal Scrolling
+        else {
+            currentY += delta;
+            if (currentY < 0) {
+                const leftover = currentY;
+                currentY = 0;
+                pullY = -leftover * FRICTION;
+            } else if (currentY > maxScroll) {
+                const leftover = currentY - maxScroll;
+                currentY = maxScroll;
+                pullY = -leftover * FRICTION;
+            }
+
+            // [INFINITE SCROLL] Auto-load when near bottom
+            if (!isChatLoading && chatHasMore && currentY >= maxScroll - 100) {
+                loadMoreChat();
+            }
+        }
+        updateTransform();
+    };
+
+    const resetPull = () => {
+        pullY = 0;
+        updateTransform(true);
+        setTimeout(() => {
+            scrollEl.classList.remove("resetting");
+            topLoader.classList.remove("loading");
+            bottomLoader.classList.remove("loading");
+        }, 400);
+    };
+
+    const triggerAction = async (dir: 'top' | 'bottom') => {
+        if (isChatLoading) return;
+        const loader = dir === 'top' ? topLoader : bottomLoader;
+        loader.classList.add("loading");
+        
+        // Hold pull position
+        pullY = dir === 'top' ? 40 : -40;
+        updateTransform(true);
+
+        if (dir === 'top') await fetchChatHistory(true);
+        else await loadMoreChat();
+
+        resetPull();
+    };
+
+    // 1. Wheel
+    container.addEventListener('wheel', (e) => {
+        if (isChatLoading) return;
+        e.preventDefault();
+        handleDelta(e.deltaY);
+
+        if (pullTimer) clearTimeout(pullTimer);
+        pullTimer = window.setTimeout(() => {
+            if (Math.abs(pullY) >= PULL_THRESHOLD) triggerAction(pullY > 0 ? 'top' : 'bottom');
+            else resetPull();
+        }, 200);
+    }, { passive: false });
+
+    // 2. Touch
+    let lastTouchY = 0;
+    container.addEventListener('touchstart', (e) => {
+        lastTouchY = e.touches[0].pageY;
+        scrollEl.classList.remove("resetting");
+    }, { passive: true });
+
+    container.addEventListener('touchmove', (e) => {
+        if (isChatLoading) return;
+        const currentTouchY = e.touches[0].pageY;
+        const delta = lastTouchY - currentTouchY;
+        lastTouchY = currentTouchY;
+        
+        handleDelta(delta);
+        e.preventDefault();
+    }, { passive: false });
+
+    container.addEventListener('touchend', () => {
+        if (Math.abs(pullY) >= PULL_THRESHOLD) triggerAction(pullY > 0 ? 'top' : 'bottom');
+        else resetPull();
+    });
+}
+
 // Call init functions
-// [NOTE] deep_research_command is typically called from the chat interface or specialized AI tools.
-// I will ensure any future calls follow the same pattern as ai_search_complex.
 const getDevicePref = () => forceCpuToggle.checked ? "cpu" : null;
 const talksScroll = document.getElementById("chat-scroll");
 if (talksScroll) {
-    talksScroll.addEventListener('wheel', (e: WheelEvent) => { 
-        // [FIX] Prevent jumping by checking boundaries and using standard direction
-        const delta = e.deltaY;
-        const isScrollingDown = delta > 0;
-        const isScrollingUp = delta < 0;
-        const canScrollDown = talksScroll.scrollHeight - talksScroll.scrollTop > talksScroll.clientHeight;
-        const canScrollUp = talksScroll.scrollTop > 0;
-
-        if ((isScrollingDown && canScrollDown) || (isScrollingUp && canScrollUp)) {
-            talksScroll.scrollTop -= delta; 
-            e.preventDefault(); 
-        }
-
-    }, { passive: false });
-    talksScroll.addEventListener('scroll', async () => { 
-        if (!isChatLoading && talksScroll.scrollTop + talksScroll.clientHeight >= talksScroll.scrollHeight - 100) {
-            await loadMoreChat(); 
-        }
-    });
+    initChatPullLogic();
 }
 async function fetchChatHistory(reset: boolean = true) { 
     if (reset) { 
@@ -1510,14 +1630,21 @@ async function loadMoreChat() {
                 if (messages.length < pageSize) chatHasMore = false;
                 messages.sort((a, b) => a.created_at - b.created_at);
                 messages.forEach(msg => renderMessage(msg, false)); chatPage++;
-            } else { chatHasMore = false; if (chatPage === 0) chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>"; }
-            if (!currentSession.email && currentTab === "settings" && chatPage === 1) performQrAuth();
+            } else { 
+                chatHasMore = false; 
+                if (chatPage === 0) {
+                    chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>";
+                    // [QR-RECOVERY] If no messages and not authenticated, show QR code immediately
+                    if (!currentSession.email && currentTab === "settings") performQrAuth();
+                }
+            }
+            // [QR-RECOVERY] Also trigger if we are on page 1 and no email exists
+            if (!currentSession.email && currentTab === "settings" && chatPage <= 1) performQrAuth();
         }
     } catch (e) { 
         console.error(e); 
     } finally { 
         isChatLoading = false; 
-        // [FIX] Always stop spinner
         stopSpinner();
     }
 }
