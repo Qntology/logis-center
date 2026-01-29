@@ -131,10 +131,8 @@ const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "
 function startSpinner() {
     if (spinnerInterval) clearInterval(spinnerInterval);
     
-    // [FIX] Use btnSettings as the spinner container
     if (settingsBtn) {
         settingsBtn.classList.add("active-spinner-mode");
-        // Ensure the extraction button is hidden while the global spinner is active
         if (btnExtract) btnExtract.style.display = "none";
     }
     
@@ -143,12 +141,8 @@ function startSpinner() {
         const char = spinnerFrames[i % spinnerFrames.length];
         if (settingsBtn) settingsBtn.innerText = char;
         
-        // [NEW] Update pull-loader spinners
-        document.querySelectorAll('.chat-pull-loader .spinner').forEach(el => {
-            (el as HTMLElement).innerText = char;
-        });
-
-        document.querySelectorAll('.active-spinner').forEach(el => {
+        // Update all active spinners, including those in pull loaders
+        document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
             (el as HTMLElement).innerText = char;
         });
         i++;
@@ -161,24 +155,15 @@ function stopSpinner() {
         spinnerInterval = null;
     }
     
-    // [FIX] Only restore the icon if we are NOT currently extracting data
     if (!isExtracting && settingsBtn) {
         settingsBtn.classList.remove("active-spinner-mode");
-
-        if(settingsBtn.classList.contains('active')){
-            settingsBtn.innerText = "💬";
-        }else{
-            settingsBtn.innerText = "🗨️";
-        }
-        
+        settingsBtn.innerText = settingsBtn.classList.contains('active') ? "💬" : "🗨️";
     }
     
-    // [FIX] Comprehensive cleanup of all active-spinner classes and elements
-    document.querySelectorAll('.active-spinner').forEach(el => {
+    // Clear all spinners to stop them visually
+    document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
         el.classList.remove('active-spinner');
-        if (el.tagName === 'SPAN' && (el as HTMLElement).innerText.length <= 2) {
-             (el as HTMLElement).innerText = ""; // Clear icon
-        }
+        (el as HTMLElement).innerText = ""; 
     });
 }
 
@@ -1477,31 +1462,43 @@ function initChatPullLogic() {
         if (resetting) scrollEl.classList.add("resetting");
         else scrollEl.classList.remove("resetting");
 
-        // Final Position = -(Scroll Position) + Pull Offset
         scrollEl.style.transform = `translateY(${-currentY + pullY}px)`;
 
-        // Show/Hide Loaders
-        if (pullY > 0) {
-            topLoader.classList.add("visible");
-            topLoader.style.opacity = Math.min(1, pullY / 20).toString();
-            if (pullY >= PULL_THRESHOLD) topLoader.classList.add("ready");
-            else topLoader.classList.remove("ready");
-        } else if (pullY < 0) {
-            bottomLoader.classList.add("visible");
-            bottomLoader.style.opacity = Math.min(1, Math.abs(pullY) / 20).toString();
-            if (Math.abs(pullY) >= PULL_THRESHOLD) bottomLoader.classList.add("ready");
-            else bottomLoader.classList.remove("ready");
+        const loader = pullY > 0 ? topLoader : (pullY < 0 ? bottomLoader : null);
+        
+        if (pullY !== 0 && loader) {
+            loader.classList.add("visible");
+            const absPull = Math.abs(pullY);
+            loader.style.opacity = Math.min(1, absPull / 20).toString();
+            
+            if (absPull >= PULL_THRESHOLD) loader.classList.add("ready");
+            else loader.classList.remove("ready");
+
+            // [DYNAMIC SPINNER] Rotate based on distance when pulling, auto-animate when loading
+            const spinner = loader.querySelector('.spinner') as HTMLElement;
+            if (spinner && !loader.classList.contains("loading")) {
+                const frameIndex = Math.floor(absPull / 5) % spinnerFrames.length;
+                spinner.innerText = spinnerFrames[frameIndex];
+                spinner.style.opacity = Math.min(1, absPull / PULL_THRESHOLD).toString();
+            }
         } else {
             topLoader.classList.remove("visible", "ready");
             bottomLoader.classList.remove("visible", "ready");
             topLoader.style.opacity = "0";
             bottomLoader.style.opacity = "0";
+            // Clear text to stop visual rotation
+            const s1 = topLoader.querySelector('.spinner') as HTMLElement;
+            const s2 = bottomLoader.querySelector('.spinner') as HTMLElement;
+            if (s1 && !topLoader.classList.contains("loading")) s1.innerText = "";
+            if (s2 && !bottomLoader.classList.contains("loading")) s2.innerText = "";
         }
     };
 
     const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
 
     const handleDelta = (delta: number) => {
+        if (isChatLoading) return; // [BLOCK] No pulling while loading
+        
         const maxScroll = getMaxScroll();
 
         // 1. Pulling Logic
