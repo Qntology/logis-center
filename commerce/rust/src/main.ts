@@ -379,9 +379,26 @@ function addSearchTag(label: string, type: 'domain' | 'type' | 'mode' | 'path', 
 }
 
 function removeSearchTag(id: string) {
+    const tagToRemove = activeTags.find(t => t.id === id);
+    if (tagToRemove) {
+        // [FIX] Reset specific context when corresponding tags are removed
+        if (tagToRemove.type === 'domain') activeContext.cc = "";
+        if (tagToRemove.type === 'type') activeContext.ref = "";
+        if (tagToRemove.type === 'path') activeContext.ref = "";
+    }
+
     activeTags = activeTags.filter(t => t.id !== id);
+    
+    // If no more tags left, clear the entire active context
+    if (activeTags.length === 0) {
+        activeContext = { cc: "", bcc: "", ref: "" };
+    }
+
     updateTagsUI();
     loadMoreDocs(true);
+    
+    // [FIX] Also refresh chat history to reflect cleared filters
+    fetchChatHistory(true);
 }
 
 function updateTagsUI() {
