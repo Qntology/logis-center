@@ -250,3 +250,18 @@ pub fn ceil_by_factor(num: f32, factor: u32) -> u32 {
     let ceil = (num / factor as f32).ceil() as u32;
     ceil * factor
 }
+
+// --- GLOBAL EXTRACTION CONTROL ---
+
+pub fn is_extraction_stopped() -> bool {
+    paths::get_stop_signal_file().exists()
+}
+
+pub fn set_extraction_stop_signal(stopped: bool) {
+    let file = paths::get_stop_signal_file();
+    if stopped {
+        let _ = std::fs::File::create(file);
+    } else {
+        let _ = std::fs::remove_file(file);
+    }
+}

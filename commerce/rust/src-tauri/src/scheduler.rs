@@ -193,6 +193,12 @@ pub async fn start_background_worker(
                 let mut current_device_pref: Option<String> = None;
                 
                 loop {
+                    // [CRITICAL] Global Stop Signal Check
+                    if crate::utils::is_extraction_stopped() {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+
                     let mut pending_tasks = Vec::new();
                     {
                         let store_opt = store.lock().await;
@@ -294,8 +300,8 @@ pub async fn start_background_worker(
                                         
                                         current_device_pref = Some("cpu".to_string());
         
-                                        let _ = app_handle.emit("extraction-progress", json!({
-                                            "task_id": task.id,
+                                        // [FIX] Removed intermediate UI emit. Log the progress instead.
+                                        log_task_progress(&app_handle, &task.id, &json!({
                                             "category": "Warning", "summary": "Memory pressure detected. Retrying on CPU...", "spinner": "⚠️"
                                         }));
                                         
@@ -494,6 +500,9 @@ async fn process_task(
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 2B)");
         
+        // [NEW] Log step A start for UI recovery
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
+
         let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
@@ -583,6 +592,9 @@ async fn process_task(
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         println!("[Scheduler] Starting DISK BRIDGE RELAY for Selectors");
         
+        // [NEW] Log step B start
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
+
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
         let pug_content = light_pug.clone();
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, selector_prompt);
@@ -694,7 +706,8 @@ async fn process_task(
     // --- PHASE 2 Continue: Detail Extraction (If needed) ---
     if !is_detail {
         // [LIST MODE] Direct DOM Extraction
-        log_task_progress(app_handle, &task.id, &json!({ "category": "List Processing", "summary": "Extracting list data..." }));
+        let list_log = json!({ "category": "List Processing", "summary": "Extracting list data...", "spinner": "⠋" });
+        log_task_progress(app_handle, &task.id, &list_log);
 
         let mut all_extracted_items = Vec::new();
         {

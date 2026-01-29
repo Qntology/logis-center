@@ -31,8 +31,9 @@ async fn stop_current_extraction(
     state: State<'_, AppState>,
     task_id: Option<String>
 ) -> Result<String, String> {
-    // 1. Set the flag immediately.
+    // 1. Set global stop signals (Atomic + File-based for persistence across threads)
     state.cancellation_token.store(true, Ordering::SeqCst);
+    crate::utils::set_extraction_stop_signal(true);
     
     // 2. Clear from DB
     if let Ok(store_guard) = state.store.try_lock() {
@@ -922,6 +923,11 @@ pub fn run() {
             cancellation_token: cancellation_token.clone(),
         })
         .setup(|app| {
+            // [FIX] Reset stop signals immediately on app startup
+            let setup_cancel = app.state::<AppState>().cancellation_token.clone();
+            setup_cancel.store(false, Ordering::SeqCst);
+            crate::utils::set_extraction_stop_signal(false);
+
             let setup_store = app.state::<AppState>().store.clone();
             tauri::async_runtime::spawn(async move {
                 let mut store_guard = setup_store.lock().await;
@@ -949,7 +955,12 @@ pub fn run() {
             });
 
             let event_store = app.state::<AppState>().store.clone();
+            let event_cancel = app.state::<AppState>().cancellation_token.clone();
             app.listen("new-task-from-browser", move |event| {
+                // [NEW] Reset stop signals when a new task arrives
+                event_cancel.store(false, Ordering::SeqCst);
+                crate::utils::set_extraction_stop_signal(false);
+
                 if let Ok(payload_val) = serde_json::from_str::<serde_json::Value>(event.payload()) {
                     let store_clone = event_store.clone();
                     tauri::async_runtime::spawn(async move {

@@ -668,8 +668,8 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        let _ = app_handle.emit("extraction-progress", json!({ 
-            "task_id": task_id.clone(),
+        // [LOG-ONLY] Removed intermediate UI emit. Log the progress instead.
+        crate::scheduler::log_task_progress(app_handle, &task_id, &json!({ 
             "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
         }));
 
@@ -848,7 +848,7 @@ impl LogisModel {
         &self, 
         params: ChatCompletionParameters,
         app_handle: &tauri::AppHandle,
-        event_name: &str,
+        _event_name: &str,
         mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
@@ -871,8 +871,9 @@ impl LogisModel {
             }
         }
 
-        // Emit initial status once (Frontend will handle continuous spinner animation via .active-spinner class)
-        let _ = app_handle.emit(event_name, &base_payload);
+        // [FIX] Removed periodic UI emits from low-level model calls.
+        // Higher-level scheduler will manage the initial and final UI states.
+        // let _ = app_handle.emit(event_name, &base_payload);
         
         // [LOG] Save to task history if task_id exists
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
@@ -894,9 +895,9 @@ impl LogisModel {
         &self, 
         prompt: String, 
         image: Option<DynamicImage>,
-        app_handle: &tauri::AppHandle,
-        event_name: &str,
-        base_payload: Value,
+        _app_handle: &tauri::AppHandle,
+        _event_name: &str,
+        _base_payload: Value,
         max_tokens: usize,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
@@ -904,8 +905,8 @@ impl LogisModel {
         // Ensure generator is loaded
         self.ensure_generator(ModelSize::Large).await?;
 
-        // Emit initial status once
-        let _ = app_handle.emit(event_name, base_payload);
+        // [FIX] Removed redundant emit. Only log the progress if needed.
+        // let _ = app_handle.emit(event_name, base_payload);
 
         let self_clone = self.generator.clone();
         
@@ -998,8 +999,8 @@ impl LogisModel {
         &self, 
         prompt: String, 
         image: Option<DynamicImage>, 
-        app_handle: &tauri::AppHandle,
-        event_name: &str,
+        _app_handle: &tauri::AppHandle,
+        _event_name: &str,
         mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
         session_id: Option<String>
@@ -1016,8 +1017,8 @@ impl LogisModel {
             }
         }
 
-        // Emit initial status once
-        let _ = app_handle.emit(event_name, base_payload);
+        // [FIX] Removed redundant emit. Only log the progress.
+        // let _ = app_handle.emit(event_name, base_payload);
 
         let generator_arc = self.generator.clone();
         let max_tok = self.max_tokens_limit;
@@ -1156,12 +1157,12 @@ impl LogisModel {
     // --- Ported from Python (search_engine.py) ---
     // --- Ported from Python (logic.py) ---
     pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let spinner = Spinner::dots();
         let mut status_history = format!("### 🔍 Deep Research: '{}'\n\n", query);
 
         // 1. Context Gathering
         status_history.push_str("✅ Context gathered.\n\n");
-        let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": spinner.frames[0] }));
+        // [LOG-ONLY]
+        crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
         // 2. Multi-step reasoning loop
         let steps = vec![
@@ -1170,10 +1171,10 @@ impl LogisModel {
             "Synthesizing final intelligence report..."
         ];
 
-        for (i, step) in steps.iter().enumerate() {
-            let frame = spinner.frames[i % spinner.frames.len()];
-            status_history.push_str(&format!("**{} {}**\n", frame, step));
-            let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": frame }));
+        for step in steps.iter() {
+            status_history.push_str(&format!("**⏳ {}**\n", step));
+            // [LOG-ONLY]
+            crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
@@ -1182,7 +1183,8 @@ impl LogisModel {
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
-            let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));
+            // [LOG-ONLY]
+            crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
         }
 
         // 3. Final Report
@@ -1192,7 +1194,8 @@ impl LogisModel {
         let report = self.run_inference_text(final_prompt, None, cancel_token, None).await?;
         status_history.push_str(&report);
         
-        let _ = app_handle.emit("research-update", json!({ "text": status_history, "spinner": "✅" }));
+        // [LOG-ONLY]
+        crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
         Ok(report)
     }

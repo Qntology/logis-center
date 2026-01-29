@@ -47,6 +47,10 @@ pub fn get_task_log_file(app: Option<&AppHandle>, task_id: &str) -> PathBuf {
     path.join(format!("{}.jsonl", task_id))
 }
 
+pub fn get_stop_signal_file() -> PathBuf {
+    PathBuf::from("tmp").join("EXTRACTION_STOPPED")
+}
+
 /// Initialize all necessary directories
 pub fn init_directories(app: Option<&AppHandle>) {
     let _ = get_kv_dir(app);

@@ -36,6 +36,7 @@ let isExpanded = false;
 let currentTab = "list";
 let currentImage: string | null = null;
 let currentDetectedUrl = "";
+let isCurrentShop = false; 
 let searchDebounceTimer: number | null = null;
 let chatPollInterval: number | null = null;
 
@@ -130,15 +131,14 @@ function startSpinner() {
             if (btnStopTask) btnStopTask.style.display = "flex";
             if (btnDetailDelete) btnDetailDelete.style.display = "none";
 
-            // [LOG-RECOVERY] Fetch and restore log history if we open the view mid-task
+            // [LOG-RECOVERY] Smart restoration: don't clear, just sync
             const logArea = document.getElementById("extraction-log");
             if (logArea && logArea.dataset.activeTaskId) {
                 const taskId = logArea.dataset.activeTaskId;
-                logArea.innerHTML = "<div style='padding:10px;'>📡 Synchronizing logs...</div>";
                 try {
                     const logs = await invoke<any[]>("get_task_logs", { taskId });
-                    logArea.innerHTML = "";
-                    logs.forEach(l => renderProgressToUI(l));
+                    // No innerHTML = "" here!
+                    logs.forEach(l => renderProgressToUI(l, true));
                 } catch (e) { console.error("Log recovery failed:", e); }
             }
         };
@@ -156,6 +156,7 @@ function startSpinner() {
 }
 
 function stopSpinner() {
+    isExtracting = false; // [FORCE]
     if (spinnerInterval) {
         clearInterval(spinnerInterval);
         spinnerInterval = null;
@@ -164,11 +165,13 @@ function stopSpinner() {
         globalNavSpinner.style.display = "none";
         globalNavSpinner.innerText = ""; 
     }
-    // [FIX] Comprehensive cleanup of all active-spinner classes and flags
+    // [FIX] Comprehensive cleanup of all active-spinner classes and elements
     document.querySelectorAll('.active-spinner').forEach(el => {
         el.classList.remove('active-spinner');
+        if (el.tagName === 'SPAN' && (el as HTMLElement).innerText.length <= 2) {
+             (el as HTMLElement).innerText = ""; // Clear icon
+        }
     });
-    isExtracting = false;
 }
 
 // --- Layout & Window Logic ---
@@ -273,8 +276,9 @@ async function updateExtractButtonVisibility() {
         btnExtract.title = "Extract from Image";
         return;
     }
-// ... (기존 로직) ...
-    if (!currentDetectedUrl) {
+
+    // [FIX] Only show extract button if it's a confirmed shop domain
+    if (!currentDetectedUrl || !isCurrentShop) {
         btnExtract.style.display = "none";
         return;
     }
@@ -296,10 +300,17 @@ async function updateExtractButtonVisibility() {
         const isActive = await invoke<boolean>("check_active_task", {
                     payload: { cc: ccHash, ref: hashedRefId }
                 });
-        if (isActive === true) {
+        
+        // [FIX] Priority Guard: Even if server says active, trust the local isExtracting flag
+        // especially during the transition period after clicking Stop button.
+        if (isActive === true && isExtracting) {
             btnExtract.classList.add("active-spinner");
             btnExtract.title = "Extraction in progress...";
             if (!spinnerInterval) startSpinner(); 
+        } else if (!isExtracting) {
+            // Ensure UI is reset if we are definitely not extracting
+            btnExtract.classList.remove("active-spinner");
+            btnExtract.innerText = "⚡";
         }
     } catch (e) { 
         console.warn("[WIDGET] visibility check error:", e);
@@ -310,14 +321,15 @@ listen("browser-match-found", async (event: any) => {
     const payload = event.payload;
     console.log("[WIDGET] Browser Match Found:", payload);
     
-    if (payload.is_client || payload.is_admin) {
-        currentDetectedUrl = payload.url;
+    currentDetectedUrl = payload.url;
+    isCurrentShop = payload.is_client || payload.is_admin;
+
+    if (isCurrentShop) {
         // If a match is found, the browser must be running, so hide launch button
         if (btnAutoLaunch) btnAutoLaunch.style.display = "none";
     } else {
-        currentDetectedUrl = "";
-        // If no match but browser was previously 'running', we might need to sync status
-        // syncBrowserStatus() handles the more general 'running' check
+        // Even if not a shop, if we have a URL, the browser is running
+        if (currentDetectedUrl && btnAutoLaunch) btnAutoLaunch.style.display = "none";
     }
     
     await updateExtractButtonVisibility();
@@ -755,6 +767,7 @@ btnExtract?.addEventListener("click", async () => {
         isExtracting = true;
         const taskId = `img_${Date.now()}`;
         activeTaskId = taskId; // [NEW]
+        if (logArea) logArea.dataset.activeTaskId = taskId; // [CRITICAL-FIX]
         try {
             await emit("new-task-from-browser", { 
                 id: taskId, type: "image_extraction", image_path: currentImage, 
@@ -767,6 +780,7 @@ btnExtract?.addEventListener("click", async () => {
     } else {
         isExtracting = true;
         let taskId = `task_${Date.now()}`;
+        if (logArea) logArea.dataset.activeTaskId = taskId; // [CRITICAL-FIX]
         try {
             const html = await invoke<string>("extract_html_from_current_tab");
             const normalizedUrl = currentDetectedUrl.toLowerCase();
@@ -790,10 +804,15 @@ btnExtract?.addEventListener("click", async () => {
 listen("extraction-progress", async (event: any) => { renderProgressToUI(event.payload); });
 document.addEventListener('render-progress', (e: any) => { renderProgressToUI(e.detail); });
 
-async function renderProgressToUI(payload: any) {
-    // [FIX] Strict Guard: If the user stopped extraction, ignore any incoming progress events 
-    // that might accidentally restart the UI spinner.
-    if (!isExtracting && payload.category !== "Done" && payload.category !== "Error") {
+async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
+    const summary = (payload.summary || "").toLowerCase();
+    const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
+
+    // [CRITICAL-FIX] If the user manually stopped extraction, ignore ALL incoming progress events 
+    // unless they are the final terminal signals confirming the stop/error/completion.
+    // [RECOVERY-BYPASS] If we are recovering logs, bypass this guard.
+    if (!isRecovery && !isExtracting && !isTerminal) {
+        console.log("[WIDGET] Ignoring late progress event after stop:", payload.category);
         return; 
     }
 
@@ -813,6 +832,8 @@ async function renderProgressToUI(payload: any) {
             btnExtract.innerText = "⚡";
         }
         await updateExtractButtonVisibility();
+        
+        // [FIX] Continue to mapping but we'll return at the end of terminal mapping
     }
 
     if (payload.task_id) {
@@ -822,6 +843,8 @@ async function renderProgressToUI(payload: any) {
         // [FIX] Correctly map status by checking summary text first
         if (summary.includes("cancelled") || summary.includes("stopped")) {
             statusCode = 3; // Cancelled
+            isExtracting = false;
+            stopSpinner();
         } else if (payload.category === "Done") {
             statusCode = 9; // Success
         } else if (payload.category === "Error") {
@@ -835,64 +858,81 @@ async function renderProgressToUI(payload: any) {
             status: statusCode, 
             created_at: Date.now() 
         });
+
+        // [FIX] If terminal status, don't proceed to draw new spinners in the log
+        if (statusCode === 3 || statusCode === 9 || statusCode === 6) {
+            if (btnStopTask) btnStopTask.style.display = "none";
+            return; // [CRITICAL] Stop processing immediately for terminal states
+        }
     }
 
     if (extractionLog && detailView.style.display !== "none") {
          let p = document.getElementById(elementId);
          if (!p) {
              p = document.createElement("div"); p.id = elementId;
+             p.className = "progress-item";
              p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
              p.style.display = "flex"; p.style.flexDirection = "column"; 
              const row = document.createElement("div"); row.className = "progress-row"; row.style.display = "flex"; row.style.alignItems = "center";
-             // Only show the spinner icon if we are actually extracting
-             const spinnerIcon = isExtracting ? `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span>` : "";
+             
+             // Initial creation
+             const spinnerIcon = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span>`;
              row.innerHTML = `${spinnerIcon}<span class="summary-text">${payload.summary || ""}</span>`;
              p.appendChild(row);
              const results = document.createElement("div"); results.className = "results-container"; p.appendChild(results);
              extractionLog.appendChild(p);
          }
          
-         const summary = p.querySelector(".summary-text") as HTMLElement;
-         const spinner = p.querySelector(".active-spinner") as HTMLElement;
+         const summaryEl = p.querySelector(".summary-text") as HTMLElement;
+         const spinnerEl = p.querySelector(".active-spinner") as HTMLElement;
          const resultsContainer = p.querySelector(".results-container");
 
+         // [SMART-UPDATE] Only update DOM if the content actually changed
+         if (summaryEl && summaryEl.textContent !== payload.summary) {
+             summaryEl.textContent = payload.summary || "";
+         }
+
          if (payload.category === "Done") {
-             isExtracting = false;
              if (btnStopTask) btnStopTask.style.display = "none";
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
-             if (globalNavSpinner) globalNavSpinner.style.display = "none"; // Double ensure
-             extractionLog.querySelectorAll(".progress-row").forEach(row => {
+             if (globalNavSpinner) globalNavSpinner.style.display = "none"; 
+             
+             // Finalize this specific row
+             const row = p.querySelector(".progress-row");
+             if (row) {
                  const s = row.querySelector(".active-spinner");
                  if (s) {
                      s.classList.remove("active-spinner");
-                     row.innerHTML = `<span style="margin-right:8px; color:#4ade80;">✅</span> <span>${row.querySelector(".summary-text")?.textContent || "Complete"}</span>`;
+                     s.innerHTML = "✅";
+                     s.style.color = "#4ade80";
                  }
-             });
+             }
          } else if (payload.category === "Error") {
-             isExtracting = false;
-             if (globalNavSpinner) globalNavSpinner.style.display = "none"; // Double ensure
              const row = p.querySelector(".progress-row");
              if (row) { 
                  const s = row.querySelector(".active-spinner");
-                 if (s) s.classList.remove("active-spinner");
-                 row.innerHTML = `<span style="margin-right:8px;">❌</span> <span>${payload.summary || "Error"}</span>`; 
+                 if (s) {
+                     s.classList.remove("active-spinner");
+                     s.innerHTML = "❌";
+                 }
                  (row as HTMLElement).style.color = "#ef4444"; 
              }
          } else {
-             if (spinner) {
-                 spinner.innerText = payload.spinner || "⠋";
-                 if (payload.spinner === "✅" || payload.spinner === "✔") {
-                     spinner.classList.remove("active-spinner");
-                     spinner.style.color = "#4ade80";
+             // Intermediate update: ensure spinner is animating if it's still processing
+             if (spinnerEl) {
+                 const newIcon = payload.spinner || "⠋";
+                 if (spinnerEl.innerText !== newIcon) {
+                     spinnerEl.innerText = newIcon;
                  }
-             }
-             if (summary) summary.innerText = payload.summary || "";
-             if((payload.display_text || payload.data) && resultsContainer) {
-                  const pre = document.createElement("pre");
-                  pre.style.whiteSpace = "pre-wrap"; pre.style.fontSize = "0.7rem"; pre.style.color = "#aaa"; pre.style.background = "#252525"; pre.style.padding = "5px"; pre.style.borderRadius = "3px"; pre.style.marginTop = "5px"; pre.style.borderLeft = "2px solid var(--primary)";
-                  pre.innerText = payload.display_text || JSON.stringify(payload.data, null, 2);
-                  resultsContainer.appendChild(pre);
-                  detailContent.scrollTop = detailContent.scrollHeight;
+                 if (newIcon === "✅" || newIcon === "✔") {
+                     spinnerEl.classList.remove("active-spinner");
+                     spinnerEl.style.color = "#4ade80";
+                 } else if (newIcon === "❌") {
+                     spinnerEl.classList.remove("active-spinner");
+                     spinnerEl.style.color = "#ef4444";
+                 } else {
+                     spinnerEl.classList.add("active-spinner");
+                 }
              }
          }
     }
@@ -934,7 +974,16 @@ btnStopTask?.addEventListener("click", async () => {
 });
 
 // --- Browser Auto ---
-btnAutoLaunch?.addEventListener("click", async () => { try { await invoke("launch_best_browser", { url: "https://google.com" }); } catch (e) { console.error("Launch error:", e); } });
+btnAutoLaunch?.addEventListener("click", async () => { 
+    try { 
+        // [FIX] Hide immediately on click for better UX
+        btnAutoLaunch.style.display = "none";
+        await invoke("launch_best_browser", { url: "https://google.com" }); 
+    } catch (e) { 
+        console.error("Launch error:", e); 
+        btnAutoLaunch.style.display = "flex"; // Restore on error
+    } 
+});
 const autoBrowser = document.getElementById("auto-browser") as HTMLSelectElement;
 const autoUrl = document.getElementById("auto-url") as HTMLInputElement;
 const autoBtn = document.getElementById("auto-btn") as HTMLButtonElement;
@@ -1278,6 +1327,7 @@ async function initSession() {
         
         if (data.current_url) {
             currentDetectedUrl = data.current_url;
+            isCurrentShop = data.is_client || data.is_admin; // [FIX] Sync shop status on startup
             // Trigger UI update based on the detected URL
             updateExtractButtonVisibility();
         }

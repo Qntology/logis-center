@@ -151,9 +151,19 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         let mut last_is_shop = false;
 
         loop {
+            // [CRITICAL] Stop monitoring if global stop signal is active
+            if crate::utils::is_extraction_stopped() {
+                println!("[AUTO] Global stop signal detected. Exiting browser monitor.");
+                break;
+            }
+
             let pages = match browser.pages().await {
                 Ok(p) => p,
-                Err(_) => break, 
+                Err(e) => {
+                    println!("[AUTO] Failed to fetch pages: {}. Retrying...", e);
+                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                    continue; 
+                }, 
             };
 
             let mut active_url = String::new();
@@ -173,9 +183,15 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             }
 
             // 2. [FALLBACK] If browser is minimized or no tab is 'visible', use the first page
-            if active_url.is_empty() && !pages.is_empty() {
-                if let Ok(val) = pages[0].evaluate("window.location.href").await {
-                    active_url = val.into_value::<String>().unwrap_or_default();
+            if (active_url.is_empty() || active_url == "about:blank") && !pages.is_empty() {
+                for page in pages.iter() {
+                    if let Ok(val) = page.evaluate("window.location.href").await {
+                        let url = val.into_value::<String>().unwrap_or_default();
+                        if !url.is_empty() && url != "about:blank" {
+                            active_url = url;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -195,13 +211,16 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 state.is_admin = is_admin;
             }
 
-            // Notify UI if URL changed OR if shop-status changed
-            if active_url != last_detected_url || current_is_shop != last_is_shop {
+            // Notify UI only if URL changed OR if it's a shop page
+            // [FIX] Always emit when URL changes so frontend can sync btn-extract and btn-auto-launch
+            if (active_url != last_detected_url || current_is_shop != last_is_shop) && !active_url.is_empty() {
                 let payload = json!({
                     "url": active_url.clone(),
                     "is_client": is_client,
                     "is_admin": is_admin
                 });
+                
+                // Emit every time to keep frontend state consistent with the actual browser
                 let _ = app_handle.emit("browser-match-found", &payload);
                 
                 last_detected_url = active_url;
