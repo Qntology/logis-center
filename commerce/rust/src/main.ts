@@ -61,12 +61,25 @@ let chatPage = 0;
 let chatHasMore = true;
 let isChatLoading = false;
 
+// [NEW] Track first-load status for UI loaders
+let isFirstNavRender = true;
+let isFirstChatLoad = true;
+
 let selectedUuids = new Set<string>();
 let currentDetailUuid: string | null = null;
 let activeTaskId: string | null = null; // [NEW] Track current extraction task
 let isExtracting = false; 
 let spinnerInterval: number | null = null;
+let qrSpinnerIndex = 0; // [NEW] Track discrete frame for QR spinner
 let systemLogCount = 0;
+
+function stepQrSpinner() {
+    const el = document.getElementById("qr-auth-spinner");
+    if (el) {
+        qrSpinnerIndex = (qrSpinnerIndex + 1) % spinnerFrames.length;
+        el.innerText = spinnerFrames[qrSpinnerIndex];
+    }
+}
 // [NEW] Active navigation context for related logs/chat
 let activeContext = {
     cc: "",
@@ -114,40 +127,21 @@ const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormEle
 
 // --- Spinner Logic ---
 const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const globalNavSpinner = document.getElementById("global-nav-spinner") as HTMLElement;
 
 function startSpinner() {
     if (spinnerInterval) clearInterval(spinnerInterval);
-    if (globalNavSpinner) {
-        globalNavSpinner.style.display = "inline-block";
+    
+    // [FIX] Use btnSettings as the spinner container
+    if (settingsBtn) {
+        settingsBtn.classList.add("active-spinner-mode");
         // Ensure the extraction button is hidden while the global spinner is active
         if (btnExtract) btnExtract.style.display = "none";
-        
-        globalNavSpinner.onclick = async () => {
-            openWidget("list");
-            listView.style.display = "none";
-            detailView.style.display = "flex";
-            detailTitle.innerText = "Task Progress";
-            if (btnStopTask) btnStopTask.style.display = "flex";
-            if (btnDetailDelete) btnDetailDelete.style.display = "none";
-
-            // [LOG-RECOVERY] Smart restoration: don't clear, just sync
-            const logArea = document.getElementById("extraction-log");
-            if (logArea && logArea.dataset.activeTaskId) {
-                const taskId = logArea.dataset.activeTaskId;
-                try {
-                    const logs = await invoke<any[]>("get_task_logs", { taskId });
-                    // No innerHTML = "" here!
-                    logs.forEach(l => renderProgressToUI(l, true));
-                } catch (e) { console.error("Log recovery failed:", e); }
-            }
-        };
     }
     
     let i = 0;
     spinnerInterval = window.setInterval(() => {
         const char = spinnerFrames[i % spinnerFrames.length];
-        if (globalNavSpinner) globalNavSpinner.innerText = char;
+        if (settingsBtn) settingsBtn.innerText = char;
         document.querySelectorAll('.active-spinner').forEach(el => {
             (el as HTMLElement).innerText = char;
         });
@@ -156,15 +150,23 @@ function startSpinner() {
 }
 
 function stopSpinner() {
-    isExtracting = false; // [FORCE]
     if (spinnerInterval) {
         clearInterval(spinnerInterval);
         spinnerInterval = null;
     }
-    if (globalNavSpinner) {
-        globalNavSpinner.style.display = "none";
-        globalNavSpinner.innerText = ""; 
+    
+    // [FIX] Only restore the icon if we are NOT currently extracting data
+    if (!isExtracting && settingsBtn) {
+        settingsBtn.classList.remove("active-spinner-mode");
+
+        if(settingsBtn.classList.contains('active')){
+            settingsBtn.innerText = "💬";
+        }else{
+            settingsBtn.innerText = "🗨️";
+        }
+        
     }
+    
     // [FIX] Comprehensive cleanup of all active-spinner classes and elements
     document.querySelectorAll('.active-spinner').forEach(el => {
         el.classList.remove('active-spinner');
@@ -200,6 +202,7 @@ function openWidget(tabName: string = "list") {
     if (!isExpanded) {
         isExpanded = true;
         contentPanel.classList.add("open");
+        settingsBtn.innerText = "💬";
         setWindowSize(true);
     }
     switchTab(tabName);
@@ -210,6 +213,7 @@ function collapseWidget() {
     contentPanel.classList.remove("open");
     setWindowSize(false);
     settingsBtn?.classList.remove("active-emoji", "active");
+    settingsBtn.innerText = "🗨️";
 }
 
 // --- Mouse Passthrough Logic ---
@@ -531,6 +535,11 @@ async function renderNavigation() {
 
     if (!pageList || !userList) return;
 
+    // [FIX] Show spinner only on the very first navigation render
+    if (isFirstNavRender) {
+        startSpinner();
+    }
+
     // Profile UI
     if (currentSession.email) {
         if (profileName) profileName.innerText = currentSession.email.split('@')[0];
@@ -609,6 +618,12 @@ async function renderNavigation() {
             // 3. Render
             pageList.innerHTML = await renderAccordion(tree);
 
+            // [FIX] Navigation rendered, stop spinner if it was the first time
+            if (isFirstNavRender) {
+                isFirstNavRender = false;
+                stopSpinner();
+            }
+
             // 4. Bind Clicks manually to labels
             pageList.querySelectorAll(".logis-label").forEach((label: any) => {
                 label.onclick = (e: Event) => {
@@ -666,6 +681,9 @@ async function syncData() {
             session_params: { hash: currentSession.hash, token: currentSession.token }
         });
 
+        // [FIX] Advance spinner one step
+        stepQrSpinner();
+
         if (response.results && Array.isArray(response.results)) {
             await Upsert["items"](response.results);
             console.log("[SYNC] Data upserted.");
@@ -676,7 +694,12 @@ async function syncData() {
             if (currentTab === "list") await loadMoreDocs(true);
         }
         
-    } catch (e) { console.error("[SYNC] Failed:", e); }
+    } catch (e) { 
+        console.error("[SYNC] Failed:", e); 
+    } finally {
+        // [FIX] Stop spinner
+        if (!isExtracting) stopSpinner();
+    }
 }
 
 // [NEW] Global Navigation Link Handler (from item2html)
@@ -1080,7 +1103,13 @@ async function loadMoreDocs(reset: boolean = false) {
         cachedDocs = [];
     }
 
-    if (isLoading || !hasMore) return;
+    if (isLoading || !hasMore) {
+        if (reset) stopSpinner(); // Stop if already loading
+        return;
+    }
+
+    // [FIX] Always start spinner for any document fetching
+    startSpinner();
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
     
@@ -1110,7 +1139,12 @@ async function loadMoreDocs(reset: boolean = false) {
         console.error("[WIDGET] loadMoreDocs error:", e);
         if (currentPage === 0 && docListContainer) docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
     } 
-    finally { isLoading = false; if (loadingIndicator) loadingIndicator.style.display = "none"; }
+    finally { 
+        isLoading = false; 
+        if (loadingIndicator) loadingIndicator.style.display = "none"; 
+        // [FIX] Always stop spinner when loading attempt finishes
+        stopSpinner();
+    }
 }
 
 function renderDocs(docs: any[]) {
@@ -1219,7 +1253,12 @@ async function checkAuthStatus() {
         if (currentSession.token) queryParams.token = currentSession.token;
         const params = new URLSearchParams(queryParams);
         const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
+        
         const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: { hash: currentSession.hash, token: currentSession.token } });
+        
+        // [FIX] Step the spinner frame only when result arrives
+        stepQrSpinner();
+
         let session = data.session || data; 
         if (session && session.hash) {
             const hashChanged = session.hash !== currentSession.hash;
@@ -1231,7 +1270,9 @@ async function checkAuthStatus() {
                 updateAuthUI(); fetchChatHistory(); syncData();
             }
         }
-    } catch (e) { console.warn("Auth check failed:", e); }
+    } catch (e) { 
+        console.warn("Auth check failed:", e); 
+    }
 }
 
 function updateAuthUI() {
@@ -1258,7 +1299,7 @@ async function performQrAuth() {
     if (!chatTalks || !currentSession.hash) return;
     const existing = document.getElementById("msg-qr-auth");
     if (existing) existing.remove();
-    const html = `<div class="chat-talk system" id="msg-qr-auth"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" style="margin-right:5px; font-family:monospace; color:var(--primary); font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
+    const html = `<div class="chat-talk system" id="msg-qr-auth"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.75rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:var(--primary); font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
     chatTalks.insertAdjacentHTML('beforeend', html);
     const qrTarget = document.getElementById("qr-code-target");
     if (qrTarget) {
@@ -1438,9 +1479,23 @@ if (talksScroll) {
         }
     });
 }
-async function fetchChatHistory(reset: boolean = true) { if (reset) { chatPage = 0; chatHasMore = true; if (chatTalks) chatTalks.innerHTML = ""; } await loadMoreChat(); }
+async function fetchChatHistory(reset: boolean = true) { 
+    if (reset) { 
+        chatPage = 0; 
+        chatHasMore = true; 
+        if (chatTalks) chatTalks.innerHTML = ""; 
+    } 
+    await loadMoreChat(); 
+}
+
 async function loadMoreChat() {
-    if (isChatLoading || !chatHasMore) return;
+    if (isChatLoading || !chatHasMore) {
+        stopSpinner();
+        return;
+    }
+
+    // [FIX] Always start spinner for any chat fetching
+    startSpinner();
     isChatLoading = true;
 
     try {
@@ -1449,6 +1504,7 @@ async function loadMoreChat() {
         else if (activeContext.bcc) sqlFilter = `bcc = '${activeContext.bcc}'`;
         else if (activeContext.cc) sqlFilter = `cc = '${activeContext.cc}'`;
         const messages = await invoke<any[]>("get_chat_messages", { limit: pageSize, offset: chatPage * pageSize, filter: sqlFilter });
+        
         if (chatTalks) {
             if (messages && messages.length > 0) {
                 if (messages.length < pageSize) chatHasMore = false;
@@ -1457,7 +1513,13 @@ async function loadMoreChat() {
             } else { chatHasMore = false; if (chatPage === 0) chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>"; }
             if (!currentSession.email && currentTab === "settings" && chatPage === 1) performQrAuth();
         }
-    } catch (e) { console.error(e); } finally { isChatLoading = false; }
+    } catch (e) { 
+        console.error(e); 
+    } finally { 
+        isChatLoading = false; 
+        // [FIX] Always stop spinner
+        stopSpinner();
+    }
 }
 
 // --- Initialize ---

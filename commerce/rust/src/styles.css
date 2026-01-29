@@ -344,8 +344,8 @@ th { text-align: left; color: var(--text-muted); padding: 8px; border-bottom: 1p
 td { padding: 8px; border-bottom: 1px solid rgba(0,0,0,0.05); }
 tr:hover { background: rgba(0,0,0,0.05); }
 
-[data-tab="settings"]::after{content: '🗨️'; font-family: 'Noto Color Emoji';}
-[data-tab="settings"][class*="active"]::after{content: '💬';}
+[data-tab="settings"]{font-family: 'Noto Color Emoji' !important;}
+[data-tab="settings"][class*="active-spinner-mode"]{font-family:monospace; }
 
 
 /* --- CHAT UI STYLES (Ported from content.js) --- */
