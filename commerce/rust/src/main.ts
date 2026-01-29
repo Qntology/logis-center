@@ -756,7 +756,11 @@ btnExtract?.addEventListener("click", async () => {
         const taskId = `img_${Date.now()}`;
         activeTaskId = taskId; // [NEW]
         try {
-            await emit("new-task-from-browser", { id: taskId, type: "image_extraction", image_path: currentImage, ref: currentImage, link: "Local Image" });
+            await emit("new-task-from-browser", { 
+                id: taskId, type: "image_extraction", image_path: currentImage, 
+                ref: currentImage, link: "Local Image",
+                device_preference: forceCpuToggle?.checked ? "cpu" : null
+            });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: Image Analysis`, status: 10, task_id: taskId, created_at: Date.now() });
             await updateExtractButtonVisibility();
         } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
@@ -774,7 +778,8 @@ btnExtract?.addEventListener("click", async () => {
             
             await emit("new-task-from-browser", { 
                 id: taskId, type: "html_extraction", html: html, link: rawPath, 
-                cc: cc, ref: hashedRefId, from: currentSession.address, to: currentSession.team
+                cc: cc, ref: hashedRefId, from: currentSession.address, to: currentSession.team,
+                device_preference: forceCpuToggle?.checked ? "cpu" : null
             });
             renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: 10, task_id: hashedRefId, created_at: Date.now() });
             await updateExtractButtonVisibility();
@@ -786,6 +791,12 @@ listen("extraction-progress", async (event: any) => { renderProgressToUI(event.p
 document.addEventListener('render-progress', (e: any) => { renderProgressToUI(e.detail); });
 
 async function renderProgressToUI(payload: any) {
+    // [FIX] Strict Guard: If the user stopped extraction, ignore any incoming progress events 
+    // that might accidentally restart the UI spinner.
+    if (!isExtracting && payload.category !== "Done" && payload.category !== "Error") {
+        return; 
+    }
+
     const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "general";
     const elementId = `progress-${catId}`;
     const extractionLog = document.getElementById("extraction-log");
@@ -795,6 +806,7 @@ async function renderProgressToUI(payload: any) {
     }
 
     if (payload.category === "Done" || payload.category === "Error") {
+        isExtracting = false; // Ensure flag is synced
         stopSpinner();
         if (btnExtract) {
             btnExtract.classList.remove("active-spinner");
@@ -832,7 +844,9 @@ async function renderProgressToUI(payload: any) {
              p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.75rem";
              p.style.display = "flex"; p.style.flexDirection = "column"; 
              const row = document.createElement("div"); row.className = "progress-row"; row.style.display = "flex"; row.style.alignItems = "center";
-             row.innerHTML = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span><span class="summary-text">${payload.summary || ""}</span>`;
+             // Only show the spinner icon if we are actually extracting
+             const spinnerIcon = isExtracting ? `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span>` : "";
+             row.innerHTML = `${spinnerIcon}<span class="summary-text">${payload.summary || ""}</span>`;
              p.appendChild(row);
              const results = document.createElement("div"); results.className = "results-container"; p.appendChild(results);
              extractionLog.appendChild(p);
@@ -846,6 +860,7 @@ async function renderProgressToUI(payload: any) {
              isExtracting = false;
              if (btnStopTask) btnStopTask.style.display = "none";
              if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+             if (globalNavSpinner) globalNavSpinner.style.display = "none"; // Double ensure
              extractionLog.querySelectorAll(".progress-row").forEach(row => {
                  const s = row.querySelector(".active-spinner");
                  if (s) {
@@ -855,6 +870,7 @@ async function renderProgressToUI(payload: any) {
              });
          } else if (payload.category === "Error") {
              isExtracting = false;
+             if (globalNavSpinner) globalNavSpinner.style.display = "none"; // Double ensure
              const row = p.querySelector(".progress-row");
              if (row) { 
                  const s = row.querySelector(".active-spinner");
@@ -884,8 +900,10 @@ async function renderProgressToUI(payload: any) {
 
 btnStopTask?.addEventListener("click", async () => {
     if (await ask("Stop the current extraction? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
-        // [UI-FIRST] Reset everything immediately
+        // [UI-FIRST] Reset everything immediately to prevent race conditions
+        isExtracting = false; 
         stopSpinner();
+        
         if (btnExtract) {
             btnExtract.classList.remove("active-spinner");
             btnExtract.innerText = "⚡";
@@ -895,6 +913,7 @@ btnStopTask?.addEventListener("click", async () => {
 
         try {
             console.log("[WIDGET] Stopping task:", activeTaskId);
+            // [FIX] Pass activeTaskId accurately
             await invoke<string>("stop_current_extraction", { taskId: activeTaskId });
             
             // Remove the message bubble immediately from UI

@@ -66,6 +66,14 @@ impl ModelVariant {
             _ => Ok(()),
         }
     }
+
+    pub fn is_cpu(&self) -> bool {
+        match self {
+            Self::Standard(m) => m.device().is_cpu(),
+            Self::QuantizedVL(m) => m.language_model.is_forced_cpu,
+            Self::QuantizedText(m) => m.language_model.is_forced_cpu,
+        }
+    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -557,8 +565,8 @@ impl Qwen3VLGenerateModel {
             all_ids.push(next_id);
             generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
             
-            // [REBALANCE] 512 토큰마다 VRAM 상태 체크하여 레이어 재배치
-            if _i > 0 && _i % 512 == 0 {
+            // [REBALANCE] 512 토큰마다 VRAM 상태 체크하여 레이어 재배치 (CPU 모드가 아닐 때만)
+            if _i > 0 && _i % 512 == 0 && !self.qwen3_vl.is_cpu() {
                 if let Err(e) = self.qwen3_vl.rebalance_layers(0) {
                     println!("[REBALANCE] Failed: {}", e);
                 }

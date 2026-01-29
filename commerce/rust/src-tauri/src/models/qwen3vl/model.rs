@@ -1278,4 +1278,8 @@ impl Qwen3VLModel {
     pub fn clear_kv_cache(&mut self) {
         self.language_model.clear_kv_cache();
     }
+
+    pub fn device(&self) -> &Device {
+        self.lm_head.weight().device()
+    }
 }

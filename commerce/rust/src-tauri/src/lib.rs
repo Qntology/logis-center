@@ -418,6 +418,17 @@ async fn ai_search_complex(
     device_preference: Option<String>,
 ) -> Result<Value, String> {
     let mut model_guard = state.model.lock().await;
+    
+    // [FIX] Check if existing model matches preference
+    if let Some(m) = model_guard.as_ref() {
+        let wants_cpu = device_preference.as_deref() == Some("cpu");
+        if m.is_cpu_mode != wants_cpu {
+            println!("[AI-SEARCH] Device preference mismatch. Reloading model...");
+            m.unload_generator().await;
+            *model_guard = None;
+        }
+    }
+
     if model_guard.is_none() {
         if let Ok(m) = LogisModel::new(device_preference.as_deref()).await { *model_guard = Some(m); }
         else { return Err("Failed to load model".to_string()); }
@@ -484,6 +495,17 @@ async fn deep_research_command(
     device_preference: Option<String>,
 ) -> Result<String, String> {
     let mut model_guard = state.model.lock().await;
+
+    // [FIX] Check if existing model matches preference
+    if let Some(m) = model_guard.as_ref() {
+        let wants_cpu = device_preference.as_deref() == Some("cpu");
+        if m.is_cpu_mode != wants_cpu {
+            println!("[DEEP-RESEARCH] Device preference mismatch. Reloading model...");
+            m.unload_generator().await;
+            *model_guard = None;
+        }
+    }
+
     if model_guard.is_none() {
         if let Ok(m) = LogisModel::new(device_preference.as_deref()).await {
             *model_guard = Some(m);

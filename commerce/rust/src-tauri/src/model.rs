@@ -614,12 +614,12 @@ impl LogisModel {
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel with Multi-GPU Support");
+        println!("[MODEL-00] Initializing LogisModel (Preference: {:?})", device_preference);
 
         let mut config = utils::get_optimal_device_config();
         
         if device_preference == Some("cpu") {
-            println!("[MODEL] Explicit CPU preference detected.");
+            println!("⚠️ [MODEL] EXPLICIT CPU MODE FORCED by user/system preference.");
             config = utils::DeviceConfig {
                 device: Device::Cpu,
                 is_cpu: true,
@@ -628,6 +628,8 @@ impl LogisModel {
                 name: "CPU-Forced".to_string(),
                 gpu_id: 0,
             };
+        } else {
+            println!("🚀 [MODEL] Running in default mode ({})", config.name);
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;

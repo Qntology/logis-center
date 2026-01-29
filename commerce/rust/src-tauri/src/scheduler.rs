@@ -359,6 +359,19 @@ async fn process_task(
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
 
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    
+    // [FIX] Robust device preference parsing (supports both "cpu" string and true/false boolean)
+    let task_device_pref = if let Some(v) = task_data.get("device_preference") {
+        if v.as_str() == Some("cpu") || v.as_bool() == Some(true) {
+            Some("cpu".to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let effective_device_pref = task_device_pref.as_deref().or(device_preference.as_deref());
+    
     let language = "english"; 
 
     // --- Image Extraction Logic ---
@@ -376,7 +389,8 @@ async fn process_task(
         data_manager.load(&light_pug_path)?
     } else {
         // [MEMORY] Fetch and immediately offload Raw HTML
-        let raw_html_path = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
+        // [FIX] Prefix with underscore to suppress unused variable warning
+        let _raw_html_path = if let Some(raw_html) = task_data.get("html").and_then(|s| s.as_str()) {
             let p = data_manager.offload(raw_html, "raw_html")?;
             if let Some(obj) = task_data.as_object_mut() { obj.remove("html"); }
             p
@@ -435,12 +449,22 @@ async fn process_task(
     let model = {
         let mut model_lock = model_mutex.lock().await;
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        // [FIX] If current model doesn't match preference, unload it to force switch (CPU <-> GPU)
+        if let Some(m) = model_lock.as_ref() {
+            let wants_cpu = effective_device_pref == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
+                m.unload_generator().await;
+                *model_lock = None;
+            }
+        }
+
         if model_lock.is_none() {
-            let payload = json!({
-                "task_id": task.id, "category": "Loading Model", "summary": "Initializing AI Core...", "spinner": "⠋"
-            });
-            let _ = app_handle.emit("extraction-progress", &payload);
-            match LogisModel::new(device_preference.as_deref()).await {
+            // [LOG-ONLY] No emit here to keep UI clean
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
+            
+            match LogisModel::new(effective_device_pref).await {
                 Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
@@ -669,16 +693,8 @@ async fn process_task(
 
     // --- PHASE 2 Continue: Detail Extraction (If needed) ---
     if !is_detail {
-        // [LIST MODE] Direct DOM Extraction (No LLM needed usually, unless refinement)
-        // ... (Existing DOM extraction logic - simplified for refactor focus)
-        // If refinement is needed, we would reuse `model` here.
-        // For strict parity with the prompt's request to "refactor architecture", I will assume Direct DOM for lists
-        // is efficient enough, or if refinement is needed, we utilize the *resident 2B model*.
-        
-        let payload = json!({ 
-            "task_id": task.id, "category": "List Processing", "summary": "Extracting list data...", "spinner": "⠋"
-        });
-        let _ = app_handle.emit("extraction-progress", &payload);
+        // [LIST MODE] Direct DOM Extraction
+        log_task_progress(app_handle, &task.id, &json!({ "category": "List Processing", "summary": "Extracting list data..." }));
 
         let mut all_extracted_items = Vec::new();
         {
@@ -726,6 +742,8 @@ async fn process_task(
             if !has_snapshot {
                 // 1. [0.6B] Bake Detail Context
                 println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
+                
                 model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
                 let model_clone = model.clone();
                 let question_clone = task_question.clone();
@@ -767,6 +785,8 @@ async fn process_task(
                 // 3. 2B Instant Inference
                 if let Some(gen) = model.generator.lock().await.as_mut() {
                     println!("[Scheduler] 2B Step C: Asking extraction question...");
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
+                    
                     let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
@@ -784,6 +804,7 @@ async fn process_task(
     // --- PHASE 3: HANDOVER (Unload 2B -> Load Embedding) ---
     {
         println!("[Scheduler] PHASE 3: Handover - Unloading 2B, Preparing for Embedding...");
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
         // 1. Explicitly Unload 2B to free VRAM for Embedding Model
         model.unload_generator().await;
@@ -817,10 +838,7 @@ async fn process_task(
         obj.insert("id".to_string(), json!(generated_id));
     }
 
-    let payload = json!({ 
-        "task_id": task.id, "category": "Saving", "summary": "Syncing to database...", "spinner": "⠋"
-    });
-    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
 
     // [SIDE EFFECTS & UPSERT]
     // Re-acquire Store for final ops

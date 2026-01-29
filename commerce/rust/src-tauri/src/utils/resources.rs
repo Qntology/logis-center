@@ -49,7 +49,7 @@ pub fn set_current_thread_low_priority() {
     }
 }
 
-pub fn get_optimal_thread_config() -> ThreadConfig {
+pub fn get_optimal_thread_config(is_cpu_mode: bool) -> ThreadConfig {
     let mut sys = SYSTEM_MONITOR.lock().unwrap();
     
     // 1. Refresh CPU stats
@@ -61,7 +61,7 @@ pub fn get_optimal_thread_config() -> ThreadConfig {
     
     // 3. Check GPU status
     let nvml = Nvml::init().ok();
-    let has_gpu = nvml.is_some();
+    let has_gpu = nvml.is_some() && !is_cpu_mode; // If forced CPU, treat as if no GPU for logging
     
     // --- ORGANIC DECISION LOGIC ---
     let (threads, mode) = if has_gpu {

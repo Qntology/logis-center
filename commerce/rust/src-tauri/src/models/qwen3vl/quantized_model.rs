@@ -836,6 +836,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub mrope_section: Vec<usize>,
     pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
     pub baking_only: bool, // [NEW] Skip MLP for KV baking
+    pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -850,6 +851,7 @@ impl QuantizedQwen3VLTextModel {
         kv_reserve: u64,
         baking_only: bool, // [NEW]
     ) -> Result<Self> {
+        let is_forced_cpu = device.is_cpu();
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
@@ -941,7 +943,7 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [ORGANIC] Dynamic Threading for Parallel Loading
-        let thread_config = crate::utils::resources::get_optimal_thread_config();
+        let thread_config = crate::utils::resources::get_optimal_thread_config(current_device.is_cpu());
         println!("[MODEL] Organic Loading: Using {} threads ({})", thread_config.thread_count, thread_config.description);
         
         let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_config.thread_count).build()?;
@@ -975,7 +977,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -988,6 +990,7 @@ impl QuantizedQwen3VLTextModel {
         kv_reserve: u64,
         baking_only: bool, // [NEW]
     ) -> Result<Self> {
+        let is_forced_cpu = device.is_cpu();
         // ... (previous logic)
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
@@ -1084,6 +1087,7 @@ impl QuantizedQwen3VLTextModel {
             mrope_section,
             mmap: None,
             baking_only,
+            is_forced_cpu,
         })
     }
 
@@ -1212,7 +1216,7 @@ impl QuantizedQwen3VLTextModel {
                 // Align to 2B dimensions (Head/Dim upscale)
                 let target_heads = layer.self_attn.num_key_value_heads;
                 let target_dim = layer.self_attn.head_dim;
-                let (_b, h, s, d) = k_small.dims4()?;
+                let (_b, h, _s, d) = k_small.dims4()?;
 
                 let mut k_aligned = if d < target_dim { Tensor::cat(&[&k_small, &k_small], D::Minus1)? } else { k_small };
                 let mut v_aligned = if d < target_dim { Tensor::cat(&[&v_small, &v_small], D::Minus1)? } else { v_small };
@@ -1334,6 +1338,8 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
+        if self.is_forced_cpu { return Ok(()); } // [FIX] Never move to GPU if user wants CPU
+        
         use nvml_wrapper::Nvml;
         
         // VRAM 체크 (NVML 사용)
