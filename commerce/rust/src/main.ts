@@ -1307,74 +1307,7 @@ function startPolling() {
     }, 3000);
 }
 
-function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: boolean = false) {
-    if (!chatTalks) return;
-    const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
-    const container = document.querySelector(".chat-container") as HTMLElement;
-    
-    const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
-    let existing = document.getElementById(msgId);
-    const isSystemTask = msg.role === "system_task";
-    const roleClass = msg.role === "user" ? "user" : "system";
-    
-    if (isSystemTask && !existing) {
-        systemLogCount++;
-        const countEl = document.querySelector('.system-label .count');
-        if (countEl) countEl.innerHTML = `(${systemLogCount})`;
-    }
-    
-    const statusMap: Record<number, { icon: string, text: string, color: string }> = { 1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 3: { icon: "🚫", text: "cancelled", color: "#666" }, 6: { icon: "❌", text: "error", color: "#ef4444" }, 9: { icon: "✅", text: "done", color: "#22c55e" }, 10: { icon: "📥", text: "pending", color: "#999" } };
-    const currentStatus = statusMap[msg.status] || statusMap[1];
-    const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    let displayHtml = "";
-    let itemData: any = null;
-    try { itemData = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch (e) { displayHtml = msg.content; }
-    if (itemData && typeof itemData === 'object') displayHtml = itemData.text || itemData.title || itemData.summary || JSON.stringify(itemData);
-    const htmlContent = `<div class="chat-message"><div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;"><span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span><span>${timeStr}</span></div><div class="content">${displayHtml}</div>${isSystemTask ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};"><span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}</div>` : ""}</div>`;
-    
-    if (existing) {
-        existing.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
-        existing.dataset.status = msg.status; existing.innerHTML = htmlContent;
-    } else {
-        const messageDiv = document.createElement("div"); 
-        messageDiv.id = msgId; 
-        messageDiv.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
-        messageDiv.dataset.taskId = msg.task_id || msg.id; 
-        messageDiv.dataset.status = msg.status; 
-        messageDiv.innerHTML = htmlContent;
-        
-        if (isSystemTask) {
-            messageDiv.style.cursor = "pointer";
-            messageDiv.onclick = async () => {
-                const taskId = messageDiv.dataset.taskId; const status = parseInt(messageDiv.dataset.status || "0");
-                if (status === 9 && taskId) showDetail(taskId);
-                else if (taskId) {
-                    openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; detailTitle.innerText = "Task Progress";
-                    const logArea = document.getElementById("extraction-log");
-                    if (logArea && logArea.dataset.activeTaskId !== taskId) {
-                        logArea.innerHTML = "<div style='padding:10px;'>📡 Loading task history...</div>"; logArea.dataset.activeTaskId = taskId;
-                        const logs = await invoke<any[]>("get_task_logs", { taskId }); logArea.innerHTML = ""; logs.forEach(l => renderProgressToUI(l));
-                    }
-                }
-            };
-        }
 
-        if (isPrepend) {
-            const topL = document.getElementById("chat-pull-top");
-            if (topL) topL.insertAdjacentElement('afterend', messageDiv);
-            else chatTalks.insertAdjacentElement('afterbegin', messageDiv);
-        } else {
-            const botL = document.getElementById("chat-pull-bottom");
-            if (botL) botL.insertAdjacentElement('beforebegin', messageDiv);
-            else chatTalks.insertAdjacentElement('beforeend', messageDiv);
-        }
-    }
-
-    if (shouldScroll && !existing && !isPrepend) {
-        currentY = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
-        updateTransform();
-    }
-}
 
 function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
 async function initSession() {
@@ -1666,15 +1599,124 @@ async function fetchChatHistory(reset: boolean = true, shouldSnap: boolean = tru
     if (reset) { 
         chatPage = 0; 
         chatHasMore = true; 
-        if (chatTalks) {
-            Array.from(chatTalks.children).forEach(el => {
-                if (el.classList.contains('chat-talk') || el.classList.contains('no-msg')) {
-                    el.remove();
-                }
-            });
-        }
+        // [SMART-UPDATE] Do not clear innerHTML here to allow Upsert/Diff logic to work on Refresh.
     } 
     await loadMoreChat(shouldSnap); 
+}
+
+interface ChatMessage {
+    id: string;
+    role: string;
+    text: string;
+    updated_at: number;
+    created_at: number;
+    status: number;
+    task_id?: string;
+    content?: string | any;
+}
+
+function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
+    if (!chatTalks) return;
+
+    // 1. Pre-process messages
+    // DB returns DESC (Newest -> Oldest).
+    // Log View (Newest at Top):
+    // - Prepend (Top Refresh): We want Newest at Top.
+    //   Input: [Newest, ..., Oldest].
+    //   Iterate ASC: [Oldest, ..., Newest].
+    //   Prepend Oldest. [Oldest, ...]
+    //   ...
+    //   Prepend Newest. [Newest, ..., Oldest, ...] -> Correct.
+    // - Append (Bottom Load): We want Oldest at Bottom.
+    //   Input: [Newer, ..., Older].
+    //   Iterate DESC: [Newer, ..., Older].
+    //   Append Newer. [..., Newer]
+    //   Append Older. [..., Newer, Older] -> Correct.
+    
+    let sortedBatch: ChatMessage[] = [];
+    if (mode === 'prepend') {
+        sortedBatch = [...messages].sort((a, b) => a.created_at - b.created_at); // ASC
+    } else {
+        sortedBatch = [...messages].sort((a, b) => b.created_at - a.created_at); // DESC
+    }
+
+    sortedBatch.forEach(msg => {
+        let textContent = "";
+        try {
+            const contentObj = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
+            textContent = contentObj.text || contentObj.title || contentObj.summary || JSON.stringify(contentObj);
+        } catch (e) { textContent = String(msg.content); }
+
+        const displayMsg: ChatMessage = { ...msg, text: textContent };
+        const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
+        const existingEl = document.getElementById(msgId);
+
+        if (existingEl) {
+            // [UPDATE] Diff Check
+            const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
+            const cachedStatus = parseInt(existingEl.dataset.status || "0");
+            
+            if (msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus) {
+                console.log(`[Chat] Updating ${msgId} (Status: ${cachedStatus} -> ${msg.status})`);
+                existingEl.outerHTML = createMessageHTML(displayMsg);
+                
+                const newEl = document.getElementById(msgId);
+                if (newEl) {
+                    newEl.classList.add("updated-flash");
+                    setTimeout(() => newEl.classList.remove("updated-flash"), 1000);
+                    if (displayMsg.role === "system_task") {
+                        newEl.onclick = () => handleTaskClick(newEl);
+                    }
+                }
+            }
+        } else {
+            // [INSERT] New Message
+            const temp = document.createElement('div');
+            temp.innerHTML = createMessageHTML(displayMsg);
+            const newEl = temp.firstElementChild as HTMLElement;
+            
+            if (displayMsg.role === "system_task") {
+                newEl.onclick = () => handleTaskClick(newEl);
+            }
+
+            if (mode === 'prepend') {
+                chatTalks.prepend(newEl);
+            } else {
+                chatTalks.appendChild(newEl);
+            }
+        }
+    });
+}
+
+function createMessageHTML(msg: ChatMessage) {
+    const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
+    const statusMap: Record<number, { icon: string, text: string, color: string }> = { 
+        1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 
+        2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 
+        3: { icon: "🚫", text: "cancelled", color: "#666" }, 
+        6: { icon: "❌", text: "error", color: "#ef4444" }, 
+        9: { icon: "✅", text: "done", color: "#22c55e" }, 
+        10: { icon: "📥", text: "pending", color: "#999" } 
+    };
+    const currentStatus = statusMap[msg.status] || statusMap[1];
+    const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const isSystemTask = msg.role === "system_task";
+    const roleClass = msg.role === "user" ? "user" : "system";
+
+    return `<div id="${msgId}" class="chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" 
+        data-task-id="${msg.task_id || msg.id}" 
+        data-status="${msg.status}" 
+        data-updated-at="${msg.updated_at || msg.created_at}"
+        style="${isSystemTask ? 'cursor:pointer;' : ''}">
+        <div class="chat-message">
+            <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
+                <span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span>
+                <span>${timeStr}</span>
+            </div>
+            <div class="content">${msg.text}</div>
+            ${isSystemTask ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};"><span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}</div>` : ""}
+        </div>
+    </div>`;
 }
 
 async function loadMoreChat(shouldSnap: boolean = true) {
@@ -1692,42 +1734,40 @@ async function loadMoreChat(shouldSnap: boolean = true) {
         else if (activeContext.bcc) sqlFilter = `bcc = '${activeContext.bcc}'`;
         else if (activeContext.cc) sqlFilter = `cc = '${activeContext.cc}'`;
         
-        const messages = await invoke<any[]>("get_chat_messages", { limit: pageSize, offset: chatPage * pageSize, filter: sqlFilter });
+        const limit = 10;
+        const offset = chatPage * limit;
+
+        const messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: sqlFilter });
         const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
         const container = document.querySelector(".chat-container") as HTMLElement;
 
         if (chatTalks) {
             if (messages && messages.length > 0) {
-                if (messages.length < pageSize) chatHasMore = false;
+                if (messages.length < limit) chatHasMore = false;
                 
-                // Sort chronologically for display
-                messages.sort((a, b) => a.created_at - b.created_at);
+                // [MODE] chatPage == 0 (Refresh/Top), chatPage > 0 (Load More/Bottom)
+                const mode = chatPage === 0 ? 'prepend' : 'append';
                 
-                const prevHeight = scrollEl.scrollHeight;
-                const isPrepend = chatPage > 0;
+                upsertChatMessages(messages, mode);
                 
-                messages.forEach(msg => renderMessage(msg, false, isPrepend));
-                chatPage++;
-
-                if (chatPage === 1 && shouldSnap) {
-                    currentY = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
-                    updateTransform();
-                } else if (isPrepend || (chatPage === 1 && !shouldSnap)) {
-                    if (isPrepend) {
-                        const addedHeight = scrollEl.scrollHeight - prevHeight;
-                        currentY += addedHeight;
-                    }
+                if (mode === 'append') chatPage++;
+                
+                if (mode === 'prepend' && shouldSnap) {
+                    currentY = 0; 
                     updateTransform();
                 }
             } else { 
                 chatHasMore = false; 
-                if (chatPage === 0) {
-                    chatTalks.querySelectorAll('.chat-talk, .no-msg').forEach(el => el.remove());
+                if (chatPage === 0 && chatTalks.querySelectorAll('.chat-talk').length === 0) {
+                    // Only show "No messages" if truly empty
                     chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
-                    if (!currentSession.email && currentTab === "settings") performQrAuth();
                 }
             }
-            if (!currentSession.email && currentTab === "settings" && chatPage <= 1) performQrAuth();
+            
+            // [FIX] Always show QR Auth if not logged in, regardless of message count
+            if (!currentSession.email && currentTab === "settings") {
+                performQrAuth();
+            }
         }
     } catch (e) { 
         console.error(e); 
