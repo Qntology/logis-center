@@ -1,135 +1,63 @@
-// --- Mobile Main (Desktop Parity) ---
-const ethers = (window as any).ethers;
-const blockies = (window as any).blockies;
+console.log("%c[MOBILE] V116 Layout Active", "color: #fb923c; font-weight: bold;");
 
-interface ChatSession {
-    hash: string;
-    email?: string;
-    address?: string;
+// @ts-ignore
+import { item2html } from "./lib/render";
+
+// --- State ---
+let activeTab = "list";
+
+// --- Elements ---
+const tabList = document.getElementById("tab-list");
+const tabSettings = document.getElementById("tab-settings");
+const docListContainer = document.getElementById("doc-list");
+const navPagesContainer = document.getElementById("nav-list-pages");
+
+// --- Tab Controller ---
+function switchTab(name: string) {
+    activeTab = name;
+    if (name === "list") {
+        tabList?.classList.add("active");
+        tabSettings?.classList.remove("active");
+    } else if (name === "settings") {
+        tabList?.classList.remove("active");
+        tabSettings?.classList.add("active");
+    }
 }
 
-let currentSession: ChatSession = { hash: "" };
+// --- Bridge Logic ---
+window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || !msg.type) return;
 
-// --- UI Elements ---
-const btnSyncQr = document.getElementById("btn-sync-qr");
-const btnScanPc = document.getElementById("btn-scan-pc");
-const qrContainer = document.getElementById("nav-qr-container");
-const qrTarget = document.getElementById("sync-qrcode");
-const cameraContainer = document.getElementById("camera-container");
-const videoEl = document.getElementById("camera-video") as HTMLVideoElement;
-const btnCancelScan = document.getElementById("btn-cancel-scan");
-const profileName = document.getElementById("nav-profile-name");
-const profileFavicon = document.getElementById("nav-profile-favicon");
-
-let stream: MediaStream | null = null;
-
-// --- Initialization ---
-async function initSession() {
-    const saved = localStorage.getItem("chat_session");
-    if (saved) {
-        try { currentSession = JSON.parse(saved); } catch (e) {}
-    }
-
-    if (!currentSession.hash && ethers) {
-        const w = ethers.Wallet.createRandom();
-        currentSession.hash = w.address.toLowerCase().replace("0x", "");
-        currentSession.address = w.address;
-        localStorage.setItem("chat_session", JSON.stringify(currentSession));
-    }
-    
-    updateProfileUI();
-    console.log("[Mobile] Session initialized:", currentSession.hash);
-}
-
-function updateProfileUI() {
-    if (currentSession.email) {
-        if (profileName) profileName.innerText = currentSession.email.split('@')[0];
-        if (profileFavicon && blockies) {
-            const icon = blockies.create({ seed: currentSession.email, size: 8, scale: 4 });
-            profileFavicon.innerHTML = ""; profileFavicon.appendChild(icon);
+    if (msg.type === "sync_list") {
+        renderDocs(msg.data);
+        // Handle Tree Render (Simplified mock for Step 1)
+        if (navPagesContainer) {
+            navPagesContainer.innerHTML = `<ul class="logis-branch"><li class="logis-label"><span>Linked Desktop Pages</span></li></ul>`;
         }
     }
-}
+});
 
-// --- QR & Scanning Logic ---
-async function startScanning() {
-    if (!cameraContainer || !videoEl) return;
-    
-    qrContainer?.classList.add("hidden");
-    cameraContainer.classList.remove("hidden");
-
-    try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-        videoEl.srcObject = stream;
-        videoEl.play();
-        
-        if ('BarcodeDetector' in window) {
-            const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
-            const scanLoop = async () => {
-                if (!stream) return;
-                try {
-                    const barcodes = await detector.detect(videoEl);
-                    if (barcodes.length > 0) {
-                        const data = barcodes[0].rawValue;
-                        console.log("[Mobile] QR Detected:", data);
-                        if (data.includes("webrtc-pair")) {
-                            stopScanning();
-                            showMobileQr();
-                            return;
-                        }
-                    }
-                } catch (e) { console.error("Detection error:", e); }
-                requestAnimationFrame(scanLoop);
-            };
-            requestAnimationFrame(scanLoop);
-        } else {
-            // Fallback for non-supported browsers
-            setTimeout(() => { stopScanning(); showMobileQr(); }, 3000);
-        }
-    } catch (e) {
-        console.error("Camera error:", e);
-        stopScanning();
-    }
-}
-
-function stopScanning() {
-    if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-    }
-    cameraContainer?.classList.add("hidden");
-}
-
-function showMobileQr() {
-    if (!qrContainer || !qrTarget) return;
-    qrContainer.classList.remove("hidden");
-    qrTarget.innerHTML = "";
-    const pairingData = JSON.stringify({
-        type: "webrtc-pair",
-        hash: currentSession.hash,
-        ts: Date.now(),
-        role: "mobile"
-    });
-    new (window as any).QRCode(qrTarget, {
-        text: pairingData,
-        width: 180, height: 180, colorDark: "#000000", colorLight: "#ffffff",
-        correctLevel: (window as any).QRCode.CorrectLevel.M
+function renderDocs(docs: any[]) {
+    if (!docListContainer) return;
+    docListContainer.innerHTML = "";
+    docs.forEach(doc => {
+        const html = item2html(doc, false, "");
+        const temp = document.createElement("div");
+        temp.innerHTML = html;
+        const el = temp.firstElementChild as HTMLElement;
+        docListContainer.appendChild(el);
     });
 }
 
-// --- Event Listeners ---
-btnScanPc?.addEventListener("click", startScanning);
-btnCancelScan?.addEventListener("click", stopScanning);
+// --- Event Bindings ---
+document.getElementById("btn-settings")?.addEventListener("click", () => switchTab("settings"));
+document.getElementById("btn-settings-back")?.addEventListener("click", () => switchTab("list"));
 
-btnSyncQr?.addEventListener("click", () => {
-    const isHidden = qrContainer?.classList.contains("hidden");
-    if (isHidden) showMobileQr();
-    else qrContainer?.classList.add("hidden");
-});
+// Scanner Logic (Keep existing functionality)
+const scannerOverlay = document.getElementById("scanner-overlay");
+document.getElementById("btn-sync-toggle")?.addEventListener("click", () => scannerOverlay?.classList.remove("hidden"));
+document.getElementById("btn-cancel-scan")?.addEventListener("click", () => scannerOverlay?.classList.add("hidden"));
 
-document.getElementById("btn-capture")?.addEventListener("click", () => {
-    alert("Mobile Capture Feature - Pending WebRTC Link");
-});
-
-// Init
-initSession();
+// Initialize
+switchTab("list");

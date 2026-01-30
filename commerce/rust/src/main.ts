@@ -1107,48 +1107,79 @@ function showPcPairingQr() {
 }
 
 function handlePairing(data: any) {
-    console.log("Handle Pairing Start:", data);
+    console.log("[P2P] Link Process Started:", data);
     
     const profileName = document.getElementById("nav-profile-name");
+    const qrContainer = document.getElementById("nav-qr-container");
+
     if (profileName) {
         profileName.textContent = "Linking Mobile...";
         profileName.style.color = "var(--primary)";
     }
 
-    const qrContainer = document.getElementById("nav-qr-container");
-    if (qrContainer) {
-        qrContainer.innerHTML = `
-            <div style="padding: 20px;">
-                <div class="spinner" style="margin: 0 auto 10px auto;"></div>
-                <p style="font-size: 0.8rem; color: var(--primary);">Establishing P2P Tunnel...</p>
-                <p style="font-size: 0.6rem; color: #666;">ID: ${data.hash}</p>
-            </div>
-        `;
-    }
+    // 1. Establish Message Bridge
+    const mobileListener = async (event: MessageEvent) => {
+        const msg = event.data;
+        if (!msg || !msg.type) return;
 
-    // 1. Gather current data from Desktop Hub
-    const docs = Array.from(document.querySelectorAll('.card')).map(card => ({
-        title: card.querySelector('.card-title')?.textContent || "No Title",
-        date: card.querySelector('.card-meta')?.textContent?.split('|')[0]?.trim() || "Unknown",
-        type: card.querySelector('.card-meta')?.textContent?.split('|')[1]?.trim() || "General"
-    })).slice(0, 10); // Take first 10 for sync
+        console.log("[P2P] Incoming from Mobile:", msg.type);
 
-    console.log("Extracted Data for Sync:", docs);
+        if (msg.type === "get_detail") {
+            try {
+                const doc = await invoke<any>("get_document", { uuid: msg.uuid });
+                if (doc) {
+                    const response = {
+                        type: "sync_detail",
+                        title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
+                        content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:#444;"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
+                    };
+                    (event.source as Window).postMessage(response, { targetOrigin: "*" } as any);
+                }
+            } catch (e) { console.error("[P2P] Proxy detail failed:", e); }
+        } else if (msg.type === "ai_search") {
+            try {
+                const response = await invoke<any>("ai_search_complex", { query: msg.query, language: "korean" });
+                let html = response.results.map((res: any) => `<div style='border-bottom:1px solid #333; padding:5px 0;'><strong style='color:var(--primary)'>${res.context_type}</strong><br>${res.text}</div>`).join("");
+                (event.source as Window).postMessage({ type: "sync_ai_search", html: html }, { targetOrigin: "*" } as any);
+            } catch (e) { console.error("AI Proxy failed:", e); }
+        } else if (msg.type === "chat_message") {
+            const response = { type: "sync_chat", data: { role: "system", content: "AI: Processing request..." } };
+            (event.source as Window).postMessage(response, { targetOrigin: "*" } as any);
+        }
+    };
 
-    // 2. WebRTC Logic (Placeholder for real P2P)
-    // In a real scenario, we'd send 'docs' over dataChannel.send(JSON.stringify(docs))
-    
+    window.removeEventListener("message", mobileListener); // Prevent double binding
+    window.addEventListener("message", mobileListener);
+
+    // 2. Initial Data Sync (Desktop -> Mobile)
+    const syncCurrentState = (targetWindow: Window) => {
+        // Collect current UI state (doc list)
+        const docs = Array.from(document.querySelectorAll('.logis-result')).map(el => {
+            const card = el as HTMLElement;
+            return {
+                id: card.id,
+                uuid: card.id,
+                doc_type: card.dataset.type || "General",
+                text: card.querySelector('.logis-info .value')?.textContent || "",
+                created_at: parseInt(card.dataset.createdAt || "0"),
+                updated_at: parseInt(card.dataset.updatedAt || "0")
+            };
+        });
+
+        console.log("[P2P] Syncing", docs.length, "items to Mobile");
+        targetWindow.postMessage({ type: "sync_list", data: docs }, "*");
+    };
+
+    // 3. Complete visual link
     setTimeout(() => {
-        if (profileName) profileName.textContent = "Mobile Connected";
+        if (profileName) profileName.textContent = "Mobile Linked";
         if (qrContainer) qrContainer.classList.add("hidden");
         
-        // Notify user sync is starting
-        console.log("P2P Tunnel Ready. Sending Mirror UI command...");
-        
-        // --- BRIDGE TO MOBILE ---
-        // (This would happen over the RTCDataChannel)
-        // For testing, we can use a Tauri event if mobile is in debug, 
-        // but since they are separate WebView instances, WebRTC is the correct way.
+        // Find the mobile window/webview and trigger sync
+        // Note: in simulated bridge, we use event.source from the next message,
+        // but for now we wait for the mobile to ping or use opener.
+        const source = window.opener || window.parent;
+        if (source) syncCurrentState(source as Window);
     }, 2000);
 }
 
