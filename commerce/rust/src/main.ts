@@ -1106,82 +1106,126 @@ function showPcPairingQr() {
     });
 }
 
-function handlePairing(data: any) {
-    console.log("[P2P] Link Process Started:", data);
+let peerConn: RTCPeerConnection | null = null;
+let dataChannel: RTCDataChannel | null = null;
+
+async function handlePairing(data: any) {
+    console.log("[WebRTC] Initializing P2P Link with Hash:", data.hash);
     
     const profileName = document.getElementById("nav-profile-name");
-    const qrContainer = document.getElementById("nav-qr-container");
-
     if (profileName) {
-        profileName.textContent = "Linking Mobile...";
+        profileName.textContent = "Negotiating P2P...";
         profileName.style.color = "var(--primary)";
     }
 
-    // 1. Establish Message Bridge
-    const mobileListener = async (event: MessageEvent) => {
-        const msg = event.data;
-        if (!msg || !msg.type) return;
+    // 1. Initialize PeerConnection
+    peerConn = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
 
-        console.log("[P2P] Incoming from Mobile:", msg.type);
+    // 2. Create Data Channel
+    dataChannel = peerConn.createDataChannel("logis-sync");
+    setupDataChannel(dataChannel);
 
-        if (msg.type === "get_detail") {
-            try {
-                const doc = await invoke<any>("get_document", { uuid: msg.uuid });
-                if (doc) {
-                    const response = {
-                        type: "sync_detail",
-                        title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
-                        content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:#444;"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
-                    };
-                    (event.source as Window).postMessage(response, { targetOrigin: "*" } as any);
-                }
-            } catch (e) { console.error("[P2P] Proxy detail failed:", e); }
-        } else if (msg.type === "ai_search") {
-            try {
-                const response = await invoke<any>("ai_search_complex", { query: msg.query, language: "korean" });
-                let html = response.results.map((res: any) => `<div style='border-bottom:1px solid #333; padding:5px 0;'><strong style='color:var(--primary)'>${res.context_type}</strong><br>${res.text}</div>`).join("");
-                (event.source as Window).postMessage({ type: "sync_ai_search", html: html }, { targetOrigin: "*" } as any);
-            } catch (e) { console.error("AI Proxy failed:", e); }
-        } else if (msg.type === "chat_message") {
-            const response = { type: "sync_chat", data: { role: "system", content: "AI: Processing request..." } };
-            (event.source as Window).postMessage(response, { targetOrigin: "*" } as any);
+    // 3. ICE Candidate Handling
+    peerConn.onicecandidate = (e) => {
+        if (e.candidate) {
+            sendSignalingMessage(data.hash, { type: "ice", candidate: e.candidate });
         }
     };
 
-    window.removeEventListener("message", mobileListener); // Prevent double binding
-    window.addEventListener("message", mobileListener);
-
-    // 2. Initial Data Sync (Desktop -> Mobile)
-    const syncCurrentState = (targetWindow: Window) => {
-        // Collect current UI state (doc list)
-        const docs = Array.from(document.querySelectorAll('.logis-result')).map(el => {
-            const card = el as HTMLElement;
-            return {
-                id: card.id,
-                uuid: card.id,
-                doc_type: card.dataset.type || "General",
-                text: card.querySelector('.logis-info .value')?.textContent || "",
-                created_at: parseInt(card.dataset.createdAt || "0"),
-                updated_at: parseInt(card.dataset.updatedAt || "0")
-            };
-        });
-
-        console.log("[P2P] Syncing", docs.length, "items to Mobile");
-        targetWindow.postMessage({ type: "sync_list", data: docs }, "*");
-    };
-
-    // 3. Complete visual link
-    setTimeout(() => {
-        if (profileName) profileName.textContent = "Mobile Linked";
-        if (qrContainer) qrContainer.classList.add("hidden");
+    // 4. Create and Send Offer
+    try {
+        const offer = await peerConn.createOffer();
+        await peerConn.setLocalDescription(offer);
+        await sendSignalingMessage(data.hash, { type: "offer", sdp: offer });
+        console.log("[WebRTC] Offer sent. Waiting for Mobile...");
         
-        // Find the mobile window/webview and trigger sync
-        // Note: in simulated bridge, we use event.source from the next message,
-        // but for now we wait for the mobile to ping or use opener.
-        const source = window.opener || window.parent;
-        if (source) syncCurrentState(source as Window);
-    }, 2000);
+        // Hide QR view
+        const qrContainer = document.getElementById("nav-qr-container");
+        if (qrContainer) {
+            qrContainer.innerHTML = `
+                <div style="padding: 20px; text-align: center;">
+                    <div class="spinner" style="margin: 0 auto 10px;"></div>
+                    <p style="font-size: 0.8rem; color: var(--primary);">Establishing secure tunnel...</p>
+                </div>
+            `;
+        }
+
+        startSignalingPoll(data.hash);
+    } catch (e) { console.error("[WebRTC] Offer failed:", e); }
 }
+
+function setupDataChannel(channel: RTCDataChannel) {
+    channel.onopen = () => {
+        console.log("[WebRTC] Channel OPEN!");
+        const profileName = document.getElementById("nav-profile-name");
+        if (profileName) {
+            profileName.textContent = "Mobile Linked (P2P)";
+            profileName.style.color = "#4ade80";
+        }
+        document.getElementById("nav-qr-container")?.classList.add("hidden");
+        syncDataToMobile();
+    };
+    channel.onmessage = async (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "get_detail") {
+            const doc = await (window as any).invoke("get_document", { uuid: msg.uuid });
+            if (doc && dataChannel?.readyState === "open") {
+                dataChannel.send(JSON.stringify({
+                    type: "sync_detail",
+                    title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
+                    content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
+                }));
+            }
+        } else if (msg.type === "chat_message") {
+            // Echo
+            dataChannel?.send(JSON.stringify({ type: "sync_chat", data: { role: "system", content: "AI (Hub): Received " + msg.content } }));
+        }
+    };
+}
+
+async function sendSignalingMessage(hash: string, payload: any) {
+    try {
+        await (window as any).invoke("proxy_fetch", {
+            url: `${API_HOST}/relay/${hash}`,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+    } catch (e) {}
+}
+
+function startSignalingPoll(hash: string) {
+    const poll = async () => {
+        if (peerConn?.remoteDescription) return;
+        try {
+            const data = await (window as any).invoke("proxy_fetch", { url: `${API_HOST}/relay/${hash}`, method: "GET" });
+            if (data.type === "answer") {
+                await peerConn?.setRemoteDescription(new RTCSessionDescription(data.sdp));
+            } else if (data.type === "ice") {
+                await peerConn?.addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
+        } catch (e) {}
+        setTimeout(poll, 2000);
+    };
+    poll();
+}
+
+const syncDataToMobile = () => {
+    if (!dataChannel || dataChannel.readyState !== "open") return;
+    const docs = Array.from(document.querySelectorAll('.logis-result')).map(el => {
+        const card = el as HTMLElement;
+        return {
+            id: card.id, uuid: card.id,
+            doc_type: card.dataset.type || "General",
+            text: card.querySelector('.logis-info .value')?.textContent || "",
+            created_at: parseInt(card.dataset.createdAt || "0"),
+            updated_at: parseInt(card.dataset.updatedAt || "0")
+        };
+    });
+    dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
+};
 
 let desktopStream: MediaStream | null = null;
 
