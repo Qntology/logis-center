@@ -1,0 +1,10 @@
+/src/main/java/com/logis/scanner/v110/generated
+
+# .so 파일은 크기가 너무 커서 Git에서 제외합니다. 
+# 필요 시 install_mobile.ps1 스크립트를 통해 로컬에서 생성/복사하여 사용하세요.
+/src/main/jniLibs/**/*.so
+
+/src/main/assets/tauri.conf.json
+/tauri.build.gradle.kts
+/proguard-tauri.pro
+/tauri.properties

@@ -1,3 +1,5 @@
+import "../styles.css";
+
 console.log("[MOBILE] V126 Logic Start");
 
 const logPanel = document.getElementById("log-panel");

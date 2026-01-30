@@ -1120,7 +1120,7 @@ async function handlePairing(data: any) {
 
     // 1. Initialize PeerConnection
     peerConn = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        iceServers: [] // STUN 서버 없이 로컬 WiFi망만 사용
     });
 
     // 2. Create Data Channel
