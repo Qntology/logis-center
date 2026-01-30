@@ -1570,7 +1570,7 @@ function initChatPullLogic() {
         if (loopId) return;
         const tick = () => {
             const now = Date.now();
-            if (pushStartTime !== 0 && now - pushStartTime >= 5000 && pullY === 0) {
+            if (pushStartTime !== 0 && now - pushStartTime >= 1000 && pullY === 0) {
                 const dir = pushDir;
                 if (dir) {
                     pullY = dir === 'top' ? TRIGGER_THRESHOLD : -TRIGGER_THRESHOLD;
@@ -1602,7 +1602,7 @@ function initChatPullLogic() {
                     pushStartTime = Date.now();
                 }
                 startAnimationLoop(); 
-                if (Date.now() - pushStartTime < 5000) return; 
+                if (Date.now() - pushStartTime < 1000) return; 
             }
 
             pullY -= delta * FRICTION;
