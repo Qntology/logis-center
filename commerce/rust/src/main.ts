@@ -115,6 +115,7 @@ const docListContainer = document.getElementById("doc-list") as HTMLElement;
 
 const listRefreshBtn = document.getElementById("list-refresh-btn") as HTMLButtonElement;
 const btnDeleteSelected = document.getElementById("btn-delete-selected") as HTMLButtonElement;
+const btnSyncQr = document.getElementById("btn-sync-qr") as HTMLButtonElement;
 const listScrollContainer = document.getElementById("list-scroll-container") as HTMLElement;
 const loadingIndicator = document.getElementById("loading-indicator") as HTMLElement;
 
@@ -1055,6 +1056,108 @@ btnDeleteSelected?.addEventListener("click", async () => {
         try { await invoke("delete_documents", { uuids: Array.from(selectedUuids) }); refreshList(); } catch (e) { console.error(e); }
     }
 });
+
+btnSyncQr?.addEventListener("click", async () => {
+    const qrContainer = document.getElementById("nav-qr-container");
+    const qrTarget = document.getElementById("sync-qrcode");
+    const navOverlay = document.getElementById("nav-categories");
+
+    if (!qrContainer || !qrTarget || !navOverlay) return;
+
+    if (navOverlay.classList.contains("hidden")) {
+        handleSearchInteraction();
+    }
+
+    const isHidden = qrContainer.classList.contains("hidden");
+    if (isHidden) {
+        qrContainer.classList.remove("hidden");
+        showPcPairingQr();
+        listCurrentY = 0;
+        updateListTransform(true);
+    } else {
+        qrContainer.classList.add("hidden");
+        stopDesktopCamera();
+    }
+});
+
+function showPcPairingQr() {
+    const qrTarget = document.getElementById("sync-qrcode");
+    const pcView = document.getElementById("pc-qr-view");
+    const mobileView = document.getElementById("mobile-scan-view");
+    
+    if (!qrTarget || !pcView || !mobileView) return;
+    
+    pcView.classList.remove("hidden");
+    mobileView.classList.add("hidden");
+    stopDesktopCamera();
+
+    qrTarget.innerHTML = "";
+    const pairingData = JSON.stringify({
+        type: "webrtc-pair",
+        hash: currentSession.hash,
+        ts: Date.now(),
+        role: "pc"
+    });
+    
+    new (window as any).QRCode(qrTarget, {
+        text: pairingData,
+        width: 180, height: 180, colorDark: "#000000", colorLight: "#ffffff",
+        correctLevel: (window as any).QRCode.CorrectLevel.M
+    });
+}
+
+let desktopStream: MediaStream | null = null;
+
+async function startMobileScanning() {
+    const pcView = document.getElementById("pc-qr-view");
+    const mobileView = document.getElementById("mobile-scan-view");
+    const videoEl = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+
+    if (!pcView || !mobileView || !videoEl) return;
+
+    pcView.classList.add("hidden");
+    mobileView.classList.remove("hidden");
+
+    try {
+        desktopStream = await navigator.mediaDevices.getUserMedia({ video: true });
+        videoEl.srcObject = desktopStream;
+        videoEl.play();
+
+        if ('BarcodeDetector' in window) {
+            const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
+            const scanLoop = async () => {
+                if (!desktopStream) return;
+                const barcodes = await detector.detect(videoEl);
+                if (barcodes.length > 0) {
+                    const data = barcodes[0].rawValue;
+                    console.log("[PC] Mobile QR Detected:", data);
+                    const parsed = JSON.parse(data);
+                    if (parsed.type === "webrtc-pair" && parsed.role === "mobile") {
+                        alert("Pairing request received from: " + parsed.hash);
+                        stopDesktopCamera();
+                        // Next: Start WebRTC Signaling with this hash
+                        return;
+                    }
+                }
+                requestAnimationFrame(scanLoop);
+            };
+            requestAnimationFrame(scanLoop);
+        }
+    } catch (e) {
+        alert("Camera error: " + e);
+        showPcPairingQr();
+    }
+}
+
+function stopDesktopCamera() {
+    if (desktopStream) {
+        desktopStream.getTracks().forEach(track => track.stop());
+        desktopStream = null;
+    }
+}
+
+document.getElementById("btn-switch-to-camera")?.addEventListener("click", startMobileScanning);
+document.getElementById("btn-switch-to-qr")?.addEventListener("click", showPcPairingQr);
 
 btnDetailDelete?.addEventListener("click", async () => {
     console.log("[WIDGET] Delete button clicked. UUID:", currentDetailUuid);

@@ -55,6 +55,7 @@
                     <h2>Results</h2>
                  </div>
                  <div style="display:flex; gap:5px;">
+                    <button id="btn-sync-qr" class="nav-btn" title="Sync with Mobile">📱</button>
                     <button id="btn-delete-selected" class="nav-btn" style="display:none; color: #ef4444;" title="Delete Selected">🗑️ All</button>
                     <button id="list-refresh-btn" class="nav-btn" title="Refresh">🔄</button>
                  </div>
@@ -68,9 +69,27 @@
 
                     <!-- Navigation Categories (Users + Pages Tree) -->
                     <div id="nav-categories" class="nav-categories hidden" style="margin-bottom: 20px; padding-bottom: 10px;">
+                        <!-- Pairing Section -->
+                        <div id="nav-qr-container" class="hidden" style="margin-bottom: 15px; padding: 15px; background: #1a1a1a; border-radius: 8px; text-align: center;">
+                            <!-- State 1: Show PC QR -->
+                            <div id="pc-qr-view">
+                                <div id="sync-qrcode" style="display: inline-block; padding: 10px; background: white; border-radius: 4px;"></div>
+                                <p style="font-size: 0.75rem; color: #aaa; margin-top: 10px;">1. Scan with Mobile</p>
+                                <button id="btn-switch-to-camera" class="link-btn" style="color: var(--primary); margin-top: 5px;">Already scanned? Scan Mobile QR instead</button>
+                            </div>
+                            <!-- State 2: Scan Mobile QR -->
+                            <div id="mobile-scan-view" class="hidden">
+                                <div style="position: relative; width: 180px; height: 180px; background: #000; margin: 0 auto; border-radius: 8px; overflow: hidden; border: 2px solid var(--primary);">
+                                    <video id="desktop-camera-video" style="width: 100%; height: 100%; object-fit: cover;"></video>
+                                </div>
+                                <p style="font-size: 0.75rem; color: #aaa; margin-top: 10px;">2. Scan Mobile's Answer QR</p>
+                                <button id="btn-switch-to-qr" class="link-btn" style="color: #666; margin-top: 5px;">Back to PC QR</button>
+                            </div>
+                        </div>
+
                         <!-- Profile Section -->
                         <div class="nav-profile" style="margin-bottom: 15px;">
-                            <div class="profile-card" style="display:flex; align-items:center; gap:10px; background:#1a1a1a; padding:10px; border-radius:8px;">
+                            <div class="profile-card" style="display:flex; align-items:center; gap:10px; background:#1a1a1a; padding:10px;">
                                 <div class="profile-favicon" id="nav-profile-favicon" style="width:32px; height:32px; background:#333; border-radius:4px;"></div>
                                 <div class="profile-info">
                                     <strong id="nav-profile-name" style="font-size:0.9rem;">Sign In</strong>
