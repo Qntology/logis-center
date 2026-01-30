@@ -1307,17 +1307,22 @@ function startPolling() {
     }, 3000);
 }
 
-function renderMessage(msg: any, shouldScroll: boolean = true) {
+function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: boolean = false) {
     if (!chatTalks) return;
+    const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
+    const container = document.querySelector(".chat-container") as HTMLElement;
+    
     const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
     let existing = document.getElementById(msgId);
     const isSystemTask = msg.role === "system_task";
     const roleClass = msg.role === "user" ? "user" : "system";
+    
     if (isSystemTask && !existing) {
         systemLogCount++;
         const countEl = document.querySelector('.system-label .count');
         if (countEl) countEl.innerHTML = `(${systemLogCount})`;
     }
+    
     const statusMap: Record<number, { icon: string, text: string, color: string }> = { 1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 3: { icon: "🚫", text: "cancelled", color: "#666" }, 6: { icon: "❌", text: "error", color: "#ef4444" }, 9: { icon: "✅", text: "done", color: "#22c55e" }, 10: { icon: "📥", text: "pending", color: "#999" } };
     const currentStatus = statusMap[msg.status] || statusMap[1];
     const timeStr = new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -1326,12 +1331,18 @@ function renderMessage(msg: any, shouldScroll: boolean = true) {
     try { itemData = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content; } catch (e) { displayHtml = msg.content; }
     if (itemData && typeof itemData === 'object') displayHtml = itemData.text || itemData.title || itemData.summary || JSON.stringify(itemData);
     const htmlContent = `<div class="chat-message"><div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;"><span>${msg.role === 'user' ? '@YOU' : '🤖 LOGIS AI'}</span><span>${timeStr}</span></div><div class="content">${displayHtml}</div>${isSystemTask ? `<div class="status-bar" style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.1); font-size:0.65rem; font-weight:bold; color:${currentStatus.color};"><span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text.toUpperCase()}</div>` : ""}</div>`;
+    
     if (existing) {
         existing.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
         existing.dataset.status = msg.status; existing.innerHTML = htmlContent;
     } else {
-        const messageDiv = document.createElement("div"); messageDiv.id = msgId; messageDiv.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
-        messageDiv.dataset.taskId = msg.task_id || msg.id; messageDiv.dataset.status = msg.status; messageDiv.innerHTML = htmlContent;
+        const messageDiv = document.createElement("div"); 
+        messageDiv.id = msgId; 
+        messageDiv.className = `chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}`;
+        messageDiv.dataset.taskId = msg.task_id || msg.id; 
+        messageDiv.dataset.status = msg.status; 
+        messageDiv.innerHTML = htmlContent;
+        
         if (isSystemTask) {
             messageDiv.style.cursor = "pointer";
             messageDiv.onclick = async () => {
@@ -1347,10 +1358,22 @@ function renderMessage(msg: any, shouldScroll: boolean = true) {
                 }
             };
         }
-        chatTalks.insertAdjacentElement('beforeend', messageDiv);
+
+        if (isPrepend) {
+            const topL = document.getElementById("chat-pull-top");
+            if (topL) topL.insertAdjacentElement('afterend', messageDiv);
+            else chatTalks.insertAdjacentElement('afterbegin', messageDiv);
+        } else {
+            const botL = document.getElementById("chat-pull-bottom");
+            if (botL) botL.insertAdjacentElement('beforebegin', messageDiv);
+            else chatTalks.insertAdjacentElement('beforeend', messageDiv);
+        }
     }
-    const scroll = document.getElementById("chat-scroll"); 
-    if (scroll && shouldScroll && !existing) scroll.scrollTop = scroll.scrollHeight;
+
+    if (shouldScroll && !existing && !isPrepend) {
+        currentY = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+        updateTransform();
+    }
 }
 
 function saveSession() { localStorage.setItem("chat_session", JSON.stringify(currentSession)); }
@@ -1446,9 +1469,60 @@ async function initDevicePreference() {
 let currentY = 0; // Standard scroll position (positive)
 let pullY = 0;    // Pull distance (positive for top, negative for bottom)
 let pullTimer: number | null = null;
+let pushStartTime = 0; // [NEW] Track hold time
+let pushDir: 'top' | 'bottom' | null = null; 
 const PULL_THRESHOLD = 50;
 const PULL_MAX = 90;
 const FRICTION = 0.3;
+const TRIGGER_THRESHOLD = 50; 
+
+function updateTransform(resetting: boolean = false) {
+    const scrollEl = document.getElementById("chat-scroll");
+    const container = document.querySelector(".chat-container") as HTMLElement;
+    const topLoader = document.getElementById("chat-pull-top");
+    const bottomLoader = document.getElementById("chat-pull-bottom");
+    
+    if (!scrollEl || !container || !topLoader || !bottomLoader) return;
+
+    if (resetting) scrollEl.classList.add("resetting");
+    else scrollEl.classList.remove("resetting");
+
+    let effectiveOffset = pullY;
+    if (pullY === 0 && pushStartTime !== 0) {
+        const pushElapsed = Date.now() - pushStartTime;
+        if (pushElapsed > 50) { 
+            effectiveOffset = pushDir === 'top' ? 50 : -50; // Full 50px peek to show loader
+        }
+    }
+
+    scrollEl.style.transform = `translateY(${-currentY + effectiveOffset}px)`;
+
+    const loader = effectiveOffset !== 0 ? (effectiveOffset > 0 ? topLoader : bottomLoader) : null;
+    
+    if (loader) {
+        loader.classList.add("visible");
+        const absPull = Math.abs(effectiveOffset);
+        loader.style.opacity = "1";
+        
+        if (absPull >= PULL_THRESHOLD) (loader as HTMLElement).classList.add("ready");
+        else (loader as HTMLElement).classList.remove("ready");
+
+        const spinner = (loader as HTMLElement).querySelector('.spinner') as HTMLElement;
+        if (spinner) {
+            const frameIndex = Math.floor(Date.now() / 80) % spinnerFrames.length;
+            spinner.innerText = spinnerFrames[frameIndex];
+        }
+    } else {
+        [topLoader, bottomLoader].forEach(el => {
+            if (el) {
+                el.classList.remove("visible", "ready");
+                (el as HTMLElement).style.opacity = "0";
+                const s = el.querySelector('.spinner') as HTMLElement;
+                if (s && !el.classList.contains("loading")) s.innerText = "";
+            }
+        });
+    }
+}
 
 function initChatPullLogic() {
     const container = document.querySelector(".chat-container") as HTMLElement;
@@ -1458,79 +1532,13 @@ function initChatPullLogic() {
     
     if (!container || !scrollEl || !topLoader || !bottomLoader) return;
 
-    const updateTransform = (resetting: boolean = false) => {
-        if (resetting) scrollEl.classList.add("resetting");
-        else scrollEl.classList.remove("resetting");
-
-        scrollEl.style.transform = `translateY(${-currentY + pullY}px)`;
-
-        const loader = pullY > 0 ? topLoader : (pullY < 0 ? bottomLoader : null);
-        
-        if (pullY !== 0 && loader) {
-            loader.classList.add("visible");
-            const absPull = Math.abs(pullY);
-            loader.style.opacity = Math.min(1, absPull / 20).toString();
-            
-            if (absPull >= PULL_THRESHOLD) loader.classList.add("ready");
-            else loader.classList.remove("ready");
-
-            // [DYNAMIC SPINNER] Rotate based on distance when pulling, auto-animate when loading
-            const spinner = loader.querySelector('.spinner') as HTMLElement;
-            if (spinner && !loader.classList.contains("loading")) {
-                const frameIndex = Math.floor(absPull / 5) % spinnerFrames.length;
-                spinner.innerText = spinnerFrames[frameIndex];
-                spinner.style.opacity = Math.min(1, absPull / PULL_THRESHOLD).toString();
-            }
-        } else {
-            topLoader.classList.remove("visible", "ready");
-            bottomLoader.classList.remove("visible", "ready");
-            topLoader.style.opacity = "0";
-            bottomLoader.style.opacity = "0";
-            // Clear text to stop visual rotation
-            const s1 = topLoader.querySelector('.spinner') as HTMLElement;
-            const s2 = bottomLoader.querySelector('.spinner') as HTMLElement;
-            if (s1 && !topLoader.classList.contains("loading")) s1.innerText = "";
-            if (s2 && !bottomLoader.classList.contains("loading")) s2.innerText = "";
-        }
-    };
-
-    const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
-
-    const handleDelta = (delta: number) => {
-        if (isChatLoading) return; // [BLOCK] No pulling while loading
-        
-        const maxScroll = getMaxScroll();
-
-        // 1. Pulling Logic
-        if (pullY !== 0 || (currentY <= 0 && delta < 0) || (currentY >= maxScroll && delta > 0)) {
-            pullY -= delta * FRICTION;
-            if (pullY > PULL_MAX) pullY = PULL_MAX;
-            if (pullY < -PULL_MAX) pullY = -PULL_MAX;
-            if ((pullY < 0 && currentY <= 0) || (pullY > 0 && currentY >= maxScroll)) pullY = 0;
-        } 
-        // 2. Normal Scrolling
-        else {
-            currentY += delta;
-            if (currentY < 0) {
-                const leftover = currentY;
-                currentY = 0;
-                pullY = -leftover * FRICTION;
-            } else if (currentY > maxScroll) {
-                const leftover = currentY - maxScroll;
-                currentY = maxScroll;
-                pullY = -leftover * FRICTION;
-            }
-
-            // [INFINITE SCROLL] Auto-load when near bottom
-            if (!isChatLoading && chatHasMore && currentY >= maxScroll - 100) {
-                loadMoreChat();
-            }
-        }
-        updateTransform();
-    };
+    let loopId: number | null = null;
+    let lastTouchY = 0;
 
     const resetPull = () => {
         pullY = 0;
+        pushStartTime = 0;
+        pushDir = null;
         updateTransform(true);
         setTimeout(() => {
             scrollEl.classList.remove("resetting");
@@ -1544,49 +1552,107 @@ function initChatPullLogic() {
         const loader = dir === 'top' ? topLoader : bottomLoader;
         loader.classList.add("loading");
         
-        // Hold pull position
         pullY = dir === 'top' ? 40 : -40;
+        pushStartTime = 0;
         updateTransform(true);
 
-        if (dir === 'top') await fetchChatHistory(true);
-        else await loadMoreChat();
+        if (dir === 'top') {
+            await syncData();
+            await fetchChatHistory(true, false); // Refresh but stay at top
+        } else {
+            await loadMoreChat(true); // Snap to bottom for load more
+        }
 
         resetPull();
     };
 
-    // 1. Wheel
+    const startAnimationLoop = () => {
+        if (loopId) return;
+        const tick = () => {
+            const now = Date.now();
+            if (pushStartTime !== 0 && now - pushStartTime >= 5000 && pullY === 0) {
+                const dir = pushDir;
+                if (dir) {
+                    pullY = dir === 'top' ? TRIGGER_THRESHOLD : -TRIGGER_THRESHOLD;
+                    triggerAction(dir);
+                }
+            }
+            updateTransform();
+            if (pullY !== 0 || pushStartTime !== 0 || isChatLoading) {
+                loopId = requestAnimationFrame(tick);
+            } else {
+                loopId = null;
+            }
+        };
+        loopId = requestAnimationFrame(tick);
+    };
+
+    const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+
+    const handleDelta = (delta: number) => {
+        const maxScroll = getMaxScroll();
+        const isAtTop = currentY <= 0;
+        const isAtBottom = currentY >= maxScroll;
+
+        if (!isChatLoading && (pullY !== 0 || (isAtTop && delta < 0) || (isAtBottom && delta > 0))) {
+            const currentDir = (isAtTop && delta < 0) ? 'top' : 'bottom';
+            if (pullY === 0) {
+                if (pushDir !== currentDir) {
+                    pushDir = currentDir;
+                    pushStartTime = Date.now();
+                }
+                startAnimationLoop(); 
+                if (Date.now() - pushStartTime < 5000) return; 
+            }
+
+            pullY -= delta * FRICTION;
+            if (pullY > PULL_MAX) pullY = PULL_MAX;
+            if (pullY < -PULL_MAX) pullY = -PULL_MAX;
+            
+            if ((pullY < 0 && currentY <= 0) || (pullY > 0 && currentY >= maxScroll)) {
+                resetPull();
+            }
+            startAnimationLoop();
+        } 
+        else {
+            pushDir = null;
+            pushStartTime = 0;
+            currentY += delta;
+            if (currentY < 0) currentY = 0;
+            else if (currentY > maxScroll) currentY = maxScroll;
+
+            if (!isChatLoading && chatHasMore && currentY <= 50 && chatPage > 0) {
+                loadMoreChat(false);
+            }
+        }
+        updateTransform();
+    };
+
     container.addEventListener('wheel', (e) => {
-        if (isChatLoading) return;
         e.preventDefault();
         handleDelta(e.deltaY);
-
         if (pullTimer) clearTimeout(pullTimer);
         pullTimer = window.setTimeout(() => {
             if (Math.abs(pullY) >= PULL_THRESHOLD) triggerAction(pullY > 0 ? 'top' : 'bottom');
-            else resetPull();
+            else if (pushStartTime === 0 && !isChatLoading) resetPull();
         }, 200);
     }, { passive: false });
 
-    // 2. Touch
-    let lastTouchY = 0;
     container.addEventListener('touchstart', (e) => {
         lastTouchY = e.touches[0].pageY;
         scrollEl.classList.remove("resetting");
     }, { passive: true });
 
     container.addEventListener('touchmove', (e) => {
-        if (isChatLoading) return;
         const currentTouchY = e.touches[0].pageY;
-        const delta = lastTouchY - currentTouchY;
+        handleDelta(lastTouchY - currentTouchY);
         lastTouchY = currentTouchY;
-        
-        handleDelta(delta);
         e.preventDefault();
     }, { passive: false });
 
     container.addEventListener('touchend', () => {
         if (Math.abs(pullY) >= PULL_THRESHOLD) triggerAction(pullY > 0 ? 'top' : 'bottom');
-        else resetPull();
+        else if (pushStartTime === 0) resetPull();
     });
 }
 
@@ -1596,22 +1662,27 @@ const talksScroll = document.getElementById("chat-scroll");
 if (talksScroll) {
     initChatPullLogic();
 }
-async function fetchChatHistory(reset: boolean = true) { 
+async function fetchChatHistory(reset: boolean = true, shouldSnap: boolean = true) { 
     if (reset) { 
         chatPage = 0; 
         chatHasMore = true; 
-        if (chatTalks) chatTalks.innerHTML = ""; 
+        if (chatTalks) {
+            Array.from(chatTalks.children).forEach(el => {
+                if (el.classList.contains('chat-talk') || el.classList.contains('no-msg')) {
+                    el.remove();
+                }
+            });
+        }
     } 
-    await loadMoreChat(); 
+    await loadMoreChat(shouldSnap); 
 }
 
-async function loadMoreChat() {
+async function loadMoreChat(shouldSnap: boolean = true) {
     if (isChatLoading || !chatHasMore) {
         stopSpinner();
         return;
     }
 
-    // [FIX] Always start spinner for any chat fetching
     startSpinner();
     isChatLoading = true;
 
@@ -1620,22 +1691,42 @@ async function loadMoreChat() {
         if (activeContext.ref) sqlFilter = `ref = '${activeContext.ref}'`;
         else if (activeContext.bcc) sqlFilter = `bcc = '${activeContext.bcc}'`;
         else if (activeContext.cc) sqlFilter = `cc = '${activeContext.cc}'`;
-        const messages = await invoke<any[]>("get_chat_messages", { limit: pageSize, offset: chatPage * pageSize, filter: sqlFilter });
         
+        const messages = await invoke<any[]>("get_chat_messages", { limit: pageSize, offset: chatPage * pageSize, filter: sqlFilter });
+        const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
+        const container = document.querySelector(".chat-container") as HTMLElement;
+
         if (chatTalks) {
             if (messages && messages.length > 0) {
                 if (messages.length < pageSize) chatHasMore = false;
+                
+                // Sort chronologically for display
                 messages.sort((a, b) => a.created_at - b.created_at);
-                messages.forEach(msg => renderMessage(msg, false)); chatPage++;
+                
+                const prevHeight = scrollEl.scrollHeight;
+                const isPrepend = chatPage > 0;
+                
+                messages.forEach(msg => renderMessage(msg, false, isPrepend));
+                chatPage++;
+
+                if (chatPage === 1 && shouldSnap) {
+                    currentY = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                    updateTransform();
+                } else if (isPrepend || (chatPage === 1 && !shouldSnap)) {
+                    if (isPrepend) {
+                        const addedHeight = scrollEl.scrollHeight - prevHeight;
+                        currentY += addedHeight;
+                    }
+                    updateTransform();
+                }
             } else { 
                 chatHasMore = false; 
                 if (chatPage === 0) {
-                    chatTalks.innerHTML = "<div style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>";
-                    // [QR-RECOVERY] If no messages and not authenticated, show QR code immediately
+                    chatTalks.querySelectorAll('.chat-talk, .no-msg').forEach(el => el.remove());
+                    chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
                     if (!currentSession.email && currentTab === "settings") performQrAuth();
                 }
             }
-            // [QR-RECOVERY] Also trigger if we are on page 1 and no email exists
             if (!currentSession.email && currentTab === "settings" && chatPage <= 1) performQrAuth();
         }
     } catch (e) { 

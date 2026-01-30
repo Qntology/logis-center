@@ -177,7 +177,10 @@ impl VectorStore {
         let table = self.conn.open_table("talks").execute().await?;
         let mut q = table.query();
         if let Some(f) = filter { q = q.only_if(f); }
-        let results = q.limit(limit).offset(offset).execute().await?.try_collect::<Vec<_>>().await?;
+        
+        let results: Vec<RecordBatch> = q.limit(limit).offset(offset)
+            .execute().await?.try_collect::<Vec<_>>().await?;
+            
         let mut msgs = Vec::new();
         for batch in results {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
@@ -205,7 +208,10 @@ impl VectorStore {
                 }));
             }
         }
-        msgs.sort_by_key(|m| m["created_at"].as_i64().unwrap_or(0));
+        
+        // [FIX] Sort in DESCENDING order (newest updated first)
+        msgs.sort_by(|a, b| b["updated_at"].as_i64().unwrap_or(0).cmp(&a["updated_at"].as_i64().unwrap_or(0)));
+        
         Ok(msgs)
     }
 
