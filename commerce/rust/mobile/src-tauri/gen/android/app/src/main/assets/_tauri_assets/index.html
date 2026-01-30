@@ -10,8 +10,8 @@
     <style>
         #answer-qr-container { position: fixed; inset: 0; background: white; z-index: 2000; display: none; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
         #answer-qr { margin: 20px 0; }
-        #scanner-overlay { position: fixed; inset: 0; background: #000; z-index: 1000; display: none; }
-        video { width: 100%; height: 100%; object-fit: cover; }
+        #scanner-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: #000; z-index: 9999; display: none; flex-direction: column; }
+        video { width: 100%; height: 100%; object-fit: cover; background: #000; }
         canvas { display: none; }
         #log-panel { height: 100px; background: #000; color: #0f0; font-size: 10px; padding: 10px; overflow-y: auto; font-family: monospace; position: fixed; bottom: 0; width: 100%; z-index: 500; opacity: 0.8; }
     </style>
@@ -48,7 +48,7 @@
     </div>
 
     <div id="scanner-overlay">
-        <video id="v" playsinline></video>
+        <video id="v" playsinline autoplay muted></video>
         <canvas id="c"></canvas>
         <button onclick="stopCamera()" style="position:absolute; bottom:40px; left:50%; transform:translateX(-50%); background:red; color:white; padding:15px 40px; border-radius:25px; border:none; font-weight:bold;">취소</button>
     </div>
@@ -146,9 +146,16 @@
         async function startCamera() {
             debug("카메라 요청...");
             try {
-                document.getElementById("scanner-overlay").style.display = "block";
-                stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+                document.getElementById("scanner-overlay").style.display = "flex";
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        facingMode: "environment",
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    } 
+                });
                 video.srcObject = stream;
+                // playsinline과 autoplay가 있어도 명시적으로 play 호출
                 await video.play();
                 requestAnimationFrame(scanLoop);
             } catch (e) { debug("카메라 에러: " + e.message); }
