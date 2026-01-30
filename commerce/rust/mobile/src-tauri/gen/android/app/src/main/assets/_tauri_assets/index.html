@@ -4,58 +4,82 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Logis Mobile Hub</title>
+    <!-- 외부 라이브러리 -->
     <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-    <script src="./pako.js"></script>
-    <script src="./qrcode.min.js"></script>
+    <script src="/pako.js"></script>
+    <script src="/qrcode.min.js"></script>
+    
+    <!-- 인라인 스타일 (CSS 로드 실패 대비) -->
     <style>
-        #answer-qr-container { position: fixed; inset: 0; background: white; z-index: 2000; display: none; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
-        #answer-qr { margin: 20px 0; }
-        #scanner-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: #000; z-index: 9999; display: none; flex-direction: column; }
-        video { width: 100%; height: 100%; object-fit: cover; background: #000; }
-        canvas { display: none; }
-        #log-panel { height: 100px; background: #000; color: #0f0; font-size: 10px; padding: 10px; overflow-y: auto; font-family: monospace; position: fixed; bottom: 0; width: 100%; z-index: 500; opacity: 0.8; }
+        :root { --primary: #fb923c; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #fff; }
+        
+        /* 카메라 오버레이: 무조건 최상단, 전체 화면 */
+        #scanner-overlay { 
+            position: fixed !important; 
+            inset: 0 !important; 
+            background: #000 !important; 
+            z-index: 99999 !important; 
+            display: none; 
+            flex-direction: column; 
+        }
+        
+        video { width: 100% !important; height: 100% !important; object-fit: cover !important; }
+        
+        #log-panel { 
+            position: fixed !important; 
+            bottom: 0 !important; 
+            left: 0 !important; 
+            right: 0 !important; 
+            height: 120px !important; 
+            background: rgba(0,0,0,0.8) !important; 
+            color: #0f0 !important; 
+            font-size: 10px !important; 
+            padding: 10px !important; 
+            overflow-y: auto !important; 
+            z-index: 100000 !important; 
+            pointer-events: none;
+        }
+
+        .nav-btn { padding: 10px 20px; background: var(--primary); color: white; border: none; border-radius: 8px; font-weight: bold; }
     </style>
-  <script type="module" crossorigin src="./assets/index-DEwZnY0C.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-DCYplXuM.css">
+    
+    <!-- 메인 CSS 로드 시도 -->
+  <script type="module" crossorigin src="/assets/index.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index.css">
 </head>
 <body>
-    <div class="widget-wrapper">
-      <nav class="pill-nav">
-        <div style="font-size: 1.2rem;">📱</div>
-        <div style="flex:1; margin-left:10px; font-weight:bold;">Logis Remote Hub</div>
-        <button class="nav-btn" onclick="startCamera()">📸</button>
+    <div id="app-root" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+      <nav style="padding: 15px; display: flex; align-items: center; border-bottom: 1px solid #eee;">
+        <div style="flex:1; font-weight:bold;">📱 Logis Remote Hub</div>
+        <button class="nav-btn" onclick="startCamera()">📸 스캔 시작</button>
       </nav>
 
-      <section class="content-panel">
-        <div id="tab-list" style="height:100%; display:flex; flex-direction:column;">
-           <div class="header-row">
-             <h2 style="margin:0; font-size:1rem; color:var(--primary);">리모트 허브</h2>
-             <button class="nav-btn" style="font-size:1rem;" onclick="startCamera()">📸 스캔</button>
-           </div>
-           <div id="doc-list" style="flex:1; overflow-y:auto; padding:20px; text-align:center;">
-                <p style="font-size:3rem; margin-top:40px;">📡</p>
-                <p>데스크탑 연결 대기 중...</p>
-           </div>
+      <section style="flex:1; display:flex; align-items:center; justify-content:center; text-align:center; padding:20px;">
+        <div id="status-area">
+            <p style="font-size:3rem;">📡</p>
+            <p>데스크탑 연결 대기 중...</p>
+            <p style="color: #666; font-size: 0.8rem;">(상단 버튼을 눌러 QR을 스캔하세요)</p>
         </div>
       </section>
     </div>
 
-    <div id="answer-qr-container">
-        <h3>데스크탑에서 이 QR을 스캔하세요</h3>
-        <div id="answer-qr"></div>
-        <p id="qr-status">ICE 정보 수집 중...</p>
-        <button onclick="closeAnswerQr()" style="padding:15px 40px; border-radius:25px; background:#fb923c; color:white; border:none; font-weight:bold;">닫기</button>
-    </div>
-
+    <!-- 카메라 오버레이 (이게 위 영역을 덮어야 함) -->
     <div id="scanner-overlay">
         <video id="v" playsinline autoplay muted></video>
-        <canvas id="c"></canvas>
-        <button onclick="stopCamera()" style="position:absolute; bottom:40px; left:50%; transform:translateX(-50%); background:red; color:white; padding:15px 40px; border-radius:25px; border:none; font-weight:bold;">취소</button>
+        <button onclick="stopCamera()" style="position:absolute; bottom:150px; left:50%; transform:translateX(-50%); background:red; color:white; padding:15px 40px; border-radius:25px; border:none; font-weight:bold; z-index:100001;">스캔 취소</button>
     </div>
 
-    <div id="log-panel">Initializing Hub...</div>
+    <!-- 응답용 QR 컨테이너 -->
+    <div id="answer-qr-container" style="position:fixed; inset:0; background:white; z-index:99998; display:none; flex-direction:column; align-items:center; justify-content:center;">
+        <h3>데스크탑에서 스캔하세요</h3>
+        <div id="answer-qr"></div>
+        <button onclick="closeAnswerQr()" class="nav-btn">닫기</button>
+    </div>
 
-    <!-- Vite 엔트리 포인트 추가 -->
+    <div id="log-panel">Initializing...</div>
+
+    <!-- 메인 로직 로드 시도 -->
 
     <script>
         const logs = document.getElementById("log-panel");
@@ -66,126 +90,52 @@
             logs.appendChild(d); logs.scrollTop = logs.scrollHeight;
         }
 
-        let peerConn = null;
+        // 로드 체크
+        window.onload = () => {
+            debug("Window Loaded");
+            if (typeof pako === 'undefined') debug("❌ Error: pako.js 미로드");
+            else debug("✅ pako.js 로드됨");
+            
+            // styles.css 로드 체크 (배경색으로 유추)
+            const bodyBg = window.getComputedStyle(document.body).backgroundColor;
+            debug("Body BG: " + bodyBg);
+        };
+
         let stream = null;
         const video = document.getElementById("v");
-        const canvas = document.getElementById("c");
-        const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-        function compress(data) {
-            const s = JSON.stringify(data);
-            const compressed = pako.deflate(s);
-            return btoa(String.fromCharCode.apply(null, compressed));
-        }
-
-        function decompress(b64) {
-            const str = atob(b64);
-            const charData = str.split('').map(x => x.charCodeAt(0));
-            const binData = new Uint8Array(charData);
-            const data = pako.inflate(binData, { to: 'string' });
-            return JSON.parse(data);
-        }
-
-        async function initWebRTC(offerData) {
-            debug("WebRTC 초기화 (STUN 미사용)...");
-            peerConn = new RTCPeerConnection({
-                iceServers: [] // STUN/TURN 없이 로컬 네트워크만 사용
-            });
-
-            const dc = peerConn.createDataChannel("logis-sync");
-            setupDataChannel(dc);
-
-            peerConn.ondatachannel = (e) => setupDataChannel(e.channel);
-
-            await peerConn.setRemoteDescription(new RTCSessionDescription(offerData.sdp));
-            const answer = await peerConn.createAnswer();
-            await peerConn.setLocalDescription(answer);
-
-            debug("ICE Candidate 수집 대기 중...");
-            peerConn.onicegatheringstatechange = () => {
-                if (peerConn.iceGatheringState === "complete") {
-                    showAnswerQr();
-                }
-            };
-        }
-
-        function showAnswerQr() {
-            const container = document.getElementById("answer-qr-container");
-            const qrTarget = document.getElementById("answer-qr");
-            container.style.display = "flex";
-            qrTarget.innerHTML = "";
-
-            const answerData = {
-                type: "webrtc-answer",
-                sdp: peerConn.localDescription,
-                ts: Date.now()
-            };
-
-            const compressed = compress(answerData);
-            new QRCode(qrTarget, {
-                text: "logis-ans:" + compressed,
-                width: 250, height: 250,
-                correctLevel: QRCode.CorrectLevel.L
-            });
-            document.getElementById("qr-status").textContent = "준비 완료! 데스크탑으로 스캔하세요.";
-        }
-
-        function closeAnswerQr() {
-            document.getElementById("answer-qr-container").style.display = "none";
-        }
-
-        function setupDataChannel(channel) {
-            channel.onopen = () => {
-                debug("✅ P2P 연결 성공!");
-                closeAnswerQr();
-                document.getElementById("doc-list").innerHTML = "<h3>데스크탑과 연결됨</h3>";
-            };
-            channel.onmessage = (e) => debug("수신: " + e.data);
-        }
 
         async function startCamera() {
-            debug("카메라 요청...");
+            debug("카메라 요청 시작...");
+            const overlay = document.getElementById("scanner-overlay");
+            overlay.style.display = "flex"; // 여기서 화면을 완전히 덮어야 함
+
             try {
-                document.getElementById("scanner-overlay").style.display = "flex";
                 stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { 
-                        facingMode: "environment",
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    } 
+                    video: { facingMode: "environment" } 
                 });
                 video.srcObject = stream;
-                // playsinline과 autoplay가 있어도 명시적으로 play 호출
-                await video.play();
-                requestAnimationFrame(scanLoop);
-            } catch (e) { debug("카메라 에러: " + e.message); }
+                
+                video.onloadedmetadata = async () => {
+                    debug(`Camera: ${video.videoWidth}x${video.videoHeight}`);
+                    await video.play();
+                    debug("Playing...");
+                };
+
+                // 강제 재생
+                setTimeout(() => {
+                    if (video.paused) video.play().then(() => debug("Forced Play Success"));
+                }, 1500);
+
+            } catch (e) { 
+                debug("카메라 에러: " + e.message);
+                overlay.style.display = "none";
+            }
         }
 
         function stopCamera() {
             if (stream) stream.getTracks().forEach(t => t.stop());
-            stream = null;
             document.getElementById("scanner-overlay").style.display = "none";
-        }
-
-        function scanLoop() {
-            if (!stream) return;
-            if (video.readyState === video.HAVE_ENOUGH_DATA) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const code = jsQR(imageData.data, imageData.width, imageData.height);
-                if (code && code.data.startsWith("logis-off:")) {
-                    debug("데스크탑 QR 인식 성공!");
-                    stopCamera();
-                    try {
-                        const offerData = decompress(code.data.replace("logis-off:", ""));
-                        initWebRTC(offerData);
-                    } catch (e) { debug("복호화 에러: " + e.message); }
-                    return;
-                }
-            }
-            requestAnimationFrame(scanLoop);
+            debug("Camera Stopped");
         }
     </script>
 </body>
