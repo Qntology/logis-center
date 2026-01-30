@@ -1490,10 +1490,13 @@ function initChatPullLogic() {
         updateTransform(true);
 
         if (dir === 'top') {
-            await syncData();
-            await fetchChatHistory(true, false); // Refresh but stay at top
+            // [Top Pull] Load Older History
+            console.log("[Chat] Loading history (older than top)...");
+            await loadMoreChat(true); 
         } else {
-            await loadMoreChat(true); // Snap to bottom for load more
+            // [Bottom Pull] Refresh/Load Latest Sync
+            console.log("[Chat] Syncing latest/updated states...");
+            await loadMoreChat(false); 
         }
 
         resetPull();
@@ -1672,19 +1675,11 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             }
 
             if (mode === 'prepend') {
-                const topLoader = document.getElementById("chat-pull-top");
-                if (topLoader && topLoader.nextSibling) {
-                    chatTalks.insertBefore(newEl, topLoader.nextSibling);
-                } else {
-                    chatTalks.prepend(newEl);
-                }
+                // [History] Older messages go to the top of the container
+                chatTalks.prepend(newEl);
             } else {
-                const bottomLoader = document.getElementById("chat-pull-bottom");
-                if (bottomLoader) {
-                    chatTalks.insertBefore(newEl, bottomLoader);
-                } else {
-                    chatTalks.appendChild(newEl);
-                }
+                // [Latest] Newer messages go to the bottom of the container
+                chatTalks.appendChild(newEl);
             }
         }
     });
@@ -1751,34 +1746,55 @@ async function loadMoreChat(isHistory: boolean = false) {
         else if (activeContext.cc) baseFilter = `cc = '${activeContext.cc}'`;
         
         let finalFilter = baseFilter;
-        let cursorTime = 0;
+        let oldestTime = 0;
+        let latestUpdateTime = 0;
+
+        // [SYNC LOGIC] Find the most recent update time currently in the UI
+        const allMsgs = chatTalks.querySelectorAll('.chat-talk');
+        allMsgs.forEach(el => {
+            const up = parseInt((el as HTMLElement).dataset.updatedAt || "0");
+            if (up > latestUpdateTime) latestUpdateTime = up;
+        });
 
         // [CURSOR LOGIC] For History Load (Top Pull)
         if (isHistory) {
-            const topMsg = chatTalks.querySelector('.chat-talk[data-created-at]');
-            if (topMsg) {
-                cursorTime = parseInt((topMsg as HTMLElement).dataset.createdAt || "0");
+            // Find the oldest message currently displayed
+            const firstMsg = chatTalks.querySelector('.chat-talk');
+            if (firstMsg) {
+                oldestTime = parseInt((firstMsg as HTMLElement).dataset.createdAt || "0");
             }
             
-            if (cursorTime > 0) {
-                const timeFilter = `created_at < ${cursorTime}`;
-                finalFilter = baseFilter ? `${baseFilter} AND ${timeFilter}` : timeFilter;
+            if (oldestTime > 0) {
+                // Fetch: (Earlier than oldest) OR (Updated since last sync)
+                let timeFilter = `created_at < ${oldestTime}`;
+                if (latestUpdateTime > 0) {
+                    timeFilter = `(${timeFilter}) OR (updated_at > ${latestUpdateTime})`;
+                }
+                finalFilter = baseFilter ? `${baseFilter} AND (${timeFilter})` : timeFilter;
             }
+        } else if (latestUpdateTime > 0) {
+            // For Bottom Pull (Sync), just get what's updated
+            const syncFilter = `updated_at > ${latestUpdateTime}`;
+            finalFilter = baseFilter ? `${baseFilter} AND ${syncFilter}` : syncFilter;
         }
 
         const limit = 10;
-        const offset = 0; // Cursor shifts the window
+        const offset = 0;
 
         const messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: finalFilter });
         const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
 
         if (chatTalks) {
             if (messages && messages.length > 0) {
+                // Determine mode: History load or Sync
+                // If we fetched history (isHistory), we prepend.
+                // If we fetched just updates (isHistory false), we append or diff update.
                 const mode = isHistory ? 'prepend' : 'append';
                 upsertChatMessages(messages, mode);
                 
                 if (!isHistory && scrollEl) {
-                    scrollEl.scrollTop = scrollEl.scrollHeight;
+                    // Only auto-scroll if it was a fresh/sync load
+                    // upsertChatMessages already handles the "near bottom" check
                 }
             } else { 
                 if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0) {

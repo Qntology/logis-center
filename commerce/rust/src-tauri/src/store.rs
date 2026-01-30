@@ -182,8 +182,9 @@ impl VectorStore {
             }
         }
         
-        let results: Vec<RecordBatch> = q.limit(limit).offset(offset)
-            .execute().await?.try_collect::<Vec<_>>().await?;
+        // [FIX] Fetch all matching rows first to sort them accurately before applying limit/offset
+        // Since local chat logs are typically small (<10k rows), this is safe and reliable.
+        let results: Vec<RecordBatch> = q.execute().await?.try_collect::<Vec<_>>().await?;
             
         let mut msgs = Vec::new();
         for batch in results {
@@ -213,10 +214,15 @@ impl VectorStore {
             }
         }
         
-        // [FIX] Sort in DESCENDING order (newest updated first)
-        msgs.sort_by(|a, b| b["updated_at"].as_i64().unwrap_or(0).cmp(&a["updated_at"].as_i64().unwrap_or(0)));
+        // [ORDER] Sort by created_at DESC (Latest messages first)
+        msgs.sort_by(|a, b| b["created_at"].as_i64().unwrap_or(0).cmp(&a["created_at"].as_i64().unwrap_or(0)));
         
-        Ok(msgs)
+        // [PAGING] Apply limit and offset in memory
+        let start = offset.min(msgs.len());
+        let end = (start + limit).min(msgs.len());
+        let paged_msgs = msgs[start..end].to_vec();
+        
+        Ok(paged_msgs)
     }
 
     pub async fn add_task(&self, task: Task) -> Result<()> {
