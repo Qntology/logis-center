@@ -1,8 +1,8 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  // 상대 경로 빌드를 위해 base를 비웁니다.
-  base: "",
+  // Use relative paths for assets so they work in Tauri's WebView
+  base: "", 
   publicDir: "public",
   build: {
     outDir: "../dist/mobile",
@@ -19,6 +19,6 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
-    host: "0.0.0.0",
-  },
+    host: true
+  }
 });

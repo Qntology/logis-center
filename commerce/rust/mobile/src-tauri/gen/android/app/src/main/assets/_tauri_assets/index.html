@@ -1,142 +1,154 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Logis Mobile Hub</title>
-    <!-- 외부 라이브러리 -->
-    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-    <script src="/pako.js"></script>
-    <script src="/qrcode.min.js"></script>
     
-    <!-- 인라인 스타일 (CSS 로드 실패 대비) -->
+    <!-- External Libraries (Relative Paths) -->
+    <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+    <script src="./pako.js"></script>
+    <script src="./qrcode.min.js"></script>
+
     <style>
         :root { --primary: #fb923c; }
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #fff; }
-        
-        /* 카메라 오버레이: 무조건 최상단, 전체 화면 */
-        #scanner-overlay { 
-            position: fixed !important; 
-            inset: 0 !important; 
-            background: #000 !important; 
-            z-index: 99999 !important; 
-            display: none; 
-            flex-direction: column; 
-        }
-        
-        video { width: 100% !important; height: 100% !important; object-fit: cover !important; }
-        
-        #log-panel { 
-            position: fixed !important; 
-            bottom: 0 !important; 
-            left: 0 !important; 
-            right: 0 !important; 
-            height: 120px !important; 
-            background: rgba(0,0,0,0.8) !important; 
-            color: #0f0 !important; 
-            font-size: 10px !important; 
-            padding: 10px !important; 
-            overflow-y: auto !important; 
-            z-index: 100000 !important; 
-            pointer-events: none;
+
+        /* Scanner Overlay: Highest Priority */
+        #scanner-overlay {
+            position: fixed !important;
+            inset: 0 !important;
+            background: #000 !important;
+            z-index: 99999 !important;
+            display: none; /* Toggled via JS */
+            flex-direction: column;
         }
 
-        .nav-btn { padding: 10px 20px; background: var(--primary); color: white; border: none; border-radius: 8px; font-weight: bold; }
+        video { 
+            width: 100% !important; 
+            height: 100% !important; 
+            object-fit: cover !important; 
+        }
+
+        /* Log Panel */
+        #log-panel {
+            position: fixed !important;
+            bottom: 0 !important;
+            left: 0 !important;
+            right: 0 !important;
+            height: 120px !important;
+            background: rgba(0,0,0,0.8) !important;
+            color: #0f0 !important;
+            font-size: 10px !important;
+            padding: 10px !important;
+            overflow-y: auto !important;
+            z-index: 100000 !important;
+            pointer-events: none;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .nav-btn { 
+            padding: 10px 20px; 
+            background: var(--primary); 
+            color: white; 
+            border: none; 
+            border-radius: 8px; 
+            font-weight: bold; 
+        }
     </style>
-    
-    <!-- 메인 CSS 로드 시도 -->
-  <script type="module" crossorigin src="/assets/index.js"></script>
-  <link rel="stylesheet" crossorigin href="/assets/index.css">
+
+    <!-- Main Styles (Relative Path) -->
+  <script type="module" crossorigin src="./assets/index.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index.css">
 </head>
 <body>
     <div id="app-root" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
       <nav style="padding: 15px; display: flex; align-items: center; border-bottom: 1px solid #eee;">
-        <div style="flex:1; font-weight:bold;">📱 Logis Remote Hub</div>
-        <button class="nav-btn" onclick="startCamera()">📸 스캔 시작</button>
+        <div style="flex:1; font-weight:bold;">Logis Remote Hub</div>
+        <button class="nav-btn" onclick="startCamera()">Scan Start</button>
       </nav>
 
       <section style="flex:1; display:flex; align-items:center; justify-content:center; text-align:center; padding:20px;">
         <div id="status-area">
             <p style="font-size:3rem;">📡</p>
-            <p>데스크탑 연결 대기 중...</p>
-            <p style="color: #666; font-size: 0.8rem;">(상단 버튼을 눌러 QR을 스캔하세요)</p>
+            <p>Waiting for Desktop...</p>
+            <p style="color: #666; font-size: 0.8rem;">(Press 'Scan Start' to connect)</p>
         </div>
       </section>
     </div>
 
-    <!-- 카메라 오버레이 (이게 위 영역을 덮어야 함) -->
+    <!-- Scanner Overlay -->
     <div id="scanner-overlay">
         <video id="v" playsinline autoplay muted></video>
-        <button onclick="stopCamera()" style="position:absolute; bottom:150px; left:50%; transform:translateX(-50%); background:red; color:white; padding:15px 40px; border-radius:25px; border:none; font-weight:bold; z-index:100001;">스캔 취소</button>
+        <button onclick="stopCamera()" style="position:absolute; bottom:50px; left:50%; transform:translateX(-50%); background:red; color:white; padding:15px 40px; border-radius:25px; border:none; font-weight:bold; z-index:100001; font-size: 18px;">CANCEL</button>
     </div>
 
-    <!-- 응답용 QR 컨테이너 -->
+    <!-- Answer QR Container -->
     <div id="answer-qr-container" style="position:fixed; inset:0; background:white; z-index:99998; display:none; flex-direction:column; align-items:center; justify-content:center;">
-        <h3>데스크탑에서 스캔하세요</h3>
+        <h3>Scan from Desktop</h3>
         <div id="answer-qr"></div>
-        <button onclick="closeAnswerQr()" class="nav-btn">닫기</button>
+        <button onclick="closeAnswerQr()" class="nav-btn" style="margin-top:20px;">Close</button>
     </div>
 
     <div id="log-panel">Initializing...</div>
 
-    <!-- 메인 로직 로드 시도 -->
+    <!-- Main Logic (Relative Path) -->
 
     <script>
         const logs = document.getElementById("log-panel");
         function debug(m) {
             console.log(m);
+            if (!logs) return;
             const d = document.createElement("div");
             d.textContent = "> " + m;
-            logs.appendChild(d); logs.scrollTop = logs.scrollHeight;
+            logs.appendChild(d); 
+            logs.scrollTop = logs.scrollHeight;
         }
 
-        // 로드 체크
-        window.onload = () => {
-            debug("Window Loaded");
-            if (typeof pako === 'undefined') debug("❌ Error: pako.js 미로드");
-            else debug("✅ pako.js 로드됨");
+        // Global functions for buttons (attached to window since module scope is isolated)
+        window.startCamera = function() {
+            debug("Attempting to start camera...");
+            const overlay = document.getElementById('scanner-overlay');
+            if(overlay) {
+                overlay.style.display = 'flex';
+                debug("Overlay displayed.");
+            } else {
+                debug("Error: Overlay element not found!");
+            }
             
-            // styles.css 로드 체크 (배경색으로 유추)
-            const bodyBg = window.getComputedStyle(document.body).backgroundColor;
-            debug("Body BG: " + bodyBg);
+            // Dispatch event for main.ts to handle
+            window.dispatchEvent(new CustomEvent('request-camera-start'));
         };
 
-        let stream = null;
-        const video = document.getElementById("v");
+        window.stopCamera = function() {
+            debug("Stopping camera...");
+            const overlay = document.getElementById('scanner-overlay');
+            if(overlay) overlay.style.display = 'none';
+            window.dispatchEvent(new CustomEvent('request-camera-stop'));
+        };
 
-        async function startCamera() {
-            debug("카메라 요청 시작...");
-            const overlay = document.getElementById("scanner-overlay");
-            overlay.style.display = "flex"; // 여기서 화면을 완전히 덮어야 함
+        window.closeAnswerQr = function() {
+            document.getElementById('answer-qr-container').style.display = 'none';
+        };
 
-            try {
-                stream = await navigator.mediaDevices.getUserMedia({ 
-                    video: { facingMode: "environment" } 
-                });
-                video.srcObject = stream;
-                
-                video.onloadedmetadata = async () => {
-                    debug(`Camera: ${video.videoWidth}x${video.videoHeight}`);
-                    await video.play();
-                    debug("Playing...");
-                };
+        window.onload = () => {
+            debug("Window Loaded");
+            if (typeof pako === 'undefined') debug("Error: pako.js NOT loaded");
+            else debug("pako.js loaded");
+            
+            if (typeof QRCode === 'undefined') debug("Error: qrcode.js NOT loaded");
+            else debug("qrcode.js loaded");
 
-                // 강제 재생
-                setTimeout(() => {
-                    if (video.paused) video.play().then(() => debug("Forced Play Success"));
-                }, 1500);
-
-            } catch (e) { 
-                debug("카메라 에러: " + e.message);
-                overlay.style.display = "none";
-            }
-        }
-
-        function stopCamera() {
-            if (stream) stream.getTracks().forEach(t => t.stop());
-            document.getElementById("scanner-overlay").style.display = "none";
-            debug("Camera Stopped");
-        }
+            // Check if CSS is applied
+            const bodyColor = window.getComputedStyle(document.body).backgroundColor;
+            debug("Body BG: " + bodyColor);
+        };
+        
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+            debug("Global Error: " + msg + " at " + lineNo);
+            return false;
+        };
     </script>
 </body>
 </html>
