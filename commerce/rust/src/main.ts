@@ -1597,11 +1597,12 @@ if (talksScroll) {
 }
 async function fetchChatHistory(reset: boolean = true, shouldSnap: boolean = true) { 
     if (reset) { 
-        chatPage = 0; 
-        chatHasMore = true; 
-        // [SMART-UPDATE] Do not clear innerHTML here to allow Upsert/Diff logic to work on Refresh.
+        if (chatTalks) {
+            chatTalks.innerHTML = "";
+        }
     } 
-    await loadMoreChat(shouldSnap); 
+    // Initial load is NOT history (isHistory = false)
+    await loadMoreChat(false); 
 }
 
 interface ChatMessage {
@@ -1618,29 +1619,19 @@ interface ChatMessage {
 function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
     if (!chatTalks) return;
 
-    // 1. Pre-process messages
-    // DB returns DESC (Newest -> Oldest).
-    // Log View (Newest at Top):
-    // - Prepend (Top Refresh): We want Newest at Top.
-    //   Input: [Newest, ..., Oldest].
-    //   Iterate ASC: [Oldest, ..., Newest].
-    //   Prepend Oldest. [Oldest, ...]
-    //   ...
-    //   Prepend Newest. [Newest, ..., Oldest, ...] -> Correct.
-    // - Append (Bottom Load): We want Oldest at Bottom.
-    //   Input: [Newer, ..., Older].
-    //   Iterate DESC: [Newer, ..., Older].
-    //   Append Newer. [..., Newer]
-    //   Append Older. [..., Newer, Older] -> Correct.
-    
-    let sortedBatch: ChatMessage[] = [];
-    if (mode === 'prepend') {
-        sortedBatch = [...messages].sort((a, b) => a.created_at - b.created_at); // ASC
-    } else {
-        sortedBatch = [...messages].sort((a, b) => b.created_at - a.created_at); // DESC
-    }
+    // [Slack/Discord Style] Chronological Order (Oldest -> Newest)
+    const sortedBatch = [...messages].sort((a, b) => a.created_at - b.created_at);
 
-    sortedBatch.forEach(msg => {
+    // Capture scroll state for history loading (prepend)
+    const scrollEl = document.getElementById("chat-scroll");
+    const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
+    const prevScrollTop = scrollEl ? scrollEl.scrollTop : 0;
+
+    // For 'prepend' mode (History), we iterate from Newest to Oldest in the batch 
+    // and prepend each, so the absolute Oldest ends up at the very top.
+    const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
+
+    processBatch.forEach(msg => {
         let textContent = "";
         try {
             const contentObj = typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content;
@@ -1648,8 +1639,9 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         } catch (e) { textContent = String(msg.content); }
 
         const displayMsg: ChatMessage = { ...msg, text: textContent };
-        const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
-        const existingEl = document.getElementById(msgId);
+        
+        // [ID-SELECTOR] Use attribute selector to handle hashes/0x safely
+        const existingEl = chatTalks.querySelector(`[id="${msg.id}"]`) as HTMLElement;
 
         if (existingEl) {
             // [UPDATE] Diff Check
@@ -1657,13 +1649,13 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             const cachedStatus = parseInt(existingEl.dataset.status || "0");
             
             if (msg.updated_at > cachedUpdatedAt || msg.status !== cachedStatus) {
-                console.log(`[Chat] Updating ${msgId} (Status: ${cachedStatus} -> ${msg.status})`);
+                console.log(`[Chat] Updating ${msg.id}`);
                 existingEl.outerHTML = createMessageHTML(displayMsg);
                 
-                const newEl = document.getElementById(msgId);
+                const newEl = chatTalks.querySelector(`[id="${msg.id}"]`) as HTMLElement;
                 if (newEl) {
                     newEl.classList.add("updated-flash");
-                    setTimeout(() => newEl.classList.remove("updated-flash"), 1000);
+                    setTimeout(() => newEl?.classList.remove("updated-flash"), 1000);
                     if (displayMsg.role === "system_task") {
                         newEl.onclick = () => handleTaskClick(newEl);
                     }
@@ -1680,16 +1672,39 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
             }
 
             if (mode === 'prepend') {
-                chatTalks.prepend(newEl);
+                const topLoader = document.getElementById("chat-pull-top");
+                if (topLoader && topLoader.nextSibling) {
+                    chatTalks.insertBefore(newEl, topLoader.nextSibling);
+                } else {
+                    chatTalks.prepend(newEl);
+                }
             } else {
-                chatTalks.appendChild(newEl);
+                const bottomLoader = document.getElementById("chat-pull-bottom");
+                if (bottomLoader) {
+                    chatTalks.insertBefore(newEl, bottomLoader);
+                } else {
+                    chatTalks.appendChild(newEl);
+                }
             }
         }
     });
+
+    // [Scroll Maintenance]
+    if (mode === 'prepend' && scrollEl) {
+        const newScrollHeight = scrollEl.scrollHeight;
+        const heightDiff = newScrollHeight - prevScrollHeight;
+        if (heightDiff > 0) {
+            scrollEl.scrollTop = prevScrollTop + heightDiff;
+        }
+    } else if (mode === 'append' && scrollEl) {
+        // Snapping to bottom if close to bottom or initial load
+        if (prevScrollHeight === 0 || (scrollEl.scrollTop + scrollEl.clientHeight >= prevScrollHeight - 50)) {
+            scrollEl.scrollTop = scrollEl.scrollHeight;
+        }
+    }
 }
 
 function createMessageHTML(msg: ChatMessage) {
-    const msgId = msg.role === "system_task" ? `msg-task-${msg.task_id || msg.id}` : `msg-${msg.id}`;
     const statusMap: Record<number, { icon: string, text: string, color: string }> = { 
         1: { icon: "⏳", text: "processing", color: "var(--primary)" }, 
         2: { icon: "🛑", text: "stopped", color: "#ef4444" }, 
@@ -1703,10 +1718,11 @@ function createMessageHTML(msg: ChatMessage) {
     const isSystemTask = msg.role === "system_task";
     const roleClass = msg.role === "user" ? "user" : "system";
 
-    return `<div id="${msgId}" class="chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" 
+    return `<div id="${msg.id}" class="chat-talk ${roleClass} ${isSystemTask ? 'task-bubble' : ''}" 
         data-task-id="${msg.task_id || msg.id}" 
         data-status="${msg.status}" 
         data-updated-at="${msg.updated_at || msg.created_at}"
+        data-created-at="${msg.created_at}"
         style="${isSystemTask ? 'cursor:pointer;' : ''}">
         <div class="chat-message">
             <div style="font-size:0.6rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between;">
@@ -1719,8 +1735,8 @@ function createMessageHTML(msg: ChatMessage) {
     </div>`;
 }
 
-async function loadMoreChat(shouldSnap: boolean = true) {
-    if (isChatLoading || !chatHasMore) {
+async function loadMoreChat(isHistory: boolean = false) {
+    if (isChatLoading) {
         stopSpinner();
         return;
     }
@@ -1729,42 +1745,47 @@ async function loadMoreChat(shouldSnap: boolean = true) {
     isChatLoading = true;
 
     try {
-        let sqlFilter = null;
-        if (activeContext.ref) sqlFilter = `ref = '${activeContext.ref}'`;
-        else if (activeContext.bcc) sqlFilter = `bcc = '${activeContext.bcc}'`;
-        else if (activeContext.cc) sqlFilter = `cc = '${activeContext.cc}'`;
+        let baseFilter = "";
+        if (activeContext.ref) baseFilter = `ref = '${activeContext.ref}'`;
+        else if (activeContext.bcc) baseFilter = `bcc = '${activeContext.bcc}'`;
+        else if (activeContext.cc) baseFilter = `cc = '${activeContext.cc}'`;
         
-        const limit = 10;
-        const offset = chatPage * limit;
+        let finalFilter = baseFilter;
+        let cursorTime = 0;
 
-        const messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: sqlFilter });
+        // [CURSOR LOGIC] For History Load (Top Pull)
+        if (isHistory) {
+            const topMsg = chatTalks.querySelector('.chat-talk[data-created-at]');
+            if (topMsg) {
+                cursorTime = parseInt((topMsg as HTMLElement).dataset.createdAt || "0");
+            }
+            
+            if (cursorTime > 0) {
+                const timeFilter = `created_at < ${cursorTime}`;
+                finalFilter = baseFilter ? `${baseFilter} AND ${timeFilter}` : timeFilter;
+            }
+        }
+
+        const limit = 10;
+        const offset = 0; // Cursor shifts the window
+
+        const messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: finalFilter });
         const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
-        const container = document.querySelector(".chat-container") as HTMLElement;
 
         if (chatTalks) {
             if (messages && messages.length > 0) {
-                if (messages.length < limit) chatHasMore = false;
-                
-                // [MODE] chatPage == 0 (Refresh/Top), chatPage > 0 (Load More/Bottom)
-                const mode = chatPage === 0 ? 'prepend' : 'append';
-                
+                const mode = isHistory ? 'prepend' : 'append';
                 upsertChatMessages(messages, mode);
                 
-                if (mode === 'append') chatPage++;
-                
-                if (mode === 'prepend' && shouldSnap) {
-                    currentY = 0; 
-                    updateTransform();
+                if (!isHistory && scrollEl) {
+                    scrollEl.scrollTop = scrollEl.scrollHeight;
                 }
             } else { 
-                chatHasMore = false; 
-                if (chatPage === 0 && chatTalks.querySelectorAll('.chat-talk').length === 0) {
-                    // Only show "No messages" if truly empty
+                if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0) {
                     chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
                 }
             }
             
-            // [FIX] Always show QR Auth if not logged in, regardless of message count
             if (!currentSession.email && currentTab === "settings") {
                 performQrAuth();
             }
@@ -1775,6 +1796,12 @@ async function loadMoreChat(shouldSnap: boolean = true) {
         isChatLoading = false; 
         stopSpinner();
     }
+}
+
+function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: boolean = false) {
+    if (!chatTalks) return;
+    // Single message upsert (Real-time is always append/newest in Slack style)
+    upsertChatMessages([msg], isPrepend ? 'prepend' : 'append');
 }
 
 // --- Initialize ---
