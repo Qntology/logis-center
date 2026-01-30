@@ -1,15 +1,11 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  clearScreen: false,
-  root: "src", // index.html이 있는 폴더를 루트로 지정
-  server: {
-    port: 1421,
-    strictPort: true,
-    host: true,
-  },
+  // 상대 경로(./)를 사용하여 안드로이드 assets 폴더에서 직접 로딩 가능하게 함
+  base: "./",
   build: {
-    outDir: "../../dist/mobile", // 빌드 결과물을 프로젝트 공통 dist 폴더로 이동 (선택 사항)
+    outDir: "../dist/mobile",
     emptyOutDir: true,
+    assetsInlineLimit: 0, // 폰트를 base64로 바꾸지 않고 파일을 유지함
   }
 });
