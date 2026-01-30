@@ -1106,47 +1106,117 @@ function showPcPairingQr() {
     });
 }
 
+function handlePairing(data: any) {
+    console.log("Handle Pairing Start:", data);
+    
+    const profileName = document.getElementById("nav-profile-name");
+    if (profileName) {
+        profileName.textContent = "Linking Mobile...";
+        profileName.style.color = "var(--primary)";
+    }
+
+    const qrContainer = document.getElementById("nav-qr-container");
+    if (qrContainer) {
+        qrContainer.innerHTML = `
+            <div style="padding: 20px;">
+                <div class="spinner" style="margin: 0 auto 10px auto;"></div>
+                <p style="font-size: 0.8rem; color: var(--primary);">Establishing P2P Tunnel...</p>
+                <p style="font-size: 0.6rem; color: #666;">ID: ${data.hash}</p>
+            </div>
+        `;
+    }
+
+    // 1. Gather current data from Desktop Hub
+    const docs = Array.from(document.querySelectorAll('.card')).map(card => ({
+        title: card.querySelector('.card-title')?.textContent || "No Title",
+        date: card.querySelector('.card-meta')?.textContent?.split('|')[0]?.trim() || "Unknown",
+        type: card.querySelector('.card-meta')?.textContent?.split('|')[1]?.trim() || "General"
+    })).slice(0, 10); // Take first 10 for sync
+
+    console.log("Extracted Data for Sync:", docs);
+
+    // 2. WebRTC Logic (Placeholder for real P2P)
+    // In a real scenario, we'd send 'docs' over dataChannel.send(JSON.stringify(docs))
+    
+    setTimeout(() => {
+        if (profileName) profileName.textContent = "Mobile Connected";
+        if (qrContainer) qrContainer.classList.add("hidden");
+        
+        // Notify user sync is starting
+        console.log("P2P Tunnel Ready. Sending Mirror UI command...");
+        
+        // --- BRIDGE TO MOBILE ---
+        // (This would happen over the RTCDataChannel)
+        // For testing, we can use a Tauri event if mobile is in debug, 
+        // but since they are separate WebView instances, WebRTC is the correct way.
+    }, 2000);
+}
+
 let desktopStream: MediaStream | null = null;
 
-async function startMobileScanning() {
-    const pcView = document.getElementById("pc-qr-view");
-    const mobileView = document.getElementById("mobile-scan-view");
-    const videoEl = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+function stopMobileScanning(video: HTMLVideoElement) {
+    if (desktopStream) {
+        desktopStream.getTracks().forEach(track => track.stop());
+        desktopStream = null;
+    }
+    if (video) video.srcObject = null;
+    document.getElementById("mobile-scan-view")?.classList.add("hidden");
+    document.getElementById("pc-qr-view")?.classList.remove("hidden");
+}
 
-    if (!pcView || !mobileView || !videoEl) return;
-
-    pcView.classList.add("hidden");
-    mobileView.classList.remove("hidden");
+async function startMobileScanning(video: HTMLVideoElement) {
+    if (!video || !(video instanceof HTMLVideoElement)) {
+        console.error('Invalid video element provided to startMobileScanning');
+        return;
+    }
 
     try {
-        desktopStream = await navigator.mediaDevices.getUserMedia({ video: true });
-        videoEl.srcObject = desktopStream;
-        videoEl.play();
+        console.log("Starting desktop camera stream...");
+        desktopStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+        video.srcObject = desktopStream;
+        await video.play();
+        
+        // Show the camera container if it's hidden
+        document.getElementById("mobile-scan-view")?.classList.remove("hidden");
+        document.getElementById("pc-qr-view")?.classList.add("hidden");
+    } catch (err) {
+        console.error("Failed to start desktop camera:", err);
+        return;
+    }
 
-        if ('BarcodeDetector' in window) {
-            const detector = new (window as any).BarcodeDetector({ formats: ['qr_code'] });
-            const scanLoop = async () => {
-                if (!desktopStream) return;
-                const barcodes = await detector.detect(videoEl);
-                if (barcodes.length > 0) {
-                    const data = barcodes[0].rawValue;
-                    console.log("[PC] Mobile QR Detected:", data);
-                    const parsed = JSON.parse(data);
-                    if (parsed.type === "webrtc-pair" && parsed.role === "mobile") {
-                        alert("Pairing request received from: " + parsed.hash);
-                        stopDesktopCamera();
-                        // Next: Start WebRTC Signaling with this hash
-                        return;
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    const scanLoop = () => {
+        if (!video || video.paused || video.ended) return;
+        
+        try {
+            if (video.readyState >= 2) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                
+                if (ctx && canvas.width > 0 && canvas.height > 0) {
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    // @ts-ignore
+                    const code = jsQR(imageData.data, imageData.width, imageData.height);
+                    
+                    if (code) {
+                        console.log('QR Scanned (jsQR):', code.data);
+                        const data = JSON.parse(code.data);
+                        if (data.type === 'webrtc-pair') {
+                            handlePairing(data);
+                            stopMobileScanning(video);
+                            return;
+                        }
                     }
                 }
-                requestAnimationFrame(scanLoop);
-            };
-            requestAnimationFrame(scanLoop);
-        }
-    } catch (e) {
-        alert("Camera error: " + e);
-        showPcPairingQr();
-    }
+            }
+        } catch (e) {}
+        requestAnimationFrame(scanLoop);
+    };
+    
+    requestAnimationFrame(scanLoop);
 }
 
 function stopDesktopCamera() {
@@ -1156,7 +1226,18 @@ function stopDesktopCamera() {
     }
 }
 
-document.getElementById("btn-switch-to-camera")?.addEventListener("click", startMobileScanning);
+document.getElementById("btn-switch-to-camera")?.addEventListener("click", () => {
+    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+    if (video) {
+        startMobileScanning(video);
+    } else {
+        console.error("Desktop camera video element not found");
+    }
+});
+document.getElementById("btn-switch-to-qr")?.addEventListener("click", () => {
+    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+    stopMobileScanning(video);
+});
 document.getElementById("btn-switch-to-qr")?.addEventListener("click", showPcPairingQr);
 
 btnDetailDelete?.addEventListener("click", async () => {
