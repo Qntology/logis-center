@@ -36,6 +36,10 @@ async function startScanning() {
     if (scanning) return;
     log("Starting scanning sequence...");
 
+    // Reset Chunk Buffer for new session
+    receivedOfferChunks = [];
+    expectedOfferTotal = 0;
+
     if (!video) {
         log("Error: Video element not found");
         return;
@@ -98,14 +102,16 @@ function tick() {
                 });
 
                 if (code) {
-                    log("QR Found: " + code.data.substring(0, 20) + "...");
-                    handleQrCode(code.data);
-                    // Stop scanning after successful read (optional, depends on UX)
-                    stopScanning();
+                    // Log throttle to avoid spamming the UI on every frame
+                    // log("QR Found: " + code.data.substring(0, 10) + "...");
                     
-                    // Hide overlay
-                    if (overlay) overlay.style.display = 'none';
-                    return; // Stop the loop
+                    handleQrCode(code.data);
+                    
+                    // [Multipart Fix] Do NOT stop scanning here. 
+                    // handleQrCode will call stopScanning() when all chunks are gathered.
+                    
+                    // Just return to avoid re-scanning the same frame immediately in this tick
+                    // But we want to continue the loop
                 }
             } else {
                 // Throttle this log so it doesn't spam
@@ -117,42 +123,55 @@ function tick() {
     requestAnimationFrame(tick);
 }
 
+// Chunk Buffer State
+let receivedOfferChunks: string[] = [];
+let expectedOfferTotal = 0;
+
 function handleQrCode(data: string) {
-    log("Processing QR Data...");
-    // Stop scanning while processing
-    stopScanning();
-    if (overlay) overlay.style.display = 'none';
-
+    // 1. Check for Chunk Format: [index, total, chunk]
     try {
-        // 1. Parse Data (Support both JSON and Compressed Base64)
-        let offerData: any;
-        if (data.trim().startsWith("{")) {
-             offerData = JSON.parse(data);
-        } else {
-             try {
-                // Base64 -> Pako Inflate -> JSON
-                const binaryString = atob(data);
-                const bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-                const inflated = pako.inflate(bytes, { to: 'string' });
-                offerData = JSON.parse(inflated);
-                log("Decompressed Offer data.");
-             } catch (err) {
-                 log("Parsing failed, assuming raw JSON failed too.");
-                 throw err;
+        if (data.trim().startsWith("[")) {
+             const parsed = JSON.parse(data);
+             if (Array.isArray(parsed) && parsed.length === 3 && typeof parsed[0] === 'number') {
+                 const [idx, total, chunk] = parsed;
+                 
+                 // Init buffer
+                 if (expectedOfferTotal === 0) {
+                     expectedOfferTotal = total;
+                     for(let i=0; i<total; i++) receivedOfferChunks.push("");
+                     log(`Detected Multipart QR. Total: ${total}`);
+                 }
+
+                 // Store chunk
+                 if (total === expectedOfferTotal && !receivedOfferChunks[idx]) {
+                     receivedOfferChunks[idx] = chunk;
+                     const count = receivedOfferChunks.filter(c => c).length;
+                     log(`Received Part ${idx + 1}/${total}`);
+                     
+                     // Feedback
+                     const statusArea = document.getElementById("status-area");
+                     if (statusArea) {
+                         statusArea.innerHTML = `<p style="font-size:3rem;">📡</p><p>Scanning... ${count}/${total}</p>`;
+                     }
+                 }
+
+                 // Check Completion
+                 if (receivedOfferChunks.every(c => c !== "")) {
+                     log("All chunks received. Processing Offer...");
+                     const fullSdp = receivedOfferChunks.join("");
+                     
+                     // Stop scanning and cleanup
+                     stopScanning();
+                     if (overlay) overlay.style.display = 'none';
+                     
+                     createPeerConnection({ type: 'offer', sdp: fullSdp });
+                 }
+                 return; // Keep scanning if not complete
              }
+             // Legacy single array check could go here
         }
-
-        log("Offer accepted. Generating Answer...");
-        createPeerConnection(offerData);
-
-    } catch (e: any) {
-        log("Error processing QR: " + e);
-        alert("Invalid QR Code.\nPlease scan a valid WebRTC Offer.");
-        // Restart scanning if failed
-        startScanning();
+    } catch (e) {
+        // Ignore parse errors, just keep scanning
     }
 }
 
@@ -198,21 +217,65 @@ async function createPeerConnection(offer: any) {
             }
         });
 
-        // 3. Compress and Display Answer
-        const finalAnswer = JSON.stringify(pc.localDescription);
-        log("Answer created. Compressing...");
+        // 3. Generate Answer QR (Multipart/Chunked)
+        const sdp = pc.localDescription!.sdp;
+        const CHUNK_COUNT = 4;
+        const chunkSize = Math.ceil(sdp.length / CHUNK_COUNT);
+        const chunks: string[] = [];
         
-        // Pako Deflate -> Base64
-        const binaryString = pako.deflate(finalAnswer, { to: 'string' });
-        const base64Answer = btoa(binaryString);
+        for (let i = 0; i < CHUNK_COUNT; i++) {
+            const chunk = sdp.substring(i * chunkSize, (i + 1) * chunkSize);
+            chunks.push(JSON.stringify([i, CHUNK_COUNT, chunk]));
+        }
         
-        showAnswerQr(base64Answer);
+        log(`Answer created. Split into ${CHUNK_COUNT} chunks. Displaying...`);
+        
+        showAnswerQrChunks(chunks);
 
     } catch (err: any) {
         log("WebRTC Error: " + err.message);
         alert("Connection Failed: " + err.message);
     }
 }
+
+function showAnswerQrChunks(chunks: string[]) {
+    const container = document.getElementById("answer-qr-container");
+    const qrDiv = document.getElementById("answer-qr");
+    
+    if (container && qrDiv) {
+        container.style.display = "flex";
+        
+        let currentIdx = 0;
+        const rotate = () => {
+            qrDiv.innerHTML = "";
+            
+            // Header
+            const h = document.createElement("div");
+            h.innerText = `Part ${currentIdx + 1}/${chunks.length}`;
+            h.style.fontWeight = "bold"; h.style.marginBottom = "10px";
+            qrDiv.appendChild(h);
+
+            // QR
+            const q = document.createElement("div");
+            qrDiv.appendChild(q);
+            
+            try {
+                new QRCode(q, {
+                    text: chunks[currentIdx],
+                    width: 250, height: 250,
+                    correctLevel: QRCode.CorrectLevel.L
+                });
+            } catch(e) {}
+            
+            currentIdx = (currentIdx + 1) % chunks.length;
+        };
+        
+        rotate();
+        setInterval(rotate, 700);
+    }
+}
+
+// Deprecated function removed to fix build error
 
 function showAnswerQr(data: string) {
     const container = document.getElementById("answer-qr-container");

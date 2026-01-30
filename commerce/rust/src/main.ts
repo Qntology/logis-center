@@ -1080,140 +1080,51 @@ btnSyncQr?.addEventListener("click", async () => {
     }
 });
 
-function showPcPairingQr() {
-    const qrTarget = document.getElementById("sync-qrcode");
-    const pcView = document.getElementById("pc-qr-view");
-    const mobileView = document.getElementById("mobile-scan-view");
-    
-    if (!qrTarget || !pcView || !mobileView) return;
-    
-    pcView.classList.remove("hidden");
-    mobileView.classList.add("hidden");
-    stopDesktopCamera();
-
-    qrTarget.innerHTML = "";
-    const pairingData = JSON.stringify({
-        type: "webrtc-pair",
-        hash: currentSession.hash,
-        ts: Date.now(),
-        role: "pc"
-    });
-    
-    new (window as any).QRCode(qrTarget, {
-        text: pairingData,
-        width: 180, height: 180, colorDark: "#000000", colorLight: "#ffffff",
-        correctLevel: (window as any).QRCode.CorrectLevel.M
-    });
-}
-
 let peerConn: RTCPeerConnection | null = null;
 let dataChannel: RTCDataChannel | null = null;
-
-async function handlePairing(data: any) {
-    console.log("[WebRTC] Initializing P2P Link with Hash:", data.hash);
-    
-    const profileName = document.getElementById("nav-profile-name");
-    if (profileName) {
-        profileName.textContent = "Negotiating P2P...";
-        profileName.style.color = "var(--primary)";
-    }
-
-    // 1. Initialize PeerConnection
-    peerConn = new RTCPeerConnection({
-        iceServers: [] // STUN 서버 없이 로컬 WiFi망만 사용
-    });
-
-    // 2. Create Data Channel
-    dataChannel = peerConn.createDataChannel("logis-sync");
-    setupDataChannel(dataChannel);
-
-    // 3. ICE Candidate Handling
-    peerConn.onicecandidate = (e) => {
-        if (e.candidate) {
-            sendSignalingMessage(data.hash, { type: "ice", candidate: e.candidate });
-        }
-    };
-
-    // 4. Create and Send Offer
-    try {
-        const offer = await peerConn.createOffer();
-        await peerConn.setLocalDescription(offer);
-        await sendSignalingMessage(data.hash, { type: "offer", sdp: offer });
-        console.log("[WebRTC] Offer sent. Waiting for Mobile...");
-        
-        // Hide QR view
-        const qrContainer = document.getElementById("nav-qr-container");
-        if (qrContainer) {
-            qrContainer.innerHTML = `
-                <div style="padding: 20px; text-align: center;">
-                    <div class="spinner" style="margin: 0 auto 10px;"></div>
-                    <p style="font-size: 0.8rem; color: var(--primary);">Establishing secure tunnel...</p>
-                </div>
-            `;
-        }
-
-        startSignalingPoll(data.hash);
-    } catch (e) { console.error("[WebRTC] Offer failed:", e); }
-}
+let desktopStream: MediaStream | null = null;
 
 function setupDataChannel(channel: RTCDataChannel) {
     channel.onopen = () => {
         console.log("[WebRTC] Channel OPEN!");
         const profileName = document.getElementById("nav-profile-name");
         if (profileName) {
-            profileName.textContent = "Mobile Linked (P2P)";
+            profileName.textContent = "✅ Mobile Linked (P2P)";
             profileName.style.color = "#4ade80";
         }
         document.getElementById("nav-qr-container")?.classList.add("hidden");
         syncDataToMobile();
     };
+
     channel.onmessage = async (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === "get_detail") {
-            const doc = await (window as any).invoke("get_document", { uuid: msg.uuid });
-            if (doc && dataChannel?.readyState === "open") {
-                dataChannel.send(JSON.stringify({
-                    type: "sync_detail",
-                    title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
-                    content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
+        try {
+            const msg = JSON.parse(e.data);
+            console.log("[WebRTC] Received:", msg.type);
+            
+            if (msg.type === "get_detail") {
+                const doc = await invoke<any>("get_document", { uuid: msg.uuid });
+                if (doc && dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_detail",
+                        title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
+                        content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
+                    }));
+                }
+            } else if (msg.type === "chat_message") {
+                dataChannel?.send(JSON.stringify({ 
+                    type: "sync_chat", 
+                    data: { role: "system", content: "AI (Hub): Received " + msg.content } 
                 }));
             }
-        } else if (msg.type === "chat_message") {
-            // Echo
-            dataChannel?.send(JSON.stringify({ type: "sync_chat", data: { role: "system", content: "AI (Hub): Received " + msg.content } }));
+        } catch (err) {
+            console.error("[WebRTC] Message handle error:", err);
         }
     };
 }
 
-async function sendSignalingMessage(hash: string, payload: any) {
-    try {
-        await (window as any).invoke("proxy_fetch", {
-            url: `${API_HOST}/relay/${hash}`,
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-        });
-    } catch (e) {}
-}
-
-function startSignalingPoll(hash: string) {
-    const poll = async () => {
-        if (peerConn?.remoteDescription) return;
-        try {
-            const data = await (window as any).invoke("proxy_fetch", { url: `${API_HOST}/relay/${hash}`, method: "GET" });
-            if (data.type === "answer") {
-                await peerConn?.setRemoteDescription(new RTCSessionDescription(data.sdp));
-            } else if (data.type === "ice") {
-                await peerConn?.addIceCandidate(new RTCIceCandidate(data.candidate));
-            }
-        } catch (e) {}
-        setTimeout(poll, 2000);
-    };
-    poll();
-}
-
 const syncDataToMobile = () => {
     if (!dataChannel || dataChannel.readyState !== "open") return;
+    console.log("[WebRTC] Syncing list to mobile...");
     const docs = Array.from(document.querySelectorAll('.logis-result')).map(el => {
         const card = el as HTMLElement;
         return {
@@ -1227,17 +1138,107 @@ const syncDataToMobile = () => {
     dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
 };
 
-let desktopStream: MediaStream | null = null;
+async function showPcPairingQr() {
+    const qrTarget = document.getElementById("sync-qrcode");
+    const pcView = document.getElementById("pc-qr-view");
+    const mobileView = document.getElementById("mobile-scan-view");
+    
+    if (!qrTarget || !pcView || !mobileView) return;
+    
+    pcView.classList.remove("hidden");
+    mobileView.classList.add("hidden");
+    stopDesktopCamera();
 
-function stopMobileScanning(video: HTMLVideoElement) {
-    if (desktopStream) {
-        desktopStream.getTracks().forEach(track => track.stop());
-        desktopStream = null;
+    qrTarget.innerHTML = "<div style='padding:20px;'><div class='spinner'></div><p>Generating P2P Offer...</p></div>";
+
+    try {
+        // 1. Initialize PeerConnection (No STUN for local only)
+        peerConn = new RTCPeerConnection({ iceServers: [] });
+        
+        // 2. Create Data Channel (Must create before offer)
+        dataChannel = peerConn.createDataChannel("logis-sync");
+        setupDataChannel(dataChannel);
+
+        // 3. Create Offer
+        const offer = await peerConn.createOffer();
+        await peerConn.setLocalDescription(offer);
+
+        // 4. Wait for ICE Gathering (Essential for LAN connection)
+        console.log("[WebRTC] Gathering ICE candidates...");
+        await new Promise<void>(resolve => {
+            if (peerConn?.iceGatheringState === 'complete') {
+                resolve();
+            } else {
+                const check = () => {
+                    if (peerConn?.iceGatheringState === 'complete') {
+                        peerConn?.removeEventListener('icegatheringstatechange', check);
+                        resolve();
+                    }
+                };
+                peerConn?.addEventListener('icegatheringstatechange', check);
+                setTimeout(resolve, 2000); // 2s timeout
+            }
+        });
+
+        // 5. Generate QR Data (Multipart/Chunked)
+        const sdp = peerConn.localDescription?.sdp || "";
+        const CHUNK_COUNT = 4;
+        const chunkSize = Math.ceil(sdp.length / CHUNK_COUNT);
+        const chunks: string[] = [];
+        
+        for (let i = 0; i < CHUNK_COUNT; i++) {
+            const chunk = sdp.substring(i * chunkSize, (i + 1) * chunkSize);
+            // Format: [index, total, chunk_data]
+            chunks.push(JSON.stringify([i, CHUNK_COUNT, chunk]));
+        }
+
+        console.log(`[WebRTC] Offer Generated. Total Length: ${sdp.length}. Split into ${CHUNK_COUNT} chunks.`);
+
+        // 6. Rotate QR (Slideshow)
+        let currentChunkIndex = 0;
+        const showChunk = () => {
+            qrTarget.innerHTML = ""; // Clear
+            
+            // Header to indicate progress
+            const header = document.createElement("div");
+            header.style.marginBottom = "5px";
+            header.style.fontWeight = "bold";
+            header.style.color = "var(--primary)";
+            header.innerText = `Offer Part ${currentChunkIndex + 1}/${CHUNK_COUNT}`;
+            qrTarget.appendChild(header);
+
+            // QR Container
+            const qrDiv = document.createElement("div");
+            qrTarget.appendChild(qrDiv);
+
+            new (window as any).QRCode(qrDiv, {
+                text: chunks[currentChunkIndex],
+                width: 250, height: 250, 
+                colorDark: "#000000", colorLight: "#ffffff",
+                correctLevel: (window as any).QRCode.CorrectLevel.L
+            });
+
+            currentChunkIndex = (currentChunkIndex + 1) % CHUNK_COUNT;
+        };
+
+        // Start Rotation
+        showChunk();
+        const qrInterval = setInterval(showChunk, 1000); // Rotate every 1000ms (1s) for better focus
+        
+        // Clean up interval when view changes
+        const cleanup = () => {
+            clearInterval(qrInterval);
+            document.getElementById("btn-switch-to-camera")?.removeEventListener("click", cleanup);
+        };
+        document.getElementById("btn-switch-to-camera")?.addEventListener("click", cleanup);
+
+    } catch (e) {
+        console.error("[WebRTC] Offer Generation Failed:", e);
+        qrTarget.innerHTML = "<p style='color:red'>Failed to gen offer</p>";
     }
-    if (video) video.srcObject = null;
-    document.getElementById("mobile-scan-view")?.classList.add("hidden");
-    document.getElementById("pc-qr-view")?.classList.remove("hidden");
 }
+
+// ... existing code ...
 
 async function startMobileScanning(video: HTMLVideoElement) {
     if (!video || !(video instanceof HTMLVideoElement)) {
@@ -1251,18 +1252,22 @@ async function startMobileScanning(video: HTMLVideoElement) {
         video.srcObject = desktopStream;
         await video.play();
         
-        // Show the camera container if it's hidden
         document.getElementById("mobile-scan-view")?.classList.remove("hidden");
         document.getElementById("pc-qr-view")?.classList.add("hidden");
     } catch (err) {
         console.error("Failed to start desktop camera:", err);
+        alert("Camera start failed: " + err);
         return;
     }
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     
-    const scanLoop = () => {
+    // Chunk Assembly State
+    const receivedChunks: string[] = [];
+    let expectedTotal = 0;
+    
+    const scanLoop = async () => {
         if (!video || video.paused || video.ended) return;
         
         try {
@@ -1277,13 +1282,66 @@ async function startMobileScanning(video: HTMLVideoElement) {
                     const code = jsQR(imageData.data, imageData.width, imageData.height);
                     
                     if (code) {
-                        console.log('QR Scanned (jsQR):', code.data);
-                        const data = JSON.parse(code.data);
-                        if (data.type === 'webrtc-pair') {
-                            handlePairing(data);
-                            stopMobileScanning(video);
-                            return;
-                        }
+                        const rawData = code.data;
+                        try {
+                            if (rawData.trim().startsWith("[")) {
+                                const data = JSON.parse(rawData);
+                                
+                                // Check for Chunk Format: [index, total, data]
+                                if (Array.isArray(data) && data.length === 3 && typeof data[0] === 'number') {
+                                    const [idx, total, chunkStr] = data;
+                                    
+                                    // Init buffer if new or reset needed
+                                    if (expectedTotal === 0) {
+                                        expectedTotal = total;
+                                        // Fill with nulls
+                                        for(let i=0; i<total; i++) receivedChunks.push(""); 
+                                    }
+
+                                    // Store chunk if matching total
+                                    if (total === expectedTotal) {
+                                        if (!receivedChunks[idx]) {
+                                            receivedChunks[idx] = chunkStr;
+                                            console.log(`[WebRTC] Received Chunk ${idx + 1}/${total}`);
+                                            
+                                            // Feedback UI (reuse profile name area)
+                                            const profileName = document.getElementById("nav-profile-name");
+                                            if (profileName) {
+                                                const count = receivedChunks.filter(c => c).length;
+                                                profileName.textContent = `Scanning... ${count}/${total}`;
+                                                profileName.style.color = "var(--primary)";
+                                            }
+                                        }
+                                    }
+
+                                    // Check completion
+                                    if (receivedChunks.every(c => c !== "")) {
+                                        console.log("All chunks received. Reassembling Answer...");
+                                        const fullSdp = receivedChunks.join("");
+                                        const answer = new RTCSessionDescription({ type: 'answer', sdp: fullSdp });
+
+                                        if (peerConn) {
+                                            await peerConn.setRemoteDescription(answer);
+                                            console.log("P2P Connection Established!");
+                                            stopMobileScanning(video);
+                                            
+                                            const profileName = document.getElementById("nav-profile-name");
+                                            if (profileName) {
+                                                profileName.textContent = "✅ Mobile Connected";
+                                                profileName.style.color = "#4ade80";
+                                            }
+                                            document.getElementById("nav-qr-container")?.classList.add("hidden");
+                                        }
+                                        return; // Stop scanning
+                                    }
+                                }
+                                // Legacy support (single array [sdp])
+                                else if (Array.isArray(data) && data.length === 1) {
+                                     // ... existing legacy logic ...
+                                     // For now, let's prioritize chunks as requested.
+                                }
+                            }
+                        } catch (parseErr) { }
                     }
                 }
             }
