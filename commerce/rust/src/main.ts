@@ -1600,6 +1600,8 @@ if (talksScroll) {
 }
 async function fetchChatHistory(reset: boolean = true, shouldSnap: boolean = true) { 
     if (reset) { 
+        chatPage = 0;
+        chatHasMore = true;
         if (chatTalks) {
             chatTalks.innerHTML = "";
         }
@@ -1689,12 +1691,18 @@ function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append')
         const newScrollHeight = scrollEl.scrollHeight;
         const heightDiff = newScrollHeight - prevScrollHeight;
         if (heightDiff > 0) {
-            scrollEl.scrollTop = prevScrollTop + heightDiff;
+            // [FIX] Update custom scroll engine's Y position to maintain visual spot
+            currentY += heightDiff;
+            updateTransform();
         }
     } else if (mode === 'append' && scrollEl) {
+        const container = document.querySelector(".chat-container") as HTMLElement;
+        const maxScroll = Math.max(0, scrollEl.scrollHeight - (container?.clientHeight || 0));
+        
         // Snapping to bottom if close to bottom or initial load
-        if (prevScrollHeight === 0 || (scrollEl.scrollTop + scrollEl.clientHeight >= prevScrollHeight - 50)) {
-            scrollEl.scrollTop = scrollEl.scrollHeight;
+        if (prevScrollHeight === 0 || (currentY >= prevScrollHeight - (container?.clientHeight || 0) - 50)) {
+            currentY = maxScroll;
+            updateTransform();
         }
     }
 }
@@ -1731,7 +1739,7 @@ function createMessageHTML(msg: ChatMessage) {
 }
 
 async function loadMoreChat(isHistory: boolean = false) {
-    if (isChatLoading) {
+    if (isChatLoading || (isHistory && !chatHasMore)) {
         stopSpinner();
         return;
     }
@@ -1759,7 +1767,7 @@ async function loadMoreChat(isHistory: boolean = false) {
         // [CURSOR LOGIC] For History Load (Top Pull)
         if (isHistory) {
             // Find the oldest message currently displayed
-            const firstMsg = chatTalks.querySelector('.chat-talk');
+            const firstMsg = chatTalks.querySelector('.chat-talk:not(.chat-history-end)');
             if (firstMsg) {
                 oldestTime = parseInt((firstMsg as HTMLElement).dataset.createdAt || "0");
             }
@@ -1787,19 +1795,27 @@ async function loadMoreChat(isHistory: boolean = false) {
         if (chatTalks) {
             if (messages && messages.length > 0) {
                 // Determine mode: History load or Sync
-                // If we fetched history (isHistory), we prepend.
-                // If we fetched just updates (isHistory false), we append or diff update.
                 const mode = isHistory ? 'prepend' : 'append';
                 upsertChatMessages(messages, mode);
                 
-                if (!isHistory && scrollEl) {
-                    // Only auto-scroll if it was a fresh/sync load
-                    // upsertChatMessages already handles the "near bottom" check
+                if (isHistory && messages.length < limit) {
+                    chatHasMore = false;
                 }
             } else { 
+                if (isHistory) chatHasMore = false;
+
                 if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0) {
                     chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' style='text-align:center; padding:20px; color:#999; font-size:0.75rem;'>No messages yet.</div>");
                 }
+            }
+
+            // [UI] Show "End of history" if no more past messages
+            if (isHistory && !chatHasMore && !chatTalks.querySelector('.chat-history-end')) {
+                const endHtml = `<div class="chat-talk system chat-history-end" style="text-align:center; opacity:0.4; font-size:0.6rem; padding:15px 10px;">
+                    <div style="border-top:1px solid rgba(255,255,255,0.05); margin-bottom:10px;"></div>
+                    <span>No more older messages</span>
+                </div>`;
+                chatTalks.insertAdjacentHTML('afterbegin', endHtml);
             }
             
             if (!currentSession.email && currentTab === "settings") {
