@@ -672,7 +672,6 @@ async function syncData() {
             session_params: { hash: currentSession.hash, token: currentSession.token }
         });
 
-        // [FIX] Advance spinner one step
         stepQrSpinner();
 
         if (response.results && Array.isArray(response.results)) {
@@ -681,14 +680,17 @@ async function syncData() {
             
             // [REACTIVE] Re-render navigation immediately after sync
             await renderNavigation();
-            // Also refresh list if on list tab
-            if (currentTab === "list") await loadMoreDocs(true);
+            
+            // [FIX] Use incremental sync instead of full reset (loadMoreDocs(true))
+            // This will trigger upsertListItems with 'prepend' mode
+            if (currentTab === "list") {
+                await loadMoreDocs(false, true); 
+            }
         }
         
     } catch (e) { 
         console.error("[SYNC] Failed:", e); 
     } finally {
-        // [FIX] Stop spinner
         if (!isExtracting) stopSpinner();
     }
 }
@@ -1083,29 +1085,35 @@ btnDetailDelete?.addEventListener("click", async () => {
 
 async function refreshList() {
     currentPage = 0; hasMore = true; cachedDocs = []; selectedUuids.clear();
+    listCurrentY = 0; // Reset scroll
     if(docListContainer) docListContainer.innerHTML = "";
-    await loadMoreDocs();
+    await loadMoreDocs(true);
 }
 
-async function loadMoreDocs(reset: boolean = false) {
+async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
     if (reset) {
         currentPage = 0; hasMore = true;
         if (docListContainer) docListContainer.innerHTML = "";
         cachedDocs = [];
+        listCurrentY = 0;
+        updateListTransform();
     }
 
-    if (isLoading || !hasMore) {
-        if (reset) stopSpinner(); // Stop if already loading
+    if (isLoading || (!reset && !isSync && !hasMore)) {
+        if (reset) stopSpinner();
         return;
     }
 
-    // [FIX] Always start spinner for any document fetching
     startSpinner();
     isLoading = true;
     if (loadingIndicator) loadingIndicator.style.display = "block";
     
     try {
-        let docs: any[] = [];
+        let baseFilter = "";
+        if (activeContext.ref) baseFilter = `ref = '${activeContext.ref}'`;
+        else if (activeContext.bcc) baseFilter = `bcc = '${activeContext.bcc}'`;
+        else if (activeContext.cc) baseFilter = `cc = '${activeContext.cc}'`;
+
         const textInput = searchInput?.value.toLowerCase() || "";
         let queryParts = activeTags.map(t => {
             if (t.type === 'domain') return `host:${t.value}`;
@@ -1114,55 +1122,138 @@ async function loadMoreDocs(reset: boolean = false) {
             return t.value;
         });
         if (textInput) queryParts.push(textInput);
-        const finalQuery = queryParts.join(" ");
+        const textQuery = queryParts.join(" ");
 
-        docs = await Select["items"]({ value: finalQuery, limit: pageSize, offset: currentPage * pageSize });
+        let finalFilter = baseFilter;
+        let latestUpdateTime = 0;
+        let oldestCreatedAt = 0;
 
-        if (docs.length < pageSize) hasMore = false;
+        // [TIMESTAMPS] Scan UI for current range
+        const allCards = docListContainer.querySelectorAll('.logis-result');
+        allCards.forEach(el => {
+            const up = parseInt((el as HTMLElement).dataset.updatedAt || "0");
+            const cr = parseInt((el as HTMLElement).dataset.createdAt || "0");
+            if (up > latestUpdateTime) latestUpdateTime = up;
+            if (oldestCreatedAt === 0 || cr < oldestCreatedAt) oldestCreatedAt = cr;
+        });
+
+        if (isSync) {
+            // [Top Pull] Newer than latest update
+            const syncFilter = `updated_at > ${latestUpdateTime}`;
+            finalFilter = baseFilter ? `${baseFilter} AND (${syncFilter})` : syncFilter;
+        } else if (!reset && oldestCreatedAt > 0) {
+            // [Bottom Pull] Older than oldest created
+            const historyFilter = `created_at < ${oldestCreatedAt}`;
+            finalFilter = baseFilter ? `${baseFilter} AND (${historyFilter})` : historyFilter;
+        }
+
+        const docs = await Select["items"]({ 
+            value: textQuery, 
+            filter: finalFilter,
+            limit: pageSize, 
+            offset: 0 // We use timestamps for paging now
+        });
+
+        if (!isSync && docs.length < pageSize) hasMore = false;
+
         if (docs.length > 0) {
-            cachedDocs = [...cachedDocs, ...docs];
-            renderDocs(docs);
-            currentPage++;
-        } else if (currentPage === 0) {
-            if (docListContainer) docListContainer.innerHTML = "<div style='text-align:center; padding:20px; color:#999;'>No documents found.</div>";
+            const mode = isSync ? 'prepend' : 'append';
+            upsertListItems(docs, mode);
+            
+            // [NEW] If syncing, also refresh the navigation tree (Shared Pages / Users)
+            if (isSync) {
+                renderNavigation();
+            }
+        } else if (reset) {
+            docListContainer.innerHTML = "<div style='text-align:center; padding:20px; color:#999;'>No documents found.</div>";
         }
     } catch (e) { 
         console.error("[WIDGET] loadMoreDocs error:", e);
-        if (currentPage === 0 && docListContainer) docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
+        if (reset && docListContainer) docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
     } 
     finally { 
         isLoading = false; 
         if (loadingIndicator) loadingIndicator.style.display = "none"; 
-        // [FIX] Always stop spinner when loading attempt finishes
         stopSpinner();
+        updateListTransform();
     }
 }
 
-function renderDocs(docs: any[]) {
+function upsertListItems(docs: any[], mode: 'prepend' | 'append') {
     if (!docListContainer) return;
-    docs.forEach(doc => {
-        const html = item2html(doc, false, currentDetectedUrl);
-        docListContainer.insertAdjacentHTML('beforeend', html);
-        const lastEl = docListContainer.lastElementChild as HTMLElement;
-        if (lastEl) {
-            lastEl.addEventListener("click", (e) => {
-                const target = e.target as HTMLElement;
-                // If user clicked 'toggle-more' or its label, let CSS/HTML handle it
-                if (target.closest('.toggle-more') || target.closest('.more-label')) return;
-                
-                // [STRICT-ID] Try every possible ID field name
-                const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
-                
-                if (!target.closest('a') && !target.closest('input') && !target.closest('button')) {
-                    if (docId) {
-                        showDetail(String(docId));
-                    } else {
-                        console.warn("[WIDGET] Item clicked but no valid ID found:", doc);
-                    }
-                }
-            });
+
+    // Capture scroll state for prepend maintenance
+    const scrollEl = document.getElementById("list-scroll");
+    const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
+    const wasAtTop = listCurrentY <= 10; // Check if user was near the top
+
+    // Sort: Newest created_at first (Descending)
+    const sortedBatch = [...docs].sort((a, b) => b.created_at - a.created_at);
+    
+    // For 'prepend' (Sync), we iterate from Oldest to Newest in the batch 
+    // and prepend each, so the absolute Newest ends up at the very top.
+    const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
+
+    processBatch.forEach(doc => {
+        const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
+        const existingEl = docListContainer.querySelector(`[id="${docId}"]`) as HTMLElement;
+
+        if (existingEl) {
+            // [DIFF] Update if modified
+            const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
+            if (doc.updated_at > cachedUpdatedAt) {
+                console.log(`[List] Updating item ${docId}`);
+                existingEl.outerHTML = item2html(doc, false, currentDetectedUrl);
+                const newEl = document.getElementById(String(docId));
+                if (newEl) bindCardEvents(newEl, doc);
+            }
+        } else {
+            // [INSERT]
+            const html = item2html(doc, false, currentDetectedUrl);
+            const temp = document.createElement('div');
+            temp.innerHTML = html;
+            const newEl = temp.firstElementChild as HTMLElement;
+            bindCardEvents(newEl, doc);
+
+            if (mode === 'prepend') {
+                docListContainer.prepend(newEl);
+            } else {
+                docListContainer.appendChild(newEl);
+            }
         }
     });
+
+    // [Scroll Maintenance]
+    if (mode === 'prepend' && scrollEl) {
+        const newScrollHeight = scrollEl.scrollHeight;
+        const heightDiff = newScrollHeight - prevScrollHeight;
+        if (heightDiff > 0) {
+            if (wasAtTop) {
+                // [FIX] If user was at the top, keep them at the top to see new items
+                listCurrentY = 0;
+            } else {
+                // If they were scrolled down, maintain visual position of old items
+                listCurrentY += heightDiff;
+            }
+            updateListTransform();
+        }
+    }
+}
+
+function bindCardEvents(el: HTMLElement, doc: any) {
+    el.addEventListener("click", (e) => {
+        const target = e.target as HTMLElement;
+        if (target.closest('.toggle-more') || target.closest('.more-label')) return;
+        const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
+        if (!target.closest('a') && !target.closest('input') && !target.closest('button')) {
+            if (docId) showDetail(String(docId));
+        }
+    });
+}
+
+function renderDocs(docs: any[]) {
+    // This is now handled by upsertListItems for consistency
+    upsertListItems(docs, 'append');
 }
 
 async function showDetail(uuid: string) {
@@ -1362,13 +1453,198 @@ async function initSession() {
 
 document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
 document.getElementById("btn-logout")?.addEventListener("click", async () => { if (await ask("Are you sure?", { title: "Sign Out", kind: "warning" })) { currentSession.email = undefined; updateAuthUI(); } });
-listScrollContainer?.addEventListener("scroll", () => { if (listScrollContainer.scrollTop + listScrollContainer.clientHeight >= listScrollContainer.scrollHeight - 20) loadMoreDocs(); });
 settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
 document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
 document.getElementById("unload-btn")?.addEventListener("click", async () => { try { await invoke("unload_model"); alert("Memory cleared."); } catch (e) {} });
 async function syncBrowserStatus() { try { const s = await invoke<string>("get_browser_status"); if (btnAutoLaunch) btnAutoLaunch.style.display = (s === "running") ? "none" : "flex"; } catch (e) {} }
 // --- Device Preference Logic ---
 const forceCpuToggle = document.getElementById("force-cpu-toggle") as HTMLInputElement;
+
+// --- List Scroll & Pull Engine ---
+let listCurrentY = 0;
+let listPullY = 0;
+let listPullTimer: number | null = null;
+let listPushStartTime = 0;
+let listPushDir: 'top' | 'bottom' | null = null;
+
+function updateListTransform(resetting: boolean = false) {
+    const scrollEl = document.getElementById("list-scroll");
+    const container = document.getElementById("list-scroll-container");
+    const topLoader = document.getElementById("list-pull-top");
+    const bottomLoader = document.getElementById("list-pull-bottom");
+    
+    if (!scrollEl || !container || !topLoader || !bottomLoader) return;
+
+    if (resetting) scrollEl.classList.add("resetting");
+    else scrollEl.classList.remove("resetting");
+
+    let effectiveOffset = listPullY;
+    if (listPullY === 0 && listPushStartTime !== 0) {
+        const pushElapsed = Date.now() - listPushStartTime;
+        if (pushElapsed > 50) { 
+            effectiveOffset = listPushDir === 'top' ? 50 : -50;
+        }
+    }
+
+    scrollEl.style.transform = `translateY(${-listCurrentY + effectiveOffset}px)`;
+
+    const loader = effectiveOffset !== 0 ? (effectiveOffset > 0 ? topLoader : bottomLoader) : null;
+    
+    if (loader) {
+        loader.classList.add("visible");
+        const absPull = Math.abs(effectiveOffset);
+        loader.style.opacity = "1";
+        
+        if (absPull >= PULL_THRESHOLD) (loader as HTMLElement).classList.add("ready");
+        else (loader as HTMLElement).classList.remove("ready");
+
+        const spinner = (loader as HTMLElement).querySelector('.spinner') as HTMLElement;
+        if (spinner) {
+            const frameIndex = Math.floor(Date.now() / 80) % spinnerFrames.length;
+            spinner.innerText = spinnerFrames[frameIndex];
+        }
+    } else {
+        [topLoader, bottomLoader].forEach(el => {
+            if (el) {
+                el.classList.remove("visible", "ready");
+                (el as HTMLElement).style.opacity = "0";
+                const s = el.querySelector('.spinner') as HTMLElement;
+                if (s && !el.classList.contains("loading")) s.innerText = "";
+            }
+        });
+    }
+}
+
+function initListPullLogic() {
+    const container = document.getElementById("list-scroll-container") as HTMLElement;
+    const scrollEl = document.getElementById("list-scroll") as HTMLElement;
+    const topLoader = document.getElementById("list-pull-top") as HTMLElement;
+    const bottomLoader = document.getElementById("list-pull-bottom") as HTMLElement;
+    
+    if (!container || !scrollEl || !topLoader || !bottomLoader) return;
+
+    let loopId: number | null = null;
+    let lastTouchY = 0;
+
+    const resetPull = () => {
+        listPullY = 0;
+        listPushStartTime = 0;
+        listPushDir = null;
+        updateListTransform(true);
+        setTimeout(() => {
+            scrollEl.classList.remove("resetting");
+            topLoader.classList.remove("loading");
+            bottomLoader.classList.remove("loading");
+        }, 400);
+    };
+
+    const triggerAction = async (dir: 'top' | 'bottom') => {
+        if (isLoading) return;
+        const loader = dir === 'top' ? topLoader : bottomLoader;
+        loader.classList.add("loading");
+        
+        listPullY = dir === 'top' ? 40 : -40;
+        listPushStartTime = 0;
+        updateListTransform(true);
+
+        if (dir === 'top') {
+            // [Top Pull] Sync Updates (opposite of chat)
+            console.log("[List] Syncing latest updates...");
+            await loadMoreDocs(false, true); 
+        } else {
+            // [Bottom Pull] Load More History (opposite of chat)
+            console.log("[List] Loading more history...");
+            await loadMoreDocs(false, false); 
+        }
+
+        resetPull();
+    };
+
+    const startAnimationLoop = () => {
+        if (loopId) return;
+        const tick = () => {
+            const now = Date.now();
+            if (listPushStartTime !== 0 && now - listPushStartTime >= 1000 && listPullY === 0) {
+                const dir = listPushDir;
+                if (dir) {
+                    listPullY = dir === 'top' ? TRIGGER_THRESHOLD : -TRIGGER_THRESHOLD;
+                    triggerAction(dir);
+                }
+            }
+            updateListTransform();
+            if (listPullY !== 0 || listPushStartTime !== 0 || isLoading) {
+                loopId = requestAnimationFrame(tick);
+            } else {
+                loopId = null;
+            }
+        };
+        loopId = requestAnimationFrame(tick);
+    };
+
+    const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+
+    const handleDelta = (delta: number) => {
+        const maxScroll = getMaxScroll();
+        const isAtTop = listCurrentY <= 0;
+        const isAtBottom = listCurrentY >= maxScroll;
+
+        if (!isLoading && (listPullY !== 0 || (isAtTop && delta < 0) || (isAtBottom && delta > 0))) {
+            const currentDir = (isAtTop && delta < 0) ? 'top' : 'bottom';
+            if (listPullY === 0) {
+                if (listPushDir !== currentDir) {
+                    listPushDir = currentDir;
+                    listPushStartTime = Date.now();
+                }
+                startAnimationLoop(); 
+                if (Date.now() - listPushStartTime < 1000) return; 
+            }
+
+            listPullY -= delta * FRICTION;
+            if (listPullY > PULL_MAX) listPullY = PULL_MAX;
+            if (listPullY < -PULL_MAX) listPullY = -PULL_MAX;
+            
+            if ((listPullY < 0 && listCurrentY <= 0) || (listPullY > 0 && listCurrentY >= maxScroll)) {
+                resetPull();
+            }
+            startAnimationLoop();
+        } 
+        else {
+            listPushDir = null;
+            listPushStartTime = 0;
+            listCurrentY += delta;
+            if (listCurrentY < 0) listCurrentY = 0;
+            else if (listCurrentY > maxScroll) listCurrentY = maxScroll;
+        }
+        updateListTransform();
+    };
+
+    container.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        handleDelta(e.deltaY);
+        if (listPullTimer) clearTimeout(listPullTimer);
+        listPullTimer = window.setTimeout(() => {
+            if (Math.abs(listPullY) >= PULL_THRESHOLD) triggerAction(listPullY > 0 ? 'top' : 'bottom');
+            else if (listPushStartTime === 0 && !isLoading) resetPull();
+        }, 200);
+    }, { passive: false });
+
+    container.addEventListener('touchstart', (e) => {
+        lastTouchY = e.touches[0].pageY;
+        scrollEl.classList.remove("resetting");
+    }, { passive: true });
+
+    container.addEventListener('touchmove', (e) => {
+        const currentTouchY = e.touches[0].pageY;
+        handleDelta(lastTouchY - currentTouchY);
+        lastTouchY = currentTouchY;
+        e.preventDefault();
+    }, { passive: false });
+
+    container.addEventListener('touchend', () => {
+        if (Math.abs(listPullY) >= PULL_THRESHOLD) triggerAction(listPullY > 0 ? 'top' : 'bottom');
+        else if (listPushStartTime === 0) resetPull();
+    });
+}
 
 async function initDevicePreference() {
     if (!forceCpuToggle) return;
@@ -1597,6 +1873,10 @@ const getDevicePref = () => forceCpuToggle.checked ? "cpu" : null;
 const talksScroll = document.getElementById("chat-scroll");
 if (talksScroll) {
     initChatPullLogic();
+}
+const listScroll = document.getElementById("list-scroll");
+if (listScroll) {
+    initListPullLogic();
 }
 async function fetchChatHistory(reset: boolean = true, shouldSnap: boolean = true) { 
     if (reset) { 

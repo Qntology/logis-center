@@ -348,18 +348,17 @@ tr:hover { background: rgba(0,0,0,0.05); }
 [data-tab="settings"][class*="active-spinner-mode"]{font-family:monospace; }
 
 
-.chat-container {
+.chat-container, .list-container {
     position: relative;
     height: 100%;
-    /* 가상 스크롤을 위해 실제 스크롤 차단 */
     overflow: hidden; 
 }
 
-.chat-scroll {
+.chat-scroll, .list-scroll {
     display: flex;
     flex-direction: column;
     width: 100%;
-    height: auto; /* 내용에 맞춰 늘어나게 함 */
+    height: auto;
     min-height: 100%;
     position: absolute;
     top: 0;
@@ -368,7 +367,7 @@ tr:hover { background: rgba(0,0,0,0.05); }
     transform: translateY(0);
 }
 
-.chat-scroll.resetting {
+.chat-scroll.resetting, .list-scroll.resetting {
     transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
 }
 
@@ -385,12 +384,12 @@ tr:hover { background: rgba(0,0,0,0.05); }
     transition: opacity 0.2s;
 }
 
-#chat-pull-top {
-    margin-top: -50px; /* 위쪽에 숨김 */
+#chat-pull-top, #list-pull-top {
+    margin-top: -50px;
 }
 
-#chat-pull-bottom {
-    margin-bottom: -50px; /* 아래쪽에 숨김 */
+#chat-pull-bottom, #list-pull-bottom {
+    margin-bottom: -50px;
 }
 
 .chat-pull-loader.visible { opacity: 1; }
