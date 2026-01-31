@@ -758,80 +758,65 @@ document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
 document.addEventListener('view-task-log', () => { openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; });
 
 btnExtract?.addEventListener("click", async () => {
-    if (currentDetectedUrl) {
-        try {
-            const normalizedUrl = currentDetectedUrl.toLowerCase();
-            const urlObj = new URL(normalizedUrl);
-            const hostname = urlObj.hostname;
-            const link = (urlObj.pathname + urlObj.search).toLowerCase();
-            const ccHash = await hashId(hostname); 
-            const hashedRefId = await hashId(ccHash + link);
-            const isActive = await invoke<boolean>("check_active_task", {
-                        payload: { cc: ccHash, ref: hashedRefId }
-                    });            if (isActive) {
-                alert("This page is already in the queue or being processed.");
-                openWidget("settings");
-                await updateExtractButtonVisibility();
-                return;
+    if (currentDetectedUrl || currentImage) {
+        // [CHECK] If already extracting, do nothing
+        if (isExtracting) return;
+
+        btnExtract.style.opacity = "0.5";
+        const logArea = document.getElementById("extraction-log");
+        
+        // [UI-RESET]
+        if (logArea) logArea.innerHTML = "";
+        if (detailTitle) detailTitle.innerText = "Task Progress";
+        if (detailContent && logArea) {
+            detailContent.innerHTML = "";
+            detailContent.appendChild(logArea);
+        }
+
+        setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
+
+        openWidget("settings");
+        startSpinner();
+        
+        isExtracting = true;
+        const taskId = `task_${Date.now()}`;
+        
+        if (currentImage) {
+            console.log("[WIDGET] Queuing IMAGE task...");
+            await emit("new-task-from-browser", { 
+                id: taskId, 
+                type: "image_extraction", 
+                image_path: currentImage, 
+                ref: currentImage, 
+                link: "Local Image",
+                device_preference: getDevicePref()
+            });
+        } else {
+            console.log("[WIDGET] Queuing HTML task...");
+            try {
+                const html = await invoke<string>("extract_html_from_current_tab");
+                const urlObj = new URL(currentDetectedUrl.toLowerCase());
+                const cc = await hashId(urlObj.hostname);
+                const rawPath = urlObj.pathname + urlObj.search;
+                const hashedRefId = await hashId(cc + rawPath.toLowerCase());
+                
+                await emit("new-task-from-browser", { 
+                    id: taskId, 
+                    type: "html_extraction", 
+                    html: html, 
+                    link: rawPath, 
+                    cc: cc, 
+                    ref: hashedRefId, 
+                    from: currentSession.address, 
+                    to: currentSession.team,
+                    device_preference: getDevicePref()
+                });
+            } catch (e) {
+                isExtracting = false;
+                stopSpinner();
             }
-        } catch(e) { console.error("[WIDGET] Pre-click check error:", e); }
-    }
-
-    btnExtract.style.opacity = "0.5";
-    const logArea = document.getElementById("extraction-log");
-    
-    // [UI-RESET] Clear previous task's debris and status messages
-    if (logArea) {
-        logArea.innerHTML = "";
-        logArea.dataset.activeTaskId = ""; // Clear active task tracking
-    }
-    if (detailTitle) detailTitle.innerText = "Task Progress";
-    if (detailContent && logArea) {
-        // Keep only the log area, remove any error/stop messages from previous run
-        detailContent.innerHTML = "";
-        detailContent.appendChild(logArea);
-    }
-
-    setTimeout(() => { if (btnExtract) btnExtract.style.opacity = "1"; }, 300);
-
-    openWidget("settings");
-    startSpinner();
-    
-    if (currentImage) {
-        isExtracting = true;
-        const taskId = `img_${Date.now()}`;
-        activeTaskId = taskId; // [NEW]
-        if (logArea) logArea.dataset.activeTaskId = taskId; // [CRITICAL-FIX]
-        try {
-            await emit("new-task-from-browser", { 
-                id: taskId, type: "image_extraction", image_path: currentImage, 
-                ref: currentImage, link: "Local Image",
-                device_preference: forceCpuToggle?.checked ? "cpu" : null
-            });
-            renderMessage({ id: taskId, role: "system_task", content: `Queued: Image Analysis`, status: 10, task_id: taskId, created_at: Date.now() });
-            await updateExtractButtonVisibility();
-        } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
-    } else {
-        isExtracting = true;
-        let taskId = `task_${Date.now()}`;
-        if (logArea) logArea.dataset.activeTaskId = taskId; // [CRITICAL-FIX]
-        try {
-            const html = await invoke<string>("extract_html_from_current_tab");
-            const normalizedUrl = currentDetectedUrl.toLowerCase();
-            const urlObj = new URL(normalizedUrl);
-            const cc = await hashId(urlObj.hostname);
-            const rawPath = urlObj.pathname + urlObj.search;
-            const hashedRefId = await hashId(cc + rawPath.toLowerCase());
-            activeTaskId = hashedRefId; // [NEW] In case of HTML, we often use the hash as ref
-            
-            await emit("new-task-from-browser", { 
-                id: taskId, type: "html_extraction", html: html, link: rawPath, 
-                cc: cc, ref: hashedRefId, from: currentSession.address, to: currentSession.team,
-                device_preference: forceCpuToggle?.checked ? "cpu" : null
-            });
-            renderMessage({ id: taskId, role: "system_task", content: `Queued: ${urlObj.hostname}`, status: 10, task_id: hashedRefId, created_at: Date.now() });
-            await updateExtractButtonVisibility();
-        } catch (e) { isExtracting = false; await updateExtractButtonVisibility(); }
+        }
+        await updateExtractButtonVisibility();
     }
 });
 
@@ -1123,6 +1108,26 @@ function setupDataChannel(channel: RTCDataChannel) {
                         data: currentSession 
                     }));
                 }
+            } else if (msg.type === "get_navigation") {
+                // Fetch pages and users for mobile tree
+                const pages = await Select["pages"]();
+                const users = await Select["users"]();
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({ 
+                        type: "sync_navigation", 
+                        pages: pages,
+                        users: users
+                    }));
+                }
+            } else if (msg.type === "get_chat_history") {
+                // Fetch last 20 messages for mobile
+                const messages = await invoke<any[]>("get_chat_messages", { limit: 20, offset: 0 });
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({ 
+                        type: "sync_chat_history", 
+                        messages: messages
+                    }));
+                }
             } else if (msg.type === "search") {
                 // Perform local search for mobile
                 console.log("[WebRTC] Remote Search Query:", msg.query);
@@ -1211,6 +1216,38 @@ const syncDataToMobile = () => {
     dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
 };
 
+function handleTaskClick(el: HTMLElement) {
+    const taskId = el.dataset.taskId;
+    if (!taskId) return;
+    
+    console.log("[Chat] Task clicked:", taskId);
+    openWidget("list"); 
+    listView.style.display = "none"; 
+    detailView.style.display = "flex";
+    if (btnStopTask) btnStopTask.style.display = "flex";
+    if (btnDetailDelete) btnDetailDelete.style.display = "none";
+
+    detailTitle.innerText = "Task Progress";
+    const logArea = document.getElementById("extraction-log");
+    if (logArea) {
+        logArea.dataset.activeTaskId = taskId;
+        // Optionally fetch logs from backend if needed
+    }
+}
+
+async function sendSignalingMessage(hash: string, payload: any) {
+    try {
+        await invoke("proxy_fetch", {
+            url: `${API_HOST}/relay/${hash}`,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload // payload is already JSON object or will be stringified
+        });
+    } catch (e) {
+        console.error("[WebRTC] Relay send failed:", e);
+    }
+}
+
 async function showPcPairingQr() {
     const qrTarget = document.getElementById("sync-qrcode");
     const pcView = document.getElementById("pc-qr-view");
@@ -1263,15 +1300,20 @@ async function showPcPairingQr() {
         await new Promise(r => setTimeout(r, 1000));
 
         // 5. Generate QR Data (Multipart/Chunked)
-        // [IMPORTANT] Use finalized SDP after gathering
         const finalSdp = peerConn.localDescription?.sdp || "";
+        const laptopHash = currentSession.hash;
+        
+        // [Relay] Also post to relay server so mobile can find us without scan next time
+        sendSignalingMessage(laptopHash, { type: "offer", sdp: finalSdp });
+
         const CHUNK_COUNT = 4;
         const chunkSize = Math.ceil(finalSdp.length / CHUNK_COUNT);
         const chunks: string[] = [];
         
         for (let i = 0; i < CHUNK_COUNT; i++) {
             const chunk = finalSdp.substring(i * chunkSize, (i + 1) * chunkSize);
-            chunks.push(JSON.stringify([i, CHUNK_COUNT, chunk]));
+            // Include hash in the first chunk or all chunks for identification
+            chunks.push(JSON.stringify([i, CHUNK_COUNT, chunk, laptopHash]));
         }
 
         console.log(`[WebRTC] Offer Generated. Total Length: ${finalSdp.length}. Split into ${CHUNK_COUNT} chunks.`);
@@ -1562,14 +1604,21 @@ async function handleImageUpload(path: string) {
     if (navPreviewContainer && navImgThumbnail) {
         navPreviewContainer.classList.remove("hidden");
         navUploadBtn?.classList.add("active-emoji");
-        searchInput.disabled = true; btnSubmit.style.display = "none"; btnExtract.style.display = "flex";
+        searchInput.disabled = true; 
+        btnSubmit.style.display = "none"; 
+        btnExtract.style.display = "flex";
+        
         try {
             const contents = await readFile(currentImage);
             const blob = new Blob([contents]);
             const reader = new FileReader();
             reader.onloadend = () => { navImgThumbnail.src = reader.result as string; };
             reader.readAsDataURL(blob);
-        } catch (e) { navImgThumbnail.src = convertFileSrc(currentImage); }
+        } catch (e) { 
+            navImgThumbnail.src = convertFileSrc(currentImage); 
+        }
+
+        console.log("[WIDGET] Image selected. Extraction button (⚡) is now visible.");
     }
 }
 

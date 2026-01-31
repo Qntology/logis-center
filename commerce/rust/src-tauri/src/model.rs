@@ -362,11 +362,11 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?}...", target_size);
+        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
@@ -377,8 +377,8 @@ impl LogisModel {
 
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
         // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
-        let text_only = target_size == ModelSize::Large && task_id.is_some();
-        self.ensure_generator_ext(target_size, text_only).await?;
+        let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
+        self.ensure_generator_ext(target_size, text_only, is_baking).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -394,7 +394,7 @@ impl LogisModel {
         let base_session = format!("{}_base", task_id);
         
         // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone()).await?;
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true).await?;
 
         // 2. Ingest PUG content
         {
@@ -471,20 +471,20 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.ensure_generator_ext(size, false).await
+        self.ensure_generator_ext(size, false, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
         let mut large_slot = self.large_hibernation.lock().await;
 
-        if *current_size_guard == Some(size) && gen_guard.is_some() {
+        if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only {
             return Ok(());
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {})...", size, force_text_only);
+        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
         // ... (rest of the switching logic remains similar but uses the new loading)
 
         // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
@@ -551,7 +551,8 @@ impl LogisModel {
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
-                force_text_only
+                force_text_only,
+                baking_only // [PASS-NEW]
             )
         }).await??;
 
@@ -633,11 +634,19 @@ impl LogisModel {
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
-        let small_gguf_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
-        let large_gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         
-        let small_model_path = small_gguf_dir.to_str().unwrap().to_string();
-        let large_model_path = large_gguf_dir.to_str().unwrap().to_string();
+        // [FIX] Normalize UNC paths for Windows to prevent "builder error" in model loaders
+        let normalize_path = |path: std::path::PathBuf| -> String {
+            let s = path.to_string_lossy().to_string();
+            if s.starts_with(r"\\?\") {
+                s[4..].to_string()
+            } else {
+                s
+            }
+        };
+
+        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
+        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
@@ -668,27 +677,29 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [LOG-ONLY] Removed intermediate UI emit. Log the progress instead.
-        crate::scheduler::log_task_progress(app_handle, &task_id, &json!({ 
-            "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
-        }));
-
-        // Ensure LARGE generator is loaded for Vision tasks
-        self.ensure_generator(ModelSize::Large).await?;
+        // [FIX] Do NOT force reload. Use current generator (Large should be already loaded via relay)
+        {
+            let gen_guard = self.generator.lock().await;
+            if gen_guard.is_none() {
+                drop(gen_guard);
+                self.ensure_generator(ModelSize::Large).await?;
+            }
+        }
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
             
+            // [IMPORTANT] Pass task_id as session_id to continue from the baked relay snapshot
             let result_str = self.chat_with_image_spinner(
                 prompt, 
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image content..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image with baked context..." }), 
                 1024, 
                 cancel_token.clone(), 
-                Some(task_id.clone())
+                Some(task_id.clone()) 
             ).await?;
 
             let extracted_data = crate::parsing::parse_json_from_llm(&result_str);

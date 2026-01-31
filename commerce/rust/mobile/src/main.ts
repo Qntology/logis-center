@@ -1,3 +1,4 @@
+
 import { item2html } from "./lib/render";
 
 declare const jsQR: any;
@@ -14,7 +15,7 @@ function log(msg: string) {
     }
 }
 
-log("Main module loaded. V140 (Final Transition Fix) Initializing...");
+log("Main module loaded. V145 (Nav & Chat Sync) Initializing...");
 
 let videoStream: MediaStream | null = null;
 let scanning = false;
@@ -45,6 +46,10 @@ function switchTab(tabName: string) {
             c.style.display = 'none';
         }
     });
+
+    if (tabName === 'settings') {
+        requestChatHistory();
+    }
 }
 
 function showDetailView(show: boolean) {
@@ -58,31 +63,155 @@ function showDetailView(show: boolean) {
 }
 
 function finalizeConnectionUI() {
-    log("🚀 Finalizing Connection UI...");
-    
-    // Hide all connection overlays
-    const intro = document.getElementById("mobile-intro-overlay");
-    if (intro) intro.style.display = 'none';
-    
+    log("🚀 Connection Finalized!");
+    document.getElementById("mobile-intro-overlay")!.style.display = 'none';
     document.getElementById("answer-qr-container")!.style.display = 'none';
     if (qrInterval) { clearInterval(qrInterval); qrInterval = null; }
 
-    // Enable Search and UI
     if (searchInput) {
         searchInput.disabled = false;
         searchInput.placeholder = "Search or Ask Prompt";
     }
     document.querySelectorAll(".nav-icons .nav-btn").forEach(btn => (btn as HTMLButtonElement).disabled = false);
-
-    // Switch to List Tab
     switchTab("list");
 }
 
-// --- Scanning ---
+// --- WebRTC Setup ---
+function setupDataChannel(channel: RTCDataChannel) {
+    channel.onopen = () => {
+        log("Channel OPEN!");
+        finalizeConnectionUI();
+        channel.send(JSON.stringify({ type: "get_session" }));
+        channel.send(JSON.stringify({ type: "get_navigation" }));
+        channel.send(JSON.stringify({ type: "search", query: "" }));
+    };
+    channel.onmessage = (e) => {
+        try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === "sync_list") renderList(msg.data);
+            else if (msg.type === "sync_detail") renderDetail(msg.title, msg.content);
+            else if (msg.type === "sync_chat") renderChat(msg.data);
+            else if (msg.type === "sync_chat_history") renderChatHistory(msg.messages);
+            else if (msg.type === "sync_session") updateSessionUI(msg.data);
+            else if (msg.type === "sync_navigation") renderNavigationTree(msg.pages, msg.users);
+            else if (msg.type === "extraction_progress") renderExtractionProgress(msg.payload);
+        } catch(err) { log("Msg Parse Err: " + err); }
+    };
+}
+
+// --- Navigation Rendering (Accordion Tree) ---
+function renderNavigationTree(pages: any[], users: any[]) {
+    log("Rendering Nav Tree...");
+    const pageList = document.getElementById("nav-list-pages");
+    const userList = document.getElementById("nav-list-users");
+    
+    if (pageList) pageList.innerHTML = renderAccordion(pages);
+    if (userList) userList.innerHTML = renderAccordion(users);
+}
+
+function renderAccordion(nodes: any[]): string {
+    if (!nodes || nodes.length === 0) return "<div style='color:#999; padding:5px; font-size:0.7rem;'>No items</div>";
+    let html = `<ul class="logis-branch" style="list-style:none; padding-left:15px; margin:0;">`;
+    nodes.forEach((node, i) => {
+        const id = node.id || node.uuid || `node-${i}`;
+        const name = node.name || (node.data && node.data.type) || "Page";
+        const hasChildren = node.children && node.children.length > 0;
+        
+        html += `<li class="logis-parent" style="margin-bottom:8px;">`;
+        html += `<div class="logis-label" style="font-size:0.8rem; cursor:pointer;" onclick="console.log('Nav to: ${id}')"><span>${name}</span></div>`;
+        if (hasChildren) html += renderAccordion(node.children);
+        html += `</li>`;
+    });
+    html += `</ul>`;
+    return html;
+}
+
+// --- Chat History ---
+function requestChatHistory() {
+    if (dataChannel?.readyState === "open") {
+        log("Fetching chat history...");
+        dataChannel.send(JSON.stringify({ type: "get_chat_history" }));
+    }
+}
+
+function renderChatHistory(messages: any[]) {
+    if (!chatTalks) return;
+    chatTalks.innerHTML = ""; // Clear for fresh history
+    messages.forEach(msg => renderChat(msg));
+}
+
+// --- Session ---
+function updateSessionUI(session: any) {
+    if (searchInput) {
+        searchInput.disabled = false;
+        searchInput.placeholder = "Search or Ask Prompt";
+    }
+}
+
+// --- Extraction Progress ---
+function renderExtractionProgress(payload: any) {
+    const detailTitle = document.getElementById("detail-title");
+    const detailContent = document.getElementById("detail-content");
+    if (detailTitle) detailTitle.innerText = "Task Progress";
+    showDetailView(true);
+
+    if (detailContent) {
+        let logArea = document.getElementById("extraction-log-mobile");
+        if (!logArea) {
+            detailContent.innerHTML = `<div id="extraction-log-mobile" style="display:flex; flex-direction:column; gap:8px;"></div>`;
+            logArea = document.getElementById("extraction-log-mobile");
+        }
+        const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "gen";
+        const elementId = `prog-${catId}`;
+        let p = document.getElementById(elementId);
+        if (!p) {
+            p = document.createElement("div");
+            p.id = elementId; p.style.fontSize = "0.8rem";
+            p.innerHTML = `<span class="spin-icon">⏳</span> <span class="txt">${payload.summary}</span>`;
+            logArea?.appendChild(p);
+        } else {
+            p.querySelector(".txt")!.textContent = payload.summary;
+        }
+        if (payload.category === "Done") p.querySelector(".spin-icon")!.textContent = "✅";
+    }
+}
+
+// --- Common Rendering ---
+function renderList(items: any[]) {
+    const list = document.getElementById("doc-list");
+    if (!list) return;
+    list.innerHTML = items.map(item => item2html(item, false)).join("");
+    list.querySelectorAll('.logis-result').forEach(el => {
+        el.addEventListener("click", () => {
+            dataChannel?.send(JSON.stringify({ type: "get_detail", uuid: el.id }));
+        });
+    });
+}
+
+function renderDetail(title: string, content: string) {
+    document.getElementById("detail-title")!.innerText = title;
+    document.getElementById("detail-content")!.innerHTML = content;
+    showDetailView(true);
+}
+
+function renderChat(data: any) {
+    if (!chatTalks) return;
+    // Handle both old and new data structures
+    let content = data.content;
+    if (typeof content === 'string' && content.startsWith('{')) {
+        try { content = JSON.parse(content).summary || JSON.parse(content).text; } catch(e){}
+    }
+    const div = document.createElement("div");
+    div.className = `chat-talk ${data.role === 'user' ? 'user' : 'system'}`;
+    div.innerHTML = `<div class="chat-message"><div class="content">${content}</div></div>`;
+    chatTalks.appendChild(div);
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+}
+
+// --- Standard Handlers (Scanning, Camera, etc) ---
 async function startScanning() {
     if (scanning) return;
     receivedOfferChunks = []; expectedOfferTotal = 0;
-    if (qrInterval) { clearInterval(qrInterval); qrInterval = null; }
     try {
         const constraints = { video: { facingMode: "environment" } };
         videoStream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -119,17 +248,16 @@ function tick() {
 function handleQrChunk(data: string) {
     try {
         const parsed = JSON.parse(data);
-        if (Array.isArray(parsed) && parsed.length === 3) {
-            const [idx, total, chunk] = parsed;
+        if (Array.isArray(parsed) && parsed.length >= 3) {
+            const [idx, total, chunk, laptopHash] = parsed;
+            if (laptopHash) localStorage.setItem("last_laptop_hash", laptopHash);
             if (expectedOfferTotal === 0) {
                 expectedOfferTotal = total;
                 receivedOfferChunks = new Array(total).fill("");
             }
             if (!receivedOfferChunks[idx]) {
                 receivedOfferChunks[idx] = chunk;
-                log(`Offer ${idx+1}/${total}`);
-                const introH3 = document.querySelector("#mobile-intro-overlay h3");
-                if (introH3) introH3.textContent = `Scanning... ${receivedOfferChunks.filter(c => c).length}/${total}`;
+                log(`Part ${idx+1}/${total}`);
             }
             if (receivedOfferChunks.every(c => c !== "")) {
                 stopScanning();
@@ -139,51 +267,35 @@ function handleQrChunk(data: string) {
     } catch(e) {}
 }
 
-// --- WebRTC ---
 async function createPeerConnection(sdp: string) {
     peerConn = new RTCPeerConnection({ iceServers: [] });
-    
     peerConn.ondatachannel = (e) => {
         dataChannel = e.channel;
         setupDataChannel(dataChannel);
     };
-
     peerConn.oniceconnectionstatechange = () => {
-        const state = peerConn?.iceConnectionState;
-        log(`ICE: ${state}`);
-        if(state === 'connected' || state === 'completed') {
-            finalizeConnectionUI();
-        }
+        if(peerConn?.iceConnectionState === 'connected') finalizeConnectionUI();
     };
-
-    try {
-        await peerConn.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: sdp }));
-        const answer = await peerConn.createAnswer();
-        await peerConn.setLocalDescription(answer);
-        
-        // Wait for ICE gathering
-        await new Promise<void>(resolve => {
-            const pc = peerConn!;
-            if (pc.iceGatheringState === 'complete') resolve();
-            else {
-                const check = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', check); resolve(); } };
-                pc.addEventListener('icegatheringstatechange', check);
-                setTimeout(resolve, 5000); 
-            }
-        });
-
-        const fullSdp = peerConn.localDescription!.sdp;
-        const CHUNK_COUNT = 4;
-        const size = Math.ceil(fullSdp.length / CHUNK_COUNT);
-        const chunks = [];
-        for(let i=0; i<CHUNK_COUNT; i++) {
-            chunks.push(JSON.stringify([i, CHUNK_COUNT, fullSdp.substring(i*size, (i+1)*size)]));
+    await peerConn.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: sdp }));
+    const answer = await peerConn.createAnswer();
+    await peerConn.setLocalDescription(answer);
+    
+    // Finalize gathering then show Answer Slide
+    await new Promise<void>(resolve => {
+        const pc = peerConn!;
+        if (pc.iceGatheringState === 'complete') resolve();
+        else {
+            const check = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', check); resolve(); } };
+            pc.addEventListener('icegatheringstatechange', check);
+            setTimeout(resolve, 5000); 
         }
-        showAnswerSlideQr(chunks);
+    });
 
-    } catch (err: any) {
-        log("WebRTC Error: " + err);
-    }
+    const fullSdp = peerConn.localDescription!.sdp;
+    const size = Math.ceil(fullSdp.length / 4);
+    const chunks = [];
+    for(let i=0; i<4; i++) chunks.push(JSON.stringify([i, 4, fullSdp.substring(i*size, (i+1)*size)]));
+    showAnswerSlideQr(chunks);
 }
 
 function showAnswerSlideQr(chunks: string[]) {
@@ -192,10 +304,10 @@ function showAnswerSlideQr(chunks: string[]) {
     const qrDiv = document.getElementById("answer-qr")!;
     let cur = 0;
     const rotate = () => {
-        qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Answer ${cur+1}/${chunks.length}</div>`;
+        qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Part ${cur+1}/${chunks.length}</div>`;
         const q = document.createElement("div");
         qrDiv.appendChild(q);
-        new QRCode(q, { text: chunks[cur], width: 250, height: 250, correctLevel: 0 });
+        new (window as any).QRCode(q, { text: chunks[cur], width: 250, height: 250 });
         cur = (cur + 1) % chunks.length;
     };
     if (qrInterval) clearInterval(qrInterval);
@@ -203,138 +315,9 @@ function showAnswerSlideQr(chunks: string[]) {
     qrInterval = setInterval(rotate, 1000);
 }
 
-function setupDataChannel(channel: RTCDataChannel) {
-    channel.onopen = () => {
-        log("Linked!");
-        finalizeConnectionUI();
-        channel.send(JSON.stringify({ type: "search", query: "" }));
-    };
-    channel.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === "sync_list") renderList(msg.data);
-        else if (msg.type === "sync_detail") renderDetail(msg.title, msg.content);
-        else if (msg.type === "sync_chat") renderChat(msg.data);
-        else if (msg.type === "sync_session") updateSessionUI(msg.data);
-        else if (msg.type === "extraction_progress") renderExtractionProgress(msg.payload);
-    };
-}
-
-// --- Extraction Progress (Mobile Mirror) ---
-function renderExtractionProgress(payload: any) {
-    const detailTitle = document.getElementById("detail-title");
-    const detailContent = document.getElementById("detail-content");
-    
-    if (detailTitle) detailTitle.innerText = "Processing Task...";
-    showDetailView(true);
-
-    if (detailContent) {
-        let logArea = document.getElementById("extraction-log-mobile");
-        if (!logArea) {
-            detailContent.innerHTML = `<div id="extraction-log-mobile" style="display:flex; flex-direction:column; gap:8px;"></div>`;
-            logArea = document.getElementById("extraction-log-mobile");
-        }
-
-        const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "gen";
-        const elementId = `prog-${catId}`;
-        let p = document.getElementById(elementId);
-        
-        if (!p) {
-            p = document.createElement("div");
-            p.id = elementId;
-            p.style.fontSize = "0.8rem";
-            p.innerHTML = `<span class="spinner-icon">⏳</span> <span class="text">${payload.summary}</span>`;
-            logArea?.appendChild(p);
-        } else {
-            const textEl = p.querySelector(".text");
-            if (textEl) textEl.textContent = payload.summary;
-        }
-
-        if (payload.category === "Done") {
-            p.querySelector(".spinner-icon")!.textContent = "✅";
-            log("Task Done!");
-        } else if (payload.category === "Error") {
-            p.querySelector(".spinner-icon")!.textContent = "❌";
-            (p as HTMLElement).style.color = "red";
-        }
-    }
-}
-
-// --- Upload Logic ---
-const fileInput = document.getElementById("mobile-file-input") as HTMLInputElement;
-
-document.getElementById("nav-upload-btn")?.addEventListener("click", () => {
-    fileInput?.click();
-});
-
-fileInput?.addEventListener("change", async (e) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
-    if (!file) return;
-
-    log(`Uploading: ${file.name}`);
-    const reader = new FileReader();
-    reader.onload = () => {
-        const base64Data = (reader.result as string).split(",")[1];
-        if (dataChannel?.readyState === "open") {
-            dataChannel.send(JSON.stringify({
-                type: "mobile_upload",
-                name: file.name,
-                data: base64Data
-            }));
-            
-            // Show initial progress UI on mobile
-            renderExtractionProgress({ category: "Start", summary: "Sending image to desktop..." });
-        }
-    };
-    reader.readAsDataURL(file);
-});
-
-
-function updateSessionUI(session: any) {
-    log(`Syncing Session: ${session.email}`);
-    if (searchInput) {
-        searchInput.disabled = false;
-        searchInput.placeholder = "Search or Ask Prompt";
-        // If user is logged in, maybe show their email prefix
-        if (session.email) {
-            log(`User: ${session.email}`);
-        }
-    }
-    // Enable all action buttons
-    document.querySelectorAll(".nav-icons .nav-btn, .logo-section .nav-btn").forEach(btn => {
-        (btn as HTMLButtonElement).disabled = false;
-    });
-}
-
-function renderList(items: any[]) {
-    const list = document.getElementById("doc-list");
-    if (!list) return;
-    list.innerHTML = items.map(item => item2html(item, false)).join("");
-    list.querySelectorAll('.logis-result').forEach(el => {
-        el.addEventListener("click", () => {
-            if (dataChannel?.readyState === "open") {
-                dataChannel.send(JSON.stringify({ type: "get_detail", uuid: el.id }));
-            }
-        });
-    });
-}
-
-function renderDetail(title: string, content: string) {
-    document.getElementById("detail-title")!.innerText = title;
-    document.getElementById("detail-content")!.innerHTML = content;
-    showDetailView(true);
-}
-
-function renderChat(data: any) {
-    const div = document.createElement("div");
-    div.className = `chat-talk ${data.role === 'user' ? 'user' : 'system'}`;
-    div.innerHTML = `<div class="chat-message"><div class="content">${data.content}</div></div>`;
-    chatTalks.appendChild(div);
-    chatScroll.scrollTop = chatScroll.scrollHeight;
-}
-
+// --- Listeners ---
 searchInput?.addEventListener("input", (e) => {
-    const query = (e.target as HTMLInputElement).value;
-    if (dataChannel?.readyState === "open") dataChannel.send(JSON.stringify({ type: "search", query: query }));
+    dataChannel?.send(JSON.stringify({ type: "search", query: (e.target as HTMLInputElement).value }));
 });
 chatForm?.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -349,7 +332,36 @@ document.getElementById("btn-settings")?.addEventListener("click", () => switchT
 document.getElementById("btn-settings-back")?.addEventListener("click", () => switchTab("list"));
 document.getElementById("btn-detail-back")?.addEventListener("click", () => showDetailView(false));
 document.getElementById("list-refresh-btn")?.addEventListener("click", () => {
-    if (dataChannel?.readyState === "open") dataChannel.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
+    dataChannel?.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
 });
+
+const fileInput = document.getElementById("mobile-file-input") as HTMLInputElement;
+document.getElementById("nav-upload-btn")?.addEventListener("click", () => fileInput?.click());
+fileInput?.addEventListener("change", async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        const base64 = (reader.result as string).split(",")[1];
+        if (dataChannel?.readyState === "open") dataChannel.send(JSON.stringify({ type: "mobile_upload", name: file.name, data: base64 }));
+    };
+    reader.readAsDataURL(file);
+});
+
 window.addEventListener("request-camera-start", () => startScanning());
 window.addEventListener("request-camera-stop", () => stopScanning());
+
+// Global Reconnect
+(window as any).tryQuickConnect = async () => {
+    const hash = localStorage.getItem("last_laptop_hash");
+    if (!hash) return;
+    log("Quick Reconnecting...");
+    try {
+        const res = await fetch(`https://commerce.logis.center/relay/${hash}`);
+        const data = await res.json();
+        if (data && data.type === 'offer') createPeerConnection(data.sdp);
+        else alert("Desktop is not ready.");
+    } catch (e) { log("Reconnect failed."); }
+};
+
+log("Event listeners ready.");

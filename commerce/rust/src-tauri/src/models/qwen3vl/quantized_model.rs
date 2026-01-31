@@ -951,8 +951,10 @@ impl QuantizedQwen3VLTextModel {
         // Ensure we capture the PATCHED config, not the original one
         let final_config = config; 
 
+        let num_layers_to_load = if baking_only { 1 } else { final_config.num_hidden_layers };
+
         let layers: Result<Vec<_>> = pool.install(|| {
-            (0..final_config.num_hidden_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
+            (0..num_layers_to_load).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
                 let mut local_cursor = std::io::Cursor::new(mmap);
                 let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
                 let standard = format!("{base_name}.layers.{layer_idx}");
@@ -1048,8 +1050,9 @@ impl QuantizedQwen3VLTextModel {
         }
 
         let mut layers = vec![];
+        let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
-        for layer_idx in 0..config.num_hidden_layers {
+        for layer_idx in 0..num_layers_to_load {
             if current_device.is_cuda() && is_vram_checked {
                  let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
                  if simulated_free_vram > ( (effective_cost as f64 * 1.02) as u64 + safety_floor ) {
@@ -1413,6 +1416,7 @@ impl QuantizedQwen3VLModel {
         _vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
+        baking_only: bool, // [NEW] Support for 1-layer vision baker
     ) -> Result<Self> {
         let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
@@ -1421,9 +1425,16 @@ impl QuantizedQwen3VLModel {
         let vb_visual = from_gguf_content(config, ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
 
-        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
+        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        
+        // [OPTIMIZATION] If baking only, limit to 1 layer to save massive VRAM/RAM
+        if baking_only {
+            println!("[MODEL] Vision Baker Mode: Reducing LLM to 1 layer.");
+            t_config.num_hidden_layers = 1;
+        }
+
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, false
+            &t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
 
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -1452,22 +1463,35 @@ impl QuantizedQwen3VLModel {
         _vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
+        baking_only: bool, // [NEW]
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
         let vb_visual = from_gguf_content(config, ct_vision, reader_vision, vision_device, vision_dtype)?;
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
-        let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-        let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, false)?;
+        let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        
+        // [OPTIMIZATION] If baking only, limit to 1 layer
+        if baking_only {
+            println!("[MODEL] Vision Baker Mode (Reader): Reducing LLM to 1 layer.");
+            t_config.num_hidden_layers = 1;
+        }
+
+        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
-            l
-        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
-            l
+        let lm_head = if !baking_only {
+            if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
+                l
+            } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
+                l
+            } else {
+                get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+            }
         } else {
-            get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+            // Minimal header for baking only
+            QLinear::new(QMatMul::Tensor(Tensor::zeros((1, 1), head_dtype, text_device)?), None, text_device.clone())
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: None, mmproj_mmap: None })

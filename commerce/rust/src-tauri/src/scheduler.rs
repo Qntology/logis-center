@@ -6,6 +6,10 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
+use crate::openai_types::{
+    ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent,
+};
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
@@ -309,14 +313,21 @@ pub async fn start_background_worker(
                                         continue; 
                                     }
         
-                                    let store_guard = store.lock().await;                            if let Some(db) = store_guard.as_ref() {
-                                let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
-                                let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
+                                    let store_guard = store.lock().await;                            
+                                    if let Some(db) = store_guard.as_ref() {
+                                        let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
+                                        let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
+                                    }
+                                    
+                                    // [NEW] Explicitly notify UI of failure to stop spinner
+                                    let _ = app_handle.emit("extraction-progress", json!({
+                                        "task_id": task.id,
+                                        "category": "Error", "summary": format!("Failed: {}", err_msg), "spinner": "❌"
+                                    }));
+                                }
                             }
                         }
                     }
-                }
-            }
             
             // Reset token after batch is done or broken, for the next poll
             cancellation_token.store(false, Ordering::SeqCst);
@@ -380,9 +391,101 @@ async fn process_task(
     
     let language = "english"; 
 
-    // --- Image Extraction Logic ---
+    // [LOCK] Acquire Model Access
+    let model = {
+        let mut model_lock = model_mutex.lock().await;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        // [FIX] If current model doesn't match preference, unload it to force switch (CPU <-> GPU)
+        if let Some(m) = model_lock.as_ref() {
+            let wants_cpu = effective_device_pref == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
+                m.unload_generator().await;
+                *model_lock = None;
+            }
+        }
+
+        if model_lock.is_none() {
+            // [LOG-ONLY] No emit here to keep UI clean
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
+            
+            match LogisModel::new(effective_device_pref).await {
+                Ok(m) => *model_lock = Some(m),
+                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
+            }
+        }
+        model_lock.as_ref().unwrap().clone()
+    };
+
+    // --- Image Extraction Logic (Vision Baker Pipeline) ---
     if task.r#type == "image_extraction" {
-        // ... (Image logic)
+        let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        if !image_path.is_empty() {
+            println!("[Scheduler] Starting VISION BAKER (1-Layer 2B) for {}", task.id);
+            
+            let snapshot_id = format!("{}_img", task.id);
+            let prompt = crate::model::get_image_extraction_prompt("kr", "korean", "tracking", "");
+
+            // 1. [Vision Baker] Load 1-layer 2B model and bake image
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
+            
+            // Activate 2B in Baking mode (1 layer, no MLP)
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true).await?;
+            
+            // Perform prefill with image to create visual KV cache
+            let model_clone = model.clone();
+            let image_path_clone = image_path.clone();
+            let prompt_clone = prompt.clone();
+            let token_clone = cancellation_token.clone();
+            let session_clone = Some(snapshot_id.clone());
+
+            use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestMessageContentPartImage, ImageURL};
+
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let mut gen_guard = model_clone.generator.blocking_lock();
+                if let Some(worker) = gen_guard.as_mut() {
+                    worker.clear_kv_cache();
+                    
+                    // Create vision message
+                    let params = ChatCompletionParameters {
+                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                            content: ChatCompletionRequestUserMessageContent::Parts(vec![
+                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
+                                    text: prompt_clone,
+                                }),
+                                ChatCompletionRequestMessageContentPart::Image(ChatCompletionRequestMessageContentPartImage {
+                                    image_url: ImageURL { url: format!("file://{}", image_path_clone) }
+                                })
+                            ]),
+                            name: None,
+                        })],
+                        ..Default::default()
+                    };
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                }
+                Ok(())
+            }).await??;
+
+            model.save_kv_snapshot(&snapshot_id).await?;
+
+            // 2. [Full Vision] Reload full 2B model and inject baked cache
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
+            
+            // Transition to full Large model with the baked snapshot
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+
+            model.extract_from_image(
+                task.id.clone(),
+                image_path,
+                "korean".to_string(),
+                app_handle,
+                Some(cancellation_token.clone()),
+                store_mutex,
+            ).await?;
+            
+            return Ok(()); 
+        }
     }
 
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
@@ -451,32 +554,8 @@ async fn process_task(
         pug
     };
 
-    // [LOCK] Acquire Model Access
-    let model = {
-        let mut model_lock = model_mutex.lock().await;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    // [LOCK] Removed (Moved up)
 
-        // [FIX] If current model doesn't match preference, unload it to force switch (CPU <-> GPU)
-        if let Some(m) = model_lock.as_ref() {
-            let wants_cpu = effective_device_pref == Some("cpu");
-            if m.is_cpu_mode != wants_cpu {
-                println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
-                m.unload_generator().await;
-                *model_lock = None;
-            }
-        }
-
-        if model_lock.is_none() {
-            // [LOG-ONLY] No emit here to keep UI clean
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
-            
-            match LogisModel::new(effective_device_pref).await {
-                Ok(m) => *model_lock = Some(m),
-                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
-            }
-        }
-        model_lock.as_ref().unwrap().clone()
-    };
 
     use crate::openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,

@@ -100,8 +100,9 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
+        baking_only: bool, // [NEW]
     ) -> Result<Self> {
-        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only)
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only)
     }
 
     pub fn init_with_tokenizer(
@@ -114,8 +115,9 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
+        baking_only: bool, // [NEW]
     ) -> Result<Self> {
-        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only) 
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only) 
     }
 
     pub fn init_with_config(
@@ -129,6 +131,7 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
+        baking_only: bool, // [NEW]
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -200,7 +203,7 @@ impl Qwen3VLGenerateModel {
                 let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
 
-                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
+                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only)?;
                 ModelVariant::QuantizedVL(model)
             } else {
                 let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
@@ -210,10 +213,10 @@ impl Qwen3VLGenerateModel {
                 let content = gguf_file::Content::read(&mut cursor)?;
                 
                 let is_06b = path.contains("0.6B");
-                let baking_only = is_06b;
-                let single_layer_mode = is_06b;
+                let actual_baking_only = baking_only || is_06b;
+                let single_layer_mode = baking_only || is_06b;
                 
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
             }
         } else {
