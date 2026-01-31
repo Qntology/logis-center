@@ -1187,7 +1187,7 @@ async function showPcPairingQr() {
         await peerConn.setLocalDescription(offer);
 
         // 4. Wait for ICE Gathering (Essential for LAN connection)
-        console.log("[WebRTC] Gathering ICE candidates...");
+        console.log("[WebRTC] Gathering ICE candidates (5s)...");
         await new Promise<void>(resolve => {
             if (peerConn?.iceGatheringState === 'complete') {
                 resolve();
@@ -1199,23 +1199,26 @@ async function showPcPairingQr() {
                     }
                 };
                 peerConn?.addEventListener('icegatheringstatechange', check);
-                setTimeout(resolve, 2000); // 2s timeout
+                setTimeout(resolve, 5000); // 5s timeout
             }
         });
 
+        // Add 1 second stability delay
+        await new Promise(r => setTimeout(r, 1000));
+
         // 5. Generate QR Data (Multipart/Chunked)
-        const sdp = peerConn.localDescription?.sdp || "";
+        // [IMPORTANT] Use finalized SDP after gathering
+        const finalSdp = peerConn.localDescription?.sdp || "";
         const CHUNK_COUNT = 4;
-        const chunkSize = Math.ceil(sdp.length / CHUNK_COUNT);
+        const chunkSize = Math.ceil(finalSdp.length / CHUNK_COUNT);
         const chunks: string[] = [];
         
         for (let i = 0; i < CHUNK_COUNT; i++) {
-            const chunk = sdp.substring(i * chunkSize, (i + 1) * chunkSize);
-            // Format: [index, total, chunk_data]
+            const chunk = finalSdp.substring(i * chunkSize, (i + 1) * chunkSize);
             chunks.push(JSON.stringify([i, CHUNK_COUNT, chunk]));
         }
 
-        console.log(`[WebRTC] Offer Generated. Total Length: ${sdp.length}. Split into ${CHUNK_COUNT} chunks.`);
+        console.log(`[WebRTC] Offer Generated. Total Length: ${finalSdp.length}. Split into ${CHUNK_COUNT} chunks.`);
 
         // 6. Rotate QR (Slideshow)
         let currentChunkIndex = 0;

@@ -1,3 +1,4 @@
+
 import { item2html } from "./lib/render";
 
 declare const jsQR: any;
@@ -14,7 +15,7 @@ function log(msg: string) {
     }
 }
 
-log("Main module loaded. V137 (Inside Panel Intro) Initializing...");
+log("Main module loaded. V139 (Stable WebRTC) Initializing...");
 
 let videoStream: MediaStream | null = null;
 let scanning = false;
@@ -34,15 +35,9 @@ const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
 const chatScroll = document.getElementById("chat-scroll") as HTMLElement;
 
 function switchTab(tabName: string) {
-    log(`Tab -> ${tabName}`);
     tabContents.forEach(c => {
-        if (c.id === `tab-${tabName}`) {
-            c.classList.add("active");
-            c.style.display = (tabName === 'intro') ? 'flex' : 'flex'; // Use flex for all
-        } else {
-            c.classList.remove("active");
-            c.style.display = 'none';
-        }
+        if (c.id === `tab-${tabName}`) c.classList.add("active");
+        else c.classList.remove("active");
     });
 }
 
@@ -105,10 +100,11 @@ function handleQrChunk(data: string) {
             if (!receivedOfferChunks[idx]) {
                 receivedOfferChunks[idx] = chunk;
                 log(`Offer ${idx+1}/${total}`);
-                const introP = document.querySelector("#tab-intro p");
-                if (introP) introP.textContent = `Scanning... ${receivedOfferChunks.filter(c => c).length}/${total}`;
+                const introH3 = document.querySelector("#tab-intro h3");
+                if (introH3) introH3.textContent = `Offer Scanned ${receivedOfferChunks.filter(c => c).length}/${total}`;
             }
             if (receivedOfferChunks.every(c => c !== "")) {
+                log("All parts gathered. Initializing Peer...");
                 stopScanning();
                 createPeerConnection(receivedOfferChunks.join(""));
             }
@@ -118,37 +114,61 @@ function handleQrChunk(data: string) {
 
 async function createPeerConnection(sdp: string) {
     peerConn = new RTCPeerConnection({ iceServers: [] });
+    
+    peerConn.onicecandidate = (e) => {
+        if(e.candidate) log("Candidate Found");
+    };
+
     peerConn.ondatachannel = (e) => {
         dataChannel = e.channel;
         setupDataChannel(dataChannel);
     };
+
     peerConn.oniceconnectionstatechange = () => {
-        if(peerConn?.iceConnectionState === 'connected') {
-            log("🚀 Connected! Switching to List UI...");
+        const state = peerConn?.iceConnectionState;
+        log(`ICE: ${state}`);
+        if(state === 'connected') {
+            document.getElementById("mobile-intro-overlay")!.style.display = 'none';
             if (qrInterval) { clearInterval(qrInterval); qrInterval = null; }
             document.getElementById("answer-qr-container")!.style.display = 'none';
-            
-            // Enable UI
-            switchTab("tab-list");
-            if (searchInput) {
-                searchInput.disabled = false;
-                searchInput.placeholder = "Search or Ask Prompt";
-            }
-            document.querySelectorAll(".nav-icons .nav-btn").forEach(btn => (btn as HTMLButtonElement).disabled = false);
         }
     };
-    await peerConn.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: sdp }));
-    const answer = await peerConn.createAnswer();
-    await peerConn.setLocalDescription(answer);
-    
-    const fullSdp = peerConn.localDescription!.sdp;
-    const CHUNK_COUNT = 4;
-    const size = Math.ceil(fullSdp.length / CHUNK_COUNT);
-    const chunks = [];
-    for(let i=0; i<CHUNK_COUNT; i++) {
-        chunks.push(JSON.stringify([i, CHUNK_COUNT, fullSdp.substring(i*size, (i+1)*size)]));
+
+    try {
+        await peerConn.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: sdp }));
+        const answer = await peerConn.createAnswer();
+        await peerConn.setLocalDescription(answer);
+        
+        log("Waiting for stable ICE gathering (5s)...");
+        // Increased wait time for mobile network radio stabilization
+        await new Promise<void>(resolve => {
+            const pc = peerConn!;
+            if (pc.iceGatheringState === 'complete') resolve();
+            else {
+                const check = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', check); resolve(); } };
+                pc.addEventListener('icegatheringstatechange', check);
+                setTimeout(resolve, 5000); // 5 seconds
+            }
+        });
+
+        // Add 1 second delay as requested to prevent "too fast" errors
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Use the finalized localDescription
+        const finalSdp = peerConn.localDescription!.sdp;
+        const CHUNK_COUNT = 4;
+        const size = Math.ceil(finalSdp.length / CHUNK_COUNT);
+        const chunks = [];
+        for(let i=0; i<CHUNK_COUNT; i++) {
+            chunks.push(JSON.stringify([i, CHUNK_COUNT, finalSdp.substring(i*size, (i+1)*size)]));
+        }
+        
+        log("Displaying Answer QR Slides...");
+        showAnswerSlideQr(chunks);
+
+    } catch (err: any) {
+        log("WebRTC Error: " + err);
     }
-    showAnswerSlideQr(chunks);
 }
 
 function showAnswerSlideQr(chunks: string[]) {
@@ -157,10 +177,10 @@ function showAnswerSlideQr(chunks: string[]) {
     const qrDiv = document.getElementById("answer-qr")!;
     let cur = 0;
     const rotate = () => {
-        qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Part ${cur+1}/${chunks.length}</div>`;
+        qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Answer ${cur+1}/${chunks.length}</div>`;
         const q = document.createElement("div");
         qrDiv.appendChild(q);
-        new QRCode(q, { text: chunks[cur], width: 250, height: 250 });
+        new QRCode(q, { text: chunks[cur], width: 250, height: 250, correctLevel: 0 }); // Level L
         cur = (cur + 1) % chunks.length;
     };
     if (qrInterval) clearInterval(qrInterval);
@@ -170,7 +190,7 @@ function showAnswerSlideQr(chunks: string[]) {
 
 function setupDataChannel(channel: RTCDataChannel) {
     channel.onopen = () => {
-        log("Linked!");
+        log("Connection Success!");
         channel.send(JSON.stringify({ type: "search", query: "" }));
     };
     channel.onmessage = (e) => {
@@ -218,8 +238,8 @@ chatForm?.addEventListener("submit", (e) => {
         input.value = "";
     }
 });
-document.getElementById("btn-settings")?.addEventListener("click", () => switchTab("tab-settings"));
-document.getElementById("btn-settings-back")?.addEventListener("click", () => switchTab("tab-list"));
+document.getElementById("btn-settings")?.addEventListener("click", () => switchTab("settings"));
+document.getElementById("btn-settings-back")?.addEventListener("click", () => switchTab("list"));
 document.getElementById("btn-detail-back")?.addEventListener("click", () => showDetailView(false));
 document.getElementById("list-refresh-btn")?.addEventListener("click", () => {
     dataChannel?.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
