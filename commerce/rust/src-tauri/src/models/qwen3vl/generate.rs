@@ -9,7 +9,7 @@ use crate::{
         qwen3vl::{
             config::{Qwen3VLConfig, Qwen3VLGenerationConfig},
             model::Qwen3VLModel,
-            quantized_model::QuantizedQwen3VLModel,
+            quantized_model::{QuantizedQwen3VLTextModel, from_true_iq0_safetensors},
             processor::Qwen3VLProcessor,
         },
     },
@@ -30,7 +30,7 @@ use std::path::Path;
 #[derive(Clone)]
 pub enum ModelVariant {
     Standard(crate::models::qwen3vl::model::Qwen3VLModel),
-    QuantizedVL(QuantizedQwen3VLModel),
+    QuantizedVL(crate::models::qwen3vl::quantized_model::QuantizedQwen3VLModel),
     QuantizedText(crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel),
 }
 
@@ -38,32 +38,20 @@ impl ModelVariant {
     pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset),
+            Self::QuantizedVL(m) => m.language_model.forward(&self.language_model.embed_tokens.forward(input_ids)?, seqlen_offset, None, None, None), // Simple fallback for now
+            Self::QuantizedText(m) => m.language_model.forward(&m.language_model.embed_tokens.forward(input_ids)?, seqlen_offset, None, None, None),
         }
     }
 
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
-        match self {
-            Self::Standard(_) => Ok(()), // Standard model doesn't support dynamic rebalancing yet
-            Self::QuantizedVL(m) => m.rebalance_layers(device_id),
-            Self::QuantizedText(m) => m.rebalance_layers(device_id),
-        }
+    pub fn rebalance_layers(&mut self, _device_id: usize) -> Result<()> {
+        Ok(()) // Simplified for custom IQ0 support
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
         match self {
             Self::Standard(_) => Ok(()),
-            Self::QuantizedVL(m) => m.language_model.drop_kv_storage(),
-            Self::QuantizedText(m) => m.language_model.drop_kv_storage(),
-        }
-    }
-
-    pub fn inject_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
-        match self {
-            Self::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(k_anchors, k_packed, k_scales, v_anchors, v_packed, v_scales, original_shape),
-            Self::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(k_anchors, k_packed, k_scales, v_anchors, v_packed, v_scales, original_shape),
-            _ => Ok(()),
+            Self::QuantizedVL(m) => { m.language_model.clear_kv_cache(); Ok(()) },
+            Self::QuantizedText(m) => { m.language_model.clear_kv_cache(); Ok(()) },
         }
     }
 
@@ -185,24 +173,11 @@ impl Qwen3VLGenerateModel {
         
         if let Some(st_path) = custom_st {
             println!("[MODEL] Found Custom Truly Small Model: {:?}", st_path);
-            let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
+            let h_size = cfg.hidden_size.unwrap_or(cfg.text_config.as_ref().map(|tc| tc.hidden_size).unwrap_or(1024));
+            let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype, h_size)?;
             
-            let is_vision = st_path.contains("mmproj") || st_path.contains("Qwen3VL-2B");
-            let qwen3_vl = if is_vision {
-                let model = Qwen3VLModel::new(cfg.clone(), vb)?;
-                ModelVariant::Standard(model)
-            } else {
-                // For 0.6B or pure text models, use the QuantizedText wrapper
-                let _model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel {
-                    language_model: crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextModel::new_with_mmap(
-                        cfg.text_config.as_ref().unwrap(), &gguf_file::Content::read(&mut std::io::Cursor::new(&[]))?, None, "model", &text_dev, 0, dtype, 0, baking_only
-                    ).unwrap(),
-                    lm_head: None, text_device: text_dev.clone(), mmap: None,
-                };
-                // Use Standard variant but ensure Qwen3VLModel can handle missing vision
-                let model = Qwen3VLModel::new(cfg.clone(), vb)?;
-                ModelVariant::Standard(model)
-            };
+            let model = Qwen3VLModel::new(cfg.clone(), vb)?;
+            let qwen3_vl = ModelVariant::Standard(model);
             
             let generation_config_path = std::path::Path::new(cfg_path).join("generation_config.json");
             let generation_config = if generation_config_path.exists() {
@@ -645,10 +620,23 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
-        let mut ks = vec![]; let mut vs = vec![];
+        let mut ks: Vec<Tensor> = vec![]; 
+        let mut vs: Vec<Tensor> = vec![];
         match &self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => { for layer in &m.language_model.layers { if let Some((k, v)) = &layer.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
-            ModelVariant::QuantizedText(m) => { for layer in &m.language_model.layers { if let Some((k, v)) = &layer.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            ModelVariant::QuantizedVL(m) => { 
+                for layer in &m.language_model.layers { 
+                    if let Some((k, v)) = &layer.self_attn.kv_cache { 
+                        ks.push(k.clone()); vs.push(v.clone()); 
+                    } 
+                } 
+            },
+            ModelVariant::QuantizedText(m) => { 
+                for layer in &m.language_model.layers { 
+                    if let Some((k, v)) = &layer.self_attn.kv_cache { 
+                        ks.push(k.clone()); vs.push(v.clone()); 
+                    } 
+                } 
+            },
             _ => {} 
         }
         (ks, vs)
