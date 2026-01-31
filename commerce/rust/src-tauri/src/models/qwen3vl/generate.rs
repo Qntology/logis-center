@@ -9,7 +9,7 @@ use crate::{
         qwen3vl::{
             config::{Qwen3VLConfig, Qwen3VLGenerationConfig},
             model::Qwen3VLModel,
-            quantized_model::{QuantizedQwen3VLTextModel, from_true_iq0_safetensors},
+            quantized_model::{QuantizedQwen3VLModel, QuantizedQwen3TextModel, from_true_iq0_safetensors},
             processor::Qwen3VLProcessor,
         },
     },
