@@ -583,8 +583,22 @@ pub fn eager_attention_forward(
                     //     println!("[TRACE-ATTN] weights: {:?} {:?}, mask: {:?} {:?}", 
                     //         attn_weights.device(), attn_weights.dtype(), mask.device(), mask.dtype());
                     // }
-                    // [FIX] Force both to F32 for the mask addition to avoid BF16 CPU errors
-                    let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
+                    // [FIX] Automatic Mask Alignment for Growing KV Cache
+                    let (b_sz, _, q_len, kv_len) = attn_weights.dims4()?;
+                    let m_len = mask.dim(D::Minus1)?;
+                    
+                    let aligned_mask = if m_len < kv_len {
+                        // Pad mask with 0s (allowed) to match KV length
+                        let padding = Tensor::zeros((b_sz, 1, q_len, kv_len - m_len), mask.dtype(), mask.device())?;
+                        Tensor::cat(&[padding, mask.clone()], D::Minus1)?
+                    } else if m_len > kv_len {
+                        // Truncate mask to match KV length
+                        mask.narrow(D::Minus1, 0, kv_len)?
+                    } else {
+                        mask.clone()
+                    };
+
+                    let mask_f32 = aligned_mask.to_dtype(candle_core::DType::F32)?;
                     let weights_f32 = attn_weights.to_dtype(candle_core::DType::F32)?;
                     weights_f32.broadcast_add(&mask_f32)?.to_dtype(attn_weights.dtype())?
                 },

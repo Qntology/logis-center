@@ -126,7 +126,23 @@ impl QuantizedQwen3VLTextAttention {
             Some((pk, pv)) => (Tensor::cat(&[pk, &key_states], 2)?, Tensor::cat(&[pv, &value_states], 2)?),
         };
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
-        let attn_output = eager_attention_forward(&query_states, &key_states, &value_states, Some(self.num_kv_groups), mask, self.scaling)?;
+        
+        // [FIX] Causal Mask Scaling for Batched Context Baking
+        let actual_kv_len = key_states.dim(2)?;
+        let adjusted_mask = if let Some(m) = mask {
+            let m_len = m.dim(D::Minus1)?;
+            if m_len < actual_kv_len {
+                // If mask is smaller than KV cache, pad it with zeros (allowed regions)
+                let padding = Tensor::zeros((b_sz, 1, q_len, actual_kv_len - m_len), m.dtype(), m.device())?;
+                Some(Tensor::cat(&[padding, m.clone()], D::Minus1)?)
+            } else if m_len > actual_kv_len {
+                Some(m.narrow(D::Minus1, 0, actual_kv_len)?)
+            } else {
+                Some(m.clone())
+            }
+        } else { None };
+
+        let attn_output = eager_attention_forward(&query_states, &key_states, &value_states, Some(self.num_kv_groups), adjusted_mask.as_ref(), self.scaling)?;
         let attn_output = attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         Ok(self.o_proj.forward(&attn_output)?)
     }
@@ -219,13 +235,23 @@ impl QuantizedQwen3VLTextModel {
             layers.push(QuantizedQwen3VLTextDecoderLayer::new(config, ct, &mut reader, &format!("blk.{i}"), device, dtype, i, baking_only)?);
         }
         let norm = get_rms_norm(ct, &mut reader, "output_norm", config.rms_norm_eps, device, dtype)?;
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section: config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
+        
+        // [FIX] Force 2B-standard M-RoPE sections
+        let mut mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
+        if mrope_section.is_empty() || mrope_section.iter().sum::<usize>() != 64 {
+            mrope_section = vec![16, 16, 32];
+        }
+
+        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
     }
     pub fn forward(&mut self, embeds: &Tensor, seqlen_offset: usize, pos_ids: Option<&Tensor>, visual_mask: Option<&Tensor>, ds_embeds: Option<Vec<Tensor>>) -> Result<Tensor> {
         let (b, s, _) = embeds.dims3()?;
         let pos_ids = match pos_ids { Some(ids) => ids.clone(), None => Tensor::arange(seqlen_offset as u32, (s + seqlen_offset) as u32, embeds.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b, s))? };
         let (cos, sin) = self.rotary_emb.forward(&pos_ids, embeds.dtype(), self.mrope_section.clone())?;
+        
+        // [FIX] Prepare batched causal mask with offset awareness
         let mask = if s <= 1 { None } else { Some(prepare_causal_attention_mask(b, s, seqlen_offset, embeds.device())?) };
+        
         let mut xs = embeds.clone();
         for (i, layer) in self.layers.iter_mut().enumerate() {
             xs = layer.forward_with_params(&xs, &cos, &sin, mask.as_ref())?;
@@ -358,11 +384,13 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
         } else if base_name.starts_with("blk.") {
             let parts: Vec<&str> = base_name[4..].splitn(2, '.').collect();
             let mapped = match parts[1] {
+                "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),
+                "attn_k_norm.weight" => "self_attn.k_norm.weight".to_string(),
                 s if s.starts_with("attn_q") => s.replace("attn_q", "self_attn.q_proj"), s if s.starts_with("attn_k") => s.replace("attn_k", "self_attn.k_proj"),
                 s if s.starts_with("attn_v") => s.replace("attn_v", "self_attn.v_proj"), s if s.starts_with("attn_output") => s.replace("attn_output", "self_attn.o_proj"),
                 s if s.starts_with("attn_norm") => s.replace("attn_norm", "input_layernorm"), s if s.starts_with("ffn_norm") => s.replace("ffn_norm", "post_attention_layernorm"),
                 s if s.starts_with("ffn_gate") => s.replace("ffn_gate", "mlp.gate_proj"), s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.up_proj"),
-                s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), _ => parts[1].to_string()
+                s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.down_proj"), _ => parts[1].to_string()
             };
             target_name = format!("language_model.layers.{}.{}", parts[0], mapped);
         } else if base_name.contains("token_embd") {
@@ -375,7 +403,7 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             target_name = "lm_head.bias".to_string();
         }
 
-        let mut final_tensor = if is_packed {
+        let final_tensor = if is_packed {
             let shape_tensor = st.tensor(&format!("{base_name}.shape"))?;
             let shape: Vec<usize> = shape_tensor.data().chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
@@ -408,25 +436,33 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
         };
 
-        // [LINEAR-BRIDGE] Auto-pad 0.6B (1024/3072) -> 2B (2048/6144)
-        for dim in 0..final_tensor.rank() {
-            let current_size = final_tensor.dim(dim)?;
-            if (current_size == 1024) || (current_size == 3072) {
-                // Double the size on this dimension
-                final_tensor = Tensor::cat(&[&final_tensor, &final_tensor], dim)?;
+        // [Surgical Physical Bridge in Rust]
+        let mut expanded_tensor = final_tensor;
+        let is_neural_weight = target_name.contains("proj") || target_name.contains("embed_tokens") || target_name.contains("norm.weight") || target_name.contains("mlp") || target_name.contains("lm_head");
+        
+        if is_neural_weight {
+            for dim in 0..expanded_tensor.rank() {
+                let size = expanded_tensor.dim(dim)?;
+                if size == 1024 || size == 3072 {
+                    if (target_name.contains("k_proj") || target_name.contains("v_proj")) && dim == 0 { continue; }
+                    expanded_tensor = Tensor::cat(&[&expanded_tensor, &expanded_tensor], dim)?;
+                }
             }
         }
 
         if !target_name.starts_with("lm_head") {
-            data.insert(format!("model.{}", target_name), final_tensor);
+            data.insert(format!("model.{}", target_name), expanded_tensor);
         } else {
-            data.insert(target_name, final_tensor);
+            data.insert(target_name, expanded_tensor);
         }
     }
     
+    // Final check of critical tensor shapes
     if let Some(t) = data.get("model.language_model.embed_tokens.weight") {
-        println!("[MODEL-TRACE] Bridged embed_tokens.weight: {:?}", t.shape());
+        println!("[MODEL-TRACE] Physical Bridge SUCCESS: embed_tokens is {:?}", t.shape());
     }
-    
+    if let Some(t) = data.get("model.language_model.layers.0.mlp.gate_proj.weight") {
+        println!("[MODEL-TRACE] Physical Bridge SUCCESS: gate_proj is {:?}", t.shape());
+    }
     Ok(VarBuilder::from_tensors(data, dtype, device))
 }

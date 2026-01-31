@@ -203,6 +203,7 @@ impl Qwen3VLTextRotaryEmbedding {
         freqs: &Tensor,
         mrope_section: Vec<usize>,
     ) -> Result<Tensor> {
+        println!("[ROPE-DEBUG] freqs shape: {:?}, mrope_section: {:?}", freqs.shape(), mrope_section);
         let mut freqs_t = freqs.i(0)?.contiguous()?; 
 
         for (dim, section) in mrope_section.iter().enumerate().skip(1) {

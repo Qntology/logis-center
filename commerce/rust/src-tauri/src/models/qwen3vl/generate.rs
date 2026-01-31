@@ -150,10 +150,17 @@ impl Qwen3VLGenerateModel {
 
         let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&final_config_path)?)?;
 
-        let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() {
+        let mut cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() {
             serde_json::from_value(raw_config)?
         } else {
-            let text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
+            let mut text_config: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
+            // Ensure head_dim is correctly captured from flat config (default 128)
+            if let Some(h) = raw_config.get("head_dim").and_then(|v| v.as_u64()) {
+                text_config.head_dim = h as usize;
+            } else if text_config.head_dim == 0 {
+                text_config.head_dim = 128; 
+            }
+            
             crate::models::qwen3vl::config::Qwen3VLConfig {
                 architectures: raw_config.get("architectures").and_then(|v| serde_json::from_value(v.clone()).ok()),
                 auto_map: raw_config.get("auto_map").and_then(|v| serde_json::from_value(v.clone()).ok()),
@@ -168,8 +175,8 @@ impl Qwen3VLGenerateModel {
                 vision_config: None,
                 vision_start_token_id: None,
                 vision_end_token_id: None,
-                        }
-                    };
+            }
+        };
         let text_dev = get_device(text_device);
         let vision_dev = get_device(vision_device);
         let cfg_dtype = cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16");

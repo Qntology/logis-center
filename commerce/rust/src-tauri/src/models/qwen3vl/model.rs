@@ -1252,7 +1252,7 @@ impl Qwen3VLModel {
 
         let position_ids;
         let rope_deltas;
-        if (cache_position.is_some() && cache_position.unwrap().i(0)?.to_scalar::<u32>()? == 0)
+        if (cache_position.is_some() && cache_position.unwrap().i((0, 0))?.to_scalar::<u32>()? == 0)
             || self.rope_deltas.is_none()
         {
             (position_ids, rope_deltas) =
