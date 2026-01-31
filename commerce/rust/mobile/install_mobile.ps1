@@ -6,12 +6,33 @@ Write-Host ">>> [하이브리드 모드] 정석 빌드와 수동 우회를 결�
 
 $projectRoot = "C:\Users\HP\Documents\GitHub\cron-logis-center\commerce\rust"
 $mobilePath = "$projectRoot\mobile"
-$appId = "com.logis.scanner.v110"
+$appId = "com.logis.scanner.v111"
 $adbPath = "C:\Users\HP\AppData\Local\Android\Sdk\platform-tools\adb.exe"
 
 # Node.js 경로 설정
 $env:PATH = "C:\Program Files\nodejs\;" + $env:PATH
 $env:PATH = "C:\Users\HP\AppData\Roaming\npm\;" + $env:PATH
+
+# 0. 딥 클린 (Deep Clean) - 이전 빌드 결과물 및 캐시 완전 삭제
+Write-Host "[0/5] 딥 클린 실행 중 (캐시 및 이전 결과물 삭제)..." -ForegroundColor Yellow
+$distPath = "$projectRoot\dist\mobile"
+$androidAssetsPath = "$mobilePath\src-tauri\gen/android\app/src/main/assets\_tauri_assets"
+$localPropertiesPath = "$mobilePath\src-tauri\gen/android\local.properties"
+
+if (Test-Path $distPath) { 
+    Write-Host "  - 삭제 중: $distPath"
+    Remove-Item -Recurse -Force $distPath 
+}
+if (Test-Path $androidAssetsPath) { 
+    Write-Host "  - 삭제 중: $androidAssetsPath"
+    Remove-Item -Recurse -Force $androidAssetsPath 
+}
+
+# 0.1 안드로이드 SDK 경로 설정 (local.properties 복구)
+if (!(Test-Path $localPropertiesPath)) {
+    Write-Host "  - local.properties 생성 중..." -ForegroundColor Cyan
+    "sdk.dir=C\:/Users/HP/AppData/Local/Android/Sdk" | Out-File -FilePath $localPropertiesPath -Encoding ascii
+}
 
 # 1. 웹 프론트엔드 빌드
 Write-Host "[1/5] 웹 프론트엔드 빌드 중..." -ForegroundColor Yellow

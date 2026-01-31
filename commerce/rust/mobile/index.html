@@ -13,53 +13,60 @@
     <script src="./marked.js"></script>
 
     <!-- Main Styles -->
-    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./styles.css?v=137">
     
     <style>
-        body { background-color: #fff !important; pointer-events: auto !important; }
-        .widget-wrapper { max-width: none !important; width: 100vw !important; height: 100vh !important; display: flex; flex-direction: column; }
-        #mobile-intro-overlay {
-            position: fixed; inset: 0; background: #fff; z-index: 9999;
-            display: flex; flex-direction: column; align-items: center; justify-content: center;
-        }
-        #btn-auto-launch, #nav-qr-container, #device-preference-container, #settings-tools, #btn-list-back {
-            display: none !important;
+        /* Build Tag */
+        #build-tag {
+            position: fixed; top: 2px; right: 5px; font-size: 8px; 
+            color: rgba(0,0,0,0.2); z-index: 100002; pointer-events: none;
         }
     </style>
 </head>
 <body>
-    <div id="mobile-intro-overlay">
-        <p style="font-size:3rem; margin:0;">📡</p>
-        <h3 style="margin:10px 0;">Disconnected</h3>
-        <p style="color: #666; font-size: 0.8rem; margin-bottom:20px;">Scan desktop QR to start</p>
-        <button class="primary-btn" onclick="startCamera()" style="width: auto; padding: 12px 40px; border-radius: 25px;">SCAN START</button>
-    </div>
+    <div id="build-tag">V137</div>
 
     <div class="widget-wrapper">
+      <!-- 1. The Pill Nav (Always Visible) -->
       <nav class="pill-nav">
         <div class="logo-section"><button id="nav-upload-btn" class="nav-btn">➕</button></div>
         <div id="search-container" class="search-container">
             <div id="search-tags-container" class="search-tags-container"></div>
-            <input type="text" id="global-search" class="search-input" placeholder="Search..." />
+            <input type="text" id="global-search" class="search-input" placeholder="Disconnected..." disabled />
         </div>
         <div class="nav-icons">
-          <button id="btn-submit" class="nav-btn">🔍</button>
-          <button id="btn-settings" class="nav-btn">🗨️</button>
+          <button id="btn-submit" class="nav-btn" disabled>🔍</button>
+          <button id="btn-settings" class="nav-btn" disabled>🗨️</button>
         </div>
       </nav>
 
-      <section id="content-panel" class="content-panel open" style="flex:1;">
-        <div id="tab-list" class="tab-content active">
-           <div id="list-view" style="height:100%; display:flex; flex-direction:column;">
+      <!-- 2. The Content Panel -->
+      <section id="content-panel" class="content-panel open">
+        
+        <!-- Disconnected / Intro View (Inside Panel) -->
+        <div id="tab-intro" class="tab-content active" style="display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; flex:1; height:100%;">
+            <p style="font-size:3rem; margin:0;">📡</p>
+            <h3 style="margin:10px 0;">Disconnected</h3>
+            <p style="color: #666; font-size: 0.8rem; margin-bottom:20px;">Scan desktop QR to start</p>
+            <button class="primary-btn" onclick="startCamera()" style="width: auto; padding: 12px 40px; border-radius: 25px;">SCAN START</button>
+        </div>
+
+        <!-- Tab: List (Hidden until connected) -->
+        <div id="tab-list" class="tab-content">
+           <div id="list-view" style="width:100%; height:100%; display:flex; flex-direction:column;">
                <div class="header-row">
                     <h2>Results</h2>
                     <button id="list-refresh-btn" class="nav-btn">🔄</button>
                </div>
-               <div id="list-scroll-container" class="list-container" style="flex:1; overflow-y: auto; padding: 0 10px;">
-                    <div id="doc-list" class="card-list"></div>
+               <div id="list-scroll-container" class="chat-container" style="flex:1;">
+                 <div id="list-scroll" class="chat-scroll">
+                    <div id="doc-list" class="chat-talks"></div>
+                 </div>
                </div>
            </div>
-           <div id="detail-view" style="display:none; height:100%; flex-direction:column;">
+
+           <!-- Detail Overlay -->
+           <div id="detail-view" style="display:none; width:100%; height:100%; flex-direction:column;">
                <div class="header-row">
                    <button id="btn-detail-back" class="nav-btn">⬅︎</button>
                    <h2 id="detail-title">Detail</h2>
@@ -68,10 +75,11 @@
            </div>
         </div>
 
+        <!-- Tab: Settings (Chat) -->
         <div id="tab-settings" class="tab-content">
            <div class="header-row">
              <button id="btn-settings-back" class="nav-btn">⬅︎</button>
-             <h2>Remote Chat</h2>
+             <h2>Remote Hub</h2>
            </div>
            <div class="chat-container">
                 <div class="chat-scroll" id="chat-scroll">
@@ -79,16 +87,17 @@
                 </div>
                 <form name="chat-form" class="chat-form">
                     <input type="text" name="talk" placeholder="Message..." required autocomplete="off">
-                    <button type="submit" class="primary-btn">➤</button>
+                    <button type="submit" class="primary-btn" style="padding: 5px 15px;">➤</button>
                 </form>
            </div>
         </div>
       </section>
     </div>
 
+    <!-- Scanner & QR Overlays -->
     <div id="scanner-overlay" style="display:none; position:fixed; inset:0; background:#000; z-index:100000;">
         <video id="v" playsinline autoplay muted style="width:100%; height:100%; object-fit:cover;"></video>
-        <button onclick="stopCamera()" style="position:absolute; bottom:50px; left:50%; transform:translateX(-50%); background:red; color:white; padding:15px 40px; border-radius:25px; border:none; font-weight:bold;">CANCEL</button>
+        <button onclick="stopCamera()" class="cancel-btn">CANCEL</button>
     </div>
 
     <div id="answer-qr-container" style="position:fixed; inset:0; background:white; z-index:99998; display:none; flex-direction:column; align-items:center; justify-content:center;">
