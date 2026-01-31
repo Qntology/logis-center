@@ -100,9 +100,10 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
-        baking_only: bool, // [NEW]
+        baking_only: bool,
+        force_4bit: bool, // [NEW]
     ) -> Result<Self> {
-        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only)
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, force_4bit)
     }
 
     pub fn init_with_tokenizer(
@@ -115,9 +116,10 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
-        baking_only: bool, // [NEW]
+        baking_only: bool,
+        force_4bit: bool, // [NEW]
     ) -> Result<Self> {
-        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only) 
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, force_4bit) 
     }
 
     pub fn init_with_config(
@@ -131,7 +133,8 @@ impl Qwen3VLGenerateModel {
         dtype: Option<DType>,
         hard_token_limit: Option<usize>,
         force_text_only: bool,
-        baking_only: bool, // [NEW]
+        baking_only: bool,
+        force_4bit: bool, // [NEW]
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -165,24 +168,75 @@ impl Qwen3VLGenerateModel {
                 vision_config: None,
                 vision_start_token_id: None,
                 vision_end_token_id: None,
-            }
-        };
-
+                        }
+                    };
         let text_dev = get_device(text_device);
         let vision_dev = get_device(vision_device);
         let cfg_dtype = cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16");
         let dtype = get_dtype(dtype, cfg_dtype);
 
         let gguf_files = find_type_files(path, "gguf")?;
-        let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
+        let st_files = find_type_files(path, "safetensors")?;
         
-        // [OPTIMIZATION] If force_text_only is enabled, treat it as a non-vision model
-        let is_vision_model = mmproj_path.is_some() && !force_text_only;
-
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
+        // [FIX] Prioritize custom TRUE_IQ0 safetensors for extreme low-memory usage
+        let custom_st = st_files.iter().find(|f| f.contains("TRUE_IQ0.safetensors"));
+        
+        if let Some(st_path) = custom_st {
+            println!("[MODEL] Found Custom Truly Small Model: {:?}", st_path);
+            let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
+            
+            let is_vision = st_path.contains("mmproj") || st_path.contains("Qwen3VL-2B");
+            let qwen3_vl = if is_vision {
+                let model = Qwen3VLModel::new(cfg.clone(), vb)?;
+                ModelVariant::Standard(model)
+            } else {
+                // For 0.6B or pure text models, use the QuantizedText wrapper
+                let _model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel {
+                    language_model: crate::models::qwen3vl::quantized_model::QuantizedQwen3VLTextModel::new_with_mmap(
+                        cfg.text_config.as_ref().unwrap(), &gguf_file::Content::read(&mut std::io::Cursor::new(&[]))?, None, "model", &text_dev, 0, dtype, 0, baking_only
+                    ).unwrap(),
+                    lm_head: None, text_device: text_dev.clone(), mmap: None,
+                };
+                // Use Standard variant but ensure Qwen3VLModel can handle missing vision
+                let model = Qwen3VLModel::new(cfg.clone(), vb)?;
+                ModelVariant::Standard(model)
+            };
+            
+            let generation_config_path = std::path::Path::new(cfg_path).join("generation_config.json");
+            let generation_config = if generation_config_path.exists() {
+                serde_json::from_slice(&std::fs::read(generation_config_path)?)?
+            } else { Qwen3VLGenerationConfig::default() };
+            
+            return Ok(Self {
+                chat_template, tokenizer, pre_processor, qwen3_vl,
+                text_device: text_dev, vision_device: vision_dev,
+                eos_token_id1: 151643, eos_token_id2: 151645,
+                generation_config, model_name: "qwen3-custom-iq0".to_string(),
+                hard_token_limit,
+            });
+        }
+
+        // [FIX] Precision Selection Logic for mmproj
+        let mut mmproj_path = if force_4bit {
+            gguf_files.iter().find(|f| f.contains("mmproj") && !f.contains("IQ1_S")).cloned()
+        } else {
+            gguf_files.iter().find(|f| f.contains("mmproj") && f.contains("IQ1_S")).cloned()
+        };
+        if mmproj_path.is_none() { mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned(); }
+        
+        let is_vision_model = mmproj_path.is_some() && !force_text_only;
+
         let qwen3_vl = if !gguf_files.is_empty() {
-            let mut model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
+            // [FIX] Precision Selection Logic for Main Model
+            let mut model_path = if force_4bit {
+                gguf_files.iter().find(|f| f.contains("Qwen3VL-2B") && !f.contains("IQ1_S")).cloned()
+            } else {
+                gguf_files.iter().find(|f| f.contains("Qwen3VL-2B-Instruct-IQ1_S.gguf")).cloned()
+            };
+            
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
 

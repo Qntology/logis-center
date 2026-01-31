@@ -362,11 +362,11 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, force_4bit: bool) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {}, Force4bit: {})...", target_size, is_baking, force_4bit);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
@@ -378,7 +378,7 @@ impl LogisModel {
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
         // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
         let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
-        self.ensure_generator_ext(target_size, text_only, is_baking).await?;
+        self.ensure_generator_ext(target_size, text_only, is_baking, force_4bit).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -393,8 +393,8 @@ impl LogisModel {
     pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
         
-        // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true).await?;
+        // 1. Load Small Model Isolated (Baking: true, Force4bit: false)
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
 
         // 2. Ingest PUG content
         {
@@ -430,20 +430,9 @@ impl LogisModel {
         
         // Only load if not already loaded or if current loaded session is different?
         // secure_vram_relay checks size but not session content.
-        // We force a relay if we are not Large. If we are Large, we assume we might need to reset or just continue.
-        // For safety in this new flow, we can check if we need to load.
         
-        {
-            let current_size = *self.current_size.lock().await;
-            if current_size == Some(ModelSize::Large) {
-                // Already Large. Assuming context is preserved or we manage it.
-                // But if we just switched from Small, we need to load base.
-                // The safest is to rely on secure_vram_relay's logic:
-                // If we pass the base_session as task_id, it will load that snapshot.
-            }
-        }
-
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token).await
+        // [FIX] Force 4-bit for high-precision inference (Baking: false, Force4bit: true)
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, true).await
     }
 
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
@@ -463,7 +452,9 @@ impl LogisModel {
                 shared_path.as_deref(), // Tokenizer path
                 shared_path.as_deref(), // Config path
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
-                force_text_only
+                force_text_only,
+                false, // baking_only default
+                false  // force_4bit default
             )
         }).await??;
         
@@ -471,20 +462,20 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.ensure_generator_ext(size, false, false).await
+        self.ensure_generator_ext(size, false, false, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool, force_4bit: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
         let mut large_slot = self.large_hibernation.lock().await;
 
-        if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only {
+        if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only && !force_4bit {
             return Ok(());
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
+        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {}, Force4bit: {})...", size, force_text_only, baking_only, force_4bit);
         // ... (rest of the switching logic remains similar but uses the new loading)
 
         // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
@@ -552,7 +543,8 @@ impl LogisModel {
                 shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                baking_only // [PASS-NEW]
+                baking_only,
+                force_4bit
             )
         }).await??;
 

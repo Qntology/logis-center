@@ -860,7 +860,7 @@ impl Qwen3VLTextModel {
 #[derive(Debug, Clone)]
 pub struct Qwen3VLModel {
     config: Qwen3VLConfig,
-    visual: Qwen3VLVisionModel,
+    visual: Option<Qwen3VLVisionModel>,
     language_model: Qwen3VLTextModel,
     lm_head: Linear,
     rope_deltas: Option<Tensor>,
@@ -870,8 +870,19 @@ impl Qwen3VLModel {
     pub fn new(config: Qwen3VLConfig, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let config = config.clone();
-        let v_config = config.vision_config.clone().ok_or(anyhow!("Missing vision_config for Qwen3VLModel"))?;
-        let visual = Qwen3VLVisionModel::new(v_config, vb_m.pp("visual"))?;
+        
+        // [FIX] Optional Vision Initialization
+        let visual = if let Some(v_config) = config.vision_config.clone() {
+            // Check if essential vision tensor exists to decide whether to init
+            if vb_m.pp("visual").pp("patch_embed").pp("proj").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() {
+                Some(Qwen3VLVisionModel::new(v_config, vb_m.pp("visual"))?)
+            } else {
+                println!("[MODEL] Vision tensors not found. Skipping Vision initialization.");
+                None
+            }
+        } else {
+            None
+        };
         
         // [FIX] text_config is optional, but required for Qwen3VLModel
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
@@ -898,11 +909,12 @@ impl Qwen3VLModel {
 
     fn get_vision_features(
         &self,
+        visual_model: &Qwen3VLVisionModel,
         pixel_values: &Tensor,
         image_grid_thw: &Tensor,
     ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
         let (image_embeds, deepstack_image_embeds) =
-            self.visual.forward(pixel_values, image_grid_thw)?;
+            visual_model.forward(pixel_values, image_grid_thw)?;
         
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let split_sizes: Vec<usize> = prod_tensor_last_dim(image_grid_thw)?
@@ -1155,48 +1167,52 @@ impl Qwen3VLModel {
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
         let mut image_mask = None;
         let mut video_mask = None;
-        let mut deepstack_image_embeds = None;
-        let mut deepstack_video_embeds = None;
-        if let Some(pixel_values) = pixel_values {
-            if let Some(image_grid_thw) = image_grid_thw {
-                let (image_embeds, deepstack_img_embed) =
-                    self.get_vision_features(pixel_values, image_grid_thw)?;
-                let image_embeds = Tensor::cat(&image_embeds, 0)?;
-                let vision_mask = self.get_placeholder_mask(input_ids, true)?;
-                let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-                if n_image_tokens as usize != image_embeds.dim(0)? {
-                    return Err(anyhow!(format!(
-                        "n_image_token num: {} not equal to image_embed len: {}",
-                        n_image_tokens,
-                        image_embeds.dim(0)?
-                    )));
+        let mut deepstack_image_embeds: Option<Vec<Tensor>> = None;
+        let mut deepstack_video_embeds: Option<Vec<Tensor>> = None;
+        
+        // [FIX] Only process vision if visual component is initialized
+        if let Some(visual_model) = &self.visual {
+            if let Some(pixel_values) = pixel_values {
+                if let Some(image_grid_thw) = image_grid_thw {
+                    let (image_embeds, ds_embeds) =
+                        self.get_vision_features(visual_model, pixel_values, image_grid_thw)?;
+                    let image_embeds = Tensor::cat(&image_embeds, 0)?;
+                    let vision_mask = self.get_placeholder_mask(input_ids, true)?;
+                    let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                    if n_image_tokens as usize != image_embeds.dim(0)? {
+                        return Err(anyhow!(format!(
+                            "n_image_token num: {} not equal to image_embed len: {}",
+                            n_image_tokens,
+                            image_embeds.dim(0)?
+                        )));
+                    }
+                    inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
+                    image_mask = Some(vision_mask);
+                    deepstack_image_embeds = Some(ds_embeds);
                 }
-                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
-                image_mask = Some(vision_mask);
-                deepstack_image_embeds = Some(deepstack_img_embed);
+            }
+            if let Some(pixel_values_video) = pixel_values_video {
+                if let Some(video_grid_thw) = video_grid_thw {
+                    let (video_embeds, ds_embeds) =
+                        self.get_vision_features(visual_model, pixel_values_video, video_grid_thw)?;
+                    let video_embeds = Tensor::cat(&video_embeds, 0)?;
+                    let vision_mask = self.get_placeholder_mask(input_ids, false)?;
+                    let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                    if n_video_tokens as usize != video_embeds.dim(0)? {
+                        return Err(anyhow!(format!(
+                            "n_image_token num: {} not equal to image_embed len: {}",
+                            n_video_tokens,
+                            video_embeds.dim(0)?
+                        )));
+                    }
+                    inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
+                    video_mask = Some(vision_mask);
+                    deepstack_video_embeds = Some(ds_embeds);
+                }
             }
         }
-        if let Some(pixel_values_video) = pixel_values_video {
-            if let Some(video_grid_thw) = video_grid_thw {
-                let (video_embeds, deepstack_video_embed) =
-                    self.get_vision_features(pixel_values_video, video_grid_thw)?;
-                let video_embeds = Tensor::cat(&video_embeds, 0)?;
-                let vision_mask = self.get_placeholder_mask(input_ids, false)?;
-                let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
-                if n_video_tokens as usize != video_embeds.dim(0)? {
-                    return Err(anyhow!(format!(
-                        "n_image_token num: {} not equal to image_embed len: {}",
-                        n_video_tokens,
-                        video_embeds.dim(0)?
-                    )));
-                }
-                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
-                video_mask = Some(vision_mask);
-                deepstack_video_embeds = Some(deepstack_video_embed);
-            }
-        }
-        let mut visual_pos_mask = None;
-        let mut deepstack_visual_embeds = None;
+        let mut visual_pos_mask: Option<Tensor> = None;
+        let mut deepstack_visual_embeds: Option<Vec<Tensor>> = None;
         if let Some(image_mask_) = image_mask {
             if let Some(video_mask_) = video_mask {
                 let image_mask_ = image_mask_.squeeze(0)?;
@@ -1209,19 +1225,19 @@ impl Qwen3VLModel {
                 let video_nonzero_joint = nonzero_index(&video_mask_joint)?;
                 let mut deepstack_embeds = vec![];
                 let visual_len = visual_none_zero_index.dim(0)?;
-                for (img_embed, vid_embed) in deepstack_image_embeds
-                    .unwrap()
-                    .iter()
-                    .zip(deepstack_video_embeds.unwrap().iter())
-                {
-                    let embed_joint = Tensor::zeros(
-                        (visual_len, img_embed.dim(D::Minus1)?),
-                        img_embed.dtype(),
-                        img_embed.device(),
-                    )?;
-                    let embed_joint = embed_joint.index_add(&image_nonzero_joint, img_embed, 0)?;
-                    let embed_joint = embed_joint.index_add(&video_nonzero_joint, vid_embed, 0)?;
-                    deepstack_embeds.push(embed_joint);
+                
+                // Use explicit Option unwrapping safely
+                if let (Some(img_ds), Some(vid_ds)) = (deepstack_image_embeds, deepstack_video_embeds) {
+                    for (img_embed, vid_embed) in img_ds.iter().zip(vid_ds.iter()) {
+                        let embed_joint = Tensor::zeros(
+                            (visual_len, img_embed.dim(D::Minus1)?),
+                            img_embed.dtype(),
+                            img_embed.device(),
+                        )?;
+                        let embed_joint = embed_joint.index_add(&image_nonzero_joint, img_embed, 0)?;
+                        let embed_joint = embed_joint.index_add(&video_nonzero_joint, vid_embed, 0)?;
+                        deepstack_embeds.push(embed_joint);
+                    }
                 }
                 visual_pos_mask = Some(visual_mask.unsqueeze(0)?);
                 deepstack_visual_embeds = Some(deepstack_embeds);

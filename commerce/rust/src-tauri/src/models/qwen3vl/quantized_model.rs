@@ -511,6 +511,40 @@ impl QuantizedQwen3VLTextAttention {
         Ok(t.to_device(device)?)
     }
 
+    /// [NEW] True Sub-1-bit Decompression (1.06bpw)
+    pub fn decompress_true_iq0(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
+        let device = packed.device();
+        let packed_vec = packed.to_vec1::<u8>()?;
+        let scales_vec = scales.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        
+        let total_elements: usize = original_shape.iter().product();
+        let mut decoded = vec![0.0f32; total_elements];
+        
+        // Each scale covers 256 elements (32 packed bytes)
+        decoded.par_chunks_mut(256).enumerate().for_each(|(block_idx, block_out)| {
+            if block_idx < scales_vec.len() {
+                let scale = scales_vec[block_idx];
+                let packed_start = block_idx * 32;
+                
+                for i in 0..32 {
+                    let global_packed_idx = packed_start + i;
+                    if global_packed_idx >= packed_vec.len() { break; }
+                    let byte = packed_vec[global_packed_idx];
+                    for bit in 0..8 {
+                        let inner_idx = i * 8 + bit;
+                        if inner_idx < block_out.len() {
+                            let is_set = (byte & (1 << bit)) != 0;
+                            block_out[inner_idx] = if is_set { scale } else { -scale };
+                        }
+                    }
+                }
+            }
+        });
+        
+        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
+        Ok(t.to_device(device)?)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
     }
@@ -1706,5 +1740,224 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
     }
     for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
     if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); } } }
-    Ok(VarBuilder::from_tensors(data, dtype, device))
-}
+        Ok(VarBuilder::from_tensors(data, dtype, device))
+    }
+    
+    /// [NEW] Load Truly Small Safetensors (1.06bpw) into VarBuilder
+    pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
+        let file = std::fs::read(path)?;
+        let st = safetensors::SafeTensors::deserialize(&file)?;
+        let mut data = HashMap::new();
+        
+        // We need a dummy model to access decompress_true_iq0, or just implement it static
+        // For simplicity, we'll implement the logic here directly or use a dummy.
+        println!("[MODEL] Unpacking Truly Small Safetensors: {:?}", path);
+    
+                for (name, view) in st.tensors() {
+    
+                    let mut target_name = name.clone();
+    
+                    
+    
+                    // [FIX] Map prefixes to match Qwen3VLModel's expected structure (model.visual or model.language_model)
+    
+                    if name.starts_with("v.") {
+    
+                        let rest = &name[2..];
+    
+                        if rest.starts_with("blk.") {
+    
+                            let parts: Vec<&str> = rest[4..].splitn(2, '.').collect();
+    
+                            let mapped = match parts[1] {
+    
+                                s if s.starts_with("ln1") => s.replace("ln1", "norm1"),
+    
+                                s if s.starts_with("ln2") => s.replace("ln2", "norm2"),
+    
+                                s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"),
+    
+                                s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"),
+    
+                                s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"),
+    
+                                s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"),
+    
+                                _ => parts[1].to_string()
+    
+                            };
+    
+                            target_name = format!("model.visual.blocks.{}.{}", parts[0], mapped);
+    
+                        } else if rest.starts_with("patch_embd") { target_name = rest.replace("patch_embd", "model.visual.patch_embed.proj"); }
+    
+                        else if rest.starts_with("position_embd") { target_name = rest.replace("position_embd", "model.visual.pos_embed"); }
+    
+                        else if rest.starts_with("post_ln") { target_name = rest.replace("post_ln", "model.visual.merger.norm"); }
+    
+                        else { target_name = format!("model.visual.{}", rest); }
+    
+                    } else if name.starts_with("mm.") {
+    
+                        let rest = &name[3..];
+    
+                        if rest.starts_with("0") { target_name = rest.replace("0", "model.visual.merger.linear_fc1"); }
+    
+                        else if rest.starts_with("2") { target_name = rest.replace("2", "model.visual.merger.linear_fc2"); }
+    
+                    } else if name.starts_with("blk.") {
+    
+                        // [NEW] Language Model Layer Mapping
+    
+                        let parts: Vec<&str> = name[4..].splitn(2, '.').collect();
+    
+                        let mapped = match parts[1] {
+    
+                            s if s.starts_with("attn_q") => s.replace("attn_q", "self_attn.q_proj"),
+    
+                            s if s.starts_with("attn_k") => s.replace("attn_k", "self_attn.k_proj"),
+    
+                            s if s.starts_with("attn_v") => s.replace("attn_v", "self_attn.v_proj"),
+    
+                            s if s.starts_with("attn_output") => s.replace("attn_output", "self_attn.o_proj"),
+    
+                            s if s.starts_with("attn_norm") => s.replace("attn_norm", "input_layernorm"),
+    
+                            s if s.starts_with("ffn_norm") => s.replace("ffn_norm", "post_attention_layernorm"),
+    
+                            s if s.starts_with("ffn_gate") => s.replace("ffn_gate", "mlp.gate_proj"),
+    
+                            s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.up_proj"),
+    
+                            s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), // Match GateUpDownMLP naming
+    
+                            _ => parts[1].to_string()
+    
+                        };
+    
+                        target_name = format!("model.language_model.layers.{}.{}", parts[0], mapped);
+    
+                    } else if name == "token_embd.weight" || name == "token_embd.packed" {
+    
+                        target_name = "model.language_model.embed_tokens".to_string() + if name.ends_with(".packed") { ".packed" } else { ".weight" };
+    
+                    } else if name == "output_norm.weight" {
+    
+                        target_name = "model.language_model.norm.weight".to_string();
+    
+                    } else if name == "output.weight" || name == "lm_head.weight" {
+    
+                        target_name = "lm_head.weight".to_string();
+    
+                    }
+    
+            
+    
+                        
+    
+                                if target_name.ends_with(".packed") {
+    
+                                    let base_name = target_name.strip_suffix(".packed").unwrap();
+    
+                                    
+    
+                                    if base_name.contains("token_embd") {
+    
+                                        // 2-bit Embedding Unpack
+    
+                                        let scale_view = st.tensor(&format!("{}.scale", name.strip_suffix(".packed").unwrap()))?;
+    
+                                        let scale = f32::from_le_bytes(scale_view.data()[0..4].try_into().unwrap());
+    
+                                        
+    
+                                        let packed = view.data();
+    
+                                        let mut unpacked = vec![0.0f32; packed.len()];
+    
+                                        for (i, &p) in packed.iter().enumerate() {
+    
+                                            unpacked[i] = ((p as f32) - 1.5) * scale;
+    
+                                        }
+    
+                                        
+    
+                                        // Shape for embedding
+    
+                                        let h = 1024; // Qwen3 0.6B default
+    
+                                        let vocab = unpacked.len() / h;
+    
+                                        let t = Tensor::from_vec(unpacked, (vocab, h), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?;
+    
+                                        data.insert(base_name.to_string() + ".weight", t);
+    
+                                    } else {
+    
+                        // 1.06bpw Weight Unpack
+                let scales_view = st.tensor(&format!("{}.scales", name.strip_suffix(".packed").unwrap()))?;
+                let scales_data = scales_view.data();
+                let scales_vec: Vec<f32> = scales_data.chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect();
+                
+                // Metadata access fix: Use view.shape() directly instead of metadata()
+                let shape = view.shape().to_vec();
+                let base_name = name.strip_suffix(".packed").unwrap();
+                
+                let packed_vec = view.data();
+                let total_elements: usize = shape.iter().product();
+                let mut decoded = vec![0.0f32; total_elements];
+                
+                use rayon::prelude::*;
+                decoded.par_chunks_mut(256).enumerate().for_each(|(block_idx, block_out)| {
+                    if block_idx < scales_vec.len() {
+                        let scale = scales_vec[block_idx];
+                        let packed_start = block_idx * 32;
+                        for i in 0..32 {
+                            let gp_idx = packed_start + i;
+                            if gp_idx >= packed_vec.len() { break; }
+                            let byte = packed_vec[gp_idx];
+                            for bit in 0..8 {
+                                let inner_idx = i * 8 + bit;
+                                if inner_idx < block_out.len() {
+                                    let is_set = (byte & (1 << bit)) != 0;
+                                    block_out[inner_idx] = if is_set { scale } else { -scale };
+                                }
+                            }
+                        }
+                    }
+                });
+    
+                                        let t = Tensor::from_vec(decoded, shape.as_slice(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?;
+    
+                                        data.insert(base_name.to_string(), t);
+    
+                                    }
+    
+                                } else if !name.contains(".scales") && !name.contains(".scale") {
+    
+                                    // Norms, Biases - Handle f16 data correctly
+    
+                                    let raw_data = view.data();
+    
+                                    let f32_data: Vec<f32> = raw_data.chunks_exact(2)
+    
+                                        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+    
+                                        .collect();
+    
+                                    let t = Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?;
+    
+                                    data.insert(target_name.to_string(), t.to_device(device)?.to_dtype(dtype)?);
+    
+                                }
+    
+                            }
+    
+                        
+        
+        Ok(VarBuilder::from_tensors(data, dtype, device))
+    }
+    

@@ -427,11 +427,11 @@ async fn process_task(
             let snapshot_id = format!("{}_img", task.id);
             let prompt = crate::model::get_image_extraction_prompt("kr", "korean", "tracking", "");
 
-            // 1. [Vision Baker] Load 1-layer 2B model and bake image
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
+            // 1. [Vision Baker] Load 1-layer 1-BIT 2B model and bake image
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer IQ1_S)...", "spinner": "⠋" }));
             
-            // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true).await?;
+            // Activate 2B in Baking mode (Large, NoSnapshot, CancelToken, Baking:true, Force4bit:false)
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
             
             // Perform prefill with image to create visual KV cache
             let model_clone = model.clone();
@@ -447,15 +447,14 @@ async fn process_task(
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
                     
-                    // Create vision message
                     let params = ChatCompletionParameters {
                         messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Parts(vec![
+                            content: ChatCompletionRequestUserMessageContent::Array(vec![
                                 ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
                                     text: prompt_clone,
                                 }),
-                                ChatCompletionRequestMessageContentPart::Image(ChatCompletionRequestMessageContentPartImage {
-                                    image_url: ImageURL { url: format!("file://{}", image_path_clone) }
+                                ChatCompletionRequestMessageContentPart::ImageURL(ChatCompletionRequestMessageContentPartImage {
+                                    image_url: ImageURL { url: format!("file://{}", image_path_clone), detail: None }
                                 })
                             ]),
                             name: None,
@@ -469,11 +468,11 @@ async fn process_task(
 
             model.save_kv_snapshot(&snapshot_id).await?;
 
-            // 2. [Full Vision] Reload full 2B model and inject baked cache
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
+            // 2. [Full Vision] Reload full 4-BIT 2B model and inject baked cache
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 4-BIT VL...", "spinner": "⠋" }));
             
-            // Transition to full Large model with the baked snapshot
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            // Transition to full Large model (Large, Snapshot, CancelToken, Baking:false, Force4bit:true)
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
 
             model.extract_from_image(
                 task.id.clone(),
@@ -594,7 +593,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
             
             let model_clone = model.clone();
             let question_clone = task_question.clone();
@@ -622,7 +621,7 @@ async fn process_task(
 
         // 2. [2B] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -686,7 +685,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake Full Context
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
@@ -713,7 +712,7 @@ async fn process_task(
 
         // 2. [2B] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -832,12 +831,14 @@ async fn process_task(
             let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
             if !has_snapshot {
-                // 1. [0.6B] Bake Detail Context
-                println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
-                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
-                
-                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
-                let model_clone = model.clone();
+                        // 1. [Baking Phase] Load 2B model in light Vision-Baker mode
+                        log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Baking visual context (Light Mode)...", "spinner": "⠋" }));
+                        
+                        // [FIX] Use Large model with is_baking=true for vision tasks (Small model has no vision)
+                        model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
+            
+                        let model_clone = model.clone();
+            
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
                 let session_clone = Some(snapshot_id.clone());
@@ -863,7 +864,7 @@ async fn process_task(
 
             // 2. [2B] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
