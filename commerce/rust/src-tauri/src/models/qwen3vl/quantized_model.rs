@@ -324,13 +324,12 @@ pub fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, r
     Ok(RmsNorm::new(w, eps))
 }
 
-pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hidden_size: usize) -> Result<VarBuilder<'static>> {
+pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
     let file = std::fs::read(path)?;
     let st = safetensors::SafeTensors::deserialize(&file)?;
     let mut data = HashMap::new();
     println!("[MODEL] Unpacking Truly Small Safetensors: {:?}", path);
     for (name, view) in st.tensors() {
-        // Identify packed tensor component
         if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") { continue; }
 
         let is_packed = name.ends_with(".packed");
@@ -338,7 +337,6 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
         
         let mut target_name = base_name.to_string();
         
-        // Map the base name to target path expected by VarBuilder hierarchies
         if base_name.starts_with("v.") {
             let rest = &base_name[2..];
             if rest.starts_with("blk.") {
@@ -377,16 +375,17 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
             target_name = "lm_head.bias".to_string();
         }
 
-        // Decompress packed or load raw
-        let final_tensor = if is_packed {
+        let mut final_tensor = if is_packed {
+            let shape_tensor = st.tensor(&format!("{base_name}.shape"))?;
+            let shape: Vec<usize> = shape_tensor.data().chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
+
             if base_name.contains("token_embd") {
                 let scale = f32::from_le_bytes(st.tensor(&format!("{base_name}.scale"))?.data()[0..4].try_into().unwrap());
                 let unpacked: Vec<f32> = view.data().iter().map(|&p| (p as f32 - 1.5) * scale).collect();
-                let vocab = unpacked.len() / hidden_size;
-                Tensor::from_vec(unpacked, (vocab, hidden_size), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
+                Tensor::from_vec(unpacked, shape.as_slice(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
             } else {
                 let scales_vec: Vec<f32> = st.tensor(&format!("{base_name}.scales"))?.data().chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
-                let shape: Vec<usize> = st.tensor(&format!("{base_name}.shape"))?.data().chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
                 let mut decoded = vec![0.0f32; shape.iter().product()]; let packed_vec = view.data();
                 decoded.par_chunks_mut(256).enumerate().for_each(|(b_idx, b_out)| {
                     if b_idx < scales_vec.len() {
@@ -409,7 +408,15 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
             Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
         };
 
-        // Final key check: Qwen3VLModel expects nested names under "model"
+        // [LINEAR-BRIDGE] Auto-pad 0.6B (1024/3072) -> 2B (2048/6144)
+        for dim in 0..final_tensor.rank() {
+            let current_size = final_tensor.dim(dim)?;
+            if (current_size == 1024) || (current_size == 3072) {
+                // Double the size on this dimension
+                final_tensor = Tensor::cat(&[&final_tensor, &final_tensor], dim)?;
+            }
+        }
+
         if !target_name.starts_with("lm_head") {
             data.insert(format!("model.{}", target_name), final_tensor);
         } else {
@@ -417,11 +424,8 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
         }
     }
     
-    // Debug Trace
     if let Some(t) = data.get("model.language_model.embed_tokens.weight") {
-        println!("[MODEL-TRACE] Found embed_tokens.weight: {:?}", t.shape());
-    } else {
-        println!("[MODEL-TRACE] MISSING embed_tokens.weight! Available: {:?}", data.keys().take(5).collect::<Vec<_>>());
+        println!("[MODEL-TRACE] Bridged embed_tokens.weight: {:?}", t.shape());
     }
     
     Ok(VarBuilder::from_tensors(data, dtype, device))

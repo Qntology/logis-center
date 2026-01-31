@@ -185,8 +185,7 @@ impl Qwen3VLGenerateModel {
         
         if let Some(st_path) = custom_st {
             println!("[MODEL] Found Custom Truly Small Model: {:?}", st_path);
-            let h_size = cfg.hidden_size.unwrap_or(cfg.text_config.as_ref().map(|tc| tc.hidden_size).unwrap_or(1024));
-            let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype, h_size)?;
+            let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
             
             let model = Qwen3VLModel::new(cfg.clone(), vb)?;
             let qwen3_vl = ModelVariant::Standard(model);
