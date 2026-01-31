@@ -39,11 +39,13 @@ impl ModelVariant {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
             Self::QuantizedVL(m) => {
-                let embeds = m.language_model.embed_tokens.forward(input_ids)?;
+                let flat = input_ids.flatten_all()?;
+                let embeds = m.language_model.embed_tokens.forward(&flat)?.reshape((input_ids.dim(0)?, input_ids.dim(1)?, ()))?;
                 m.language_model.forward(&embeds, seqlen_offset, None, None, None)
             },
             Self::QuantizedText(m) => {
-                let embeds = m.language_model.embed_tokens.forward(input_ids)?;
+                let flat = input_ids.flatten_all()?;
+                let embeds = m.language_model.embed_tokens.forward(&flat)?.reshape((input_ids.dim(0)?, input_ids.dim(1)?, ()))?;
                 m.language_model.forward(&embeds, seqlen_offset, None, None, None)
             },
         }

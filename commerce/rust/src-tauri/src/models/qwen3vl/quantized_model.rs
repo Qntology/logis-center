@@ -141,7 +141,27 @@ pub struct QuantizedQwen3VLTextDecoderLayer {
     pub input_layernorm: RmsNorm, pub post_attention_layernorm: Option<RmsNorm>,
 }
 
+impl Module for QuantizedQwen3VLTextDecoderLayer {
+    fn forward(&self, _xs: &Tensor) -> candle_core::Result<Tensor> {
+        Err(candle_core::Error::Msg("Use custom forward with cos/sin/mask".to_string()))
+    }
+}
+
 impl QuantizedQwen3VLTextDecoderLayer {
+    pub fn forward_with_params(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        let residual = xs.clone();
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, mask)?;
+        let xs = residual.add(&xs)?;
+        if let (Some(g), Some(u), Some(d), Some(n)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
+            let residual = xs.clone();
+            let xs = n.forward(&xs)?;
+            let gate = candle_nn::ops::silu(&g.forward(&xs)?)?;
+            let up = u.forward(&xs)?;
+            let xs = d.forward(&gate.mul(&up)?)?;
+            Ok(residual.add(&xs)?)
+        } else { Ok(xs) }
+    }
     pub fn new<R: std::io::Seek + std::io::Read>(config: &Qwen3VLTextConfig, ct: &gguf_file::Content, reader: &mut R, base_name: &str, device: &Device, dtype: DType, layer_idx: usize, baking_only: bool) -> Result<Self> {
         let is_gguf = base_name.starts_with("blk.");
         let (q, k, v, o, q_n, k_n) = if is_gguf { ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm") } else { ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm") };
@@ -174,30 +194,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
         if let Some(d) = &mut self.mlp_down { d.to_device(device)?; }
         if let Some(n) = &mut self.post_attention_layernorm { n.to_device(device)?; }
         Ok(())
-    }
-}
-
-impl Module for QuantizedQwen3VLTextDecoderLayer {
-    fn forward(&self, _xs: &Tensor) -> candle_core::Result<Tensor> {
-        // Module trait implementation for basic forward (not used by our LLM loop which needs more params)
-        Err(candle_core::Error::Msg("Use custom forward with cos/sin/mask".to_string()))
-    }
-}
-
-impl QuantizedQwen3VLTextDecoderLayer {
-    pub fn forward_with_params(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let residual = xs.clone();
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin, mask)?;
-        let xs = residual.add(&xs)?;
-        if let (Some(g), Some(u), Some(d), Some(n)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
-            let residual = xs.clone();
-            let xs = n.forward(&xs)?;
-            let gate = candle_nn::ops::silu(&g.forward(&xs)?)?;
-            let up = u.forward(&xs)?;
-            let xs = d.forward(&gate.mul(&up)?)?;
-            Ok(residual.add(&xs)?)
-        } else { Ok(xs) }
     }
 }
 
@@ -332,8 +328,10 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
     let file = std::fs::read(path)?;
     let st = safetensors::SafeTensors::deserialize(&file)?;
     let mut data = HashMap::new();
+    println!("[MODEL] Unpacking Truly Small Safetensors: {:?}", path);
     for (name, view) in st.tensors() {
         let mut target_name = name.clone();
+        
         if name.starts_with("v.") {
             let rest = &name[2..];
             if rest.starts_with("blk.") {
@@ -343,15 +341,15 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
                     s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"), s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"),
                     s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"), s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), _ => parts[1].to_string()
                 };
-                target_name = format!("model.visual.blocks.{}.{}", parts[0], mapped);
-            } else if rest.starts_with("patch_embd") { target_name = rest.replace("patch_embd", "model.visual.patch_embed.proj"); }
-            else if rest.starts_with("position_embd") { target_name = rest.replace("position_embd", "model.visual.pos_embed"); }
-            else if rest.starts_with("post_ln") { target_name = rest.replace("post_ln", "model.visual.merger.norm"); }
-            else { target_name = format!("model.visual.{}", rest); }
+                target_name = format!("visual.blocks.{}.{}", parts[0], mapped);
+            } else if rest.starts_with("patch_embd") { target_name = "visual.patch_embed.proj".to_string(); }
+            else if rest.starts_with("position_embd") { target_name = "visual.pos_embed".to_string(); }
+            else if rest.starts_with("post_ln") { target_name = "visual.merger.norm".to_string(); }
+            else { target_name = format!("visual.{}", rest); }
         } else if name.starts_with("mm.") {
             let rest = &name[3..];
-            if rest.starts_with("0") { target_name = rest.replace("0", "model.visual.merger.linear_fc1"); }
-            else if rest.starts_with("2") { target_name = rest.replace("2", "model.visual.merger.linear_fc2"); }
+            if rest.starts_with("0") { target_name = "visual.merger.linear_fc1".to_string(); }
+            else if rest.starts_with("2") { target_name = "visual.merger.linear_fc2".to_string(); }
         } else if name.starts_with("blk.") {
             let parts: Vec<&str> = name[4..].splitn(2, '.').collect();
             let mapped = match parts[1] {
@@ -361,19 +359,24 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
                 s if s.starts_with("ffn_gate") => s.replace("ffn_gate", "mlp.gate_proj"), s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.up_proj"),
                 s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), _ => parts[1].to_string()
             };
-            target_name = format!("model.language_model.layers.{}.{}", parts[0], mapped);
-        } else if name == "token_embd.weight" || name == "token_embd.packed" { target_name = "model.language_model.embed_tokens.weight".to_string(); }
-        else if name == "output_norm.weight" { target_name = "model.language_model.norm.weight".to_string(); }
-        else if name == "output.weight" || name == "lm_head.weight" { target_name = "lm_head.weight".to_string(); }
+            target_name = format!("language_model.layers.{}.{}", parts[0], mapped);
+        } else if name == "token_embd.weight" || name == "token_embd.packed" {
+            target_name = "language_model.embed_tokens.weight".to_string();
+        } else if name == "output_norm.weight" {
+            target_name = "language_model.norm.weight".to_string();
+        } else if name == "output.weight" || name == "lm_head.weight" {
+            target_name = "lm_head.weight".to_string();
+        } else if name == "lm_head.bias" || name == "output.bias" {
+            target_name = "lm_head.bias".to_string();
+        }
 
-        if name.ends_with(".packed") {
+        let final_tensor = if name.ends_with(".packed") {
             let base = name.strip_suffix(".packed").unwrap();
-            let target_base = target_name.strip_suffix(".packed").unwrap();
             if base.contains("token_embd") {
                 let scale = f32::from_le_bytes(st.tensor(&format!("{base}.scale"))?.data()[0..4].try_into().unwrap());
                 let unpacked: Vec<f32> = view.data().iter().map(|&p| (p as f32 - 1.5) * scale).collect();
                 let vocab = unpacked.len() / hidden_size;
-                data.insert(target_base.to_string(), Tensor::from_vec(unpacked, (vocab, hidden_size), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?);
+                Tensor::from_vec(unpacked, (vocab, hidden_size), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
             } else {
                 let scales_vec: Vec<f32> = st.tensor(&format!("{base}.scales"))?.data().chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
                 let shape: Vec<usize> = st.tensor(&format!("{base}.shape"))?.data().chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
@@ -390,14 +393,27 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType, hid
                         }
                     }
                 });
-                data.insert(target_base.to_string(), Tensor::from_vec(decoded, shape.as_slice(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?);
+                Tensor::from_vec(decoded, shape.as_slice(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
             }
         } else if !name.contains(".scales") && !name.contains(".scale") && !name.contains(".shape") {
             let raw = view.data();
             let f32_data: Vec<f32> = if raw.len() % 4 == 0 { raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
             else { raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect() };
-            data.insert(target_name.to_string(), Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?);
+            Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
+        } else {
+            continue; // Skip metadata tensors
+        };
+
+        // [FINAL FIX] Key mapping for VarBuilder::pp("model")
+        if !target_name.starts_with("lm_head") {
+            data.insert(format!("model.{}", target_name), final_tensor);
+        } else {
+            data.insert(target_name, final_tensor);
         }
     }
+    
+    // Debug: Print final keys
+    println!("[MODEL] VarBuilder Keys (First 5): {:?}", data.keys().take(5).collect::<Vec<_>>());
+    
     Ok(VarBuilder::from_tensors(data, dtype, device))
 }
