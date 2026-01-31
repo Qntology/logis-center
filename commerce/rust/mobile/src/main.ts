@@ -1,14 +1,9 @@
+import { item2html } from "./lib/render";
 
-
-// Import styles to ensure Vite bundles them
-import "../styles.css";
-
-// Declare global types for external libraries loaded via <script>
+// Declare global types
 declare const jsQR: any;
-declare const pako: any;
 declare const QRCode: any;
 
-// Utility to write to the log panel in HTML
 function log(msg: string) {
     console.log(`[Main] ${msg}`);
     const panel = document.getElementById("log-panel");
@@ -20,451 +15,29 @@ function log(msg: string) {
     }
 }
 
-log("Main module loaded. Initializing...");
+log("Main module loaded. V134 (Slide QR) Initializing...");
 
-import { item2html } from "./lib/render";
-
-// State
+// --- State ---
 let videoStream: MediaStream | null = null;
 let scanning = false;
-let dataChannel: RTCDataChannel | null = null; // Store data channel globally
+let dataChannel: RTCDataChannel | null = null;
+let peerConn: RTCPeerConnection | null = null;
+let receivedOfferChunks: string[] = [];
+let expectedOfferTotal = 0;
+let qrInterval: any = null;
 
-// DOM Elements
+// --- DOM Elements ---
+const video = document.getElementById("v") as HTMLVideoElement;
+const searchInput = document.getElementById("global-search") as HTMLInputElement;
+const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
+const listView = document.getElementById("list-view") as HTMLElement;
+const detailView = document.getElementById("detail-view") as HTMLElement;
 const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormElement;
 const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
 const chatScroll = document.getElementById("chat-scroll") as HTMLElement;
 
-// --- Data Channel Handlers ---
-
-function setupMobileDataChannel(channel: RTCDataChannel) {
-    channel.onopen = () => {
-        log("Data Channel OPEN (Client)");
-        channel.send(JSON.stringify({ type: "search", query: "" }));
-    };
-
-    channel.onmessage = (e) => {
-        try {
-            const msg = JSON.parse(e.data);
-            if (msg.type === "sync_list") {
-                renderRemoteList(msg.data);
-            } else if (msg.type === "sync_detail") {
-                renderRemoteDetail(msg.title, msg.content);
-            } else if (msg.type === "sync_chat") {
-                renderChatMessage(msg.data);
-            }
-        } catch (err) {
-            log("Msg Err: " + err);
-        }
-    };
-}
-
-// --- Chat Logic ---
-
-chatForm?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const input = chatForm.querySelector('input[name="talk"]') as HTMLInputElement;
-    if (!input || !input.value.trim()) return;
-
-    const content = input.value.trim();
-    
-    // 1. Show locally immediately
-    renderChatMessage({ role: "user", content: content });
-
-    // 2. Send to Desktop
-    if (dataChannel?.readyState === "open") {
-        dataChannel.send(JSON.stringify({ type: "chat_message", content: content }));
-    }
-
-    input.value = "";
-});
-
-function renderChatMessage(data: { role: string, content: string }) {
-    if (!chatTalks) return;
-    
-    const div = document.createElement("div");
-    div.className = `chat-talk ${data.role === 'user' ? 'user' : 'system'}`;
-    
-    // Simple markdown-ish or plain text
-    div.innerHTML = `
-        <div class="chat-message">
-            <div class="content">${data.content}</div>
-        </div>
-    `;
-    
-    chatTalks.appendChild(div);
-    
-    // Scroll to bottom
-    if (chatScroll) {
-        chatScroll.scrollTop = chatScroll.scrollHeight;
-    }
-}
-
-// --- Navigation Button Handlers ---
-
-document.getElementById("btn-submit")?.addEventListener("click", () => {
-    if (dataChannel?.readyState === "open") {
-        dataChannel.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
-    }
-});
-
-document.getElementById("nav-upload-btn")?.addEventListener("click", () => {
-    alert("Mobile Upload: This could trigger camera or gallery in future. Currently notify desktop.");
-    if (dataChannel?.readyState === "open") {
-        dataChannel.send(JSON.stringify({ type: "notification", text: "Mobile user clicked Upload" }));
-    }
-});
-
-
-function renderRemoteList(items: any[]) {
-    if (!docList) return;
-    docList.innerHTML = "";
-    if (items.length === 0) {
-        docList.innerHTML = "<div style='padding:20px; text-align:center;'>No results found.</div>";
-        return;
-    }
-    items.forEach(item => {
-        const html = item2html(item, false);
-        const temp = document.createElement("div");
-        temp.innerHTML = html;
-        const el = temp.firstElementChild as HTMLElement;
-        
-        // Add click listener for detail
-        el.addEventListener("click", () => {
-            const uuid = el.id;
-            if (dataChannel?.readyState === "open") {
-                log("Requesting detail for: " + uuid);
-                dataChannel.send(JSON.stringify({ type: "get_detail", uuid: uuid }));
-            }
-        });
-        
-        docList.appendChild(el);
-    });
-}
-
-function renderRemoteDetail(title: string, content: string) {
-    const detailTitle = document.getElementById("detail-title");
-    const detailContent = document.getElementById("detail-content");
-    if (detailTitle) detailTitle.innerText = title;
-    if (detailContent) detailContent.innerHTML = content;
-    (window as any).showDetailView(true);
-}
-
-// Search interaction
-searchInput?.addEventListener("input", (e) => {
-    const query = (e.target as HTMLInputElement).value;
-    if (dataChannel?.readyState === "open") {
-        dataChannel.send(JSON.stringify({ type: "search", query: query }));
-    }
-});
-
-// Refresh button
-document.getElementById("list-refresh-btn")?.addEventListener("click", () => {
-    if (dataChannel?.readyState === "open") {
-        dataChannel.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
-    }
-});
-
-async function startScanning() {
-    if (scanning) return;
-    log("Starting scanning sequence...");
-
-    // Reset Chunk Buffer for new session
-    receivedOfferChunks = [];
-    expectedOfferTotal = 0;
-
-    if (!video) {
-        log("Error: Video element not found");
-        return;
-    }
-
-    try {
-        // 1. Request Camera
-        const constraints = { video: { facingMode: "environment" } };
-        videoStream = await navigator.mediaDevices.getUserMedia(constraints);
-        video.srcObject = videoStream;
-        
-        // 2. Play Video
-        // Required for iOS/Android to actually start playing
-        video.setAttribute("playsinline", "true"); 
-        await video.play();
-        
-        scanning = true;
-        log("Camera active. Scanning for QR...");
-        
-        requestAnimationFrame(tick);
-    } catch (err: any) {
-        log(`Camera Error: ${err.message || err}`);
-        alert("Camera failed: " + err);
-    }
-}
-
-function stopScanning() {
-    log("Stopping camera...");
-    scanning = false;
-    
-    if (videoStream) {
-        videoStream.getTracks().forEach(track => track.stop());
-        videoStream = null;
-    }
-    
-    if (video) {
-        video.pause();
-        video.srcObject = null;
-    }
-}
-
-function tick() {
-    if (!scanning) return;
-    
-    if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        // Create a temporary canvas to draw the video frame for analysis
-        const canvas = document.createElement("canvas");
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext("2d");
-        
-        if (ctx) {
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            
-            // Attempt to find QR code
-            if (typeof jsQR !== 'undefined') {
-                const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                    inversionAttempts: "dontInvert",
-                });
-
-                if (code) {
-                    // Log throttle to avoid spamming the UI on every frame
-                    // log("QR Found: " + code.data.substring(0, 10) + "...");
-                    
-                    handleQrCode(code.data);
-                    
-                    // [Multipart Fix] Do NOT stop scanning here. 
-                    // handleQrCode will call stopScanning() when all chunks are gathered.
-                    
-                    // Just return to avoid re-scanning the same frame immediately in this tick
-                    // But we want to continue the loop
-                }
-            } else {
-                // Throttle this log so it doesn't spam
-                if (Math.random() < 0.01) log("Warning: jsQR not loaded");
-            }
-        }
-    }
-    
-    requestAnimationFrame(tick);
-}
-
-// Chunk Buffer State
-let receivedOfferChunks: string[] = [];
-let expectedOfferTotal = 0;
-
-function handleQrCode(data: string) {
-    // 1. Check for Chunk Format: [index, total, chunk]
-    try {
-        if (data.trim().startsWith("[")) {
-             const parsed = JSON.parse(data);
-             if (Array.isArray(parsed) && parsed.length === 3 && typeof parsed[0] === 'number') {
-                 const [idx, total, chunk] = parsed;
-                 
-                 // Init buffer
-                 if (expectedOfferTotal === 0) {
-                     expectedOfferTotal = total;
-                     for(let i=0; i<total; i++) receivedOfferChunks.push("");
-                     log(`Detected Multipart QR. Total: ${total}`);
-                 }
-
-                 // Store chunk
-                 if (total === expectedOfferTotal && !receivedOfferChunks[idx]) {
-                     receivedOfferChunks[idx] = chunk;
-                     const count = receivedOfferChunks.filter(c => c).length;
-                     log(`Received Part ${idx + 1}/${total}`);
-                     
-                     // Feedback
-                     const statusArea = document.getElementById("status-area");
-                     if (statusArea) {
-                         statusArea.innerHTML = `<p style="font-size:3rem;">📡</p><p>Scanning... ${count}/${total}</p>`;
-                     }
-                 }
-
-                 // Check Completion
-                 if (receivedOfferChunks.every(c => c !== "")) {
-                     log("All chunks received. Processing Offer...");
-                     const fullSdp = receivedOfferChunks.join("");
-                     
-                     // Stop scanning and cleanup
-                     stopScanning();
-                     if (overlay) overlay.style.display = 'none';
-                     
-                     createPeerConnection({ type: 'offer', sdp: fullSdp });
-                 }
-                 return; // Keep scanning if not complete
-             }
-             // Legacy single array check could go here
-        }
-    } catch (e) {
-        // Ignore parse errors, just keep scanning
-    }
-}
-
-async function createPeerConnection(offer: any) {
-    // 2. Create PC (No STUN needed for local network, or use default)
-    const pc = new RTCPeerConnection({
-        iceServers: [] // Local network only
-    });
-    
-    // Log ICE Candidates for debugging
-    pc.onicecandidate = (event) => {
-        if (event.candidate) log(`ICE: ${event.candidate.candidate.substring(0, 20)}...`);
-    };
-
-    pc.oniceconnectionstatechange = () => {
-        log(`ICE State: ${pc.iceConnectionState}`);
-        if(pc.iceConnectionState === 'connected') {
-            log("🚀 Connected! Switching to Main UI...");
-            
-            // Hide Intro & QR
-            document.getElementById("app-intro")?.classList.add("hidden");
-            document.getElementById("app-intro")!.style.display = 'none'; // Force hide
-            document.getElementById("answer-qr-container")!.style.display = 'none';
-            document.getElementById("scanner-overlay")!.style.display = 'none';
-            
-            // Show Main UI
-            const mainApp = document.getElementById("app-main");
-            if (mainApp) {
-                mainApp.classList.remove("hidden");
-                mainApp.classList.add("visible");
-            }
-            
-            // Hide Log Panel (Optional, keep for now if needed)
-            // document.getElementById("log-panel")!.style.display = 'none';
-        }
-    };
-
-    try {
-        await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-
-        log("Gathering ICE candidates...");
-        // Wait for ICE gathering to complete (max 2s) to ensure local IP is included
-        await new Promise<void>(resolve => {
-            if (pc.iceGatheringState === 'complete') {
-                resolve();
-            } else {
-                const check = () => {
-                    if (pc.iceGatheringState === 'complete') {
-                        pc.removeEventListener('icegatheringstatechange', check);
-                        resolve();
-                    }
-                };
-                pc.addEventListener('icegatheringstatechange', check);
-                setTimeout(resolve, 2000); 
-            }
-        });
-
-        // 3. Generate Answer QR (Multipart/Chunked)
-        const sdp = pc.localDescription!.sdp;
-        const CHUNK_COUNT = 4;
-        const chunkSize = Math.ceil(sdp.length / CHUNK_COUNT);
-        const chunks: string[] = [];
-        
-        for (let i = 0; i < CHUNK_COUNT; i++) {
-            const chunk = sdp.substring(i * chunkSize, (i + 1) * chunkSize);
-            chunks.push(JSON.stringify([i, CHUNK_COUNT, chunk]));
-        }
-        
-        log(`Answer created. Split into ${CHUNK_COUNT} chunks. Displaying...`);
-        
-        showAnswerQrChunks(chunks);
-
-    } catch (err: any) {
-        log("WebRTC Error: " + err.message);
-        alert("Connection Failed: " + err.message);
-    }
-}
-
-function showAnswerQrChunks(chunks: string[]) {
-    const container = document.getElementById("answer-qr-container");
-    const qrDiv = document.getElementById("answer-qr");
-    
-    if (container && qrDiv) {
-        container.style.display = "flex";
-        
-        let currentIdx = 0;
-        const rotate = () => {
-            qrDiv.innerHTML = "";
-            
-            // Header
-            const h = document.createElement("div");
-            h.innerText = `Part ${currentIdx + 1}/${chunks.length}`;
-            h.style.fontWeight = "bold"; h.style.marginBottom = "10px";
-            qrDiv.appendChild(h);
-
-            // QR
-            const q = document.createElement("div");
-            qrDiv.appendChild(q);
-            
-            try {
-                new QRCode(q, {
-                    text: chunks[currentIdx],
-                    width: 250, height: 250,
-                    correctLevel: QRCode.CorrectLevel.L
-                });
-            } catch(e) {}
-            
-            currentIdx = (currentIdx + 1) % chunks.length;
-        };
-        
-        rotate();
-        setInterval(rotate, 700);
-    }
-}
-
-// Deprecated function removed to fix build error
-
-function showAnswerQr(data: string) {
-    const container = document.getElementById("answer-qr-container");
-    const qrDiv = document.getElementById("answer-qr");
-    
-    if (container && qrDiv) {
-        qrDiv.innerHTML = ""; 
-        try {
-            new QRCode(qrDiv, {
-                text: data,
-                width: 250,
-                height: 250,
-                correctLevel: QRCode.CorrectLevel.L
-            });
-            container.style.display = "flex";
-            log("Displaying Answer QR. Scan this with Laptop.");
-        } catch(e) {
-            log("QR Gen Error: " + e);
-        }
-    }
-}
-
-// --- Event Listeners ---
-
-// Listen for events dispatched from index.html
-window.addEventListener("request-camera-start", () => {
-    startScanning();
-});
-
-window.addEventListener("request-camera-stop", () => {
-    stopScanning();
-});
-
-log("Event listeners ready.");
-
-// --- UI Control Handlers (Desktop Parity) ---
-
-const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
-const listView = document.getElementById("list-view") as HTMLElement;
-const detailView = document.getElementById("detail-view") as HTMLElement;
-
+// --- UI Logic ---
 function switchTab(tabName: string) {
-    log(`Switching tab to: ${tabName}`);
     tabContents.forEach(c => {
         if (c.id === `tab-${tabName}`) c.classList.add("active");
         else c.classList.remove("active");
@@ -481,12 +54,179 @@ function showDetailView(show: boolean) {
     }
 }
 
-// Bind UI Elements
+// --- Scanning ---
+async function startScanning() {
+    if (scanning) return;
+    receivedOfferChunks = [];
+    expectedOfferTotal = 0;
+    
+    // Clear rotation if scan starts
+    if (qrInterval) { clearInterval(qrInterval); qrInterval = null; }
+
+    try {
+        const constraints = { video: { facingMode: "environment" } };
+        videoStream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = videoStream;
+        await video.play();
+        scanning = true;
+        document.getElementById("scanner-overlay")!.style.display = 'block';
+        requestAnimationFrame(tick);
+    } catch (err) { log(`Camera Err: ${err}`); }
+}
+
+function stopScanning() {
+    scanning = false;
+    if (videoStream) videoStream.getTracks().forEach(t => t.stop());
+    document.getElementById("scanner-overlay")!.style.display = 'none';
+}
+
+function tick() {
+    if (!scanning) return;
+    if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imgData.data, imgData.width, imgData.height);
+            if (code) handleQrChunk(code.data);
+        }
+    }
+    requestAnimationFrame(tick);
+}
+
+function handleQrChunk(data: string) {
+    try {
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed) && parsed.length === 3) {
+            const [idx, total, chunk] = parsed;
+            if (expectedOfferTotal === 0) {
+                expectedOfferTotal = total;
+                receivedOfferChunks = new Array(total).fill("");
+            }
+            if (!receivedOfferChunks[idx]) {
+                receivedOfferChunks[idx] = chunk;
+                log(`Part ${idx + 1}/${total} Received`);
+                
+                // UI Feedback
+                const introMsg = document.querySelector("#mobile-intro-overlay p");
+                if (introMsg) introMsg.textContent = `Scanning... ${receivedOfferChunks.filter(c => c).length}/${total}`;
+            }
+            if (receivedOfferChunks.every(c => c !== "")) {
+                log("All Offer parts received. Connecting...");
+                stopScanning();
+                createPeerConnection(receivedOfferChunks.join(""));
+            }
+        }
+    } catch(e) {}
+}
+
+// --- WebRTC ---
+async function createPeerConnection(sdp: string) {
+    peerConn = new RTCPeerConnection({ iceServers: [] });
+    peerConn.ondatachannel = (e) => {
+        dataChannel = e.channel;
+        setupDataChannel(dataChannel);
+    };
+    peerConn.oniceconnectionstatechange = () => {
+        if(peerConn?.iceConnectionState === 'connected') {
+            document.getElementById("mobile-intro-overlay")!.style.display = 'none';
+            if (qrInterval) { clearInterval(qrInterval); qrInterval = null; }
+            document.getElementById("answer-qr-container")!.style.display = 'none';
+        }
+    };
+    await peerConn.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: sdp }));
+    const answer = await peerConn.createAnswer();
+    await peerConn.setLocalDescription(answer);
+    
+    // Chunk the Answer
+    const fullSdp = peerConn.localDescription!.sdp;
+    const CHUNK_COUNT = 4;
+    const size = Math.ceil(fullSdp.length / CHUNK_COUNT);
+    const chunks = [];
+    for(let i=0; i<CHUNK_COUNT; i++) {
+        chunks.push(JSON.stringify([i, CHUNK_COUNT, fullSdp.substring(i*size, (i+1)*size)]));
+    }
+    
+    showAnswerSlideQr(chunks);
+}
+
+function showAnswerSlideQr(chunks: string[]) {
+    const container = document.getElementById("answer-qr-container")!;
+    container.style.display = 'flex';
+    const qrDiv = document.getElementById("answer-qr")!;
+    
+    let cur = 0;
+    const rotate = () => {
+        qrDiv.innerHTML = `<div style="font-weight:bold; margin-bottom:10px;">Answer Part ${cur+1}/${chunks.length}</div>`;
+        const q = document.createElement("div");
+        qrDiv.appendChild(q);
+        new QRCode(q, { text: chunks[cur], width: 250, height: 250 });
+        cur = (cur + 1) % chunks.length;
+    };
+    
+    if (qrInterval) clearInterval(qrInterval);
+    rotate();
+    qrInterval = setInterval(rotate, 1000);
+}
+
+function setupDataChannel(channel: RTCDataChannel) {
+    channel.onopen = () => {
+        log("Channel OPEN - Connected!");
+        channel.send(JSON.stringify({ type: "search", query: "" }));
+    };
+    channel.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "sync_list") renderList(msg.data);
+        else if (msg.type === "sync_detail") renderDetail(msg.title, msg.content);
+        else if (msg.type === "sync_chat") renderChat(msg.data);
+    };
+}
+
+function renderList(items: any[]) {
+    const list = document.getElementById("doc-list");
+    if (!list) return;
+    list.innerHTML = items.map(item => item2html(item, false)).join("");
+    list.querySelectorAll('.logis-result').forEach(el => {
+        el.addEventListener("click", () => {
+            dataChannel?.send(JSON.stringify({ type: "get_detail", uuid: el.id }));
+        });
+    });
+}
+
+function renderDetail(title: string, content: string) {
+    document.getElementById("detail-title")!.innerText = title;
+    document.getElementById("detail-content")!.innerHTML = content;
+    showDetailView(true);
+}
+
+function renderChat(data: any) {
+    const div = document.createElement("div");
+    div.className = `chat-talk ${data.role === 'user' ? 'user' : 'system'}`;
+    div.innerHTML = `<div class="chat-message"><div class="content">${data.content}</div></div>`;
+    chatTalks.appendChild(div);
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+}
+
+// --- Listeners ---
+searchInput?.addEventListener("input", (e) => {
+    dataChannel?.send(JSON.stringify({ type: "search", query: (e.target as HTMLInputElement).value }));
+});
+chatForm?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = chatForm.querySelector('input[name="talk"]') as HTMLInputElement;
+    if (input.value.trim()) {
+        renderChat({ role: 'user', content: input.value });
+        dataChannel?.send(JSON.stringify({ type: "chat_message", content: input.value }));
+        input.value = "";
+    }
+});
 document.getElementById("btn-settings")?.addEventListener("click", () => switchTab("settings"));
 document.getElementById("btn-settings-back")?.addEventListener("click", () => switchTab("list"));
 document.getElementById("btn-detail-back")?.addEventListener("click", () => showDetailView(false));
-
-// Global accessible for inline onclicks if any
-(window as any).switchTab = switchTab;
-(window as any).showDetailView = showDetailView;
-
+document.getElementById("list-refresh-btn")?.addEventListener("click", () => {
+    dataChannel?.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
+});
+window.addEventListener("request-camera-start", () => startScanning());
+window.addEventListener("request-camera-stop", () => stopScanning());

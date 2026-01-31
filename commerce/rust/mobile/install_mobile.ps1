@@ -37,7 +37,7 @@ Copy-Item -Recurse -Force "$projectRoot\dist\mobile\*" "$targetAssets\"
 Write-Host "[4/5] Gradle 최종 APK 생성 중 (이미 빌드된 Rust는 스킵)..." -ForegroundColor Yellow
 cd "$mobilePath\src-tauri\gen/android"
 ./gradlew clean
-./gradlew :app:assembleArm64Debug -x :app:rustBuildArm64Debug -x :app:rustBuildArmDebug --offline
+./gradlew :app:assembleArm64Debug -x :app:rustBuildArm64Debug -x :app:rustBuildArmDebug
 
 # 5. 설치 및 실행
 Write-Host "[5/5] APK 설치 및 실행 중..." -ForegroundColor Yellow

@@ -1261,141 +1261,6 @@ async function showPcPairingQr() {
     }
 }
 
-// ... existing code ...
-
-async function startMobileScanning(video: HTMLVideoElement) {
-    if (!video || !(video instanceof HTMLVideoElement)) {
-        console.error('Invalid video element provided to startMobileScanning');
-        return;
-    }
-
-    try {
-        console.log("Starting desktop camera stream...");
-        desktopStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
-        video.srcObject = desktopStream;
-        await video.play();
-        
-        document.getElementById("mobile-scan-view")?.classList.remove("hidden");
-        document.getElementById("pc-qr-view")?.classList.add("hidden");
-    } catch (err) {
-        console.error("Failed to start desktop camera:", err);
-        alert("Camera start failed: " + err);
-        return;
-    }
-
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    
-    // Chunk Assembly State
-    const receivedChunks: string[] = [];
-    let expectedTotal = 0;
-    
-    const scanLoop = async () => {
-        if (!video || video.paused || video.ended) return;
-        
-        try {
-            if (video.readyState >= 2) {
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                
-                if (ctx && canvas.width > 0 && canvas.height > 0) {
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                    // @ts-ignore
-                    const code = jsQR(imageData.data, imageData.width, imageData.height);
-                    
-                    if (code) {
-                        const rawData = code.data;
-                        try {
-                            if (rawData.trim().startsWith("[")) {
-                                const data = JSON.parse(rawData);
-                                
-                                // Check for Chunk Format: [index, total, data]
-                                if (Array.isArray(data) && data.length === 3 && typeof data[0] === 'number') {
-                                    const [idx, total, chunkStr] = data;
-                                    
-                                    // Init buffer if new or reset needed
-                                    if (expectedTotal === 0) {
-                                        expectedTotal = total;
-                                        // Fill with nulls
-                                        for(let i=0; i<total; i++) receivedChunks.push(""); 
-                                    }
-
-                                    // Store chunk if matching total
-                                    if (total === expectedTotal) {
-                                        if (!receivedChunks[idx]) {
-                                            receivedChunks[idx] = chunkStr;
-                                            console.log(`[WebRTC] Received Chunk ${idx + 1}/${total}`);
-                                            
-                                            // Feedback UI (reuse profile name area)
-                                            const profileName = document.getElementById("nav-profile-name");
-                                            if (profileName) {
-                                                const count = receivedChunks.filter(c => c).length;
-                                                profileName.textContent = `Scanning... ${count}/${total}`;
-                                                profileName.style.color = "var(--primary)";
-                                            }
-                                        }
-                                    }
-
-                                    // Check completion
-                                    if (receivedChunks.every(c => c !== "")) {
-                                        console.log("All chunks received. Reassembling Answer...");
-                                        const fullSdp = receivedChunks.join("");
-                                        const answer = new RTCSessionDescription({ type: 'answer', sdp: fullSdp });
-
-                                        if (peerConn) {
-                                            await peerConn.setRemoteDescription(answer);
-                                            console.log("P2P Connection Established!");
-                                            stopMobileScanning(video);
-                                            
-                                            const profileName = document.getElementById("nav-profile-name");
-                                            if (profileName) {
-                                                profileName.textContent = "✅ Mobile Connected";
-                                                profileName.style.color = "#4ade80";
-                                            }
-                                            document.getElementById("nav-qr-container")?.classList.add("hidden");
-                                        }
-                                        return; // Stop scanning
-                                    }
-                                }
-                                // Legacy support (single array [sdp])
-                                else if (Array.isArray(data) && data.length === 1) {
-                                     // ... existing legacy logic ...
-                                     // For now, let's prioritize chunks as requested.
-                                }
-                            }
-                        } catch (parseErr) { }
-                    }
-                }
-            }
-        } catch (e) {}
-        requestAnimationFrame(scanLoop);
-    };
-    
-    requestAnimationFrame(scanLoop);
-}
-
-function stopDesktopCamera() {
-    if (desktopStream) {
-        desktopStream.getTracks().forEach(track => track.stop());
-        desktopStream = null;
-    }
-}
-
-document.getElementById("btn-switch-to-camera")?.addEventListener("click", () => {
-    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
-    if (video) {
-        startMobileScanning(video);
-    } else {
-        console.error("Desktop camera video element not found");
-    }
-});
-document.getElementById("btn-switch-to-qr")?.addEventListener("click", () => {
-    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
-    stopMobileScanning(video);
-});
-document.getElementById("btn-switch-to-qr")?.addEventListener("click", showPcPairingQr);
-
 btnDetailDelete?.addEventListener("click", async () => {
     console.log("[WIDGET] Delete button clicked. UUID:", currentDetailUuid);
     if (!currentDetailUuid) {
@@ -2461,3 +2326,98 @@ initSession();
 setWindowSize(false);
 syncBrowserStatus();
 initDevicePreference();
+
+function stopDesktopCamera() {
+    if (desktopStream) {
+        desktopStream.getTracks().forEach(track => track.stop());
+        desktopStream = null;
+    }
+}
+
+async function startMobileScanning(video: HTMLVideoElement) {
+    if (!video || !(video instanceof HTMLVideoElement)) {
+        console.error('Invalid video element provided to startMobileScanning');
+        return;
+    }
+
+    try {
+        console.log("Starting desktop camera stream...");
+        desktopStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+        video.srcObject = desktopStream;
+        await video.play();
+        
+        document.getElementById("mobile-scan-view")?.classList.remove("hidden");
+        document.getElementById("pc-qr-view")?.classList.add("hidden");
+    } catch (err) {
+        console.error("Failed to start desktop camera:", err);
+        alert("Camera start failed: " + err);
+        return;
+    }
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    const receivedChunks: string[] = [];
+    let expectedTotal = 0;
+    
+    const scanLoop = async () => {
+        if (!video || video.paused || video.ended) return;
+        try {
+            if (video.readyState >= 2) {
+                canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+                if (ctx && canvas.width > 0 && canvas.height > 0) {
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    // @ts-ignore
+                    const code = jsQR(imageData.data, imageData.width, imageData.height);
+                    if (code) {
+                        try {
+                            const data = JSON.parse(code.data);
+                            if (Array.isArray(data) && data.length === 3) {
+                                const [idx, total, chunkStr] = data;
+                                if (expectedTotal === 0) {
+                                    expectedTotal = total;
+                                    for(let i=0; i<total; i++) receivedChunks.push(""); 
+                                }
+                                if (!receivedChunks[idx]) {
+                                    receivedChunks[idx] = chunkStr;
+                                    const profileName = document.getElementById("nav-profile-name");
+                                    if (profileName) {
+                                        const count = receivedChunks.filter(c => c).length;
+                                        profileName.textContent = `Scanning... ${count}/${total}`;
+                                    }
+                                }
+                                if (receivedChunks.every(c => c !== "")) {
+                                    const answer = new RTCSessionDescription({ type: 'answer', sdp: receivedChunks.join("") });
+                                    if (peerConn) {
+                                        await peerConn.setRemoteDescription(answer);
+                                        stopDesktopCamera();
+                                        const profileName = document.getElementById("nav-profile-name");
+                                        if (profileName) {
+                                            profileName.textContent = "✅ Mobile Connected";
+                                            profileName.style.color = "#4ade80";
+                                        }
+                                        document.getElementById("nav-qr-container")?.classList.add("hidden");
+                                    }
+                                    return;
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+        } catch (e) {}
+        requestAnimationFrame(scanLoop);
+    };
+    requestAnimationFrame(scanLoop);
+}
+
+document.getElementById("btn-switch-to-camera")?.addEventListener("click", () => {
+    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+    if (video) startMobileScanning(video);
+});
+document.getElementById("btn-switch-to-qr")?.addEventListener("click", () => {
+    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+    if (video) stopDesktopCamera();
+    showPcPairingQr();
+});
