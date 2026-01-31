@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp, Module};
 use candle_nn::VarBuilder;
 use candle_transformers::utils::apply_repeat_penalty;
 

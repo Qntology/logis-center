@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::fs;
 use memmap2::Mmap;
 
 use crate::{
@@ -94,6 +95,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub q_norm: RmsNorm, pub k_norm: RmsNorm,
     pub num_attention_heads: usize, pub num_key_value_heads: usize, pub head_dim: usize,
     pub num_kv_groups: usize, pub scaling: f64, pub kv_cache: Option<(Tensor, Tensor)>,
+    pub layer_idx: usize,
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -128,6 +130,8 @@ impl QuantizedQwen3VLTextAttention {
         let attn_output = attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         Ok(self.o_proj.forward(&attn_output)?)
     }
+    pub fn clear_kv_cache(&mut self) { self.kv_cache = None; }
+    pub fn get_kv_len(&self) -> usize { self.kv_cache.as_ref().map(|(k, _)| k.dim(2).unwrap_or(0)).unwrap_or(0) }
 }
 
 #[derive(Clone)]
@@ -171,7 +175,17 @@ impl QuantizedQwen3VLTextDecoderLayer {
         if let Some(n) = &mut self.post_attention_layernorm { n.to_device(device)?; }
         Ok(())
     }
-    pub fn forward(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+}
+
+impl Module for QuantizedQwen3VLTextDecoderLayer {
+    fn forward(&self, _xs: &Tensor) -> candle_core::Result<Tensor> {
+        // Module trait implementation for basic forward (not used by our LLM loop which needs more params)
+        Err(candle_core::Error::Msg("Use custom forward with cos/sin/mask".to_string()))
+    }
+}
+
+impl QuantizedQwen3VLTextDecoderLayer {
+    pub fn forward_with_params(&mut self, xs: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.self_attn.forward(&xs, cos, sin, mask)?;
@@ -218,7 +232,7 @@ impl QuantizedQwen3VLTextModel {
         let mask = if s <= 1 { None } else { Some(prepare_causal_attention_mask(b, s, seqlen_offset, embeds.device())?) };
         let mut xs = embeds.clone();
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            xs = layer.forward(&xs, &cos, &sin, mask.as_ref())?;
+            xs = layer.forward_with_params(&xs, &cos, &sin, mask.as_ref())?;
             if let (Some(m), Some(ds)) = (visual_mask, ds_embeds.as_ref()) { if i < ds.len() { xs = mask_index_add(&xs.squeeze(0)?, &m.squeeze(0)?, &ds[i])?.unsqueeze(0)?; } }
         }
         Ok(xs.apply(&self.norm)?)
@@ -256,6 +270,8 @@ impl QuantizedQwen3VLTextModel {
         }
         Ok(())
     }
+    pub fn compress_to_bitkv(&self, _: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> { Err(anyhow!("Not implemented")) }
+    pub fn inject_live_kv_bitkv(&mut self, _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[usize]) -> Result<()> { Ok(()) }
 }
 
 #[derive(Clone)]
