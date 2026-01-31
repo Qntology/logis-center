@@ -907,6 +907,21 @@ async fn check_gpu_availability() -> bool {
     !config.is_cpu
 }
 
+#[tauri::command]
+async fn save_mobile_temp_file(
+    app_handle: tauri::AppHandle,
+    filename: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    let temp_dir = app_handle.path().app_cache_dir().map_err(|e| e.to_string())?.join("mobile_uploads");
+    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    
+    let file_path = temp_dir.join(filename);
+    std::fs::write(&file_path, data).map_err(|e| e.to_string())?;
+    
+    Ok(file_path.to_string_lossy().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let model = Arc::new(TokioMutex::new(None));
@@ -1006,7 +1021,8 @@ pub fn run() {
             launch_browser, launch_best_browser, extract_html_from_current_tab, stop_current_extraction, check_available_browsers,
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
-            upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability
+            upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
+            save_mobile_temp_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

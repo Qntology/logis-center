@@ -1115,6 +1115,14 @@ function setupDataChannel(channel: RTCDataChannel) {
                         content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
                     }));
                 }
+            } else if (msg.type === "get_session") {
+                // Send current desktop session info to mobile
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({ 
+                        type: "sync_session", 
+                        data: currentSession 
+                    }));
+                }
             } else if (msg.type === "search") {
                 // Perform local search for mobile
                 console.log("[WebRTC] Remote Search Query:", msg.query);
@@ -1132,12 +1140,60 @@ function setupDataChannel(channel: RTCDataChannel) {
                     type: "sync_chat", 
                     data: { role: "system", content: "Hub: Received '" + msg.content + "'" } 
                 }));
+            } else if (msg.type === "mobile_upload") {
+                console.log("[WebRTC] Receiving file from mobile:", msg.name);
+                try {
+                    // 1. Convert Base64 to Uint8Array
+                    const binaryString = atob(msg.data);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+
+                    // 2. Save to a temporary location using Tauri FS
+                    // We'll use a specific name to identify mobile uploads
+                    const tempPath = `mobile_upload_${Date.now()}_${msg.name}`;
+                    const fullPath = await invoke<string>("save_mobile_temp_file", { 
+                        filename: tempPath, 
+                        data: Array.from(bytes) 
+                    });
+
+                    console.log("[WebRTC] Saved mobile upload to:", fullPath);
+
+                    // 3. Trigger Desktop's existing Extraction Logic
+                    const taskId = `task_mobile_${Date.now()}`;
+                    await emit("new-task-from-browser", { 
+                        id: taskId, 
+                        type: "image_extraction", 
+                        image_path: fullPath, 
+                        ref: fullPath, 
+                        link: "Mobile Upload",
+                        device_preference: getDevicePref()
+                    });
+
+                    // 4. Relay progress to mobile
+                    // (We'll handle this in the global progress listener below)
+
+                } catch (err) {
+                    console.error("[WebRTC] Mobile upload failed:", err);
+                }
             }
         } catch (err) {
             console.error("[WebRTC] Message handle error:", err);
         }
     };
 }
+
+// --- Relay Desktop Progress to Mobile ---
+listen("extraction-progress", (event: any) => {
+    if (dataChannel && dataChannel.readyState === "open") {
+        dataChannel.send(JSON.stringify({
+            type: "extraction_progress",
+            payload: event.payload
+        }));
+    }
+});
+
 
 const syncDataToMobile = () => {
     if (!dataChannel || dataChannel.readyState !== "open") return;

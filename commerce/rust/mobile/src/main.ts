@@ -205,8 +205,8 @@ function showAnswerSlideQr(chunks: string[]) {
 
 function setupDataChannel(channel: RTCDataChannel) {
     channel.onopen = () => {
-        log("Channel OPEN!");
-        finalizeConnectionUI(); // Ensure UI switches even if ICE event was messy
+        log("Linked!");
+        finalizeConnectionUI();
         channel.send(JSON.stringify({ type: "search", query: "" }));
     };
     channel.onmessage = (e) => {
@@ -214,7 +214,95 @@ function setupDataChannel(channel: RTCDataChannel) {
         if (msg.type === "sync_list") renderList(msg.data);
         else if (msg.type === "sync_detail") renderDetail(msg.title, msg.content);
         else if (msg.type === "sync_chat") renderChat(msg.data);
+        else if (msg.type === "sync_session") updateSessionUI(msg.data);
+        else if (msg.type === "extraction_progress") renderExtractionProgress(msg.payload);
     };
+}
+
+// --- Extraction Progress (Mobile Mirror) ---
+function renderExtractionProgress(payload: any) {
+    const detailTitle = document.getElementById("detail-title");
+    const detailContent = document.getElementById("detail-content");
+    
+    if (detailTitle) detailTitle.innerText = "Processing Task...";
+    showDetailView(true);
+
+    if (detailContent) {
+        let logArea = document.getElementById("extraction-log-mobile");
+        if (!logArea) {
+            detailContent.innerHTML = `<div id="extraction-log-mobile" style="display:flex; flex-direction:column; gap:8px;"></div>`;
+            logArea = document.getElementById("extraction-log-mobile");
+        }
+
+        const catId = payload.category ? payload.category.replace(/[^a-zA-Z0-9]/g, "") : "gen";
+        const elementId = `prog-${catId}`;
+        let p = document.getElementById(elementId);
+        
+        if (!p) {
+            p = document.createElement("div");
+            p.id = elementId;
+            p.style.fontSize = "0.8rem";
+            p.innerHTML = `<span class="spinner-icon">⏳</span> <span class="text">${payload.summary}</span>`;
+            logArea?.appendChild(p);
+        } else {
+            const textEl = p.querySelector(".text");
+            if (textEl) textEl.textContent = payload.summary;
+        }
+
+        if (payload.category === "Done") {
+            p.querySelector(".spinner-icon")!.textContent = "✅";
+            log("Task Done!");
+        } else if (payload.category === "Error") {
+            p.querySelector(".spinner-icon")!.textContent = "❌";
+            (p as HTMLElement).style.color = "red";
+        }
+    }
+}
+
+// --- Upload Logic ---
+const fileInput = document.getElementById("mobile-file-input") as HTMLInputElement;
+
+document.getElementById("nav-upload-btn")?.addEventListener("click", () => {
+    fileInput?.click();
+});
+
+fileInput?.addEventListener("change", async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+
+    log(`Uploading: ${file.name}`);
+    const reader = new FileReader();
+    reader.onload = () => {
+        const base64Data = (reader.result as string).split(",")[1];
+        if (dataChannel?.readyState === "open") {
+            dataChannel.send(JSON.stringify({
+                type: "mobile_upload",
+                name: file.name,
+                data: base64Data
+            }));
+            
+            // Show initial progress UI on mobile
+            renderExtractionProgress({ category: "Start", summary: "Sending image to desktop..." });
+        }
+    };
+    reader.readAsDataURL(file);
+});
+
+
+function updateSessionUI(session: any) {
+    log(`Syncing Session: ${session.email}`);
+    if (searchInput) {
+        searchInput.disabled = false;
+        searchInput.placeholder = "Search or Ask Prompt";
+        // If user is logged in, maybe show their email prefix
+        if (session.email) {
+            log(`User: ${session.email}`);
+        }
+    }
+    // Enable all action buttons
+    document.querySelectorAll(".nav-icons .nav-btn, .logo-section .nav-btn").forEach(btn => {
+        (btn as HTMLButtonElement).disabled = false;
+    });
 }
 
 function renderList(items: any[]) {
