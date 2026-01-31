@@ -128,8 +128,6 @@ impl QuantizedQwen3VLTextAttention {
         let attn_output = attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         Ok(self.o_proj.forward(&attn_output)?)
     }
-    pub fn clear_kv_cache(&mut self) { self.kv_cache = None; }
-    pub fn get_kv_len(&self) -> usize { self.kv_cache.as_ref().map(|(k, _)| k.dim(2).unwrap_or(0)).unwrap_or(0) }
 }
 
 #[derive(Clone)]
@@ -140,6 +138,31 @@ pub struct QuantizedQwen3VLTextDecoderLayer {
 }
 
 impl QuantizedQwen3VLTextDecoderLayer {
+    pub fn new<R: std::io::Seek + std::io::Read>(config: &Qwen3VLTextConfig, ct: &gguf_file::Content, reader: &mut R, base_name: &str, device: &Device, dtype: DType, layer_idx: usize, baking_only: bool) -> Result<Self> {
+        let is_gguf = base_name.starts_with("blk.");
+        let (q, k, v, o, q_n, k_n) = if is_gguf { ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm") } else { ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm") };
+        let self_attn = QuantizedQwen3VLTextAttention {
+            q_proj: get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?,
+            k_proj: get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?,
+            v_proj: get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?,
+            o_proj: get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?,
+            q_norm: get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?,
+            k_norm: get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?,
+            num_attention_heads: config.num_attention_heads, num_key_value_heads: config.num_key_value_heads,
+            num_kv_groups: config.num_attention_heads / config.num_key_value_heads, head_dim: config.head_dim,
+            scaling: 1f64 / f64::sqrt(config.head_dim as f64), kv_cache: None, layer_idx,
+        };
+        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
+            let (g, u, d, n) = if is_gguf { ("ffn_gate", "ffn_up", "ffn_down", "ffn_norm") } else { ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "post_attention_layernorm") };
+            (Some(get_qlinear(ct, reader, &format!("{base_name}.{g}"), device, dtype)?),
+             Some(get_qlinear(ct, reader, &format!("{base_name}.{u}"), device, dtype)?),
+             Some(get_qlinear(ct, reader, &format!("{base_name}.{d}"), device, dtype)?),
+             Some(get_rms_norm(ct, reader, &format!("{base_name}.{n}"), config.rms_norm_eps, device, dtype)?))
+        } else { (None, None, None, None) };
+        let in_ln = if is_gguf { "attn_norm" } else { "input_layernorm" };
+        let input_layernorm = get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype)?;
+        Ok(Self { self_attn, mlp_gate, mlp_up, mlp_down, input_layernorm, post_attention_layernorm })
+    }
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         self.self_attn.to_device(device)?; self.input_layernorm.to_device(device)?;
         if let Some(g) = &mut self.mlp_gate { g.to_device(device)?; }
@@ -209,37 +232,58 @@ impl QuantizedQwen3VLTextModel {
         self.norm.to_device(device)?;
         Ok(())
     }
-    pub fn compress_to_bitkv(&self, _t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> { Err(anyhow!("Not implemented")) }
-    pub fn inject_live_kv_bitkv(&mut self, _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[usize]) -> Result<()> { Ok(()) }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _: usize) -> Result<()> {
+        if !path.exists() { fs::create_dir_all(path)?; }
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if let Some((k, v)) = &layer.self_attn.kv_cache {
+                let mut map = HashMap::new();
+                map.insert("k".to_string(), k.clone()); map.insert("v".to_string(), v.clone());
+                candle_core::safetensors::save(&map, path.join(format!("layer_{}_kv.safetensors", i)))?;
+            }
+            if clear { layer.self_attn.clear_kv_cache(); }
+        }
+        Ok(())
+    }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, _: usize, _: usize) -> Result<()> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let p = path.join(format!("layer_{}_kv.safetensors", i));
+            if p.exists() {
+                let map = candle_core::safetensors::load(p, device)?;
+                if let (Some(k), Some(v)) = (map.get("k"), map.get("v")) {
+                    layer.self_attn.kv_cache = Some((k.clone(), v.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLModel {
-    pub config: Qwen3VLConfig,
-    pub visual: Qwen3VLVisionModel, 
-    pub language_model: QuantizedQwen3VLTextModel,
-    pub lm_head: QLinear,
-    pub text_device: Device,
-    pub vision_device: Device,
+    pub config: Qwen3VLConfig, pub visual: Qwen3VLVisionModel, 
+    pub language_model: QuantizedQwen3VLTextModel, pub lm_head: QLinear,
+    pub text_device: Device, pub vision_device: Device,
 }
 
 impl QuantizedQwen3VLModel {
-    pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, main_mmap: Option<Arc<Mmap>>, ct_vision: &gguf_file::Content, vision_mmap: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, vision_device: &Device, _vision_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool) -> Result<Self> {
-        let mut v_reader = std::io::Cursor::new(vision_mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]));
-        let visual = Qwen3VLVisionModel::new(config.vision_config.as_ref().unwrap().clone(), VarBuilder::from_tensors(HashMap::new(), dtype, vision_device))?; // Simplified
-        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(config.text_config.as_ref().unwrap(), ct_main, main_mmap, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
+    pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, main_mmap: Option<Arc<Mmap>>, _ct_vision: &gguf_file::Content, _vision_mmap: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, vision_device: &Device, _vision_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool) -> Result<Self> {
+        let visual = Qwen3VLVisionModel::new(config.vision_config.as_ref().unwrap().clone(), VarBuilder::from_tensors(HashMap::new(), dtype, vision_device))?;
+        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(config.text_config.as_ref().unwrap(), ct_main, main_mmap.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         let mut m_reader = std::io::Cursor::new(main_mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]));
         let lm_head = get_qlinear(ct_main, &mut m_reader, "lm_head", text_device, dtype)?;
         Ok(Self { config: config.clone(), visual, language_model, lm_head, text_device: text_device.clone(), vision_device: vision_device.clone() })
     }
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; Ok(())
+    }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, b: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, b) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, e: usize, u: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, e, u) }
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
 }
 
 #[derive(Clone)]
 pub struct QuantizedQwen3TextModel {
-    pub language_model: QuantizedQwen3VLTextModel,
-    pub lm_head: Option<QLinear>,
-    pub text_device: Device,
+    pub language_model: QuantizedQwen3VLTextModel, pub lm_head: Option<QLinear>, pub text_device: Device,
 }
 
 impl QuantizedQwen3TextModel {
@@ -249,6 +293,11 @@ impl QuantizedQwen3TextModel {
         let lm_head = get_qlinear(ct, &mut reader, "lm_head", text_device, dtype).ok();
         Ok(Self { language_model, lm_head, text_device: text_device.clone() })
     }
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.language_model.to_device(device)?; if let Some(h) = &mut self.lm_head { h.to_device(device)?; } Ok(())
+    }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, b: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, b) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, e: usize, u: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, e, u) }
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
 }
 

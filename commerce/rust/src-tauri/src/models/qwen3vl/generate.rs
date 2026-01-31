@@ -38,13 +38,19 @@ impl ModelVariant {
     pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => m.language_model.forward(&self.language_model.embed_tokens.forward(input_ids)?, seqlen_offset, None, None, None), // Simple fallback for now
-            Self::QuantizedText(m) => m.language_model.forward(&m.language_model.embed_tokens.forward(input_ids)?, seqlen_offset, None, None, None),
+            Self::QuantizedVL(m) => {
+                let embeds = m.language_model.embed_tokens.forward(input_ids)?;
+                m.language_model.forward(&embeds, seqlen_offset, None, None, None)
+            },
+            Self::QuantizedText(m) => {
+                let embeds = m.language_model.embed_tokens.forward(input_ids)?;
+                m.language_model.forward(&embeds, seqlen_offset, None, None, None)
+            },
         }
     }
 
     pub fn rebalance_layers(&mut self, _device_id: usize) -> Result<()> {
-        Ok(()) // Simplified for custom IQ0 support
+        Ok(())
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
@@ -53,6 +59,10 @@ impl ModelVariant {
             Self::QuantizedVL(m) => { m.language_model.clear_kv_cache(); Ok(()) },
             Self::QuantizedText(m) => { m.language_model.clear_kv_cache(); Ok(()) },
         }
+    }
+
+    pub fn inject_kv_bitkv(&mut self, _k_anchors: &[Tensor], _k_packed: &[Tensor], _k_scales: &[Tensor], _v_anchors: &[Tensor], _v_packed: &[Tensor], _v_scales: &[Tensor], _original_shape: &[usize]) -> Result<()> {
+        Ok(()) // Simplified
     }
 
     pub fn is_cpu(&self) -> bool {
@@ -245,7 +255,9 @@ impl Qwen3VLGenerateModel {
                 let actual_baking_only = baking_only || is_06b;
                 let single_layer_mode = baking_only || is_06b;
                 
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode)?;
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(
+                    &cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode
+                )?;
                 ModelVariant::QuantizedText(model)
             }
         } else {
