@@ -9,6 +9,8 @@
     <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
     <script src="./pako.js"></script>
     <script src="./qrcode.min.js"></script>
+    <script src="./blockies.js"></script>
+    <script src="./marked.js"></script>
 
     <style>
         :root { --primary: #fb923c; }
@@ -30,7 +32,7 @@
             object-fit: cover !important; 
         }
 
-        /* Log Panel */
+        /* Log Panel (Initially visible for debugging, hidden later) */
         #log-panel {
             position: fixed !important;
             bottom: 0 !important;
@@ -56,13 +58,19 @@
             border-radius: 8px; 
             font-weight: bold; 
         }
+        
+        /* Utility classes */
+        .hidden { display: none !important; }
+        .visible { display: flex !important; }
     </style>
 
     <!-- Main Styles (Relative Path) -->
     <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
-    <div id="app-root" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+    
+    <!-- === [VIEW 1] Scanner / Intro === -->
+    <div id="app-intro" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
       <nav style="padding: 15px; display: flex; align-items: center; border-bottom: 1px solid #eee;">
         <div style="flex:1; font-weight:bold;">Logis Remote Hub</div>
         <button class="nav-btn" onclick="startCamera()">Scan Start</button>
@@ -88,6 +96,98 @@
         <h3>Scan from Desktop</h3>
         <div id="answer-qr"></div>
         <button onclick="closeAnswerQr()" class="nav-btn" style="margin-top:20px;">Close</button>
+    </div>
+
+    <!-- === [VIEW 2] Main UI (Cloned from Desktop) === -->
+    <div id="app-main" class="widget-wrapper hidden" style="width:100%; height:100%;">
+      
+      <!-- 1. The Pill Nav -->
+      <nav class="pill-nav">
+        <!-- Logo Section with Upload (Optional for Mobile) -->
+        <div class="logo-section">
+            <button id="nav-upload-btn" class="nav-btn" title="Upload Image">➕</button>
+        </div>
+        
+        <!-- Search Container -->
+        <div id="search-container" class="search-container">
+            <div id="search-tags-container" class="search-tags-container"></div>
+            <input type="text" id="global-search" class="search-input" placeholder="Search..." />
+        </div>
+        
+        <!-- Icons -->
+        <div class="nav-icons" style="display: flex; align-items: center; gap: 8px;">
+          <button id="btn-submit" class="nav-btn" title="Search">🔍</button>
+          <!-- Removed #btn-auto-launch -->
+          <button id="btn-settings" class="nav-btn" data-tab="settings" title="Config" style="min-width:24px; text-align:center;">🗨️</button>
+        </div>
+      </nav>
+
+      <!-- 2. The Content Panel -->
+      <section id="content-panel" class="content-panel open" style="flex:1; overflow:hidden;">
+        
+        <!-- Tab: List (Primary View) -->
+        <div id="tab-list" class="tab-content active">
+           <!-- View 1: List Table -->
+           <div id="list-view" style="position: relative; height:100%; display:flex; flex-direction:column;">
+               <div class="header-row">
+                 <div style="display:flex; align-items:center; gap:10px;">
+                    <button id="btn-list-back" class="nav-btn" title="Collapse" style="display:none;">⬅︎</button> <!-- Hidden on Mobile -->
+                    <h2>Remote Data</h2>
+                 </div>
+                 <div style="display:flex; gap:5px;">
+                    <button id="list-refresh-btn" class="nav-btn" title="Refresh">🔄</button>
+                 </div>
+               </div>
+               
+               <div id="list-scroll-container" class="list-container" style="flex:1; overflow-y: auto; padding: 0 10px; position: relative;">
+                 <div id="list-scroll" class="list-scroll">
+                    <!-- REPLACED: Table with Div Container for Cards -->
+                    <div id="doc-list" class="card-list"></div>
+                 </div>
+                 
+                 <div id="loading-indicator" style="display:none; text-align:center; padding:10px; font-size:0.8rem; color:#666;">Loading...</div>
+               </div>
+           </div>
+
+           <!-- View 2: Detail Overlay -->
+           <div id="detail-view" style="display:none; height:100%; flex-direction:column;">
+               <div class="header-row" style="justify-content: space-between;">
+                   <div style="display:flex; align-items:center; gap:10px;">
+                       <button id="btn-detail-back" class="nav-btn">⬅︎</button>
+                       <h2 id="detail-title">Detail</h2>
+                   </div>
+               </div>
+               <div id="detail-content" class="markdown-body" style="overflow-y:auto; flex:1; font-size: 0.85rem; padding:10px;">
+                   <!-- Content Injected Here -->
+               </div>
+           </div>
+        </div>
+
+        <!-- Tab: Settings (Chat) -->
+        <div id="tab-settings" class="tab-content">
+           <div class="header-row">
+             <div style="display:flex; align-items:center; gap:10px;">
+                <button id="btn-settings-back" class="nav-btn">⬅︎</button>
+                <h2>Chat</h2>
+             </div>
+           </div>
+           
+           <div class="aside right" style="height: calc(100% - 40px); display: flex; flex-direction: column; position: relative;">
+                <div id="chat-interface" class="chat-interface" style="display:flex; flex-direction:column; height:100%;">
+                    <div class="chat-container">
+                        <div class="chat-scroll" id="chat-scroll">
+                            <div class="chat-talks"></div>
+                        </div>
+                        <form name="chat-form" class="chat-form">
+                            <input type="text" name="talk" placeholder="Message..." required autocomplete="off">
+                            <button type="submit" class="primary-btn" style="width:auto; padding: 0 15px;">➤</button>
+                        </form>
+                    </div>
+                </div>
+           </div>
+        </div>
+
+      </section>
     </div>
 
     <div id="log-panel">Initializing...</div>
@@ -134,15 +234,8 @@
 
         window.onload = () => {
             debug("Window Loaded");
-            if (typeof pako === 'undefined') debug("Error: pako.js NOT loaded");
-            else debug("pako.js loaded");
-            
+            if (typeof pako === 'undefined') debug("Error: pako.js NOT loaded"); // Just checking, not using
             if (typeof QRCode === 'undefined') debug("Error: qrcode.js NOT loaded");
-            else debug("qrcode.js loaded");
-
-            // Check if CSS is applied
-            const bodyColor = window.getComputedStyle(document.body).backgroundColor;
-            debug("Body BG: " + bodyColor);
         };
         
         window.onerror = function(msg, url, lineNo, columnNo, error) {

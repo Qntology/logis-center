@@ -22,15 +22,147 @@ function log(msg: string) {
 
 log("Main module loaded. Initializing...");
 
+import { item2html } from "./lib/render";
+
 // State
 let videoStream: MediaStream | null = null;
 let scanning = false;
+let dataChannel: RTCDataChannel | null = null; // Store data channel globally
 
 // DOM Elements
-const video = document.getElementById("v") as HTMLVideoElement;
-const overlay = document.getElementById("scanner-overlay");
+const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormElement;
+const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
+const chatScroll = document.getElementById("chat-scroll") as HTMLElement;
 
-// --- Camera & Scanning Logic ---
+// --- Data Channel Handlers ---
+
+function setupMobileDataChannel(channel: RTCDataChannel) {
+    channel.onopen = () => {
+        log("Data Channel OPEN (Client)");
+        channel.send(JSON.stringify({ type: "search", query: "" }));
+    };
+
+    channel.onmessage = (e) => {
+        try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === "sync_list") {
+                renderRemoteList(msg.data);
+            } else if (msg.type === "sync_detail") {
+                renderRemoteDetail(msg.title, msg.content);
+            } else if (msg.type === "sync_chat") {
+                renderChatMessage(msg.data);
+            }
+        } catch (err) {
+            log("Msg Err: " + err);
+        }
+    };
+}
+
+// --- Chat Logic ---
+
+chatForm?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = chatForm.querySelector('input[name="talk"]') as HTMLInputElement;
+    if (!input || !input.value.trim()) return;
+
+    const content = input.value.trim();
+    
+    // 1. Show locally immediately
+    renderChatMessage({ role: "user", content: content });
+
+    // 2. Send to Desktop
+    if (dataChannel?.readyState === "open") {
+        dataChannel.send(JSON.stringify({ type: "chat_message", content: content }));
+    }
+
+    input.value = "";
+});
+
+function renderChatMessage(data: { role: string, content: string }) {
+    if (!chatTalks) return;
+    
+    const div = document.createElement("div");
+    div.className = `chat-talk ${data.role === 'user' ? 'user' : 'system'}`;
+    
+    // Simple markdown-ish or plain text
+    div.innerHTML = `
+        <div class="chat-message">
+            <div class="content">${data.content}</div>
+        </div>
+    `;
+    
+    chatTalks.appendChild(div);
+    
+    // Scroll to bottom
+    if (chatScroll) {
+        chatScroll.scrollTop = chatScroll.scrollHeight;
+    }
+}
+
+// --- Navigation Button Handlers ---
+
+document.getElementById("btn-submit")?.addEventListener("click", () => {
+    if (dataChannel?.readyState === "open") {
+        dataChannel.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
+    }
+});
+
+document.getElementById("nav-upload-btn")?.addEventListener("click", () => {
+    alert("Mobile Upload: This could trigger camera or gallery in future. Currently notify desktop.");
+    if (dataChannel?.readyState === "open") {
+        dataChannel.send(JSON.stringify({ type: "notification", text: "Mobile user clicked Upload" }));
+    }
+});
+
+
+function renderRemoteList(items: any[]) {
+    if (!docList) return;
+    docList.innerHTML = "";
+    if (items.length === 0) {
+        docList.innerHTML = "<div style='padding:20px; text-align:center;'>No results found.</div>";
+        return;
+    }
+    items.forEach(item => {
+        const html = item2html(item, false);
+        const temp = document.createElement("div");
+        temp.innerHTML = html;
+        const el = temp.firstElementChild as HTMLElement;
+        
+        // Add click listener for detail
+        el.addEventListener("click", () => {
+            const uuid = el.id;
+            if (dataChannel?.readyState === "open") {
+                log("Requesting detail for: " + uuid);
+                dataChannel.send(JSON.stringify({ type: "get_detail", uuid: uuid }));
+            }
+        });
+        
+        docList.appendChild(el);
+    });
+}
+
+function renderRemoteDetail(title: string, content: string) {
+    const detailTitle = document.getElementById("detail-title");
+    const detailContent = document.getElementById("detail-content");
+    if (detailTitle) detailTitle.innerText = title;
+    if (detailContent) detailContent.innerHTML = content;
+    (window as any).showDetailView(true);
+}
+
+// Search interaction
+searchInput?.addEventListener("input", (e) => {
+    const query = (e.target as HTMLInputElement).value;
+    if (dataChannel?.readyState === "open") {
+        dataChannel.send(JSON.stringify({ type: "search", query: query }));
+    }
+});
+
+// Refresh button
+document.getElementById("list-refresh-btn")?.addEventListener("click", () => {
+    if (dataChannel?.readyState === "open") {
+        dataChannel.send(JSON.stringify({ type: "search", query: searchInput?.value || "" }));
+    }
+});
 
 async function startScanning() {
     if (scanning) return;
@@ -189,9 +321,23 @@ async function createPeerConnection(offer: any) {
     pc.oniceconnectionstatechange = () => {
         log(`ICE State: ${pc.iceConnectionState}`);
         if(pc.iceConnectionState === 'connected') {
+            log("🚀 Connected! Switching to Main UI...");
+            
+            // Hide Intro & QR
+            document.getElementById("app-intro")?.classList.add("hidden");
+            document.getElementById("app-intro")!.style.display = 'none'; // Force hide
             document.getElementById("answer-qr-container")!.style.display = 'none';
-            const status = document.getElementById("status-area");
-            if(status) status.innerHTML = `<p style="font-size:3rem;">🚀</p><p>Connected!</p>`;
+            document.getElementById("scanner-overlay")!.style.display = 'none';
+            
+            // Show Main UI
+            const mainApp = document.getElementById("app-main");
+            if (mainApp) {
+                mainApp.classList.remove("hidden");
+                mainApp.classList.add("visible");
+            }
+            
+            // Hide Log Panel (Optional, keep for now if needed)
+            // document.getElementById("log-panel")!.style.display = 'none';
         }
     };
 
@@ -310,3 +456,37 @@ window.addEventListener("request-camera-stop", () => {
 });
 
 log("Event listeners ready.");
+
+// --- UI Control Handlers (Desktop Parity) ---
+
+const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
+const listView = document.getElementById("list-view") as HTMLElement;
+const detailView = document.getElementById("detail-view") as HTMLElement;
+
+function switchTab(tabName: string) {
+    log(`Switching tab to: ${tabName}`);
+    tabContents.forEach(c => {
+        if (c.id === `tab-${tabName}`) c.classList.add("active");
+        else c.classList.remove("active");
+    });
+}
+
+function showDetailView(show: boolean) {
+    if (show) {
+        listView.style.display = "none";
+        detailView.style.display = "flex";
+    } else {
+        listView.style.display = "flex";
+        detailView.style.display = "none";
+    }
+}
+
+// Bind UI Elements
+document.getElementById("btn-settings")?.addEventListener("click", () => switchTab("settings"));
+document.getElementById("btn-settings-back")?.addEventListener("click", () => switchTab("list"));
+document.getElementById("btn-detail-back")?.addEventListener("click", () => showDetailView(false));
+
+// Global accessible for inline onclicks if any
+(window as any).switchTab = switchTab;
+(window as any).showDetailView = showDetailView;
+

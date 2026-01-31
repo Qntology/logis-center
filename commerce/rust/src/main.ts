@@ -1076,6 +1076,10 @@ btnSyncQr?.addEventListener("click", async () => {
         updateListTransform(true);
     } else {
         qrContainer.classList.add("hidden");
+        if (qrRotationInterval) {
+            clearInterval(qrRotationInterval);
+            qrRotationInterval = null;
+        }
         stopDesktopCamera();
     }
 });
@@ -1083,6 +1087,7 @@ btnSyncQr?.addEventListener("click", async () => {
 let peerConn: RTCPeerConnection | null = null;
 let dataChannel: RTCDataChannel | null = null;
 let desktopStream: MediaStream | null = null;
+let qrRotationInterval: number | null = null;
 
 function setupDataChannel(channel: RTCDataChannel) {
     channel.onopen = () => {
@@ -1099,7 +1104,7 @@ function setupDataChannel(channel: RTCDataChannel) {
     channel.onmessage = async (e) => {
         try {
             const msg = JSON.parse(e.data);
-            console.log("[WebRTC] Received:", msg.type);
+            console.log("[WebRTC] Received from Mobile:", msg.type);
             
             if (msg.type === "get_detail") {
                 const doc = await invoke<any>("get_document", { uuid: msg.uuid });
@@ -1110,10 +1115,22 @@ function setupDataChannel(channel: RTCDataChannel) {
                         content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.75rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
                     }));
                 }
+            } else if (msg.type === "search") {
+                // Perform local search for mobile
+                console.log("[WebRTC] Remote Search Query:", msg.query);
+                const docs = await Select["items"]({ 
+                    value: msg.query || "", 
+                    limit: 20, 
+                    offset: 0 
+                });
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({ type: "sync_list", data: docs }));
+                }
             } else if (msg.type === "chat_message") {
+                // Echo for now, or could integrate with actual AI chat logic
                 dataChannel?.send(JSON.stringify({ 
                     type: "sync_chat", 
-                    data: { role: "system", content: "AI (Hub): Received " + msg.content } 
+                    data: { role: "system", content: "Hub: Received '" + msg.content + "'" } 
                 }));
             }
         } catch (err) {
@@ -1145,6 +1162,12 @@ async function showPcPairingQr() {
     
     if (!qrTarget || !pcView || !mobileView) return;
     
+    // Clear existing interval if any
+    if (qrRotationInterval) {
+        clearInterval(qrRotationInterval);
+        qrRotationInterval = null;
+    }
+
     pcView.classList.remove("hidden");
     mobileView.classList.add("hidden");
     stopDesktopCamera();
@@ -1223,11 +1246,11 @@ async function showPcPairingQr() {
 
         // Start Rotation
         showChunk();
-        const qrInterval = setInterval(showChunk, 1000); // Rotate every 1000ms (1s) for better focus
+        qrRotationInterval = window.setInterval(showChunk, 1000); // Rotate every 1000ms (1s) for better focus
         
         // Clean up interval when view changes
         const cleanup = () => {
-            clearInterval(qrInterval);
+            if (qrRotationInterval) clearInterval(qrRotationInterval);
             document.getElementById("btn-switch-to-camera")?.removeEventListener("click", cleanup);
         };
         document.getElementById("btn-switch-to-camera")?.addEventListener("click", cleanup);
