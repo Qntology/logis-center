@@ -1030,8 +1030,8 @@ impl Qwen3VLTextModel {
                 )?)
             }
         };
-        // [2025-H2 Research: Layer Melting]
-        // If baking, process only Layer 0 to keep the weight-set cache-resident.
+        // [ADAPTIVE-MELTING] Restore full forward pass for maximum intelligence
+        // Use 1 layer for fast baking, but full layers for inference.
         let layer_limit = if self.is_baking { 1 } else { self.layers.len() };
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate().take(layer_limit) {
@@ -1078,40 +1078,42 @@ impl Qwen3VLTextModel {
 
     pub fn load_kv_cache(&mut self, path: &std::path::Path, device: &Device) -> Result<()> {
         let mut first_layer_kv: Option<(Tensor, Tensor)> = None;
+        let target_dtype = if device.is_cpu() { candle_core::DType::F32 } else { candle_core::DType::BF16 };
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let p = path.join(format!("layer_{}_kv.safetensors", i));
             let (mut k, mut v): (Tensor, Tensor) = if p.exists() {
                 let m = candle_core::safetensors::load(p, device)?;
-                (m.get("k").expect("Missing K tensor").clone(), m.get("v").expect("Missing V tensor").clone())
+                (
+                    m.get("k").expect("Missing K").to_dtype(target_dtype)?,
+                    m.get("v").expect("Missing V").to_dtype(target_dtype)?
+                )
             } else if let Some((ref fk, ref fv)) = first_layer_kv {
-                // [RELAY] Broadcast first layer to others
                 (fk.clone(), fv.clone())
             } else {
                 continue;
             };
 
-            let (_b, h, _s, d) = k.dims4()?;
-            let target_h = layer.self_attn.num_key_value_heads;
-            let target_d = layer.self_attn.head_dim;
+            // [DTYPE-SYNC] Critical: Ensure bridged KV matches the current computation dtype
+            k = k.to_dtype(target_dtype)?;
+            v = v.to_dtype(target_dtype)?;
 
-            // [BRIDGE] Handle Head Count Mismatch (e.g., 0.6B vs 2B)
+            let (_b, h, _s, d) = k.dims4()?;
+            let target_h = self.language_model.layers[i].self_attn.num_key_value_heads;
+            let target_d = self.language_model.layers[i].self_attn.head_dim;
+
             if h != target_h {
-                println!("[BRIDGE] Adjusting KV Heads {} -> {} for Layer {}", h, target_h, i);
                 if target_h % h == 0 {
                     let repeats = target_h / h;
                     k = k.repeat((1, repeats, 1, 1))?;
                     v = v.repeat((1, repeats, 1, 1))?;
                 } else {
-                    // Fallback to simpler narrow/pad or interpolation if needed
                     k = k.narrow(1, 0, h.min(target_h))?;
                     v = v.narrow(1, 0, h.min(target_h))?;
                 }
             }
 
-            // [BRIDGE] Handle Head Dimension Mismatch
             if d != target_d {
-                println!("[BRIDGE] Adjusting KV Head Dim {} -> {} for Layer {}", d, target_d, i);
                 k = Self::apply_linear_bridge(&k, target_d)?;
                 v = Self::apply_linear_bridge(&v, target_d)?;
             }
@@ -1120,14 +1122,9 @@ impl Qwen3VLTextModel {
                 first_layer_kv = Some((k.clone(), v.clone()));
             }
 
-            layer.self_attn.kv_cache = Some((k, v));
-
-            // [LAYER-MELTING] If we are in baking mode, we ONLY need the first layer for inference.
-            if self.is_baking {
-                println!("[MODEL-OPTIM] Layer Melting active. Only loaded Layer 0 for inference.");
-                break; 
-            }
+            self.language_model.layers[i].self_attn.kv_cache = Some((k, v));
         }
+        println!("[MODEL-OPTIM] Full Restoration: Loaded all {} layers for inference.", self.layers.len());
         Ok(())
     }
 
