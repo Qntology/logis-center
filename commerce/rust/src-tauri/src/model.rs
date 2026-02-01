@@ -409,7 +409,7 @@ impl LogisModel {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
                     // Just prefill, no generation needed for base context
-                    gen.prefill_chunk(prompt, token_clone, None)?;
+                    gen.prefill_chunk(prompt, token_clone, None, None)?;
                 }
                 Ok(())
             }).await??;

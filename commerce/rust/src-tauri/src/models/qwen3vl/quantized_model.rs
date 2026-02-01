@@ -257,18 +257,30 @@ impl QuantizedQwen3VLTextModel {
             layers.push(QuantizedQwen3VLTextDecoderLayer::new(config, ct, &mut reader, &format!("blk.{i}"), device, dtype, i, baking_only)?);
         }
         let norm = get_rms_norm(ct, &mut reader, "output_norm", config.rms_norm_eps, device, dtype)?;
-        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
+        let mut mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
+        
+        // [STRUCTURAL-FIX] Head Dimension과 mRoPE 섹션 불일치 보정
+        let half_head = config.head_dim / 2;
+        let section_sum: usize = mrope_section.iter().sum();
+        if section_sum != half_head && section_sum > 0 {
+            let ratio = half_head as f32 / section_sum as f32;
+            mrope_section = mrope_section.iter().map(|&s| (s as f32 * ratio).round() as usize).collect();
+            // 합계가 정확히 맞지 않을 경우 마지막 섹션에서 조정
+            let new_sum: usize = mrope_section.iter().sum();
+            if new_sum != half_head {
+                if let Some(last) = mrope_section.last_mut() {
+                    *last = (*last as i32 + (half_head as i32 - new_sum as i32)) as usize;
+                }
+            }
+            println!("[MODEL-FIX] Adjusted mRoPE sections to {:?} to match head_dim {}", mrope_section, config.head_dim);
+        }
 
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
     }
     pub fn forward(&mut self, embeds: &Tensor, seqlen_offset: usize, pos_ids: Option<&Tensor>, visual_mask: Option<&Tensor>, ds_embeds: Option<Vec<Tensor>>) -> Result<Tensor> {
-        let (b, s, h_dim) = embeds.dims3()?;
+        let (b, s, _h_dim) = embeds.dims3()?;
         let pos_ids = match pos_ids { Some(ids) => ids.clone(), None => Tensor::arange(seqlen_offset as u32, (s + seqlen_offset) as u32, embeds.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b, s))? };
         
-        if seqlen_offset == 0 {
-            println!("[ROPE-DEBUG] Model hidden_size: {}, mrope_section: {:?}", h_dim, self.mrope_section);
-        }
-
         let (cos, sin) = self.rotary_emb.forward(&pos_ids, embeds.dtype(), self.mrope_section.clone())?;
         
         // [FIX] Prepare batched causal mask with offset awareness
@@ -290,33 +302,150 @@ impl QuantizedQwen3VLTextModel {
         self.norm.to_device(device)?;
         Ok(())
     }
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _: usize) -> Result<()> {
-        if !path.exists() { fs::create_dir_all(path)?; }
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            if let Some((k, v)) = &layer.self_attn.kv_cache {
-                let mut map = HashMap::new();
-                map.insert("k".to_string(), k.clone()); map.insert("v".to_string(), v.clone());
-                candle_core::safetensors::save(&map, path.join(format!("layer_{}_kv.safetensors", i)))?;
+        pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _: usize) -> Result<()> {
+            if !path.exists() { fs::create_dir_all(path)?; }
+            
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                if let Some((k, v)) = &layer.self_attn.kv_cache {
+                    // [FILE-BRIDGE] 비대칭 압축 수행 후 저장
+                    let res_k = Self::compress_to_bitkv_static(i, k)?;
+                    let res_v = Self::compress_to_bitkv_static(i, v)?;
+                    
+                    let mut map = HashMap::new();
+                    map.insert("k_a".to_string(), res_k.0); map.insert("k_p".to_string(), res_k.1);
+                    map.insert("k_s".to_string(), res_k.2);
+                    map.insert("v_a".to_string(), res_v.0); map.insert("v_p".to_string(), res_v.1);
+                    map.insert("v_s".to_string(), res_v.2);
+                    
+                    let shape_tensor = Tensor::new(res_k.3.iter().map(|&x| x as u32).collect::<Vec<_>>().as_slice(), k.device())?;
+                    map.insert("shape".to_string(), shape_tensor);
+    
+                    candle_core::safetensors::save(&map, path.join(format!("layer_{}_bitkv.safetensors", i)))?;
+                }
+                if clear { layer.self_attn.kv_cache = None; }
             }
-            if clear { layer.self_attn.clear_kv_cache(); }
+            println!("[FILE-BRIDGE] Saved compressed KV cache to {:?}", path);
+            Ok(())
         }
-        Ok(())
-    }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, _: usize, _: usize) -> Result<()> {
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            let p = path.join(format!("layer_{}_kv.safetensors", i));
-            if p.exists() {
-                let map = candle_core::safetensors::load(p, device)?;
-                if let (Some(k), Some(v)) = (map.get("k"), map.get("v")) {
-                    layer.self_attn.kv_cache = Some((k.clone(), v.clone()));
+    
+        pub fn load_kv_cache(&mut self, path: &Path, device: &Device, _: usize, _: usize) -> Result<()> {
+            let is_forced_cpu = self.is_forced_cpu;
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                let p = path.join(format!("layer_{}_bitkv.safetensors", i));
+                if p.exists() {
+                    let map = candle_core::safetensors::load(p, device)?;
+                    let shape_vec: Vec<usize> = map.get("shape").unwrap().to_vec1::<u32>()?.into_iter().map(|x| x as usize).collect();
+                    
+                    let k_res = (map.get("k_a").unwrap().clone(), map.get("k_p").unwrap().clone(), map.get("k_s").unwrap().clone());
+                    let v_res = (map.get("v_a").unwrap().clone(), map.get("v_p").unwrap().clone(), map.get("v_s").unwrap().clone());
+                    
+                    let (k, v) = Self::decompress_kv_static(i, k_res, v_res, &shape_vec, is_forced_cpu)?;
+                    layer.self_attn.kv_cache = Some((k, v));
                 }
             }
+            println!("[FILE-BRIDGE] Loaded and decompressed KV cache from {:?}", path);
+            Ok(())
         }
-        Ok(())
-    }
-    pub fn compress_to_bitkv(&self, _: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> { Err(anyhow!("Not implemented")) }
-    pub fn inject_live_kv_bitkv(&mut self, _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[Tensor], _: &[usize]) -> Result<()> { Ok(()) }
-}
+    
+        // Helper static methods to avoid borrow conflicts
+        fn compress_to_bitkv_static(layer_idx: usize, tensor: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+            let shape = tensor.dims().to_vec();
+            let dev = tensor.device();
+            
+            if layer_idx == 0 {
+                return Ok((tensor.clone(), Tensor::zeros(1, DType::U8, dev)?, Tensor::zeros(1, DType::F32, dev)?, shape));
+            }
+    
+            let flat = tensor.flatten_all()?;
+            let num_el = flat.dim(0)?;
+    
+            if layer_idx <= 4 {
+                let scale = (flat.abs()?.max_all()?.to_scalar::<f32>()? / 3.0).max(1e-6);
+                let quantized = ((flat / scale as f64)? + 1.0)?.round()?.clamp(0.0, 3.0)?;
+                let q_vec = quantized.to_vec1::<f32>()?;
+                let packed_size = (num_el + 3) / 4;
+                let mut packed = vec![0u8; packed_size];
+                for (i, &v) in q_vec.iter().enumerate() { packed[i / 4] |= (v as u8) << ((i % 4) * 2); }
+                Ok((Tensor::zeros(1, tensor.dtype(), dev)?, Tensor::from_vec(packed, (packed_size,), dev)?, Tensor::new(&[scale], dev)?, shape))
+            } else {
+                let scale = flat.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-6);
+                let sign = flat.ge(0.0)?;
+                let sign_vec = sign.to_vec1::<u8>()?;
+                let packed_size = (num_el + 7) / 8;
+                let mut packed = vec![0u8; packed_size];
+                for (i, &s) in sign_vec.iter().enumerate() { if s > 0 { packed[i / 8] |= 1 << (i % 8); } }
+                Ok((Tensor::zeros(1, tensor.dtype(), dev)?, Tensor::from_vec(packed, (packed_size,), dev)?, Tensor::new(&[scale], dev)?, shape))
+            }
+        }
+    
+        fn decompress_kv_static(layer_idx: usize, k_res: (Tensor, Tensor, Tensor), v_res: (Tensor, Tensor, Tensor), original_shape: &[usize], is_forced_cpu: bool) -> Result<(Tensor, Tensor)> {
+            let target_dev = if is_forced_cpu { Device::Cpu } else { k_res.0.device().clone() };
+            let dtype = if is_forced_cpu { DType::F32 } else { DType::BF16 };
+    
+            let decompress = |res: (Tensor, Tensor, Tensor), target_device: &Device| -> Result<Tensor> {
+                if layer_idx == 0 { return Ok(res.0); }
+                let s = res.2.to_scalar::<f32>()?;
+                let packed_vec = res.1.to_vec1::<u8>()?; 
+                let total_el: usize = original_shape.iter().product();
+                let mut out = vec![0.0f32; total_el];
+                if layer_idx <= 4 {
+                    for i in 0..total_el {
+                        let val = (packed_vec[i / 4] >> ((i % 4) * 2)) & 0x03;
+                        out[i] = (val as f32 - 1.0) * s;
+                    }
+                } else {
+                    for i in 0..total_el {
+                        let sign = (packed_vec[i / 8] >> (i % 8)) & 0x01;
+                        out[i] = if sign == 1 { s } else { -s };
+                    }
+                }
+                Ok(Tensor::from_vec(out, original_shape, &Device::Cpu)?.to_device(target_device)?.to_dtype(dtype)?)
+            };
+    
+            Ok((decompress(k_res, &target_dev)?, decompress(v_res, &target_dev)?))
+        }
+    
+        pub fn compress_to_bitkv(&self, layer_idx: usize, tensor: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+            Self::compress_to_bitkv_static(layer_idx, tensor)
+        }
+    
+            pub fn inject_live_kv_bitkv(
+                &mut self, 
+                layer_idx: usize, 
+                k_res: (Tensor, Tensor, Tensor), 
+                v_res: (Tensor, Tensor, Tensor), 
+                original_shape: &[usize]
+            ) -> Result<()> {
+                let (mut k_decompressed, mut v_decompressed) = Self::decompress_kv_static(layer_idx, k_res, v_res, original_shape, self.is_forced_cpu)?;
+        
+                // [MODEL-AWARE-CHECK] 모델 레이어에서 직접 head_dim 추출 및 검증
+                if let Some(layer) = self.layers.get_mut(layer_idx) {
+                    let model_head_dim = layer.self_attn.head_dim;
+                    let data_head_dim = k_decompressed.dim(D::Minus1)?;
+        
+                    if data_head_dim != model_head_dim {
+                        println!("[RELAY-FIX] Head Dim Mismatch Detected! Model: {}, Data: {}. Aligning...", model_head_dim, data_head_dim);
+                        
+                        let align = |t: Tensor| -> Result<Tensor> {
+                            if data_head_dim < model_head_dim {
+                                // 데이터가 부족하면 (0.6B -> 2B) 0으로 패딩
+                                let mut pad_shape = t.dims().to_vec();
+                                pad_shape[t.dims().len() - 1] = model_head_dim - data_head_dim;
+                                let padding = Tensor::zeros(pad_shape, t.dtype(), t.device())?;
+                                Ok(Tensor::cat(&[t, padding], D::Minus1)?)
+                            } else {
+                                // 데이터가 넘치면 잘라냄
+                                Ok(t.narrow(D::Minus1, 0, model_head_dim)?)
+                            }
+                        };
+                        k_decompressed = align(k_decompressed)?;
+                        v_decompressed = align(v_decompressed)?;
+                    }
+        
+                    layer.self_attn.kv_cache = Some((k_decompressed, v_decompressed));
+                }
+                Ok(())
+            }}
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLModel {
@@ -469,12 +598,10 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             else if rest.starts_with("2") { target_name = "visual.merger.linear_fc2".to_string(); }
         } else if base_name.starts_with("blk.") {
             let parts: Vec<&str> = base_name[4..].splitn(2, '.').collect();
-            let layer_idx: usize = parts[0].parse().unwrap_or(0);
+            // let layer_idx: usize = parts[0].parse().unwrap_or(0);
             
-            // [9d1369 Parity] If we are in anchor-only mode (implicit for baking), skip layers > 0
-            // Note: Since this is a general Unpacker, we check if we should skip high layers.
-            // For now, we will mark them for exclusion if we are in a truly small mode.
-            if layer_idx > 0 { continue; }
+            // [FIX] Full Layer Mode: Do not skip any layers.
+            // if layer_idx > 0 { continue; }
 
             let mapped = match parts[1] {
                 "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),

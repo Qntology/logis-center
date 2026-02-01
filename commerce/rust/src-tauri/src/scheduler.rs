@@ -6,10 +6,6 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
-use crate::openai_types::{
-    ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent,
-};
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;

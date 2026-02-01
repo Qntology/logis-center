@@ -203,22 +203,22 @@ impl Qwen3VLTextRotaryEmbedding {
         freqs: &Tensor,
         mrope_section: Vec<usize>,
     ) -> Result<Tensor> {
-        println!("[ROPE-DEBUG] freqs shape: {:?}, mrope_section: {:?}", freqs.shape(), mrope_section);
-        let mut freqs_t = freqs.i(0)?.contiguous()?; 
-
-        for (dim, section) in mrope_section.iter().enumerate().skip(1) {
-            let length = section * 3;
-            let idx = Tensor::arange_step(dim as u32, length as u32, 3, freqs.device())?;
-            let src = freqs.i(dim)?.contiguous()?; 
-            let src = src.index_select(&idx, D::Minus1)?.contiguous()?;
-            let idx = idx
-                .unsqueeze(0)?
-                .unsqueeze(0)?
-                .broadcast_as(src.shape())?
-                .contiguous()?;
-            freqs_t = freqs_t.scatter(&idx, &src, D::Minus1)?;
+        if mrope_section.is_empty() {
+            return Ok(freqs.i(0)?);
         }
-        Ok(freqs_t)
+
+        let mut sections = Vec::with_capacity(mrope_section.len());
+        let mut start_idx = 0;
+        
+        for (i, &size) in mrope_section.iter().enumerate() {
+            // 각 차원(dim)에 해당하는 freqs에서 필요한 구간만 잘라냄
+            let src = freqs.i(i % 3)?;
+            let part = src.narrow(D::Minus1, start_idx, size)?;
+            sections.push(part);
+            start_idx += size;
+        }
+        
+        Ok(Tensor::cat(&sections, D::Minus1)?)
     }
     pub fn forward(
         &self,

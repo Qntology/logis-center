@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp, Module};
+use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
 use candle_nn::VarBuilder;
 use candle_transformers::utils::apply_repeat_penalty;
 
@@ -9,7 +9,7 @@ use crate::{
         qwen3vl::{
             config::{Qwen3VLConfig, Qwen3VLGenerationConfig},
             model::Qwen3VLModel,
-            quantized_model::{QuantizedQwen3VLModel, QuantizedQwen3TextModel, from_true_iq0_safetensors},
+            quantized_model::QuantizedQwen3VLModel,
             processor::Qwen3VLProcessor,
         },
     },
@@ -126,7 +126,7 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        force_4bit: bool, // [NEW]
+        _force_4bit: bool, // [NEW]
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -189,6 +189,34 @@ impl Qwen3VLGenerateModel {
         let st_files = find_type_files(path, "safetensors")?;
         
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
+
+        // [9d1369] [BIT-SERIAL-PRIORITY] 최적화된 Full Layer 0-bit 모델 우선 로드
+        let bitserial_st = st_files.iter().find(|f| f.contains("BITSERIAL_ALL.safetensors"));
+        
+        if let Some(st_path) = bitserial_st {
+            println!("[MODEL-LOAD] BIT-SERIAL Optimized Model detected: {:?}", st_path);
+            
+            // 비전 모델 경로 확인 (같은 폴더 내 mmproj-BITSERIAL_ALL.safetensors)
+            let mmproj_st = st_files.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors")).cloned();
+            
+            let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
+            
+            // 만약 비전 모델도 존재한다면 로드
+            if let Some(ref mm_path) = mmproj_st {
+                println!("[MODEL-LOAD] BIT-SERIAL Vision Projector detected: {:?}", mm_path);
+                // 비전 가중치 추가 로드 (from_true_iq0_safetensors 내부적으로 visual. 접두사 매핑 지원)
+                // (이 부분은 vb에 병합되거나 별도 VarBuilder로 처리되어야 함)
+            }
+
+            let model = Qwen3VLModel::new(cfg.clone(), vb)?;
+            return Ok(Self {
+                chat_template, tokenizer, pre_processor, qwen3_vl: ModelVariant::Standard(model),
+                text_device: text_dev, vision_device: vision_dev,
+                eos_token_id1: 151643, eos_token_id2: 151645,
+                generation_config: Qwen3VLGenerationConfig::default(), 
+                model_name: "qwen3-bitserial-full".to_string(), hard_token_limit,
+            });
+        }
 
         // [STRICT] Baking Path: Use TRUE_IQ0 (0.6B) ONLY when baking_only is true
         if baking_only {
@@ -353,44 +381,10 @@ impl Qwen3VLGenerateModel {
                 // println!("[STREAM-SAVE] Progress: {}/{} tokens saved.", end, total_tokens);
             }
 
-            if let Some(ref mut target) = relay_target {
-                let (ks, vs) = self.get_current_kv();
-                // [TURBO-RELAY] Parallelize layer compression across ALL CPU cores
-                    let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
-                    let seq_len = k.dim(candle_core::D::Minus2)?;
-                    let chunk_tokens = end - current_pos;
-                    let start = seq_len.saturating_sub(chunk_tokens);
-                    
-                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    
-                    if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
-                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
-                        Ok((res_k, res_v))
-                    } else {
-                        Err(anyhow!("Unsupported model variant"))
-                    }
-                }).collect();
-
-                let results = results?;
-                let mut k_anchors = Vec::with_capacity(results.len());
-                let mut k_packed = Vec::with_capacity(results.len());
-                let mut k_scales = Vec::with_capacity(results.len());
-                let mut v_anchors = Vec::with_capacity(results.len());
-                let mut v_packed = Vec::with_capacity(results.len());
-                let mut v_scales = Vec::with_capacity(results.len());
-                let mut original_shape = vec![];
-
-                for (res_k, res_v) in results {
-                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                    original_shape = res_k.3;
-                }
-                
-                if !k_anchors.is_empty() {
-                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
-                }
+            // [FILE-BRIDGE] 저장 경로가 있으면 디스크에 압축 상태로 저장
+            if let Some(path) = auto_save_path {
+                if !path.exists() { let _ = fs::create_dir_all(path); }
+                self.save_kv_to_disk(path)?;
             }
             current_pos = end;
         }
@@ -404,7 +398,7 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
-    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         // [STRICT-ALIGN] Never add BOS manually; ChatML handles starts.
@@ -424,52 +418,17 @@ impl Qwen3VLGenerateModel {
 
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
 
-            if let Some(ref mut target) = relay_target {
-                let (ks, vs) = self.get_current_kv();
-                // [TURBO-RELAY] Parallelize layer compression
-                    let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
-                    let s_len = k.dim(candle_core::D::Minus2)?;
-                    let chunk_tokens = end - current_pos;
-                    let start = s_len.saturating_sub(chunk_tokens);
-                    
-                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    
-                    if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
-                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
-                        Ok((res_k, res_v))
-                    } else {
-                        Err(anyhow!("Unsupported model variant for BitKV relay"))
-                    }
-                }).collect();
-
-                let results = results?;
-                let mut k_anchors = Vec::with_capacity(results.len());
-                let mut k_packed = Vec::with_capacity(results.len());
-                let mut k_scales = Vec::with_capacity(results.len());
-                let mut v_anchors = Vec::with_capacity(results.len());
-                let mut v_packed = Vec::with_capacity(results.len());
-                let mut v_scales = Vec::with_capacity(results.len());
-                let mut original_shape = vec![];
-
-                for (res_k, res_v) in results {
-                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                    original_shape = res_k.3;
-                }
-                
-                if !k_anchors.is_empty() {
-                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
-                }
+            // [FILE-BRIDGE] 디스크 저장 방식으로 통합
+            if let Some(ref sid) = session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                self.save_kv_to_disk(&path)?;
             }
             current_pos = end;
         }
 
         if let Some(sid) = session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(sid);
-            if !path.exists() { let _ = fs::create_dir_all(&path); }     
-            self.save_kv_to_disk(&path)?;
+            let path = crate::utils::paths::get_kv_dir(None).join(&sid);
             let token_path = path.join("tokens.json");
             if let Ok(file) = fs::File::create(&token_path) {
                 let _ = serde_json::to_writer(file, &full_input_ids_vec);
@@ -478,50 +437,19 @@ impl Qwen3VLGenerateModel {
         Ok(current_pos)
     }
 
-    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
-        let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
-        let chunk_size = chunk_ids_vec.len();
+    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, _relay_target: Option<&mut Qwen3VLGenerateModel>, session_id: Option<String>) -> Result<usize> {
+        let chunk = self.tokenizer.text_encode_vec(text, false)?;
+        let chunk_size = chunk.len();
         let current_pos = self.get_kv_len();
-        let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
+        let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
         let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
         if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
         
-        if let Some(target) = relay_target {
-            let (ks, vs) = self.get_current_kv();
-            // [TURBO-RELAY] Parallelize layer compression
-                let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
-                 let s_len = k.dim(candle_core::D::Minus2)?;
-                 let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                 let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                 
-                 if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                    let res_k = m.language_model.compress_to_bitkv(&k_new)?;
-                    let res_v = m.language_model.compress_to_bitkv(&v_new)?;
-                    Ok((res_k, res_v))
-                } else {
-                    Err(anyhow!("Unsupported variant"))
-                }
-            }).collect();
-
-            let results = results?;
-            let mut k_anchors = Vec::with_capacity(results.len());
-            let mut k_packed = Vec::with_capacity(results.len());
-            let mut k_scales = Vec::with_capacity(results.len());
-            let mut v_anchors = Vec::with_capacity(results.len());
-            let mut v_packed = Vec::with_capacity(results.len());
-            let mut v_scales = Vec::with_capacity(results.len());
-            let mut original_shape = vec![];
-
-            for (res_k, res_v) in results {
-                k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                original_shape = res_k.3;
-            }
-            
-            if !k_anchors.is_empty() {
-                target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
-            }
+        if let Some(sid) = session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            if !path.exists() { let _ = fs::create_dir_all(&path); }
+            self.save_kv_to_disk(&path)?;
         }
         Ok(chunk_size)
     }
