@@ -404,7 +404,7 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _
         let shape = view.shape().to_vec();
         let data = view.data();
         
-        let tensor = if dtype == DType::U8 && view.dtype() == safetensors::Dtype::I8 {
+        let tensor = if dtype == DType::U8 && (view.dtype() == safetensors::Dtype::I8 || view.dtype() == safetensors::Dtype::BOOL) {
              // Just load as U8, same byte size. 
              Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
         } else {
@@ -418,6 +418,11 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _
                 safetensors::Dtype::U32 => {
                     let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
                     Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+                },
+                safetensors::Dtype::I32 => {
+                    let i_data: &[i32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len() / 4) };
+                    let i64_data: Vec<i64> = i_data.iter().map(|&x| x as i64).collect();
+                    Tensor::from_vec(i64_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
                 },
                 safetensors::Dtype::U8 => {
                     Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
