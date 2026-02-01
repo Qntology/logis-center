@@ -1230,26 +1230,28 @@ impl Qwen3VLModel {
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
         
         // [SMART-PROBE] Dynamically find the Language Model root
-        let probe_lm = |v: &VarBuilder| {
-            let check = |p: &str| {
-                v.pp(p).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
-                v.pp(p).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
-                v.pp(p).get_with_hints((1,), "weight.min", candle_nn::Init::Const(0.)).is_ok()
-            };
-            check("embed_tokens") || check("token_embd")
+        let probe_lm = |v: &VarBuilder, prefix: &str| -> bool {
+            let p = if prefix.is_empty() { "".to_string() } else { format!("{}.", prefix) };
+            v.pp(&format!("{}embed_tokens", p)).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
+            v.pp(&format!("{}embed_tokens", p)).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
+            v.pp(&format!("{}token_embd", p)).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
+            v.pp(&format!("{}token_embd", p)).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok()
         };
 
-        let vb_lm = if probe_lm(&vb_m.pp("language_model")) {
+        // Order matters! Check deep hierarchy first, then intermediate, then flat.
+        let vb_lm = if probe_lm(&vb_m, "language_model") {
+            println!("[MODEL-PROBE] Selected Deep root: model.language_model");
             vb_m.pp("language_model") 
-        } else if probe_lm(&vb_m) {
+        } else if probe_lm(&vb, "model") {
+            println!("[MODEL-PROBE] Selected Intermediate root: model");
             vb_m.clone()
-        } else if probe_lm(&vb) {
+        } else if probe_lm(&vb, "") {
+            println!("[MODEL-PROBE] Selected Flat root: <empty>");
             vb.clone()
         } else {
+            println!("[MODEL-PROBE] Warning: No root matched probe. Falling back to default.");
             vb_m.pp("language_model")
         };
-
-        println!("[MODEL] Detected Language Model root: {:?}", vb_lm.prefix());
 
         let language_model =
             Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
@@ -1274,6 +1276,12 @@ impl Qwen3VLModel {
             } else if probe_head(&vb.pp("output")) {
                 vb.pp("output")
             } else {
+                // If not found anywhere and tie_word_embeddings is false, 
+                // we check if we should fallback to embed_tokens anyway (emergency tie)
+                println!("[MODEL-PROBE] lm_head not found. Checking for tied weights fallback...");
+                if config.tie_word_embeddings {
+                    return Ok(Self { config, visual, language_model: language_model.clone(), lm_head: Linear::new(language_model.embed_tokens.embeddings().clone(), None), rope_deltas: None, is_baking });
+                }
                 vb.pp("lm_head")
             };
 
