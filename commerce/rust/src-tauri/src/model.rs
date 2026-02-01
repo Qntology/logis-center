@@ -221,8 +221,8 @@ impl LogisModel {
         if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
         if let Ok(mut emb) = self.embedding_model.try_lock() { *emb = None; }
         
-        let mut current_size = self.current_size.lock().await;
-        *current_size = None;
+        // [FIX] Do not reset current_size here. State management is caller's responsibility.
+        // This prevents race conditions during relay.
 
         // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]
@@ -371,6 +371,13 @@ impl LogisModel {
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
         println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {}, High-Fidelity: {})...", target_size, is_baking, high_fidelity);
+        
+        // [FIX] Reserve slot immediately to block Embedding from taking GPU (moved BEFORE purge)
+        {
+            let mut size_guard = self.current_size.lock().await;
+            *size_guard = Some(target_size); 
+        } // Lock released
+
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {

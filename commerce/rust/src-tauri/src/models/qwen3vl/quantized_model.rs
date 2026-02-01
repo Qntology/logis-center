@@ -124,7 +124,8 @@ impl QLinear {
         let weight = self.dequantize_on_the_fly(target_device)?;
         
         // 2. Perform Linear operation
-        let xs_flat = xs.reshape((b * s, h))?;
+        // [FIX] Ensure input dtype matches weight dtype (e.g. F32 -> BF16)
+        let xs_flat = xs.reshape((b * s, h))?.to_dtype(weight.dtype())?;
         let mut out = xs_flat.matmul(&weight.t()?)?;
         
         if let Some(bias) = &self.bias {
@@ -146,20 +147,23 @@ impl QLinear {
         let packed_data = packed_cpu.to_vec1::<u32>()?;
         let scales_data = scales_cpu.to_vec1::<f32>()?;
         
-        let mut weights = vec![0.0f32; total_el];
+        // [PERF-FIX] Avoid zero-initialization overhead in Debug mode (memset is slow)
+        let mut weights = Vec::with_capacity(total_el);
+        unsafe { weights.set_len(total_el); }
         
-        for b_i in 0..num_blocks {
-            if b_i < scales_data.len() {
+        // [PERF-FIX] Use Rayon for parallel dequantization to prevent UI freeze in Debug mode
+        weights.par_chunks_exact_mut(32).enumerate().for_each(|(b_i, block_out)| {
+            if b_i < scales_data.len() && b_i < packed_data.len() {
                 let s_val = scales_data[b_i];
                 let b = packed_data[b_i];
-                let offset = b_i * 32;
+                
                 for bit in 0..32 {
-                    if offset + bit < total_el {
-                        weights[offset + bit] = if (b & (1 << bit)) != 0 { s_val } else { -s_val };
-                    }
+                    // Branchless optimization attempt for debug mode
+                    let sign = if (b >> bit) & 1 != 0 { 1.0 } else { -1.0 };
+                    block_out[bit] = s_val * sign;
                 }
             }
-        }
+        });
         
         Ok(Tensor::from_vec(weights, s.as_slice(), device)?.to_dtype(self.dtype)?)
     }
