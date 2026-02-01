@@ -1347,12 +1347,23 @@ impl Qwen3VLModel {
         
         // [SMART-PROBE] Improved existence check that handles ShapeMismatch and Missing keys
         let exists = |v: &VarBuilder, path: &str| -> bool {
-            if v.get_dtype(path).is_ok() { return true; }
-            // Try flat key as well (some safetensors have flat naming)
-            if let Some(last) = path.split('.').last() {
-                if vb.get_dtype(last).is_ok() { return true; }
+            match v.get_with_hints((1,), path, Init::Const(0.)) {
+                Ok(_) => true,
+                Err(candle_core::Error::ShapeMismatch { .. }) => true,
+                Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => true,
+                _ => {
+                    // Try flat key as well (some safetensors have flat naming)
+                    if let Some(last) = path.split('.').last() {
+                         match vb.get_with_hints((1,), last, Init::Const(0.)) {
+                             Ok(_) => return true,
+                             Err(candle_core::Error::ShapeMismatch { .. }) => return true,
+                             Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => return true,
+                             _ => {}
+                         }
+                    }
+                    false
+                }
             }
-            false
         };
 
         // [SMART-PROBE] Dynamically find the Vision Model root
