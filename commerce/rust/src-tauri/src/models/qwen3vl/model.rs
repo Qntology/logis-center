@@ -892,21 +892,19 @@ impl Qwen3VLTextModel {
     }
 
     pub fn load_kv_cache(&mut self, path: &std::path::Path, device: &Device) -> Result<()> {
-        let mut first_layer_kv = None;
+        let mut first_layer_kv: Option<(Tensor, Tensor)> = None;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let p = path.join(format!("layer_{}_kv.safetensors", i));
-            let (mut k, mut v) = if p.exists() {
+            let (mut k, mut v): (Tensor, Tensor) = if p.exists() {
                 let m = candle_core::safetensors::load(p, device)?;
-                (m.get("k").unwrap().clone(), m.get("v").unwrap().clone())
+                (m.get("k").expect("Missing K tensor").clone(), m.get("v").expect("Missing V tensor").clone())
             } else if let Some((ref fk, ref fv)) = first_layer_kv {
-                // [RELAY] If this layer has no snapshot but we have the first layer, broadcast it
                 (fk.clone(), fv.clone())
             } else {
                 continue;
             };
 
-            // [LINEAR-BRIDGE] Handle Dimension Mismatch (e.g., 0.6B 64-dim -> 2B 128-dim)
             let loaded_head_dim = k.dim(candle_core::D::Minus1)?;
             let target_head_dim = layer.self_attn.head_dim;
 
@@ -928,26 +926,21 @@ impl Qwen3VLTextModel {
     fn apply_linear_bridge(&self, x: &Tensor, target_dim: usize) -> Result<Tensor> {
         let (b, h, s, d) = x.dims4()?;
         let x_f32 = x.to_dtype(candle_core::DType::F32)?;
-
-        // [QUALITY-BOOST] Energy Normalization Scale
-        // When dimension doubles, the dot product energy changes. 
-        // We scale by sqrt(d_small / d_large) to keep the 2B model's attention focused.
-        let energy_scale = (d as f32 / target_dim as f32).sqrt();
+        let energy_scale = (d as f32 / target_dim as f32).sqrt() as f64;
 
         if target_dim == d * 2 {
             let left = x_f32.clone();
             let right = x_f32.roll(1, candle_core::D::Minus1)?;
             let avg = ((left + right)? * 0.5)?;
             
-            // Interleave and apply energy scale
-            let interleaved = (Tensor::stack(&[x_f32, avg], candle_core::D::Minus1)? * energy_scale as f64)?
+            let interleaved = (Tensor::stack(&[x_f32, avg], candle_core::D::Minus1)? * energy_scale)?
                 .reshape((b, h, s, target_dim))?
                 .to_dtype(x.dtype())?;
             Ok(interleaved)
         } else {
             let repeats = target_dim / d;
             let upscaled = x.repeat((1, 1, 1, repeats))?.narrow(candle_core::D::Minus1, 0, target_dim)?;
-            (upscaled.to_dtype(candle_core::DType::F32)? * energy_scale as f64)?.to_dtype(x.dtype())
+            Ok((upscaled.to_dtype(candle_core::DType::F32)? * energy_scale)?.to_dtype(x.dtype())?)
         }
     }
 }

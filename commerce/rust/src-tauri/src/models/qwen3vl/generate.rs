@@ -177,6 +177,8 @@ impl Qwen3VLGenerateModel {
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
         let mut logit_processor = get_logit_processor(mes.temperature.map(|t| t as f32), mes.top_p.map(|p| p as f32), Some(40), mes.seed.unwrap_or(34562) as u64);
         let mut seqlen_offset = self.get_kv_len();
+        let mut generated_text = String::new();
+        
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
@@ -220,6 +222,7 @@ impl Qwen3VLGenerateModel {
             local_pos += c_size; 
             seqlen_offset += c_size;
         }
+        
         let mut all_ids = full_input_ids_vec.clone(); 
         let mut pixel_values = input.pixel_values.take(); 
         let image_grid_thw = input.image_grid_thw.take();
@@ -253,13 +256,10 @@ impl Qwen3VLGenerateModel {
             let decoded = self.tokenizer.token_decode(vec![next_id])?;
             generated_text.push_str(&decoded);
             
-            // Optional progress logging
-            // if _i % 10 == 0 { println!("[GEN] Progress: {}", generated_text); }
-
             if _i > 0 && _i % 512 == 0 && !self.qwen3_vl.is_cpu() { let _ = self.qwen3_vl.rebalance_layers(0); }
             
             seqlen_offset += seq_len; 
-            local_pos = total_tokens; // After first token, we only feed the last generated ID
+            local_pos = total_tokens; 
             pixel_values = None;
         }
         Ok(generated_text)
