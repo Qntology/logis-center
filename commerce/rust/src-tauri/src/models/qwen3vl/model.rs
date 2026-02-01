@@ -777,29 +777,32 @@ impl Qwen3VLVisionModel {
 }
 
 fn get_qlinear_from_vb(vb: VarBuilder, name: &str) -> Result<QLinear> {
+    let prefix = if name.is_empty() { "".to_string() } else { format!("{}.", name) };
+    let packed_name = format!("{}packed", prefix);
+    let scales_name = format!("{}scales", prefix);
+    let shape_name = format!("{}shape", prefix);
+    let bias_name = format!("{}bias", prefix);
+
     // [VRAM-OPTIM] Load packed components instead of full tensor
     if let (Ok(packed), Ok(scales_raw), Ok(shape_t)) = (
-        vb.get_with_hints((1,), &format!("{}.packed", name), Init::Const(0.)),
-        vb.get_with_hints((1,), &format!("{}.scales", name), Init::Const(0.)),
-        vb.get_with_hints((1,), &format!("{}.shape", name), Init::Const(0.))
+        vb.get_with_hints((1,), &packed_name, Init::Const(0.)),
+        vb.get_with_hints((1,), &scales_name, Init::Const(0.)),
+        vb.get_with_hints((1,), &shape_name, Init::Const(0.))
     ) {
-        // [FIX] Scales might be loaded as F16 from Python script, convert to F32 for math
         let scales = scales_raw.to_dtype(DType::F32)?;
-        // Fix i32 error: Read as U32 or I64 if possible, or cast.
-        // Assuming shape was saved as I32/U32. Try converting to U32 first for extraction.
         let shape_vec: Vec<usize> = shape_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-        let bias = vb.get_with_hints((1,), &format!("{}.bias", name), Init::Const(0.)).ok();
+        let bias = vb.get_with_hints((1,), &bias_name, Init::Const(0.)).ok();
         return Ok(QLinear::new(packed, scales, shape_vec, bias, vb.device().clone()));
     }
     
-    // Fallback for non-quantized weights
-    let weight = vb.get_with_hints((1,), name, Init::Const(0.))?; 
+    // Fallback for non-quantized weights (look for "weight" or the name itself)
+    let weight_name = if name.is_empty() { "weight".to_string() } else { name.to_string() };
+    let weight = vb.get_with_hints((1,), &weight_name, Init::Const(0.))?; 
     let s = weight.dims().to_vec();
     let total_el = s.iter().product::<usize>();
-    // Fake pack
     let scales = Tensor::ones((total_el / 32).max(1), DType::F32, vb.device())?;
     let packed = Tensor::zeros((total_el / 32).max(1), DType::U32, vb.device())?;
-    let bias = vb.get_with_hints((1,), &format!("{}.bias", name), Init::Const(0.)).ok();
+    let bias = vb.get_with_hints((1,), &bias_name, Init::Const(0.)).ok();
     
     Ok(QLinear::new(packed, scales, s, bias, vb.device().clone()))
 }
@@ -829,6 +832,7 @@ impl Qwen3VLTextAttention {
         let num_kv_groups = num_attention_heads / num_key_value_heads;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
         
+        // [FIX] Use explicit weight sub-key naming to match Bit-Serial format
         let q_proj = get_qlinear_from_vb(vb.pp("q_proj"), "weight")?;
         let k_proj = get_qlinear_from_vb(vb.pp("k_proj"), "weight")?;
         let v_proj = get_qlinear_from_vb(vb.pp("v_proj"), "weight")?;
@@ -1034,20 +1038,27 @@ impl Qwen3VLTextModel {
             // [SMART-PROBE] Check if this layer exists in the file (RESILIENT)
             let check_path = vb_l.pp(layer_idx).pp("input_layernorm");
             
-            let mut layer_exists = match check_path.get_with_hints((1,), "weight", Init::Const(0.)) {
-                Ok(_) => true,
-                Err(_) => {
-                    // Try alternative name
-                    vb_l.pp(layer_idx).pp("attn_norm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok()
+            let is_tensor_there = |v: &VarBuilder, name: &str| -> bool {
+                match v.get_with_hints((1,), name, Init::Const(0.)) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        let s = e.to_string().to_lowercase();
+                        s.contains("shape mismatch") || s.contains("dtype mismatch")
+                    }
                 }
             };
+
+            let mut layer_exists = is_tensor_there(&check_path, "weight");
             
-            // Try flat check if not found
+            if !layer_exists {
+                // Try alternative name
+                layer_exists = is_tensor_there(&vb_l.pp(layer_idx).pp("attn_norm"), "weight");
+            }
+            
+            // Final fallback: try flat check on the original VarBuilder
             if !layer_exists {
                 let flat_name = format!("layers.{}.input_layernorm.weight", layer_idx);
-                if vb.get_with_hints((1,), &flat_name, Init::Const(0.)).is_ok() {
-                    layer_exists = true;
-                }
+                layer_exists = is_tensor_there(&vb, &flat_name);
             }
 
             println!("[MODEL-DEBUG] Probing Layer {}: Found={}", layer_idx, layer_exists);
@@ -1353,41 +1364,32 @@ impl Qwen3VLModel {
     }
 
     pub fn new_ext(config: Qwen3VLConfig, vb: VarBuilder, force_text_only: bool, is_baking: bool) -> Result<Self> {
-        let vb_m = vb.pp("model");
         let config = config.clone();
         
-        // [SMART-PROBE] Improved existence check that handles ShapeMismatch and Missing keys
-        let exists = |v: &VarBuilder, path: &str| -> bool {
-            match v.get_with_hints((1,), path, Init::Const(0.)) {
+        // [SMART-PROBE] Robust existence check helper
+        let probe = |v: &VarBuilder, p: &str| -> bool {
+            match v.get_with_hints((1,), p, Init::Const(0.)) {
                 Ok(_) => true,
-                Err(candle_core::Error::ShapeMismatch { .. }) => true,
-                Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => true,
-                _ => {
-                    // Try flat key as well (some safetensors have flat naming)
-                    if let Some(last) = path.split('.').last() {
-                         match vb.get_with_hints((1,), last, Init::Const(0.)) {
-                             Ok(_) => return true,
-                             Err(candle_core::Error::ShapeMismatch { .. }) => return true,
-                             Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => return true,
-                             _ => {}
-                         }
-                    }
-                    false
+                Err(e) => {
+                    let s = e.to_string().to_lowercase();
+                    s.contains("shape mismatch") || s.contains("dtype mismatch")
                 }
             }
         };
 
-        // [SMART-PROBE] Dynamically find the Vision Model root
+        // 1. [SMART-PROBE] Dynamically find the Vision Model root
         let visual = if !force_text_only && config.vision_config.is_some() {
             let v_config = config.vision_config.as_ref().unwrap();
             
-            let vb_v = if exists(&vb_m, "visual.patch_embed.proj.weight") || exists(&vb_m, "visual.patch_embd.weight") {
-                Some(vb_m.pp("visual")) 
-            } else if exists(&vb, "visual.patch_embed.proj.weight") || exists(&vb, "visual.patch_embd.weight") {
+            let vb_v = if probe(&vb, "model.visual.patch_embed.proj.weight") || probe(&vb, "model.visual.patch_embd.weight") {
+                Some(vb.pp("model").pp("visual")) 
+            } else if probe(&vb, "visual.patch_embed.proj.weight") || probe(&vb, "visual.patch_embd.weight") {
                 Some(vb.pp("visual"))
-            } else if exists(&vb, "v.patch_embd.weight") || exists(&vb, "v.blk.0.ln1.weight") {
+            } else if probe(&vb, "model.v.patch_embd.weight") || probe(&vb, "model.v.blk.0.ln1.weight") {
+                Some(vb.pp("model").pp("v"))
+            } else if probe(&vb, "v.patch_embd.weight") || probe(&vb, "v.blk.0.ln1.weight") {
                 Some(vb.pp("v"))
-            } else if exists(&vb, "patch_embd.weight") || exists(&vb, "patch_embed.proj.weight") {
+            } else if probe(&vb, "patch_embd.weight") || probe(&vb, "patch_embed.proj.weight") {
                 Some(vb.clone()) // Flat root
             } else {
                 None
@@ -1406,30 +1408,31 @@ impl Qwen3VLModel {
             None
         };
         
-        // [FIX] text_config is optional, but required for Qwen3VLModel
+        // 2. [SMART-PROBE] Dynamically find the Language Model root
+        println!("[MODEL-DEBUG] Probing for Language Model Root...");
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
         
-        // [SMART-PROBE] Dynamically find the Language Model root using Layer 0 Anchor
-        println!("[MODEL-DEBUG] Probing for Language Model Root...");
-        let (vb_lm, found_root) = if exists(&vb_m, "language_model.layers.0.input_layernorm.weight") {
+        let (vb_lm, _found_root) = if probe(&vb, "model.language_model.layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Deep root: model.language_model");
-            (vb_m.pp("language_model"), true)
-        } else if exists(&vb_m, "layers.0.input_layernorm.weight") {
+            (vb.pp("model").pp("language_model"), true)
+        } else if probe(&vb, "model.layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Intermediate root: model");
-            (vb_m.clone(), true)
-        } else if exists(&vb, "model.layers.0.input_layernorm.weight") {
-             println!("[MODEL-PROBE] Selected Root (with model. prefix): <root>");
-             (vb.pp("model"), true)
-        } else if exists(&vb, "layers.0.input_layernorm.weight") {
-            println!("[MODEL-PROBE] Selected Flat root: <root>");
+            (vb.pp("model"), true)
+        } else if probe(&vb, "language_model.layers.0.input_layernorm.weight") {
+            println!("[MODEL-PROBE] Selected language_model root (no model prefix)");
+            (vb.pp("language_model"), true)
+        } else if probe(&vb, "layers.0.input_layernorm.weight") {
+            println!("[MODEL-PROBE] Selected Flat root");
             (vb.clone(), true)
-        } else if exists(&vb, "blk.0.attn_norm.weight") {
-            println!("[MODEL-PROBE] Selected GGUF-Style root: <root>");
+        } else if probe(&vb, "model.embed_tokens.weight") {
+            println!("[MODEL-PROBE] Selected model root via embed_tokens anchor");
+            (vb.pp("model"), true)
+        } else if probe(&vb, "blk.0.attn_norm.weight") {
+            println!("[MODEL-PROBE] Selected GGUF-Style root");
             (vb.clone(), true)
         } else {
-            println!("[MODEL-DEBUG] Root Probe FAILED. Available Layer 0 candidates were NOT found.");
-            println!("[MODEL-PROBE] Warning: Layer anchor not found. Falling back to model.language_model");
-            (vb_m.pp("language_model"), false)
+            println!("[MODEL-DEBUG] Root Probe FAILED. Falling back to default.");
+            (vb.pp("model").pp("language_model"), false)
         };
 
         let language_model = Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
@@ -1437,28 +1440,27 @@ impl Qwen3VLModel {
         // [BAKING-CHECK] Critical: If baking, we MUST have layer 0
         if is_baking && language_model.layers.len() > 0 && language_model.layers[0].is_none() {
             println!("[MODEL-CRITICAL] Baking requested but Layer 0 was NOT loaded! Check tensor keys.");
-            return Err(anyhow!("Layer 0 missing in baking mode"));
+            return Err(anyhow!("Layer 0 missing in baking mode."));
         }
         
+        // 3. [SMART-PROBE] Find LM Head
         let lm_head = {
             let probe_h = |v: &VarBuilder, path: &str| -> bool {
                 for suffix in &["", ".packed", ".min"] {
                     let full_name = format!("{}.weight{}", path, suffix);
-                    if exists(v, &full_name) { return true; }
+                    if probe(v, &full_name) { return true; }
                 }
                 false
             };
 
-            let vb_head = if probe_h(&vb_m, "language_model.lm_head") {
-                Some(vb_m.pp("language_model").pp("lm_head"))
-            } else if probe_h(&vb_m, "lm_head") {
-                Some(vb_m.pp("lm_head"))
+            let vb_head = if probe_h(&vb, "model.language_model.lm_head") {
+                Some(vb.pp("model").pp("language_model").pp("lm_head"))
             } else if probe_h(&vb, "model.lm_head") {
                 Some(vb.pp("model").pp("lm_head"))
+            } else if probe_h(&vb, "language_model.lm_head") {
+                Some(vb.pp("language_model").pp("lm_head"))
             } else if probe_h(&vb, "lm_head") {
                 Some(vb.pp("lm_head"))
-            } else if probe_h(&vb_m, "output") {
-                Some(vb_m.pp("output"))
             } else if probe_h(&vb, "model.output") {
                 Some(vb.pp("model").pp("output"))
             } else if probe_h(&vb, "output") {
@@ -1470,12 +1472,9 @@ impl Qwen3VLModel {
             if let Some(vh) = vb_head {
                 get_qlinear_from_vb(vh, "weight")?
             } else {
-                println!("[MODEL-PROBE] lm_head not found in file. Creating dummy tied weights for Baking/Inference-Split.");
-                // Fake pack for tied weights or dummy placeholder
+                println!("[MODEL-PROBE] lm_head not found. Creating dummy tied weights.");
                 let w = language_model.embed_tokens.embeddings().clone();
                 let total_el = w.elem_count();
-                // If w is dummy (zero tensor from inference mode missing embeddings), this is fine as long as we don't use it.
-                // QLinear constructor will handle it.
                 let scales = Tensor::ones((total_el / 32).max(1), DType::F32, w.device())?;
                 let packed = Tensor::zeros((total_el / 32).max(1), DType::U32, w.device())?;
                 QLinear::new(packed, scales, w.dims().to_vec(), None, w.device().clone())
@@ -1483,17 +1482,10 @@ impl Qwen3VLModel {
         };
 
         let mut model = Self {
-            config,
-            visual,
-            language_model,
-            lm_head,
-            rope_deltas: None,
-            is_baking,
+            config, visual, language_model, lm_head,
+            rope_deltas: None, is_baking,
         };
-        
-        // Ensure baking state is propagated
         model.set_baking(is_baking);
-
         Ok(model)
     }
 
