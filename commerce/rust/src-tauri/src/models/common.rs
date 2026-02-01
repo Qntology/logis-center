@@ -1,22 +1,35 @@
 use anyhow::Result;
 use candle_core::{D, Device, Tensor};
 use candle_nn::{
-    Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig,
-    Linear, Module, RmsNorm, VarBuilder, batch_norm, conv2d, conv2d_no_bias, layer_norm, linear,
-    linear_no_bias, rms_norm,
+    Activation, LayerNorm, Linear, Module, RmsNorm, VarBuilder, rms_norm,
 };
 
 use crate::{models::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
 
-fn find_bitserial_weight(v: &VarBuilder, name: &str, out_dim: usize, in_dim: usize) -> Result<Tensor> {
+pub fn find_flexible_weight(v: &VarBuilder, name: &str, out_dim: usize, in_dim: usize) -> Result<Tensor> {
     for suffix in &["", ".packed", ".min"] {
         let full_name = format!("{}{}", name, suffix);
-        if let Ok(t) = v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)) {
-            return Ok(v.get(t.shape(), &full_name)?);
+        // [SMART-LOAD] Catch ShapeMismatch to detect existence and retrieve actual shape
+        match v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)) {
+            Ok(t) => return Ok(v.get(t.shape(), &full_name)?),
+            Err(candle_core::Error::ShapeMismatch { shape, .. }) => {
+                return Ok(v.get(shape, &full_name)?);
+            }
+            Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => {
+                // Fallback for versions returning Msg
+                return Ok(v.get((out_dim, in_dim), &full_name).or_else(|_| v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)))?);
+            }
+            _ => {}
         }
     }
-    // Fallback to standard linear init to get a proper error if it truly doesn't exist
+    // Final fallback to standard name and dimensions
     Ok(v.get((out_dim, in_dim), name)?)
+}
+
+pub fn get_layer_norm(vb: VarBuilder, eps: f64, size: usize) -> Result<LayerNorm> {
+    let weight = vb.get(size, "weight")?;
+    let bias = vb.get(size, "bias")?;
+    Ok(LayerNorm::new(weight, bias, eps))
 }
 
 #[derive(Debug, Clone)]
@@ -35,9 +48,9 @@ impl GateUpDownMLP {
         act_fn: Activation,
         bias: bool,
     ) -> Result<Self> {
-        let gate_w = find_bitserial_weight(&vb.pp("gate_proj"), "weight", intermediate_size, hidden_size)?;
-        let up_w = find_bitserial_weight(&vb.pp("up_proj"), "weight", intermediate_size, hidden_size)?;
-        let down_w = find_bitserial_weight(&vb.pp("down_proj"), "weight", hidden_size, intermediate_size)?;
+        let gate_w = find_flexible_weight(&vb.pp("gate_proj"), "weight", intermediate_size, hidden_size)?;
+        let up_w = find_flexible_weight(&vb.pp("up_proj"), "weight", intermediate_size, hidden_size)?;
+        let down_w = find_flexible_weight(&vb.pp("down_proj"), "weight", hidden_size, intermediate_size)?;
 
         let (gate_b, up_b, down_b) = if bias {
             (
@@ -98,8 +111,8 @@ impl TwoLinearMLP {
         linear1_pp_name: &str,
         linear2_pp_name: &str,
     ) -> Result<Self> {
-        let l1_w = find_bitserial_weight(&vb.pp(linear1_pp_name), "weight", mlp_dim, embedding_dim)?;
-        let l2_w = find_bitserial_weight(&vb.pp(linear2_pp_name), "weight", embedding_dim, mlp_dim)?;
+        let l1_w = find_flexible_weight(&vb.pp(linear1_pp_name), "weight", mlp_dim, embedding_dim)?;
+        let l2_w = find_flexible_weight(&vb.pp(linear2_pp_name), "weight", embedding_dim, mlp_dim)?;
 
         let (l1_b, l2_b) = if bias {
             (
@@ -169,10 +182,10 @@ impl NaiveAttention {
         };
         let o_proj_pp_name = o_proj_pp_name.unwrap_or("o_proj");
 
-        let q_w = find_bitserial_weight(&vb.pp("q_proj"), "weight", num_attention_heads * head_dim, hidden_size)?;
-        let k_w = find_bitserial_weight(&vb.pp("k_proj"), "weight", num_key_value_heads * head_dim, hidden_size)?;
-        let v_w = find_bitserial_weight(&vb.pp("v_proj"), "weight", num_key_value_heads * head_dim, hidden_size)?;
-        let o_w = find_bitserial_weight(&vb.pp(o_proj_pp_name), "weight", hidden_size, num_attention_heads * head_dim)?;
+        let q_w = find_flexible_weight(&vb.pp("q_proj"), "weight", num_attention_heads * head_dim, hidden_size)?;
+        let k_w = find_flexible_weight(&vb.pp("k_proj"), "weight", num_key_value_heads * head_dim, hidden_size)?;
+        let v_w = find_flexible_weight(&vb.pp("v_proj"), "weight", num_key_value_heads * head_dim, hidden_size)?;
+        let o_w = find_flexible_weight(&vb.pp(o_proj_pp_name), "weight", hidden_size, num_attention_heads * head_dim)?;
 
         let (q_b, k_b, v_b, o_b) = if bias {
             (

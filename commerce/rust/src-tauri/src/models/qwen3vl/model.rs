@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
 use candle_nn::{
-    Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
+    Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, linear,
     linear_no_bias, rms_norm,
 };
 
@@ -961,27 +961,16 @@ pub struct Qwen3VLTextModel {
 impl Qwen3VLTextModel {
     pub fn new(mut config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
         let vocab_size = config.vocab_size;
+        use crate::models::common::find_flexible_weight;
 
-        // [SMART-PROBE] Find the weight tensor for embed_tokens among possible variations
-        let find_weight = |v: &VarBuilder, name: &str| -> Result<Tensor> {
-            for suffix in &["", ".packed", ".min"] {
-                let full_name = format!("{}{}", name, suffix);
-                if let Ok(t) = v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)) {
-                    // Re-fetch with correct shape now that we know it exists
-                    return Ok(v.get(t.shape(), &full_name)?);
-                }
-            }
-            Err(anyhow!(format!("Cannot find tensor for {}", name)))
-        };
-
-        let embed_tokens_weight = find_weight(&vb.pp("embed_tokens"), "weight")?;
+        let embed_tokens_weight = find_flexible_weight(&vb.pp("embed_tokens"), "weight", vocab_size, config.hidden_size)?;
         let actual_h = embed_tokens_weight.dim(1)?;
         if actual_h != config.hidden_size {
             println!("[MODEL-FIX] Hidden Size Mismatch. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_h);
             config.hidden_size = actual_h;
         }
 
-        let embed_tokens = embedding(vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+        let embed_tokens = Embedding::new(embed_tokens_weight, config.hidden_size);
         let mut layers = vec![];
         let vb_l = vb.pp("layers");
         for layer_idx in 0..config.num_hidden_layers {
@@ -1102,7 +1091,7 @@ impl Qwen3VLTextModel {
                 continue;
             };
 
-            let (b, h, s, d) = k.dims4()?;
+            let (_b, h, _s, d) = k.dims4()?;
             let target_h = layer.self_attn.num_key_value_heads;
             let target_d = layer.self_attn.head_dim;
 
@@ -1192,33 +1181,32 @@ impl Qwen3VLModel {
         let visual = if !force_text_only && config.vision_config.is_some() {
             let v_config = config.vision_config.as_ref().unwrap();
             
-            // Check multiple possible vision roots and naming variations
-            let probe_v = |v: &VarBuilder| {
-                let check = |p: &str| {
-                    v.pp(p).pp("proj").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
-                    v.pp(p).pp("proj").get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
-                    v.pp(p).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
-                    v.pp(p).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok()
-                };
-                check("patch_embed") || check("patch_embd")
+            // Check multiple possible vision roots using stable layer anchors
+            let probe_v = |path: &str| -> bool {
+                let full_n = format!("{}.patch_embed.proj.weight", path);
+                let full_n2 = format!("{}.patch_embd.weight", path);
+                let full_n3 = format!("{}.blk.0.ln1.weight", path);
+                vb.get_with_hints((1,), &full_n, Init::Const(0.)).is_ok() ||
+                vb.get_with_hints((1,), &full_n2, Init::Const(0.)).is_ok() ||
+                vb.get_with_hints((1,), &full_n3, Init::Const(0.)).is_ok()
             };
 
-            let vb_v = if probe_v(&vb_m.pp("visual")) {
-                Some(vb_m.pp("visual")) // model.visual...
-            } else if probe_v(&vb.pp("visual")) {
-                Some(vb.pp("visual")) // visual...
-            } else if probe_v(&vb.pp("v")) {
-                Some(vb.pp("v")) // v... (mmproj standard)
+            let vb_v = if probe_v("model.visual") {
+                Some(vb_m.pp("visual")) 
+            } else if probe_v("visual") {
+                Some(vb.pp("visual"))
+            } else if probe_v("v") {
+                Some(vb.pp("v"))
             } else {
                 None
             };
 
             if let Some(vb_v_final) = vb_v {
-                println!("[MODEL] Detected Vision Model root: {:?}", vb_v_final.prefix());
+                println!("[MODEL-PROBE] Detected Vision root: {:?}", vb_v_final.prefix());
                 Some(Qwen3VLVisionModel::new(v_config.clone(), vb_v_final)?)
             } else {
                 if !is_baking {
-                    println!("[MODEL] Vision tensors (mmproj) not found in weight set. Skipping Vision initialization.");
+                    println!("[MODEL-PROBE] Vision tensors not found. Skipping Vision initialization.");
                 }
                 None
             }
@@ -1229,27 +1217,25 @@ impl Qwen3VLModel {
         // [FIX] text_config is optional, but required for Qwen3VLModel
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
         
-        // [SMART-PROBE] Dynamically find the Language Model root
-        let probe_lm = |v: &VarBuilder, prefix: &str| -> bool {
-            let p = if prefix.is_empty() { "".to_string() } else { format!("{}.", prefix) };
-            v.pp(&format!("{}embed_tokens", p)).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
-            v.pp(&format!("{}embed_tokens", p)).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
-            v.pp(&format!("{}token_embd", p)).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
-            v.pp(&format!("{}token_embd", p)).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok()
+        // [SMART-PROBE] Dynamically find the Language Model root using Layer 0 Anchor
+        // Layer 0's input_layernorm is the most stable anchor across all model variants.
+        let probe_lm = |path: &str| -> bool {
+            let full_n = format!("{}.layers.0.input_layernorm.weight", path);
+            vb.get_with_hints((1,), &full_n, Init::Const(0.)).is_ok() ||
+            vb.get_with_hints((1,), &format!("{}.weight", full_n), Init::Const(0.)).is_ok() // Some tools export as .weight.weight
         };
 
-        // Order matters! Check deep hierarchy first, then intermediate, then flat.
-        let vb_lm = if probe_lm(&vb_m, "language_model") {
+        let vb_lm = if probe_lm("model.language_model") {
             println!("[MODEL-PROBE] Selected Deep root: model.language_model");
             vb_m.pp("language_model") 
-        } else if probe_lm(&vb, "model") {
+        } else if probe_lm("model") {
             println!("[MODEL-PROBE] Selected Intermediate root: model");
             vb_m.clone()
-        } else if probe_lm(&vb, "") {
-            println!("[MODEL-PROBE] Selected Flat root: <empty>");
+        } else if probe_lm("") {
+            println!("[MODEL-PROBE] Selected Flat root: <root>");
             vb.clone()
         } else {
-            println!("[MODEL-PROBE] Warning: No root matched probe. Falling back to default.");
+            println!("[MODEL-PROBE] Warning: Layer anchor not found. Falling back to default.");
             vb_m.pp("language_model")
         };
 
@@ -1259,39 +1245,44 @@ impl Qwen3VLModel {
         // [FIX] Use actual hidden size from loaded model for lm_head to prevent mismatch
         let actual_h = language_model.embed_tokens.hidden_size();
 
-        let lm_head = if config.tie_word_embeddings {
-            Linear::new(language_model.embed_tokens.embeddings().clone(), None)
-        } else {
-            // [SMART-PROBE] Find lm_head similarly
-            let probe_head = |v: &VarBuilder| {
-                v.get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
-                v.get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
-                v.get_with_hints((1,), "weight.min", candle_nn::Init::Const(0.)).is_ok()
-            };
-
-            let vb_head = if probe_head(&vb_m.pp("lm_head")) {
-                vb_m.pp("lm_head")
-            } else if probe_head(&vb.pp("lm_head")) {
-                vb.pp("lm_head")
-            } else if probe_head(&vb.pp("output")) {
-                vb.pp("output")
-            } else {
-                // If not found anywhere and tie_word_embeddings is false, 
-                // we check if we should fallback to embed_tokens anyway (emergency tie)
-                println!("[MODEL-PROBE] lm_head not found. Checking for tied weights fallback...");
-                if config.tie_word_embeddings {
-                    return Ok(Self { config, visual, language_model: language_model.clone(), lm_head: Linear::new(language_model.embed_tokens.embeddings().clone(), None), rope_deltas: None, is_baking });
+        let lm_head = {
+            // [SMART-PROBE] Find lm_head similarly using absolute paths
+            use crate::models::common::find_flexible_weight;
+            
+            let probe_h = |path: &str| -> bool {
+                for suffix in &["", ".packed", ".min"] {
+                    let full_name = format!("{}.weight{}", path, suffix);
+                    match vb.get_with_hints((1,), &full_name, Init::Const(0.)) {
+                        Ok(_) => return true,
+                        Err(candle_core::Error::ShapeMismatch { .. }) => return true,
+                        _ => {}
+                    }
                 }
-                vb.pp("lm_head")
+                false
             };
 
-            linear_no_bias(
-                actual_h,
-                text_config.vocab_size,
-                vb_head,
-            )?
+            let vb_head = if probe_h("model.language_model.lm_head") {
+                Some(vb_m.pp("language_model").pp("lm_head"))
+            } else if probe_h("model.lm_head") {
+                Some(vb_m.pp("lm_head"))
+            } else if probe_h("lm_head") {
+                Some(vb.pp("lm_head"))
+            } else if probe_h("model.output") {
+                Some(vb_m.pp("output"))
+            } else {
+                None
+            };
+
+            if let Some(vh) = vb_head {
+                let lm_head_w = find_flexible_weight(&vh, "weight", text_config.vocab_size, actual_h)?;
+                let lm_head_b = vh.get(text_config.vocab_size, "bias").ok();
+                Linear::new(lm_head_w, lm_head_b)
+            } else {
+                println!("[MODEL-PROBE] lm_head not found in file. Falling back to Tied Weights.");
+                Linear::new(language_model.embed_tokens.embeddings().clone(), None)
+            }
         };
-        
+
         let mut model = Self {
             config,
             visual,
