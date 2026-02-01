@@ -1425,7 +1425,12 @@ impl Qwen3VLModel {
             let probe_h = |v: &VarBuilder, path: &str| -> bool {
                 for suffix in &["", ".packed", ".min"] {
                     let full_name = format!("{}.weight{}", path, suffix);
-                    if v.get_dtype(&full_name).is_ok() { return true; }
+                    match v.get_with_hints((1,), &full_name, Init::Const(0.)) {
+                        Ok(_) => return true,
+                        Err(candle_core::Error::ShapeMismatch { .. }) => return true,
+                        Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => return true,
+                        _ => {}
+                    }
                 }
                 false
             };
