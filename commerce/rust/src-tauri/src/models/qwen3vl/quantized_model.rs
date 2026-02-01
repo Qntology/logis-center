@@ -240,8 +240,13 @@ impl QuantizedQwen3VLTextModel {
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
     }
     pub fn forward(&mut self, embeds: &Tensor, seqlen_offset: usize, pos_ids: Option<&Tensor>, visual_mask: Option<&Tensor>, ds_embeds: Option<Vec<Tensor>>) -> Result<Tensor> {
-        let (b, s, _) = embeds.dims3()?;
+        let (b, s, h_dim) = embeds.dims3()?;
         let pos_ids = match pos_ids { Some(ids) => ids.clone(), None => Tensor::arange(seqlen_offset as u32, (s + seqlen_offset) as u32, embeds.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b, s))? };
+        
+        if seqlen_offset == 0 {
+            println!("[ROPE-DEBUG] Model hidden_size: {}, mrope_section: {:?}", h_dim, self.mrope_section);
+        }
+
         let (cos, sin) = self.rotary_emb.forward(&pos_ids, embeds.dtype(), self.mrope_section.clone())?;
         
         // [FIX] Prepare batched causal mask with offset awareness
@@ -530,33 +535,12 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
         };
 
-        // [Surgical Physical Bridge in Rust]
-        let mut expanded_tensor = final_tensor;
-        let is_neural_weight = target_name.contains("proj") || target_name.contains("embed_tokens") || target_name.contains("norm.weight") || target_name.contains("mlp") || target_name.contains("lm_head");
-        
-        if is_neural_weight {
-            for dim in 0..expanded_tensor.rank() {
-                let size = expanded_tensor.dim(dim)?;
-                if size == 1024 || size == 3072 {
-                    if (target_name.contains("k_proj") || target_name.contains("v_proj")) && dim == 0 { continue; }
-                    expanded_tensor = Tensor::cat(&[&expanded_tensor, &expanded_tensor], dim)?;
-                }
-            }
-        }
-
         if !target_name.starts_with("lm_head") {
-            data.insert(format!("model.{}", target_name), expanded_tensor);
+            data.insert(format!("model.{}", target_name), final_tensor);
         } else {
-            data.insert(target_name, expanded_tensor);
+            data.insert(target_name, final_tensor);
         }
     }
     
-    // Final check of critical tensor shapes
-    if let Some(t) = data.get("model.language_model.embed_tokens.weight") {
-        println!("[MODEL-TRACE] Physical Bridge SUCCESS: embed_tokens is {:?}", t.shape());
-    }
-    if let Some(t) = data.get("model.language_model.layers.0.mlp.gate_proj.weight") {
-        println!("[MODEL-TRACE] Physical Bridge SUCCESS: gate_proj is {:?}", t.shape());
-    }
     Ok(VarBuilder::from_tensors(data, dtype, device))
 }
