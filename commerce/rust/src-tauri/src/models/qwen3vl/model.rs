@@ -293,6 +293,65 @@ impl Qwen3VLVisionAttention {
             scaling,
         })
     }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let qkv_w = self.qkv.weight().to_device(device)?;
+        let qkv_b = self.qkv.bias().map(|b| b.to_device(device)).transpose()?;
+        self.qkv = Linear::new(qkv_w, qkv_b);
+
+        let proj_w = self.proj.weight().to_device(device)?;
+        let proj_b = self.proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.proj = Linear::new(proj_w, proj_b);
+        Ok(())
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cu_seqlens: &Tensor,
+    ) -> Result<Tensor> {
+        // xs: (seq_len, hidden_size)
+        let seq_length = xs.dim(0)?;
+        // (seq_len, hidden_size) -> (seq_len, hidden_size*3)
+        // -> (seq_len, 3, num_heads, head_dim)
+        // -> (3, seq_len, num_heads, head_dim)
+        let qkv_states = xs
+            .apply(&self.qkv)?
+            .reshape((seq_length, 3, self.num_heads, ()))?
+            .permute((1, 0, 2, 3))?;
+        // (seq_len, num_heads, head_dim)
+        let query_states = qkv_states.i(0)?.contiguous()?;
+        let key_states = qkv_states.i(1)?.contiguous()?;
+        let value_states = qkv_states.i(2)?.contiguous()?;
+        let (query_states, key_states) =
+            apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
+        // (seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim) -> (1, num_heads, seq_len, head_dim)
+        let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let cu_last_id = cu_seqlens.dim(0)? - 1;
+        let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
+        let chunks: Vec<usize> = lengths
+            .to_vec1::<u32>()?
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
+        let q_splits = split_tensor(&query_states, &chunks, 2)?;
+        let k_splits = split_tensor(&key_states, &chunks, 2)?;
+        let v_splits = split_tensor(&value_states, &chunks, 2)?;
+
+        let mut attn_outputs = Vec::new();
+        for (q, (k, v)) in q_splits.iter().zip(k_splits.iter().zip(v_splits.iter())) {
+            let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
+            attn_outputs.push(output);
+        }
+        let attn_output = Tensor::cat(&attn_outputs, 1)?;
+        let attn_output = attn_output.reshape((seq_length, ()))?.contiguous()?;
+        let attn_ouput = attn_output.apply(&self.proj)?;
+        Ok(attn_ouput)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1217,6 +1276,13 @@ impl Qwen3VLModel {
             } else {
                 vb.pp("lm_head")
             };
+
+            linear_no_bias(
+                actual_h,
+                text_config.vocab_size,
+                vb_head,
+            )?
+        };
         
         let mut model = Self {
             config,
