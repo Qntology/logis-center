@@ -170,6 +170,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub embed_tokens: Embedding, pub layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
     pub norm: RmsNorm, pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>, pub mmap: Option<Arc<Mmap>>, pub is_forced_cpu: bool,
+    pub is_baking: bool,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -182,13 +183,17 @@ impl QuantizedQwen3VLTextModel {
              let t = tensor.dequantize(device)?.to_dtype(dtype)?; let h = t.dim(1)?; (Embedding::new(t, h), h)
         } else { return Err(anyhow!("Failed to load embed_tokens")); };
         let mut p_cfg = config.clone(); p_cfg.hidden_size = actual_h;
-        let mut layers = vec![]; let nl = if baking_only { 1 } else { p_cfg.num_hidden_layers };
+        let mut layers = vec![]; 
+        
+        // [STRICT-RELAY] In baking mode, we only need the first layer even for quantized models
+        let nl = if baking_only { 1 } else { p_cfg.num_hidden_layers };
         for i in 0..nl { layers.push(QuantizedQwen3VLTextDecoderLayer::new(&p_cfg, ct, &mut reader, &format!("blk.{i}"), device, dtype, i, baking_only)?); }
+        
         let norm = get_rms_norm(ct, &mut reader, "output_norm", p_cfg.rms_norm_eps, device, dtype)?;
         let mut mrope = p_cfg.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         let hh = p_cfg.head_dim / 2; let ss: usize = mrope.iter().sum();
         if ss != hh && ss > 0 { let r = hh as f32 / ss as f32; mrope = mrope.iter().map(|&s| (s as f32 * r).round() as usize).collect(); }
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(p_cfg.head_dim, p_cfg.rope_theta), mrope_section: mrope, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(p_cfg.head_dim, p_cfg.rope_theta), mrope_section: mrope, mmap: mmap_handle, is_forced_cpu: device.is_cpu(), is_baking: baking_only })
     }
     pub fn forward(&mut self, embeds: &Tensor, seqlen_offset: usize, pos_ids: Option<&Tensor>, visual_mask: Option<&Tensor>, ds_embeds: Option<Vec<Tensor>>) -> Result<Tensor> {
         let (b, s, _) = embeds.dims3()?;
@@ -196,7 +201,11 @@ impl QuantizedQwen3VLTextModel {
         let (cos, sin) = self.rotary_emb.forward(&pos_ids, embeds.dtype(), self.mrope_section.clone())?;
         let mask = if s <= 1 { None } else { Some(prepare_causal_attention_mask(b, s, seqlen_offset, embeds.device())?) };
         let mut xs = embeds.clone();
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        
+        // [LAYER-MELTING] Apply melting logic to quantized model
+        let layer_limit = if self.is_baking { 1 } else { self.layers.len() };
+        
+        for (i, layer) in self.layers.iter_mut().enumerate().take(layer_limit) {
             xs = layer.forward_with_params(&xs, &cos, &sin, mask.as_ref())?;
             if let (Some(m), Some(ds)) = (visual_mask, ds_embeds.as_ref()) { if i < ds.len() { xs = mask_index_add(&xs.squeeze(0)?, &m.squeeze(0)?, &ds[i])?.unsqueeze(0)?; } }
         }
@@ -383,6 +392,7 @@ pub struct QuantizedQwen3VLModel {
     pub lm_head: QLinear,
     pub text_device: Device,
     pub vision_device: Device,
+    pub is_baking: bool,
 }
 
 impl QuantizedQwen3VLModel {
@@ -430,6 +440,7 @@ impl QuantizedQwen3VLModel {
             lm_head: lh,
             text_device: td.clone(),
             vision_device: vd.clone(),
+            is_baking: bo,
         })
     }
 

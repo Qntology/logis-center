@@ -615,9 +615,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Bake Task
+        // 2. [2B] Load Snapshot & Bake Task (Use is_baking: true for single-layer inference)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), true, true).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -706,9 +706,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load & Generate
+        // 2. [2B] Load & Generate (Use is_baking: true for fast selector identification)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), true, true).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 

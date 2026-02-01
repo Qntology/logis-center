@@ -103,9 +103,20 @@ impl Qwen3VLGenerateModel {
                 }
             }
             let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);
-            let mut model = Qwen3VLModel::new_ext(m_cfg, vb, force_text_only)?;
-            if baking_only || is_anchor { model.set_baking(true); }
-            return Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, qwen3_vl: ModelVariant::Standard(model), text_device: text_dev, vision_device: vision_dev, eos_token_id1: 151643, eos_token_id2: 151645, generation_config: Qwen3VLGenerationConfig::default(), model_name: if is_anchor { "qwen3-anchor" } else { "qwen3-bitserial-full" }.to_string(), hard_token_limit });
+            let model = Qwen3VLModel::new_ext(m_cfg, vb, force_text_only, baking_only || is_anchor)?;
+            return Ok(Self { 
+                chat_template, 
+                tokenizer, 
+                pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, 
+                qwen3_vl: ModelVariant::Standard(model), 
+                text_device: text_dev, 
+                vision_device: vision_dev, 
+                eos_token_id1: 151643, 
+                eos_token_id2: 151645, 
+                generation_config: Qwen3VLGenerationConfig::default(), 
+                model_name: if is_anchor { "qwen3-anchor" } else { "qwen3-bitserial-full" }.to_string(), 
+                hard_token_limit 
+            });
         }
         let kv_reserve = 512 * 1024 * 1024;
         let qwen3_vl = if !gguf_files.is_empty() {

@@ -900,18 +900,35 @@ impl Qwen3VLTextModel {
                 let m = candle_core::safetensors::load(p, device)?;
                 (m.get("k").expect("Missing K tensor").clone(), m.get("v").expect("Missing V tensor").clone())
             } else if let Some((ref fk, ref fv)) = first_layer_kv {
+                // [RELAY] Broadcast first layer to others
                 (fk.clone(), fv.clone())
             } else {
                 continue;
             };
 
-            let loaded_head_dim = k.dim(candle_core::D::Minus1)?;
-            let target_head_dim = layer.self_attn.head_dim;
+            let (b, h, s, d) = k.dims4()?;
+            let target_h = layer.self_attn.num_key_value_heads;
+            let target_d = layer.self_attn.head_dim;
 
-            if loaded_head_dim != target_head_dim {
-                println!("[BRIDGE] Upscaling KV Head Dim {} -> {} for Layer {}", loaded_head_dim, target_head_dim, i);
-                k = Self::apply_linear_bridge(&k, target_head_dim)?;
-                v = Self::apply_linear_bridge(&v, target_head_dim)?;
+            // [BRIDGE] Handle Head Count Mismatch (e.g., 0.6B vs 2B)
+            if h != target_h {
+                println!("[BRIDGE] Adjusting KV Heads {} -> {} for Layer {}", h, target_h, i);
+                if target_h % h == 0 {
+                    let repeats = target_h / h;
+                    k = k.repeat((1, repeats, 1, 1))?;
+                    v = v.repeat((1, repeats, 1, 1))?;
+                } else {
+                    // Fallback to simpler narrow/pad or interpolation if needed
+                    k = k.narrow(1, 0, h.min(target_h))?;
+                    v = v.narrow(1, 0, h.min(target_h))?;
+                }
+            }
+
+            // [BRIDGE] Handle Head Dimension Mismatch
+            if d != target_d {
+                println!("[BRIDGE] Adjusting KV Head Dim {} -> {} for Layer {}", d, target_d, i);
+                k = Self::apply_linear_bridge(&k, target_d)?;
+                v = Self::apply_linear_bridge(&v, target_d)?;
             }
 
             if first_layer_kv.is_none() {
@@ -919,6 +936,12 @@ impl Qwen3VLTextModel {
             }
 
             layer.self_attn.kv_cache = Some((k, v));
+
+            // [LAYER-MELTING] If we are in baking mode, we ONLY need the first layer for inference.
+            if self.is_baking {
+                println!("[MODEL-OPTIM] Layer Melting active. Only loaded Layer 0 for inference.");
+                break; 
+            }
         }
         Ok(())
     }
@@ -962,10 +985,10 @@ impl Qwen3VLModel {
     }
 
     pub fn new(config: Qwen3VLConfig, vb: VarBuilder) -> Result<Self> {
-        Self::new_ext(config, vb, false)
+        Self::new_ext(config, vb, false, false)
     }
 
-    pub fn new_ext(config: Qwen3VLConfig, vb: VarBuilder, force_text_only: bool) -> Result<Self> {
+    pub fn new_ext(config: Qwen3VLConfig, vb: VarBuilder, force_text_only: bool, is_baking: bool) -> Result<Self> {
         let vb_m = vb.pp("model");
         let config = config.clone();
         
@@ -976,7 +999,9 @@ impl Qwen3VLModel {
             if vb_m.pp("visual").pp("patch_embed").pp("proj").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() {
                 Some(Qwen3VLVisionModel::new(v_config.clone(), vb_m.pp("visual"))?)
             } else {
-                println!("[MODEL] Vision tensors not found in weight set. Skipping Vision initialization.");
+                if !is_baking {
+                    println!("[MODEL] Vision tensors not found in weight set. Skipping Vision initialization.");
+                }
                 None
             }
         } else {
@@ -986,8 +1011,17 @@ impl Qwen3VLModel {
         // [FIX] text_config is optional, but required for Qwen3VLModel
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
         
+        // [FIX] Branch VarBuilder based on model mode (Baking/Anchor vs Full)
+        // Anchor/Baking files usually have a flat structure: "model.layers.0..."
+        // Full HF/GGUF models have a deep structure: "model.language_model.layers.0..."
+        let vb_lm = if is_baking {
+            vb_m.clone() // FLAT (Anchor/Baking)
+        } else {
+            vb_m.pp("language_model") // DEEP (Full)
+        };
+
         let language_model =
-            Qwen3VLTextModel::new(text_config.clone(), vb_m.pp("language_model"))?;
+            Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
         
         // [FIX] Use actual hidden size from loaded model for lm_head to prevent mismatch
         let actual_h = language_model.embed_tokens.hidden_size();
@@ -995,20 +1029,34 @@ impl Qwen3VLModel {
         let lm_head = if config.tie_word_embeddings {
             Linear::new(language_model.embed_tokens.embeddings().clone(), None)
         } else {
+            // [FIX] lm_head can also be inside "model." or top-level
+            let vb_head = if is_baking && vb_m.pp("lm_head").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() {
+                vb_m.pp("lm_head")
+            } else {
+                vb.pp("lm_head")
+            };
+
             linear_no_bias(
                 actual_h,
                 text_config.vocab_size,
-                vb.pp("lm_head"),
+                vb_head,
             )?
         };
-        Ok(Self {
+        
+        let mut model = Self {
             config,
             visual,
             language_model,
             lm_head,
             rope_deltas: None,
-            is_baking: false,
-        })
+            is_baking,
+        };
+        
+        if is_baking {
+            model.set_baking(true);
+        }
+
+        Ok(model)
     }
 
     pub fn save_kv_cache(&mut self, path: &std::path::Path) -> Result<()> {
