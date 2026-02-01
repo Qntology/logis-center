@@ -1345,26 +1345,28 @@ impl Qwen3VLModel {
         let vb_m = vb.pp("model");
         let config = config.clone();
         
-        // [SMART-PROBE] Improved existence check that handles ShapeMismatch
-        let exists = |path: &str| -> bool {
-            match vb.get_with_hints((1,), path, Init::Const(0.)) {
-                Ok(_) => true,
-                Err(candle_core::Error::ShapeMismatch { .. }) => true,
-                Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => true,
-                _ => false,
+        // [SMART-PROBE] Improved existence check that handles ShapeMismatch and Missing keys
+        let exists = |v: &VarBuilder, path: &str| -> bool {
+            if v.get_dtype(path).is_ok() { return true; }
+            // Try flat key as well (some safetensors have flat naming)
+            if let Some(last) = path.split('.').last() {
+                if vb.get_dtype(last).is_ok() { return true; }
             }
+            false
         };
 
         // [SMART-PROBE] Dynamically find the Vision Model root
         let visual = if !force_text_only && config.vision_config.is_some() {
             let v_config = config.vision_config.as_ref().unwrap();
             
-            let vb_v = if exists("model.visual.patch_embed.proj.weight") || exists("model.visual.patch_embd.weight") {
+            let vb_v = if exists(&vb_m, "visual.patch_embed.proj.weight") || exists(&vb_m, "visual.patch_embd.weight") {
                 Some(vb_m.pp("visual")) 
-            } else if exists("visual.patch_embed.proj.weight") || exists("visual.patch_embd.weight") {
+            } else if exists(&vb, "visual.patch_embed.proj.weight") || exists(&vb, "visual.patch_embd.weight") {
                 Some(vb.pp("visual"))
-            } else if exists("v.patch_embd.weight") || exists("v.blk.0.ln1.weight") {
+            } else if exists(&vb, "v.patch_embd.weight") || exists(&vb, "v.blk.0.ln1.weight") {
                 Some(vb.pp("v"))
+            } else if exists(&vb, "patch_embd.weight") || exists(&vb, "patch_embed.proj.weight") {
+                Some(vb.clone()) // Flat root
             } else {
                 None
             };
@@ -1387,20 +1389,20 @@ impl Qwen3VLModel {
         
         // [SMART-PROBE] Dynamically find the Language Model root using Layer 0 Anchor
         println!("[MODEL-DEBUG] Probing for Language Model Root...");
-        let vb_lm = if exists("model.language_model.layers.0.input_layernorm.weight") {
+        let vb_lm = if exists(&vb_m, "language_model.layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Deep root: model.language_model");
             vb_m.pp("language_model") 
-        } else if exists("model.layers.0.input_layernorm.weight") {
+        } else if exists(&vb_m, "layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Intermediate root: model");
             vb_m.clone()
-        } else if exists("layers.0.input_layernorm.weight") {
+        } else if exists(&vb, "layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Flat root: <root>");
             vb.clone()
+        } else if exists(&vb, "layers.0.input_layernorm.weight") || exists(&vb, "blk.0.attn_norm.weight") {
+            println!("[MODEL-PROBE] Selected Root (Flat/GGUF-Style): <root>");
+            vb.clone()
         } else {
-            // [DEBUG] Print all available keys to help diagnose
             println!("[MODEL-DEBUG] Root Probe FAILED. Available Layer 0 candidates were NOT found.");
-            // We can't print all keys from VarBuilder easily without access to underlying map, 
-            // but we rely on previous logs from `load_tensors`.
             println!("[MODEL-PROBE] Warning: Layer anchor not found. Falling back to default.");
             vb_m.pp("language_model")
         };
@@ -1409,26 +1411,24 @@ impl Qwen3VLModel {
             Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
         
         let lm_head = {
-            let probe_h = |path: &str| -> bool {
+            let probe_h = |v: &VarBuilder, path: &str| -> bool {
                 for suffix in &["", ".packed", ".min"] {
                     let full_name = format!("{}.weight{}", path, suffix);
-                    match vb.get_with_hints((1,), &full_name, Init::Const(0.)) {
-                        Ok(_) => return true,
-                        Err(candle_core::Error::ShapeMismatch { .. }) => return true,
-                        _ => {}
-                    }
+                    if v.get_dtype(&full_name).is_ok() { return true; }
                 }
                 false
             };
 
-            let vb_head = if probe_h("model.language_model.lm_head") {
+            let vb_head = if probe_h(&vb_m, "language_model.lm_head") {
                 Some(vb_m.pp("language_model").pp("lm_head"))
-            } else if probe_h("model.lm_head") {
+            } else if probe_h(&vb_m, "lm_head") {
                 Some(vb_m.pp("lm_head"))
-            } else if probe_h("lm_head") {
+            } else if probe_h(&vb, "lm_head") {
                 Some(vb.pp("lm_head"))
-            } else if probe_h("model.output") {
+            } else if probe_h(&vb_m, "output") {
                 Some(vb_m.pp("output"))
+            } else if probe_h(&vb, "output") {
+                Some(vb.pp("output"))
             } else {
                 None
             };
@@ -1457,9 +1457,8 @@ impl Qwen3VLModel {
             is_baking,
         };
         
-        if is_baking {
-            model.set_baking(true);
-        }
+        // Ensure baking state is propagated
+        model.set_baking(is_baking);
 
         Ok(model)
     }
