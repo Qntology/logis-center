@@ -910,8 +910,8 @@ impl Qwen3VLTextModel {
 
             if loaded_head_dim != target_head_dim {
                 println!("[BRIDGE] Upscaling KV Head Dim {} -> {} for Layer {}", loaded_head_dim, target_head_dim, i);
-                k = self.apply_linear_bridge(&k, target_head_dim)?;
-                v = self.apply_linear_bridge(&v, target_head_dim)?;
+                k = Self::apply_linear_bridge(&k, target_head_dim)?;
+                v = Self::apply_linear_bridge(&v, target_head_dim)?;
             }
 
             if first_layer_kv.is_none() {
@@ -923,7 +923,7 @@ impl Qwen3VLTextModel {
         Ok(())
     }
 
-    fn apply_linear_bridge(&self, x: &Tensor, target_dim: usize) -> Result<Tensor> {
+    fn apply_linear_bridge(x: &Tensor, target_dim: usize) -> Result<Tensor> {
         let (b, h, s, d) = x.dims4()?;
         let x_f32 = x.to_dtype(candle_core::DType::F32)?;
         let energy_scale = (d as f32 / target_dim as f32).sqrt() as f64;
