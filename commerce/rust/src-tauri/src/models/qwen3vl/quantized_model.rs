@@ -323,7 +323,7 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
         let is_p = name.ends_with(".packed"); let b_n = if is_p { name.strip_suffix(".packed").unwrap() } else { &name };
         let clean = b_n.replace("model.language_model.", "").replace("model.layers.", "layers.").replace("model.visual.", "visual.").replace("model.", "").replace("language_model.", "");
         if bo {
-            let is_l0 = clean == "layers.0.self_attn.q_proj.weight" || clean == "layers.0.self_attn.k_proj.weight" || clean == "layers.0.self_attn.v_proj.weight" || clean == "layers.0.self_attn.o_proj.weight" || clean == "embed_tokens.weight" || clean == "norm.weight";
+            let is_l0 = clean == "layers.0.self_attn.q_proj.weight" || clean == "layers.0.self_attn.k_proj.weight" || clean == "layers.0.self_attn.v_proj.weight" || clean == "layers.0.self_attn.o_proj.weight" || clean == "layers.0.input_layernorm.weight" || clean == "layers.0.post_attention_layernorm.weight" || clean == "embed_tokens.weight" || clean == "norm.weight";
             let is_c = !clean.contains(".layers.") && !clean.contains(".blocks.") && !clean.contains("blk.");
             if !is_l0 && !is_c { continue; }
         }

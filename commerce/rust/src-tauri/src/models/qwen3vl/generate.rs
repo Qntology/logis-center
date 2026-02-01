@@ -90,7 +90,11 @@ impl Qwen3VLGenerateModel {
         let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let st_files = find_type_files(path, "safetensors")?;
         let gguf_files = find_type_files(path, "gguf")?;
-        let model_path = if baking_only { st_files.iter().find(|f| f.contains("ANCHOR_IQ0.safetensors")).cloned() } else { st_files.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors")).cloned() };
+        let model_path = if baking_only { 
+            st_files.iter().find(|f| f.contains("ANCHOR_IQ0.safetensors") && !f.contains("mmproj")).cloned() 
+        } else { 
+            st_files.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors") && !f.contains("mmproj")).cloned() 
+        };
         if let Some(st_path) = model_path {
             let is_anchor = st_path.contains("ANCHOR_IQ0");
             let mut m_cfg = cfg.clone(); if baking_only || is_anchor { if let Some(ref mut tc) = m_cfg.text_config { tc.num_hidden_layers = 1; } }
