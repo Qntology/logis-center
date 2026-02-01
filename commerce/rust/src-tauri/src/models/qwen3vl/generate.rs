@@ -107,22 +107,56 @@ impl Qwen3VLGenerateModel {
         }
         let text_dev = get_device(text_device); let vision_dev = get_device(vision_device);
         let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
-        let st_files = find_type_files(path, "safetensors")?;
-        let gguf_files = find_type_files(path, "gguf")?;
-        let model_path = if baking_only { 
-            st_files.iter().find(|f| f.contains("ANCHOR_IQ0.safetensors") && !f.contains("mmproj")).cloned() 
-        } else { 
-            st_files.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors") && !f.contains("mmproj")).cloned() 
+        
+        // [FIX] Support direct file paths to avoid "Not a directory" errors
+        let path_obj = Path::new(path);
+        let (model_path, gguf_files, st_files_for_mmproj) = if path_obj.is_file() {
+            let p_str = path.to_string();
+            if p_str.ends_with(".safetensors") {
+                // If direct safetensors provided, use it. Mmproj must be in same dir if needed.
+                let parent = path_obj.parent().unwrap_or(Path::new("."));
+                let st_files = find_type_files(parent.to_str().unwrap(), "safetensors").unwrap_or_default();
+                (Some(p_str), vec![], st_files)
+            } else if p_str.ends_with(".gguf") {
+                (None, vec![p_str], vec![])
+            } else {
+                (None, vec![], vec![])
+            }
+        } else {
+            let st = find_type_files(path, "safetensors")?;
+            let gf = find_type_files(path, "gguf")?;
+            let mp = if baking_only { 
+                st.iter().find(|f| f.contains("ANCHOR_IQ0.safetensors") && !f.contains("mmproj")).cloned() 
+            } else { 
+                st.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors") && !f.contains("mmproj")).cloned() 
+            };
+            (mp, gf, st)
         };
+
         if let Some(st_path) = model_path {
-            let is_anchor = st_path.contains("ANCHOR_IQ0");
-            let mut m_cfg = cfg.clone(); if baking_only || is_anchor { if let Some(ref mut tc) = m_cfg.text_config { tc.num_hidden_layers = 1; } }
+            let is_anchor = st_path.contains("ANCHOR_IQ0") || st_path.contains("LAYER0");
+            let mut m_cfg = cfg.clone(); 
+            // [BAKING-OPTIM] If loading a Layer 0 model, force num_hidden_layers to 1
+            if baking_only || is_anchor { 
+                if let Some(ref mut tc) = m_cfg.text_config { tc.num_hidden_layers = 1; } 
+            }
+            
             let mut merged_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(&st_path), &text_dev, dtype, baking_only)?;
+            
             if !force_text_only {
-                let mmproj_st = st_files.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors"));
+                // [AUTO-MATCH] Look for corresponding mmproj based on text model suffix
+                let suffix = if st_path.contains("LAYER0") { "mmproj-BITSERIAL_LAYER0.safetensors" }
+                             else if st_path.contains("INFERENCE") { "mmproj-BITSERIAL_INFERENCE.safetensors" }
+                             else { "mmproj-BITSERIAL_ALL.safetensors" };
+                             
+                let mmproj_st = st_files_for_mmproj.iter().find(|f| f.contains(suffix)).or_else(|| st_files_for_mmproj.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors")));
+                
                 if let Some(mm_path) = mmproj_st {
+                    println!("[MODEL] Loading Vision from: {}", mm_path);
                     let vision_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(mm_path), &vision_dev, dtype, baking_only)?;
                     for (k, v) in vision_data { merged_data.insert(k, v); }
+                } else {
+                    println!("[MODEL] Warning: Vision model ({}) not found. Proceeding text-only.", suffix);
                 }
             }
             let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);

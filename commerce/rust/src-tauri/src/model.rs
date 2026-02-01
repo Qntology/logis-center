@@ -439,26 +439,37 @@ impl LogisModel {
         self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, true).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, baking_only: bool, high_fidelity: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+        let suffix = if baking_only {
+            "model-BITSERIAL_LAYER0.safetensors"
+        } else {
+            "model-BITSERIAL_INFERENCE.safetensors"
+        };
+        
+        // Handle path joining safely
+        let model_file_path = std::path::Path::new(path).join(suffix);
+        let model_file_str = model_file_path.to_string_lossy().to_string();
+
+        println!("[MODEL] Loading Generator from {} (Text-Only: {}, Baking: {})...", model_file_str, force_text_only, baking_only);
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
 
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
-        let path_clone = path.to_string();
-        let shared_path = shared_config_path.map(|s| s.to_string());
+        
+        // Pass the directory as config path if not shared, but pass specific model file as model path
+        let config_path = shared_config_path.map(|s| s.to_string()).or_else(|| Some(path.to_string()));
 
         let generator = tokio::task::spawn_blocking(move || {
             // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
             Qwen3VLGenerateModel::init_with_config(
-                &path_clone, 
-                shared_path.as_deref(), // Tokenizer path
-                shared_path.as_deref(), // Config path
+                &model_file_str, 
+                config_path.as_deref(), // Tokenizer path (directory)
+                config_path.as_deref(), // Config path (directory)
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                false, // baking_only default
-                false  // high_fidelity default
+                baking_only,
+                high_fidelity
             )
         }).await??;
         
@@ -534,24 +545,8 @@ impl LogisModel {
             }
         }
 
-        let dev_id = self.device_config.gpu_id;
-        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
-        let limit = self.max_tokens_limit;
-        let path_clone = path.to_string();
-        let shared_path_clone = shared_path.map(|s| s.to_string());
-
-        let gen = tokio::task::spawn_blocking(move || {
-            // [FIX] tokenizer_path만 공유하고 config_path는 자기 자신의 경로를 우선 사용하도록 수정
-            Qwen3VLGenerateModel::init_with_config(
-                &path_clone, 
-                shared_path_clone.as_deref(), // tokenizer_path: Large 모델 것 공유
-                None,                         // config_path: None으로 설정하여 path_clone(자기 자신)의 config.json 사용
-                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
-                force_text_only,
-                baking_only,
-                high_fidelity
-            )
-        }).await??;
+        // Use the helper method with updated signature
+        let gen = self.load_generator_internal(path, shared_path, force_text_only, baking_only, high_fidelity).await?;
 
         // Move current main to slot
         if let Some(old_m) = gen_guard.take() {
