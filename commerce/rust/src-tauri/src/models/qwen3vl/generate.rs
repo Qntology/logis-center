@@ -191,23 +191,28 @@ impl Qwen3VLGenerateModel {
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
         // [9d1369] [BIT-SERIAL-PRIORITY] 최적화된 Full Layer 0-bit 모델 우선 로드
-        let bitserial_st = st_files.iter().find(|f| f.contains("BITSERIAL_ALL.safetensors"));
+        let bitserial_st = st_files.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors"));
         
         if let Some(st_path) = bitserial_st {
-            println!("[MODEL-LOAD] BIT-SERIAL Optimized Model detected: {:?}", st_path);
+            println!("[MODEL-LOAD] BIT-SERIAL Language Model detected: {:?}", st_path);
             
-            // 비전 모델 경로 확인 (같은 폴더 내 mmproj-BITSERIAL_ALL.safetensors)
-            let mmproj_st = st_files.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors")).cloned();
+            // 1. 언어 모델 가중치 로드 (HashMap으로 로드)
+            let mut merged_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(st_path), &text_dev, dtype)?;
             
-            let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
-            
-            // 만약 비전 모델도 존재한다면 로드
-            if let Some(ref mm_path) = mmproj_st {
-                println!("[MODEL-LOAD] BIT-SERIAL Vision Projector detected: {:?}", mm_path);
-                // 비전 가중치 추가 로드 (from_true_iq0_safetensors 내부적으로 visual. 접두사 매핑 지원)
-                // (이 부분은 vb에 병합되거나 별도 VarBuilder로 처리되어야 함)
+            // 2. 비전 모델 가중치 로드 및 병합 (존재할 경우)
+            let mmproj_st = st_files.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors"));
+            if let Some(mm_path) = mmproj_st {
+                println!("[MODEL-LOAD] BIT-SERIAL Vision Projector integration: {:?}", mm_path);
+                let vision_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(mm_path), &vision_dev, dtype)?;
+                
+                // HashMap 병합
+                for (k, v) in vision_data {
+                    merged_data.insert(k, v);
+                }
             }
 
+            // 3. 최종 VarBuilder 생성
+            let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);
             let model = Qwen3VLModel::new(cfg.clone(), vb)?;
             return Ok(Self {
                 chat_template, tokenizer, pre_processor, qwen3_vl: ModelVariant::Standard(model),

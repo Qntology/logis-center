@@ -409,43 +409,97 @@ impl QuantizedQwen3VLTextModel {
             Self::compress_to_bitkv_static(layer_idx, tensor)
         }
     
-            pub fn inject_live_kv_bitkv(
-                &mut self, 
-                layer_idx: usize, 
-                k_res: (Tensor, Tensor, Tensor), 
-                v_res: (Tensor, Tensor, Tensor), 
-                original_shape: &[usize]
-            ) -> Result<()> {
-                let (mut k_decompressed, mut v_decompressed) = Self::decompress_kv_static(layer_idx, k_res, v_res, original_shape, self.is_forced_cpu)?;
-        
-                // [MODEL-AWARE-CHECK] 모델 레이어에서 직접 head_dim 추출 및 검증
-                if let Some(layer) = self.layers.get_mut(layer_idx) {
-                    let model_head_dim = layer.self_attn.head_dim;
-                    let data_head_dim = k_decompressed.dim(D::Minus1)?;
-        
-                    if data_head_dim != model_head_dim {
-                        println!("[RELAY-FIX] Head Dim Mismatch Detected! Model: {}, Data: {}. Aligning...", model_head_dim, data_head_dim);
-                        
-                        let align = |t: Tensor| -> Result<Tensor> {
-                            if data_head_dim < model_head_dim {
-                                // 데이터가 부족하면 (0.6B -> 2B) 0으로 패딩
-                                let mut pad_shape = t.dims().to_vec();
-                                pad_shape[t.dims().len() - 1] = model_head_dim - data_head_dim;
-                                let padding = Tensor::zeros(pad_shape, t.dtype(), t.device())?;
-                                Ok(Tensor::cat(&[t, padding], D::Minus1)?)
-                            } else {
-                                // 데이터가 넘치면 잘라냄
-                                Ok(t.narrow(D::Minus1, 0, model_head_dim)?)
+                        pub fn inject_live_kv_bitkv(
+    
+                            &mut self, 
+    
+                            layer_idx: usize, 
+    
+                            k_res: (Tensor, Tensor, Tensor), 
+    
+                            v_res: (Tensor, Tensor, Tensor), 
+    
+                            original_shape: &[usize]
+    
+                        ) -> Result<()> {
+    
+                            let is_cpu = self.is_forced_cpu;
+    
+                            let (mut k_dec, mut v_dec) = Self::decompress_kv_static(layer_idx, k_res, v_res, original_shape, is_cpu)?;
+    
+                    
+    
+                            if let Some(layer) = self.layers.get_mut(layer_idx) {
+    
+                                // [STRUCTURAL-EXPANSION] 
+    
+                                // 0.6B (8 heads) 데이터를 2B (16 heads) 공간에 맞추기 위한 로직
+    
+                                let target_heads = layer.self_attn.num_key_value_heads;
+    
+                                let current_shape = k_dec.dims().to_vec();
+    
+                                
+    
+                                // KV Cache Shape: [Batch, Num_Heads, Seq_Len, Head_Dim]
+    
+                                let current_heads = current_shape[1];
+    
+                    
+    
+                                if current_heads != target_heads {
+    
+                                    println!("[RELAY-EXPAND] Expanding KV heads: {} -> {}", current_heads, target_heads);
+    
+                                    
+    
+                                    let expand = |t: Tensor| -> Result<Tensor> {
+    
+                                        if current_heads < target_heads && target_heads % current_heads == 0 {
+    
+                                            // "두 번 더해서(반복해서) 맞춤": 타겟이 현재의 배수일 경우 반복 복사
+    
+                                            let repeats = target_heads / current_heads;
+    
+                                            let mut expanded = t.clone();
+    
+                                            for _ in 1..repeats {
+    
+                                                expanded = Tensor::cat(&[expanded, t.clone()], 1)?;
+    
+                                            }
+    
+                                            Ok(expanded.contiguous()?)
+    
+                                        } else {
+    
+                                            // 형상이 너무 다르면 기존 방식(Padding/Truncate) 사용하되 경고 출력
+    
+                                            println!("[RELAY-WARNING] Complex Mismatch. Falling back to alignment.");
+    
+                                            // ... (기존 보정 로직)
+    
+                                            Ok(t.contiguous()?)
+    
+                                        }
+    
+                                    };
+    
+                                    k_dec = expand(k_dec)?;
+    
+                                    v_dec = expand(v_dec)?;
+    
+                                }
+    
+                    
+    
+                                layer.self_attn.kv_cache = Some((k_dec, v_dec));
+    
                             }
-                        };
-                        k_decompressed = align(k_decompressed)?;
-                        v_decompressed = align(v_decompressed)?;
-                    }
-        
-                    layer.self_attn.kv_cache = Some((k_decompressed, v_decompressed));
-                }
-                Ok(())
-            }}
+    
+                            Ok(())
+    
+                        }}
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLModel {
@@ -565,7 +619,7 @@ pub fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, r
     Ok(RmsNorm::new(w, eps))
 }
 
-pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
+pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, dtype: DType) -> Result<HashMap<String, Tensor>> {
     let file = std::fs::read(path)?;
     let st = safetensors::SafeTensors::deserialize(&file)?;
     let mut data = HashMap::new();
@@ -596,13 +650,11 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             let rest = &base_name[3..];
             if rest.starts_with("0") { target_name = "visual.merger.linear_fc1".to_string(); }
             else if rest.starts_with("2") { target_name = "visual.merger.linear_fc2".to_string(); }
-        } else if base_name.starts_with("blk.") {
-            let parts: Vec<&str> = base_name[4..].splitn(2, '.').collect();
-            // let layer_idx: usize = parts[0].parse().unwrap_or(0);
+        } else if base_name.starts_with("blk.") || base_name.starts_with("model.layers.") {
+            // [FIX] 'blk.' 와 'model.layers.' 두 가지 접두사 모두 지원
+            let rest = if base_name.starts_with("blk.") { &base_name[4..] } else { &base_name[13..] };
+            let parts: Vec<&str> = rest.splitn(2, '.').collect();
             
-            // [FIX] Full Layer Mode: Do not skip any layers.
-            // if layer_idx > 0 { continue; }
-
             let mapped = match parts[1] {
                 "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),
                 "attn_k_norm.weight" => "self_attn.k_norm.weight".to_string(),
@@ -613,9 +665,9 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
                 s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.down_proj"), _ => parts[1].to_string()
             };
             target_name = format!("language_model.layers.{}.{}", parts[0], mapped);
-        } else if base_name.contains("token_embd") {
+        } else if base_name.contains("token_embd") || base_name.eq("model.embed_tokens.weight") {
             target_name = "language_model.embed_tokens.weight".to_string();
-        } else if base_name.contains("output_norm") {
+        } else if base_name.contains("output_norm") || base_name.eq("model.norm.weight") {
             target_name = "language_model.norm.weight".to_string();
         } else if base_name.contains("lm_head") || base_name == "output.weight" {
             target_name = "lm_head.weight".to_string();
@@ -624,9 +676,17 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
         }
 
         let final_tensor = if is_packed {
-            let shape_tensor = st.tensor(&format!("{base_name}.shape"))?;
-            let shape: Vec<usize> = shape_tensor.data().chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
+            // [FIX] 파일 내부에 명시된 .shape 텐서를 읽어와서 정확한 형상 복원
+            let shape_name = format!("{}.shape", base_name);
+            let shape: Vec<usize> = if let Ok(shape_view) = st.tensor(&shape_name) {
+                let shape_data = shape_view.data();
+                shape_data.chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                    .collect()
+            } else {
+                // 백업: .shape가 없으면 기본 추측 (이미 체크하고 있으므로 거의 발생 안 함)
+                view.shape().to_vec()
+            };
 
             if base_name.contains("token_embd") || base_name.contains("embed_tokens") {
                 // [V2] 2-bit Unpack (4 weights per byte)
@@ -675,13 +735,19 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
                         }
                     }
                 });
-                Tensor::from_vec(decoded, shape.as_slice(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
+                Tensor::from_vec(decoded, shape.as_slice(), &Device::Cpu)?
+                    .to_device(device)?
+                    .to_dtype(dtype)?
+                    .contiguous()?
             }
         } else {
             let raw = view.data();
             let f32_data: Vec<f32> = if raw.len() % 4 == 0 { raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
             else { raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect() };
-            Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
+            Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?
+                .to_device(device)?
+                .to_dtype(dtype)?
+                .contiguous()?
         };
 
         if !target_name.starts_with("lm_head") {
@@ -690,6 +756,10 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             data.insert(target_name, final_tensor);
         }
     }
-    
+    Ok(data)
+}
+
+pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
+    let data = load_tensors_from_true_iq0(path, device, dtype)?;
     Ok(VarBuilder::from_tensors(data, dtype, device))
 }

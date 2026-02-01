@@ -204,13 +204,14 @@ impl Qwen3VLTextRotaryEmbedding {
         mrope_section: Vec<usize>,
     ) -> Result<Tensor> {
         if mrope_section.is_empty() {
-            return Ok(freqs.i(0)?);
+            return Ok(freqs.i(0)?.contiguous()?);
         }
 
         let mut sections = Vec::with_capacity(mrope_section.len());
         let mut start_idx = 0;
         
         for (i, &size) in mrope_section.iter().enumerate() {
+            if size == 0 { continue; }
             // 각 차원(dim)에 해당하는 freqs에서 필요한 구간만 잘라냄
             let src = freqs.i(i % 3)?;
             let part = src.narrow(D::Minus1, start_idx, size)?;
@@ -218,7 +219,11 @@ impl Qwen3VLTextRotaryEmbedding {
             start_idx += size;
         }
         
-        Ok(Tensor::cat(&sections, D::Minus1)?)
+        if sections.is_empty() {
+            return Ok(freqs.i(0)?.contiguous()?);
+        }
+
+        Ok(Tensor::cat(&sections, D::Minus1)?.contiguous()?)
     }
     pub fn forward(
         &self,
