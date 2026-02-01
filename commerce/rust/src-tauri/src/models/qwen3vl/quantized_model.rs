@@ -329,17 +329,17 @@ impl QuantizedQwen3VLTextModel {
         }
     
         pub fn load_kv_cache(&mut self, path: &Path, device: &Device, _: usize, _: usize) -> Result<()> {
-            let is_forced_cpu = self.is_forced_cpu;
+            let target_device = if self.is_forced_cpu { Device::Cpu } else { device.clone() };
             for (i, layer) in self.layers.iter_mut().enumerate() {
                 let p = path.join(format!("layer_{}_bitkv.safetensors", i));
                 if p.exists() {
-                    let map = candle_core::safetensors::load(p, device)?;
+                    let map = candle_core::safetensors::load(p, &target_device)?;
                     let shape_vec: Vec<usize> = map.get("shape").unwrap().to_vec1::<u32>()?.into_iter().map(|x| x as usize).collect();
                     
                     let k_res = (map.get("k_a").unwrap().clone(), map.get("k_p").unwrap().clone(), map.get("k_s").unwrap().clone());
                     let v_res = (map.get("v_a").unwrap().clone(), map.get("v_p").unwrap().clone(), map.get("v_s").unwrap().clone());
                     
-                    let (k, v) = Self::decompress_kv_static(i, k_res, v_res, &shape_vec, is_forced_cpu)?;
+                    let (k, v) = Self::decompress_kv_static(i, k_res, v_res, &shape_vec, &target_device)?;
                     layer.self_attn.kv_cache = Some((k, v));
                 }
             }
@@ -378,128 +378,96 @@ impl QuantizedQwen3VLTextModel {
             }
         }
     
-        fn decompress_kv_static(layer_idx: usize, k_res: (Tensor, Tensor, Tensor), v_res: (Tensor, Tensor, Tensor), original_shape: &[usize], is_forced_cpu: bool) -> Result<(Tensor, Tensor)> {
-            let target_dev = if is_forced_cpu { Device::Cpu } else { k_res.0.device().clone() };
-            let dtype = if is_forced_cpu { DType::F32 } else { DType::BF16 };
-    
-            let decompress = |res: (Tensor, Tensor, Tensor), target_device: &Device| -> Result<Tensor> {
-                if layer_idx == 0 { return Ok(res.0); }
-                let s = res.2.to_scalar::<f32>()?;
-                let packed_vec = res.1.to_vec1::<u8>()?; 
-                let total_el: usize = original_shape.iter().product();
-                let mut out = vec![0.0f32; total_el];
-                if layer_idx <= 4 {
-                    for i in 0..total_el {
-                        let val = (packed_vec[i / 4] >> ((i % 4) * 2)) & 0x03;
-                        out[i] = (val as f32 - 1.0) * s;
-                    }
-                } else {
-                    for i in 0..total_el {
-                        let sign = (packed_vec[i / 8] >> (i % 8)) & 0x01;
-                        out[i] = if sign == 1 { s } else { -s };
-                    }
+    fn decompress_kv_static(
+        layer_idx: usize, 
+        k_res: (Tensor, Tensor, Tensor), 
+        v_res: (Tensor, Tensor, Tensor), 
+        original_shape: &[usize], 
+        target_device: &Device
+    ) -> Result<(Tensor, Tensor)> {
+        let dtype = if target_device.is_cpu() { DType::F32 } else { DType::BF16 };
+
+        let decompress = |res: (Tensor, Tensor, Tensor)| -> Result<Tensor> {
+            if layer_idx == 0 { 
+                return Ok(res.0.to_device(target_device)?.to_dtype(dtype)?); 
+            }
+            
+            let s = res.2.to_scalar::<f32>()?;
+            let packed_vec = res.1.to_vec1::<u8>()?; 
+            let total_el: usize = original_shape.iter().product();
+            let mut out = vec![0.0f32; total_el];
+
+            if layer_idx <= 4 {
+                for i in 0..total_el {
+                    let val = (packed_vec[i / 4] >> ((i % 4) * 2)) & 0x03;
+                    out[i] = (val as f32 - 1.0) * s;
                 }
-                Ok(Tensor::from_vec(out, original_shape, &Device::Cpu)?.to_device(target_device)?.to_dtype(dtype)?)
-            };
-    
-            Ok((decompress(k_res, &target_dev)?, decompress(v_res, &target_dev)?))
+            } else {
+                for i in 0..total_el {
+                    let sign = (packed_vec[i / 8] >> (i % 8)) & 0x01;
+                    out[i] = if sign == 1 { s } else { -s };
+                }
+            }
+            Ok(Tensor::from_vec(out, original_shape, &Device::Cpu)?
+                .to_device(target_device)?
+                .to_dtype(dtype)?
+                .contiguous()?)
+        };
+
+        Ok((decompress(k_res)?, decompress(v_res)?))
+    }
+
+    pub fn compress_to_bitkv(&self, layer_idx: usize, tensor: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+        Self::compress_to_bitkv_static(layer_idx, tensor)
+    }
+
+    pub fn inject_live_kv_bitkv(
+        &mut self, 
+        layer_idx: usize, 
+        k_res: (Tensor, Tensor, Tensor), 
+        v_res: (Tensor, Tensor, Tensor), 
+        original_shape: &[usize]
+    ) -> Result<()> {
+        // [FIX] 현재 모델의 실제 디바이스를 참조하여 텐서 생성 위치 결정
+        let target_device = if self.is_forced_cpu { 
+            Device::Cpu 
+        } else { 
+            self.embed_tokens.embeddings().device().clone() 
+        };
+
+        let (mut k_dec, mut v_dec) = Self::decompress_kv_static(layer_idx, k_res, v_res, original_shape, &target_device)?;
+
+        if let Some(layer) = self.layers.get_mut(layer_idx) {
+            let target_heads = layer.self_attn.num_key_value_heads;
+            let current_shape = k_dec.dims().to_vec();
+            let current_heads = current_shape[1];
+
+            if current_heads != target_heads {
+                println!("[RELAY-FIX] Aligning heads: {} -> {}", current_heads, target_heads);
+                
+                let expand = |t: Tensor| -> Result<Tensor> {
+                    if current_heads < target_heads && target_heads % current_heads == 0 {
+                        let repeats = target_heads / current_heads;
+                        let mut res = t.clone();
+                        for _ in 1..repeats {
+                            res = Tensor::cat(&[res, t.clone()], 1)?;
+                        }
+                        Ok(res.contiguous()?)
+                    } else if current_heads > target_heads {
+                        Ok(t.narrow(1, 0, target_heads)?.contiguous()?)
+                    } else {
+                        Ok(t.contiguous()?)
+                    }
+                };
+                k_dec = expand(k_dec)?;
+                v_dec = expand(v_dec)?;
+            }
+
+            layer.self_attn.kv_cache = Some((k_dec, v_dec));
         }
-    
-        pub fn compress_to_bitkv(&self, layer_idx: usize, tensor: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
-            Self::compress_to_bitkv_static(layer_idx, tensor)
-        }
-    
-                        pub fn inject_live_kv_bitkv(
-    
-                            &mut self, 
-    
-                            layer_idx: usize, 
-    
-                            k_res: (Tensor, Tensor, Tensor), 
-    
-                            v_res: (Tensor, Tensor, Tensor), 
-    
-                            original_shape: &[usize]
-    
-                        ) -> Result<()> {
-    
-                            let is_cpu = self.is_forced_cpu;
-    
-                            let (mut k_dec, mut v_dec) = Self::decompress_kv_static(layer_idx, k_res, v_res, original_shape, is_cpu)?;
-    
-                    
-    
-                            if let Some(layer) = self.layers.get_mut(layer_idx) {
-    
-                                // [STRUCTURAL-EXPANSION] 
-    
-                                // 0.6B (8 heads) 데이터를 2B (16 heads) 공간에 맞추기 위한 로직
-    
-                                let target_heads = layer.self_attn.num_key_value_heads;
-    
-                                let current_shape = k_dec.dims().to_vec();
-    
-                                
-    
-                                // KV Cache Shape: [Batch, Num_Heads, Seq_Len, Head_Dim]
-    
-                                let current_heads = current_shape[1];
-    
-                    
-    
-                                if current_heads != target_heads {
-    
-                                    println!("[RELAY-EXPAND] Expanding KV heads: {} -> {}", current_heads, target_heads);
-    
-                                    
-    
-                                    let expand = |t: Tensor| -> Result<Tensor> {
-    
-                                        if current_heads < target_heads && target_heads % current_heads == 0 {
-    
-                                            // "두 번 더해서(반복해서) 맞춤": 타겟이 현재의 배수일 경우 반복 복사
-    
-                                            let repeats = target_heads / current_heads;
-    
-                                            let mut expanded = t.clone();
-    
-                                            for _ in 1..repeats {
-    
-                                                expanded = Tensor::cat(&[expanded, t.clone()], 1)?;
-    
-                                            }
-    
-                                            Ok(expanded.contiguous()?)
-    
-                                        } else {
-    
-                                            // 형상이 너무 다르면 기존 방식(Padding/Truncate) 사용하되 경고 출력
-    
-                                            println!("[RELAY-WARNING] Complex Mismatch. Falling back to alignment.");
-    
-                                            // ... (기존 보정 로직)
-    
-                                            Ok(t.contiguous()?)
-    
-                                        }
-    
-                                    };
-    
-                                    k_dec = expand(k_dec)?;
-    
-                                    v_dec = expand(v_dec)?;
-    
-                                }
-    
-                    
-    
-                                layer.self_attn.kv_cache = Some((k_dec, v_dec));
-    
-                            }
-    
-                            Ok(())
-    
-                        }}
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLModel {
