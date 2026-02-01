@@ -38,16 +38,8 @@ impl ModelVariant {
     pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => {
-                let flat = input_ids.flatten_all()?;
-                let embeds = m.language_model.embed_tokens.forward(&flat)?.reshape((input_ids.dim(0)?, input_ids.dim(1)?, ()))?;
-                m.language_model.forward(&embeds, seqlen_offset, None, None, None)
-            },
-            Self::QuantizedText(m) => {
-                let flat = input_ids.flatten_all()?;
-                let embeds = m.language_model.embed_tokens.forward(&flat)?.reshape((input_ids.dim(0)?, input_ids.dim(1)?, ()))?;
-                m.language_model.forward(&embeds, seqlen_offset, None, None, None)
-            },
+            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),      
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset),
         }
     }
 

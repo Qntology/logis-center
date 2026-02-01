@@ -235,11 +235,7 @@ impl QuantizedQwen3VLTextModel {
             layers.push(QuantizedQwen3VLTextDecoderLayer::new(config, ct, &mut reader, &format!("blk.{i}"), device, dtype, i, baking_only)?);
         }
         let norm = get_rms_norm(ct, &mut reader, "output_norm", config.rms_norm_eps, device, dtype)?;
-        
-        // [FIX] Force 2B-standard M-RoPE sections for 0.6B-to-2B bridging
-        // Regardless of config, we MUST use [16, 16, 32] to match the 2B shell.
-        println!("[MODEL-FIX] Forcing 2B RoPE Sections: [16, 16, 32]");
-        let mrope_section = vec![16, 16, 32];
+        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
 
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
     }
@@ -310,8 +306,51 @@ impl QuantizedQwen3VLModel {
         let lm_head = get_qlinear(ct_main, &mut m_reader, "lm_head", text_device, dtype)?;
         Ok(Self { config: config.clone(), visual, language_model, lm_head, text_device: text_device.clone(), vision_device: vision_device.clone() })
     }
+
+    fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let pixel_values = if !pixel_values.device().same_device(&self.vision_device) { pixel_values.to_device(&self.vision_device)? } else { pixel_values.clone() };
+        let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) { image_grid_thw.to_device(&self.vision_device)? } else { image_grid_thw.clone() };
+        let (image_embeds, deepstack_image_embeds) = self.visual.forward(&pixel_values, &image_grid_thw)?;
+        let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
+        let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?.to_vec1::<u32>()?.iter().map(|&x| x as usize / spatial_merge_size.pow(2)).collect();
+        let image_embeds = image_embeds.to_device(&self.text_device)?;
+        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_device(&self.text_device)?)).collect();
+        let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;       
+        Ok((image_embeds, deepstack_image_embeds?))
+    }
+
+    fn get_placeholder_mask(&self, input_ids: &Tensor, is_image: bool) -> Result<Tensor> {
+        let special_token_id = if is_image { self.config.image_token_id.unwrap_or(0) as u32 } else { self.config.video_token_id.unwrap_or(0) as u32 };
+        let special_token = Tensor::new(vec![special_token_id], input_ids.device())?;
+        let special_mask = input_ids.broadcast_eq(&special_token)?.to_dtype(candle_core::DType::U32)?;
+        Ok(special_mask)
+    }
+
+    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _video_pixel_values: Option<&Tensor>, _video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let flat_input = input_ids.flatten_all()?;
+        let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
+        let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+        
+        if let (Some(pv), Some(thw)) = (pixel_values, image_grid_thw) {
+            let (image_embeds, _) = self.get_vision_features(pv, thw)?;
+            let image_embeds = Tensor::cat(&image_embeds, 0)?;
+            let vision_mask = self.get_placeholder_mask(input_ids, true)?;
+            inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
+        }
+
+        let start = if let Some(cp) = cache_position { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { seqlen_offset as u32 };
+        let pos_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
+        
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&pos_ids), None, None)?;
+        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        Ok(self.lm_head.forward(&hidden_state)?)
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; Ok(())
+        self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; 
+        self.text_device = device.clone(); self.vision_device = device.clone();
+        Ok(())
     }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, b: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, b) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, e: usize, u: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, e, u) }
@@ -330,8 +369,29 @@ impl QuantizedQwen3TextModel {
         let lm_head = get_qlinear(ct, &mut reader, "lm_head", text_device, dtype).ok();
         Ok(Self { language_model, lm_head, text_device: text_device.clone() })
     }
+
+    pub fn forward(&mut self, input_ids: &Tensor, cache_position: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let flat_input = input_ids.flatten_all()?;
+        let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
+        let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+        
+        let start = if let Some(cp) = cache_position { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { seqlen_offset as u32 };
+        let pos_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
+        
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&pos_ids), None, None)?;
+        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        if let Some(head) = &self.lm_head {
+            Ok(head.forward(&hidden_state)?)
+        } else {
+            Ok(hidden_state)
+        }
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        self.language_model.to_device(device)?; if let Some(h) = &mut self.lm_head { h.to_device(device)?; } Ok(())
+        self.language_model.to_device(device)?; if let Some(h) = &mut self.lm_head { h.to_device(device)?; } 
+        self.text_device = device.clone();
+        Ok(())
     }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, b: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, b) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, e: usize, u: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, e, u) }
@@ -417,7 +477,12 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             if base_name.contains("token_embd") || base_name.contains("embed_tokens") {
                 // [V2] 2-bit Unpack (4 weights per byte)
                 let scale = f32::from_le_bytes(st.tensor(&format!("{base_name}.scale"))?.data()[0..4].try_into().unwrap());
-                let min_val = f32::from_le_bytes(st.tensor(&format!("{base_name}.min"))?.data()[0..4].try_into().unwrap());
+                let min_val = if let Ok(min_tensor) = st.tensor(&format!("{base_name}.min")) {
+                    f32::from_le_bytes(min_tensor.data()[0..4].try_into().unwrap())
+                } else {
+                    println!("[MODEL-WARNING] Missing .min for {}, defaulting to 0.0", base_name);
+                    0.0f32
+                };
                 let mut unpacked = vec![0.0f32; shape.iter().product()];
                 let packed_vec = view.data();
                 

@@ -784,10 +784,7 @@ impl Qwen3VLTextModel {
         let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
-        // [FIX] Force 2B-standard M-RoPE sections for absolute parity
-        // 0.6B default [24, 20, 20] must be overridden to [16, 16, 32]. Both sum to 64.
-        println!("[MODEL-FIX] Forcing 2B RoPE Sections: [16, 16, 32]");
-        let mrope_section = vec![16, 16, 32];
+        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
 
         Ok(Self {
             embed_tokens,
