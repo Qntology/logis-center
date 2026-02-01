@@ -1145,14 +1145,64 @@ impl Qwen3VLTextModel {
         for (i, layer_opt) in self.layers.iter_mut().enumerate() {
             if let Some(layer) = layer_opt {
                 if let Some((k, v)) = &layer.self_attn.kv_cache {
+                    // [BRIDGE-FIX] Compress to bitkv format for compatibility with QuantizedQwen3VLModel
+                    let rk = Self::compress_to_bitkv(i, k)?; 
+                    let rv = Self::compress_to_bitkv(i, v)?;
+                    
                     let mut m = std::collections::HashMap::new();
-                    m.insert("k".to_string(), k.clone());
-                    m.insert("v".to_string(), v.clone());
-                    candle_core::safetensors::save(&m, path.join(format!("layer_{}_kv.safetensors", i)))?;
+                    m.insert("k_a".to_string(), rk.0); m.insert("k_p".to_string(), rk.1); m.insert("k_s".to_string(), rk.2);
+                    m.insert("v_a".to_string(), rv.0); m.insert("v_p".to_string(), rv.1); m.insert("v_s".to_string(), rv.2);
+                    
+                    // Add shape tensor (important for decompression)
+                    // k is [b, h, s, d]. We need to store this original shape.
+                    let shape_u32: Vec<u32> = rk.3.iter().map(|&x| x as u32).collect();
+                    let shape_tensor = Tensor::from_vec(shape_u32, (rk.3.len(),), k.device())?;
+                    m.insert("shape".to_string(), shape_tensor);
+
+                    candle_core::safetensors::save(&m, path.join(format!("layer_{}_bitkv.safetensors", i)))?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn compress_to_bitkv(l_i: usize, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+        // Ported from quantized_model.rs
+        let s = t.dims().to_vec(); 
+        let d = t.device(); 
+        // Layer 0 is kept in high precision (BF16/F32) usually, but for uniformity in save/load loop of quantized loader, 
+        // we might want to store it as is or compress it.
+        // The quantized loader expects k_a/k_p/k_s.
+        // If we want to keep it uncompressed, we need a flag or special handling.
+        // However, quantized_model.rs `compress_to_bitkv_static` has: `if l_i == 0 { return Ok((t.clone(), ...)); }`
+        // Let's match that behavior.
+        
+        if l_i == 0 { 
+            return Ok((t.clone(), Tensor::zeros(1, DType::U8, d)?, Tensor::zeros(1, DType::F32, d)?, s)); 
+        }
+        
+        let f = t.flatten_all()?; 
+        let n = f.dim(0)?;
+        
+        // Use a heuristic for compression based on layer depth (matching quantized_model logic)
+        if l_i <= 4 {
+            let sc = (f.abs()?.max_all()?.to_scalar::<f32>()? / 3.0).max(1e-6);
+            let q = f.to_vec1::<f32>()?; 
+            let mut p = vec![0u8; (n + 3) / 4];
+            for (i, &v) in q.iter().enumerate() { 
+                let qv = ((v / sc + 1.0).round() as u8).clamp(0, 3); 
+                p[i / 4] |= qv << ((i % 4) * 2); 
+            }
+            Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n + 3) / 4,), d)?, Tensor::new(&[sc], d)?, s))
+        } else {
+            let sc = f.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-6);
+            let sv = f.ge(0.0)?.to_vec1::<u8>()?; 
+            let mut p = vec![0u8; (n + 7) / 8];
+            for (i, &sv) in sv.iter().enumerate() { 
+                if sv > 0 { p[i / 8] |= 1 << (i % 8); } 
+            }
+            Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n + 7) / 8,), d)?, Tensor::new(&[sc], d)?, s))
+        }
     }
 
     pub fn load_kv_cache(&mut self, path: &std::path::Path, device: &Device) -> Result<()> {
