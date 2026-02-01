@@ -1,7 +1,8 @@
 use anyhow::Result;
 use candle_core::{D, Device, Tensor};
 use candle_nn::{
-    Activation, LayerNorm, Linear, Module, RmsNorm, VarBuilder, rms_norm,
+    Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm,
+    Linear, Module, RmsNorm, VarBuilder, batch_norm, conv2d, conv2d_no_bias, rms_norm,
 };
 
 use crate::{models::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
@@ -673,16 +674,6 @@ pub fn get_conv2d(
         conv2d_no_bias(in_c, out_c, kernel_size, cfg, vb)?
     };
     Ok(conv2d)
-}
-
-pub fn get_layer_norm(vb: VarBuilder, eps: f64, dim: usize) -> Result<LayerNorm> {
-    let ln_config = LayerNormConfig {
-        eps,
-        remove_mean: true, // true for layernorm, false for RMSNorm
-        affine: true,      // true for with bias, false for without bias
-    };
-    let norm = layer_norm(dim, ln_config, vb)?;
-    Ok(norm)
 }
 
 pub fn get_batch_norm(vb: VarBuilder, eps: f64, dim: usize) -> Result<BatchNorm> {
