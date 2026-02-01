@@ -877,6 +877,79 @@ impl Qwen3VLTextModel {
             layer.clear_kv_cache()
         }
     }
+
+    pub fn save_kv_cache(&mut self, path: &std::path::Path) -> Result<()> {
+        if !path.exists() { std::fs::create_dir_all(path)?; }
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if let Some((k, v)) = &layer.self_attn.kv_cache {
+                let mut m = std::collections::HashMap::new();
+                m.insert("k".to_string(), k.clone());
+                m.insert("v".to_string(), v.clone());
+                candle_core::safetensors::save(&m, path.join(format!("layer_{}_kv.safetensors", i)))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_kv_cache(&mut self, path: &std::path::Path, device: &Device) -> Result<()> {
+        let mut first_layer_kv = None;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let p = path.join(format!("layer_{}_kv.safetensors", i));
+            let (mut k, mut v) = if p.exists() {
+                let m = candle_core::safetensors::load(p, device)?;
+                (m.get("k").unwrap().clone(), m.get("v").unwrap().clone())
+            } else if let Some((ref fk, ref fv)) = first_layer_kv {
+                // [RELAY] If this layer has no snapshot but we have the first layer, broadcast it
+                (fk.clone(), fv.clone())
+            } else {
+                continue;
+            };
+
+            // [LINEAR-BRIDGE] Handle Dimension Mismatch (e.g., 0.6B 64-dim -> 2B 128-dim)
+            let loaded_head_dim = k.dim(candle_core::D::Minus1)?;
+            let target_head_dim = layer.self_attn.head_dim;
+
+            if loaded_head_dim != target_head_dim {
+                println!("[BRIDGE] Upscaling KV Head Dim {} -> {} for Layer {}", loaded_head_dim, target_head_dim, i);
+                k = self.apply_linear_bridge(&k, target_head_dim)?;
+                v = self.apply_linear_bridge(&v, target_head_dim)?;
+            }
+
+            if first_layer_kv.is_none() {
+                first_layer_kv = Some((k.clone(), v.clone()));
+            }
+
+            layer.self_attn.kv_cache = Some((k, v));
+        }
+        Ok(())
+    }
+
+    fn apply_linear_bridge(&self, x: &Tensor, target_dim: usize) -> Result<Tensor> {
+        let (b, h, s, d) = x.dims4()?;
+        let x_f32 = x.to_dtype(candle_core::DType::F32)?;
+
+        // [QUALITY-BOOST] Energy Normalization Scale
+        // When dimension doubles, the dot product energy changes. 
+        // We scale by sqrt(d_small / d_large) to keep the 2B model's attention focused.
+        let energy_scale = (d as f32 / target_dim as f32).sqrt();
+
+        if target_dim == d * 2 {
+            let left = x_f32.clone();
+            let right = x_f32.roll(1, candle_core::D::Minus1)?;
+            let avg = ((left + right)? * 0.5)?;
+            
+            // Interleave and apply energy scale
+            let interleaved = (Tensor::stack(&[x_f32, avg], candle_core::D::Minus1)? * energy_scale as f64)?
+                .reshape((b, h, s, target_dim))?
+                .to_dtype(x.dtype())?;
+            Ok(interleaved)
+        } else {
+            let repeats = target_dim / d;
+            let upscaled = x.repeat((1, 1, 1, repeats))?.narrow(candle_core::D::Minus1, 0, target_dim)?;
+            (upscaled.to_dtype(candle_core::DType::F32)? * energy_scale as f64)?.to_dtype(x.dtype())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -896,16 +969,21 @@ impl Qwen3VLModel {
     }
 
     pub fn new(config: Qwen3VLConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_ext(config, vb, false)
+    }
+
+    pub fn new_ext(config: Qwen3VLConfig, vb: VarBuilder, force_text_only: bool) -> Result<Self> {
         let vb_m = vb.pp("model");
         let config = config.clone();
         
-        // [FIX] Optional Vision Initialization
-        let visual = if let Some(v_config) = config.vision_config.clone() {
+        // [FIX] Optional Vision Initialization with strict suppression
+        let visual = if !force_text_only && config.vision_config.is_some() {
+            let v_config = config.vision_config.as_ref().unwrap();
             // Check if essential vision tensor exists to decide whether to init
             if vb_m.pp("visual").pp("patch_embed").pp("proj").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() {
-                Some(Qwen3VLVisionModel::new(v_config, vb_m.pp("visual"))?)
+                Some(Qwen3VLVisionModel::new(v_config.clone(), vb_m.pp("visual"))?)
             } else {
-                println!("[MODEL] Vision tensors not found. Skipping Vision initialization.");
+                println!("[MODEL] Vision tensors not found in weight set. Skipping Vision initialization.");
                 None
             }
         } else {
@@ -938,6 +1016,14 @@ impl Qwen3VLModel {
             rope_deltas: None,
             is_baking: false,
         })
+    }
+
+    pub fn save_kv_cache(&mut self, path: &std::path::Path) -> Result<()> {
+        self.language_model.save_kv_cache(path)
+    }
+
+    pub fn load_kv_cache(&mut self, path: &std::path::Path, device: &Device) -> Result<()> {
+        self.language_model.load_kv_cache(path, device)
     }
 
     fn get_vision_features(

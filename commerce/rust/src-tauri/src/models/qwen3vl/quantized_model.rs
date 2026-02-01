@@ -292,7 +292,8 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model: lm, lm_head: lh, text_device: td.clone() })
     }
     pub fn forward(&mut self, ids: &Tensor, cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let (bs, sl) = ids.dims2()?; let mut embs = self.language_model.embed_tokens.forward(&ids.flatten_all()?)?.reshape((bs, sl, ()))?;
+        let (bs, sl) = ids.dims2()?; 
+        let embs = self.language_model.embed_tokens.forward(&ids.flatten_all()?)?.reshape((bs, sl, ()))?;
         let pos = match cp { Some(p) => p.flatten_all()?.i(0)?.to_scalar::<u32>()? as usize, None => offset };
         let pids = Tensor::arange(pos as u32, (pos + sl) as u32, ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))?;
         let out = self.language_model.forward(&embs, offset, Some(&pids), None, None)?;
@@ -375,29 +376,126 @@ pub fn from_true_iq0_safetensors(p: &Path, d: &Device, dt: DType) -> Result<VarB
 }
 
 #[derive(Clone)]
-pub struct QuantizedQwen3VLModel { pub config: Qwen3VLConfig, pub visual: Qwen3VLVisionModel, pub language_model: QuantizedQwen3VLTextModel, pub lm_head: QLinear, pub text_device: Device, pub vision_device: Device }
+pub struct QuantizedQwen3VLModel {
+    pub config: Qwen3VLConfig,
+    pub visual: Option<Qwen3VLVisionModel>,
+    pub language_model: QuantizedQwen3VLTextModel,
+    pub lm_head: QLinear,
+    pub text_device: Device,
+    pub vision_device: Device,
+}
+
 impl QuantizedQwen3VLModel {
-    pub fn new_with_mmap(cfg: &Qwen3VLConfig, ctm: &gguf_file::Content, mm: Option<Arc<Mmap>>, _ctv: &gguf_file::Content, _vmm: Option<Arc<Mmap>>, td: &Device, tdi: usize, vd: &Device, _vi: usize, dt: DType, kvr: u64, bo: bool) -> Result<Self> {
-        let visual = Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), VarBuilder::from_tensors(HashMap::new(), dt, vd))?;
-        let lm = QuantizedQwen3VLTextModel::new_with_mmap(cfg.text_config.as_ref().unwrap(), ctm, mm.clone(), "model", td, tdi, dt, kvr, bo)?;
+    pub fn new_with_mmap(
+        cfg: &Qwen3VLConfig,
+        ctm: &gguf_file::Content,
+        mm: Option<Arc<Mmap>>,
+        _ctv: &gguf_file::Content,
+        _vmm: Option<Arc<Mmap>>,
+        td: &Device,
+        tdi: usize,
+        vd: &Device,
+        _vi: usize,
+        dt: DType,
+        kvr: u64,
+        bo: bool,
+        force_text_only: bool,
+    ) -> Result<Self> {
+        let visual = if !force_text_only && cfg.vision_config.is_some() {
+            Some(Qwen3VLVisionModel::new(
+                cfg.vision_config.as_ref().unwrap().clone(),
+                VarBuilder::from_tensors(HashMap::new(), dt, vd),
+            )?)
+        } else {
+            None
+        };
+
+        let lm = QuantizedQwen3VLTextModel::new_with_mmap(
+            cfg.text_config.as_ref().unwrap(),
+            ctm,
+            mm.clone(),
+            "model",
+            td,
+            tdi,
+            dt,
+            kvr,
+            bo,
+        )?;
         let mut r = std::io::Cursor::new(mm.as_ref().map(|m| &m[..]).unwrap_or(&[]));
         let lh = get_qlinear(ctm, &mut r, "lm_head", td, dt)?;
-        Ok(Self { config: cfg.clone(), visual, language_model: lm, lm_head: lh, text_device: td.clone(), vision_device: vd.clone() })
+        Ok(Self {
+            config: cfg.clone(),
+            visual,
+            language_model: lm,
+            lm_head: lh,
+            text_device: td.clone(),
+            vision_device: vd.clone(),
+        })
     }
-    pub fn forward(&mut self, input_ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, _vthw: Option<&Tensor>, cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let (bs, sl) = input_ids.dims2()?; let mut embs = self.language_model.embed_tokens.forward(&input_ids.flatten_all()?)?.reshape((bs, sl, ()))?;
-        if let (Some(pv), Some(thw)) = (pv, thw) {
-            let (ie, _) = self.visual.forward(pv, thw)?; let ie = ie.to_device(&self.text_device)?;
-            let mask = input_ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], input_ids.device())?)?.to_dtype(DType::U32)?;
+
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        pv: Option<&Tensor>,
+        thw: Option<&Tensor>,
+        _vpv: Option<&Tensor>,
+        _vthw: Option<&Tensor>,
+        cp: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (bs, sl) = input_ids.dims2()?;
+        let mut embs = self
+            .language_model
+            .embed_tokens
+            .forward(&input_ids.flatten_all()?)?
+            .reshape((bs, sl, ()))?;
+
+        if let (Some(visual_model), Some(pv), Some(thw)) = (&self.visual, pv, thw) {
+            let (ie, _) = visual_model.forward(pv, thw)?;
+            let ie = ie.to_device(&self.text_device)?;
+            let mask = input_ids
+                .broadcast_eq(&Tensor::new(
+                    vec![self.config.image_token_id.unwrap_or(0) as u32],
+                    input_ids.device(),
+                )?)?
+                .to_dtype(DType::U32)?;
             embs = masked_scatter_dim0(&embs, &ie, &mask)?;
         }
-        let pos = match cp { Some(p) => p.flatten_all()?.i(0)?.to_scalar::<u32>()? as usize, None => offset };
-        let pids = Tensor::arange(pos as u32, (pos + sl) as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))?;
-        let out = self.language_model.forward(&embs, offset, Some(&pids), None, None)?;
+
+        let pos = match cp {
+            Some(p) => p.flatten_all()?.i(0)?.to_scalar::<u32>()? as usize,
+            None => offset,
+        };
+        let pids = Tensor::arange(pos as u32, (pos + sl) as u32, input_ids.device())?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .broadcast_as((3, bs, sl))?;
+        let out = self
+            .language_model
+            .forward(&embs, offset, Some(&pids), None, None)?;
         Ok(self.lm_head.forward(&out.narrow(1, out.dim(1)? - 1, 1)?)?)
     }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> { self.visual.to_device(d)?; self.language_model.to_device(d)?; self.lm_head.to_device(d)?; self.text_device = d.clone(); self.vision_device = d.clone(); Ok(()) }
-    pub fn save_kv_cache(&mut self, p: &Path, c: bool, b: usize) -> Result<()> { self.language_model.save_kv_cache(p, c, b) }
-    pub fn load_kv_cache(&mut self, p: &Path, d: &Device, e: usize, u: usize) -> Result<()> { self.language_model.load_kv_cache(p, d, e, u) }
-    pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
+
+    pub fn to_device(&mut self, d: &Device) -> Result<()> {
+        if let Some(v) = &mut self.visual {
+            v.to_device(d)?;
+        }
+        self.language_model.to_device(d)?;
+        self.lm_head.to_device(d)?;
+        self.text_device = d.clone();
+        self.vision_device = d.clone();
+        Ok(())
+    }
+
+    pub fn save_kv_cache(&mut self, p: &Path, c: bool, b: usize) -> Result<()> {
+        self.language_model.save_kv_cache(p, c, b)
+    }
+
+    pub fn load_kv_cache(&mut self, p: &Path, d: &Device, e: usize, u: usize) -> Result<()> {
+        self.language_model.load_kv_cache(p, d, e, u)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.language_model.clear_kv_cache();
+    }
 }

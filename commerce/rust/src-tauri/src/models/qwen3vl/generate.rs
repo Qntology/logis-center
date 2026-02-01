@@ -103,7 +103,7 @@ impl Qwen3VLGenerateModel {
                 }
             }
             let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);
-            let mut model = Qwen3VLModel::new(m_cfg, vb)?;
+            let mut model = Qwen3VLModel::new_ext(m_cfg, vb, force_text_only)?;
             if baking_only || is_anchor { model.set_baking(true); }
             return Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, qwen3_vl: ModelVariant::Standard(model), text_device: text_dev, vision_device: vision_dev, eos_token_id1: 151643, eos_token_id2: 151645, generation_config: Qwen3VLGenerationConfig::default(), model_name: if is_anchor { "qwen3-anchor" } else { "qwen3-bitserial-full" }.to_string(), hard_token_limit });
         }
@@ -121,7 +121,7 @@ impl Qwen3VLGenerateModel {
                 let mm_mmap = unsafe { memmap2::MmapOptions::new().map(&mm_file)? };
                 let mut mm_cursor = std::io::Cursor::new(&mm_mmap[..]);
                 let mm_content = gguf_file::Content::read(&mut mm_cursor)?;
-                ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &mm_content, Some(Arc::new(mm_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only)?)
+                ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &mm_content, Some(Arc::new(mm_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only, force_text_only)?)
             } else {
                 ModelVariant::QuantizedText(QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, path.contains("0.6B"))?)
             }
@@ -181,34 +181,86 @@ impl Qwen3VLGenerateModel {
         let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
-        if seqlen_offset == 0 { if let Some(sid) = &session_id { let path = crate::utils::paths::get_kv_dir(None).join(sid); if path.exists() { self.load_kv_from_disk(&path)?; seqlen_offset = self.get_kv_len(); } } }
-        let mut local_pos = if seqlen_offset > 0 { seqlen_offset.min(total_tokens.saturating_sub(1)) } else { 0 };
+        
+        if seqlen_offset == 0 { 
+            if let Some(sid) = &session_id { 
+                let path = crate::utils::paths::get_kv_dir(None).join(sid); 
+                if path.exists() { 
+                    self.load_kv_from_disk(&path)?; 
+                    seqlen_offset = self.get_kv_len();
+                    if seqlen_offset > 0 {
+                        println!("[RESUME] Loaded KV cache via Bridge. Offset: {}", seqlen_offset);
+                    }
+                } 
+            } 
+        }
+
+        // [FIX] local_pos should track where we are in the CURRENT prompt.
+        // If we resumed from a snapshot, we should skip tokens already in the cache.
+        let mut local_pos = seqlen_offset.min(total_tokens);
         let chunk_size = if self.text_device.is_cpu() { 1024 } else { 256 };
+
         while local_pos < total_tokens {
-            let remaining = total_tokens - local_pos; if remaining == 1 { break; }
-            let mut c_size = remaining.min(chunk_size); if local_pos + c_size >= total_tokens { c_size = (total_tokens - local_pos).saturating_sub(1); }
+            let remaining = total_tokens - local_pos; 
+            if remaining <= 1 && generated_text.is_empty() { break; } // Leave last token for generation loop
+            
+            let mut c_size = remaining.min(chunk_size); 
+            if local_pos + c_size >= total_tokens && generated_text.is_empty() { 
+                c_size = (total_tokens - local_pos).saturating_sub(1); 
+            }
             if c_size == 0 { break; }
+
             let chunk_ids = Tensor::from_vec(full_input_ids_vec[local_pos..local_pos + c_size].to_vec(), (1, c_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + c_size) as u32, &self.text_device)?.unsqueeze(0)?;
+            
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset)?;
-            local_pos += c_size; seqlen_offset += c_size;
+            
+            local_pos += c_size; 
+            seqlen_offset += c_size;
         }
-        let mut all_ids = full_input_ids_vec.clone(); let mut generated_text = String::new();
-        let mut pixel_values = input.pixel_values.take(); let image_grid_thw = input.image_grid_thw.take();
+        let mut all_ids = full_input_ids_vec.clone(); 
+        let mut pixel_values = input.pixel_values.take(); 
+        let image_grid_thw = input.image_grid_thw.take();
+
         for _i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-            let input_ids = if generated_text.is_empty() { Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)? } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
+            
+            // [FIX] Correctly determine the next token to feed. 
+            // If we just finished prefilling, feed the very last token of the prompt.
+            let input_ids = if generated_text.is_empty() {
+                let start = local_pos.min(total_tokens.saturating_sub(1));
+                Tensor::new(&full_input_ids_vec[start..total_tokens], &self.text_device)?.unsqueeze(0)?
+            } else {
+                Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?
+            };
+
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
+            
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
-            let logits = logits.squeeze(0)?; let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
+            
+            let logits = logits.squeeze(0)?; 
+            let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
+            
             logits = apply_repeat_penalty(&logits, 1.1, if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] })?;
             let next_id = logit_processor.sample(&logits)?;
+            
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
-            all_ids.push(next_id); generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
+            
+            all_ids.push(next_id); 
+            let decoded = self.tokenizer.token_decode(vec![next_id])?;
+            generated_text.push_str(&decoded);
+            
+            // Optional progress logging
+            // if _i % 10 == 0 { println!("[GEN] Progress: {}", generated_text); }
+
             if _i > 0 && _i % 512 == 0 && !self.qwen3_vl.is_cpu() { let _ = self.qwen3_vl.rebalance_layers(0); }
-            seqlen_offset += seq_len; pixel_values = None;
+            
+            seqlen_offset += seq_len; 
+            local_pos = total_tokens; // After first token, we only feed the last generated ID
+            pixel_values = None;
         }
         Ok(generated_text)
     }
@@ -224,8 +276,20 @@ impl Qwen3VLGenerateModel {
         (ks, vs)
     }
     pub fn inject_kv_bitkv(&mut self, k_a: &[Tensor], k_p: &[Tensor], k_s: &[Tensor], v_a: &[Tensor], v_p: &[Tensor], v_s: &[Tensor], os: &[usize]) -> Result<()> { self.qwen3_vl.inject_kv_bitkv(k_a, k_p, k_s, v_a, v_p, v_s, os) }
-    pub fn save_kv_to_disk(&mut self, p: &Path) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.save_kv_cache(p, false, 1024), ModelVariant::QuantizedText(m) => m.save_kv_cache(p, false, 1024), _ => Ok(()) } }
-    pub fn load_kv_from_disk(&mut self, p: &Path) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.load_kv_cache(p, &self.text_device, 0, 128), ModelVariant::QuantizedText(m) => m.load_kv_cache(p, &self.text_device, 0, 128), _ => Ok(()) } }
+    pub fn save_kv_to_disk(&mut self, p: &Path) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.save_kv_cache(p, false, 1024),
+            ModelVariant::QuantizedText(m) => m.save_kv_cache(p, false, 1024),
+            ModelVariant::Standard(m) => m.save_kv_cache(p),
+        }
+    }
+    pub fn load_kv_from_disk(&mut self, p: &Path) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(p, &self.text_device, 0, 128),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(p, &self.text_device, 0, 128),
+            ModelVariant::Standard(m) => m.load_kv_cache(p, &self.text_device),
+        }
+    }
     pub fn to_device(&mut self, d: &Device) -> Result<()> { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.to_device(d)?, ModelVariant::QuantizedText(m) => m.to_device(d)?, _ => {} }; self.text_device = d.clone(); self.vision_device = d.clone(); Ok(()) }
     pub fn clear_kv_cache(&mut self) { match &mut self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.clear_kv_cache(), ModelVariant::QuantizedText(m) => m.clear_kv_cache(), _ => {} } }
 }
