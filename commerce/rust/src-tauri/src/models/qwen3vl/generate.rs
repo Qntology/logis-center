@@ -183,10 +183,13 @@ impl Qwen3VLGenerateModel {
         if baking_only {
             let custom_st = st_files.iter().find(|f| f.contains("TRUE_IQ0.safetensors") && !f.contains("mmproj"));
             if let Some(st_path) = custom_st {
-                println!("[MODEL] Baking Mode: Using TRUE_IQ0 Anchor Model: {:?}", st_path);
+                println!("[MODEL-LOAD] Baking Mode detected. Using TRUE_IQ0 Anchor: {:?}", st_path);
                 
                 // For Baking, we force 1-layer mode to save VRAM/RAM
-                if let Some(ref mut tc) = cfg.text_config { tc.num_hidden_layers = 1; }
+                if let Some(ref mut tc) = cfg.text_config { 
+                    println!("[MODEL-LOAD] Forcing 1-layer mode for Baking.");
+                    tc.num_hidden_layers = 1; 
+                }
                 if let Some(ref mut vc) = cfg.vision_config { vc.depth = 1; }
 
                 let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
@@ -228,7 +231,13 @@ impl Qwen3VLGenerateModel {
             };
             
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned(); }
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
+
+            // [LOG] Print exact paths being loaded for verification
+            if let Some(ref mp) = model_path { println!("[MODEL-LOAD] Main Language Model: {:?}", mp); }
+            if let Some(ref vp) = mmproj_path { println!("[MODEL-LOAD] Vision Projector: {:?}", vp); }
+            else { println!("[MODEL-LOAD] Vision Projector: SKIPPED (Text-Only or Not Found)"); }
 
             let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;  
             let reserve_tokens = limit_tokens.min(8192);
