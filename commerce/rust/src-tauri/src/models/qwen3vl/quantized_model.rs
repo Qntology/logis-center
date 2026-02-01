@@ -711,10 +711,36 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, dtype: DType) ->
                     .contiguous()?
             }
         } else {
+            // [FIX] 추측하지 말고 safetensors의 메타데이터(view.dtype())를 직접 참조
             let raw = view.data();
-            let f32_data: Vec<f32> = if raw.len() % 4 == 0 { raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() }
-            else { raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect() };
-            Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?
+            let final_tensor = match view.dtype() {
+                safetensors::Dtype::F32 => {
+                    let f32_data: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    Tensor::from_vec(f32_data, view.shape(), &Device::Cpu)?
+                },
+                safetensors::Dtype::F16 | safetensors::Dtype::BF16 => {
+                    let f16_data: Vec<half::f16> = raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect();
+                    Tensor::from_vec(f16_data, view.shape(), &Device::Cpu)?
+                },
+                safetensors::Dtype::I8 => {
+                    // candle doesn't support i8, convert to u8 (same bits)
+                    let u8_data: Vec<u8> = raw.to_vec();
+                    Tensor::from_vec(u8_data, view.shape(), &Device::Cpu)?
+                },
+                safetensors::Dtype::U8 => {
+                    Tensor::from_vec(raw.to_vec(), view.shape(), &Device::Cpu)?
+                },
+                safetensors::Dtype::I32 => {
+                    // candle doesn't support i32, convert to i64
+                    let i64_data: Vec<i64> = raw.chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                        .collect();
+                    Tensor::from_vec(i64_data, view.shape(), &Device::Cpu)?
+                },
+                _ => return Err(anyhow!("Unsupported dtype in safetensors: {:?} for tensor {}", view.dtype(), name)),
+            };
+
+            final_tensor
                 .to_device(device)?
                 .to_dtype(dtype)?
                 .contiguous()?
