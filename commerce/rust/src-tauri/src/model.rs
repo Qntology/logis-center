@@ -573,19 +573,10 @@ impl LogisModel {
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         let current_size = { *self.current_size.lock().await };
         
-        // [STRICT ISOLATION] Never load Embedding on GPU if an LLM is active
+        // [STRICT-ISOLATION] Do NOT load Embedding model if an LLM is currently active.
+        // This prevents the "vicious cycle" of resource contention during heavy Baking/Inference.
         if current_size.is_some() {
-            println!("[MODEL] LLM is active ({:?}). Embedding load deferred or forced to CPU.", current_size);
-            // If we MUST load, force to CPU
-            let mut emb_guard = self.embedding_model.lock().await;
-            if emb_guard.is_none() {
-                let self_clone = self.embedding_path.clone();
-                let emb = tokio::task::spawn_blocking(move || {
-                    EmbeddingModel::new_with_device(&self_clone, &candle_core::Device::Cpu)
-                }).await??;
-                *emb_guard = Some(emb);
-            }
-            return Ok(());
+            return Err(anyhow::anyhow!("Resource Busy: LLM is active ({:?}). Embedding load blocked.", current_size));
         }
 
         let mut emb_guard = self.embedding_model.lock().await;
@@ -1096,7 +1087,17 @@ impl LogisModel {
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
-        // Ensure embedding model is loaded (and generator is unloaded)
+        // [RESOURCE-CHECK] If LLM is active, return a zero vector immediately instead of attempting to load.
+        // This stops background search/UI tasks from interfering with the Baking process.
+        {
+            let size_guard = self.current_size.lock().await;
+            if size_guard.is_some() {
+                println!("[MODEL-WATCH] Embedding request IGNORED (LLM is busy). Returning zero vector.");
+                return Ok(vec![0.0; 768]);
+            }
+        }
+
+        // Ensure embedding model is loaded
         self.ensure_embedding().await?;
 
         let embedding_model_arc = self.embedding_model.clone();
@@ -1106,7 +1107,6 @@ impl LogisModel {
             if let Some(model) = guard.as_ref() {
                 model.embed(&text).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
             } else {
-                // Fallback to zeros if model failed to load
                 Ok(vec![0.0; 768])
             }
         }).await?

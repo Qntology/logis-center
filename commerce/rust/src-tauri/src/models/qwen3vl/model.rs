@@ -1031,9 +1031,23 @@ impl Qwen3VLTextModel {
         
         for layer_idx in 0..config.num_hidden_layers {
             // [SMART-PROBE] Check if this layer exists in the file (RESILIENT)
-            let layer_exists = vb_l.pp(layer_idx).pp("input_layernorm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() ||
-                               vb_l.pp(layer_idx).pp("attn_norm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok();
+            let check_path = vb_l.pp(layer_idx).pp("input_layernorm");
             
+            let layer_exists = match check_path.get_with_hints((1,), "weight", Init::Const(0.)) {
+                Ok(_) => true,
+                Err(e) => {
+                    if layer_idx == 0 {
+                        println!("[MODEL-DEBUG] Layer 0 Probe FAILED at '{}': {:?}", check_path.prefix(), e);
+                    }
+                    // Try alternative name
+                    vb_l.pp(layer_idx).pp("attn_norm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok()
+                }
+            };
+            
+            if layer_idx == 0 {
+                println!("[MODEL-DEBUG] Probing Layer 0: Prefix='{}', Found={}", check_path.prefix(), layer_exists);
+            }
+
             if layer_exists {
                 let layer = Qwen3VLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
                 layers.push(Some(layer));
@@ -1373,6 +1387,7 @@ impl Qwen3VLModel {
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
         
         // [SMART-PROBE] Dynamically find the Language Model root using Layer 0 Anchor
+        println!("[MODEL-DEBUG] Probing for Language Model Root...");
         let vb_lm = if exists("model.language_model.layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Deep root: model.language_model");
             vb_m.pp("language_model") 
@@ -1383,6 +1398,10 @@ impl Qwen3VLModel {
             println!("[MODEL-PROBE] Selected Flat root: <root>");
             vb.clone()
         } else {
+            // [DEBUG] Print all available keys to help diagnose
+            println!("[MODEL-DEBUG] Root Probe FAILED. Available Layer 0 candidates were NOT found.");
+            // We can't print all keys from VarBuilder easily without access to underlying map, 
+            // but we rely on previous logs from `load_tensors`.
             println!("[MODEL-PROBE] Warning: Layer anchor not found. Falling back to default.");
             vb_m.pp("language_model")
         };
