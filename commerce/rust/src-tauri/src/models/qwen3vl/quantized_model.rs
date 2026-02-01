@@ -689,13 +689,15 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, dtype: DType) ->
                     if b_idx < scales_vec.len() {
                         let s = scales_vec[b_idx]; 
                         let p_start = b_idx * 64; // 512 / 8 = 64 bytes
+                        let chunk_len = b_out.len(); // 512 or less for the last block
+                        
                         for i in 0..64 {
                             let gp = p_start + i; 
                             if gp < packed_vec.len() {
                                 let byte = packed_vec[gp];
                                 for bit in 0..8 {
                                     let idx = i * 8 + bit;
-                                    if idx < b_out.len() {
+                                    if idx < chunk_len {
                                         b_out[idx] = if (byte & (1 << bit)) != 0 { s } else { -s };
                                     }
                                 }
