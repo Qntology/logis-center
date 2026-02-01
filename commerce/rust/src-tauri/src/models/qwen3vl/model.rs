@@ -778,11 +778,13 @@ impl Qwen3VLVisionModel {
 
 fn get_qlinear_from_vb(vb: VarBuilder, name: &str) -> Result<QLinear> {
     // [VRAM-OPTIM] Load packed components instead of full tensor
-    if let (Ok(packed), Ok(scales), Ok(shape_t)) = (
+    if let (Ok(packed), Ok(scales_raw), Ok(shape_t)) = (
         vb.get_with_hints((1,), &format!("{}.packed", name), Init::Const(0.)),
         vb.get_with_hints((1,), &format!("{}.scales", name), Init::Const(0.)),
         vb.get_with_hints((1,), &format!("{}.shape", name), Init::Const(0.))
     ) {
+        // [FIX] Scales might be loaded as F16 from Python script, convert to F32 for math
+        let scales = scales_raw.to_dtype(DType::F32)?;
         // Fix i32 error: Read as U32 or I64 if possible, or cast.
         // Assuming shape was saved as I32/U32. Try converting to U32 first for extraction.
         let shape_vec: Vec<usize> = shape_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
@@ -1032,26 +1034,28 @@ impl Qwen3VLTextModel {
             // [SMART-PROBE] Check if this layer exists in the file (RESILIENT)
             let check_path = vb_l.pp(layer_idx).pp("input_layernorm");
             
-            let layer_exists = match check_path.get_with_hints((1,), "weight", Init::Const(0.)) {
+            let mut layer_exists = match check_path.get_with_hints((1,), "weight", Init::Const(0.)) {
                 Ok(_) => true,
-                Err(e) => {
-                    if layer_idx == 0 {
-                        println!("[MODEL-DEBUG] Layer 0 Probe FAILED at '{}': {:?}", check_path.prefix(), e);
-                    }
+                Err(_) => {
                     // Try alternative name
                     vb_l.pp(layer_idx).pp("attn_norm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok()
                 }
             };
             
-            if layer_idx == 0 {
-                println!("[MODEL-DEBUG] Probing Layer 0: Prefix='{}', Found={}", check_path.prefix(), layer_exists);
+            // Try flat check if not found
+            if !layer_exists {
+                let flat_name = format!("layers.{}.input_layernorm.weight", layer_idx);
+                if vb.get_with_hints((1,), &flat_name, Init::Const(0.)).is_ok() {
+                    layer_exists = true;
+                }
             }
+
+            println!("[MODEL-DEBUG] Probing Layer {}: Found={}", layer_idx, layer_exists);
 
             if layer_exists {
                 let layer = Qwen3VLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
                 layers.push(Some(layer));
             } else {
-                // Layer missing in this file (e.g. L0 missing in Inference file, or L1+ missing in Baking file)
                 layers.push(None);
             }
         }
@@ -1116,14 +1120,13 @@ impl Qwen3VLTextModel {
                 )?)
             }
         };
-        // [ADAPTIVE-MELTING] Restore full forward pass for maximum intelligence
-        // Use 1 layer for fast baking, but full layers for inference.
-        // Also respect loaded layers (skip None).
         let layer_limit = if self.is_baking { 1 } else { self.layers.len() };
+        let mut layers_executed = 0;
 
         for (layer_idx, layer_opt) in self.layers.iter_mut().enumerate().take(layer_limit) {
             if let Some(layer) = layer_opt {
                 xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+                layers_executed += 1;
                 if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                     if layer_idx < deepstack_embeds.len() {
                         xs = mask_index_add(
@@ -1135,6 +1138,14 @@ impl Qwen3VLTextModel {
                     }
                 }
             }
+        }
+
+        if layers_executed == 0 {
+             println!("[MODEL-WARNING] Forward pass completed with 0 layers executed! is_baking={}, layer_limit={}", self.is_baking, layer_limit);
+        } else {
+             if self.is_baking {
+                 println!("[MODEL-DEBUG] Baking: Executed {} layer(s).", layers_executed);
+             }
         }
 
         // [STRICT RELAY] If baking, we already got the KV from layer 0. 
@@ -1400,37 +1411,40 @@ impl Qwen3VLModel {
         
         // [SMART-PROBE] Dynamically find the Language Model root using Layer 0 Anchor
         println!("[MODEL-DEBUG] Probing for Language Model Root...");
-        let vb_lm = if exists(&vb_m, "language_model.layers.0.input_layernorm.weight") {
+        let (vb_lm, found_root) = if exists(&vb_m, "language_model.layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Deep root: model.language_model");
-            vb_m.pp("language_model") 
+            (vb_m.pp("language_model"), true)
         } else if exists(&vb_m, "layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Intermediate root: model");
-            vb_m.clone()
+            (vb_m.clone(), true)
+        } else if exists(&vb, "model.layers.0.input_layernorm.weight") {
+             println!("[MODEL-PROBE] Selected Root (with model. prefix): <root>");
+             (vb.pp("model"), true)
         } else if exists(&vb, "layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Flat root: <root>");
-            vb.clone()
-        } else if exists(&vb, "layers.0.input_layernorm.weight") || exists(&vb, "blk.0.attn_norm.weight") {
-            println!("[MODEL-PROBE] Selected Root (Flat/GGUF-Style): <root>");
-            vb.clone()
+            (vb.clone(), true)
+        } else if exists(&vb, "blk.0.attn_norm.weight") {
+            println!("[MODEL-PROBE] Selected GGUF-Style root: <root>");
+            (vb.clone(), true)
         } else {
             println!("[MODEL-DEBUG] Root Probe FAILED. Available Layer 0 candidates were NOT found.");
-            println!("[MODEL-PROBE] Warning: Layer anchor not found. Falling back to default.");
-            vb_m.pp("language_model")
+            println!("[MODEL-PROBE] Warning: Layer anchor not found. Falling back to model.language_model");
+            (vb_m.pp("language_model"), false)
         };
 
-        let language_model =
-            Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
+        let language_model = Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
+        
+        // [BAKING-CHECK] Critical: If baking, we MUST have layer 0
+        if is_baking && language_model.layers.len() > 0 && language_model.layers[0].is_none() {
+            println!("[MODEL-CRITICAL] Baking requested but Layer 0 was NOT loaded! Check tensor keys.");
+            return Err(anyhow!("Layer 0 missing in baking mode"));
+        }
         
         let lm_head = {
             let probe_h = |v: &VarBuilder, path: &str| -> bool {
                 for suffix in &["", ".packed", ".min"] {
                     let full_name = format!("{}.weight{}", path, suffix);
-                    match v.get_with_hints((1,), &full_name, Init::Const(0.)) {
-                        Ok(_) => return true,
-                        Err(candle_core::Error::ShapeMismatch { .. }) => return true,
-                        Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => return true,
-                        _ => {}
-                    }
+                    if exists(v, &full_name) { return true; }
                 }
                 false
             };
@@ -1439,10 +1453,14 @@ impl Qwen3VLModel {
                 Some(vb_m.pp("language_model").pp("lm_head"))
             } else if probe_h(&vb_m, "lm_head") {
                 Some(vb_m.pp("lm_head"))
+            } else if probe_h(&vb, "model.lm_head") {
+                Some(vb.pp("model").pp("lm_head"))
             } else if probe_h(&vb, "lm_head") {
                 Some(vb.pp("lm_head"))
             } else if probe_h(&vb_m, "output") {
                 Some(vb_m.pp("output"))
+            } else if probe_h(&vb, "model.output") {
+                Some(vb.pp("model").pp("output"))
             } else if probe_h(&vb, "output") {
                 Some(vb.pp("output"))
             } else {

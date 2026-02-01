@@ -385,6 +385,7 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _
     let mut tensors = HashMap::new();
 
     for (name, view) in safetensors.tensors() {
+        println!("[DEBUG-LOAD] Tensor Key: {}", name);
         let dtype = match view.dtype() {
             safetensors::Dtype::BOOL => DType::U8,
             safetensors::Dtype::U8 => DType::U8,
