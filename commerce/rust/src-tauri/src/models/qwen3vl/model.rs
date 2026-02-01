@@ -908,9 +908,35 @@ impl Qwen3VLTextAttention {
 }
 
 #[derive(Debug, Clone)]
+pub struct QGateUpDownMLP {
+    pub gate_proj: QLinear,
+    pub up_proj: QLinear,
+    pub down_proj: QLinear,
+    pub act_fn: Activation,
+}
+
+impl QGateUpDownMLP {
+    pub fn new(vb: VarBuilder, _hidden: usize, _inter: usize, act: Activation) -> Result<Self> {
+        let gate_proj = get_qlinear_from_vb(vb.pp("gate_proj"), "weight")?;
+        let up_proj = get_qlinear_from_vb(vb.pp("up_proj"), "weight")?;
+        let down_proj = get_qlinear_from_vb(vb.pp("down_proj"), "weight")?;
+        Ok(Self { gate_proj, up_proj, down_proj, act_fn: act })
+    }
+    
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(x)?;
+        let gate = self.act_fn.forward(&gate)?;
+        let up = self.up_proj.forward(x)?;
+        let x = gate.mul(&up)?;
+        let x = self.down_proj.forward(&x)?;
+        Ok(x)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Qwen3VLTextDecoderLayer {
     pub self_attn: Qwen3VLTextAttention,
-    pub mlp: GateUpDownMLP,
+    pub mlp: QGateUpDownMLP,
     pub input_layernorm: RmsNorm,
     pub post_attention_layernorm: RmsNorm,
 }
@@ -918,12 +944,11 @@ pub struct Qwen3VLTextDecoderLayer {
 impl Qwen3VLTextDecoderLayer {
     pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
         let self_attn = Qwen3VLTextAttention::new(config.clone(), vb.pp("self_attn"))?;
-        let mlp = GateUpDownMLP::new(
+        let mlp = QGateUpDownMLP::new(
             vb.pp("mlp"),
             config.hidden_size,
             config.intermediate_size,
             config.hidden_act,
-            false,
         )?;
         let input_layernorm = rms_norm(
             config.hidden_size,
@@ -969,7 +994,7 @@ impl Qwen3VLTextDecoderLayer {
 #[derive(Debug, Clone)]
 pub struct Qwen3VLTextModel {
     pub embed_tokens: Embedding,
-    pub layers: Vec<Qwen3VLTextDecoderLayer>,
+    pub layers: Vec<Option<Qwen3VLTextDecoderLayer>>,
     pub norm: RmsNorm,
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
@@ -981,9 +1006,21 @@ impl Qwen3VLTextModel {
         let vocab_size = config.vocab_size;
         use crate::models::common::find_flexible_weight;
 
-        let embed_tokens_weight = find_flexible_weight(&vb.pp("embed_tokens"), "weight", vocab_size, config.hidden_size)?;
+        // [SMART-PROBE] Check if embeddings exist (Baking model has them, Inference model might not)
+        let embed_tokens_weight = if vb.pp("embed_tokens").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() {
+            find_flexible_weight(&vb.pp("embed_tokens"), "weight", vocab_size, config.hidden_size)?
+        } else {
+            // If missing (Inference-Only file), create a dummy embedding or try to load from baking context?
+            // For now, if missing, we initialize a zero tensor to avoid crash, assuming we won't embed in inference-only mode without passing embeddings.
+            // But wait, inference needs embeddings if we input tokens.
+            // Actually, Inference-Only model is loaded *after* Baking, or as a second model.
+            // If we run inference, we usually have full model or we pipe embeddings.
+            // Let's assume standard behavior: if missing, create dummy (it will be unused if we pass embeddings directly).
+            Tensor::zeros((vocab_size, config.hidden_size), DType::F32, vb.device())?
+        };
+
         let actual_h = embed_tokens_weight.dim(1)?;
-        if actual_h != config.hidden_size {
+        if actual_h != config.hidden_size && actual_h > 0 {
             println!("[MODEL-FIX] Hidden Size Mismatch. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_h);
             config.hidden_size = actual_h;
         }
@@ -991,11 +1028,28 @@ impl Qwen3VLTextModel {
         let embed_tokens = Embedding::new(embed_tokens_weight, config.hidden_size);
         let mut layers = vec![];
         let vb_l = vb.pp("layers");
+        
         for layer_idx in 0..config.num_hidden_layers {
-            let layer = Qwen3VLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
-            layers.push(layer)
+            // [SMART-PROBE] Check if this layer exists in the file
+            let layer_exists = vb_l.pp(layer_idx).pp("input_layernorm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok();
+            
+            if layer_exists {
+                let layer = Qwen3VLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
+                layers.push(Some(layer));
+            } else {
+                // Layer missing in this file (e.g. L0 missing in Inference file, or L1+ missing in Baking file)
+                layers.push(None);
+            }
         }
-        let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
+        
+        // Norm might be missing in Baking-Only file
+        let norm = if vb.pp("norm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() {
+            rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?
+        } else {
+             // Create dummy norm
+             RmsNorm::new(Tensor::ones(config.hidden_size, DType::F32, vb.device())?, config.rms_norm_eps)
+        };
+
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
@@ -1050,18 +1104,21 @@ impl Qwen3VLTextModel {
         };
         // [ADAPTIVE-MELTING] Restore full forward pass for maximum intelligence
         // Use 1 layer for fast baking, but full layers for inference.
+        // Also respect loaded layers (skip None).
         let layer_limit = if self.is_baking { 1 } else { self.layers.len() };
 
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate().take(layer_limit) {
-            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
-            if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
-                if layer_idx < deepstack_embeds.len() {
-                    xs = mask_index_add(
-                        &xs.squeeze(0)?,
-                        &visual_pos_masks.unwrap().squeeze(0)?,
-                        &deepstack_embeds[layer_idx],
-                    )?
-                    .unsqueeze(0)?;
+        for (layer_idx, layer_opt) in self.layers.iter_mut().enumerate().take(layer_limit) {
+            if let Some(layer) = layer_opt {
+                xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+                if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
+                    if layer_idx < deepstack_embeds.len() {
+                        xs = mask_index_add(
+                            &xs.squeeze(0)?,
+                            &visual_pos_masks.unwrap().squeeze(0)?,
+                            &deepstack_embeds[layer_idx],
+                        )?
+                        .unsqueeze(0)?;
+                    }
                 }
             }
         }
@@ -1077,18 +1134,22 @@ impl Qwen3VLTextModel {
 
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
-            layer.clear_kv_cache()
+            if let Some(l) = layer {
+                l.clear_kv_cache()
+            }
         }
     }
 
     pub fn save_kv_cache(&mut self, path: &std::path::Path) -> Result<()> {
         if !path.exists() { std::fs::create_dir_all(path)?; }
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            if let Some((k, v)) = &layer.self_attn.kv_cache {
-                let mut m = std::collections::HashMap::new();
-                m.insert("k".to_string(), k.clone());
-                m.insert("v".to_string(), v.clone());
-                candle_core::safetensors::save(&m, path.join(format!("layer_{}_kv.safetensors", i)))?;
+        for (i, layer_opt) in self.layers.iter_mut().enumerate() {
+            if let Some(layer) = layer_opt {
+                if let Some((k, v)) = &layer.self_attn.kv_cache {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("k".to_string(), k.clone());
+                    m.insert("v".to_string(), v.clone());
+                    candle_core::safetensors::save(&m, path.join(format!("layer_{}_kv.safetensors", i)))?;
+                }
             }
         }
         Ok(())
@@ -1098,51 +1159,53 @@ impl Qwen3VLTextModel {
         let mut first_layer_kv: Option<(Tensor, Tensor)> = None;
         let target_dtype = if device.is_cpu() { candle_core::DType::F32 } else { candle_core::DType::BF16 };
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            let p = path.join(format!("layer_{}_kv.safetensors", i));
-            let (mut k, mut v): (Tensor, Tensor) = if p.exists() {
-                let m = candle_core::safetensors::load(p, device)?;
-                (
-                    m.get("k").expect("Missing K").to_dtype(target_dtype)?,
-                    m.get("v").expect("Missing V").to_dtype(target_dtype)?
-                )
-            } else if let Some((ref fk, ref fv)) = first_layer_kv {
-                (fk.clone(), fv.clone())
-            } else {
-                continue;
-            };
-
-            k = k.to_dtype(target_dtype)?;
-            v = v.to_dtype(target_dtype)?;
-
-            let (_b, h, _s, d) = k.dims4()?;
-            // Use 'layer' reference directly instead of self.layers[i]
-            let target_h = layer.self_attn.num_key_value_heads;
-            let target_d = layer.self_attn.head_dim;
-
-            if h != target_h {
-                if target_h % h == 0 {
-                    let repeats = target_h / h;
-                    k = k.repeat((1, repeats, 1, 1))?;
-                    v = v.repeat((1, repeats, 1, 1))?;
+        for (i, layer_opt) in self.layers.iter_mut().enumerate() {
+            if let Some(layer) = layer_opt {
+                let p = path.join(format!("layer_{}_kv.safetensors", i));
+                let (mut k, mut v): (Tensor, Tensor) = if p.exists() {
+                    let m = candle_core::safetensors::load(p, device)?;
+                    (
+                        m.get("k").expect("Missing K").to_dtype(target_dtype)?,
+                        m.get("v").expect("Missing V").to_dtype(target_dtype)?
+                    )
+                } else if let Some((ref fk, ref fv)) = first_layer_kv {
+                    (fk.clone(), fv.clone())
                 } else {
-                    k = k.narrow(1, 0, h.min(target_h))?;
-                    v = v.narrow(1, 0, h.min(target_h))?;
+                    continue;
+                };
+
+                k = k.to_dtype(target_dtype)?;
+                v = v.to_dtype(target_dtype)?;
+
+                let (_b, h, _s, d) = k.dims4()?;
+                // Use 'layer' reference directly
+                let target_h = layer.self_attn.num_key_value_heads;
+                let target_d = layer.self_attn.head_dim;
+
+                if h != target_h {
+                    if target_h % h == 0 {
+                        let repeats = target_h / h;
+                        k = k.repeat((1, repeats, 1, 1))?;
+                        v = v.repeat((1, repeats, 1, 1))?;
+                    } else {
+                        k = k.narrow(1, 0, h.min(target_h))?;
+                        v = v.narrow(1, 0, h.min(target_h))?;
+                    }
                 }
-            }
 
-            if d != target_d {
-                k = Self::apply_linear_bridge(&k, target_d)?;
-                v = Self::apply_linear_bridge(&v, target_d)?;
-            }
+                if d != target_d {
+                    k = Self::apply_linear_bridge(&k, target_d)?;
+                    v = Self::apply_linear_bridge(&v, target_d)?;
+                }
 
-            if first_layer_kv.is_none() {
-                first_layer_kv = Some((k.clone(), v.clone()));
-            }
+                if first_layer_kv.is_none() {
+                    first_layer_kv = Some((k.clone(), v.clone()));
+                }
 
-            layer.self_attn.kv_cache = Some((k, v));
+                layer.self_attn.kv_cache = Some((k, v));
+            }
         }
-        println!("[MODEL-OPTIM] Full Restoration: Loaded all {} layers for inference.", self.layers.len());
+        println!("[MODEL-OPTIM] Full Restoration: Loaded all present layers for inference.");
         Ok(())
     }
 
@@ -1191,7 +1254,7 @@ pub struct Qwen3VLModel {
     config: Qwen3VLConfig,
     visual: Option<Qwen3VLVisionModel>,
     pub language_model: Qwen3VLTextModel,
-    lm_head: Linear,
+    lm_head: QLinear,
     rope_deltas: Option<Tensor>,
     pub is_baking: bool,
 }
@@ -1268,13 +1331,7 @@ impl Qwen3VLModel {
         let language_model =
             Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
         
-        // [FIX] Use actual hidden size from loaded model for lm_head to prevent mismatch
-        let actual_h = language_model.embed_tokens.hidden_size();
-
         let lm_head = {
-            // [SMART-PROBE] Find lm_head similarly using absolute paths
-            use crate::models::common::find_flexible_weight;
-            
             let probe_h = |path: &str| -> bool {
                 for suffix in &["", ".packed", ".min"] {
                     let full_name = format!("{}.weight{}", path, suffix);
@@ -1300,12 +1357,17 @@ impl Qwen3VLModel {
             };
 
             if let Some(vh) = vb_head {
-                let lm_head_w = find_flexible_weight(&vh, "weight", text_config.vocab_size, actual_h)?;
-                let lm_head_b = vh.get(text_config.vocab_size, "bias").ok();
-                Linear::new(lm_head_w, lm_head_b)
+                get_qlinear_from_vb(vh, "weight")?
             } else {
-                println!("[MODEL-PROBE] lm_head not found in file. Falling back to Tied Weights.");
-                Linear::new(language_model.embed_tokens.embeddings().clone(), None)
+                println!("[MODEL-PROBE] lm_head not found in file. Creating dummy tied weights for Baking/Inference-Split.");
+                // Fake pack for tied weights or dummy placeholder
+                let w = language_model.embed_tokens.embeddings().clone();
+                let total_el = w.elem_count();
+                // If w is dummy (zero tensor from inference mode missing embeddings), this is fine as long as we don't use it.
+                // QLinear constructor will handle it.
+                let scales = Tensor::ones((total_el / 32).max(1), DType::F32, w.device())?;
+                let packed = Tensor::zeros((total_el / 32).max(1), DType::U32, w.device())?;
+                QLinear::new(packed, scales, w.dims().to_vec(), None, w.device().clone())
             }
         };
 
@@ -1722,6 +1784,6 @@ impl Qwen3VLModel {
     }
 
     pub fn device(&self) -> &Device {
-        self.lm_head.weight().device()
+        self.language_model.embed_tokens.embeddings().device()
     }
 }

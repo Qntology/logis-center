@@ -43,7 +43,7 @@ pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, re
         // Assuming shape tensor in GGUF is stored such that dequantize works or we read raw.
         // Safest is to read raw if possible, but candle's gguf interface returns QTensor.
         // Let's assume dequantize gives us the numbers.
-        let shape_vec: Vec<usize> = shape_t.dequantize(device)?.to_vec1::<i32>()?.iter().map(|&x| x as usize).collect();
+        let shape_vec: Vec<usize> = shape_t.dequantize(device)?.to_dtype(DType::F32)?.to_vec1::<f32>()?.iter().map(|&x| x as usize).collect();
         let bias = ct.tensor(reader, &bias_name, device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
         
         return Ok(QLinear::new(packed_tensor, scales_tensor, shape_vec, bias, device.clone()));
@@ -449,7 +449,10 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
             let packed_tensor = Tensor::from_vec(packed_u32, (packed_raw.len() / 4,), d)?;
             
             // Handle scales (F16 -> F32)
-            let scales_view = st.tensor(&format!("{b_n}.scales"))?;
+            let scales_view = match st.tensor(&format!("{b_n}.scales")) {
+                Ok(v) => v,
+                Err(_) => st.tensor(&format!("{b_n}.scale"))?,
+            };
             let scales_raw = scales_view.data();
             let scales_f32: Vec<f32> = scales_raw.chunks_exact(2)
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -459,10 +462,10 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
             // Handle shape (I32 -> usize)
             let shape_view = st.tensor(&format!("{b_n}.shape"))?;
             let shape_raw = shape_view.data();
-            let shape_i32: Vec<i32> = shape_raw.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            let shape_u32: Vec<u32> = shape_raw.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            let shape_tensor = Tensor::from_vec(shape_i32, (shape_raw.len() / 4,), d)?;
+            let shape_tensor = Tensor::from_vec(shape_u32, (shape_raw.len() / 4,), d)?;
             
             // Store metadata alongside the packed tensor for QLinear initialization
             data.insert(format!("model.{}.scales", t_n), scales);
