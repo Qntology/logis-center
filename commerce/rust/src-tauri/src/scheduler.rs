@@ -615,9 +615,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Bake Task (Use is_baking: true for single-layer inference)
+        // 2. [2B] Load Snapshot & Generate (Automatic Skip Redundant Context)
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), true, true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -628,18 +628,16 @@ async fn process_task(
                 ..Default::default()
             };
 
-                        if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[Scheduler] 2B Step A: Asking classification question...");
-                            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
-                            println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                            
-                            // [DEBUG] AI 응답 저장
-                            let _ = data_manager.offload(&res, "step_a_res");
-            
-                            let type_info = parsing::parse_json_from_llm(&res); 
-                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+            if let Some(gen) = model.generator.lock().await.as_mut() {
+                println!("[Scheduler] 2B Step A: Context loaded via Bridge. Generating answer...");
+                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                
+                let _ = data_manager.offload(&res, "step_a_res");
+                let type_info = parsing::parse_json_from_llm(&res); 
+                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                
                 if page_type.is_empty() {
-                    println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
                     page_type = match task.r#type.as_str() {
                         "image_extraction" => "tracking".to_string(),
                         _ => "unknown".to_string(),
@@ -679,7 +677,7 @@ async fn process_task(
         let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
-            // 1. [0.6B] Bake Full Context
+            // 1. [0.6B] Bake Full Context with 0.6B (Layer Melting)
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
             let model_clone = model.clone();
@@ -706,9 +704,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load & Generate (Use is_baking: true for fast selector identification)
+        // 2. [2B] Load Snapshot & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), true, true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -720,13 +718,11 @@ async fn process_task(
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step B: Asking selector question...");
+                println!("[Scheduler] 2B Step B: Context loaded via Bridge. Identifying selectors...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
-                // [DEBUG] AI 응답 저장
                 let _ = data_manager.offload(&res, "step_b_res");
-
                 selector_info = parsing::parse_json_from_llm(&res);
                 println!("[Scheduler] Selectors Identified.");
             }

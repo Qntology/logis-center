@@ -1135,13 +1135,16 @@ impl Qwen3VLTextModel {
         let (b, h, s, d) = x.dims4()?;
         let x_f32 = x.to_dtype(candle_core::DType::F32)?;
         
-        // 1. Calculate base energy scale for dimension preservation (using f64 for precision)
-        let scale_factor = (d as f64 / target_dim as f64).sqrt();
+        // [RelayBridge 2025.12] ADA-Protocol: Dynamic Distribution Alignment
+        // 1. Measure current signal energy (RMS) to perform Variance Whitening
+        let rms = (x_f32.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt()).max(1e-6);
         
-        // 2. [Bridge-Mathematical-Synergy] Variance Alignment
-        // Using f64 to match .affine() requirements and maintain numerical stability
-        let alignment_coeff = 0.7071067811865476_f64; 
-        let final_scale = scale_factor * alignment_coeff;
+        // 2. Calculate mathematical target scale
+        let theory_scale = (d as f64 / target_dim as f64).sqrt();
+        let alignment_coeff = 0.7071067811865476_f64; // Golden ratio for 1024->2048
+        
+        // 3. Dynamic Bridge Scale: Standardize 0.6B energy to 2B's expected manifold
+        let dynamic_bridge_scale = (theory_scale * alignment_coeff) / (rms as f64);
 
         if target_dim >= d {
             // [Spectral Interpolation] Smooth signal mapping
@@ -1150,17 +1153,20 @@ impl Qwen3VLTextModel {
             let lerp = ((left + right)? * 0.5)?; 
             
             let upscaled = if target_dim > d {
-                (Tensor::stack(&[x_f32, lerp], D::Minus1)?.affine(final_scale, 0.0))?
+                (Tensor::stack(&[x_f32, lerp], D::Minus1)?.affine(dynamic_bridge_scale, 0.0))?
                     .reshape((b, h, s, target_dim))?
             } else {
-                x_f32.affine(alignment_coeff, 0.0)? // Corrected: Both are f64 now
+                // Same dimension: Still perform alignment to standardize energy
+                x_f32.affine(dynamic_bridge_scale * (rms as f64), 0.0)?
             };
             
-            Ok(upscaled.to_dtype(x.dtype())?)
+            // 4. [Outlier Suppression] Suppress ghost activations from bit-serial noise
+            let final_tensor = upscaled.clamp(-10.0, 10.0)?;
+            Ok(final_tensor.to_dtype(x.dtype())?)
         } else {
             let downscaled = x.narrow(D::Minus1, 0, target_dim)?;
-            let inv_scale = (d as f64 / target_dim as f64).sqrt();
-            Ok((downscaled.to_dtype(DType::F32)?.affine(inv_scale, 0.0))?.to_dtype(x.dtype())?)
+            let inv_scale = ((d as f64 / target_dim as f64).sqrt()) / (rms as f64);
+            Ok((downscaled.to_dtype(candle_core::DType::F32)?.affine(inv_scale, 0.0))?.to_dtype(x.dtype())?)
         }
     }
 }
