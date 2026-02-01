@@ -116,16 +116,9 @@ impl Qwen3VLGenerateModel {
     pub fn init_with_config(
         path: &str,
         tokenizer_path: Option<&str>,
-        config_path: Option<&str>,
-        text_device: Option<&Device>,
-        text_device_id: usize,
-        vision_device: Option<&Device>,
-        vision_device_id: usize,
-        dtype: Option<DType>,
-        hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        high_fidelity: bool, // [NEW]
+        _high_fidelity: bool, // [NEW]
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -198,7 +191,7 @@ impl Qwen3VLGenerateModel {
         };
 
         if let Some(st_path) = model_path {
-            let is_bitserial = st_path.contains("BITSERIAL_ALL");
+            let _is_bitserial = st_path.contains("BITSERIAL_ALL");
             let is_anchor = st_path.contains("ANCHOR_IQ0");
             
             println!("[MODEL-LOAD] {} Model detected: {:?}", 

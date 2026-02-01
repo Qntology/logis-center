@@ -592,70 +592,80 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, dtype: DType, ba
     let st = safetensors::SafeTensors::deserialize(&file)?;
     let mut data = HashMap::new();
     println!("[MODEL] Unpacking Safetensors: {:?} (Baking Only: {})", path, baking_only);
+    
     for (name, view) in st.tensors() {
-        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") { continue; }
+        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") || name.ends_with(".format") { continue; }
 
         let is_packed = name.ends_with(".packed");
         let base_name = if is_packed { name.strip_suffix(".packed").unwrap() } else { &name };
         
-        // [FIX] Baking 모드일 때 0번 레이어 외에는 로드 건너뜀 (문자열 파싱 방식)
+        // [1] 이름 표준화: 모든 접두사 제거
+        let clean_name = base_name.replace("model.language_model.", "")
+                                  .replace("model.layers.", "layers.")
+                                  .replace("model.", "")
+                                  .replace("language_model.", "");
+        
+        // [2] Baking 모드 필터링
         if baking_only {
-            let skip = if base_name.contains(".layers.") || base_name.contains(".blocks.") || base_name.contains("blk.") {
-                // 인덱스가 .0. 이 아닌 모든 경우 제외
-                !base_name.contains(".0.")
-            } else {
-                false // 공통 가중치(임베딩 등)는 유지
-            };
-            if skip { continue; }
+            let is_layer_0 = clean_name.contains("layers.0.") || clean_name.contains("blocks.0.") || clean_name.contains("blk.0.");
+            let is_common = !clean_name.contains(".layers.") && !clean_name.contains(".blocks.") && !clean_name.contains("blk.");
+            if !is_layer_0 && !is_common { continue; }
         }
-        
-        let mut target_name = base_name.to_string();
-        
-        if base_name.starts_with("v.") {
-            let rest = &base_name[2..];
-            if rest.starts_with("blk.") {
-                let parts: Vec<&str> = rest[4..].splitn(2, '.').collect();
+
+        let mut target_name = clean_name.clone();
+
+        // [3] 상세 매핑
+        if base_name.starts_with("v.") || clean_name.starts_with("visual.") {
+            let rest = if base_name.starts_with("v.") { &base_name[2..] } else if clean_name.starts_with("visual.") { &clean_name[7..] } else { &clean_name };
+            if rest.starts_with("blk.") || rest.starts_with("blocks.") {
+                let rest_stripped = if rest.starts_with("blk.") { &rest[4..] } else { &rest[7..] };
+                let parts: Vec<&str> = rest_stripped.splitn(2, '.').collect();
                 let mapped = match parts[1] {
-                    s if s.starts_with("ln1") => s.replace("ln1", "norm1"), s if s.starts_with("ln2") => s.replace("ln2", "norm2"),
-                    s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"), s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"),
-                    s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"), s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), _ => parts[1].to_string()
+                    s if s.starts_with("ln1") || s.starts_with("norm1") => "norm1".to_string(),
+                    s if s.starts_with("ln2") || s.starts_with("norm2") => "norm2".to_string(),
+                    s if s.starts_with("attn_qkv") || s.starts_with("attn.qkv") => "attn.qkv".to_string(),
+                    s if s.starts_with("attn_out") || s.starts_with("attn.proj") => "attn.proj".to_string(),
+                    s if s.starts_with("ffn_up") || s.starts_with("mlp.linear_fc1") => "mlp.linear_fc1".to_string(),
+                    s if s.starts_with("ffn_down") || s.starts_with("mlp.linear_fc2") => "mlp.linear_fc2".to_string(),
+                    _ => parts[1].to_string()
                 };
                 target_name = format!("visual.blocks.{}.{}", parts[0], mapped);
-            } else if rest.starts_with("patch_embd") { target_name = "visual.patch_embed.proj".to_string(); }
-            else if rest.starts_with("position_embd") { target_name = "visual.pos_embed".to_string(); }
-            else if rest.starts_with("post_ln") { target_name = "visual.merger.norm".to_string(); }
+            } else if rest.starts_with("patch_embd") || rest.starts_with("patch_embed") { target_name = "visual.patch_embed.proj".to_string(); }
+            else if rest.starts_with("position_embd") || rest.starts_with("pos_embed") { target_name = "visual.pos_embed".to_string(); }
+            else if rest.starts_with("post_ln") || rest.starts_with("merger.norm") { target_name = "visual.merger.norm".to_string(); }
             else { target_name = format!("visual.{}", rest); }
         } else if base_name.starts_with("mm.") {
             let rest = &base_name[3..];
             if rest.starts_with("0") { target_name = "visual.merger.linear_fc1".to_string(); }
             else if rest.starts_with("2") { target_name = "visual.merger.linear_fc2".to_string(); }
-        } else if base_name.starts_with("blk.") || base_name.starts_with("model.layers.") {
-            // [FIX] 'blk.' 와 'model.layers.' 두 가지 접두사 모두 지원
-            let rest = if base_name.starts_with("blk.") { &base_name[4..] } else { &base_name[13..] };
+        } else if clean_name.starts_with("layers.") || base_name.starts_with("blk.") {
+            let rest = if clean_name.starts_with("layers.") { &clean_name[7..] } else { &base_name[4..] };
             let parts: Vec<&str> = rest.splitn(2, '.').collect();
-            
             let mapped = match parts[1] {
                 "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),
                 "attn_k_norm.weight" => "self_attn.k_norm.weight".to_string(),
-                s if s.starts_with("attn_q") => s.replace("attn_q", "self_attn.q_proj"), s if s.starts_with("attn_k") => s.replace("attn_k", "self_attn.k_proj"),
-                s if s.starts_with("attn_v") => s.replace("attn_v", "self_attn.v_proj"), s if s.starts_with("attn_output") => s.replace("attn_output", "self_attn.o_proj"),
-                s if s.starts_with("attn_norm") => s.replace("attn_norm", "input_layernorm"), s if s.starts_with("ffn_norm") => s.replace("ffn_norm", "post_attention_layernorm"),
-                s if s.starts_with("ffn_gate") => s.replace("ffn_gate", "mlp.gate_proj"), s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.up_proj"),
-                s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.down_proj"), _ => parts[1].to_string()
+                s if s.starts_with("attn_q") => "self_attn.q_proj".to_string(),
+                s if s.starts_with("attn_k") => "self_attn.k_proj".to_string(),
+                s if s.starts_with("attn_v") => "self_attn.v_proj".to_string(),
+                s if s.starts_with("attn_output") => "self_attn.o_proj".to_string(),
+                s if s.starts_with("attn_norm") => "input_layernorm".to_string(),
+                s if s.starts_with("ffn_norm") => "post_attention_layernorm".to_string(),
+                s if s.starts_with("ffn_gate") => "mlp.gate_proj".to_string(),
+                s if s.starts_with("ffn_up") => "mlp.up_proj".to_string(),
+                s if s.starts_with("ffn_down") => "mlp.down_proj".to_string(),
+                _ => parts[1].to_string()
             };
             target_name = format!("language_model.layers.{}.{}", parts[0], mapped);
-        } else if base_name.contains("token_embd") || base_name.eq("model.embed_tokens.weight") {
+        } else if clean_name.contains("embed_tokens") || clean_name.contains("token_embd") {
             target_name = "language_model.embed_tokens.weight".to_string();
-        } else if base_name.contains("output_norm") || base_name.eq("model.norm.weight") {
+        } else if clean_name.contains("output_norm") || (clean_name.contains("norm.weight") && !clean_name.contains("layers")) {
             target_name = "language_model.norm.weight".to_string();
-        } else if base_name.contains("lm_head") || base_name == "output.weight" {
+        } else if clean_name.contains("lm_head") || clean_name.eq("output.weight") {
             target_name = "lm_head.weight".to_string();
-        } else if base_name.contains("output.bias") {
-            target_name = "lm_head.bias".to_string();
         }
 
+        // [4] 최종 텐서 언팩/로드
         let final_tensor = if is_packed {
-            // [FIX] 파일 내부에 명시된 .shape 텐서를 읽어와서 정확한 형상 복원
             let shape_name = format!("{}.shape", base_name);
             let shape: Vec<usize> = if let Ok(shape_view) = st.tensor(&shape_name) {
                 let shape_data = shape_view.data();
