@@ -85,7 +85,28 @@ impl Qwen3VLGenerateModel {
             if let Some(h) = raw_config.get("head_dim").and_then(|v| v.as_u64()) { tc.head_dim = h as usize; }
             Qwen3VLConfig { text_config: Some(tc), model_type: "qwen2".to_string(), ..Default::default() }
         };
-        if path.contains("0.6B") { if let Some(ref mut tc) = cfg.text_config { if tc.hidden_size == 2048 { tc.hidden_size = 1024; tc.intermediate_size = 2816; } } }
+        if path.contains("0.6B") { 
+            if let Some(ref mut tc) = cfg.text_config { 
+                // 1. Architecture size correction (matching 0.6B model specs)
+                if tc.hidden_size == 2048 { 
+                    tc.hidden_size = 1024; 
+                    tc.intermediate_size = 3072; // Actual model value
+                } 
+                
+                // 2. [BRIDGE-PROTOCOL] Sync RoPE Theta with 2B-VL (5M)
+                tc.rope_theta = 5000000.0;
+
+                // 3. [BRIDGE-PROTOCOL] Force mRoPE settings injection
+                // Ensure 0.6B rotates position info in the same way as 2B-VL
+                tc.rope_scaling = Some(crate::models::qwen3vl::config::RopeScaling {
+                    mrope_section: vec![24, 20, 20], // Match 2B-VL model settings
+                    rope_type: "default".to_string(),
+                    mrope_interleaved: Some(true),
+                });
+
+                println!("[BRIDGE] Full Sync: RoPE Theta(5M) and mRoPE Sections applied to 0.6B for compatibility.");
+            } 
+        }
         let text_dev = get_device(text_device); let vision_dev = get_device(vision_device);
         let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
         let st_files = find_type_files(path, "safetensors")?;

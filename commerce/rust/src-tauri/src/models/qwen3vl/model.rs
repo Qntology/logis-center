@@ -1134,21 +1134,32 @@ impl Qwen3VLTextModel {
     fn apply_linear_bridge(x: &Tensor, target_dim: usize) -> Result<Tensor> {
         let (b, h, s, d) = x.dims4()?;
         let x_f32 = x.to_dtype(candle_core::DType::F32)?;
-        let energy_scale = (d as f32 / target_dim as f32).sqrt() as f64;
+        
+        // 1. Calculate base energy scale for dimension preservation
+        let scale_factor = (d as f32 / target_dim as f32).sqrt();
+        
+        // 2. [BridgeKV 2025.10] Variance Alignment Coefficient
+        // Compensates for the higher variance in smaller models (0.6B) when entering 2B space
+        let alignment_coeff = 0.975; 
+        let final_scale = (scale_factor * alignment_coeff) as f64;
 
-        if target_dim == d * 2 {
+        if target_dim > d {
+            // [Spectral Interpolation] Create a smooth signal for the expanded dimensions
             let left = x_f32.clone();
-            let right = x_f32.roll(1, candle_core::D::Minus1)?;
-            let avg = ((left + right)? * 0.5)?;
+            let right = x_f32.roll(1, D::Minus1)?;
+            let lerp = ((left + right)? * 0.5)?; 
             
-            let interleaved = (Tensor::stack(&[x_f32, avg], candle_core::D::Minus1)? * energy_scale)?
+            // Map to higher dimension while preserving energy and topology
+            let upscaled = (Tensor::stack(&[x_f32, lerp], D::Minus1)? * final_scale)?
                 .reshape((b, h, s, target_dim))?
                 .to_dtype(x.dtype())?;
-            Ok(interleaved)
+            Ok(upscaled)
+        } else if target_dim < d {
+            let downscaled = x.narrow(D::Minus1, 0, target_dim)?;
+            let inv_scale = (d as f32 / target_dim as f32).sqrt() as f64;
+            Ok((downscaled.to_dtype(DType::F32)? * inv_scale)?.to_dtype(x.dtype())?)
         } else {
-            let repeats = target_dim / d;
-            let upscaled = x.repeat((1, 1, 1, repeats))?.narrow(candle_core::D::Minus1, 0, target_dim)?;
-            Ok((upscaled.to_dtype(candle_core::DType::F32)? * energy_scale)?.to_dtype(x.dtype())?)
+            Ok(x.clone())
         }
     }
 }
