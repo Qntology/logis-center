@@ -772,8 +772,19 @@ pub struct Qwen3VLTextModel {
 }
 
 impl Qwen3VLTextModel {
-    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(mut config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
         let vocab_size = config.vocab_size;
+
+        // [FIX] Dynamically detect hidden_size from loaded tensor to prevent shape mismatch
+        // This is critical for Linear Bridge / Baking mode where 0.6B (1024) and 2B (2048) swap.
+        if let Ok(tensor) = vb.pp("embed_tokens").get_with_hints((vocab_size, config.hidden_size), "weight", candle_nn::Init::Const(0.)) {
+            let actual_h = tensor.dim(1)?;
+            if actual_h != config.hidden_size {
+                println!("[MODEL-FIX] Hidden Size Mismatch in VarBuilder. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_h);
+                config.hidden_size = actual_h;
+            }
+        }
+
         let embed_tokens = embedding(vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
         let mut layers = vec![];
         let vb_l = vb.pp("layers");
@@ -906,11 +917,15 @@ impl Qwen3VLModel {
         
         let language_model =
             Qwen3VLTextModel::new(text_config.clone(), vb_m.pp("language_model"))?;
+        
+        // [FIX] Use actual hidden size from loaded model for lm_head to prevent mismatch
+        let actual_h = language_model.embed_tokens.hidden_size();
+
         let lm_head = if config.tie_word_embeddings {
             Linear::new(language_model.embed_tokens.embeddings().clone(), None)
         } else {
             linear_no_bias(
-                text_config.hidden_size,
+                actual_h,
                 text_config.vocab_size,
                 vb.pp("lm_head"),
             )?

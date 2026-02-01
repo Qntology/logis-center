@@ -537,10 +537,11 @@ impl LogisModel {
         let shared_path_clone = shared_path.map(|s| s.to_string());
 
         let gen = tokio::task::spawn_blocking(move || {
+            // [FIX] tokenizer_path만 공유하고 config_path는 자기 자신의 경로를 우선 사용하도록 수정
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                shared_path_clone.as_deref(), 
-                shared_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), // tokenizer_path: Large 모델 것 공유
+                None,                         // config_path: None으로 설정하여 path_clone(자기 자신)의 config.json 사용
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
                 baking_only,

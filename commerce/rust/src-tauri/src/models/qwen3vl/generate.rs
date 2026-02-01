@@ -169,6 +169,17 @@ impl Qwen3VLGenerateModel {
                 vision_end_token_id: None,
             }
         };
+
+        // [FIX] 만약 경로에 0.6B가 포함되어 있는데 hidden_size가 2048이라면 강제로 1024로 교정
+        if path.contains("0.6B") {
+            if let Some(ref mut tc) = cfg.text_config {
+                if tc.hidden_size == 2048 {
+                    println!("[MODEL-FIX] Forcing hidden_size to 1024 for 0.6B model path.");
+                    tc.hidden_size = 1024;
+                    tc.intermediate_size = 2816; // 0.6B 표준 intermediate_size
+                }
+            }
+        }
         let text_dev = get_device(text_device);
         let vision_dev = get_device(vision_device);
         let cfg_dtype = cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16");

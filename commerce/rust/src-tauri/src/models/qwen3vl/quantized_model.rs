@@ -228,7 +228,29 @@ impl QuantizedQwen3VLTextModel {
     pub fn new_with_mmap(config: &Qwen3VLTextConfig, ct: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, _base_name: &str, device: &Device, _device_id: usize, dtype: DType, _kv_reserve: u64, baking_only: bool) -> Result<Self> {
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
-        let embed_tokens = Embedding::new(ct.tensor(&mut reader, "token_embd.weight", device)?.dequantize(device)?.to_dtype(dtype)?, config.hidden_size);
+        
+        // [9d1369 Parity] Dynamically detect hidden size from loaded tensor to prevent shape mismatch
+        let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, "token_embd.weight", device) {
+             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let h = tensor.dim(1)?;
+             (Embedding::new(tensor, h), h)
+        } else if let Ok(tensor) = ct.tensor(&mut reader, "model.embed_tokens.weight", device) {
+             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let h = tensor.dim(1)?;
+             (Embedding::new(tensor, h), h)
+        } else {
+             return Err(anyhow!("Failed to load token_embd.weight."));
+        };
+
+        if actual_hidden_size != config.hidden_size {
+            println!("[MODEL-FIX] Hidden Size Mismatch Detected! Config: {}, File: {}. Patching config to match file...", config.hidden_size, actual_hidden_size);
+        }
+
+        // [CRITICAL] Apply patched config for ALL subsequent layer/norm initialization
+        let mut patched_config = config.clone();
+        patched_config.hidden_size = actual_hidden_size;
+        let config = &patched_config;
+
         let mut layers = vec![];
         let num_layers = if baking_only { 1 } else { config.num_hidden_layers };
         for i in 0..num_layers {
