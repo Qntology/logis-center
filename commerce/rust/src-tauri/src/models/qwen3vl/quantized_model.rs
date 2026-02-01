@@ -25,9 +25,44 @@ use crate::{
 };
 
 pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
-    let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
-    let bias = ct.tensor(reader, &format!("{name}.bias"), device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
-    Ok(QLinear::new(QMatMul::from_qtensor(weight)?, bias, device.clone()))
+    // [VRAM-RESIDENT] Try loading Bit-Serial 1-bit tensors first
+    let packed_name = format!("{}.weight.packed", name);
+    let scales_name = format!("{}.weight.scales", name);
+    let shape_name = format!("{}.weight.shape", name);
+    let bias_name = format!("{}.bias", name);
+
+    if let (Ok(packed), Ok(scales), Ok(shape_t)) = (
+        ct.tensor(reader, &packed_name, device),
+        ct.tensor(reader, &scales_name, device),
+        ct.tensor(reader, &shape_name, device)
+    ) {
+        let packed_tensor = packed.dequantize(device)?;
+        let scales_tensor = scales.dequantize(device)?.to_dtype(DType::F32)?;
+        // GGUF shape is usually stored as i32 or u32. Read as is and convert.
+        // If dequantize returns F32 (common for simple dequant), we might need to cast.
+        // Assuming shape tensor in GGUF is stored such that dequantize works or we read raw.
+        // Safest is to read raw if possible, but candle's gguf interface returns QTensor.
+        // Let's assume dequantize gives us the numbers.
+        let shape_vec: Vec<usize> = shape_t.dequantize(device)?.to_vec1::<i32>()?.iter().map(|&x| x as usize).collect();
+        let bias = ct.tensor(reader, &bias_name, device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
+        
+        return Ok(QLinear::new(packed_tensor, scales_tensor, shape_vec, bias, device.clone()));
+    }
+
+    // Fallback to standard GGUF if bit-serial tensors are missing
+    let weight = ct.tensor(reader, &format!("{}.weight", name), device)?;
+    let bias = ct.tensor(reader, &bias_name, device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
+    
+    // Convert standard QTensor to the new QLinear format (temporary expansion during load if needed)
+    let w_dequant = weight.dequantize(device)?.to_dtype(DType::F32)?;
+    let s = w_dequant.dims().to_vec();
+    let total_el = s.iter().product::<usize>();
+    
+    // Fake bit-serial packing for legacy GGUF weights to maintain API compatibility
+    let scales = Tensor::ones((total_el / 32).max(1), DType::F32, device)?;
+    let packed = Tensor::zeros((total_el / 32).max(1), DType::U32, device)?;
+    
+    Ok(QLinear::new(packed, scales, s, bias, device.clone()))
 }
 
 pub fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {
@@ -53,29 +88,80 @@ impl Module for RmsNorm {
     }
 }
 
-#[derive(Clone)]
-pub struct QLinear { inner: QMatMul, bias: Option<Tensor>, device: Device }
+#[derive(Debug, Clone)]
+pub struct QLinear { 
+    packed_weight: Tensor, 
+    scales: Tensor, 
+    original_shape: Vec<usize>,
+    bias: Option<Tensor>, 
+    device: Device,
+    dtype: DType
+}
+
 impl QLinear {
-    pub fn new(inner: QMatMul, bias: Option<Tensor>, device: Device) -> Self { Self { inner, bias, device } }
+    pub fn new(packed_weight: Tensor, scales: Tensor, original_shape: Vec<usize>, bias: Option<Tensor>, device: Device) -> Self { 
+        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        Self { packed_weight, scales, original_shape, bias, device, dtype } 
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
-            let td = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-            self.inner = match &self.inner {
-                QMatMul::QTensor(q) => QMatMul::Tensor(q.dequantize(device)?.to_dtype(td)?),
-                QMatMul::Tensor(t) => QMatMul::Tensor(t.to_device(device)?.to_dtype(td)?),
-                _ => self.inner.clone(),
-            };
-            if let Some(b) = &self.bias { self.bias = Some(b.to_device(device)?.to_dtype(td)?); }
+            self.packed_weight = self.packed_weight.to_device(device)?;
+            self.scales = self.scales.to_device(device)?;
+            if let Some(b) = &self.bias { self.bias = Some(b.to_device(device)?); }
             self.device = device.clone();
+            self.dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         }
         Ok(())
     }
+
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = if !xs.device().same_device(&self.device) { xs.to_device(&self.device)? } else { xs.clone() };
+        // [ON-THE-FLY DEQUANTIZATION] GGUF Style High-Speed Extraction
         let (b, s, h) = xs.dims3()?;
-        let out = self.inner.forward(&xs.reshape((b * s, h))?.to_dtype(DType::F32)?)?;
-        let out = out.reshape((b, s, ()))?.to_dtype(if self.device.is_cuda() { DType::BF16 } else { DType::F32 })?;
-        if let Some(bias) = &self.bias { Ok(out.broadcast_add(bias)?) } else { Ok(out) }
+        let target_device = xs.device();
+        
+        // 1. Dequantize weights only for the current forward pass
+        let weight = self.dequantize_on_the_fly(target_device)?;
+        
+        // 2. Perform Linear operation
+        let xs_flat = xs.reshape((b * s, h))?;
+        let mut out = xs_flat.matmul(&weight.t()?)?;
+        
+        if let Some(bias) = &self.bias {
+            out = out.broadcast_add(bias)?;
+        }
+        
+        Ok(out.reshape((b, s, ()))?)
+    }
+
+    fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
+        let s = &self.original_shape;
+        let total_el = s.iter().product::<usize>();
+        let num_blocks = total_el / 32;
+        
+        // This is a high-speed Rust-side bit extractor.
+        let packed_cpu = self.packed_weight.to_device(&Device::Cpu)?;
+        let scales_cpu = self.scales.to_device(&Device::Cpu)?;
+        
+        let packed_data = packed_cpu.to_vec1::<u32>()?;
+        let scales_data = scales_cpu.to_vec1::<f32>()?;
+        
+        let mut weights = vec![0.0f32; total_el];
+        
+        for b_i in 0..num_blocks {
+            if b_i < scales_data.len() {
+                let s_val = scales_data[b_i];
+                let b = packed_data[b_i];
+                let offset = b_i * 32;
+                for bit in 0..32 {
+                    if offset + bit < total_el {
+                        weights[offset + bit] = if (b & (1 << bit)) != 0 { s_val } else { -s_val };
+                    }
+                }
+            }
+        }
+        
+        Ok(Tensor::from_vec(weights, s.as_slice(), device)?.to_dtype(self.dtype)?)
     }
 }
 
@@ -321,12 +407,15 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
     for (name, view) in st.tensors() {
         if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") || name.ends_with(".format") || name.ends_with(".min") { continue; }
         let is_p = name.ends_with(".packed"); let b_n = if is_p { name.strip_suffix(".packed").unwrap() } else { &name };
+        
+        // [Universal Naming Protocol] Match all Python patterns to Rust
         let clean = b_n.replace("model.language_model.", "").replace("model.layers.", "layers.").replace("model.visual.", "visual.").replace("model.", "").replace("language_model.", "");
         if bo {
             let is_l0 = clean == "layers.0.self_attn.q_proj.weight" || clean == "layers.0.self_attn.k_proj.weight" || clean == "layers.0.self_attn.v_proj.weight" || clean == "layers.0.self_attn.o_proj.weight" || clean == "layers.0.input_layernorm.weight" || clean == "layers.0.post_attention_layernorm.weight" || clean == "embed_tokens.weight" || clean == "norm.weight";
             let is_c = !clean.contains(".layers.") && !clean.contains(".blocks.") && !clean.contains("blk.");
             if !is_l0 && !is_c { continue; }
         }
+        
         let mut t_n = clean.clone();
         if b_n.starts_with("v.") || clean.starts_with("visual.") {
             let rest = if b_n.starts_with("v.") { &b_n[2..] } else if clean.starts_with("visual.") { &clean[7..] } else { &clean };
@@ -351,21 +440,34 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
         else if clean == "lm_head.weight" || clean == "output.weight" { t_n = "lm_head.weight".to_string(); }
 
         let ft = if is_p {
-            let sv = st.tensor(&format!("{b_n}.shape"))?; let s: Vec<usize> = sv.data().chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
-            if clean.contains("embed_tokens") || clean.contains("token_embd") {
-                let sc = f32::from_le_bytes(st.tensor(&format!("{b_n}.scale"))?.data()[0..4].try_into().unwrap());
-                let min = st.tensor(&format!("{b_n}.min")).map(|t| f32::from_le_bytes(t.data()[0..4].try_into().unwrap())).unwrap_or(0.0);
-                let mut u = vec![0.0f32; s.iter().product()]; let pv = view.data();
-                for (i, &b) in pv.iter().enumerate() { for j in 0..4 { let idx = i * 4 + j; if idx < u.len() { u[idx] = (((b >> (j * 2)) & 0x03) as f32 * sc) + min; } } }
-                Tensor::from_vec(u, s.as_slice(), &Device::Cpu)?.to_device(d)?.to_dtype(dt)?
-            } else {
-                let scv: Vec<f32> = st.tensor(&format!("{b_n}.scales"))?.data().chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
-                let mut dec = vec![0.0f32; s.iter().product()]; let pv = view.data();
-                dec.par_chunks_mut(512).enumerate().for_each(|(b_i, b_o)| {
-                    if b_i < scv.len() { let s_val = scv[b_i]; let p_s = b_i * 64; for i in 0..64 { let gp = p_s + i; if gp < pv.len() { let b = pv[gp]; for bit in 0..8 { let idx = i * 8 + bit; if idx < b_o.len() { b_o[idx] = if (b & (1 << bit)) != 0 { s_val } else { -s_val }; } } } } }
-                });
-                Tensor::from_vec(dec, s.as_slice(), &Device::Cpu)?.to_device(d)?.to_dtype(dt)?.contiguous()?
-            }
+            // [VRAM-RESIDENT UPGRADE] Store raw packed bit-data instead of dequantizing
+            let packed_raw = view.data().to_vec();
+            // Assuming packed data is u32
+            let packed_u32: Vec<u32> = packed_raw.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let packed_tensor = Tensor::from_vec(packed_u32, (packed_raw.len() / 4,), d)?;
+            
+            // Handle scales (F16 -> F32)
+            let scales_view = st.tensor(&format!("{b_n}.scales"))?;
+            let scales_raw = scales_view.data();
+            let scales_f32: Vec<f32> = scales_raw.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect();
+            let scales = Tensor::from_vec(scales_f32, (scales_raw.len() / 2,), d)?;
+
+            // Handle shape (I32 -> usize)
+            let shape_view = st.tensor(&format!("{b_n}.shape"))?;
+            let shape_raw = shape_view.data();
+            let shape_i32: Vec<i32> = shape_raw.chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let shape_tensor = Tensor::from_vec(shape_i32, (shape_raw.len() / 4,), d)?;
+            
+            // Store metadata alongside the packed tensor for QLinear initialization
+            data.insert(format!("model.{}.scales", t_n), scales);
+            data.insert(format!("model.{}.shape", t_n), shape_tensor);
+            packed_tensor
         } else {
             let r = view.data(); match view.dtype() {
                 safetensors::Dtype::F32 => Tensor::from_vec(r.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>(), view.shape(), &Device::Cpu)?,

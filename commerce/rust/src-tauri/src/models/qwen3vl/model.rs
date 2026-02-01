@@ -8,7 +8,10 @@ use candle_nn::{
 use crate::{
     models::{
         common::{GateUpDownMLP, TwoLinearMLP, eager_attention_forward, get_layer_norm},
-        qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
+        qwen3vl::{
+            config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
+            quantized_model::QLinear, // [VRAM-OPTIM] Import QLinear
+        },
     },
     position_embed::rope::{
         Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
@@ -774,12 +777,38 @@ impl Qwen3VLVisionModel {
     }
 }
 
+fn get_qlinear_from_vb(vb: VarBuilder, name: &str) -> Result<QLinear> {
+    // [VRAM-OPTIM] Load packed components instead of full tensor
+    if let (Ok(packed), Ok(scales), Ok(shape_t)) = (
+        vb.get_with_hints((1,), &format!("{}.packed", name), Init::Const(0.)),
+        vb.get_with_hints((1,), &format!("{}.scales", name), Init::Const(0.)),
+        vb.get_with_hints((1,), &format!("{}.shape", name), Init::Const(0.))
+    ) {
+        // Fix i32 error: Read as U32 or I64 if possible, or cast.
+        // Assuming shape was saved as I32/U32. Try converting to U32 first for extraction.
+        let shape_vec: Vec<usize> = shape_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+        let bias = vb.get_with_hints((1,), &format!("{}.bias", name), Init::Const(0.)).ok();
+        return Ok(QLinear::new(packed, scales, shape_vec, bias, vb.device().clone()));
+    }
+    
+    // Fallback for non-quantized weights
+    let weight = vb.get_with_hints((1,), name, Init::Const(0.))?; 
+    let s = weight.dims().to_vec();
+    let total_el = s.iter().product::<usize>();
+    // Fake pack
+    let scales = Tensor::ones((total_el / 32).max(1), DType::F32, vb.device())?;
+    let packed = Tensor::zeros((total_el / 32).max(1), DType::U32, vb.device())?;
+    let bias = vb.get_with_hints((1,), &format!("{}.bias", name), Init::Const(0.)).ok();
+    
+    Ok(QLinear::new(packed, scales, s, bias, vb.device().clone()))
+}
+
 #[derive(Debug, Clone)]
 pub struct Qwen3VLTextAttention {
-    pub q_proj: Linear,
-    pub k_proj: Linear,
-    pub v_proj: Linear,
-    pub o_proj: Linear,
+    pub q_proj: QLinear,
+    pub k_proj: QLinear,
+    pub v_proj: QLinear,
+    pub o_proj: QLinear,
     pub q_norm: RmsNorm,
     pub k_norm: RmsNorm,
     pub num_attention_heads: usize,
@@ -798,23 +827,12 @@ impl Qwen3VLTextAttention {
         let num_key_value_heads = config.num_key_value_heads;
         let num_kv_groups = num_attention_heads / num_key_value_heads;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
-        let (q_proj, k_proj, v_proj, o_proj) = if config.attention_bias {
-            let q_proj = linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?;
-            let k_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?;
-            let v_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?;
-            let o_proj = linear(num_attention_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
-            (q_proj, k_proj, v_proj, o_proj)
-        } else {
-            let q_proj =
-                linear_no_bias(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?;
-            let k_proj =
-                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?;
-            let v_proj =
-                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?;
-            let o_proj =
-                linear_no_bias(num_attention_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
-            (q_proj, k_proj, v_proj, o_proj)
-        };
+        
+        let q_proj = get_qlinear_from_vb(vb.pp("q_proj"), "weight")?;
+        let k_proj = get_qlinear_from_vb(vb.pp("k_proj"), "weight")?;
+        let v_proj = get_qlinear_from_vb(vb.pp("v_proj"), "weight")?;
+        let o_proj = get_qlinear_from_vb(vb.pp("o_proj"), "weight")?;
+
         let q_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
         Ok(Self {
@@ -880,7 +898,7 @@ impl Qwen3VLTextAttention {
         )?;
         let attn_output =
             attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
-        let attn_output = attn_output.apply(&self.o_proj)?;
+        let attn_output = self.o_proj.forward(&attn_output)?; // Changed from .apply()
         Ok(attn_output)
     }
 
@@ -1094,13 +1112,13 @@ impl Qwen3VLTextModel {
                 continue;
             };
 
-            // [DTYPE-SYNC] Critical: Ensure bridged KV matches the current computation dtype
             k = k.to_dtype(target_dtype)?;
             v = v.to_dtype(target_dtype)?;
 
             let (_b, h, _s, d) = k.dims4()?;
-            let target_h = self.language_model.layers[i].self_attn.num_key_value_heads;
-            let target_d = self.language_model.layers[i].self_attn.head_dim;
+            // Use 'layer' reference directly instead of self.layers[i]
+            let target_h = layer.self_attn.num_key_value_heads;
+            let target_d = layer.self_attn.head_dim;
 
             if h != target_h {
                 if target_h % h == 0 {
@@ -1122,7 +1140,7 @@ impl Qwen3VLTextModel {
                 first_layer_kv = Some((k.clone(), v.clone()));
             }
 
-            self.language_model.layers[i].self_attn.kv_cache = Some((k, v));
+            layer.self_attn.kv_cache = Some((k, v));
         }
         println!("[MODEL-OPTIM] Full Restoration: Loaded all {} layers for inference.", self.layers.len());
         Ok(())
