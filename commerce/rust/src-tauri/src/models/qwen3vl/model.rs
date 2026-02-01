@@ -821,7 +821,7 @@ pub struct Qwen3VLTextAttention {
 
 impl Qwen3VLTextAttention {
     pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
-        let hidden_size = config.hidden_size;
+        let _hidden_size = config.hidden_size;
         let num_attention_heads = config.num_attention_heads;
         let head_dim = config.head_dim;
         let num_key_value_heads = config.num_key_value_heads;

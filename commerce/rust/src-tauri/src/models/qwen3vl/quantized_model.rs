@@ -24,8 +24,8 @@ use crate::{
     },
 };
 
+// ... (Keep existing QLinear, RmsNorm, get_qlinear, get_rms_norm as they are correct) ...
 pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
-    // [VRAM-RESIDENT] Try loading Bit-Serial 1-bit tensors first
     let packed_name = format!("{}.weight.packed", name);
     let scales_name = format!("{}.weight.scales", name);
     let shape_name = format!("{}.weight.shape", name);
@@ -40,7 +40,6 @@ pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, re
         let scales_tensor = scales.dequantize(device)?.to_dtype(DType::F32)?;
         let shape_vec: Vec<usize> = shape_t.dequantize(device)?.to_dtype(DType::F32)?.to_vec1::<f32>()?.iter().map(|&x| x as usize).collect();
         let bias = ct.tensor(reader, &bias_name, device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
-        
         return Ok(QLinear::new(packed_tensor, scales_tensor, shape_vec, bias, device.clone()));
     }
 
@@ -79,20 +78,13 @@ impl Module for RmsNorm {
 
 #[derive(Debug, Clone)]
 pub struct QLinear { 
-    packed_weight: Tensor, 
-    scales: Tensor, 
-    original_shape: Vec<usize>,
-    bias: Option<Tensor>, 
-    device: Device,
-    dtype: DType
+    packed_weight: Tensor, scales: Tensor, original_shape: Vec<usize>, bias: Option<Tensor>, device: Device, dtype: DType
 }
-
 impl QLinear {
     pub fn new(packed_weight: Tensor, scales: Tensor, original_shape: Vec<usize>, bias: Option<Tensor>, device: Device) -> Self { 
         let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         Self { packed_weight, scales, original_shape, bias, device, dtype } 
     }
-
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
             self.packed_weight = self.packed_weight.to_device(device)?;
@@ -103,17 +95,14 @@ impl QLinear {
         }
         Ok(())
     }
-
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, s, h) = xs.dims3()?;
-        let target_device = xs.device();
-        let weight = self.dequantize_on_the_fly(target_device)?;
+        let weight = self.dequantize_on_the_fly(xs.device())?;
         let xs_flat = xs.reshape((b * s, h))?.to_dtype(weight.dtype())?;
         let mut out = xs_flat.matmul(&weight.t()?)?;
         if let Some(bias) = &self.bias { out = out.broadcast_add(bias)?; }
         Ok(out.reshape((b, s, ()))?)
     }
-
     fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
         let s = &self.original_shape;
         let total_el = s.iter().product::<usize>();
@@ -127,10 +116,7 @@ impl QLinear {
             if b_i < scales_data.len() && b_i < packed_data.len() {
                 let s_val = scales_data[b_i];
                 let b = packed_data[b_i];
-                for bit in 0..32 {
-                    let sign = if (b >> bit) & 1 != 0 { 1.0 } else { -1.0 };
-                    block_out[bit] = s_val * sign;
-                }
+                for bit in 0..32 { block_out[bit] = s_val * (if (b >> bit) & 1 != 0 { 1.0 } else { -1.0 }); }
             }
         });
         Ok(Tensor::from_vec(weights, s.as_slice(), device)?.to_dtype(self.dtype)?)
@@ -196,8 +182,15 @@ impl QuantizedQwen3VLTextDecoderLayer {
         } else { Ok(xs) }
     }
     pub fn new<R: std::io::Seek + std::io::Read>(cfg: &Qwen3VLTextConfig, ct: &gguf_file::Content, r: &mut R, b_n: &str, dev: &Device, dt: DType, l_i: usize, b_o: bool) -> Result<Self> {
-        let is_g = b_n.starts_with("blk.");
-        let (q, k, v, o, qn, kn) = if is_g { ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm") } else { ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm") };
+        // [ADAPTIVE-NAMING] Check if using GGUF style (blk.0) or Safetensors style (model.layers.0)
+        // If b_n contains "layers", use standard suffixes. If "blk", use gguf suffixes.
+        let is_g = b_n.contains("blk.");
+        let (q, k, v, o, qn, kn, g, u, d, n, in_ln) = if is_g {
+            ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm", "ffn_gate", "ffn_up", "ffn_down", "ffn_norm", "attn_norm")
+        } else {
+            ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "self_attn.q_norm", "self_attn.k_norm", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "post_attention_layernorm", "input_layernorm")
+        };
+
         let self_attn = QuantizedQwen3VLTextAttention {
             q_proj: get_qlinear(ct, r, &format!("{b_n}.{q}"), dev, dt)?, k_proj: get_qlinear(ct, r, &format!("{b_n}.{k}"), dev, dt)?,
             v_proj: get_qlinear(ct, r, &format!("{b_n}.{v}"), dev, dt)?, o_proj: get_qlinear(ct, r, &format!("{b_n}.{o}"), dev, dt)?,
@@ -206,10 +199,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
             scaling: 1f64 / f64::sqrt(cfg.head_dim as f64), kv_cache: None, layer_idx: l_i,
         };
         let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !b_o {
-            let (g, u, d, n) = if is_g { ("ffn_gate", "ffn_up", "ffn_down", "ffn_norm") } else { ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "post_attention_layernorm") };
             (Some(get_qlinear(ct, r, &format!("{b_n}.{g}"), dev, dt)?), Some(get_qlinear(ct, r, &format!("{b_n}.{u}"), dev, dt)?), Some(get_qlinear(ct, r, &format!("{b_n}.{d}"), dev, dt)?), Some(get_rms_norm(ct, r, &format!("{b_n}.{n}"), cfg.rms_norm_eps, dev, dt)?))
         } else { (None, None, None, None) };
-        let in_ln = if is_g { "attn_norm" } else { "input_layernorm" };
         let input_layernorm = get_rms_norm(ct, r, &format!("{b_n}.{in_ln}"), cfg.rms_norm_eps, dev, dt)?;
         Ok(Self { self_attn, mlp_gate, mlp_up, mlp_down, input_layernorm, post_attention_layernorm })
     }
@@ -227,24 +218,36 @@ impl QuantizedQwen3VLTextDecoderLayer {
 pub struct QuantizedQwen3VLTextModel {
     pub embed_tokens: Embedding, pub layers: Vec<QuantizedQwen3VLTextDecoderLayer>,
     pub norm: RmsNorm, pub rotary_emb: Qwen3VLTextRotaryEmbedding,
-    pub mrope_section: Vec<usize>, pub mmap: Option<Arc<Mmap>>, pub is_forced_cpu: bool,
-    pub is_baking: bool,
+    pub mrope_section: Vec<usize>, pub mmap: Option<Arc<Mmap>>, pub is_forced_cpu: bool, pub is_baking: bool,
 }
 
 impl QuantizedQwen3VLTextModel {
     pub fn new_with_mmap(config: &Qwen3VLTextConfig, ct: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, _base_name: &str, device: &Device, _device_id: usize, dtype: DType, _kv_reserve: u64, baking_only: bool) -> Result<Self> {
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
-        let (embed_tokens, actual_h) = if let Ok(tensor) = ct.tensor(&mut reader, "token_embd.weight", device) {
+        
+        // [AUTO-DETECT] Prefix
+        let prefix = if ct.tensor(&mut reader, "model.layers.0.input_layernorm.weight", device).is_ok() { "model.layers" }
+                     else if ct.tensor(&mut reader, "model.language_model.layers.0.input_layernorm.weight", device).is_ok() { "model.language_model.layers" }
+                     else { "blk" };
+        
+        let emb_name = if prefix == "blk" { "token_embd.weight" } else if prefix.contains("language_model") { "model.language_model.embed_tokens.weight" } else { "model.embed_tokens.weight" };
+        let norm_name = if prefix == "blk" { "output_norm.weight" } else if prefix.contains("language_model") { "model.language_model.norm.weight" } else { "model.norm.weight" };
+
+        let (embed_tokens, actual_h) = if let Ok(tensor) = ct.tensor(&mut reader, emb_name, device) {
              let t = tensor.dequantize(device)?.to_dtype(dtype)?; let h = t.dim(1)?; (Embedding::new(t, h), h)
-        } else if let Ok(tensor) = ct.tensor(&mut reader, "model.embed_tokens.weight", device) {
-             let t = tensor.dequantize(device)?.to_dtype(dtype)?; let h = t.dim(1)?; (Embedding::new(t, h), h)
-        } else { return Err(anyhow!("Failed to load embed_tokens")); };
+        } else { return Err(anyhow!("Failed to load embed_tokens: {}", emb_name)); };
+        
         let mut p_cfg = config.clone(); p_cfg.hidden_size = actual_h;
         let mut layers = vec![]; 
         let nl = if baking_only { 1 } else { p_cfg.num_hidden_layers };
-        for i in 0..nl { layers.push(QuantizedQwen3VLTextDecoderLayer::new(&p_cfg, ct, &mut reader, &format!("blk.{i}"), device, dtype, i, baking_only)?); }
-        let norm = get_rms_norm(ct, &mut reader, "output_norm", p_cfg.rms_norm_eps, device, dtype)?;
+        
+        for i in 0..nl { 
+            let layer_prefix = if prefix == "blk" { format!("blk.{i}") } else { format!("{prefix}.{i}") };
+            layers.push(QuantizedQwen3VLTextDecoderLayer::new(&p_cfg, ct, &mut reader, &layer_prefix, device, dtype, i, baking_only)?); 
+        }
+        
+        let norm = get_rms_norm(ct, &mut reader, norm_name, p_cfg.rms_norm_eps, device, dtype)?;
         let mut mrope = p_cfg.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         let hh = p_cfg.head_dim / 2; let ss: usize = mrope.iter().sum();
         if ss != hh && ss > 0 { let r = hh as f32 / ss as f32; mrope = mrope.iter().map(|&s| (s as f32 * r).round() as usize).collect(); }
@@ -374,108 +377,43 @@ impl QuantizedQwen3VLTextModel {
     }
 }
 
-pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> Result<HashMap<String, Tensor>> {
-    let f = std::fs::read(p)?; let st = safetensors::SafeTensors::deserialize(&f)?;
+// [HELPER] Load Vision Tensors with correct Mapping
+pub fn load_vision_tensors_to_vb(ct: &gguf_file::Content, reader: &mut std::io::Cursor<&[u8]>, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
     let mut data = HashMap::new();
-    for (name, view) in st.tensors() {
-        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") || name.ends_with(".format") || name.ends_with(".min") { continue; }
-        let is_p = name.ends_with(".packed"); let b_n = if is_p { name.strip_suffix(".packed").unwrap() } else { &name };
-        let mut clean = b_n.to_string();
-        if clean.starts_with("visual.blk.") { clean = clean.replace("visual.blk.", "visual.blocks."); }
-        if clean.starts_with("v.blk.") { clean = clean.replace("v.blk.", "visual.blocks."); }
-        if clean.starts_with("v.patch_embd") { clean = clean.replace("v.patch_embd", "visual.patch_embed.proj"); }
-        clean = clean.replace("model.language_model.layers.", "layers.").replace("model.language_model.", "").replace("model.layers.", "layers.").replace("model.visual.", "visual.").replace("model.", "").replace("language_model.", "");
-        if bo {
-            let is_l0 = clean.starts_with("layers.0.") || clean.starts_with("blk.0.") || clean.starts_with("visual.blocks.0.");
-            let is_global = !clean.contains(".layers.") && !clean.contains(".blocks.") && !clean.contains(".blk.");
-            if !is_l0 && !is_global { continue; }
+    for (name, view) in ct.tensors() {
+        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") { continue; }
+        
+        // Map keys: mm.0 -> visual.merger.linear_fc1, visual.blk.0 -> visual.blocks.0, etc.
+        // Or if the model expects "blocks.0" from its local root:
+        // We will construct a flat map like "blocks.0.attn.qkv.weight"
+        // and wrap it in a VB.
+        
+        let mut clean = name.to_string();
+        if clean.starts_with("mm.") {
+            let rest = &clean[3..]; 
+            if rest.starts_with("0") { clean = "merger.linear_fc1".to_string() + &rest[1..]; } 
+            else if rest.starts_with("2") { clean = "merger.linear_fc2".to_string() + &rest[1..]; }
+        } else if clean.starts_with("visual.blk.") {
+            clean = clean.replace("visual.blk.", "blocks."); 
+        } else if clean.starts_with("visual.") {
+            clean = clean[7..].to_string(); // remove visual.
+        } else if clean.starts_with("v.") {
+            clean = clean[2..].to_string();
         }
-        let mut t_n = clean.clone();
-        if b_n.starts_with("mm.") {
-            let rest = &b_n[3..]; if rest.starts_with("0") { t_n = "visual.merger.linear_fc1".to_string(); } else if rest.starts_with("2") { t_n = "visual.merger.linear_fc2".to_string(); }
-        } else if clean.starts_with("visual.") || b_n.starts_with("v.") || b_n.contains(".visual.") {
-            let rest = if b_n.starts_with("v.") { &b_n[2..] } else if clean.starts_with("visual.") { &clean[7..] } else { &clean };
-            if rest.starts_with("blk.") || rest.starts_with("blocks.") {
-                let rs = if rest.starts_with("blk.") { &rest[4..] } else { &rest[7..] };
-                let ps: Vec<&str> = rs.splitn(2, '.').collect();
-                if ps.len() >= 2 {
-                    let m = match ps[1] { 
-                        s if s.starts_with("ln1") || s.starts_with("norm1") => "norm1", 
-                        s if s.starts_with("ln2") || s.starts_with("norm2") => "norm2", 
-                        s if s.starts_with("attn_qkv") || s.starts_with("attn.qkv") || s.starts_with("attn_qkvisual") => "attn.qkv", 
-                        s if s.starts_with("attn_out") || s.starts_with("attn.proj") => "attn.proj", 
-                        s if s.starts_with("ffn_up") || s.starts_with("mlp.linear_fc1") => "mlp.linear_fc1", 
-                        s if s.starts_with("ffn_down") || s.starts_with("mlp.linear_fc2") => "mlp.linear_fc2", 
-                        _ => ps[1] 
-                    };
-                    t_n = format!("visual.blocks.{}.{}", ps[0], m);
-                }
-            } else if rest.starts_with("patch_embd") || rest.starts_with("patch_embed") { t_n = "visual.patch_embed.proj".to_string(); }
-            else if rest.starts_with("position_embd") || rest.starts_with("pos_embed") { t_n = "visual.pos_embed".to_string(); }
-            else if rest.starts_with("post_ln") || rest.starts_with("merger.norm") { t_n = "visual.merger.norm".to_string(); }
-            else { t_n = format!("visual.{}", rest); }
-        } else if clean.starts_with("layers.") || b_n.starts_with("blk.") || clean.starts_with("blk.") {
-            let rest = if clean.starts_with("layers.") { &clean[7..] } else if clean.starts_with("blk.") { &clean[4..] } else { &b_n[4..] };
-            let ps: Vec<&str> = rest.splitn(2, '.').collect();
-            if ps.len() >= 2 {
-                let m = match ps[1] { 
-                    "attn_q_norm.weight" => "self_attn.q_norm.weight", 
-                    "attn_k_norm.weight" => "self_attn.k_norm.weight", 
-                    s if s.starts_with("attn_q") => "self_attn.q_proj", 
-                    s if s.starts_with("attn_k") => "self_attn.k_proj", 
-                    s if s.starts_with("attn_v") => "self_attn.v_proj", 
-                    s if s.starts_with("attn_output") => "self_attn.o_proj", 
-                    s if s.starts_with("attn_norm") => "input_layernorm", 
-                    s if s.starts_with("ffn_norm") => "post_attention_layernorm", 
-                    s if s.starts_with("ffn_gate") => "mlp.gate_proj", 
-                    s if s.starts_with("ffn_up") => "mlp.up_proj", 
-                    s if s.starts_with("ffn_down") => "mlp.down_proj", 
-                    _ => ps[1] 
-                };
-                t_n = format!("language_model.layers.{}.{}", ps[0], m);
-            }
-        } else if clean == "embed_tokens.weight" || clean == "token_embd.weight" { t_n = "language_model.embed_tokens.weight".to_string(); }
-        else if clean == "norm.weight" || clean == "output_norm.weight" { t_n = "language_model.norm.weight".to_string(); }
-        else if clean == "lm_head.weight" || clean == "output.weight" { t_n = "lm_head.weight".to_string(); }
-        let ft = if is_p {
-            let packed_raw = view.data().to_vec();
-            let packed_u32: Vec<u32> = packed_raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            let packed_tensor = Tensor::from_vec(packed_u32, (packed_raw.len() / 4,), d)?;
-            let scales_view = st.tensor(&format!("{b_n}.scales")).or_else(|_| st.tensor(&format!("{b_n}.scale"))).ok();
-            let (scales, shape_tensor) = if let Some(sv) = scales_view {
-                let s_raw = sv.data();
-                let s_f32: Vec<f32> = match sv.dtype() {
-                    safetensors::Dtype::F16 => s_raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
-                    safetensors::Dtype::F32 => s_raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-                    _ => vec![1.0; s_raw.len() / 4],
-                };
-                let s_t = Tensor::from_vec(s_f32, (s_raw.len() / match sv.dtype() { safetensors::Dtype::F16 => 2, _ => 4 },), d)?;
-                let sh_t = if let Ok(sh_v) = st.tensor(&format!("{b_n}.shape")) {
-                    let sh_raw = sh_v.data();
-                    let sh_u32: Vec<u32> = sh_raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                    Tensor::from_vec(sh_u32, (sh_raw.len() / 4,), d)?
-                } else { Tensor::new(&[1u32], d)? };
-                (s_t, sh_t)
-            } else { (Tensor::new(&[1.0f32], d)?, Tensor::new(&[1u32], d)?) };
-            data.insert(format!("model.{}.scales", t_n), scales);
-            data.insert(format!("model.{}.shape", t_n), shape_tensor);
-            packed_tensor
-        } else {
-            let r = view.data(); match view.dtype() {
-                safetensors::Dtype::F32 => Tensor::from_vec(r.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<f32>>(), view.shape(), &Device::Cpu)?,
-                safetensors::Dtype::F16 | safetensors::Dtype::BF16 => Tensor::from_vec(r.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect::<Vec<half::f16>>(), view.shape(), &Device::Cpu)?,
-                safetensors::Dtype::U8 => Tensor::from_vec(r.to_vec(), view.shape(), &Device::Cpu)?,
-                safetensors::Dtype::I32 => Tensor::from_vec(r.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64).collect::<Vec<i64>>(), view.shape(), &Device::Cpu)?,
-                _ => return Err(anyhow!("Unsupported dtype: {:?} for {}", view.dtype(), name)),
-            }.to_device(d)?.to_dtype(dt)?.contiguous()?
-        };
-        data.insert(if t_n.starts_with("lm_head") { t_n } else { format!("model.{}", t_n) }, ft);
+        
+        // Handle submodule mappings
+        if clean.contains("attn_qkvisual") { clean = clean.replace("attn_qkvisual", "attn.qkv"); }
+        if clean.contains("attn_out") { clean = clean.replace("attn_out", "attn.proj"); }
+        if clean.contains("ffn_up") { clean = clean.replace("ffn_up", "mlp.linear_fc1"); }
+        if clean.contains("ffn_down") { clean = clean.replace("ffn_down", "mlp.linear_fc2"); }
+        if clean.contains("post_ln") { clean = clean.replace("post_ln", "merger.norm"); }
+        if clean.contains("patch_embd") { clean = clean.replace("patch_embd", "patch_embed.proj"); }
+        if clean.contains("position_embd") { clean = clean.replace("position_embd", "pos_embed"); }
+        
+        let t = view.dequantize(device)?.to_dtype(dtype)?;
+        data.insert(clean, t);
     }
-    Ok(data)
-}
-
-pub fn from_true_iq0_safetensors(p: &Path, d: &Device, dt: DType) -> Result<VarBuilder<'static>> {
-    let data = load_tensors_from_true_iq0(p, d, dt, false)?; Ok(VarBuilder::from_tensors(data, dt, d))
+    Ok(VarBuilder::from_tensors(data, dtype, device))
 }
 
 #[derive(Clone)]
@@ -490,13 +428,26 @@ pub struct QuantizedQwen3VLModel {
 }
 
 impl QuantizedQwen3VLModel {
-    pub fn new_with_mmap(cfg: &Qwen3VLConfig, ctm: &gguf_file::Content, mm: Option<Arc<Mmap>>, _ctv: &gguf_file::Content, _vmm: Option<Arc<Mmap>>, td: &Device, tdi: usize, vd: &Device, _vi: usize, dt: DType, kvr: u64, bo: bool, force_text_only: bool) -> Result<Self> {
+    pub fn new_with_mmap(cfg: &Qwen3VLConfig, ctm: &gguf_file::Content, mm: Option<Arc<Mmap>>, _ctv: &gguf_file::Content, vmm: Option<Arc<Mmap>>, td: &Device, tdi: usize, vd: &Device, _vi: usize, dt: DType, kvr: u64, bo: bool, force_text_only: bool) -> Result<Self> {
         let visual = if !force_text_only && cfg.vision_config.is_some() {
-            Some(Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), VarBuilder::from_tensors(HashMap::new(), dt, vd))?)
+            let v_map = vmm.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+            let mut v_reader = std::io::Cursor::new(v_map);
+            let vb_v = if !v_map.is_empty() {
+                // If we have a separate vision file (mmproj), load from it
+                load_vision_tensors_to_vb(_ctv, &mut v_reader, vd, dt)?
+            } else {
+                // Otherwise load from main model file
+                let m_map = mm.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+                let mut m_reader = std::io::Cursor::new(m_map);
+                load_vision_tensors_to_vb(ctm, &mut m_reader, vd, dt)?
+            };
+            Some(Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), vb_v)?)
         } else { None };
+
         let lm = QuantizedQwen3VLTextModel::new_with_mmap(cfg.text_config.as_ref().unwrap(), ctm, mm.clone(), "model", td, tdi, dt, kvr, bo)?;
         let mut r = std::io::Cursor::new(mm.as_ref().map(|m| &m[..]).unwrap_or(&[]));
-        let lh = get_qlinear(ctm, &mut r, "lm_head", td, dt)?;
+        let base_head = if lm.embed_tokens.embeddings().dim(1)? == 1024 { "output" } else { "lm_head" };
+        let lh = get_qlinear(ctm, &mut r, base_head, td, dt)?;
         Ok(Self { config: cfg.clone(), visual, language_model: lm, lm_head: lh, text_device: td.clone(), vision_device: vd.clone(), is_baking: bo })
     }
     pub fn forward(&mut self, input_ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, _vthw: Option<&Tensor>, cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {

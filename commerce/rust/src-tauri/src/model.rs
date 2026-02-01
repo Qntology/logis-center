@@ -445,7 +445,7 @@ impl LogisModel {
         self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, true).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, baking_only: bool, high_fidelity: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, baking_only: bool, high_fidelity: bool, device_override: Option<Device>) -> anyhow::Result<Qwen3VLGenerateModel> {
         let suffix = if baking_only {
             "model-BITSERIAL_LAYER0.safetensors"
         } else {
@@ -457,7 +457,7 @@ impl LogisModel {
         let model_file_str = model_file_path.to_string_lossy().to_string();
 
         println!("[MODEL] Loading Generator from {} (Text-Only: {}, Baking: {})...", model_file_str, force_text_only, baking_only);
-        let dev = self.device_config.device.clone();
+        let dev = device_override.unwrap_or_else(|| self.device_config.device.clone());
         let dev_id = self.device_config.gpu_id;
 
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
@@ -552,7 +552,7 @@ impl LogisModel {
         }
 
         // Use the helper method with updated signature
-        let gen = self.load_generator_internal(path, shared_path, force_text_only, baking_only, high_fidelity).await?;
+        let gen = self.load_generator_internal(path, shared_path, force_text_only, baking_only, high_fidelity, Some(target_device)).await?;
 
         // Move current main to slot
         if let Some(old_m) = gen_guard.take() {
