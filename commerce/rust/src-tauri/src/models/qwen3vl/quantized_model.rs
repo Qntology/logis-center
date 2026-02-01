@@ -236,11 +236,10 @@ impl QuantizedQwen3VLTextModel {
         }
         let norm = get_rms_norm(ct, &mut reader, "output_norm", config.rms_norm_eps, device, dtype)?;
         
-        // [FIX] Force 2B-standard M-RoPE sections
-        let mut mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
-        if mrope_section.is_empty() || mrope_section.iter().sum::<usize>() != 64 {
-            mrope_section = vec![16, 16, 32];
-        }
+        // [FIX] Force 2B-standard M-RoPE sections for 0.6B-to-2B bridging
+        // Regardless of config, we MUST use [16, 16, 32] to match the 2B shell.
+        println!("[MODEL-FIX] Forcing 2B RoPE Sections: [16, 16, 32]");
+        let mrope_section = vec![16, 16, 32];
 
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(config.head_dim, config.rope_theta), mrope_section, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
     }
@@ -383,6 +382,13 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             else if rest.starts_with("2") { target_name = "visual.merger.linear_fc2".to_string(); }
         } else if base_name.starts_with("blk.") {
             let parts: Vec<&str> = base_name[4..].splitn(2, '.').collect();
+            let layer_idx: usize = parts[0].parse().unwrap_or(0);
+            
+            // [9d1369 Parity] If we are in anchor-only mode (implicit for baking), skip layers > 0
+            // Note: Since this is a general Unpacker, we check if we should skip high layers.
+            // For now, we will mark them for exclusion if we are in a truly small mode.
+            if layer_idx > 0 { continue; }
+
             let mapped = match parts[1] {
                 "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),
                 "attn_k_norm.weight" => "self_attn.k_norm.weight".to_string(),
@@ -408,21 +414,44 @@ pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> 
             let shape: Vec<usize> = shape_tensor.data().chunks_exact(4)
                 .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
 
-            if base_name.contains("token_embd") {
+            if base_name.contains("token_embd") || base_name.contains("embed_tokens") {
+                // [V2] 2-bit Unpack (4 weights per byte)
                 let scale = f32::from_le_bytes(st.tensor(&format!("{base_name}.scale"))?.data()[0..4].try_into().unwrap());
-                let unpacked: Vec<f32> = view.data().iter().map(|&p| (p as f32 - 1.5) * scale).collect();
+                let min_val = f32::from_le_bytes(st.tensor(&format!("{base_name}.min"))?.data()[0..4].try_into().unwrap());
+                let mut unpacked = vec![0.0f32; shape.iter().product()];
+                let packed_vec = view.data();
+                
+                for (byte_idx, &byte) in packed_vec.iter().enumerate() {
+                    for i in 0..4 {
+                        let idx = byte_idx * 4 + i;
+                        if idx < unpacked.len() {
+                            let q_val = (byte >> (i * 2)) & 0x03;
+                            unpacked[idx] = (q_val as f32 * scale) + min_val;
+                        }
+                    }
+                }
                 Tensor::from_vec(unpacked, shape.as_slice(), &Device::Cpu)?.to_device(device)?.to_dtype(dtype)?
             } else {
+                // [V2] 1-bit Unpack with 512-bit Block Alignment
                 let scales_vec: Vec<f32> = st.tensor(&format!("{base_name}.scales"))?.data().chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect();
-                let mut decoded = vec![0.0f32; shape.iter().product()]; let packed_vec = view.data();
-                decoded.par_chunks_mut(256).enumerate().for_each(|(b_idx, b_out)| {
+                let mut decoded = vec![0.0f32; shape.iter().product()];
+                let packed_vec = view.data();
+                
+                // Parallel Decode: Each 64-byte block (512 bits) processed independently
+                decoded.par_chunks_mut(512).enumerate().for_each(|(b_idx, b_out)| {
                     if b_idx < scales_vec.len() {
-                        let s = scales_vec[b_idx]; let p_start = b_idx * 32;
-                        for i in 0..32 {
-                            let gp = p_start + i; if gp >= packed_vec.len() { break; }
-                            let byte = packed_vec[gp];
-                            for bit in 0..8 {
-                                let idx = i * 8 + bit; if idx < b_out.len() { b_out[idx] = if (byte & (1 << bit)) != 0 { s } else { -s }; }
+                        let s = scales_vec[b_idx]; 
+                        let p_start = b_idx * 64; // 512 / 8 = 64 bytes
+                        for i in 0..64 {
+                            let gp = p_start + i; 
+                            if gp < packed_vec.len() {
+                                let byte = packed_vec[gp];
+                                for bit in 0..8 {
+                                    let idx = i * 8 + bit;
+                                    if idx < b_out.len() {
+                                        b_out[idx] = if (byte & (1 << bit)) != 0 { s } else { -s };
+                                    }
+                                }
                             }
                         }
                     }

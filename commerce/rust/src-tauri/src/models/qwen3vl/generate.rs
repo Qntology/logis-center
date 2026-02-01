@@ -192,9 +192,23 @@ impl Qwen3VLGenerateModel {
         
         if let Some(st_path) = custom_st {
             println!("[MODEL] Found Custom Truly Small Model: {:?}", st_path);
+            
+            // [9d1369 Parity] Force 1 layer for custom tiny models
+            if let Some(ref mut tc) = cfg.text_config {
+                println!("[MODEL-OPTIM] Forcing Text Single-Layer mode.");
+                tc.num_hidden_layers = 1;
+            }
+            
+            // [NEW] Force 1 layer for Vision blocks as well
+            if let Some(ref mut vc) = cfg.vision_config {
+                println!("[MODEL-OPTIM] Forcing Vision Single-Layer mode (Depth=1).");
+                vc.depth = 1;
+            }
+
             let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
             
-            let model = Qwen3VLModel::new(cfg.clone(), vb)?;
+            let mut model = Qwen3VLModel::new(cfg.clone(), vb)?;
+            model.set_baking(baking_only); // Propagate baking flag correctly
             let qwen3_vl = ModelVariant::Standard(model);
             
             let generation_config_path = std::path::Path::new(cfg_path).join("generation_config.json");

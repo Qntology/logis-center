@@ -1,75 +1,91 @@
-import sys
+import torch
 import numpy as np
-from gguf import GGUFReader
-from safetensors.numpy import save_file
+from safetensors.torch import save_file, load_file
 import os
+import gguf
+import re
 
-def pack_weights_optimized(weight):
-    flat_w = weight.flatten().astype(np.float32)
-    scale_block = 256
-    pad_size = (scale_block - (len(flat_w) % scale_block)) % scale_block
-    if pad_size > 0:
-        flat_w = np.append(flat_w, np.zeros(pad_size))
+def quantize_to_anchor_iq0(input_path, output_path, is_gguf=False):
+    mode_str = "GGUF-ANCHOR" if is_gguf else "SAFE-ANCHOR"
+    print(f"[{mode_str}] Processing {input_path}...")
     
-    signs = (np.sign(flat_w) >= 0).astype(np.uint8)
-    bits = signs.reshape(-1, 8)
-    packed_weights = np.zeros(bits.shape[0], dtype=np.uint8)
-    for i in range(8):
-        packed_weights |= (bits[:, i] << i)
-        
-    w_blocks = flat_w.reshape(-1, scale_block)
-    scales = np.mean(np.abs(w_blocks), axis=1).astype(np.float16)
-    return packed_weights, scales
+    quantized_dict = {}
+    BLOCK_SIZE = 512 
 
-def convert_to_ultra_low_bit(input_path, output_path):
-    if not os.path.exists(input_path): 
-        print(f"File not found: {input_path}")
-        return
-    
-    reader = GGUFReader(input_path)
-    tensors_to_save = {}
+    # 1. Load Tensors
+    if is_gguf:
+        reader = gguf.GGUFReader(input_path)
+        tensors_to_process = {t.name: torch.from_numpy(t.data.copy()) for t in reader.tensors}
+    else:
+        tensors_to_process = load_file(input_path)
 
-    print(f"--- [0.6B ONLY] Packing: {os.path.basename(input_path)} ---")
-    
-    for tensor in reader.tensors:
-        name = tensor.name
-        data = tensor.data
-        # GGUF shapes are reversed compared to numpy
-        logical_shape = tuple(reversed(tensor.shape.tolist()))
-        
-        if "weight" in name and np.prod(logical_shape) > 2048:
-            total_elements = np.prod(logical_shape)
-            flat_data = data.flatten().astype(np.float32)
+    for name, param in tensors_to_process.items():
+        # [STRICT ANCHOR POLICY] 
+        # Identify layer indices in names like 'model.layers.1.xxx', 'blk.1.xxx', 'v.blk.1.xxx'
+        match = re.search(r'(layers|blk|deepstack)\.(\d+)\.', name)
+        if match:
+            layer_idx = int(match.group(2))
+            if layer_idx > 0:
+                continue # Skip all layers except the first one (0)
+
+        # Quantization Logic
+        if "weight" in name and len(param.shape) >= 2:
+            # Embedding Special Case: 2-bit
+            if "embed_tokens" in name or "token_embd" in name:
+                min_val, max_val = param.min(), param.max()
+                scale = (max_val - min_val) / 3.0
+                q_param = torch.clamp(torch.round((param - min_val) / scale), 0, 3).to(torch.uint8)
+                packed_shape = (q_param.shape[0], q_param.shape[1] // 4)
+                packed = torch.zeros(packed_shape, dtype=torch.uint8)
+                for i in range(4):
+                    packed |= (q_param[:, i::4] << (i * 2))
+                
+                quantized_dict[f"{name}.packed"] = packed
+                quantized_dict[f"{name}.scale"] = torch.tensor([scale.item()], dtype=torch.float32)
+                quantized_dict[f"{name}.min"] = torch.tensor([min_val.item()], dtype=torch.float32)
+                quantized_dict[f"{name}.shape"] = torch.tensor(list(param.shape), dtype=torch.int32)
+                continue
+
+            # Standard Weight: 1-bit with 512-block scaling
+            original_shape = list(param.shape)
+            flat_w = param.view(-1).to(torch.float32)
+            pad_len = (BLOCK_SIZE - (flat_w.numel() % BLOCK_SIZE)) % BLOCK_SIZE
+            if pad_len > 0: flat_w = torch.cat([flat_w, torch.zeros(pad_len)])
             
-            # Critical fix: Align raw data buffer with logical shape
-            if flat_data.size != total_elements:
-                if flat_data.size < total_elements:
-                    flat_data = np.append(flat_data, np.zeros(total_elements - flat_data.size))
-                else:
-                    flat_data = flat_data[:total_elements]
-
-            if "token_embd" in name:
-                print(f"  [EMBD] {name:30} | 2-bit | Shape: {logical_shape}")
-                max_val = np.max(np.abs(flat_data))
-                scale = max_val / 1.5
-                q = np.clip(np.round(flat_data / (scale + 1e-9) + 1.5), 0, 3).astype(np.uint8)
-                tensors_to_save[f"{name}.packed"] = q
-                tensors_to_save[f"{name}.scale"] = np.array([scale], dtype=np.float32)
-                tensors_to_save[f"{name}.shape"] = np.array(logical_shape, dtype=np.int32)
-            else:
-                print(f"  [PACK] {name:30} | 1.06 bpw | Shape: {logical_shape}")
-                packed, scales = pack_weights_optimized(flat_data)
-                tensors_to_save[f"{name}.packed"] = packed
-                tensors_to_save[f"{name}.scales"] = scales
-                tensors_to_save[f"{name}.shape"] = np.array(logical_shape, dtype=np.int32)
+            num_blocks = flat_w.numel() // BLOCK_SIZE
+            blocks = flat_w.view(num_blocks, BLOCK_SIZE)
+            scales = torch.max(torch.abs(blocks), dim=1)[0].to(torch.float16)
+            binary = (blocks >= 0)
+            
+            packed = torch.zeros((num_blocks, BLOCK_SIZE // 8), dtype=torch.uint8)
+            for i in range(8):
+                packed |= (binary[:, i::8].to(torch.uint8) << i)
+            
+            quantized_dict[f"{name}.packed"] = packed.view(-1)
+            quantized_dict[f"{name}.scales"] = scales
+            quantized_dict[f"{name}.shape"] = torch.tensor(original_shape, dtype=torch.int32)
         else:
-            tensors_to_save[name] = data
+            quantized_dict[name] = param
 
-    print(f"Saving to: {output_path}")
-    save_file(tensors_to_save, output_path)
-    print(f"--- SUCCESS ---")
+    save_file(quantized_dict, output_path)
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f" -> DONE. {output_path} size: {size_mb:.2f} MB")
 
 if __name__ == "__main__":
-    # ONLY process 0.6B model with native 1024 dimensions.
-    convert_to_ultra_low_bit("src-tauri/models/Qwen3-0.6B-Instruct-gguf/Qwen3-0.6B-UD-IQ1_S.gguf", 
-                             "src-tauri/models/Qwen3-0.6B-Instruct-gguf/Qwen3-0.6B-UD-TRUE_IQ0.safetensors")
+    # 1. 0.6B Language Model
+    src_06b = "src-tauri/models/Qwen3-0.6B-Instruct-gguf/model.safetensors"
+    tgt_06b = "src-tauri/models/Qwen3-0.6B-Instruct-gguf/Qwen3-0.6B-UD-ANCHOR_IQ0.safetensors"
+    if os.path.exists(src_06b):
+        quantize_to_anchor_iq0(src_06b, tgt_06b, is_gguf=False)
+
+    # 2. 2B Language Model (Main)
+    src_2b = "src-tauri/models/Qwen3-VL-2B-Instruct-gguf/model.safetensors"
+    tgt_2b = "src-tauri/models/Qwen3-VL-2B-Instruct-gguf/Qwen3VL-2B-Instruct-ANCHOR_IQ0.safetensors"
+    if os.path.exists(src_2b):
+        quantize_to_anchor_iq0(src_2b, tgt_2b, is_gguf=False)
+
+    # 3. Vision mmproj
+    src_mm = "src-tauri/models/Qwen3-VL-2B-Instruct-gguf/mmproj-Qwen3VL-2B-Instruct-F16.gguf"
+    tgt_mm = "src-tauri/models/Qwen3-VL-2B-Instruct-gguf/mmproj-Qwen3VL-2B-Instruct-ANCHOR_IQ0.safetensors"
+    if os.path.exists(src_mm):
+        quantize_to_anchor_iq0(src_mm, tgt_mm, is_gguf=True)

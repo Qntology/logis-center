@@ -749,19 +749,19 @@ async fn process_task(
     // [PARITY] Store 'Page' Entity
     {
         // Acquire Store lock briefly
-        let store = {
+        let _store = {
             let store_guard = store_mutex.lock().await;
             store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
         };
         
-        let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
+        let _team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
         let origin_str = task_data.get("origin").and_then(|s| s.as_str()).unwrap_or("http://localhost");
         let base_url = url::Url::parse(origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
         let url_obj = base_url.join(&url).unwrap_or(base_url);
         let raw_path = url_obj.path();
-        let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+        let _page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
         let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-        let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+        let _bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
 
         let mut page_data: serde_json::Value = selector_info.clone();
         if let Some(obj) = page_data.as_object_mut() {
@@ -770,7 +770,10 @@ async fn process_task(
             obj.insert("type".to_string(), json!(page_type));
         }
 
-        let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
+        // [STRICT ISOLATION] Skip intermediate upsert to prevent early Embedding load.
+        // Let the Handover phase handle all DB writes that require vectors.
+        println!("[Scheduler] Skipping intermediate Page upsert to isolate VRAM.");
+        // let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
     }
 
     let item_selector = final_page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
@@ -896,14 +899,15 @@ async fn process_task(
 
     // --- PHASE 3: HANDOVER (Unload 2B -> Load Embedding) ---
     {
-        println!("[Scheduler] PHASE 3: Handover - Unloading 2B, Preparing for Embedding...");
+        println!("[Scheduler] PHASE 3: Handover - Unloading LLM, Preparing for Embedding...");
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
-        // 1. Explicitly Unload 2B to free VRAM for Embedding Model
+        // 1. Explicitly Unload LLM to free VRAM for Embedding Model
         model.unload_generator().await;
         
         // 2. Wait for VRAM to settle (Driver latency)
-        wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+        wait_for_resources_settled(1500, 1000, Some(cancellation_token)).await?;
+        println!("[Scheduler] LLM Unloaded. Safe to proceed with Embedding.");
     }
 
     // --- DB OPS & SIDE EFFECTS ---

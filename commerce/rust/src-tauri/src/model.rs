@@ -567,32 +567,25 @@ impl LogisModel {
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         let current_size = { *self.current_size.lock().await };
         
-        // [STRATEGY] High-priority exclusion logic
-        match current_size {
-            Some(ModelSize::Large) => {
-                // If Large is active, Embedding must stay on CPU to avoid OOM
-                println!("[MODEL] Large model active. Forcing Embedding to CPU to prevent swapping.");
-            },
-            Some(ModelSize::Small) => {
-                // Small and Embedding can coexist. 
-                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
-            },
-            None => {
-                // No generator active, safe to clean up any leftovers
-                self.unload_generator().await;
+        // [STRICT ISOLATION] Never load Embedding on GPU if an LLM is active
+        if current_size.is_some() {
+            println!("[MODEL] LLM is active ({:?}). Embedding load deferred or forced to CPU.", current_size);
+            // If we MUST load, force to CPU
+            let mut emb_guard = self.embedding_model.lock().await;
+            if emb_guard.is_none() {
+                let self_clone = self.embedding_path.clone();
+                let emb = tokio::task::spawn_blocking(move || {
+                    EmbeddingModel::new_with_device(&self_clone, &candle_core::Device::Cpu)
+                }).await??;
+                *emb_guard = Some(emb);
             }
+            return Ok(());
         }
 
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
-            
-            // Determine target device: CPU if Large is active, else use default GPU
-            let target_device = if current_size == Some(ModelSize::Large) { 
-                candle_core::Device::Cpu 
-            } else { 
-                self.device_config.device.clone() 
-            };
+            let target_device = self.device_config.device.clone();
             
             println!("[MODEL] Loading Embedding Model on {:?}...", if target_device.is_cpu() { "CPU" } else { "GPU" });
             
