@@ -32,11 +32,19 @@ impl Qwen3VLVisionPatchEmbed {
         let patch_size = cfg.patch_size;
         let temporal_patch_size = cfg.temporal_patch_size;
         let in_channels = cfg.in_channels;
-        // Use embed_dim if present, otherwise fallback to hidden_size
         let embed_dim = cfg.embed_dim.unwrap_or(cfg.hidden_size);
         
-        // conv3d weight key: visual.patch_embed.proj.weight, value: Tensor[dims 1024, 3, 2, 16, 16; bf16, cuda:0]
-        // (1024, 3, 2, 16, 16) -> (1024, 1536) -> (1536, 1024)
+        // [SMART-PROBE] Match mmproj naming variations
+        let (weight_name, bias_name) = if vb.get_with_hints((1,), "proj.weight", Init::Const(0.)).is_ok() {
+            ("proj.weight", "proj.bias")
+        } else if vb.get_with_hints((1,), "weight", Init::Const(0.)).is_ok() {
+            ("weight", "bias")
+        } else if vb.get_with_hints((1,), "weight.packed", Init::Const(0.)).is_ok() {
+            ("weight.packed", "bias")
+        } else {
+            ("proj.weight", "proj.bias")
+        };
+
         let conv3d_weight = vb
             .get_with_hints(
                 (
@@ -46,14 +54,14 @@ impl Qwen3VLVisionPatchEmbed {
                     patch_size,
                     patch_size,
                 ),
-                "proj.weight",
+                weight_name,
                 Init::Const(1.),
             )?
             .flatten(1, 4)?
             .t()?;
-        // (1024) -> (1, 1024)
+
         let conv3d_bias = vb
-            .get_with_hints((embed_dim,), "proj.bias", Init::Const(0.))?
+            .get_with_hints((embed_dim,), bias_name, Init::Const(0.))?
             .unsqueeze(0)?;
         Ok(Self {
             conv3d_weight,
@@ -87,58 +95,161 @@ pub struct Qwen3VLVisionPatchMerger {
 }
 
 impl Qwen3VLVisionPatchMerger {
+
     pub fn new(
+
         config: &Qwen3VLVisionConfig,
+
         vb: VarBuilder,
+
         use_postshuffle_norm: bool,
+
     ) -> Result<Self> {
+
         let hidden_size = config.hidden_size * config.spatial_merge_size.pow(2);
+
         let norm_size = if use_postshuffle_norm {
+
             hidden_size
+
         } else {
+
             config.hidden_size
+
         };
-        let norm = get_layer_norm(vb.pp("norm"), 1e-6, norm_size)?;
-        let linear_fc1 = linear(hidden_size, hidden_size, vb.pp("linear_fc1"))?;
-        let act_fn = Activation::Gelu;
-        let linear_fc2 = linear(hidden_size, config.out_hidden_size, vb.pp("linear_fc2"))?;
+
+
+
+        // [SMART-PROBE] Merger variation (merger.linear_fc1 vs mm.0)
+
+        let (fc1_name, fc2_name, norm_name) = if vb.pp("linear_fc1").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() {
+
+            ("linear_fc1", "linear_fc2", "norm")
+
+        } else if vb.get_with_hints((1,), "0.weight", Init::Const(0.)).is_ok() || vb.get_with_hints((1,), "0.weight.packed", Init::Const(0.)).is_ok() {
+
+            ("0", "2", "norm") // Short form like mm.0, mm.2
+
+        } else {
+
+            ("linear_fc1", "linear_fc2", "norm")
+
+        };
+
+
+
+        let norm = get_layer_norm(vb.pp(norm_name), 1e-6, norm_size)?;
+
+        
+
+        let find_v_weight = |v: &VarBuilder, out_d: usize, in_d: usize| -> Result<Tensor> {
+
+            for suffix in &["", ".packed", ".min"] {
+
+                let full_n = format!("weight{}", suffix);
+
+                if let Ok(t) = v.get_with_hints((1,), &full_n, Init::Const(0.)) {
+
+                    return Ok(v.get(t.shape(), &full_n)?);
+
+                }
+
+            }
+
+            Ok(v.get((out_d, in_d), "weight")?)
+
+        };
+
+
+
+        let fc1_w = find_v_weight(&vb.pp(fc1_name), hidden_size, hidden_size)?;
+
+        let fc1_b = vb.pp(fc1_name).get(hidden_size, "bias").ok();
+
+        
+
+        let fc2_w = find_v_weight(&vb.pp(fc2_name), config.out_hidden_size, hidden_size)?;
+
+        let fc2_b = vb.pp(fc2_name).get(config.out_hidden_size, "bias").ok();
+
+
+
         Ok(Self {
+
             hidden_size,
+
             use_postshuffle_norm,
+
             norm,
-            linear_fc1,
-            act_fn,
-            linear_fc2,
+
+            linear_fc1: Linear::new(fc1_w, fc1_b),
+
+            act_fn: Activation::Gelu,
+
+            linear_fc2: Linear::new(fc2_w, fc2_b),
+
         })
+
     }
 
+
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
+
         // [MEMORY-FIX] LayerNorm/Linear don't have to_device, so we recreate with moved tensors
+
         let n_w = self.norm.weight().to_device(device)?;
+
         let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+
         self.norm = LayerNorm::new(n_w, n_b, 1e-6);
+
     
+
         let l1_w = self.linear_fc1.weight().to_device(device)?;
+
         let l1_b = self.linear_fc1.bias().map(|b| b.to_device(device)).transpose()?;
+
         self.linear_fc1 = Linear::new(l1_w, l1_b);
+
     
+
         let l2_w = self.linear_fc2.weight().to_device(device)?;
+
         let l2_b = self.linear_fc2.bias().map(|b| b.to_device(device)).transpose()?;
+
         self.linear_fc2 = Linear::new(l2_w, l2_b);
+
         Ok(())
+
     }
-        pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+
+
+
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+
         let xs = if self.use_postshuffle_norm {
+
             xs.reshape(((), self.hidden_size))?
+
         } else {
+
             xs.clone()
+
         };
+
         let xs = self.norm.forward(&xs)?.reshape(((), self.hidden_size))?;
+
         let xs = self
+
             .linear_fc2
+
             .forward(&self.act_fn.forward(&self.linear_fc1.forward(&xs)?)?)?;
+
         Ok(xs)
+
     }
+
 }
 
 #[derive(Debug, Clone)]
@@ -154,75 +265,33 @@ impl Qwen3VLVisionAttention {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_heads;
         let head_dim = hidden_size / num_heads;
-        let qkv = linear(hidden_size, hidden_size * 3, vb.pp("qkv"))?;
-        let proj = linear(hidden_size, hidden_size, vb.pp("proj"))?;
         let scaling = 1.0 / (head_dim as f64).sqrt();
+
+        // [SMART-PROBE] Attn variations (qkv vs attn_qkv)
+        let find_attn_weight = |v: &VarBuilder, name: &str, out_d: usize, in_d: usize| -> Result<Tensor> {
+            for n in &[name, &format!("attn_{}", name)] {
+                for suffix in &["", ".packed", ".min"] {
+                    let full_n = format!("{}{}", n, suffix);
+                    if let Ok(t) = v.get_with_hints((1,), &full_n, Init::Const(0.)) {
+                        return Ok(v.get(t.shape(), &full_n)?);
+                    }
+                }
+            }
+            Ok(v.get((out_d, in_d), name)?)
+        };
+
+        let qkv_w = find_attn_weight(&vb, "qkv", hidden_size * 3, hidden_size)?;
+        let qkv_b = vb.get(hidden_size * 3, "qkv.bias").or_else(|_| vb.get(hidden_size * 3, "attn_qkv.bias")).ok();
+        
+        let proj_w = find_attn_weight(&vb, "proj", hidden_size, hidden_size).or_else(|_| find_attn_weight(&vb, "out", hidden_size, hidden_size))?;
+        let proj_b = vb.get(hidden_size, "proj.bias").or_else(|_| vb.get(hidden_size, "attn_out.bias")).ok();
 
         Ok(Self {
             num_heads,
-            qkv,
-            proj,
+            qkv: Linear::new(qkv_w, qkv_b),
+            proj: Linear::new(proj_w, proj_b),
             scaling,
         })
-    }
-
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let qkv_w = self.qkv.weight().to_device(device)?;
-        let qkv_b = self.qkv.bias().map(|b| b.to_device(device)).transpose()?;
-        self.qkv = Linear::new(qkv_w, qkv_b);
-
-        let proj_w = self.proj.weight().to_device(device)?;
-        let proj_b = self.proj.bias().map(|b| b.to_device(device)).transpose()?;
-        self.proj = Linear::new(proj_w, proj_b);
-        Ok(())
-    }
-
-    pub fn forward(
-        &self,
-        xs: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        cu_seqlens: &Tensor,
-    ) -> Result<Tensor> {
-        // xs: (seq_len, hidden_size)
-        let seq_length = xs.dim(0)?;
-        // (seq_len, hidden_size) -> (seq_len, hidden_size*3)
-        // -> (seq_len, 3, num_heads, head_dim)
-        // -> (3, seq_len, num_heads, head_dim)
-        let qkv_states = xs
-            .apply(&self.qkv)?
-            .reshape((seq_length, 3, self.num_heads, ()))?
-            .permute((1, 0, 2, 3))?;
-        // (seq_len, num_heads, head_dim)
-        let query_states = qkv_states.i(0)?.contiguous()?;
-        let key_states = qkv_states.i(1)?.contiguous()?;
-        let value_states = qkv_states.i(2)?.contiguous()?;
-        let (query_states, key_states) =
-            apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
-        // (seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim) -> (1, num_heads, seq_len, head_dim)
-        let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
-        let cu_last_id = cu_seqlens.dim(0)? - 1;
-        let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
-        let chunks: Vec<usize> = lengths
-            .to_vec1::<u32>()?
-            .iter()
-            .map(|&x| x as usize)
-            .collect();
-        let q_splits = split_tensor(&query_states, &chunks, 2)?;
-        let k_splits = split_tensor(&key_states, &chunks, 2)?;
-        let v_splits = split_tensor(&value_states, &chunks, 2)?;
-
-        let mut attn_outputs = Vec::new();
-        for (q, (k, v)) in q_splits.iter().zip(k_splits.iter().zip(v_splits.iter())) {
-            let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
-            attn_outputs.push(output);
-        }
-        let attn_output = Tensor::cat(&attn_outputs, 1)?;
-        let attn_output = attn_output.reshape((seq_length, ()))?.contiguous()?;
-        let attn_ouput = attn_output.apply(&self.proj)?;
-        Ok(attn_ouput)
     }
 }
 
@@ -236,18 +305,46 @@ pub struct Qwen3VLVisionBlock {
 
 impl Qwen3VLVisionBlock {
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
-        let norm1 = get_layer_norm(vb.pp("norm1"), 1e-6, config.hidden_size)?;
-        let norm2 = get_layer_norm(vb.pp("norm2"), 1e-6, config.hidden_size)?;
-        let attn = Qwen3VLVisionAttention::new(config.clone(), vb.pp("attn"))?;
+        // [SMART-PROBE] Block variations (norm1 vs ln1, attn.qkv vs attn_qkv)
+        let (n1_n, n2_n, attn_n) = if vb.get_with_hints((1,), "norm1.weight", Init::Const(0.)).is_ok() {
+            ("norm1", "norm2", "attn")
+        } else {
+            ("ln1", "ln2", "") // mmproj style: v.blk.0.ln1
+        };
+
+        let norm1 = get_layer_norm(vb.pp(n1_n), 1e-6, config.hidden_size)?;
+        let norm2 = get_layer_norm(vb.pp(n2_n), 1e-6, config.hidden_size)?;
+        
+        let attn_vb = if attn_n.is_empty() { vb.clone() } else { vb.pp(attn_n) };
+        let attn = Qwen3VLVisionAttention::new(config.clone(), attn_vb)?;
+        
+        let mlp_vb = if vb.pp("mlp").get_with_hints((1,), "linear_fc1.weight", Init::Const(0.)).is_ok() {
+            vb.pp("mlp")
+        } else {
+            vb.clone() // mmproj style: v.blk.0.ffn_up
+        };
+
         let mlp = TwoLinearMLP::new(
-            vb.pp("mlp"),
+            mlp_vb,
             config.hidden_size,
             config.intermediate_size,
             Activation::Gelu,
             false,
             "linear_fc1",
             "linear_fc2",
-        )?;
+        ).or_else(|_| {
+            // Try mmproj style naming
+            TwoLinearMLP::new(
+                vb.clone(),
+                config.hidden_size,
+                config.intermediate_size,
+                Activation::Gelu,
+                false,
+                "ffn_up",
+                "ffn_down",
+            )
+        })?;
+
         Ok(Self {
             norm1,
             norm2,
@@ -305,22 +402,53 @@ pub struct Qwen3VLVisionModel {
 impl Qwen3VLVisionModel {
     pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let spatial_merge_size = config.spatial_merge_size;
-        let patch_embed = Qwen3VLVisionPatchEmbed::new(&config, vb.pp("patch_embed"))?;
-        let pos_embed = embedding(
-            config.num_position_embeddings,
-            config.hidden_size,
-            vb.pp("pos_embed"),
-        )?;
+        
+        // [SMART-PROBE] Patch Embed naming
+        let pe_vb = if vb.pp("patch_embed").get_with_hints((1,), "proj.weight", Init::Const(0.)).is_ok() {
+            vb.pp("patch_embed")
+        } else {
+            vb.pp("patch_embd") // mmproj style
+        };
+        let patch_embed = Qwen3VLVisionPatchEmbed::new(&config, pe_vb)?;
+
+        // [SMART-PROBE] Pos Embed naming
+        let pos_vb = if vb.pp("pos_embed").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() {
+            vb.pp("pos_embed")
+        } else {
+            vb.pp("position_embd") // mmproj style
+        };
+        let pos_w = if let Ok(t) = pos_vb.get_with_hints((1,), "weight", Init::Const(0.)) {
+            pos_vb.get(t.shape(), "weight")?
+        } else {
+            pos_vb.get((config.num_position_embeddings, config.hidden_size), "weight")?
+        };
+        let pos_embed = Embedding::new(pos_w, config.hidden_size);
+
         let num_grid_per_side = (config.num_position_embeddings as f32).sqrt() as u32;
         let head_dim = config.hidden_size / config.num_heads;
         let rotary_pos_emb = Qwen2_5VisionRotaryEmbedding::new(head_dim / 2, None);
+        
         let mut blocks = Vec::new();
-        let vb_blocks = vb.pp("blocks");
+        // [SMART-PROBE] Block naming (blocks vs blk)
+        let blocks_vb = if vb.pp("blocks").pp(0).get_with_hints((1,), "norm1.weight", Init::Const(0.)).is_ok() {
+            vb.pp("blocks")
+        } else {
+            vb.pp("blk") // mmproj style: v.blk.0
+        };
+
         for i in 0..config.depth {
-            let block = Qwen3VLVisionBlock::new(config.clone(), vb_blocks.pp(i))?;
+            let block = Qwen3VLVisionBlock::new(config.clone(), blocks_vb.pp(i))?;
             blocks.push(block);
         }
-        let merger = Qwen3VLVisionPatchMerger::new(&config, vb.pp("merger"), false)?;
+
+        // [SMART-PROBE] Merger naming (merger vs mm)
+        let merger_vb = if vb.pp("merger").get_with_hints((1,), "linear_fc1.weight", Init::Const(0.)).is_ok() {
+            vb.pp("merger")
+        } else {
+            vb.pp("mm") // mmproj style
+        };
+        let merger = Qwen3VLVisionPatchMerger::new(&config, merger_vb, false)?;
+
         let deepstack_visual_indexes = config.deepstack_visual_indexes.clone();
         let mut deepstack_merger_list = Vec::new();
         let vb_deepstack = vb.pp("deepstack_merger_list");
@@ -775,14 +903,23 @@ impl Qwen3VLTextModel {
     pub fn new(mut config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
         let vocab_size = config.vocab_size;
 
-        // [FIX] Dynamically detect hidden_size from loaded tensor to prevent shape mismatch
-        // This is critical for Linear Bridge / Baking mode where 0.6B (1024) and 2B (2048) swap.
-        if let Ok(tensor) = vb.pp("embed_tokens").get_with_hints((vocab_size, config.hidden_size), "weight", candle_nn::Init::Const(0.)) {
-            let actual_h = tensor.dim(1)?;
-            if actual_h != config.hidden_size {
-                println!("[MODEL-FIX] Hidden Size Mismatch in VarBuilder. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_h);
-                config.hidden_size = actual_h;
+        // [SMART-PROBE] Find the weight tensor for embed_tokens among possible variations
+        let find_weight = |v: &VarBuilder, name: &str| -> Result<Tensor> {
+            for suffix in &["", ".packed", ".min"] {
+                let full_name = format!("{}{}", name, suffix);
+                if let Ok(t) = v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)) {
+                    // Re-fetch with correct shape now that we know it exists
+                    return Ok(v.get(t.shape(), &full_name)?);
+                }
             }
+            Err(anyhow!(format!("Cannot find tensor for {}", name)))
+        };
+
+        let embed_tokens_weight = find_weight(&vb.pp("embed_tokens"), "weight")?;
+        let actual_h = embed_tokens_weight.dim(1)?;
+        if actual_h != config.hidden_size {
+            println!("[MODEL-FIX] Hidden Size Mismatch. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_h);
+            config.hidden_size = actual_h;
         }
 
         let embed_tokens = embedding(vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
@@ -992,15 +1129,37 @@ impl Qwen3VLModel {
         let vb_m = vb.pp("model");
         let config = config.clone();
         
-        // [FIX] Optional Vision Initialization with strict suppression
+        // [SMART-PROBE] Dynamically find the Vision Model root
         let visual = if !force_text_only && config.vision_config.is_some() {
             let v_config = config.vision_config.as_ref().unwrap();
-            // Check if essential vision tensor exists to decide whether to init
-            if vb_m.pp("visual").pp("patch_embed").pp("proj").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() {
-                Some(Qwen3VLVisionModel::new(v_config.clone(), vb_m.pp("visual"))?)
+            
+            // Check multiple possible vision roots and naming variations
+            let probe_v = |v: &VarBuilder| {
+                let check = |p: &str| {
+                    v.pp(p).pp("proj").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
+                    v.pp(p).pp("proj").get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
+                    v.pp(p).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
+                    v.pp(p).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok()
+                };
+                check("patch_embed") || check("patch_embd")
+            };
+
+            let vb_v = if probe_v(&vb_m.pp("visual")) {
+                Some(vb_m.pp("visual")) // model.visual...
+            } else if probe_v(&vb.pp("visual")) {
+                Some(vb.pp("visual")) // visual...
+            } else if probe_v(&vb.pp("v")) {
+                Some(vb.pp("v")) // v... (mmproj standard)
+            } else {
+                None
+            };
+
+            if let Some(vb_v_final) = vb_v {
+                println!("[MODEL] Detected Vision Model root: {:?}", vb_v_final.prefix());
+                Some(Qwen3VLVisionModel::new(v_config.clone(), vb_v_final)?)
             } else {
                 if !is_baking {
-                    println!("[MODEL] Vision tensors not found in weight set. Skipping Vision initialization.");
+                    println!("[MODEL] Vision tensors (mmproj) not found in weight set. Skipping Vision initialization.");
                 }
                 None
             }
@@ -1011,14 +1170,27 @@ impl Qwen3VLModel {
         // [FIX] text_config is optional, but required for Qwen3VLModel
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
         
-        // [FIX] Branch VarBuilder based on model mode (Baking/Anchor vs Full)
-        // Anchor/Baking files usually have a flat structure: "model.layers.0..."
-        // Full HF/GGUF models have a deep structure: "model.language_model.layers.0..."
-        let vb_lm = if is_baking {
-            vb_m.clone() // FLAT (Anchor/Baking)
-        } else {
-            vb_m.pp("language_model") // DEEP (Full)
+        // [SMART-PROBE] Dynamically find the Language Model root
+        let probe_lm = |v: &VarBuilder| {
+            let check = |p: &str| {
+                v.pp(p).get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
+                v.pp(p).get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
+                v.pp(p).get_with_hints((1,), "weight.min", candle_nn::Init::Const(0.)).is_ok()
+            };
+            check("embed_tokens") || check("token_embd")
         };
+
+        let vb_lm = if probe_lm(&vb_m.pp("language_model")) {
+            vb_m.pp("language_model") 
+        } else if probe_lm(&vb_m) {
+            vb_m.clone()
+        } else if probe_lm(&vb) {
+            vb.clone()
+        } else {
+            vb_m.pp("language_model")
+        };
+
+        println!("[MODEL] Detected Language Model root: {:?}", vb_lm.prefix());
 
         let language_model =
             Qwen3VLTextModel::new(text_config.clone(), vb_lm)?;
@@ -1029,19 +1201,22 @@ impl Qwen3VLModel {
         let lm_head = if config.tie_word_embeddings {
             Linear::new(language_model.embed_tokens.embeddings().clone(), None)
         } else {
-            // [FIX] lm_head can also be inside "model." or top-level
-            let vb_head = if is_baking && vb_m.pp("lm_head").get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() {
+            // [SMART-PROBE] Find lm_head similarly
+            let probe_head = |v: &VarBuilder| {
+                v.get_with_hints((1,), "weight", candle_nn::Init::Const(0.)).is_ok() ||
+                v.get_with_hints((1,), "weight.packed", candle_nn::Init::Const(0.)).is_ok() ||
+                v.get_with_hints((1,), "weight.min", candle_nn::Init::Const(0.)).is_ok()
+            };
+
+            let vb_head = if probe_head(&vb_m.pp("lm_head")) {
                 vb_m.pp("lm_head")
+            } else if probe_head(&vb.pp("lm_head")) {
+                vb.pp("lm_head")
+            } else if probe_head(&vb.pp("output")) {
+                vb.pp("output")
             } else {
                 vb.pp("lm_head")
             };
-
-            linear_no_bias(
-                actual_h,
-                text_config.vocab_size,
-                vb_head,
-            )?
-        };
         
         let mut model = Self {
             config,

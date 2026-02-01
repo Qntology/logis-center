@@ -8,6 +8,17 @@ use candle_nn::{
 
 use crate::{models::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
 
+fn find_bitserial_weight(v: &VarBuilder, name: &str, out_dim: usize, in_dim: usize) -> Result<Tensor> {
+    for suffix in &["", ".packed", ".min"] {
+        let full_name = format!("{}{}", name, suffix);
+        if let Ok(t) = v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)) {
+            return Ok(v.get(t.shape(), &full_name)?);
+        }
+    }
+    // Fallback to standard linear init to get a proper error if it truly doesn't exist
+    Ok(v.get((out_dim, in_dim), name)?)
+}
+
 #[derive(Debug, Clone)]
 pub struct GateUpDownMLP {
     gate_proj: Linear,
@@ -24,23 +35,24 @@ impl GateUpDownMLP {
         act_fn: Activation,
         bias: bool,
     ) -> Result<Self> {
-        let (gate_proj, up_proj, down_proj) = if bias {
+        let gate_w = find_bitserial_weight(&vb.pp("gate_proj"), "weight", intermediate_size, hidden_size)?;
+        let up_w = find_bitserial_weight(&vb.pp("up_proj"), "weight", intermediate_size, hidden_size)?;
+        let down_w = find_bitserial_weight(&vb.pp("down_proj"), "weight", hidden_size, intermediate_size)?;
+
+        let (gate_b, up_b, down_b) = if bias {
             (
-                linear(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear(intermediate_size, hidden_size, vb.pp("down_proj"))?,
+                Some(vb.pp("gate_proj").get(intermediate_size, "bias")?),
+                Some(vb.pp("up_proj").get(intermediate_size, "bias")?),
+                Some(vb.pp("down_proj").get(hidden_size, "bias")?),
             )
         } else {
-            (
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
-            )
+            (None, None, None)
         };
+
         Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
+            gate_proj: Linear::new(gate_w, gate_b),
+            up_proj: Linear::new(up_w, up_b),
+            down_proj: Linear::new(down_w, down_b),
             act_fn,
         })
     }
@@ -86,20 +98,21 @@ impl TwoLinearMLP {
         linear1_pp_name: &str,
         linear2_pp_name: &str,
     ) -> Result<Self> {
-        let (linear1, linear2) = if bias {
+        let l1_w = find_bitserial_weight(&vb.pp(linear1_pp_name), "weight", mlp_dim, embedding_dim)?;
+        let l2_w = find_bitserial_weight(&vb.pp(linear2_pp_name), "weight", embedding_dim, mlp_dim)?;
+
+        let (l1_b, l2_b) = if bias {
             (
-                linear(embedding_dim, mlp_dim, vb.pp(linear1_pp_name))?,
-                linear(mlp_dim, embedding_dim, vb.pp(linear2_pp_name))?,
+                Some(vb.pp(linear1_pp_name).get(mlp_dim, "bias")?),
+                Some(vb.pp(linear2_pp_name).get(embedding_dim, "bias")?),
             )
         } else {
-            (
-                linear_no_bias(embedding_dim, mlp_dim, vb.pp(linear1_pp_name))?,
-                linear_no_bias(mlp_dim, embedding_dim, vb.pp(linear2_pp_name))?,
-            )
+            (None, None)
         };
+
         Ok(Self {
-            linear1,
-            linear2,
+            linear1: Linear::new(l1_w, l1_b),
+            linear2: Linear::new(l2_w, l2_b),
             act,
         })
     }
@@ -155,35 +168,28 @@ impl NaiveAttention {
             Some(dim) => dim,
         };
         let o_proj_pp_name = o_proj_pp_name.unwrap_or("o_proj");
-        let (q_proj, k_proj, v_proj, o_proj) = if bias {
+
+        let q_w = find_bitserial_weight(&vb.pp("q_proj"), "weight", num_attention_heads * head_dim, hidden_size)?;
+        let k_w = find_bitserial_weight(&vb.pp("k_proj"), "weight", num_key_value_heads * head_dim, hidden_size)?;
+        let v_w = find_bitserial_weight(&vb.pp("v_proj"), "weight", num_key_value_heads * head_dim, hidden_size)?;
+        let o_w = find_bitserial_weight(&vb.pp(o_proj_pp_name), "weight", hidden_size, num_attention_heads * head_dim)?;
+
+        let (q_b, k_b, v_b, o_b) = if bias {
             (
-                linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?,
-                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?,
-                linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?,
-                linear(
-                    num_attention_heads * head_dim,
-                    hidden_size,
-                    vb.pp(o_proj_pp_name),
-                )?,
+                Some(vb.pp("q_proj").get(num_attention_heads * head_dim, "bias")?),
+                Some(vb.pp("k_proj").get(num_key_value_heads * head_dim, "bias")?),
+                Some(vb.pp("v_proj").get(num_key_value_heads * head_dim, "bias")?),
+                Some(vb.pp(o_proj_pp_name).get(hidden_size, "bias")?),
             )
         } else {
-            (
-                linear_no_bias(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?,
-                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?,
-                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?,
-                linear_no_bias(
-                    num_attention_heads * head_dim,
-                    hidden_size,
-                    vb.pp(o_proj_pp_name),
-                )?,
-            )
+            (None, None, None, None)
         };
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
+            q_proj: Linear::new(q_w, q_b),
+            k_proj: Linear::new(k_w, k_b),
+            v_proj: Linear::new(v_w, v_b),
+            o_proj: Linear::new(o_w, o_b),
             num_heads: num_attention_heads,
             num_kv_heads: num_key_value_heads,
             num_kv_groups,
