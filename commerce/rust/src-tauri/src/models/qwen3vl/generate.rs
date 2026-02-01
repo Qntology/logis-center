@@ -87,24 +87,22 @@ impl Qwen3VLGenerateModel {
         };
         if path.contains("0.6B") { 
             if let Some(ref mut tc) = cfg.text_config { 
-                // 1. Architecture size correction (matching 0.6B model specs)
-                if tc.hidden_size == 2048 { 
-                    tc.hidden_size = 1024; 
-                    tc.intermediate_size = 3072; // Actual model value
-                } 
+                // 1. Precise architecture mapping for 0.6B (1024 -> 3072 FFN)
+                tc.hidden_size = 1024; 
+                tc.intermediate_size = 3072; 
                 
-                // 2. [BRIDGE-PROTOCOL] Sync RoPE Theta with 2B-VL (5M)
+                // 2. [BRIDGE-PROTOCOL] Unified Frequency Space
                 tc.rope_theta = 5000000.0;
 
-                // 3. [BRIDGE-PROTOCOL] Force mRoPE settings injection
-                // Ensure 0.6B rotates position info in the same way as 2B-VL
+                // 3. [BRIDGE-PROTOCOL] Multimodal-RoPE Topology Mapping
+                // Pre-align 0.6B baking to 2B-VL's 3D positional manifold
                 tc.rope_scaling = Some(crate::models::qwen3vl::config::RopeScaling {
-                    mrope_section: vec![24, 20, 20], // Match 2B-VL model settings
+                    mrope_section: vec![24, 20, 20], 
                     rope_type: "default".to_string(),
                     mrope_interleaved: Some(true),
                 });
 
-                println!("[BRIDGE] Full Sync: RoPE Theta(5M) and mRoPE Sections applied to 0.6B for compatibility.");
+                println!("[BRIDGE] Mathematical Synergy: 0.6B reconfigured for 2B-VL compatibility.");
             } 
         }
         let text_dev = get_device(text_device); let vision_dev = get_device(vision_device);
