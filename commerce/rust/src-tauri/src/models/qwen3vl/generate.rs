@@ -22,7 +22,6 @@ use crate::{
     },
     openai_types::ChatCompletionParameters,
 };
-use rayon::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::fs;
 use std::path::Path;
@@ -93,9 +92,9 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        force_4bit: bool, // [NEW]
+        high_fidelity: bool, // [NEW]
     ) -> Result<Self> {
-        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, force_4bit)
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, high_fidelity)
     }
 
     pub fn init_with_tokenizer(
@@ -109,9 +108,9 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        force_4bit: bool, // [NEW]
+        high_fidelity: bool, // [NEW]
     ) -> Result<Self> {
-        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, force_4bit) 
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, high_fidelity) 
     }
 
     pub fn init_with_config(
@@ -126,7 +125,7 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        _force_4bit: bool, // [NEW]
+        high_fidelity: bool, // [NEW]
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -204,6 +203,16 @@ impl Qwen3VLGenerateModel {
             
             println!("[MODEL-LOAD] {} Model detected: {:?}", 
                 if is_anchor { "ANCHOR" } else { "BIT-SERIAL" }, st_path);
+
+            // [FIX] Baking 모드이거나 ANCHOR 파일 로드 시 레이어 수를 1로 강제 고정
+            // 그래야 모델 생성자가 존재하지 않는 레이어 1~27 가중치를 찾지 않음
+            let mut model_cfg = cfg.clone();
+            if baking_only || is_anchor {
+                if let Some(ref mut tc) = model_cfg.text_config {
+                    println!("[MODEL-LOAD] Adjusting config to 1-layer for Baking/Anchor mode.");
+                    tc.num_hidden_layers = 1;
+                }
+            }
             
             // 1. 모델 가중치 로드
             let mut merged_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(&st_path), &text_dev, dtype, baking_only)?;
@@ -212,14 +221,14 @@ impl Qwen3VLGenerateModel {
             if !force_text_only {
                 let mmproj_st = st_files.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors"));
                 if let Some(mm_path) = mmproj_st {
-                    println!("[MODEL-LOAD] Vision Projector integration: {:?}", mm_path);
+                    println!("[MODEL-LOAD] BIT-SERIAL Vision Projector integration: {:?}", mm_path);
                     let vision_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(mm_path), &vision_dev, dtype, baking_only)?;
                     for (k, v) in vision_data { merged_data.insert(k, v); }
                 }
             }
 
             let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);
-            let mut model = Qwen3VLModel::new(cfg.clone(), vb)?;
+            let mut model = Qwen3VLModel::new(model_cfg, vb)?;
             
             if baking_only || is_anchor { model.set_baking(true); }
 
