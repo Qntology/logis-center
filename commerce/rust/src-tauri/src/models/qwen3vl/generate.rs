@@ -179,28 +179,30 @@ impl Qwen3VLGenerateModel {
         
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
-        // [FIX] Prioritize custom TRUE_IQ0 safetensors for extreme low-memory usage
-        let custom_st = st_files.iter().find(|f| f.contains("TRUE_IQ0.safetensors"));
+        // [FIX] Prioritize custom TRUE_IQ0 safetensors ONLY for baking (Context Ingestion)
+        // [STRICT] Avoid picking mmproj as the main language model
+        let custom_st = if baking_only {
+            st_files.iter().find(|f| f.contains("TRUE_IQ0.safetensors") && !f.contains("mmproj"))
+        } else {
+            None
+        };
         
         if let Some(st_path) = custom_st {
-            println!("[MODEL] Found Custom Truly Small Model: {:?}", st_path);
+            println!("[MODEL] Found Custom Truly Small Model for Baking: {:?}", st_path);
             
-            // [9d1369 Parity] Force 1 layer for custom tiny models
             if let Some(ref mut tc) = cfg.text_config {
-                println!("[MODEL-OPTIM] Forcing Text Single-Layer mode.");
+                println!("[MODEL-OPTIM] Baking mode: Forcing Text Single-Layer.");
                 tc.num_hidden_layers = 1;
             }
-            
-            // [NEW] Force 1 layer for Vision blocks as well
             if let Some(ref mut vc) = cfg.vision_config {
-                println!("[MODEL-OPTIM] Forcing Vision Single-Layer mode (Depth=1).");
+                println!("[MODEL-OPTIM] Baking mode: Forcing Vision Single-Layer (Depth=1).");
                 vc.depth = 1;
             }
 
             let vb = crate::models::qwen3vl::quantized_model::from_true_iq0_safetensors(Path::new(st_path), &text_dev, dtype)?;
             
             let mut model = Qwen3VLModel::new(cfg.clone(), vb)?;
-            model.set_baking(baking_only); // Propagate baking flag correctly
+            model.set_baking(true);
             let qwen3_vl = ModelVariant::Standard(model);
             
             let generation_config_path = std::path::Path::new(cfg_path).join("generation_config.json");
@@ -212,13 +214,16 @@ impl Qwen3VLGenerateModel {
                 chat_template, tokenizer, pre_processor, qwen3_vl,
                 text_device: text_dev, vision_device: vision_dev,
                 eos_token_id1: 151643, eos_token_id2: 151645,
-                generation_config, model_name: "qwen3-custom-iq0".to_string(),
+                generation_config, model_name: "qwen3-baking-iq0".to_string(),
                 hard_token_limit,
             });
         }
 
-        // [FIX] Precision Selection Logic for mmproj
-        let mut mmproj_path = if force_4bit {
+        // --- Inference Path (Full Model) ---
+        // [FIX] Precision Selection Logic for mmproj (Prioritize Q8_0 for Inference)
+        let mut mmproj_path = if !baking_only {
+            gguf_files.iter().find(|f| f.contains("mmproj") && f.contains("Q8_0")).cloned()
+        } else if force_4bit {
             gguf_files.iter().find(|f| f.contains("mmproj") && !f.contains("IQ1_S")).cloned()
         } else {
             gguf_files.iter().find(|f| f.contains("mmproj") && f.contains("IQ1_S")).cloned()
@@ -228,8 +233,10 @@ impl Qwen3VLGenerateModel {
         let is_vision_model = mmproj_path.is_some() && !force_text_only;
 
         let qwen3_vl = if !gguf_files.is_empty() {
-            // [FIX] Precision Selection Logic for Main Model
-            let mut model_path = if force_4bit {
+            // [FIX] Precision Selection Logic for Main Model (Prioritize Q4_K_M for Inference)
+            let mut model_path = if !baking_only {
+                gguf_files.iter().find(|f| f.contains("Qwen3VL-2B") && f.contains("Q4_K_M")).cloned()
+            } else if force_4bit {
                 gguf_files.iter().find(|f| f.contains("Qwen3VL-2B") && !f.contains("IQ1_S")).cloned()
             } else {
                 gguf_files.iter().find(|f| f.contains("Qwen3VL-2B-Instruct-IQ1_S.gguf")).cloned()
