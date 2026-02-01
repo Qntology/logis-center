@@ -587,16 +587,27 @@ pub fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, r
     Ok(RmsNorm::new(w, eps))
 }
 
-pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, dtype: DType) -> Result<HashMap<String, Tensor>> {
+pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, dtype: DType, baking_only: bool) -> Result<HashMap<String, Tensor>> {
     let file = std::fs::read(path)?;
     let st = safetensors::SafeTensors::deserialize(&file)?;
     let mut data = HashMap::new();
-    println!("[MODEL] Unpacking Truly Small Safetensors: {:?}", path);
+    println!("[MODEL] Unpacking Safetensors: {:?} (Baking Only: {})", path, baking_only);
     for (name, view) in st.tensors() {
         if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") { continue; }
 
         let is_packed = name.ends_with(".packed");
         let base_name = if is_packed { name.strip_suffix(".packed").unwrap() } else { &name };
+        
+        // [FIX] Baking 모드일 때 0번 레이어 외에는 로드 건너뜀 (문자열 파싱 방식)
+        if baking_only {
+            let skip = if base_name.contains(".layers.") || base_name.contains(".blocks.") || base_name.contains("blk.") {
+                // 인덱스가 .0. 이 아닌 모든 경우 제외
+                !base_name.contains(".0.")
+            } else {
+                false // 공통 가중치(임베딩 등)는 유지
+            };
+            if skip { continue; }
+        }
         
         let mut target_name = base_name.to_string();
         
@@ -756,6 +767,6 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, dtype: DType) ->
 }
 
 pub fn from_true_iq0_safetensors(path: &Path, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
-    let data = load_tensors_from_true_iq0(path, device, dtype)?;
+    let data = load_tensors_from_true_iq0(path, device, dtype, false)?;
     Ok(VarBuilder::from_tensors(data, dtype, device))
 }

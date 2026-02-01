@@ -190,36 +190,46 @@ impl Qwen3VLGenerateModel {
         
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
-        // [9d1369] [BIT-SERIAL-PRIORITY] 최적화된 Full Layer 0-bit 모델 우선 로드
-        let bitserial_st = st_files.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors"));
-        
-        if let Some(st_path) = bitserial_st {
-            println!("[MODEL-LOAD] BIT-SERIAL Language Model detected: {:?}", st_path);
+        // [9d1369] [MODEL-PRIORITY]
+        // 1. Baking 모드인 경우 ANCHOR 모델(1개 레이어)을 최우선으로 찾음
+        let model_path = if baking_only {
+            st_files.iter().find(|f| f.contains("ANCHOR_IQ0.safetensors")).cloned()
+        } else {
+            st_files.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors")).cloned()
+        };
+
+        if let Some(st_path) = model_path {
+            let is_bitserial = st_path.contains("BITSERIAL_ALL");
+            let is_anchor = st_path.contains("ANCHOR_IQ0");
             
-            // 1. 언어 모델 가중치 로드 (HashMap으로 로드)
-            let mut merged_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(st_path), &text_dev, dtype)?;
+            println!("[MODEL-LOAD] {} Model detected: {:?}", 
+                if is_anchor { "ANCHOR" } else { "BIT-SERIAL" }, st_path);
             
-            // 2. 비전 모델 가중치 로드 및 병합 (존재할 경우)
-            let mmproj_st = st_files.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors"));
-            if let Some(mm_path) = mmproj_st {
-                println!("[MODEL-LOAD] BIT-SERIAL Vision Projector integration: {:?}", mm_path);
-                let vision_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(mm_path), &vision_dev, dtype)?;
-                
-                // HashMap 병합
-                for (k, v) in vision_data {
-                    merged_data.insert(k, v);
+            // 1. 모델 가중치 로드
+            let mut merged_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(&st_path), &text_dev, dtype, baking_only)?;
+            
+            // 2. 비전 모델 가중치 로드 및 병합 (비전 전용 모델이 따로 있을 경우)
+            if !force_text_only {
+                let mmproj_st = st_files.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors"));
+                if let Some(mm_path) = mmproj_st {
+                    println!("[MODEL-LOAD] Vision Projector integration: {:?}", mm_path);
+                    let vision_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(mm_path), &vision_dev, dtype, baking_only)?;
+                    for (k, v) in vision_data { merged_data.insert(k, v); }
                 }
             }
 
-            // 3. 최종 VarBuilder 생성
             let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);
-            let model = Qwen3VLModel::new(cfg.clone(), vb)?;
+            let mut model = Qwen3VLModel::new(cfg.clone(), vb)?;
+            
+            if baking_only || is_anchor { model.set_baking(true); }
+
             return Ok(Self {
                 chat_template, tokenizer, pre_processor, qwen3_vl: ModelVariant::Standard(model),
                 text_device: text_dev, vision_device: vision_dev,
                 eos_token_id1: 151643, eos_token_id2: 151645,
                 generation_config: Qwen3VLGenerationConfig::default(), 
-                model_name: "qwen3-bitserial-full".to_string(), hard_token_limit,
+                model_name: if is_anchor { "qwen3-anchor" } else { "qwen3-bitserial-full" }.to_string(), 
+                hard_token_limit,
             });
         }
 
