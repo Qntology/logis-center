@@ -1030,8 +1030,9 @@ impl Qwen3VLTextModel {
         let vb_l = vb.pp("layers");
         
         for layer_idx in 0..config.num_hidden_layers {
-            // [SMART-PROBE] Check if this layer exists in the file
-            let layer_exists = vb_l.pp(layer_idx).pp("input_layernorm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok();
+            // [SMART-PROBE] Check if this layer exists in the file (RESILIENT)
+            let layer_exists = vb_l.pp(layer_idx).pp("input_layernorm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() ||
+                               vb_l.pp(layer_idx).pp("attn_norm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok();
             
             if layer_exists {
                 let layer = Qwen3VLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
@@ -1142,9 +1143,11 @@ impl Qwen3VLTextModel {
 
     pub fn save_kv_cache(&mut self, path: &std::path::Path) -> Result<()> {
         if !path.exists() { std::fs::create_dir_all(path)?; }
+        let mut saved_count = 0;
         for (i, layer_opt) in self.layers.iter_mut().enumerate() {
             if let Some(layer) = layer_opt {
                 if let Some((k, v)) = &layer.self_attn.kv_cache {
+                    println!("[SSD-BRIDGE] Compressing Layer {} KV cache (Standard -> BitKV)...", i);
                     // [BRIDGE-FIX] Compress to bitkv format for compatibility with QuantizedQwen3VLModel
                     let rk = Self::compress_to_bitkv(i, k)?; 
                     let rv = Self::compress_to_bitkv(i, v)?;
@@ -1153,15 +1156,21 @@ impl Qwen3VLTextModel {
                     m.insert("k_a".to_string(), rk.0); m.insert("k_p".to_string(), rk.1); m.insert("k_s".to_string(), rk.2);
                     m.insert("v_a".to_string(), rv.0); m.insert("v_p".to_string(), rv.1); m.insert("v_s".to_string(), rv.2);
                     
-                    // Add shape tensor (important for decompression)
-                    // k is [b, h, s, d]. We need to store this original shape.
                     let shape_u32: Vec<u32> = rk.3.iter().map(|&x| x as u32).collect();
                     let shape_tensor = Tensor::from_vec(shape_u32, (rk.3.len(),), k.device())?;
                     m.insert("shape".to_string(), shape_tensor);
 
-                    candle_core::safetensors::save(&m, path.join(format!("layer_{}_bitkv.safetensors", i)))?;
+                    let file_path = path.join(format!("layer_{}_bitkv.safetensors", i));
+                    candle_core::safetensors::save(&m, &file_path)?;
+                    println!("[SSD-BRIDGE] Saved: {:?}", file_path);
+                    saved_count += 1;
+                } else {
+                    println!("[SSD-BRIDGE] Warning: Layer {} has no KV cache data.", i);
                 }
             }
+        }
+        if saved_count == 0 {
+            println!("[SSD-BRIDGE] CRITICAL: No layers were saved to disk! Check forward pass.");
         }
         Ok(())
     }

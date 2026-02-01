@@ -402,7 +402,8 @@ impl LogisModel {
 
     // --- [NEW] Base Context Baking (One-time Heavy Lifting) ---
     pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        let base_session = format!("{}_base", task_id);
+        // [FIX] Session naming parity with scheduler
+        let base_session = format!("{}_step_a", task_id); 
         
         // 1. Load Small Model Isolated (Baking: true, Force4bit: false)
         self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
@@ -412,21 +413,19 @@ impl LogisModel {
             let gen_clone = self.generator.clone();
             let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
             let token_clone = cancel_token.clone();
-            
-            // We use prefill_only via a manual chat construct or direct access if possible
-            // Reusing chat_params_with_spinner for convenience but with empty generation
+            let session_id = Some(base_session.clone());
             
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    // Just prefill, no generation needed for base context
-                    gen.prefill_chunk(prompt, token_clone, None, None)?;
+                    // [CRITICAL-FIX] Pass session_id to prefill_chunk to trigger automatic Disk-Save
+                    gen.prefill_chunk(prompt, token_clone, None, session_id)?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 3. Save Base Snapshot
+        // 3. Save Final Snapshot (Just in case, although prefill_chunk does it)
         self.save_kv_snapshot(&base_session).await?;
         
         // 4. Unload immediately to free VRAM for 2B

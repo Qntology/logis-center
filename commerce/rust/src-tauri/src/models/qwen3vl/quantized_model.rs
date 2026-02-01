@@ -478,12 +478,16 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
         if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") || name.ends_with(".format") || name.ends_with(".min") { continue; }
         let is_p = name.ends_with(".packed"); let b_n = if is_p { name.strip_suffix(".packed").unwrap() } else { &name };
         
-        // [Universal Naming Protocol] Match all Python patterns to Rust
         let clean = b_n.replace("model.language_model.", "").replace("model.layers.", "layers.").replace("model.visual.", "visual.").replace("model.", "").replace("language_model.", "");
+        
         if bo {
-            let is_l0 = clean == "layers.0.self_attn.q_proj.weight" || clean == "layers.0.self_attn.k_proj.weight" || clean == "layers.0.self_attn.v_proj.weight" || clean == "layers.0.self_attn.o_proj.weight" || clean == "layers.0.input_layernorm.weight" || clean == "layers.0.post_attention_layernorm.weight" || clean == "embed_tokens.weight" || clean == "norm.weight";
-            let is_c = !clean.contains(".layers.") && !clean.contains(".blocks.") && !clean.contains("blk.");
-            if !is_l0 && !is_c { continue; }
+            // [FLEXIBLE-FILTER] Support both 'layers.0' and 'blk.0'
+            let is_layer_zero = clean.starts_with("layers.0.") || clean.starts_with("blk.0.") || clean.starts_with("model.layers.0.") || clean.starts_with("model.blk.0.");
+            let is_common = !clean.contains(".layers.") && !clean.contains(".blocks.") && !clean.contains("blk.");
+            
+            if !is_layer_zero && !is_common { 
+                continue; 
+            }
         }
         
         let mut t_n = clean.clone();
@@ -500,10 +504,23 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
             else { t_n = format!("visual.{}", rest); }
         } else if b_n.starts_with("mm.") {
             let rest = &b_n[3..]; if rest.starts_with("0") { t_n = "visual.merger.linear_fc1".to_string(); } else if rest.starts_with("2") { t_n = "visual.merger.linear_fc2".to_string(); }
-        } else if clean.starts_with("layers.") || b_n.starts_with("blk.") {
-            let rest = if clean.starts_with("layers.") { &clean[7..] } else { &b_n[4..] };
+        } else if clean.starts_with("layers.") || b_n.starts_with("blk.") || clean.starts_with("blk.") {
+            let rest = if clean.starts_with("layers.") { &clean[7..] } else if clean.starts_with("blk.") { &clean[4..] } else { &b_n[4..] };
             let ps: Vec<&str> = rest.splitn(2, '.').collect();
-            let m = match ps[1] { "attn_q_norm.weight" => "self_attn.q_norm.weight", "attn_k_norm.weight" => "self_attn.k_norm.weight", s if s.starts_with("attn_q") => "self_attn.q_proj", s if s.starts_with("attn_k") => "self_attn.k_proj", s if s.starts_with("attn_v") => "self_attn.v_proj", s if s.starts_with("attn_output") => "self_attn.o_proj", s if s.starts_with("attn_norm") => "input_layernorm", s if s.starts_with("ffn_norm") => "post_attention_layernorm", s if s.starts_with("ffn_gate") => "mlp.gate_proj", s if s.starts_with("ffn_up") => "mlp.up_proj", s if s.starts_with("ffn_down") => "mlp.down_proj", _ => ps[1] };
+            let m = match ps[1] { 
+                "attn_q_norm.weight" => "self_attn.q_norm.weight", 
+                "attn_k_norm.weight" => "self_attn.k_norm.weight", 
+                s if s.starts_with("attn_q") => "self_attn.q_proj", 
+                s if s.starts_with("attn_k") => "self_attn.k_proj", 
+                s if s.starts_with("attn_v") => "self_attn.v_proj", 
+                s if s.starts_with("attn_output") => "self_attn.o_proj", 
+                s if s.starts_with("attn_norm") => "input_layernorm", 
+                s if s.starts_with("ffn_norm") => "post_attention_layernorm", 
+                s if s.starts_with("ffn_gate") => "mlp.gate_proj", 
+                s if s.starts_with("ffn_up") => "mlp.up_proj", 
+                s if s.starts_with("ffn_down") => "mlp.down_proj", 
+                _ => ps[1] 
+            };
             t_n = format!("language_model.layers.{}.{}", ps[0], m);
         } else if clean == "embed_tokens.weight" || clean == "token_embd.weight" { t_n = "language_model.embed_tokens.weight".to_string(); }
         else if clean == "norm.weight" || clean == "output_norm.weight" { t_n = "language_model.norm.weight".to_string(); }
@@ -521,25 +538,45 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
             // Handle scales (F16 -> F32)
             let scales_view = match st.tensor(&format!("{b_n}.scales")) {
                 Ok(v) => v,
-                Err(_) => st.tensor(&format!("{b_n}.scale"))?,
+                Err(_) => match st.tensor(&format!("{b_n}.scale")) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Create dummy scales if missing
+                        println!("[MODEL-PROBE] Warning: Scale missing for {}. Using 1.0.", b_n);
+                        let dummy = vec![1.0f32; 1];
+                        let t = Tensor::from_vec(dummy, (1,), d)?;
+                        // We need a dummy view-like access or just a tensor.
+                        // Since we are building the map, we can just insert a dummy tensor later.
+                        data.insert(format!("model.{}.scales", t_n), t.clone());
+                        data.insert(format!("model.{}.shape", t_n), Tensor::new(&[1u32], d)?);
+                        packed_tensor.clone() // Fallback return
+                    }
+                }
             };
-            let scales_raw = scales_view.data();
-            let scales_f32: Vec<f32> = scales_raw.chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect();
-            let scales = Tensor::from_vec(scales_f32, (scales_raw.len() / 2,), d)?;
-
-            // Handle shape (I32 -> usize)
-            let shape_view = st.tensor(&format!("{b_n}.shape"))?;
-            let shape_raw = shape_view.data();
-            let shape_u32: Vec<u32> = shape_raw.chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let shape_tensor = Tensor::from_vec(shape_u32, (shape_raw.len() / 4,), d)?;
             
-            // Store metadata alongside the packed tensor for QLinear initialization
-            data.insert(format!("model.{}.scales", t_n), scales);
-            data.insert(format!("model.{}.shape", t_n), shape_tensor);
+            if !data.contains_key(&format!("model.{}.scales", t_n)) {
+                let scales_raw = scales_view.data();
+                let scales_f32: Vec<f32> = match scales_view.dtype() {
+                    safetensors::Dtype::F16 => scales_raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+                    safetensors::Dtype::F32 => scales_raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                    _ => vec![1.0; scales_raw.len() / 4],
+                };
+                let scales = Tensor::from_vec(scales_f32, (scales_raw.len() / match scales_view.dtype() { safetensors::Dtype::F16 => 2, _ => 4 },), d)?;
+
+                // Handle shape (I32 -> usize)
+                let shape_tensor = if let Ok(shape_view) = st.tensor(&format!("{b_n}.shape")) {
+                    let shape_raw = shape_view.data();
+                    let shape_u32: Vec<u32> = shape_raw.chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    Tensor::from_vec(shape_u32, (shape_raw.len() / 4,), d)?
+                } else {
+                    Tensor::new(&[1u32], d)?
+                };
+                
+                data.insert(format!("model.{}.scales", t_n), scales);
+                data.insert(format!("model.{}.shape", t_n), shape_tensor);
+            }
             packed_tensor
         } else {
             let r = view.data(); match view.dtype() {

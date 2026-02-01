@@ -225,7 +225,13 @@ impl Qwen3VLGenerateModel {
             let chunk_ids = Tensor::from_vec(full_input_ids_vec[current_pos..end].to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
-            if let Some(ref sid) = session_id { let path = crate::utils::paths::get_kv_dir(None).join(sid); if !path.exists() { let _ = fs::create_dir_all(&path); } self.save_kv_to_disk(&path)?; }
+            
+            if let Some(ref sid) = session_id { 
+                let path = crate::utils::paths::get_kv_dir(None).join(sid); 
+                println!("[GENERATE] Saving intermediate KV cache to: {:?}", path);
+                if !path.exists() { let _ = fs::create_dir_all(&path); } 
+                self.save_kv_to_disk(&path)?; 
+            }
             current_pos = end;
         }
         Ok(current_pos)
@@ -238,7 +244,13 @@ impl Qwen3VLGenerateModel {
         let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
         if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
-        if let Some(sid) = session_id { let path = crate::utils::paths::get_kv_dir(None).join(sid); if !path.exists() { let _ = fs::create_dir_all(&path); } self.save_kv_to_disk(&path)?; }
+        
+        if let Some(sid) = session_id { 
+            let path = crate::utils::paths::get_kv_dir(None).join(sid); 
+            println!("[GENERATE] Saving chunk KV cache to: {:?}", path);
+            if !path.exists() { let _ = fs::create_dir_all(&path); } 
+            self.save_kv_to_disk(&path)?; 
+        }
         Ok(chunk_size)
     }
 
