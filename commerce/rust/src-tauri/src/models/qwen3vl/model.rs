@@ -1,13 +1,12 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
 use candle_nn::{
-    Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, linear,
-    linear_no_bias, rms_norm,
+    Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, rms_norm,
 };
 
 use crate::{
     models::{
-        common::{GateUpDownMLP, TwoLinearMLP, eager_attention_forward, get_layer_norm},
+        common::{TwoLinearMLP, eager_attention_forward, get_layer_norm},
         qwen3vl::{
             config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
             quantized_model::QLinear, // [VRAM-OPTIM] Import QLinear
