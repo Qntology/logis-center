@@ -24,7 +24,6 @@ use crate::{
     },
 };
 
-// --- Global Helper Functions ---
 pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
     let bias = ct.tensor(reader, &format!("{name}.bias"), device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
@@ -182,14 +181,14 @@ impl QuantizedQwen3VLTextModel {
         } else if let Ok(tensor) = ct.tensor(&mut reader, "model.embed_tokens.weight", device) {
              let t = tensor.dequantize(device)?.to_dtype(dtype)?; let h = t.dim(1)?; (Embedding::new(t, h), h)
         } else { return Err(anyhow!("Failed to load embed_tokens")); };
-        let mut patched_cfg = config.clone(); patched_cfg.hidden_size = actual_h;
-        let mut layers = vec![]; let nl = if baking_only { 1 } else { patched_cfg.num_hidden_layers };
-        for i in 0..nl { layers.push(QuantizedQwen3VLTextDecoderLayer::new(&patched_cfg, ct, &mut reader, &format!("blk.{i}"), device, dtype, i, baking_only)?); }
-        let norm = get_rms_norm(ct, &mut reader, "output_norm", patched_cfg.rms_norm_eps, device, dtype)?;
-        let mut mrope = patched_cfg.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
-        let hh = patched_cfg.head_dim / 2; let ss: usize = mrope.iter().sum();
+        let mut p_cfg = config.clone(); p_cfg.hidden_size = actual_h;
+        let mut layers = vec![]; let nl = if baking_only { 1 } else { p_cfg.num_hidden_layers };
+        for i in 0..nl { layers.push(QuantizedQwen3VLTextDecoderLayer::new(&p_cfg, ct, &mut reader, &format!("blk.{i}"), device, dtype, i, baking_only)?); }
+        let norm = get_rms_norm(ct, &mut reader, "output_norm", p_cfg.rms_norm_eps, device, dtype)?;
+        let mut mrope = p_cfg.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
+        let hh = p_cfg.head_dim / 2; let ss: usize = mrope.iter().sum();
         if ss != hh && ss > 0 { let r = hh as f32 / ss as f32; mrope = mrope.iter().map(|&s| (s as f32 * r).round() as usize).collect(); }
-        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(patched_cfg.head_dim, patched_cfg.rope_theta), mrope_section: mrope, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(p_cfg.head_dim, p_cfg.rope_theta), mrope_section: mrope, mmap: mmap_handle, is_forced_cpu: device.is_cpu() })
     }
     pub fn forward(&mut self, embeds: &Tensor, seqlen_offset: usize, pos_ids: Option<&Tensor>, visual_mask: Option<&Tensor>, ds_embeds: Option<Vec<Tensor>>) -> Result<Tensor> {
         let (b, s, _) = embeds.dims3()?;
@@ -257,9 +256,9 @@ impl QuantizedQwen3VLTextModel {
         let dec = |res: (Tensor, Tensor, Tensor)| -> Result<Tensor> {
             if l_i == 0 { return Ok(res.0.to_device(td)?.to_dtype(dt)?); }
             let sc = res.2.to_scalar::<f32>()?; let pv = res.1.to_vec1::<u8>()?; 
-            let mut o = vec![0.0f32; os.iter().product()];
-            if l_i <= 4 { for i in 0..o.len() { o[i] = (((pv[i / 4] >> ((i % 4) * 2)) & 0x03) as f32 - 1.0) * sc; } }
-            else { for i in 0..o.len() { o[i] = if (pv[i / 8] >> (i % 8)) & 0x01 == 1 { sc } else { -sc }; } }
+            let total_el = os.iter().product(); let mut o = vec![0.0f32; total_el];
+            if l_i <= 4 { for i in 0..total_el { o[i] = (((pv[i / 4] >> ((i % 4) * 2)) & 0x03) as f32 - 1.0) * sc; } }
+            else { for i in 0..total_el { o[i] = if (pv[i / 8] >> (i % 8)) & 0x01 == 1 { sc } else { -sc }; } }
             Ok(Tensor::from_vec(o, os, &Device::Cpu)?.to_device(td)?.to_dtype(dt)?.contiguous()?)
         };
         Ok((dec(kr)?, dec(vr)?))
@@ -310,11 +309,11 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
     let f = std::fs::read(p)?; let st = safetensors::SafeTensors::deserialize(&f)?;
     let mut data = HashMap::new();
     for (name, view) in st.tensors() {
-        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") || name.ends_with(".format") { continue; }
+        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") || name.ends_with(".format") || name.ends_with(".min") { continue; }
         let is_p = name.ends_with(".packed"); let b_n = if is_p { name.strip_suffix(".packed").unwrap() } else { &name };
         let clean = b_n.replace("model.language_model.", "").replace("model.layers.", "layers.").replace("model.visual.", "visual.").replace("model.", "").replace("language_model.", "");
         if bo {
-            let is_l0 = clean.contains("layers.0.") || clean.contains("blocks.0.") || clean.contains("blk.0.");
+            let is_l0 = clean == "layers.0.self_attn.q_proj.weight" || clean == "layers.0.self_attn.k_proj.weight" || clean == "layers.0.self_attn.v_proj.weight" || clean == "layers.0.self_attn.o_proj.weight" || clean == "embed_tokens.weight" || clean == "norm.weight";
             let is_c = !clean.contains(".layers.") && !clean.contains(".blocks.") && !clean.contains("blk.");
             if !is_l0 && !is_c { continue; }
         }
@@ -337,9 +336,9 @@ pub fn load_tensors_from_true_iq0(p: &Path, d: &Device, dt: DType, bo: bool) -> 
             let ps: Vec<&str> = rest.splitn(2, '.').collect();
             let m = match ps[1] { "attn_q_norm.weight" => "self_attn.q_norm.weight", "attn_k_norm.weight" => "self_attn.k_norm.weight", s if s.starts_with("attn_q") => "self_attn.q_proj", s if s.starts_with("attn_k") => "self_attn.k_proj", s if s.starts_with("attn_v") => "self_attn.v_proj", s if s.starts_with("attn_output") => "self_attn.o_proj", s if s.starts_with("attn_norm") => "input_layernorm", s if s.starts_with("ffn_norm") => "post_attention_layernorm", s if s.starts_with("ffn_gate") => "mlp.gate_proj", s if s.starts_with("ffn_up") => "mlp.up_proj", s if s.starts_with("ffn_down") => "mlp.down_proj", _ => ps[1] };
             t_n = format!("language_model.layers.{}.{}", ps[0], m);
-        } else if clean.contains("embed_tokens") || clean.contains("token_embd") { t_n = "language_model.embed_tokens.weight".to_string(); }
-        else if clean.contains("output_norm") || (clean.contains("norm.weight") && !clean.contains("layers")) { t_n = "language_model.norm.weight".to_string(); }
-        else if clean.contains("lm_head") || clean.eq("output.weight") { t_n = "lm_head.weight".to_string(); }
+        } else if clean == "embed_tokens.weight" || clean == "token_embd.weight" { t_n = "language_model.embed_tokens.weight".to_string(); }
+        else if clean == "norm.weight" || clean == "output_norm.weight" { t_n = "language_model.norm.weight".to_string(); }
+        else if clean == "lm_head.weight" || clean == "output.weight" { t_n = "lm_head.weight".to_string(); }
 
         let ft = if is_p {
             let sv = st.tensor(&format!("{b_n}.shape"))?; let s: Vec<usize> = sv.data().chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect();
@@ -385,15 +384,15 @@ impl QuantizedQwen3VLModel {
         let lh = get_qlinear(ctm, &mut r, "lm_head", td, dt)?;
         Ok(Self { config: cfg.clone(), visual, language_model: lm, lm_head: lh, text_device: td.clone(), vision_device: vd.clone() })
     }
-    pub fn forward(&mut self, ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, _vthw: Option<&Tensor>, cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let (bs, sl) = ids.dims2()?; let mut embs = self.language_model.embed_tokens.forward(&ids.flatten_all()?)?.reshape((bs, sl, ()))?;
+    pub fn forward(&mut self, input_ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, _vthw: Option<&Tensor>, cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        let (bs, sl) = input_ids.dims2()?; let mut embs = self.language_model.embed_tokens.forward(&input_ids.flatten_all()?)?.reshape((bs, sl, ()))?;
         if let (Some(pv), Some(thw)) = (pv, thw) {
             let (ie, _) = self.visual.forward(pv, thw)?; let ie = ie.to_device(&self.text_device)?;
-            let mask = ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], ids.device())?)?.to_dtype(DType::U32)?;
-            embeds_scatter_dim0(&mut embs, &ie, &mask)?;
+            let mask = input_ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], input_ids.device())?)?.to_dtype(DType::U32)?;
+            embs = masked_scatter_dim0(&embs, &ie, &mask)?;
         }
         let pos = match cp { Some(p) => p.flatten_all()?.i(0)?.to_scalar::<u32>()? as usize, None => offset };
-        let pids = Tensor::arange(pos as u32, (pos + sl) as u32, ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))?;
+        let pids = Tensor::arange(pos as u32, (pos + sl) as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))?;
         let out = self.language_model.forward(&embs, offset, Some(&pids), None, None)?;
         Ok(self.lm_head.forward(&out.narrow(1, out.dim(1)? - 1, 1)?)?)
     }
@@ -401,8 +400,4 @@ impl QuantizedQwen3VLModel {
     pub fn save_kv_cache(&mut self, p: &Path, c: bool, b: usize) -> Result<()> { self.language_model.save_kv_cache(p, c, b) }
     pub fn load_kv_cache(&mut self, p: &Path, d: &Device, e: usize, u: usize) -> Result<()> { self.language_model.load_kv_cache(p, d, e, u) }
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
-}
-
-fn embeds_scatter_dim0(embs: &mut Tensor, ie: &Tensor, mask: &Tensor) -> Result<()> {
-    *embs = masked_scatter_dim0(embs, ie, mask)?; Ok(())
 }

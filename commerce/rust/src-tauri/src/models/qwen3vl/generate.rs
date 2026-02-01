@@ -74,7 +74,7 @@ impl Qwen3VLGenerateModel {
         Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, high_fidelity) 
     }
     pub fn init_with_config(path: &str, tokenizer_path: Option<&str>, config_path: Option<&str>, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>, force_text_only: bool, baking_only: bool, _high_fidelity: bool) -> Result<Self> {
-        let path = if let Some(s) = path.strip_prefix(r"\\?\") { s } else { path };
+        let path = if let Some(s) = path.strip_prefix(r"\\\\") { s } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
         let cfg_path = config_path.unwrap_or(path);
         let chat_template = ChatTemplate::init(tok_path)?;
