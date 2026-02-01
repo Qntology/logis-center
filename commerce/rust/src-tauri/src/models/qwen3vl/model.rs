@@ -1177,25 +1177,25 @@ impl Qwen3VLModel {
         let vb_m = vb.pp("model");
         let config = config.clone();
         
+        // [SMART-PROBE] Improved existence check that handles ShapeMismatch
+        let exists = |path: &str| -> bool {
+            match vb.get_with_hints((1,), path, Init::Const(0.)) {
+                Ok(_) => true,
+                Err(candle_core::Error::ShapeMismatch { .. }) => true,
+                Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => true,
+                _ => false,
+            }
+        };
+
         // [SMART-PROBE] Dynamically find the Vision Model root
         let visual = if !force_text_only && config.vision_config.is_some() {
             let v_config = config.vision_config.as_ref().unwrap();
             
-            // Check multiple possible vision roots using stable layer anchors
-            let probe_v = |path: &str| -> bool {
-                let full_n = format!("{}.patch_embed.proj.weight", path);
-                let full_n2 = format!("{}.patch_embd.weight", path);
-                let full_n3 = format!("{}.blk.0.ln1.weight", path);
-                vb.get_with_hints((1,), &full_n, Init::Const(0.)).is_ok() ||
-                vb.get_with_hints((1,), &full_n2, Init::Const(0.)).is_ok() ||
-                vb.get_with_hints((1,), &full_n3, Init::Const(0.)).is_ok()
-            };
-
-            let vb_v = if probe_v("model.visual") {
+            let vb_v = if exists("model.visual.patch_embed.proj.weight") || exists("model.visual.patch_embd.weight") {
                 Some(vb_m.pp("visual")) 
-            } else if probe_v("visual") {
+            } else if exists("visual.patch_embed.proj.weight") || exists("visual.patch_embd.weight") {
                 Some(vb.pp("visual"))
-            } else if probe_v("v") {
+            } else if exists("v.patch_embd.weight") || exists("v.blk.0.ln1.weight") {
                 Some(vb.pp("v"))
             } else {
                 None
@@ -1218,20 +1218,13 @@ impl Qwen3VLModel {
         let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
         
         // [SMART-PROBE] Dynamically find the Language Model root using Layer 0 Anchor
-        // Layer 0's input_layernorm is the most stable anchor across all model variants.
-        let probe_lm = |path: &str| -> bool {
-            let full_n = format!("{}.layers.0.input_layernorm.weight", path);
-            vb.get_with_hints((1,), &full_n, Init::Const(0.)).is_ok() ||
-            vb.get_with_hints((1,), &format!("{}.weight", full_n), Init::Const(0.)).is_ok() // Some tools export as .weight.weight
-        };
-
-        let vb_lm = if probe_lm("model.language_model") {
+        let vb_lm = if exists("model.language_model.layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Deep root: model.language_model");
             vb_m.pp("language_model") 
-        } else if probe_lm("model") {
+        } else if exists("model.layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Intermediate root: model");
             vb_m.clone()
-        } else if probe_lm("") {
+        } else if exists("layers.0.input_layernorm.weight") {
             println!("[MODEL-PROBE] Selected Flat root: <root>");
             vb.clone()
         } else {
