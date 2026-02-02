@@ -148,9 +148,9 @@ impl Qwen3VLGenerateModel {
             }
             
             println!("[DEBUG-GEN] Building VarBuilder from {} tensors...", merged_data.len());
-            let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);
+            let vb = VarBuilder::from_tensors(merged_data.clone(), dtype, &text_dev);
             println!("[MODEL-DEBUG] Constructing Qwen3VLModel...");
-            let model = Qwen3VLModel::new_ext(m_cfg, vb, force_text_only, baking_only || is_anchor)?;
+            let model = Qwen3VLModel::new_ext(m_cfg, vb, Some(merged_data), force_text_only, baking_only || is_anchor)?;
             println!("[MODEL-DEBUG] Qwen3VLModel constructed. Building GenerateModel...");
             return Ok(Self { 
                 chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, 
