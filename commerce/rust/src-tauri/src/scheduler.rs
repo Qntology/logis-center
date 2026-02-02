@@ -85,12 +85,14 @@ pub fn log_task_progress(app_handle: &tauri::AppHandle, task_id: &str, payload: 
 
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
-    model: Arc<LogisModel>, // Changed to Arc<LogisModel> to match main.rs likely usage, or keep existing signature if wrapped
+    model: Arc<LogisModel>, 
     cancellation_token: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
 ) {
     println!("[Scheduler] Background worker waiting for UI Ready signal...");
     
+    clear_all_temp_data(Some(&app_handle));
+
     // Cleanup zombie tasks on startup
     {
         let store_clone = store.clone();
@@ -133,8 +135,8 @@ pub async fn start_background_worker(
 
             if pending_tasks.is_empty() {
                 tokio::select! {
-                    _ = sleep(Duration::from_secs(delay_secs)) => { delay_secs = (delay_secs + 1).min(10); } 
-                    _ = TASK_QUEUED_SIGNAL.notified() => { delay_secs = 1; } 
+                    _ = sleep(Duration::from_secs(delay_secs)) => { delay_secs = (delay_secs + 1).min(10); }
+                    _ = TASK_QUEUED_SIGNAL.notified() => { delay_secs = 1; }
                 }
                 continue;
             } else {
@@ -218,12 +220,19 @@ async fn process_task(
     let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
     if kv_path.exists() { println!("[PROCESS] Found existing KV cache for {}", task.id); }
 
+    // [SSD-BRIDGE] Start warming up 2B weights in background RAM immediately
+    let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
+        .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
+    if let Some(p) = large_model_path_hint {
+        let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
+    }
+
     // Initial Progress Log
-    log_task_progress(app_handle, &task.id, &json!({ 
-        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋" 
+    log_task_progress(app_handle, &task.id, &json!({
+        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
     }));
 
-    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); } 
+    if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
@@ -236,7 +245,7 @@ async fn process_task(
     });
 
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
-    if url.is_empty() { return Ok(()); } 
+    if url.is_empty() { return Ok(()); }
 
     // 2. Fetch & Convert to PUG
     let light_pug = {
@@ -277,7 +286,7 @@ async fn process_task(
     let mut selector_info = json!({});
     
     {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); } 
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
         let type_prompt = parsing::page_type_prompt();
@@ -293,7 +302,7 @@ async fn process_task(
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?; // Save Native Snapshot
+                 gen.save_kv_to_disk(&kv_dir)?;
              }
         }
 
@@ -307,14 +316,15 @@ async fn process_task(
         println!("[Scheduler] Classified as: {}", page_type);
     }
     
-    if page_type == "unknown" { return Ok(()); } 
+    if page_type == "unknown" { return Ok(()); }
     
     // --- PIPELINE STEP B: SELECTORS ---
     // Clear resources between heavy steps
     model.deep_purge_resources().await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
     {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); } 
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
@@ -328,7 +338,7 @@ async fn process_task(
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?; 
+                 gen.save_kv_to_disk(&kv_dir)?;
              }
         }
 
@@ -396,7 +406,7 @@ async fn process_task(
                  if let Some(gen) = gen_guard.as_mut() {
                      gen.clear_kv_cache();
                      gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                     gen.save_kv_to_disk(&kv_dir)?; 
+                     gen.save_kv_to_disk(&kv_dir)?;
                  }
              }
              
@@ -409,6 +419,7 @@ async fn process_task(
 
     // --- PHASE 3: HANDOVER & EMBEDDING ---
     model.unload_generator().await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
     
     // Normalize Data
     if let Some(obj) = extracted_data.as_object_mut() {
@@ -445,4 +456,191 @@ async fn process_task(
 
 fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) {
     let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
+}
+
+// [3번 가속: PRE-FETCH] OS 페이지 캐시에 무게추 파일을 미리 로드함
+fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
+    use std::io::Read;
+    println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
+    if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let p = entry.path();
+                    if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
+                        if let Ok(mut file) = std::fs::File::open(p) {
+                            let mut buffer = [0u8; 1024 * 1024]; // 1MB buffer
+                            // 파일 전체를 읽어서 OS가 램에 캐싱하도록 유도함
+                            while let Ok(n) = file.read(&mut buffer) {
+                                if n == 0 { break; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("[PRE-FETCH] Warm-up complete.");
+    Ok(())
+}
+
+fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
+    println!("[Cleanup] Clearing all temporary data directories...");
+    utils::paths::cleanup_temp_dirs(app_handle);
+}
+
+async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>) -> Result<()> {
+    use nvml_wrapper::Nvml;
+    use sysinfo::System;
+    
+    let mut sys = System::new_all();
+    let nvml = Nvml::init().ok();
+    
+    let target_vram_bytes = target_vram_mb * 1024 * 1024;
+    let target_ram_bytes = target_ram_mb * 1024 * 1024;
+
+    let mut last_vram = 0;
+    let mut stable_ticks = 0;
+    let mut last_report = std::time::Instant::now();
+    let start_time = std::time::Instant::now();
+
+    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB)...", target_vram_mb);
+
+    loop {
+        if let Some(token) = cancellation_token {
+            if token.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Task cancelled during resource wait"));
+            }
+        }
+
+        sys.refresh_memory(); 
+        let current_ram = sys.available_memory();
+        let mut current_vram = 0;
+        let mut has_gpu = false;
+
+        if let Some(ref nvml_inst) = nvml {
+            if let Ok(count) = nvml_inst.device_count() {
+                for i in 0..count {
+                    if let Ok(dev) = nvml_inst.device_by_index(i) {
+                        if let Ok(mem) = dev.memory_info() {
+                            if mem.free > current_vram { current_vram = mem.free; }
+                            has_gpu = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
+        let meets_ram = current_ram >= target_ram_bytes;
+        
+        if meets_vram && meets_ram {
+            break; // Perfect state reached
+        }
+
+        // [STABILITY-LOGIC] Even if below target, if memory release has stopped changing, 
+        // it means we've recovered all we can. Don't wait forever.
+        let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
+        if delta < 5_000_000 { // Change < 5MB
+            stable_ticks += 1;
+        } else {
+            stable_ticks = 0;
+        }
+
+        // If stable for 3 seconds AND we have at least 1.2GB free (enough for Large model weights)
+        if stable_ticks >= 6 && current_vram > 1_200_000_000 {
+            println!("[RESOURCE-WATCH] Memory stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
+            break;
+        }
+
+        if last_report.elapsed().as_secs() >= 5 {
+            println!("[RESOURCE-DIAG] Waiting... VRAM: {:.2} GB free (Target: {:.2} GB)", 
+                current_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0);
+            last_report = std::time::Instant::now();
+        }
+
+        // Absolute maximum wait 20s
+        if start_time.elapsed().as_secs() > 20 {
+            println!("[RESOURCE-WATCH] Max wait reached. Proceeding anyway.");
+            break;
+        }
+
+        last_vram = current_vram;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
+
+// Helper to chunk text, strictly respecting Pug line boundaries (\n)
+fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+
+    while start < text.len() {
+        let mut end = (start + target_size).min(text.len());
+
+        // [BACKTRACKING] If mid-line, move back until we find a newline
+        if end < text.len() {
+            let mut temp_end = end;
+            while temp_end > start && bytes[temp_end] != b'\n' {
+                temp_end -= 1;
+            }
+            
+            // If found a newline, use it as the end
+            if temp_end > start {
+                end = temp_end + 1; // Include the \n
+            } else {
+                // No newline found in the whole chunk? Force char boundary to avoid hang
+                while end < text.len() && !text.is_char_boundary(end) {
+                    end += 1;
+                }
+            }
+        } else {
+            // Reached the end of string
+            end = text.len();
+        }
+
+        let slice = &text[start..end];
+        if !slice.trim().is_empty() {
+            chunks.push(slice.to_string());
+        }
+        start = end;
+    }
+    chunks
+}
+
+// Deep merge for JSON objects
+fn merge_json_results(target: &mut Value, source: &Value) {
+    if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
+        for (k, v) in source_obj {
+            // If value is null or empty string/array, ignore
+            if v.is_null() { continue; }
+            if let Some(s) = v.as_str() { if s.is_empty() { continue; } }
+            if let Some(a) = v.as_array() { if a.is_empty() { continue; } }
+            
+            // If target doesn't have it or target is empty, overwrite
+            let should_update = match target_obj.get(k) {
+                None => true,
+                Some(tv) => {
+                    tv.is_null() || 
+                    (tv.is_string() && tv.as_str() == Some("")) ||
+                    (tv.is_array() && tv.as_array().unwrap().is_empty())
+                }
+            };
+
+            if should_update {
+                target_obj.insert(k.clone(), v.clone());
+            } else if let Some(target_inner) = target_obj.get_mut(k) {
+                // If both are objects, recurse
+                if target_inner.is_object() && v.is_object() {
+                    merge_json_results(target_inner, v);
+                }
+                // Lists? Simply append for now (might duplicate, but safe for search)
+                else if let (Some(ta), Some(sa)) = (target_inner.as_array_mut(), v.as_array()) {
+                    ta.extend(sa.clone());
+                }
+            }
+        }
+    }
 }
