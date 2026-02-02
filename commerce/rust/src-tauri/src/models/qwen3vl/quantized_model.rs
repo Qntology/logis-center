@@ -26,8 +26,26 @@ use crate::{
 };
 
 pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
+    let packed_name = format!("{}.weight.packed", name);
+    let scales_name = format!("{}.weight.scales", name);
+    let shape_name = format!("{}.weight.shape", name);
+    let bias_name = format!("{}.bias", name);
+
+    if let (Ok(packed), Ok(scales), Ok(shape_t)) = (
+        ct.tensor(reader, &packed_name, device),
+        ct.tensor(reader, &scales_name, device),
+        ct.tensor(reader, &shape_name, device)
+    ) {
+        let mut packed_tensor = packed.dequantize(device)?;
+        if packed_tensor.dtype() != DType::U32 { packed_tensor = packed_tensor.to_dtype(DType::U32)?; }
+        let scales_tensor = scales.dequantize(device)?.to_dtype(DType::F32)?;
+        let shape_vec: Vec<usize> = shape_t.dequantize(device)?.to_dtype(DType::F32)?.to_vec1::<f32>()?.iter().map(|&x| x as usize).collect();
+        let bias = ct.tensor(reader, &bias_name, device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
+        return Ok(QLinear::new(packed_tensor, scales_tensor, shape_vec, bias, device.clone()));
+    }
+
     let weight = ct.tensor(reader, &format!("{}.weight", name), device)?;
-    let bias = ct.tensor(reader, &format!("{}.bias", name), device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
+    let bias = ct.tensor(reader, &bias_name, device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
     let w_dequant = weight.dequantize(device)?.to_dtype(DType::F32)?;
     let s = w_dequant.dims().to_vec();
     let total_el = s.iter().product::<usize>();
@@ -46,11 +64,13 @@ pub fn get_qlinear_safe(vb: VarBuilder, name: &str, map: Option<&HashMap<String,
     let packed_path = get_path(&format!("{}.packed", name));
     if let Some(m) = map {
         if let Some(p) = m.get(&packed_path) {
+            let mut p_val = p.clone();
+            if p_val.dtype() != DType::U32 { p_val = p_val.to_dtype(DType::U32)?; }
             let s = m.get(&get_path(&format!("{}.scales", name))).ok_or(anyhow!("Missing scales for {}", name))?.clone().to_dtype(DType::F32)?;
             let sh_t = m.get(&get_path(&format!("{}.shape", name))).ok_or(anyhow!("Missing shape for {}", name))?.clone();
             let sh: Vec<usize> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
             let b = m.get(&get_path(&format!("{}.bias", name))).cloned();
-            return Ok(QLinear::new(p.clone(), s, sh, b, vb.device().clone()));
+            return Ok(QLinear::new(p_val, s, sh, b, vb.device().clone()));
         }
     }
     let w = vb.get_with_hints((1,), name, candle_nn::Init::Const(0.0))?;
@@ -100,15 +120,11 @@ impl QLinear {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, s, h) = xs.dims3()?;
         let weight = self.dequantize_on_the_fly(xs.device())?;
-        
-        // Ensure inputs are F32 and Contiguous for maximum stability
+        // CRITICAL: Ensure inputs to matmul are F32 and Contiguous
         let xs_flat = xs.reshape((b * s, h))?.to_dtype(DType::F32)?.contiguous()?;
         let weight_f32 = weight.to_dtype(DType::F32)?.contiguous()?;
-        
         let mut out = xs_flat.matmul(&weight_f32.t()?)?;
-        if let Some(bias) = &self.bias { 
-            out = out.broadcast_add(&bias.to_dtype(DType::F32)?)?; 
-        }
+        if let Some(bias) = &self.bias { out = out.broadcast_add(&bias.to_dtype(DType::F32)?)?; }
         Ok(out.reshape((b, s, ()))?.to_dtype(xs.dtype())?)
     }
     fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
@@ -116,20 +132,14 @@ impl QLinear {
         let total_el = s.iter().product::<usize>();
         let packed_cpu = self.packed_weight.to_device(&Device::Cpu)?;
         let scales_cpu = self.scales.to_device(&Device::Cpu)?;
-        
-        let packed_data = packed_cpu.to_vec1::<u32>()?;
+        let packed_data = if packed_cpu.dtype() != DType::U32 { packed_cpu.to_dtype(DType::U32)?.to_vec1::<u32>()? } else { packed_cpu.to_vec1::<u32>()? };
         let scales_data = scales_cpu.to_vec1::<f32>()?;
-        
         let mut weights = vec![0.0f32; total_el];
         weights.par_chunks_exact_mut(32).enumerate().for_each(|(b_i, block_out)| {
             if b_i < scales_data.len() && b_i < packed_data.len() {
                 let s_val = scales_data[b_i];
                 let b = packed_data[b_i];
-                for bit in 0..32 { 
-                    if b_i * 32 + bit < total_el {
-                        block_out[bit] = s_val * (if (b >> bit) & 1 != 0 { 1.0 } else { -1.0 }); 
-                    }
-                }
+                for bit in 0..32 { if b_i * 32 + bit < total_el { block_out[bit] = s_val * (if (b >> bit) & 1 != 0 { 1.0 } else { -1.0 }); } }
             }
         });
         Ok(Tensor::from_vec(weights, s.as_slice(), device)?.to_dtype(self.dtype)?)
@@ -272,7 +282,16 @@ impl QuantizedQwen3VLTextModel {
         let (bs, sl, _) = x.dims3()?;
         let pi = match pids { Some(ids) => ids.clone(), None => Tensor::arange(offset as u32, (sl + offset) as u32, x.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))? };
         let (cos, sin) = self.rotary_emb.forward(&pi, x.dtype(), self.mrope_section.clone())?;
-        let mask = if sl <= 1 { None } else { Some(prepare_causal_attention_mask(bs, sl, offset, x.device())?) };
+        
+        // --- GPU-Only Memory Efficient Masking (Verified by Python) ---
+        let mask = if sl <= 1 { None } else {
+            let q_idx = Tensor::arange(0u32, sl as u32, x.device())?.reshape((1, 1, sl, 1))?;
+            let kv_idx = Tensor::arange(0u32, (offset + sl) as u32, x.device())?.reshape((1, 1, 1, offset + sl))?;
+            let m = kv_idx.broadcast_gt(&(q_idx.broadcast_add(&Tensor::new(offset as u32, x.device())?)?))?;
+            let m = m.to_dtype(x.dtype())?.affine(-65504.0, 0.0)?;
+            Some(m)
+        };
+        
         let mut x = x.clone(); let limit = if self.is_baking { 1 } else { self.layers.len() };
         for (i, layer) in self.layers.iter_mut().enumerate().take(limit) {
             x = layer.forward_with_params(&x, &cos, &sin, mask.as_ref())?;
@@ -405,15 +424,23 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _
         println!("[DEBUG-LOAD] Key: {} | ST-DType: {:?}", name, view.dtype());
         let shape = view.shape().to_vec(); let data = view.data();
         if name.ends_with(".packed") {
+             // CRITICAL: Interpret bytes directly as U32 to solve I32/I64 mismatch issues
              let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
-             let mut new_shape = shape.clone(); if let Some(last) = new_shape.last_mut() { if *last == data.len() { *last /= 4; } }
+             let mut new_shape = shape.clone(); 
+             if let Some(last) = new_shape.last_mut() {
+                 if *last == data.len() { *last /= 4; } // Adjust if shape was in bytes
+             }
              println!("[DEBUG-LOAD]   -> Reinterpreted as U32. New Shape: {:?}", new_shape);
              tensors.insert(name.to_string(), Tensor::from_slice(u_data, new_shape.as_slice(), &Device::Cpu)?.to_device(device)?);
         } else {
             match view.dtype() {
                 safetensors::Dtype::F32 => { let f_data: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
                 safetensors::Dtype::U32 => { let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) }; tensors.insert(name.to_string(), Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
-                safetensors::Dtype::I32 => { let i_data: &[i32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len() / 4) }; let u_data: Vec<u32> = i_data.iter().map(|&x| x as u32).collect(); tensors.insert(name.to_string(), Tensor::from_vec(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
+                safetensors::Dtype::I32 => { 
+                    let i_data: &[i32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len() / 4) }; 
+                    let u_data: Vec<u32> = i_data.iter().map(|&x| x as u32).collect(); 
+                    tensors.insert(name.to_string(), Tensor::from_vec(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); 
+                },
                 safetensors::Dtype::U8 | safetensors::Dtype::I8 | safetensors::Dtype::BOOL => { tensors.insert(name.to_string(), Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
                 safetensors::Dtype::F16 => { let f_data: &[half::f16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
                 safetensors::Dtype::BF16 => { let f_data: &[half::bf16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },

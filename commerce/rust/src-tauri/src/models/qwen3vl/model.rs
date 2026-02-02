@@ -251,7 +251,11 @@ impl Qwen3VLTextModel {
         let pi = match pids { Some(ids) => ids.clone(), None => Tensor::arange(offset as u32, (sl + offset) as u32, x.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))? };
         let (cos, sin) = self.rotary.forward(&pi, x.dtype(), self.mrope.clone())?;
         
-        let mask = if sl <= 1 { None } else {
+        // --- GPU-Only Memory Efficient Masking (Verified by Python) ---
+        let mask = if sl <= 1 {
+            None 
+        } else {
+            // (1, 1, query_len, total_kv_len)
             let q_idx = Tensor::arange(0u32, sl as u32, x.device())?.reshape((1, 1, sl, 1))?;
             let kv_idx = Tensor::arange(0u32, (offset + sl) as u32, x.device())?.reshape((1, 1, 1, offset + sl))?;
             let m = kv_idx.broadcast_gt(&(q_idx.broadcast_add(&Tensor::new(offset as u32, x.device())?)?))?;
@@ -270,7 +274,11 @@ impl Qwen3VLTextModel {
     }
     pub fn clear_kv_cache(&mut self) { for l in &mut self.layers { if let Some(li) = l { li.clear_kv_cache() } } }
     pub fn get_kv_len(&self) -> usize {
-        for layer in &self.layers { if let Some(l) = layer { if let Some((k, _)) = &l.attn.kv_cache { return k.dim(2).unwrap_or(0); } } }
+        for layer in &self.layers {
+            if let Some(l) = layer {
+                if let Some((k, _)) = &l.attn.kv_cache { return k.dim(2).unwrap_or(0); }
+            }
+        }
         0
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> {
@@ -300,13 +308,21 @@ impl Qwen3VLModel {
         else if safe_probe(&vb, "model.layers.0.input_layernorm.weight", map_r) { vb.pp("model") }
         else { vb.pp("model").pp("language_model") };
         let lm = Qwen3VLTextModel::new(t_cfg, vb_lm, map_r)?;
-        let head = if safe_probe(&vb, "model.language_model.lm_head.weight", map_r) { get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)? }
-        else if safe_probe(&vb, "model.lm_head.weight", map_r) { get_qlinear_safe(vb.pp("model").pp("lm_head"), "weight", map_r)? }
-        else if bo {
+        if bo && !lm.layers.is_empty() && lm.layers[0].is_none() { return Err(anyhow!("Layer 0 missing")); }
+        let head = if safe_probe(&vb, "model.language_model.lm_head.weight", map_r) {
+            get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
+        } else if safe_probe(&vb, "model.lm_head.weight", map_r) {
+            get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
+        } else if bo {
             let tc = cfg.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
             let shape = vec![tc.vocab_size, tc.hidden_size];
-            QLinear::new(Tensor::zeros((1,), DType::U32, vb.device())?, Tensor::ones((1,), DType::F32, vb.device())?, shape, None, vb.device().clone())
-        } else { get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)? };
+            let dev = vb.device();
+            let p = Tensor::zeros(((shape[0]*shape[1]+31)/32,), DType::U32, dev)?;
+            let s = Tensor::ones(((shape[0]*shape[1]+31)/32,), DType::F32, dev)?;
+            QLinear::new(p, s, shape, None, dev.clone())
+        } else {
+             get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
+        };
         let mut model = Self { config: cfg, visual: vis, language_model: lm, lm_head: head, is_baking: bo }; model.set_baking(bo); Ok(model)
     }
     pub fn forward(&mut self, ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, vthw: Option<&Tensor>, _cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
@@ -318,7 +334,9 @@ impl Qwen3VLModel {
         } }
         let (pids, _) = Qwen3VLModel::get_rope_index_static(&self.config, ids, thw, vthw, None)?;
         let out = self.language_model.forward(&embs, offset, Some(&pids), im.as_ref(), dse)?;
-        if self.is_baking { return Ok(out.narrow(1, out.dim(1)? - 1, 1)?); }
+        if self.is_baking {
+            return Ok(out.narrow(1, out.dim(1)? - 1, 1)?);
+        }
         Ok(self.lm_head.forward(&out.narrow(1, out.dim(1)? - 1, 1)?)?)
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> { if let Some(v) = &mut self.visual { v.to_device(d)?; } self.language_model.to_device(d)?; Ok(()) }
