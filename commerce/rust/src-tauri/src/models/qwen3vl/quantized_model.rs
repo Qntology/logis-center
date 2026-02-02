@@ -32,35 +32,43 @@ pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, re
 
 pub fn get_qlinear_safe(vb: VarBuilder, name: &str, map: Option<&HashMap<String, Tensor>>) -> Result<QLinear> {
     let prefix = vb.prefix();
-    let get_path = |p: &str| -> String { if prefix.is_empty() { p.to_string() } else if prefix.ends_with('.') { format!("{}{}", prefix, p) } else { format!("{}.{}", prefix, p) } };
-    let packed_path = get_path(&format!("{}.packed", name));
+    let map_r = map.ok_or(anyhow!("Map required"))?;
     
-    if let Some(m) = map {
-        if let Some(p) = m.get(&packed_path) {
-            let s = m.get(&get_path(&format!("{}.scales", name))).ok_or(anyhow!("Missing scales"))?.to_dtype(DType::F32)?;
-            let sh_t = m.get(&get_path(&format!("{}.shape", name))).ok_or(anyhow!("Missing shape"))?;
-            let sh: Vec<usize> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-            let b = m.get(&get_path(&format!("{}.bias", name))).cloned();
-            
-            let total_el: usize = sh.iter().product();
-            let p_cpu = p.to_device(&Device::Cpu)?;
-            let p_u32 = p_cpu.to_dtype(DType::U32)?;
-            let p_data = p_u32.to_vec1::<u32>()?;
-            let s_data = s.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
-            
-            let mut weights = vec![0.0f32; total_el];
-            weights.par_chunks_exact_mut(32).enumerate().for_each(|(b_i, block)| {
-                if b_i < s_data.len() && b_i < p_data.len() {
-                    let sc = s_data[b_i]; let bits = p_data[b_i];
-                    for i in 0..32 { if b_i * 32 + i < total_el { block[i] = sc * (if (bits >> i) & 1 != 0 { 1.0 } else { -1.0 }); } }
-                }
-            });
-            let w_tensor = Tensor::from_vec(weights, sh.as_slice(), vb.device())?.to_dtype(vb.dtype())?;
-            return Ok(QLinear::new_direct(w_tensor, b));
+    let get_c = |suffix: &str| -> Result<Tensor> {
+        let full_name = if name.is_empty() { suffix.to_string() } else { format!("{}.{}", name, suffix) };
+        let prefixes = vec!["model.", "language_model.", "model.language_model.", ""];
+        for pre in prefixes {
+            let path = format!("{}{}{}", pre, prefix, full_name);
+            if let Some(t) = map_r.get(&path) { return Ok(t.clone()); }
         }
+        Err(anyhow!("Component not found: {} in {}", suffix, prefix))
+    };
+
+    if let Ok(p) = get_c("weight.packed") {
+        let s = get_c("weight.scales")?.to_dtype(DType::F32)?;
+        let sh_t = get_c("weight.shape")?;
+        let sh: Vec<usize> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+        let b = get_c("weight.bias").ok();
+        
+        let total_el: usize = sh.iter().product();
+        let p_cpu = p.to_device(&Device::Cpu)?;
+        let p_u32 = p_cpu.to_dtype(DType::U32)?;
+        let p_data = p_u32.to_vec1::<u32>()?;
+        let s_data = s.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+        
+        let mut weights = vec![0.0f32; total_el];
+        weights.par_chunks_exact_mut(32).enumerate().for_each(|(b_i, block)| {
+            if b_i < s_data.len() && b_i < p_data.len() {
+                let sc = s_data[b_i]; let bits = p_data[b_i];
+                for i in 0..32 { if b_i * 32 + i < total_el { block[i] = sc * (if (bits >> i) & 1 != 0 { 1.0 } else { -1.0 }); } }
+            }
+        });
+        return Ok(QLinear::new_direct(Tensor::from_vec(weights, sh.as_slice(), vb.device())?.to_dtype(vb.dtype())?, b));
     }
-    let w = vb.get_with_hints((1,), name, candle_nn::Init::Const(0.0))?.to_dtype(vb.dtype())?;
-    Ok(QLinear::new_direct(w, None))
+    
+    let w_key = if name.is_empty() { "weight".to_string() } else { format!("{}.weight", name) };
+    let w = if let Ok(t) = get_c(&w_key) { t } else { vb.get_with_hints((1,), &w_key, candle_nn::Init::Const(0.0))? };
+    Ok(QLinear::new_direct(w.to_dtype(vb.dtype())?, None))
 }
 
 #[derive(Clone)] pub struct QuantizedQwen3VLTextAttention { pub q_proj: QLinear, pub k_proj: QLinear, pub v_proj: QLinear, pub o_proj: QLinear, pub q_norm: RmsNorm, pub k_norm: RmsNorm, pub num_attention_heads: usize, pub num_key_value_heads: usize, pub head_dim: usize, pub num_kv_groups: usize, pub scaling: f64, pub kv_cache: Option<(Tensor, Tensor)> }
@@ -93,6 +101,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let res_mlp = xs.clone(); let xs_mlp = n.forward(&xs)?;
             let gate = candle_nn::ops::silu(&g.forward(&xs_mlp)?)?; let up = u.forward(&xs_mlp)?; Ok(res_mlp.add(&d.forward(&gate.mul(&up)?)?)?)
         } else { Ok(xs) }
+    }
+    pub fn to_device(&mut self, d: &Device) -> Result<()> {
+        self.self_attn.to_device(d)?; self.input_layernorm.weight = self.input_layernorm.weight.to_device(d)?;
+        if let Some(g) = &mut self.mlp_gate { g.to_device(d)?; } if let Some(u) = &mut self.mlp_up { u.to_device(d)?; } if let Some(d_p) = &mut self.mlp_down { d_p.to_device(d)?; }
+        if let Some(n) = &mut self.post_attention_layernorm { n.weight = n.weight.to_device(d)?; } Ok(())
     }
     pub fn new<R: std::io::Seek + std::io::Read>(cfg: &Qwen3VLTextConfig, ct: &gguf_file::Content, r: &mut R, b_n: &str, dev: &Device, dt: DType, _l_i: usize, b_o: bool) -> Result<Self> {
         let is_g = b_n.contains("blk.");
@@ -184,17 +197,20 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _
         if name.ends_with(".packed") {
              let u_data: Vec<u32> = data.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
              let mut new_shape = shape.clone(); if let Some(last) = new_shape.last_mut() { if *last == data.len() { *last /= 4; } }
-             tensors.insert(name.to_string(), Tensor::from_vec(u_data, new_shape.as_slice(), device)?);
+             let t = Tensor::from_vec(u_data, new_shape.as_slice(), device)?;
+             tensors.insert(name.to_string(), t);
         } else {
-            match view.dtype() {
-                safetensors::Dtype::F32 => { tensors.insert(name.to_string(), Tensor::from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()/4) }, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
-                safetensors::Dtype::U32 => { tensors.insert(name.to_string(), Tensor::from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len()/4) }, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
-                safetensors::Dtype::I32 => { 
+            let t = match view.dtype() {
+                safetensors::Dtype::F32 => tensors.insert(name.to_string(), Tensor::from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len()/4) }, shape.as_slice(), &Device::Cpu)?.to_device(device)?),
+                safetensors::Dtype::U32 => tensors.insert(name.to_string(), Tensor::from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len()/4) }, shape.as_slice(), &Device::Cpu)?.to_device(device)?),
+                safetensors::Dtype::I32 => {
                     let u_data: Vec<u32> = data.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
-                    tensors.insert(name.to_string(), Tensor::from_vec(u_data, shape.as_slice(), device)?);
+                    tensors.insert(name.to_string(), Tensor::from_vec(u_data, shape.as_slice(), device)?)
                 },
-                _ => { tensors.insert(name.to_string(), Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
-            }
+                safetensors::Dtype::F16 => tensors.insert(name.to_string(), Tensor::from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len()/2) }, shape.as_slice(), &Device::Cpu)?.to_device(device)?),
+                safetensors::Dtype::BF16 => tensors.insert(name.to_string(), Tensor::from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len()/2) }, shape.as_slice(), &Device::Cpu)?.to_device(device)?),
+                _ => tensors.insert(name.to_string(), Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?),
+            };
         };
     }
     Ok(tensors)
