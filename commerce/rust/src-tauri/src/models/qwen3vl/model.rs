@@ -16,7 +16,7 @@ use crate::{
     },
     utils::tensor_utils::{
         mask_index_add, masked_scatter_dim0,
-        nonzero_index, prepare_causal_attention_mask,
+        nonzero_index,
         get_vision_next_indices,
     },
 };
@@ -242,27 +242,21 @@ impl Qwen3VLTextModel {
             } else { blks.push(None); }
         }
         let nw = if safe_probe(&vb.pp("norm"), "weight", map) { safe_get(&vb.pp("norm"), "weight", map)? }
-        else if safe_probe(&vb.pp("output_norm"), "weight", map) { safe_get(&vb.pp("output_norm"), "weight", map)? }
+        else if safe_probe(&vb, &format!("output_norm.weight"), map) { safe_get(&vb, "output_norm.weight", map)? }
         else { Tensor::ones(cfg.hidden_size, DType::F32, vb.device())? };
         Ok(Self { embed: Embedding::new(ew, cfg.hidden_size), layers: blks, norm: RmsNorm::new(nw, cfg.rms_norm_eps), rotary: Qwen3VLTextRotaryEmbedding::new(cfg.head_dim, cfg.rope_theta), mrope: cfg.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), is_baking: false })
     }
     pub fn forward(&mut self, x: &Tensor, offset: usize, pids: Option<&Tensor>, vm: Option<&Tensor>, ds: Option<Vec<Tensor>>) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
         let pi = match pids { Some(ids) => ids.clone(), None => Tensor::arange(offset as u32, (sl + offset) as u32, x.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))? };
-        
-        println!("[TRACE-FWD] RoPE Start. PIDs: {:?}", pi.dims());
         let (cos, sin) = self.rotary.forward(&pi, x.dtype(), self.mrope.clone())?;
         
-        // --- MEMORY PROTECTION: Chunked Mask ---
-        // Instead of full causality, we only care about the current chunk's relation to previous KV
-        // For prefilling, if we process 512 tokens at a time, we only need a (1, 1, 512, offset + 512) mask.
-        println!("[TRACE-FWD] Mask Prep. Chunk: {}, Total KV: {}", sl, offset + sl);
-        let mask = if sl <= 1 && offset > 0 {
-            None // Single token generation doesn't need mask
-        } else {
-            // prepare_causal_attention_mask is often implementation-specific. 
-            // Let's ensure it handles the offset correctly without creating a full (total, total) matrix.
-            Some(prepare_causal_attention_mask(bs, sl, offset, x.device())?)
+        let mask = if sl <= 1 { None } else {
+            let q_idx = Tensor::arange(0u32, sl as u32, x.device())?.reshape((1, 1, sl, 1))?;
+            let kv_idx = Tensor::arange(0u32, (offset + sl) as u32, x.device())?.reshape((1, 1, 1, offset + sl))?;
+            let m = kv_idx.broadcast_gt(&(q_idx.broadcast_add(&Tensor::new(offset as u32, x.device())?)?))?;
+            let m = m.to_dtype(x.dtype())?.affine(-65504.0, 0.0)?;
+            Some(m)
         };
         
         let mut x = x.clone(); let limit = if self.is_baking { 1 } else { self.layers.len() };
@@ -275,6 +269,10 @@ impl Qwen3VLTextModel {
         Ok(x.apply(&self.norm)?)
     }
     pub fn clear_kv_cache(&mut self) { for l in &mut self.layers { if let Some(li) = l { li.clear_kv_cache() } } }
+    pub fn get_kv_len(&self) -> usize {
+        for layer in &self.layers { if let Some(l) = layer { if let Some((k, _)) = &l.attn.kv_cache { return k.dim(2).unwrap_or(0); } } }
+        0
+    }
     pub fn to_device(&mut self, d: &Device) -> Result<()> {
         let ew = self.embed.embeddings().to_device(d)?; self.embed = Embedding::new(ew, self.embed.hidden_size());
         for l in &mut self.layers { if let Some(li) = l { li.to_device(d)?; } }
@@ -302,27 +300,16 @@ impl Qwen3VLModel {
         else if safe_probe(&vb, "model.layers.0.input_layernorm.weight", map_r) { vb.pp("model") }
         else { vb.pp("model").pp("language_model") };
         let lm = Qwen3VLTextModel::new(t_cfg, vb_lm, map_r)?;
-        if bo && !lm.layers.is_empty() && lm.layers[0].is_none() { return Err(anyhow!("Layer 0 missing")); }
-        let head = if safe_probe(&vb, "model.language_model.lm_head.weight", map_r) {
-            get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
-        } else if safe_probe(&vb, "model.lm_head.weight", map_r) {
-            get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
-        } else if bo {
-            println!("[MODEL] Baking Mode: lm_head missing, using dummy zero head.");
+        let head = if safe_probe(&vb, "model.language_model.lm_head.weight", map_r) { get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)? }
+        else if safe_probe(&vb, "model.lm_head.weight", map_r) { get_qlinear_safe(vb.pp("model").pp("lm_head"), "weight", map_r)? }
+        else if bo {
             let tc = cfg.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
             let shape = vec![tc.vocab_size, tc.hidden_size];
-            let total_el: usize = shape.iter().product();
-            let dev = vb.device();
-            let p = Tensor::zeros(((total_el + 31) / 32,), DType::U32, dev)?;
-            let s = Tensor::ones(((total_el + 31) / 32,), DType::F32, dev)?;
-            QLinear::new(p, s, shape, None, dev.clone())
-        } else {
-             get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
-        };
+            QLinear::new(Tensor::zeros((1,), DType::U32, vb.device())?, Tensor::ones((1,), DType::F32, vb.device())?, shape, None, vb.device().clone())
+        } else { get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)? };
         let mut model = Self { config: cfg, visual: vis, language_model: lm, lm_head: head, is_baking: bo }; model.set_baking(bo); Ok(model)
     }
     pub fn forward(&mut self, ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, vthw: Option<&Tensor>, _cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        println!("[TRACE-FWD] Qwen3VLModel forward start. Offset: {}", offset);
         let mut embs = self.language_model.embed.forward(ids)?;
         let (mut im, mut dse) = (None, None);
         if let Some(ref mut vm) = &mut self.visual { if let (Some(p), Some(t)) = (pv, thw) {
@@ -330,14 +317,8 @@ impl Qwen3VLModel {
             embs = masked_scatter_dim0(&embs, &Tensor::cat(&[ie], 0)?, &vm_m)?; im = Some(vm_m); dse = Some(ds);
         } }
         let (pids, _) = Qwen3VLModel::get_rope_index_static(&self.config, ids, thw, vthw, None)?;
-        
-        // Ensure CUDA sync before calling text model to catch the "real" crash point
-        if ids.device().is_cuda() { ids.device().synchronize()?; }
-        
         let out = self.language_model.forward(&embs, offset, Some(&pids), im.as_ref(), dse)?;
-        if self.is_baking {
-            return Ok(out.narrow(1, out.dim(1)? - 1, 1)?);
-        }
+        if self.is_baking { return Ok(out.narrow(1, out.dim(1)? - 1, 1)?); }
         Ok(self.lm_head.forward(&out.narrow(1, out.dim(1)? - 1, 1)?)?)
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> { if let Some(v) = &mut self.visual { v.to_device(d)?; } self.language_model.to_device(d)?; Ok(()) }

@@ -100,12 +100,16 @@ impl QLinear {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, s, h) = xs.dims3()?;
         let weight = self.dequantize_on_the_fly(xs.device())?;
-        let xs_flat = xs.reshape((b * s, h))?.to_dtype(DType::F32)?;
-        let weight_f32 = weight.to_dtype(DType::F32)?;
+        
+        // Ensure inputs are F32 and Contiguous for maximum stability
+        let xs_flat = xs.reshape((b * s, h))?.to_dtype(DType::F32)?.contiguous()?;
+        let weight_f32 = weight.to_dtype(DType::F32)?.contiguous()?;
+        
         let mut out = xs_flat.matmul(&weight_f32.t()?)?;
-        if let Some(bias) = &self.bias { out = out.broadcast_add(&bias.to_dtype(DType::F32)?)?; }
-        let res = out.reshape((b, s, ()))?.to_dtype(xs.dtype())?;
-        Ok(res)
+        if let Some(bias) = &self.bias { 
+            out = out.broadcast_add(&bias.to_dtype(DType::F32)?)?; 
+        }
+        Ok(out.reshape((b, s, ()))?.to_dtype(xs.dtype())?)
     }
     fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
         let s = &self.original_shape;
@@ -401,23 +405,15 @@ pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _
         println!("[DEBUG-LOAD] Key: {} | ST-DType: {:?}", name, view.dtype());
         let shape = view.shape().to_vec(); let data = view.data();
         if name.ends_with(".packed") {
-             // CRITICAL: Interpret bytes directly as U32 to solve I32/I64 mismatch issues
              let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
-             let mut new_shape = shape.clone(); 
-             if let Some(last) = new_shape.last_mut() {
-                 if *last == data.len() { *last /= 4; } // Adjust if shape was in bytes
-             }
+             let mut new_shape = shape.clone(); if let Some(last) = new_shape.last_mut() { if *last == data.len() { *last /= 4; } }
              println!("[DEBUG-LOAD]   -> Reinterpreted as U32. New Shape: {:?}", new_shape);
              tensors.insert(name.to_string(), Tensor::from_slice(u_data, new_shape.as_slice(), &Device::Cpu)?.to_device(device)?);
         } else {
             match view.dtype() {
                 safetensors::Dtype::F32 => { let f_data: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
                 safetensors::Dtype::U32 => { let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) }; tensors.insert(name.to_string(), Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
-                safetensors::Dtype::I32 => { 
-                    let i_data: &[i32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len() / 4) }; 
-                    let u_data: Vec<u32> = i_data.iter().map(|&x| x as u32).collect(); 
-                    tensors.insert(name.to_string(), Tensor::from_vec(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); 
-                },
+                safetensors::Dtype::I32 => { let i_data: &[i32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len() / 4) }; let u_data: Vec<u32> = i_data.iter().map(|&x| x as u32).collect(); tensors.insert(name.to_string(), Tensor::from_vec(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
                 safetensors::Dtype::U8 | safetensors::Dtype::I8 | safetensors::Dtype::BOOL => { tensors.insert(name.to_string(), Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
                 safetensors::Dtype::F16 => { let f_data: &[half::f16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
                 safetensors::Dtype::BF16 => { let f_data: &[half::bf16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
