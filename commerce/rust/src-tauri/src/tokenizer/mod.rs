@@ -1,49 +1,25 @@
-use anyhow::{Ok, Result, anyhow};
-use candle_core::{Device, Tensor};
+use anyhow::{Result, anyhow};
 use tokenizers::Tokenizer;
+use std::path::Path;
 
+#[derive(Clone)]
 pub struct TokenizerModel {
     pub tokenizer: Tokenizer,
 }
 
 impl TokenizerModel {
     pub fn init(path: &str) -> Result<Self> {
-        let path = path.to_string();
-        assert!(
-            std::path::Path::new(&path).exists(),
-            "model path file not exists"
-        );
-        let tokenizer_file = std::path::Path::new(&path).join("tokenizer.json");
-        assert!(
-            tokenizer_file.exists(),
-            "tokenizer.json not exists in model path: {:?}",
-            tokenizer_file
-        );
-        let tokenizer = Tokenizer::from_file(tokenizer_file)
-            .map_err(|e| anyhow!(format!("tokenizer from file error{}", e)))?;
+        let tokenizer_path = Path::new(path).join("tokenizer.json");
+        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow!(e))?;
         Ok(Self { tokenizer })
     }
 
-    pub fn text_encode_vec(&self, text: String, add_special_token: bool) -> Result<Vec<u32>> {
-        let token_id = self
-            .tokenizer
-            .encode(text, add_special_token)
-            .map_err(|e| anyhow!(format!("tokenizer encode error: {}", e)))?
-            .get_ids()
-            .to_vec();
-        Ok(token_id)
-    }
-    pub fn text_encode(&self, text: String, device: &Device) -> Result<Tensor> {
-        let token_id = self.text_encode_vec(text, true)?;
-        let token_tensor = Tensor::from_slice(&token_id, (1, token_id.len()), device)?;
-        Ok(token_tensor)
+    pub fn text_encode_vec(&self, text: String, add_special: bool) -> Result<Vec<u32>> {
+        let encoding = self.tokenizer.encode(text, add_special).map_err(|e| anyhow!(e))?;
+        Ok(encoding.get_ids().to_vec())
     }
 
-    pub fn token_decode(&self, tokens: Vec<u32>) -> Result<String> {
-        let decode = self
-            .tokenizer
-            .decode(&tokens, true)
-            .map_err(|e| anyhow!(format!("tokenizer encode error{}", e)))?;
-        Ok(decode)
+    pub fn token_decode(&self, ids: Vec<u32>) -> Result<String> {
+        self.tokenizer.decode(&ids, true).map_err(|e| anyhow!(e))
     }
 }

@@ -16,6 +16,8 @@ trade/model_cache/
 trade/model_offload/
 trade/conda_env/
 
+commerce/rust/backup-src-tauri/
+
 commerce/rust/mobile/src-tauri/target/
 commerce/rust/mobile/src-tauri/gen/android/app/build/outputs
 

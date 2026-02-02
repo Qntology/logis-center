@@ -112,7 +112,7 @@ impl ChatTemplate {
                             text_content.push_str(&text_part.text);
                         }
                     }
-                    user_msg.content = crate::openai_types::ChatCompletionRequestUserMessageContent::Text(text_content);
+                    user_msg.content = crate::openai_types::ChatCompletionRequestUserMessageContent::String(text_content);
                 }
             }
         }

@@ -1097,11 +1097,22 @@ impl QuantizedQwen3VLTextModel {
         device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        baking_only: bool, // [NEW]
+        baking_only: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
+        let is_sf = ct.tensor_infos.is_empty() && !mmap.is_empty();
+
+        // [BITSERIAL-FIX] Create a VarBuilder from safetensors early if needed
+        let sf_vb = if is_sf {
+            let mmap_ref = mmap_handle.as_ref().ok_or(anyhow!("Mmap required for safetensors"))?;
+            let tensors = candle_core::safetensors::load_buffer(&mmap_ref[..], device)?;
+            Some(VarBuilder::from_tensors(tensors, dtype, device))
+        } else {
+            None
+        };
+
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
@@ -1111,6 +1122,15 @@ impl QuantizedQwen3VLTextModel {
              (Embedding::new(tensor, h), h)
         } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let h = tensor.dim(1)?;
+             (Embedding::new(tensor, h), h)
+        } else if let Some(vb) = &sf_vb {
+             // Fallback for safetensors
+             let tensor = if vb.contains_tensor(&token_emb_name) {
+                 vb.get_with_hints((), &token_emb_name, candle_nn::Init::Const(0.0))?
+             } else {
+                 vb.get_with_hints((), alt_token_emb, candle_nn::Init::Const(0.0))?
+             };
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
@@ -1141,6 +1161,11 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
+        // [BITSERIAL-FIX] If no GGUF info, use a reasonable default weight size for 2B/0.6B models
+        if layer_weight_size == 0 && is_sf {
+            layer_weight_size = if config.num_hidden_layers > 20 { 150_000_000 } else { 50_000_000 };
+        }
+
         // [OPTIMIZATION] If baking only (MLP 0%), we don't need MLP weights, so cost is much lower
         let cost_per_layer = if baking_only { layer_weight_size / 3 } else { layer_weight_size };
         let estimated_activation_buffer = 200_000_000; // Increased to 200MB for 28-layer prefill
@@ -1171,9 +1196,6 @@ impl QuantizedQwen3VLTextModel {
 
         let mut layer_devices = vec![];
         
-        // [BITSERIAL-FIX] If loading from safetensors, populate layer_devices and skip VRAM cost check for now
-        let is_sf = ct.tensor_infos.is_empty();
-        
         if is_sf {
             for _ in 0..config.num_hidden_layers { layer_devices.push(current_device.clone()); }
         } else {
@@ -1200,15 +1222,6 @@ impl QuantizedQwen3VLTextModel {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_config.thread_count).build()?;
         
         let final_config = config; 
-        
-        // [BITSERIAL-FIX] Create a VarBuilder from safetensors if needed
-        let sf_vb = if is_sf {
-            let mmap = mmap_handle.as_ref().ok_or(anyhow!("Mmap required for safetensors"))?;
-            let tensors = candle_core::safetensors::load_buffer(&mmap[..], device)?;
-            Some(VarBuilder::from_tensors(tensors, dtype, device))
-        } else {
-            None
-        };
 
         let layers: Result<Vec<_>> = pool.install(|| {
             (0..final_config.num_hidden_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
@@ -1689,8 +1702,14 @@ impl QuantizedQwen3VLModel {
         let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
-        let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
-        let vb_visual = from_gguf_content(config, ct_vision, &mut reader_vision, vision_device, vision_dtype)?;
+        let is_sf_vision = ct_vision.tensor_infos.is_empty() && !mmproj_mmap.is_empty();
+
+        let vb_visual = if is_sf_vision {
+            from_safetensors_content(config, mmproj_mmap, vision_device, vision_dtype)?
+        } else {
+            let mut reader_vision = std::io::Cursor::new(mmproj_mmap);
+            from_gguf_content(config, ct_vision, &mut reader_vision, vision_device, vision_dtype)?
+        };
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
 
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
@@ -1701,12 +1720,22 @@ impl QuantizedQwen3VLModel {
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader_main = std::io::Cursor::new(main_mmap);
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_any_linear(ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
-            l
-        } else if let Ok(l) = get_any_linear(ct_main, &mut reader_main, "output", text_device, head_dtype) {
-            l
+        let is_sf_main = ct_main.tensor_infos.is_empty() && !main_mmap.is_empty();
+
+        let lm_head = if is_sf_main {
+            let tensors = candle_core::safetensors::load_buffer(main_mmap, text_device)?;
+            let vb = VarBuilder::from_tensors(tensors, dtype, text_device);
+            if let Ok(l) = get_any_linear_sf(&vb, "lm_head", text_device, head_dtype) { l }
+            else if let Ok(l) = get_any_linear_sf(&vb, "output", text_device, head_dtype) { l }
+            else { get_any_linear_sf(&vb, "model.embed_tokens", text_device, head_dtype)? }
         } else {
-            get_any_linear(ct_main, &mut reader_main, "token_embd", text_device, head_dtype)?
+            if let Ok(l) = get_any_linear(ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
+                l
+            } else if let Ok(l) = get_any_linear(ct_main, &mut reader_main, "output", text_device, head_dtype) {
+                l
+            } else {
+                get_any_linear(ct_main, &mut reader_main, "token_embd", text_device, head_dtype)?
+            }
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: main_mmap_handle, mmproj_mmap: mmproj_mmap_handle })
@@ -1727,19 +1756,36 @@ impl QuantizedQwen3VLModel {
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
-        let vb_visual = from_gguf_content(config, ct_vision, reader_vision, vision_device, vision_dtype)?;
+        
+        let vb_visual = if ct_vision.tensor_infos.is_empty() {
+            let mut buf = Vec::new();
+            reader_vision.read_to_end(&mut buf)?;
+            from_safetensors_content(config, &buf, vision_device, vision_dtype)?
+        } else {
+            from_gguf_content(config, ct_vision, reader_vision, vision_device, vision_dtype)?
+        };
         let visual = Qwen3VLVisionModel::new(v_config.clone(), vb_visual.pp("visual"))?;
         
         let t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, false)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_any_linear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
-            l
-        } else if let Ok(l) = get_any_linear(ct_main, reader_main, "output", text_device, head_dtype) {
-            l
+        let lm_head = if ct_main.tensor_infos.is_empty() {
+            let mut buf = Vec::new();
+            reader_main.read_to_end(&mut buf)?;
+            let tensors = candle_core::safetensors::load_buffer(&buf, text_device)?;
+            let vb = VarBuilder::from_tensors(tensors, dtype, text_device);
+            if let Ok(l) = get_any_linear_sf(&vb, "lm_head", text_device, head_dtype) { l }
+            else if let Ok(l) = get_any_linear_sf(&vb, "output", text_device, head_dtype) { l }
+            else { get_any_linear_sf(&vb, "model.embed_tokens", text_device, head_dtype)? }
         } else {
-            get_any_linear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+            if let Ok(l) = get_any_linear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
+                l
+            } else if let Ok(l) = get_any_linear(ct_main, reader_main, "output", text_device, head_dtype) {
+                l
+            } else {
+                get_any_linear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+            }
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: None, mmproj_mmap: None })
@@ -1948,36 +1994,87 @@ fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reade
     Ok(RmsNorm::new(weight, eps))
 }
 
+fn map_vision_tensor_name(name: &str, config: &Qwen3VLConfig) -> String {
+    let mut new_name = name.to_string();
+    if let Some(rest) = name.strip_prefix("v.") {
+         if let Some(blk_rest) = rest.strip_prefix("blk.") {
+             let parts: Vec<&str> = blk_rest.splitn(2, '.').collect();
+             if parts.len() == 2 {
+                 let idx = parts[0];
+                 let layer = parts[1];
+                 let mapped_layer = match layer { 
+                     s if s.starts_with("ln1") => s.replace("ln1", "norm1"), 
+                     s if s.starts_with("ln2") => s.replace("ln2", "norm2"), 
+                     s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"), 
+                     s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"), 
+                     s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"), 
+                     s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), 
+                     _ => layer.to_string() 
+                 };
+                 new_name = format!("visual.blocks.{}.{}", idx, mapped_layer);
+             }
+         } else if rest.starts_with("patch_embd") { new_name = rest.replace("patch_embd", "visual.patch_embed.proj"); }
+         else if rest.starts_with("position_embd") { new_name = rest.replace("position_embd", "visual.pos_embed"); }
+         else if rest.starts_with("post_ln") { new_name = rest.replace("post_ln", "visual.merger.norm"); }
+         else if rest.starts_with("deepstack.") {
+             let parts: Vec<&str> = rest.split('.').collect();
+             if parts.len() >= 2 {
+                 if let Ok(layer_idx) = parts[1].parse::<usize>() {
+                     let v_idx_opt = config.vision_config.as_ref().and_then(|vc| vc.deepstack_visual_indexes.iter().position(|&x| x == layer_idx));
+                     if let Some(pos) = v_idx_opt { 
+                         let suffix = parts[2..].join("."); 
+                         new_name = format!("visual.deepstack_merger_list.{}.{}", pos, suffix).replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); 
+                     } else { 
+                         new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); 
+                     }
+                 } else { 
+                     new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); 
+                 }
+             }
+         } else { new_name = format!("visual.{}", rest); }
+    } else if let Some(rest) = name.strip_prefix("mm.") { 
+        if rest.starts_with("0") { new_name = rest.replace("0", "visual.merger.linear_fc1"); } 
+        else if rest.starts_with("2") { new_name = rest.replace("2", "visual.merger.linear_fc2"); } 
+    } else if name.starts_with("model.visual") { 
+        new_name = name.strip_prefix("model.").unwrap().to_string(); 
+    }
+    new_name
+}
+
+fn from_safetensors_content(config: &Qwen3VLConfig, mmap: &[u8], device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
+    use std::collections::{HashMap, BTreeMap};
+    let tensors = candle_core::safetensors::load_buffer(mmap, device)?;
+    let mut data = HashMap::new();
+    let mut split_tensors: BTreeMap<String, Vec<(usize, Tensor)>> = BTreeMap::new();
+
+    for (name, t) in tensors {
+        let new_name = map_vision_tensor_name(&name, config);
+        let mut is_split = false;
+        let mut split_idx = 0;
+        let mut base_split_name = new_name.clone();
+        if let Some(last_dot) = new_name.rfind('.') { 
+            if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() { 
+                if name.ends_with(&format!(".{}", idx)) { 
+                    base_split_name = new_name[..last_dot].to_string(); 
+                    split_idx = idx; 
+                    is_split = true; 
+                } 
+            } 
+        }
+        let t = t.to_dtype(dtype)?;
+        if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
+    }
+    for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
+    if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); } } }
+    Ok(VarBuilder::from_tensors(data, dtype, device))
+}
+
 fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, ct: &gguf_file::Content, reader: &mut R, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
     use std::collections::{HashMap, BTreeMap};
     let mut data = HashMap::new();
     let mut split_tensors: BTreeMap<String, Vec<(usize, Tensor)>> = BTreeMap::new();
     for (name, _) in ct.tensor_infos.iter() {
-        let mut new_name = name.clone();
-        if let Some(rest) = name.strip_prefix("v.") {
-             if let Some(blk_rest) = rest.strip_prefix("blk.") {
-                 let parts: Vec<&str> = blk_rest.splitn(2, '.').collect();
-                 if parts.len() == 2 {
-                     let idx = parts[0];
-                     let layer = parts[1];
-                     let mapped_layer = match layer { s if s.starts_with("ln1") => s.replace("ln1", "norm1"), s if s.starts_with("ln2") => s.replace("ln2", "norm2"), s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"), s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"), s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"), s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), _ => layer.to_string() };
-                     new_name = format!("visual.blocks.{}.{}", idx, mapped_layer);
-                 }
-             } else if rest.starts_with("patch_embd") { new_name = rest.replace("patch_embd", "visual.patch_embed.proj"); }
-             else if rest.starts_with("position_embd") { new_name = rest.replace("position_embd", "visual.pos_embed"); }
-             else if rest.starts_with("post_ln") { new_name = rest.replace("post_ln", "visual.merger.norm"); }
-             else if rest.starts_with("deepstack.") {
-                 let parts: Vec<&str> = rest.split('.').collect();
-                 if parts.len() >= 2 {
-                     if let Ok(layer_idx) = parts[1].parse::<usize>() {
-                         let v_idx_opt = config.vision_config.as_ref().and_then(|vc| vc.deepstack_visual_indexes.iter().position(|&x| x == layer_idx));
-                         if let Some(pos) = v_idx_opt { let suffix = parts[2..].join("."); new_name = format!("visual.deepstack_merger_list.{}.{}", pos, suffix).replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
-                         else { new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
-                     } else { new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
-                 }
-             } else { new_name = format!("visual.{}", rest); }
-        } else if let Some(rest) = name.strip_prefix("mm.") { if rest.starts_with("0") { new_name = rest.replace("0", "visual.merger.linear_fc1"); } else if rest.starts_with("2") { new_name = rest.replace("2", "visual.merger.linear_fc2"); } }
-        else if name.starts_with("model.visual") { new_name = name.strip_prefix("model.").unwrap().to_string(); }
+        let new_name = map_vision_tensor_name(name, config);
         let mut is_split = false;
         let mut split_idx = 0;
         let mut base_split_name = new_name.clone();
