@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
 use candle_nn::{
     Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
     linear_no_bias, rms_norm,
