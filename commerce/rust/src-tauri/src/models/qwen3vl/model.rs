@@ -1,66 +1,12 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Shape, Tensor, Module};
 use candle_nn::{
-    Activation, Embedding, Init, Linear, VarBuilder, rms_norm,
+    Activation, Embedding, Init, Linear, VarBuilder,
 };
-
-#[derive(Debug, Clone)]
-pub struct RmsNorm {
-    weight: Tensor,
-    eps: f64,
-}
-
-impl RmsNorm {
-    pub fn new(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
-    }
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
-        let x_norm = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let weight_f32 = self.weight.to_dtype(DType::F32)?;
-        Ok(x_norm.broadcast_mul(&weight_f32)?.to_dtype(x.dtype())?)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LayerNorm {
-    weight: Tensor,
-    bias: Tensor,
-    eps: f64,
-}
-
-impl LayerNorm {
-    pub fn new(weight: Tensor, bias: Tensor, eps: f64) -> Self {
-        Self { weight, bias, eps }
-    }
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_f32 = x.to_dtype(DType::F32)?;
-        let mean = x_f32.mean_keepdim(D::Minus1)?;
-        let x_mu = x_f32.broadcast_sub(&mean)?;
-        let variance = x_mu.sqr()?.mean_keepdim(D::Minus1)?;
-        let x_norm = x_mu.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let weight_f32 = self.weight.to_dtype(DType::F32)?;
-        let bias_f32 = self.bias.to_dtype(DType::F32)?;
-        Ok(x_norm.broadcast_mul(&weight_f32)?.broadcast_add(&bias_f32)?.to_dtype(x.dtype())?)
-    }
-}
-
-impl Module for RmsNorm {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        self.forward(x).map_err(|e| candle_core::Error::Msg(e.to_string()))
-    }
-}
-
-impl Module for LayerNorm {
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        self.forward(x).map_err(|e| candle_core::Error::Msg(e.to_string()))
-    }
-}
 
 use crate::{
     models::{
-        common::{TwoLinearMLP, eager_attention_forward, get_layer_norm},
+        common::{TwoLinearMLP, eager_attention_forward, get_layer_norm, RmsNorm, LayerNorm, rms_norm as get_rms_norm},
         qwen3vl::{
             config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
             quantized_model::QLinear, // [VRAM-OPTIM] Import QLinear
@@ -931,8 +877,8 @@ impl Qwen3VLTextAttention {
         let v_proj = get_qlinear_from_vb(vb.pp("v_proj"), "weight")?;
         let o_proj = get_qlinear_from_vb(vb.pp("o_proj"), "weight")?;
 
-        let q_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+        let q_norm = get_rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = get_rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
         Ok(Self {
             q_proj,
             k_proj,
