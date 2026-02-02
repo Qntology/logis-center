@@ -26,7 +26,7 @@ pub struct AppState {
 }
 
 #[tauri::command]
-pub async fn search_documents_cmd(state: State<'_, AppState>, query: String) -> Result<Vec<Value>, String> {
+pub async fn search_documents_handler(state: State<'_, AppState>, query: String) -> Result<Vec<Value>, String> {
     let mut model_guard = state.model.lock().await;
     if model_guard.is_none() { *model_guard = Some(LogisModel::new(None).await.map_err(|e| e.to_string())?); }
     let model = model_guard.as_ref().unwrap();
@@ -45,7 +45,7 @@ pub fn run() {
             model: Arc::new(Mutex::new(None)),
             cancellation_token: Arc::new(AtomicBool::new(false)),
         })
-        .invoke_handler(tauri::generate_handler![search_documents_cmd])
+        .invoke_handler(tauri::generate_handler![search_documents_handler])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
