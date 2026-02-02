@@ -67,7 +67,6 @@ fn get_qlinear_safe(vb: VarBuilder, name: &str, map: Option<&HashMap<String, Ten
     
     if safe_probe(&vb, &p_key, map) {
         let p = safe_get(&vb, &p_key, map)?;
-        // We assume p is already U32 or converted to U32 by the loader.
         let s = safe_get(&vb, &s_key, map)?.to_dtype(DType::F32)?;
         let sh_t = safe_get(&vb, &sh_key, map)?;
         let sh: Vec<usize> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
@@ -249,9 +248,23 @@ impl Qwen3VLTextModel {
     }
     pub fn forward(&mut self, x: &Tensor, offset: usize, pids: Option<&Tensor>, vm: Option<&Tensor>, ds: Option<Vec<Tensor>>) -> Result<Tensor> {
         let (bs, sl, _) = x.dims3()?;
-        let pi = match pids { Some(ids) => ids.clone(), None => Tensor::arange(offset as u32, (sl + offset) as u32, x.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))? };
+        let pi = match pids { Some(ids) => ids.clone(), None => Tensor::arange(offset as u32, (sl + offset) as u32, x.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))? };
+        
+        println!("[TRACE-FWD] RoPE Start. PIDs: {:?}", pi.dims());
         let (cos, sin) = self.rotary.forward(&pi, x.dtype(), self.mrope.clone())?;
-        let mask = if sl <= 1 { None } else { Some(prepare_causal_attention_mask(bs, sl, 0, x.device())?) };
+        
+        // --- MEMORY PROTECTION: Chunked Mask ---
+        // Instead of full causality, we only care about the current chunk's relation to previous KV
+        // For prefilling, if we process 512 tokens at a time, we only need a (1, 1, 512, offset + 512) mask.
+        println!("[TRACE-FWD] Mask Prep. Chunk: {}, Total KV: {}", sl, offset + sl);
+        let mask = if sl <= 1 && offset > 0 {
+            None // Single token generation doesn't need mask
+        } else {
+            // prepare_causal_attention_mask is often implementation-specific. 
+            // Let's ensure it handles the offset correctly without creating a full (total, total) matrix.
+            Some(prepare_causal_attention_mask(bs, sl, offset, x.device())?)
+        };
+        
         let mut x = x.clone(); let limit = if self.is_baking { 1 } else { self.layers.len() };
         for (i, l_opt) in self.layers.iter_mut().enumerate().take(limit) {
             if let Some(l) = l_opt {
@@ -309,13 +322,18 @@ impl Qwen3VLModel {
         let mut model = Self { config: cfg, visual: vis, language_model: lm, lm_head: head, is_baking: bo }; model.set_baking(bo); Ok(model)
     }
     pub fn forward(&mut self, ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, vthw: Option<&Tensor>, _cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        println!("[TRACE-FWD] Qwen3VLModel forward start. Offset: {}", offset);
         let mut embs = self.language_model.embed.forward(ids)?;
         let (mut im, mut dse) = (None, None);
-        if let Some(vm) = &mut self.visual { if let (Some(p), Some(t)) = (pv, thw) {
+        if let Some(ref mut vm) = &mut self.visual { if let (Some(p), Some(t)) = (pv, thw) {
             let (ie, ds) = vm.forward(p, t)?; let vm_m = ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], ids.device())?)?.to_dtype(DType::U32)?;
             embs = masked_scatter_dim0(&embs, &Tensor::cat(&[ie], 0)?, &vm_m)?; im = Some(vm_m); dse = Some(ds);
         } }
         let (pids, _) = Qwen3VLModel::get_rope_index_static(&self.config, ids, thw, vthw, None)?;
+        
+        // Ensure CUDA sync before calling text model to catch the "real" crash point
+        if ids.device().is_cuda() { ids.device().synchronize()?; }
+        
         let out = self.language_model.forward(&embs, offset, Some(&pids), im.as_ref(), dse)?;
         if self.is_baking {
             return Ok(out.narrow(1, out.dim(1)? - 1, 1)?);
@@ -353,7 +371,7 @@ impl Qwen3VLModel {
     fn get_rope_index_static(cfg: &Qwen3VLConfig, ids: &Tensor, thw: Option<&Tensor>, vthw: Option<&Tensor>, m: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let ms = cfg.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let (tid, vtid, vsid) = (cfg.image_token_id.unwrap_or(0), cfg.video_token_id.unwrap_or(0), cfg.vision_start_token_id.unwrap_or(0));
-        let mut deltas = vec![]; let mut pos_ids = Tensor::ones((3, ids.dim(0)?, ids.dim(1)?), ids.dtype(), ids.device())?;
+        let mut deltas = vec![]; let mut pos_ids = Tensor::ones((3, ids.dim(0)?, ids.dim(1)?), DType::U32, ids.device())?;
         let (mut ii, mut vi) = (0, 0);
         for i in 0..ids.dim(0)? {
             let mut cur_ids = ids.i(i)?; if let Some(mask) = m { if mask.i(i)?.sum_all()?.to_scalar::<u32>()? != mask.dim(1)? as u32 { cur_ids = cur_ids.gather(&nonzero_index(&mask.i(i)?)?, 0)?; } }
@@ -365,15 +383,15 @@ impl Qwen3VLModel {
                     else if t == vtid as u32 { let v = vthw.as_ref().unwrap().i(vi)?.to_vec1::<u32>()?; vi += 1; te = vidx_v[j]; v } else { continue; };
                     let (gt, gh, gw) = (thw_v[0], thw_v[1] / ms as u32, thw_v[2] / ms as u32);
                     let tlen = te - ts; let sidx = if list.is_empty() { 0 } else { list[list.len()-1].max_all()?.to_scalar::<u32>()? + 1 };
-                    list.push(Tensor::arange(sidx, sidx + tlen, ids.device())?.unsqueeze(0)?.broadcast_as((3, tlen as usize))?);
+                    list.push(Tensor::arange(sidx, sidx + tlen, ids.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.broadcast_as((3, tlen as usize))?);
                     let base = sidx + tlen;
-                    let ti = Tensor::arange(base, base + gt, ids.device())?.unsqueeze(D::Minus1)?.broadcast_as((gt as usize, (gh * gw) as usize))?.flatten_all()?;
-                    let hi = Tensor::arange(base, base + gh, ids.device())?.unsqueeze(0)?.unsqueeze(D::Minus1)?.broadcast_as((gt as usize, gh as usize, gw as usize))?.flatten_all()?;
-                    let wi = Tensor::arange(base, base + gw, ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((gt as usize, gh as usize, gw as usize))?.flatten_all()?;
+                    let ti = Tensor::arange(base, base + gt, ids.device())?.to_dtype(DType::U32)?.unsqueeze(D::Minus1)?.broadcast_as((gt as usize, (gh * gw) as usize))?.flatten_all()?;
+                    let hi = Tensor::arange(base, base + gh, ids.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(D::Minus1)?.broadcast_as((gt as usize, gh as usize, gw as usize))?.flatten_all()?;
+                    let wi = Tensor::arange(base, base + gw, ids.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((gt as usize, gh as usize, gw as usize))?.flatten_all()?;
                     list.push(Tensor::stack(&[ti, hi, wi], 0)?); ts = te + gt * gh * gw;
                 }
             }
-            if ts < cur_ids.dim(0)? as u32 { let tlen = cur_ids.dim(0)? as u32 - ts; let sidx = if list.is_empty() { 0 } else { list[list.len()-1].max_all()?.to_scalar::<u32>()? + 1 }; list.push(Tensor::arange(sidx, sidx + tlen, ids.device())?.unsqueeze(0)?.broadcast_as((3, tlen as usize))?); }
+            if ts < cur_ids.dim(0)? as u32 { let tlen = cur_ids.dim(0)? as u32 - ts; let sidx = if list.is_empty() { 0 } else { list[list.len()-1].max_all()?.to_scalar::<u32>()? + 1 }; list.push(Tensor::arange(sidx, sidx + tlen, ids.device())?.to_dtype(DType::U32)?.unsqueeze(0)?.broadcast_as((3, tlen as usize))?); }
             let lp = Tensor::cat(&list, 1)?.reshape((3, 1, ()))?; pos_ids = pos_ids.slice_assign(&[(0..3), (i..i + 1), (0..ids.dim(1)?)], &lp)?;
             deltas.push(lp.max_all()?.to_scalar::<u32>()? as i64 + 1 - cur_ids.dim(0)? as i64);
         }
