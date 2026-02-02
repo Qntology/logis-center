@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-// [SAFE-PROBE] Helper to check tensor existence via HashMap without triggering CUDA kernels
+// [SAFE-PROBE] Check existence via HashMap to avoid CUDA kernel triggers
 fn probe(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> bool {
     if let Some(m) = map {
         let full_path = if v.prefix().is_empty() { p.to_string() } else { format!("{}{}", v.prefix(), p) };
@@ -39,7 +39,7 @@ fn probe(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> bool
     }
 }
 
-// [SAFE-GET] Helper to load tensor with dynamic shape, avoids DriverError on missing keys
+// [SAFE-GET] Load tensor via HashMap or VarBuilder safely
 fn get_any(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> Result<Tensor> {
     if let Some(m) = map {
         let full_path = if v.prefix().is_empty() { p.to_string() } else { format!("{}{}", v.prefix(), p) };
@@ -58,7 +58,7 @@ fn get_any(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> Re
                     }
                 }
             }
-            Err(anyhow!("Failed to load tensor '{}': {}", p, e))
+            Err(anyhow!("Tensor not found: {}", p))
         }
     }
 }
@@ -97,7 +97,7 @@ impl Qwen3VLVisionPatchEmbed {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionPatchMerger { hidden_size: usize, use_postshuffle_norm: bool, norm: LayerNorm, l1: Linear, act: Activation, l2: Linear }
+pub struct Qwen3VLVisionPatchMerger { hidden_size: usize, use_postshuffle_norm: bool, norm: LayerNorm, linear_fc1: Linear, act_fn: Activation, linear_fc2: Linear }
 impl Qwen3VLVisionPatchMerger {
     pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder, upn: bool) -> Result<Self> {
         let hs = cfg.hidden_size * cfg.spatial_merge_size.pow(2);
@@ -107,17 +107,17 @@ impl Qwen3VLVisionPatchMerger {
         let norm = get_layer_norm(vb.pp(n), 1e-6, ns)?;
         let w1 = vb.pp(f1).get((hs, hs), "weight")?; let b1 = vb.pp(f1).get(hs, "bias").ok();
         let w2 = vb.pp(f2).get((cfg.out_hidden_size, hs), "weight")?; let b2 = vb.pp(f2).get(cfg.out_hidden_size, "bias").ok();
-        Ok(Self { hidden_size: hs, use_postshuffle_norm: upn, norm, l1: Linear::new(w1, b1), act: Activation::Gelu, l2: Linear::new(w2, b2) })
+        Ok(Self { hidden_size: hs, use_postshuffle_norm: upn, norm, linear_fc1: Linear::new(w1, b1), act_fn: Activation::Gelu, linear_fc2: Linear::new(w2, b2) })
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> {
         let nw = self.norm.weight.to_device(d)?; let nb = self.norm.bias.to_device(d)?; self.norm = LayerNorm::new(nw, nb, 1e-6);
-        let w1 = self.l1.weight().to_device(d)?; let b1 = self.l1.bias().map(|b| b.to_device(d)).transpose()?; self.l1 = Linear::new(w1, b1);
-        let w2 = self.l2.weight().to_device(d)?; let b2 = self.l2.bias().map(|b| b.to_device(d)).transpose()?; self.l2 = Linear::new(w2, b2); Ok(())
+        let w1 = self.linear_fc1.weight().to_device(d)?; let b1 = self.linear_fc1.bias().map(|b| b.to_device(d)).transpose()?; self.linear_fc1 = Linear::new(w1, b1);
+        let w2 = self.linear_fc2.weight().to_device(d)?; let b2 = self.linear_fc2.bias().map(|b| b.to_device(d)).transpose()?; self.linear_fc2 = Linear::new(w2, b2); Ok(())
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = if self.use_postshuffle_norm { x.reshape(((), self.hidden_size))? } else { x.clone() };
         let x = self.norm.forward(&x)?.reshape(((), self.hidden_size))?;
-        Ok(self.l2.forward(&self.act.forward(&self.l1.forward(&x)?)?)?)
+        Ok(self.linear_fc2.forward(&self.act_fn.forward(&self.linear_fc1.forward(&x)?)?)?)
     }
 }
 
@@ -150,31 +150,31 @@ impl Qwen3VLVisionAttention {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionBlock { n1: LayerNorm, n2: LayerNorm, attn: Qwen3VLVisionAttention, mlp: TwoLinearMLP }
+pub struct Qwen3VLVisionBlock { norm1: LayerNorm, norm2: LayerNorm, attn: Qwen3VLVisionAttention, mlp: TwoLinearMLP }
 impl Qwen3VLVisionBlock {
     pub fn new(cfg: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let n1 = get_layer_norm(vb.pp("norm1"), 1e-6, cfg.hidden_size)?;
         let n2 = get_layer_norm(vb.pp("norm2"), 1e-6, cfg.hidden_size)?;
         let attn = Qwen3VLVisionAttention::new(cfg.clone(), vb.pp("attn"))?;
         let mlp = TwoLinearMLP::new(vb.pp("mlp"), cfg.hidden_size, cfg.intermediate_size, Activation::Gelu, false, "linear_fc1", "linear_fc2")?;
-        Ok(Self { n1, n2, attn, mlp })
+        Ok(Self { norm1: n1, norm2: n2, attn, mlp })
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> {
-        let w1 = self.n1.weight.to_device(d)?; let b1 = self.n1.bias.to_device(d)?; self.n1 = LayerNorm::new(w1, b1, 1e-6);
-        let w2 = self.n2.weight.to_device(d)?; let b2 = self.n2.bias.to_device(d)?; self.n2 = LayerNorm::new(w2, b2, 1e-6);
+        let w1 = self.norm1.weight.to_device(d)?; let b1 = self.norm1.bias.to_device(d)?; self.norm1 = LayerNorm::new(w1, b1, 1e-6);
+        let w2 = self.norm2.weight.to_device(d)?; let b2 = self.norm2.bias.to_device(d)?; self.norm2 = LayerNorm::new(w2, b2, 1e-6);
         self.attn.to_device(d)?; self.mlp.to_device(d)?; Ok(())
     }
     pub fn forward(&self, x: &Tensor, cu: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let r = x.clone(); let x = self.n1.forward(x)?; let x = self.attn.forward(&x, cos, sin, cu)?; let x = r.add(&x)?;
-        let r = x.clone(); let x = self.mlp.forward(&self.n2.forward(&x)?)?; Ok(r.add(&x)?)
+        let r = x.clone(); let x = self.norm1.forward(x)?; let x = self.attn.forward(&x, cos, sin, cu)?; let x = r.add(&x)?;
+        let r = x.clone(); let x = self.mlp.forward(&self.norm2.forward(&x)?)?; Ok(r.add(&x)?)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Qwen3VLVisionModel { 
-    pub sm_size: usize, pub patch_embed: Qwen3VLVisionPatchEmbed, pub pos_embed: Embedding, pub num_grid: u32,
-    pub rotary: Qwen2_5VisionRotaryEmbedding, pub blocks: Vec<Qwen3VLVisionBlock>, pub merger: Qwen3VLVisionPatchMerger,
-    pub ds_idx: Vec<usize>, pub ds_mergers: Vec<Qwen3VLVisionPatchMerger>, pub dtype: DType
+    pub spatial_merge_size: usize, pub patch_embed: Qwen3VLVisionPatchEmbed, pub pos_embed: Embedding, pub num_grid_per_side: u32,
+    pub rotary_pos_emb: Qwen2_5VisionRotaryEmbedding, pub blocks: Vec<Qwen3VLVisionBlock>, pub merger: Qwen3VLVisionPatchMerger,
+    pub deepstack_visual_indexes: Vec<usize>, pub deepstack_merger_list: Vec<Qwen3VLVisionPatchMerger>, pub dtype: DType
 }
 impl Qwen3VLVisionModel {
     pub fn new(cfg: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
@@ -182,11 +182,11 @@ impl Qwen3VLVisionModel {
         let pw = vb.pp("pos_embed").get((cfg.num_position_embeddings, cfg.hidden_size), "weight")?;
         let mut blocks = vec![]; for i in 0..cfg.depth { blocks.push(Qwen3VLVisionBlock::new(cfg.clone(), vb.pp("blocks").pp(i))?); }
         let ds_mergers = cfg.deepstack_visual_indexes.iter().enumerate().map(|(i, _)| Qwen3VLVisionPatchMerger::new(&cfg, vb.pp("deepstack_merger_list").pp(i), true)).collect::<Result<Vec<_>>>()?;
-        Ok(Self { sm_size: cfg.spatial_merge_size, patch_embed: pe, pos_embed: Embedding::new(pw, cfg.hidden_size), num_grid: (cfg.num_position_embeddings as f32).sqrt() as u32, rotary: Qwen2_5VisionRotaryEmbedding::new(cfg.hidden_size/cfg.num_heads/2, None), blocks, merger: Qwen3VLVisionPatchMerger::new(&cfg, vb.pp("merger"), false)?, ds_idx: cfg.deepstack_visual_indexes.clone(), ds_mergers, dtype: vb.dtype() })
+        Ok(Self { spatial_merge_size: cfg.spatial_merge_size, patch_embed: pe, pos_embed: Embedding::new(pw, cfg.hidden_size), num_grid_per_side: (cfg.num_position_embeddings as f32).sqrt() as u32, rotary_pos_emb: Qwen2_5VisionRotaryEmbedding::new(cfg.hidden_size/cfg.num_heads/2, None), blocks, merger: Qwen3VLVisionPatchMerger::new(&cfg, vb.pp("merger"), false)?, deepstack_visual_indexes: cfg.deepstack_visual_indexes.clone(), deepstack_merger_list: ds_mergers, dtype: vb.dtype() })
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> {
         self.patch_embed.to_device(d)?; let pw = self.pos_embed.embeddings().to_device(d)?; self.pos_embed = Embedding::new(pw, self.pos_embed.hidden_size());
-        for b in &mut self.blocks { b.to_device(d)?; } self.merger.to_device(d)?; for m in &mut self.ds_mergers { m.to_device(d)?; } Ok(())
+        for b in &mut self.blocks { b.to_device(d)?; } self.merger.to_device(d)?; for m in &mut self.deepstack_merger_list { m.to_device(d)?; } Ok(())
     }
     pub fn forward(&self, pv: &Tensor, thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         let x = self.patch_embed.forward(pv)?; let pos = self.fast_pos_embed_interpolate(thw)?; let x = x.broadcast_add(&pos)?;
@@ -195,19 +195,19 @@ impl Qwen3VLVisionModel {
         let cu_full = Tensor::cat(&thw.i((.., 1))?.mul(&thw.i((.., 2))?)?.to_vec1::<u32>()?.iter().enumerate().map(|(i, &s)| thw.i((i, 0)).map_err(anyhow::Error::from)?.repeat(s as usize).map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()?, 0)?.flatten_all()?;
         let cu = cu_full.to_dtype(DType::F64)?.cumsum(0)?.to_dtype(DType::U32)?.pad_with_zeros(D::Minus1, 1, 0)?;
         let mut dsf = vec![];
-        for (i, b) in self.blocks.iter().enumerate() { x = b.forward(&x, &cu, &cos, &sin)?; if let Some(idx) = self.ds_idx.iter().position(|&v| v == i) { dsf.push(self.ds_mergers[idx].forward(&x)?); } }
+        for (i, b) in self.blocks.iter().enumerate() { x = b.forward(&x, &cu, &cos, &sin)?; if let Some(idx) = self.deepstack_visual_indexes.iter().position(|&v| v == i) { dsf.push(self.deepstack_merger_list[idx].forward(&x)?); } }
         Ok((self.merger.forward(&x)?, dsf))
     }
     fn fast_pos_embed_interpolate(&self, thw: &Tensor) -> Result<Tensor> {
         let mut idxs = vec![vec![]; 4]; let mut wts = vec![vec![]; 4]; let mut split = vec![];
         for i in 0..thw.dim(0)? {
             let [_, h, w] = thw.i(i)?.to_vec1::<u32>()?[..] else { return Err(anyhow!("Expected 3 elements")); };
-            split.push((h * w) as usize); let n_sub = (self.num_grid - 1) as f32;
+            split.push((h * w) as usize); let n_sub = (self.num_grid_per_side - 1) as f32;
             let hi = linspace(0.0, n_sub, h as usize, thw.device())?; let wi = linspace(0.0, n_sub, w as usize, thw.device())?;
             let hf = hi.to_dtype(DType::U32)?; let wf = wi.to_dtype(DType::U32)?;
             let hc = hf.affine(1.0, 1.0)?.clamp(0u32, n_sub as u32)?; let wc = wf.affine(1.0, 1.0)?.clamp(0u32, n_sub as u32)?;
             let dh = hi.sub(&hf.to_dtype(hi.dtype())?)?.unsqueeze(D::Minus1)?; let dw = wi.sub(&wf.to_dtype(hi.dtype())?)?.unsqueeze(0)?;
-            let bh = hf.affine(self.num_grid as f64, 0.0)?.unsqueeze(D::Minus1)?; let bc = hc.affine(self.num_grid as f64, 0.0)?.unsqueeze(D::Minus1)?;
+            let bh = hf.affine(self.num_grid_per_side as f64, 0.0)?.unsqueeze(D::Minus1)?; let bc = hc.affine(self.num_grid_per_side as f64, 0.0)?.unsqueeze(D::Minus1)?;
             idxs[0].extend_from_slice(&bh.broadcast_add(&wf.unsqueeze(0)?)?.flatten_all()?.to_vec1::<u32>()?);
             idxs[1].extend_from_slice(&bh.broadcast_add(&wc.unsqueeze(0)?)?.flatten_all()?.to_vec1::<u32>()?);
             idxs[2].extend_from_slice(&bc.broadcast_add(&wf.unsqueeze(0)?)?.flatten_all()?.to_vec1::<u32>()?);
@@ -224,21 +224,21 @@ impl Qwen3VLVisionModel {
         for (i, p) in split_res.iter().enumerate() {
             let [t, h, w] = thw.i(i)?.to_vec1::<u32>()?[..] else { return Err(anyhow!("Expected 3 elements")); };
             let ld: usize = p.dim(D::Minus1)?; let p = p.repeat((t as usize, 1))?;
-            outs.push(p.reshape((t as usize, h as usize / self.sm_size, self.sm_size, w as usize / self.sm_size, self.sm_size, ld))?.permute((0, 1, 3, 2, 4, 5))?.flatten(0, 4)?);
+            outs.push(p.reshape((t as usize, h as usize / self.spatial_merge_size, self.spatial_merge_size, w as usize / self.spatial_merge_size, self.spatial_merge_size, ld))?.permute((0, 1, 3, 2, 4, 5))?.flatten(0, 4)?);
         }
         Ok(Tensor::cat(&outs, 0)?)
     }
     fn rot_pos_emb(&self, thw: &Tensor) -> Result<Tensor> {
         let max_hw = thw.i((.., 1..))?.max_all()?.to_scalar::<u32>()?;
-        let ft = self.rotary.forward(max_hw as usize, thw.device())?;
+        let ft = self.rotary_pos_emb.forward(max_hw as usize, thw.device())?;
         let mut list = vec![];
         for i in 0..thw.dim(0)? {
             let [t, h, w] = thw.i(i)?.to_vec1::<u32>()?[..] else { return Err(anyhow!("Expected 3 elements")); };
-            let (mh, mw) = (h / self.sm_size as u32, w / self.sm_size as u32);
+            let (mh, mw) = (h / self.spatial_merge_size as u32, w / self.spatial_merge_size as u32);
             let (br, bc) = (Tensor::arange(0, mh, thw.device())?, Tensor::arange(0, mw, thw.device())?);
-            let (ir, ic) = (Tensor::arange(0, self.sm_size as u32, thw.device())?, Tensor::arange(0, self.sm_size as u32, thw.device())?);
-            let ri = br.reshape(((), 1, 1, 1))?.contiguous()?.affine(self.sm_size as f64, 0.0)?.broadcast_add(&ir.reshape((1, 1, (), 1))?.contiguous()?)?.expand((mh as usize, mw as usize, self.sm_size, self.sm_size))?.flatten_all()?;
-            let ci = bc.reshape((1, (), 1, 1))?.contiguous()?.affine(self.sm_size as f64, 0.0)?.broadcast_add(&ic.reshape((1, 1, 1, ()))?.contiguous()?)?.expand((mh as usize, mw as usize, self.sm_size, self.sm_size))?.flatten_all()?;
+            let (ir, ic) = (Tensor::arange(0, self.spatial_merge_size as u32, thw.device())?, Tensor::arange(0, self.spatial_merge_size as u32, thw.device())?);
+            let ri = br.reshape(((), 1, 1, 1))?.contiguous()?.affine(self.spatial_merge_size as f64, 0.0)?.broadcast_add(&ir.reshape((1, 1, (), 1))?.contiguous()?)?.expand((mh as usize, mw as usize, self.spatial_merge_size, self.spatial_merge_size))?.flatten_all()?;
+            let ci = bc.reshape((1, (), 1, 1))?.contiguous()?.affine(self.spatial_merge_size as f64, 0.0)?.broadcast_add(&ic.reshape((1, 1, 1, ()))?.contiguous()?)?.expand((mh as usize, mw as usize, self.spatial_merge_size, self.spatial_merge_size))?.flatten_all()?;
             let mut coords = Tensor::stack(&[ri, ci], D::Minus1)?.contiguous()?; if t > 1 { coords = coords.repeat((t as usize, 1))?; } list.push(coords);
         }
         let ids = Tensor::cat(&list, 0)?;
@@ -314,10 +314,10 @@ impl Qwen3VLTextModel {
         let ew = if probe(&vb.pp("embed_tokens"), "weight", map) { get_any(&vb.pp("embed_tokens"), "weight", map)? } else { Tensor::zeros((cfg.vocab_size, cfg.hidden_size), DType::F32, vb.device())? };
         if ew.dim(1)? != cfg.hidden_size { cfg.hidden_size = ew.dim(1)?; }
         let mut layers = vec![]; let vbl = vb.pp("layers");
-        for i in 0..cfg.num_hidden_layers {
-            let mut ex = probe(&vbl.pp(i).pp("input_layernorm"), "weight", map);
-            if !ex { ex = probe(&vbl.pp(i).pp("attn_norm"), "weight", map); }
-            if ex { layers.push(Some(Qwen3VLTextDecoderLayer::new(cfg.clone(), vbl.pp(i), map)?)); } else { layers.push(None); }
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let mut ex = probe(&vbl.pp(layer_idx).pp("input_layernorm"), "weight", map);
+            if !ex { ex = probe(&vbl.pp(layer_idx).pp("attn_norm"), "weight", map); }
+            if ex { layers.push(Some(Qwen3VLTextDecoderLayer::new(cfg.clone(), vbl.pp(layer_idx), map)?)); } else { layers.push(None); }
         }
         let n = if probe(&vb.pp("norm"), "weight", map) { RmsNorm::new(get_any(&vb.pp("norm"), "weight", map)?, cfg.rms_norm_eps) }
         else if probe(&vb.pp("output_norm"), "weight", map) { RmsNorm::new(get_any(&vb.pp("output_norm"), "weight", map)?, cfg.rms_norm_eps) }
