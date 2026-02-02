@@ -520,7 +520,7 @@ impl QuantizedQwen3VLModel {
                 let mut m_reader = std::io::Cursor::new(m_map);
                 load_vision_tensors_to_vb(ctm, &mut m_reader, vd, dt)?
             };
-            Some(Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), vb_v)?)
+            Some(Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), vb_v, None)?)
         } else { None };
 
         let lm = QuantizedQwen3VLTextModel::new_with_mmap(cfg.text_config.as_ref().unwrap(), ctm, mm.clone(), "model", td, tdi, dt, kvr, bo)?;
