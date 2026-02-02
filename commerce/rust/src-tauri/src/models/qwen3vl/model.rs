@@ -1,8 +1,62 @@
 use anyhow::{Result, anyhow};
-use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
+use candle_core::{D, DType, Device, IndexOp, Shape, Tensor, Module};
 use candle_nn::{
-    Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, rms_norm,
+    Activation, Embedding, Init, Linear, VarBuilder, rms_norm,
 };
+
+#[derive(Debug, Clone)]
+pub struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    pub fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let x_norm = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let weight_f32 = self.weight.to_dtype(DType::F32)?;
+        Ok(x_norm.broadcast_mul(&weight_f32)?.to_dtype(x.dtype())?)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LayerNorm {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+impl LayerNorm {
+    pub fn new(weight: Tensor, bias: Tensor, eps: f64) -> Self {
+        Self { weight, bias, eps }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let mean = x_f32.mean_keepdim(D::Minus1)?;
+        let x_mu = x_f32.broadcast_sub(&mean)?;
+        let variance = x_mu.sqr()?.mean_keepdim(D::Minus1)?;
+        let x_norm = x_mu.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let weight_f32 = self.weight.to_dtype(DType::F32)?;
+        let bias_f32 = self.bias.to_dtype(DType::F32)?;
+        Ok(x_norm.broadcast_mul(&weight_f32)?.broadcast_add(&bias_f32)?.to_dtype(x.dtype())?)
+    }
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward(x).map_err(|e| candle_core::Error::Msg(e.to_string()))
+    }
+}
+
+impl Module for LayerNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward(x).map_err(|e| candle_core::Error::Msg(e.to_string()))
+    }
+}
 
 use crate::{
     models::{
@@ -784,27 +838,67 @@ fn get_qlinear_from_vb(vb: VarBuilder, name: &str) -> Result<QLinear> {
     let bias_name = format!("{}bias", prefix);
 
     // [VRAM-OPTIM] Load packed components instead of full tensor
-    if let (Ok(packed), Ok(scales_raw), Ok(shape_t)) = (
-        vb.get_with_hints((1,), &packed_name, Init::Const(0.)),
-        vb.get_with_hints((1,), &scales_name, Init::Const(0.)),
-        vb.get_with_hints((1,), &shape_name, Init::Const(0.))
-    ) {
+    // Use probe to check if bit-serial components exist
+    if probe(&vb, &packed_name) {
+        let packed = get_any(&vb, &packed_name)?;
+        let scales_raw = get_any(&vb, &scales_name)?;
+        let shape_t = get_any(&vb, &shape_name)?;
+        
         let scales = scales_raw.to_dtype(DType::F32)?;
         let shape_vec: Vec<usize> = shape_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-        let bias = vb.get_with_hints((1,), &bias_name, Init::Const(0.)).ok();
+        let bias = if probe(&vb, &bias_name) { Some(get_any(&vb, &bias_name)?) } else { None };
         return Ok(QLinear::new(packed, scales, shape_vec, bias, vb.device().clone()));
     }
     
     // Fallback for non-quantized weights (look for "weight" or the name itself)
     let weight_name = if name.is_empty() { "weight".to_string() } else { name.to_string() };
-    let weight = vb.get_with_hints((1,), &weight_name, Init::Const(0.))?; 
+    let weight = get_any(&vb, &weight_name)?; 
     let s = weight.dims().to_vec();
     let total_el = s.iter().product::<usize>();
+    // Fake pack
     let scales = Tensor::ones((total_el / 32).max(1), DType::F32, vb.device())?;
     let packed = Tensor::zeros((total_el / 32).max(1), DType::U32, vb.device())?;
-    let bias = vb.get_with_hints((1,), &bias_name, Init::Const(0.)).ok();
+    let bias = if probe(&vb, &bias_name) { Some(get_any(&vb, &bias_name)?) } else { None };
     
     Ok(QLinear::new(packed, scales, s, bias, vb.device().clone()))
+}
+
+// [HELPER] Robust existence check
+fn probe(v: &VarBuilder, p: &str) -> bool {
+    match v.get_with_hints((1,), p, Init::Const(0.)) {
+        Ok(_) => true,
+        Err(e) => {
+            let s = e.to_string().to_lowercase();
+            s.contains("shape mismatch") || s.contains("dtype mismatch")
+        }
+    }
+}
+
+// [HELPER] Get tensor with any shape by parsing ShapeMismatch error if necessary
+fn get_any(v: &VarBuilder, p: &str) -> Result<Tensor> {
+    match v.get_with_hints((1,), p, Init::Const(0.)) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("shape mismatch") {
+                // Extract actual shape from error message "got: [d1, d2, ...]"
+                if let Some(start) = err_str.find("got: [") {
+                    let rest = &err_str[start + 6..];
+                    if let Some(end) = rest.find(']') {
+                        let shape_str = &rest[..end];
+                        let dims: Vec<usize> = shape_str.split(',')
+                            .map(|s| s.trim().parse::<usize>())
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        if !dims.is_empty() {
+                            return Ok(v.get(dims, p)?);
+                        }
+                    }
+                }
+            }
+            Err(anyhow!("Failed to load tensor '{}': {}", p, e))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -832,7 +926,6 @@ impl Qwen3VLTextAttention {
         let num_kv_groups = num_attention_heads / num_key_value_heads;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
         
-        // [FIX] Use explicit weight sub-key naming to match Bit-Serial format
         let q_proj = get_qlinear_from_vb(vb.pp("q_proj"), "weight")?;
         let k_proj = get_qlinear_from_vb(vb.pp("k_proj"), "weight")?;
         let v_proj = get_qlinear_from_vb(vb.pp("v_proj"), "weight")?;
@@ -955,16 +1048,15 @@ impl Qwen3VLTextDecoderLayer {
             config.intermediate_size,
             config.hidden_act,
         )?;
-        let input_layernorm = rms_norm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            vb.pp("input_layernorm"),
-        )?;
-        let post_attention_layernorm = rms_norm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
+        
+        let input_layernorm = {
+            let w = get_any(&vb.pp("input_layernorm"), "weight")?;
+            RmsNorm::new(w, config.rms_norm_eps)
+        };
+        let post_attention_layernorm = {
+            let w = get_any(&vb.pp("post_attention_layernorm"), "weight")?;
+            RmsNorm::new(w, config.rms_norm_eps)
+        };
         Ok(Self {
             self_attn,
             mlp,
@@ -1009,18 +1101,11 @@ pub struct Qwen3VLTextModel {
 impl Qwen3VLTextModel {
     pub fn new(mut config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
         let vocab_size = config.vocab_size;
-        use crate::models::common::find_flexible_weight;
-
+        
         // [SMART-PROBE] Check if embeddings exist (Baking model has them, Inference model might not)
-        let embed_tokens_weight = if vb.pp("embed_tokens").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() {
-            find_flexible_weight(&vb.pp("embed_tokens"), "weight", vocab_size, config.hidden_size)?
+        let embed_tokens_weight = if probe(&vb.pp("embed_tokens"), "weight") {
+            get_any(&vb.pp("embed_tokens"), "weight")?
         } else {
-            // If missing (Inference-Only file), create a dummy embedding or try to load from baking context?
-            // For now, if missing, we initialize a zero tensor to avoid crash, assuming we won't embed in inference-only mode without passing embeddings.
-            // But wait, inference needs embeddings if we input tokens.
-            // Actually, Inference-Only model is loaded *after* Baking, or as a second model.
-            // If we run inference, we usually have full model or we pipe embeddings.
-            // Let's assume standard behavior: if missing, create dummy (it will be unused if we pass embeddings directly).
             Tensor::zeros((vocab_size, config.hidden_size), DType::F32, vb.device())?
         };
 
@@ -1037,28 +1122,17 @@ impl Qwen3VLTextModel {
         for layer_idx in 0..config.num_hidden_layers {
             // [SMART-PROBE] Check if this layer exists in the file (RESILIENT)
             let check_path = vb_l.pp(layer_idx).pp("input_layernorm");
-            
-            let is_tensor_there = |v: &VarBuilder, name: &str| -> bool {
-                match v.get_with_hints((1,), name, Init::Const(0.)) {
-                    Ok(_) => true,
-                    Err(e) => {
-                        let s = e.to_string().to_lowercase();
-                        s.contains("shape mismatch") || s.contains("dtype mismatch")
-                    }
-                }
-            };
-
-            let mut layer_exists = is_tensor_there(&check_path, "weight");
+            let mut layer_exists = probe(&check_path, "weight");
             
             if !layer_exists {
                 // Try alternative name
-                layer_exists = is_tensor_there(&vb_l.pp(layer_idx).pp("attn_norm"), "weight");
+                layer_exists = probe(&vb_l.pp(layer_idx).pp("attn_norm"), "weight");
             }
             
             // Final fallback: try flat check on the original VarBuilder
             if !layer_exists {
                 let flat_name = format!("layers.{}.input_layernorm.weight", layer_idx);
-                layer_exists = is_tensor_there(&vb, &flat_name);
+                layer_exists = probe(&vb, &flat_name);
             }
 
             println!("[MODEL-DEBUG] Probing Layer {}: Found={}", layer_idx, layer_exists);
@@ -1072,8 +1146,12 @@ impl Qwen3VLTextModel {
         }
         
         // Norm might be missing in Baking-Only file
-        let norm = if vb.pp("norm").get_with_hints((1,), "weight", Init::Const(0.)).is_ok() {
-            rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?
+        let norm = if probe(&vb.pp("norm"), "weight") {
+            let w = get_any(&vb.pp("norm"), "weight")?;
+            RmsNorm::new(w, config.rms_norm_eps)
+        } else if probe(&vb.pp("output_norm"), "weight") {
+            let w = get_any(&vb.pp("output_norm"), "weight")?;
+            RmsNorm::new(w, config.rms_norm_eps)
         } else {
              // Create dummy norm
              RmsNorm::new(Tensor::ones(config.hidden_size, DType::F32, vb.device())?, config.rms_norm_eps)

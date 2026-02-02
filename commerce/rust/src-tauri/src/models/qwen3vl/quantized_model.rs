@@ -64,16 +64,15 @@ pub struct RmsNorm { weight: Tensor, eps: f64 }
 impl RmsNorm {
     pub fn new(weight: Tensor, eps: f64) -> Self { Self { weight, eps } }
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let td = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        self.weight = self.weight.to_device(device)?.to_dtype(td)?; Ok(())
+        self.weight = self.weight.to_device(device)?.to_dtype(DType::F32)?; Ok(())
     }
 }
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let x = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        x.to_dtype(self.weight.dtype())?.broadcast_mul(&self.weight)
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let x_norm = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        x_norm.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?.to_dtype(x.dtype())
     }
 }
 
@@ -83,7 +82,8 @@ pub struct QLinear {
 }
 impl QLinear {
     pub fn new(packed_weight: Tensor, scales: Tensor, original_shape: Vec<usize>, bias: Option<Tensor>, device: Device) -> Self { 
-        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        // Force F32 for better compatibility with CUDA kernels
+        let dtype = DType::F32;
         Self { packed_weight, scales, original_shape, bias, device, dtype } 
     }
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
@@ -92,17 +92,19 @@ impl QLinear {
             self.scales = self.scales.to_device(device)?;
             if let Some(b) = &self.bias { self.bias = Some(b.to_device(device)?); }
             self.device = device.clone();
-            self.dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+            self.dtype = DType::F32;
         }
         Ok(())
     }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, s, h) = xs.dims3()?;
         let weight = self.dequantize_on_the_fly(xs.device())?;
-        let xs_flat = xs.reshape((b * s, h))?.to_dtype(weight.dtype())?;
-        let mut out = xs_flat.matmul(&weight.t()?)?;
-        if let Some(bias) = &self.bias { out = out.broadcast_add(bias)?; }
-        Ok(out.reshape((b, s, ()))?)
+        // Ensure both inputs to matmul are F32
+        let xs_flat = xs.reshape((b * s, h))?.to_dtype(DType::F32)?;
+        let weight_f32 = weight.to_dtype(DType::F32)?;
+        let mut out = xs_flat.matmul(&weight_f32.t()?)?;
+        if let Some(bias) = &self.bias { out = out.broadcast_add(&bias.to_dtype(DType::F32)?)?; }
+        Ok(out.reshape((b, s, ()))?.to_dtype(xs.dtype())?)
     }
     fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
         let s = &self.original_shape;

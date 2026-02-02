@@ -1,30 +1,61 @@
 use anyhow::Result;
-use candle_core::{D, Device, Tensor};
+use candle_core::{D, DType, Device, Tensor, Module};
 use candle_nn::{
-    Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm,
-    Linear, Module, RmsNorm, VarBuilder, batch_norm, conv2d, conv2d_no_bias, rms_norm,
+    Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig,
+    Linear, VarBuilder, batch_norm, conv2d, conv2d_no_bias,
 };
 
-use crate::{models::rope::apply_rotary_pos_emb, utils::tensor_utils::repeat_kv};
+#[derive(Debug, Clone)]
+pub struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
 
-pub fn find_flexible_weight(v: &VarBuilder, name: &str, out_dim: usize, in_dim: usize) -> Result<Tensor> {
-    for suffix in &["", ".packed", ".min"] {
-        let full_name = format!("{}{}", name, suffix);
-        // [SMART-LOAD] Catch ShapeMismatch to detect existence and retrieve actual shape
-        match v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)) {
-            Ok(t) => return Ok(v.get(t.shape(), &full_name)?),
-            Err(candle_core::Error::ShapeMismatch { shape, .. }) => {
-                return Ok(v.get(shape, &full_name)?);
-            }
-            Err(candle_core::Error::Msg(s)) if s.contains("shape mismatch") => {
-                // Fallback for versions returning Msg
-                return Ok(v.get((out_dim, in_dim), &full_name).or_else(|_| v.get_with_hints((1,), &full_name, candle_nn::Init::Const(0.)))?);
-            }
-            _ => {}
-        }
+impl RmsNorm {
+    pub fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
     }
-    // Final fallback to standard name and dimensions
-    Ok(v.get((out_dim, in_dim), name)?)
+}
+
+impl Module for RmsNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let variance = x_f32.sqr()?.mean_keepdim(D::Minus1)?;
+        let x_norm = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let weight_f32 = self.weight.to_dtype(DType::F32)?;
+        x_norm.broadcast_mul(&weight_f32)?.to_dtype(x.dtype())
+    }
+}
+
+pub fn rms_norm(size: usize, eps: f64, vb: VarBuilder) -> Result<RmsNorm> {
+    let weight = vb.get(size, "weight")?;
+    Ok(RmsNorm::new(weight, eps))
+}
+
+#[derive(Debug, Clone)]
+pub struct LayerNorm {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+impl LayerNorm {
+    pub fn new(weight: Tensor, bias: Tensor, eps: f64) -> Self {
+        Self { weight, bias, eps }
+    }
+}
+
+impl Module for LayerNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let mean = x_f32.mean_keepdim(D::Minus1)?;
+        let x_mu = x_f32.broadcast_sub(&mean)?;
+        let variance = x_mu.sqr()?.mean_keepdim(D::Minus1)?;
+        let x_norm = x_mu.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let weight_f32 = self.weight.to_dtype(DType::F32)?;
+        let bias_f32 = self.bias.to_dtype(DType::F32)?;
+        x_norm.broadcast_mul(&weight_f32)?.broadcast_add(&bias_f32)?.to_dtype(x.dtype())
+    }
 }
 
 pub fn get_layer_norm(vb: VarBuilder, eps: f64, size: usize) -> Result<LayerNorm> {
