@@ -2,7 +2,7 @@ use crate::utils;
 use anyhow::anyhow;
 use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
 use crate::models::native_embedding::NativeEmbeddingModel;
-use crate::openai_types::{
+use crate::openai_types {
     ChatCompletionParameters,
     ChatCompletionRequestMessage,
     ChatCompletionRequestUserMessage,
@@ -13,7 +13,6 @@ use crate::openai_types::{
     ChatCompletionRequestMessageContentPartImage,
     ImageURL,
 };
-use candle_core::{Device, DType};
 use image::DynamicImage;
 use serde_json::{Value, json, Map};
 use std::sync::{Arc, atomic::AtomicBool};
@@ -36,8 +35,8 @@ pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
     pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
     pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
-    pub embedding_model: Arc<TokioMutex<Option<NativeEmbeddingModel>>>
-,
+    pub embedding_model: Arc<TokioMutex<Option<NativeEmbeddingModel>>>,
+    
     pub is_cpu_mode: bool, 
     pub dual_mode_enabled: bool,
     
@@ -47,8 +46,8 @@ pub struct LogisModel {
     embedding_path: std::path::PathBuf,
     device_config: utils::DeviceConfig,
     max_tokens_limit: u32,
-    dtype: Option<DType>, 
-    current_size: Arc<TokioMutex<Option<ModelSize>>>,
+    dtype: Option<()>, 
+    current_size: Arc<TokioMutex<Option<ModelSize>>>, 
 }
 
 impl LogisModel {
@@ -80,9 +79,8 @@ impl LogisModel {
 
         let mut sys = System::new();
         sys.refresh_memory();
-        let free_ram = sys.total_memory().saturating_sub(sys.used_memory()); // Bytes in sysinfo 0.30
+        let free_ram = sys.total_memory().saturating_sub(sys.used_memory()); 
 
-        // Threshold: 4GB
         if free_ram < 4 * 1024 * 1024 * 1024 {
             println!("[RAM-WATCH] Low System Memory ({:.2} GB). Flushing Working Set...", free_ram as f64 / 1024.0 / 1024.0 / 1024.0);
             
@@ -104,14 +102,6 @@ impl LogisModel {
 
     /// [CLEANUP] Adaptive resource management based on system stress
     pub async fn deep_purge_resources(&self) {
-        if !self.is_cpu_mode {
-            let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                // Ignore sync errors if context is already gone
-                if dev.is_cuda() { let _ = dev.synchronize(); }
-            }).await;
-        }
-
         // 1. Clear Active Slots
         if let Ok(mut gen) = self.generator.try_lock() { *gen = None; }
         if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
@@ -201,13 +191,11 @@ impl LogisModel {
 
             // [TIMEOUT-HANDLER]
             if start.elapsed().as_secs() > timeout_sec {
-                // If memory is still actively freeing up, extend timeout dynamically
                 if increasing_ticks > 0 {
                     println!("[VRAM-WATCH] Timeout reached but memory is freeing up. Extending wait...");
-                    increasing_ticks = 0; // Reset to avoid infinite loop
+                    increasing_ticks = 0; 
                     continue; 
                 }
-                
                 println!("[VRAM-WATCH] Timeout reached. Proceeding with {:.2} GB (Target: {:.2} GB)", current_free as f64/1e9, target_free_mb as f64/1024.0);
                 break;
             }
@@ -227,7 +215,7 @@ impl LogisModel {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
                 let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
-                println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
+                println!("[SSD-BRIDGE] Saving KV snapshot to {{:?}}", path);
                 gen.save_kv_to_disk(&path)?;
                 Ok(path.to_string_lossy().to_string())
             } else {
@@ -245,7 +233,7 @@ impl LogisModel {
             if let Some(gen) = gen_guard.as_mut() {
                 let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 if path.exists() {
-                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
+                    println!("[SSD-BRIDGE] Loading KV snapshot from {{:?}}", path);
                     gen.load_kv_from_disk(&path)?;
                     Ok(())
                 } else {
@@ -262,27 +250,22 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?}...", target_size);
+        println!("[RELAY] Performing Deep Purge before loading {{:?}}...", target_size);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
-            // VRAM이 실제로 비워질 때까지 대기
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
         let text_only = target_size == ModelSize::Large && task_id.is_some();
         self.ensure_generator_ext(target_size, text_only).await?;
 
-        // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
             self.load_kv_snapshot(tid).await?;
         }
 
-        println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
+        println!("[RELAY] Transition to {{:?}} complete in {{:.2}}s", target_size, start_time.elapsed().as_secs_f32());
         Ok(())
     }
 
@@ -290,32 +273,24 @@ impl LogisModel {
     pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
         
-        // 1. Load Small Model Isolated
         self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone()).await?;
 
-        // 2. Ingest PUG content
         {
             let gen_clone = self.generator.clone();
             let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
             let token_clone = cancel_token.clone();
             
-            // We use prefill_only via a manual chat construct or direct access if possible
-            // Reusing chat_params_with_spinner for convenience but with empty generation
-            
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    // Just prefill, no generation needed for base context
                     gen.prefill_chunk(prompt, token_clone, None)?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 3. Save Base Snapshot
         self.save_kv_snapshot(&base_session).await?;
         
-        // 4. Unload immediately to free VRAM for 2B
         self.unload_generator().await;
         
         Ok(())
@@ -328,22 +303,19 @@ impl LogisModel {
     }
 
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})", path, force_text_only);
-        let dev = self.device_config.device.clone();
+        println!("[MODEL] Loading Generator from {{}} (Text-Only: {{}})...", path, force_text_only);
+        
         let dev_id = self.device_config.gpu_id;
-
-        let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path = shared_config_path.map(|s| s.to_string());
 
         let generator = tokio::task::spawn_blocking(move || {
-            // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                shared_path.as_deref(), // Tokenizer path
-                shared_path.as_deref(), // Config path
-                Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
+                shared_path.as_deref(), 
+                shared_path.as_deref(), 
+                None, dev_id, None, dev_id, None, Some(limit as usize),
                 force_text_only
             )
         }).await??;
@@ -362,13 +334,11 @@ impl LogisModel {
         let mut large_slot = self.large_hibernation.lock().await;
 
         if *current_size_guard == Some(size) && gen_guard.is_some() {
-            return Ok(());
+            return Ok(())
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {})", size, force_text_only);
-        // ... (rest of the switching logic remains similar but uses the new loading)
+        println!("[MODEL] Activating engine for size: {{:?}} (Text-Only: {{}})...", size, force_text_only);
 
-        // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
         let found_in_slot = match size {
             ModelSize::Small => {
                 if let Some(m) = small_slot.take() {
@@ -395,33 +365,15 @@ impl LogisModel {
         };
 
         if found_in_slot {
-            println!("[MODEL] Switched to cached {:?} engine.", size);
-            return Ok(());
+            println!("[MODEL] Switched to cached {{:?}} engine.", size);
+            return Ok(())
         }
 
-        // 2. [LOAD] Load from disk if not found in any slot
-        println!("[LOAD] Fresh loading {:?} from disk...", size);
+        println!("[LOAD] Fresh loading {{:?}} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
-        let mut target_device = self.device_config.device.clone();
-        
-        // [OOM-SAFETY] Small (0.6B) can stay on CPU if VRAM is tight to keep Large (2B) on GPU.
-        if size == ModelSize::Small && target_device.is_cuda() {
-            if let Ok(nvml_inst) = nvml_wrapper::Nvml::init() {
-                if let Ok(dev) = nvml_inst.device_by_index(self.device_config.gpu_id as u32) {
-                    if let Ok(mem) = dev.memory_info() {
-                        if mem.free < 3_000_000_000 {
-                            println!("[MODEL-CONFIG] Tight VRAM. Loading Small (0.6B) on CPU.");
-                            target_device = Device::Cpu;
-                        }
-                    }
-                }
-            }
-        }
-
         let dev_id = self.device_config.gpu_id;
-        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path_clone = shared_path.map(|s| s.to_string());
@@ -431,12 +383,11 @@ impl LogisModel {
                 &path_clone, 
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
-                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
+                None, dev_id, None, dev_id, None, Some(limit as usize),
                 force_text_only
             )
         }).await??;
 
-        // Move current main to slot
         if let Some(old_m) = gen_guard.take() {
             if let Some(old_size) = *current_size_guard {
                 match old_size {
@@ -483,14 +434,13 @@ impl LogisModel {
     }
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel (Preference: {:?})", device_preference);
+        println!("[MODEL-00] Initializing LogisModel (Preference: {{:?}})", device_preference);
 
         let mut config = utils::get_optimal_device_config();
         
         if device_preference == Some("cpu") {
             println!("⚠️ [MODEL] EXPLICIT CPU MODE FORCED by user/system preference.");
             config = utils::DeviceConfig {
-                device: Device::Cpu,
                 is_cpu: true,
                 classify_chunk_size: 12000,
                 extract_chunk_size: 12000,
@@ -596,7 +546,7 @@ Return valid JSON only. No explanation.
             let store_guard = store_mutex.lock().await;
             if let Some(db) = store_guard.as_ref() {
                 let from_addr = "0x0000000000000000000000000000000000000000";
-                let team_id = crate::utils::hash::hash_id("local.image"); 
+                let team_id = crate::utils::hash::hash_id(from_addr); 
                 let hashed_cc = crate::utils::hash::hash_id("local.image");
 
                 let raw_no = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
@@ -682,8 +632,8 @@ Return valid JSON only. No explanation.
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))?;
-            println!("[MODEL-CHAT] Raw Response: {}", response);
+            let response = gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {{}}", e))?;
+            println!("[MODEL-CHAT] Raw Response: {{}}", response);
             Ok(response)
         }).await?
     }
@@ -761,10 +711,10 @@ Return valid JSON only. No explanation.
         let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {{}}", e))
         });
 
-        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
+        task.await.map_err(|e| anyhow!("Task join error: {{}}", e))?
     }
 
     pub async fn chat_with_image_spinner(
@@ -819,10 +769,10 @@ Return valid JSON only. No explanation.
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {{}}", e))
         });
 
-        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
+        task.await.map_err(|e| anyhow!("Task join error: {{}}", e))?
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
@@ -864,7 +814,7 @@ Return valid JSON only. No explanation.
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {{}}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -888,6 +838,7 @@ Return valid JSON only. No explanation.
         }
 
         let generator_arc = self.generator.clone();
+        let max_tok = self.max_tokens_limit;
         
         let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = generator_arc.blocking_lock();
@@ -919,20 +870,20 @@ Return valid JSON only. No explanation.
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(message)],
                 model: "qwen3vl".to_string(),
-                max_tokens: Some(self.max_tokens_limit),
+                max_tokens: Some(max_tok),
                 temperature: Some(0.1),
                 top_p: Some(0.9),
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {{}}", e))
         });
         
-        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
+        task.await.map_err(|e| anyhow!("Task join error: {{}}", e))?
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
-        println!("[PROCESS] General image analysis for: {}", image_path);
+        println!("[PROCESS] General image analysis for: {{}}", image_path);
         
         let full_img_raw = image::open(&image_path)?;
         let full_img_raw = DynamicImage::ImageRgb8(full_img_raw.to_rgb8());
@@ -951,7 +902,7 @@ Return valid JSON only. No explanation.
             None
         ).await?;
 
-        println!("[PROCESS] Raw Response: {}", response);
+        println!("[PROCESS] Raw Response: {{}}", response);
         let extracted_data = crate::parsing::parse_json_from_llm(&response);
         
         Ok(extracted_data)
@@ -965,7 +916,7 @@ Return valid JSON only. No explanation.
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
             let guard = embedding_model_arc.blocking_lock();
             if let Some(model) = guard.as_ref() {
-                model.embed(&text).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
+                model.embed(&text).map_err(|e| anyhow::anyhow!("Embedding error: {{}}", e))
             } else {
                 Ok(vec![0.0; 768])
             }
@@ -976,7 +927,7 @@ Return valid JSON only. No explanation.
         let current_time = chrono::Utc::now().to_rfc3339();
         
         let prompt1 = crate::parsing::para2graph(language);
-        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, Some("system_search_p2g".to_string())).await?;
+        let res1 = self.chat("", &format!("{{}}\n\nQuery: {{}}", prompt1, query), None, Some("system_search_p2g".to_string())).await?;
         let segments = crate::parsing::parse_json_from_llm(&res1);
         
         let mut final_contexts = Vec::new();
@@ -984,12 +935,12 @@ Return valid JSON only. No explanation.
             let mut combined_segments = String::new();
             for (idx, seg) in ctx_arr.iter().enumerate() {
                 let seg_text = seg.get("text").and_then(|v: &Value| v.as_str()).unwrap_or("");
-                combined_segments.push_str(&format!("Segment #{}: {}\n", idx + 1, seg_text));
+                combined_segments.push_str(&format!("Segment #{}: {{}}\n", idx + 1, seg_text));
             }
 
             if !combined_segments.is_empty() {
                 let prompt2 = crate::parsing::graph2contexts(&current_time);
-                let res2 = self.chat("", &format!("{}\n\nInput Segments:\n{}", prompt2, combined_segments), None, Some("system_search_g2c".to_string())).await?;
+                let res2 = self.chat("", &format!("{{}}\n\nInput Segments:\n{{}}", prompt2, combined_segments), None, Some("system_search_g2c".to_string())).await?;
                 let mut batch_info = crate::parsing::parse_json_from_llm(&res2);
                 
                 if let Some(res_arr) = batch_info.get_mut("context").and_then(|v: &mut Value| v.as_array_mut()) {
@@ -1011,7 +962,7 @@ Return valid JSON only. No explanation.
     }
 
     pub async fn run_deep_research(&self, query: String, context_data: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let mut status_history = format!("### 🔍 Deep Research: '{}'\n\n", query);
+        let mut status_history = format!("### 🔍 Deep Research: '{{}}'\n\n", query);
 
         status_history.push_str("✅ Context gathered.\n\n");
         crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
@@ -1023,30 +974,12 @@ Return valid JSON only. No explanation.
         ];
 
         for step in steps.iter() {
-            status_history.push_str(&format!("**⏳ {}**\n", step));
+            status_history.push_str(&format!("**⏳ {{}}**\n", step));
             crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
 
-            let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
+            let prompt = format!("Given this context: {{}}\n\nTask: {{}}\nQuery: {{}}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
             let step_result = self.run_inference_text(prompt, None, cancel_token.clone(), None).await?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
-            status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
-            crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
-        }
-
-        status_history.push_str("### 📊 Final Research Report\n\n");
-        let final_prompt = format!("CONTEXT: {}\nQUERY: {}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
-        
-        let report = self.run_inference_text(final_prompt, None, cancel_token, None).await?;
-        status_history.push_str(&report);
-        
-        crate::scheduler::log_task_progress(app_handle, "research", &json!({ "text": status_history }));
-
-        Ok(report)
-    }
-}
-
-pub fn get_image_extraction_prompt(region: &str, language: &str, page_type: &str, address: &str) -> String {
-    LogisModel::get_image_extraction_prompt(region, language, page_type, address)
-}
+            status_history.push_str(&format!(

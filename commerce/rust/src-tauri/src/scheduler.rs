@@ -6,6 +6,7 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::{LogisModel, ModelSize};
+use crate::models::qwen3vl::generate::Qwen3VLGenerateModel; // Import added
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::{AppHandle, Manager, Emitter};
@@ -235,16 +236,16 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
-    let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let _task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
     // Device Preference Handling
-    let effective_device_pref = device_preference.or_else(|| {
-        task_data.get("device_preference").and_then(|v| {
+    let _effective_device_pref = device_preference.or_else(|| {
+        _task_data.get("device_preference").and_then(|v| {
             if v.as_str() == Some("cpu") || v.as_bool() == Some(true) { Some("cpu".to_string()) } else { None }
         })
     });
 
-    let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let url = _task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
     if url.is_empty() { return Ok(()); }
 
     // 2. Fetch & Convert to PUG
@@ -257,7 +258,7 @@ async fn process_task(
             let raw_html_path = data_manager.get_path("raw_html");
             let raw_content = if raw_html_path.exists() {
                 data_manager.load(&raw_html_path)?
-            } else if let Some(h) = task_data.get("html").and_then(|s| s.as_str()) {
+            } else if let Some(h) = _task_data.get("html").and_then(|s| s.as_str()) {
                  data_manager.offload(h, "raw_html")?;
                  h.to_string()
             } else {
@@ -298,11 +299,11 @@ async fn process_task(
         if !kv_dir.exists() {
             // [0.6B] Bake
              model.secure_vram_relay(ModelSize::Small, None, Some(cancellation_token.clone())).await?;
-             let mut gen_guard = model.generator.lock().await;
+             let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?;
+                 gen.save_kv_to_disk(&kv_dir)?; // Save Native Snapshot
              }
         }
 
@@ -316,7 +317,7 @@ async fn process_task(
         println!("[Scheduler] Classified as: {}", page_type);
     }
     
-    if page_type == "unknown" { return Ok(()); }
+    if page_type == "unknown" { return Ok(()); } 
     
     // --- PIPELINE STEP B: SELECTORS ---
     // Clear resources between heavy steps
@@ -334,11 +335,11 @@ async fn process_task(
 
         if !kv_dir.exists() {
              model.secure_vram_relay(ModelSize::Small, None, Some(cancellation_token.clone())).await?;
-             let mut gen_guard = model.generator.lock().await;
+             let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?;
+                 gen.save_kv_to_disk(&kv_dir)?; 
              }
         }
 
@@ -402,11 +403,11 @@ async fn process_task(
 
              if !kv_dir.exists() {
                  model.secure_vram_relay(ModelSize::Small, None, Some(cancellation_token.clone())).await?;
-                 let mut gen_guard = model.generator.lock().await;
+                 let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
                  if let Some(gen) = gen_guard.as_mut() {
                      gen.clear_kv_cache();
                      gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                     gen.save_kv_to_disk(&kv_dir)?;
+                     gen.save_kv_to_disk(&kv_dir)?; 
                  }
              }
              
@@ -538,7 +539,7 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             break; // Perfect state reached
         }
 
-        // [STABILITY-LOGIC] Even if below target, if memory release has stopped changing, 
+        // [STABILITY-LOGIC] Even if below target, if memory release has stopped changing,
         // it means we've recovered all we can. Don't wait forever.
         let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
         if delta < 5_000_000 { // Change < 5MB
