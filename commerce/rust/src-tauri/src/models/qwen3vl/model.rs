@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::{
     models::{
-        common::{TwoLinearMLP, eager_attention_forward, RmsNorm, LayerNorm},
+        common::{GateUpDownMLP, NaiveAttention, TwoLinearMLP, eager_attention_forward, RmsNorm, LayerNorm},
         qwen3vl::{
             config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
             quantized_model::QLinear,
@@ -13,11 +13,10 @@ use crate::{
     },
     position_embed::rope::{
         Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
-        apply_rotary_pos_emb_vision,
     },
     utils::tensor_utils::{
-        linspace, mask_index_add, masked_scatter_dim0,
-        nonzero_index, prepare_causal_attention_mask, split_tensor,
+        mask_index_add, masked_scatter_dim0,
+        nonzero_index, prepare_causal_attention_mask,
         get_vision_next_indices,
     },
 };
@@ -27,7 +26,7 @@ use crate::{
 fn safe_probe(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> bool {
     let prefix = v.prefix();
     let path = if prefix.is_empty() { p.to_string() } 
-    else if prefix.ends_with('.') { format!("{}{}", prefix, p) } 
+    else if prefix.ends_with('.') || p.is_empty() { format!("{}{}", prefix, p) } 
     else { format!("{}.{}", prefix, p) };
 
     if let Some(m) = map { return m.contains_key(&path); }
@@ -37,7 +36,7 @@ fn safe_probe(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) ->
 fn safe_get(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> Result<Tensor> {
     let prefix = v.prefix();
     let path = if prefix.is_empty() { p.to_string() } 
-    else if prefix.ends_with('.') { format!("{}{}", prefix, p) } 
+    else if prefix.ends_with('.') || p.is_empty() { format!("{}{}", prefix, p) } 
     else { format!("{}.{}", prefix, p) };
 
     if let Some(m) = map {
@@ -63,18 +62,21 @@ fn safe_get(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> R
 }
 
 fn get_qlinear_safe(vb: VarBuilder, name: &str, map: Option<&HashMap<String, Tensor>>) -> Result<QLinear> {
-    let prefix = if name.is_empty() { "".to_string() } else { format!("{}.", name) };
-    if safe_probe(&vb, &format!("{}packed", prefix), map) {
-        let p = safe_get(&vb, &format!("{}packed", prefix), map)?;
-        let s = safe_get(&vb, &format!("{}scales", prefix), map)?.to_dtype(DType::F32)?;
-        let sh_t = safe_get(&vb, &format!("{}shape", prefix), map)?;
+    let (p_key, s_key, sh_key) = if name.is_empty() { ("packed".to_string(), "scales".to_string(), "shape".to_string()) } 
+                                 else { (format!("{}.packed", name), format!("{}.scales", name), format!("{}.shape", name)) };
+    
+    if safe_probe(&vb, &p_key, map) {
+        let p = safe_get(&vb, &p_key, map)?;
+        // We assume p is already U32 or converted to U32 by the loader.
+        let s = safe_get(&vb, &s_key, map)?.to_dtype(DType::F32)?;
+        let sh_t = safe_get(&vb, &sh_key, map)?;
         let sh: Vec<usize> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
-        let b = if safe_probe(&vb, &format!("{}bias", prefix), map) { Some(safe_get(&vb, &format!("{}bias", prefix), map)?) } else { None };
+        let b = if safe_probe(&vb, &format!("{}.bias", name), map) { Some(safe_get(&vb, &format!("{}.bias", name), map)?) } else { None };
         return Ok(QLinear::new(p, s, sh, b, vb.device().clone()));
     }
     let w = safe_get(&vb, if name.is_empty() { "weight" } else { name }, map)?;
     let s = w.dims().to_vec(); let t = s.iter().product::<usize>();
-    let b = if safe_probe(&vb, &format!("{}bias", prefix), map) { Some(safe_get(&vb, &format!("{}bias", prefix), map)?) } else { None };
+    let b = if safe_probe(&vb, &format!("{}.bias", name), map) { Some(safe_get(&vb, &format!("{}.bias", name), map)?) } else { None };
     Ok(QLinear::new(Tensor::zeros((t/32).max(1), DType::U32, vb.device())?, Tensor::ones((t/32).max(1), DType::F32, vb.device())?, s, b, vb.device().clone()))
 }
 
@@ -83,7 +85,7 @@ fn get_qlinear_safe(vb: VarBuilder, name: &str, map: Option<&HashMap<String, Ten
 #[derive(Debug, Clone)]
 pub struct Qwen3VLVisionPatchEmbed { conv3d_weight: Tensor, conv3d_bias: Tensor }
 impl Qwen3VLVisionPatchEmbed {
-    pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder, map: Option<&HashMap<String, Tensor>>) -> Result<Self> {
+    pub fn new(_cfg: &Qwen3VLVisionConfig, vb: VarBuilder, map: Option<&HashMap<String, Tensor>>) -> Result<Self> {
         let (wn, bn) = if safe_probe(&vb, "proj.weight", map) { ("proj.weight", "proj.bias") } else { ("weight", "bias") };
         let w = safe_get(&vb, wn, map)?.flatten(1, 4)?.t()?;
         let b = safe_get(&vb, bn, map)?.unsqueeze(0)?;
@@ -98,147 +100,69 @@ pub struct Qwen3VLVisionPatchMerger { hidden_size: usize, use_postshuffle_norm: 
 impl Qwen3VLVisionPatchMerger {
     pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder, upn: bool, map: Option<&HashMap<String, Tensor>>) -> Result<Self> {
         let hs = cfg.hidden_size * cfg.spatial_merge_size.pow(2);
-        let ns = if upn { hs } else { cfg.hidden_size };
-        let (f1, f2, n) = if safe_probe(&vb, "linear_fc1.weight", map) { ("linear_fc1", "linear_fc2", "norm") } else { ("0", "2", "norm") };
-        let nw = safe_get(&vb.pp(n), "weight", map)?; let nb = safe_get(&vb.pp(n), "bias", map)?;
-        let w1 = safe_get(&vb.pp(f1), "weight", map)?; let b1 = safe_get(&vb.pp(f1), "bias", map).ok();
-        let w2 = safe_get(&vb.pp(f2), "weight", map)?; let b2 = safe_get(&vb.pp(f2), "bias", map).ok();
-        Ok(Self { hidden_size: hs, use_postshuffle_norm: upn, norm: LayerNorm::new(nw, nb, 1e-6), linear_fc1: Linear::new(w1, b1), act_fn: Activation::Gelu, linear_fc2: Linear::new(w2, b2) })
+        let ln_w = safe_get(&vb.pp("norm"), "weight", map)?; let ln_b = safe_get(&vb.pp("norm"), "bias", map)?;
+        let fc1_w = safe_get(&vb.pp("linear_fc1"), "weight", map)?; let fc1_b = safe_get(&vb.pp("linear_fc1"), "bias", map)?;
+        let fc2_w = safe_get(&vb.pp("linear_fc2"), "weight", map)?; let fc2_b = safe_get(&vb.pp("linear_fc2"), "bias", map)?;
+        Ok(Self { hidden_size: hs, use_postshuffle_norm: upn, norm: LayerNorm::new(ln_w, ln_b, 1e-6), linear_fc1: Linear::new(fc1_w, Some(fc1_b)), act_fn: Activation::Gelu, linear_fc2: Linear::new(fc2_w, Some(fc2_b)) })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = if self.use_postshuffle_norm { x.reshape(((), self.hidden_size))? } else { x.clone() };
-        let x = self.norm.forward(&x)?.reshape(((), self.hidden_size))?;
-        Ok(self.linear_fc2.forward(&self.act_fn.forward(&self.linear_fc1.forward(&x)?)?)?)
+        let x = if !self.use_postshuffle_norm { self.norm.forward(x)? } else { x.clone() };
+        let x = self.linear_fc1.forward(&x)?; let x = self.act_fn.forward(&x)?;
+        let x = self.linear_fc2.forward(&x)?;
+        if self.use_postshuffle_norm { Ok(self.norm.forward(&x)?) } else { Ok(x) }
     }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> {
+    pub fn to_device(&mut self, d: &Device) -> Result<()> { 
         let nw = self.norm.weight.to_device(d)?; let nb = self.norm.bias.to_device(d)?; self.norm = LayerNorm::new(nw, nb, 1e-6);
-        let w1 = self.linear_fc1.weight().to_device(d)?; let b1 = self.linear_fc1.bias().map(|b| b.to_device(d)).transpose()?; self.linear_fc1 = Linear::new(w1, b1);
-        let w2 = self.linear_fc2.weight().to_device(d)?; let b2 = self.linear_fc2.bias().map(|b| b.to_device(d)).transpose()?; self.linear_fc2 = Linear::new(w2, b2); Ok(())
+        let f1w = self.linear_fc1.weight().to_device(d)?; let f1b = self.linear_fc1.bias().as_ref().unwrap().to_device(d)?; self.linear_fc1 = Linear::new(f1w, Some(f1b));
+        let f2w = self.linear_fc2.weight().to_device(d)?; let f2b = self.linear_fc2.bias().as_ref().unwrap().to_device(d)?; self.linear_fc2 = Linear::new(f2w, Some(f2b));
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionAttention { num_heads: usize, qkv: Linear, proj: Linear, scaling: f64 }
-impl Qwen3VLVisionAttention {
-    pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder, map: Option<&HashMap<String, Tensor>>) -> Result<Self> {
-        let hs = cfg.hidden_size; let nh = cfg.num_heads;
-        let qw = safe_get(&vb, "qkv.weight", map)?; let qb = safe_get(&vb, "qkv.bias", map).ok();
-        let pw = safe_get(&vb, "proj.weight", map)?; let pb = safe_get(&vb, "proj.bias", map).ok();
-        Ok(Self { num_heads: nh, qkv: Linear::new(qw, qb), proj: Linear::new(pw, pb), scaling: 1.0 / ((hs / nh) as f64).sqrt() })
-    }
-    pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, cu: &Tensor) -> Result<Tensor> {
-        let sl = x.dim(0)?; let qkv = x.apply(&self.qkv)?.reshape((sl, 3, self.num_heads, ()))?.permute((1, 0, 2, 3))?;
-        let (q, k, v) = (qkv.i(0)?.contiguous()?, qkv.i(1)?.contiguous()?, qkv.i(2)?.contiguous()?);
-        let (q, k) = apply_rotary_pos_emb_vision(&q, &k, cos, sin)?;
-        let (q, k, v) = (q.transpose(0, 1)?.unsqueeze(0)?.contiguous()?, k.transpose(0, 1)?.unsqueeze(0)?.contiguous()?, v.transpose(0, 1)?.unsqueeze(0)?.contiguous()?);
-        let lens = cu.i(1..)?.sub(&cu.i(..cu.dim(0)?-1)?)?.to_vec1::<u32>()?;
-        let ss = lens.iter().map(|&l| l as usize).collect::<Vec<_>>();
-        let qs = split_tensor(&q, &ss, 2)?; let ks = split_tensor(&k, &ss, 2)?; let vs = split_tensor(&v, &ss, 2)?;
-        let mut outs = vec![];
-        for (qi, (ki, vi)) in qs.iter().zip(ks.iter().zip(vs.iter())) { outs.push(eager_attention_forward(qi, ki, vi, None, None, self.scaling)?); }
-        Ok(Tensor::cat(&outs, 1)?.reshape((sl, ()))?.contiguous()?.apply(&self.proj)?)
-    }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> {
-        let w1 = self.qkv.weight().to_device(d)?; let b1 = self.qkv.bias().map(|b| b.to_device(d)).transpose()?; self.qkv = Linear::new(w1, b1);
-        let w2 = self.proj.weight().to_device(d)?; let b2 = self.proj.bias().map(|b| b.to_device(d)).transpose()?; self.proj = Linear::new(w2, b2); Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Qwen3VLVisionBlock { norm1: LayerNorm, norm2: LayerNorm, attn: Qwen3VLVisionAttention, mlp: TwoLinearMLP }
+pub struct Qwen3VLVisionBlock { attn: NaiveAttention, mlp: TwoLinearMLP, norm1: LayerNorm, norm2: LayerNorm }
 impl Qwen3VLVisionBlock {
     pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder, map: Option<&HashMap<String, Tensor>>) -> Result<Self> {
         let n1w = safe_get(&vb.pp("norm1"), "weight", map)?; let n1b = safe_get(&vb.pp("norm1"), "bias", map)?;
         let n2w = safe_get(&vb.pp("norm2"), "weight", map)?; let n2b = safe_get(&vb.pp("norm2"), "bias", map)?;
-        Ok(Self { norm1: LayerNorm::new(n1w, n1b, 1e-6), norm2: LayerNorm::new(n2w, n2b, 1e-6), attn: Qwen3VLVisionAttention::new(cfg, vb.pp("attn"), map)?, mlp: TwoLinearMLP::new(vb.pp("mlp"), cfg.hidden_size, cfg.intermediate_size, Activation::Gelu, false, "linear_fc1", "linear_fc2")? })
+        let embed_dim = cfg.embed_dim.unwrap_or(cfg.hidden_size);
+        let head_dim = embed_dim / cfg.num_heads;
+        Ok(Self { 
+            attn: NaiveAttention::new(vb.pp("attn"), cfg.hidden_size, cfg.num_heads, cfg.num_heads, Some(head_dim), true, Some("o_proj"))?,
+            mlp: TwoLinearMLP::new(vb.pp("mlp"), cfg.hidden_size, cfg.intermediate_size, Activation::Gelu, true, "linear1", "linear2")?,
+            norm1: LayerNorm::new(n1w, n1b, 1e-6), norm2: LayerNorm::new(n2w, n2b, 1e-6)
+        })
     }
-    pub fn forward(&self, x: &Tensor, cu: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-        let r = x.clone(); let x = self.attn.forward(&self.norm1.forward(x)?, cos, sin, cu)?; let x = r.add(&x)?;
+    pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let r = x.clone(); let x = self.attn.forward(&self.norm1.forward(x)?, Some(cos), Some(sin), None, false)?; let x = r.add(&x)?;
         let r = x.clone(); let x = self.mlp.forward(&self.norm2.forward(&x)?)?; Ok(r.add(&x)?)
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> {
-        let w1 = self.norm1.weight.to_device(d)?; let b1 = self.norm1.bias.to_device(d)?; self.norm1 = LayerNorm::new(w1, b1, 1e-6);
-        let w2 = self.norm2.weight.to_device(d)?; let b2 = self.norm2.bias.to_device(d)?; self.norm2 = LayerNorm::new(w2, b2, 1e-6);
-        self.attn.to_device(d)?; self.mlp.to_device(d)?; Ok(())
+        self.attn.to_device(d)?; self.mlp.to_device(d)?;
+        let n1w = self.norm1.weight.to_device(d)?; let n1b = self.norm1.bias.to_device(d)?; self.norm1 = LayerNorm::new(n1w, n1b, 1e-6);
+        let n2w = self.norm2.weight.to_device(d)?; let n2b = self.norm2.bias.to_device(d)?; self.norm2 = LayerNorm::new(n2w, n2b, 1e-6);
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3VLVisionModel { 
-    pub spatial_merge_size: usize, pub patch_embed: Qwen3VLVisionPatchEmbed, pub pos_embed: Embedding, pub num_grid_per_side: u32,
-    pub rotary_pos_emb: Qwen2_5VisionRotaryEmbedding, pub blocks: Vec<Qwen3VLVisionBlock>, pub merger: Qwen3VLVisionPatchMerger,
-    pub deepstack_visual_indexes: Vec<usize>, pub deepstack_merger_list: Vec<Qwen3VLVisionPatchMerger>, pub dtype: DType
-}
+pub struct Qwen3VLVisionModel { patch_embed: Qwen3VLVisionPatchEmbed, blocks: Vec<Qwen3VLVisionBlock>, merger: Qwen3VLVisionPatchMerger, rotary: Qwen2_5VisionRotaryEmbedding }
 impl Qwen3VLVisionModel {
     pub fn new(cfg: Qwen3VLVisionConfig, vb: VarBuilder, map: Option<&HashMap<String, Tensor>>) -> Result<Self> {
-        let mut blks = vec![]; for i in 0..cfg.depth { blks.push(Qwen3VLVisionBlock::new(&cfg, vb.pp("blocks").pp(i), map)?); }
-        let dsm = cfg.deepstack_visual_indexes.iter().enumerate().map(|(i, _)| Qwen3VLVisionPatchMerger::new(&cfg, vb.pp("deepstack_merger_list").pp(i), true, map)).collect::<Result<Vec<_>>>()?;
-        Ok(Self { spatial_merge_size: cfg.spatial_merge_size, patch_embed: Qwen3VLVisionPatchEmbed::new(&cfg, vb.pp("patch_embed"), map)?, pos_embed: Embedding::new(safe_get(&vb.pp("pos_embed"), "weight", map)?, cfg.hidden_size), num_grid_per_side: (cfg.num_position_embeddings as f32).sqrt() as u32, rotary_pos_emb: Qwen2_5VisionRotaryEmbedding::new(cfg.hidden_size/cfg.num_heads/2, None), blocks: blks, merger: Qwen3VLVisionPatchMerger::new(&cfg, vb.pp("merger"), false, map)?, deepstack_visual_indexes: cfg.deepstack_visual_indexes.clone(), deepstack_merger_list: dsm, dtype: vb.dtype() })
+        let pe = Qwen3VLVisionPatchEmbed::new(&cfg, vb.pp("patch_embed"), map)?;
+        let mut blks = vec![]; for i in 0..cfg.depth { blks.push(Qwen3VLVisionBlock::new(&cfg, vb.pp("blocks").pp(&i.to_string()), map)?); }
+        let me = Qwen3VLVisionPatchMerger::new(&cfg, vb.pp("merger"), true, map)?;
+        let embed_dim = cfg.embed_dim.unwrap_or(cfg.hidden_size);
+        Ok(Self { patch_embed: pe, blocks: blks, merger: me, rotary: Qwen2_5VisionRotaryEmbedding::new(embed_dim / cfg.num_heads, None) })
     }
-    pub fn forward(&self, pv: &Tensor, thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
-        let x = self.patch_embed.forward(pv)?; let pos = self.fast_pos_embed_interpolate(thw)?; let x = x.broadcast_add(&pos)?;
-        let rot = self.rot_pos_emb(thw)?; let sl = x.dim(0)?; let mut x = x.reshape((sl, ()))?; let rot = rot.reshape((sl, ()))?;
-        let emb = Tensor::cat(&[&rot, &rot], D::Minus1)?; let (cos, sin) = (emb.cos()?, emb.sin()?);
-        let mut cur_v = vec![];
-        for i in 0..thw.dim(0)? {
-            let s = thw.i((i, 1))?.mul(&thw.i((i, 2))?)?.to_scalar::<u32>()?;
-            cur_v.push(thw.i((i, 0))?.repeat(s as usize)?);
-        }
-        let cu_f = Tensor::cat(&cur_v, 0)?.flatten_all()?;
-        let cu = cu_f.to_dtype(DType::F64)?.cumsum(0)?.to_dtype(DType::U32)?.pad_with_zeros(D::Minus1, 1, 0)?;
-        let mut dsf = vec![];
-        for (i, b) in self.blocks.iter().enumerate() { x = b.forward(&x, &cu, &cos, &sin)?; if let Some(idx) = self.deepstack_visual_indexes.iter().position(|&v| v == i) { dsf.push(self.deepstack_merger_list[idx].forward(&x)?); } }
-        Ok((self.merger.forward(&x)?, dsf))
+    pub fn forward(&mut self, x: &Tensor, thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
+        let x = self.patch_embed.forward(x)?; 
+        let cos_sin = self.rotary.forward(thw.dim(0)?, x.device())?;
+        let (cos, sin) = (cos_sin.clone(), cos_sin); 
+        let mut x = x; let mut ds = vec![]; for b in &mut self.blocks { x = b.forward(&x, &cos, &sin)?; ds.push(x.clone()); }
+        Ok((self.merger.forward(&x)?, ds))
     }
-    fn fast_pos_embed_interpolate(&self, thw: &Tensor) -> Result<Tensor> {
-        let mut idxs = vec![vec![]; 4]; let mut wts = vec![vec![]; 4]; let mut split = vec![];
-        for i in 0..thw.dim(0)? {
-            let [_, h, w] = thw.i(i)?.to_vec1::<u32>()?[..] else { return Err(anyhow!("Expected 3 elements")); };
-            split.push((h * w) as usize); let n_sub = (self.num_grid_per_side - 1) as f32;
-            let hi = linspace(0.0, n_sub, h as usize, thw.device())?; let wi = linspace(0.0, n_sub, w as usize, thw.device())?;
-            let hf = hi.to_dtype(DType::U32)?; let wf = wi.to_dtype(DType::U32)?;
-            let hc = hf.affine(1.0, 1.0)?.clamp(0u32, n_sub as u32)?; let wc = wf.affine(1.0, 1.0)?.clamp(0u32, n_sub as u32)?;
-            let dh = hi.sub(&hf.to_dtype(hi.dtype())?)?.unsqueeze(D::Minus1)?; let dw = wi.sub(&wf.to_dtype(hi.dtype())?)?.unsqueeze(0)?;
-            let bh = hf.affine(self.num_grid_per_side as f64, 0.0)?.unsqueeze(D::Minus1)?; let bc = hc.affine(self.num_grid_per_side as f64, 0.0)?.unsqueeze(D::Minus1)?;
-            idxs[0].extend_from_slice(&bh.broadcast_add(&wf.unsqueeze(0)?)?.flatten_all()?.to_vec1::<u32>()?);
-            idxs[1].extend_from_slice(&bh.broadcast_add(&wc.unsqueeze(0)?)?.flatten_all()?.to_vec1::<u32>()?);
-            idxs[2].extend_from_slice(&bc.broadcast_add(&wf.unsqueeze(0)?)?.flatten_all()?.to_vec1::<u32>()?);
-            idxs[3].extend_from_slice(&bc.broadcast_add(&wc.unsqueeze(0)?)?.flatten_all()?.to_vec1::<u32>()?);
-            let (oh, ow) = (Tensor::ones_like(&dh)?.sub(&dh)?, Tensor::ones_like(&dw)?.sub(&dw)?);
-            wts[0].extend_from_slice(&oh.broadcast_mul(&ow)?.flatten_all()?.to_vec1::<f32>()?);
-            wts[1].extend_from_slice(&oh.broadcast_mul(&dw)?.flatten_all()?.to_vec1::<f32>()?);
-            wts[2].extend_from_slice(&dh.broadcast_mul(&ow)?.flatten_all()?.to_vec1::<f32>()?);
-            wts[3].extend_from_slice(&dh.broadcast_mul(&dw)?.flatten_all()?.to_vec1::<f32>()?);
-        }
-        let pos = self.pos_embed.forward(&Tensor::new(idxs, thw.device())?)?.broadcast_mul(&Tensor::new(wts, thw.device())?.to_dtype(self.dtype)?.unsqueeze(D::Minus1)?)?;
-        let res = pos.i(0)?.add(&pos.i(1)?)?.add(&pos.i(2)?)?.add(&pos.i(3)?)?;
-        let mut outs = vec![]; let split_res = split_tensor(&res, &split, 0)?;
-        for (i, p) in split_res.iter().enumerate() {
-            let [t, h, w] = thw.i(i)?.to_vec1::<u32>()?[..] else { return Err(anyhow!("Expected 3 elements")); };
-            let ld: usize = p.dim(D::Minus1)?; let p = p.repeat((t as usize, 1))?;
-            outs.push(p.reshape((t as usize, h as usize / self.spatial_merge_size, self.spatial_merge_size, w as usize / self.spatial_merge_size, self.spatial_merge_size, ld))?.permute((0, 1, 3, 2, 4, 5))?.flatten(0, 4)?);
-        }
-        Ok(Tensor::cat(&outs, 0)?)
-    }
-    fn rot_pos_emb(&self, thw: &Tensor) -> Result<Tensor> {
-        let ft = self.rotary_pos_emb.forward(thw.i((.., 1..))?.max_all()?.to_scalar::<u32>()? as usize, thw.device())?;
-        let mut list = vec![];
-        for i in 0..thw.dim(0)? {
-            let [t, h, w] = thw.i(i)?.to_vec1::<u32>()?[..] else { return Err(anyhow!("Expected 3 elements")); };
-            let (mh, mw) = (h / self.spatial_merge_size as u32, w / self.spatial_merge_size as u32);
-            let (br, bc) = (Tensor::arange(0, mh, thw.device())?, Tensor::arange(0, mw, thw.device())?);
-            let (ir, ic) = (Tensor::arange(0, self.spatial_merge_size as u32, thw.device())?, Tensor::arange(0, self.spatial_merge_size as u32, thw.device())?);
-            let ri = br.reshape(((), 1, 1, 1))?.contiguous()?.affine(self.spatial_merge_size as f64, 0.0)?.broadcast_add(&ir.reshape((1, 1, (), 1))?.contiguous()?)?.expand((mh as usize, mw as usize, self.spatial_merge_size, self.spatial_merge_size))?.flatten_all()?;
-            let ci = bc.reshape((1, (), 1, 1))?.contiguous()?.affine(self.spatial_merge_size as f64, 0.0)?.broadcast_add(&ic.reshape((1, 1, 1, ()))?.contiguous()?)?.expand((mh as usize, mw as usize, self.spatial_merge_size, self.spatial_merge_size))?.flatten_all()?;
-            let mut coords = Tensor::stack(&[ri, ci], D::Minus1)?.contiguous()?; if t > 1 { coords = coords.repeat((t as usize, 1))?; } list.push(coords);
-        }
-        let ids = Tensor::cat(&list, 0)?;
-        Ok(Tensor::cat(&[ft.index_select(&ids.i((.., 0))?.contiguous()?, 0)?, ft.index_select(&ids.i((.., 1))?.contiguous()?, 0)?], 1)?.contiguous()?)
-    }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> {
-        self.patch_embed.to_device(d)?; let pw = self.pos_embed.embeddings().to_device(d)?; self.pos_embed = Embedding::new(pw, self.pos_embed.hidden_size());
-        for b in &mut self.blocks { b.to_device(d)?; } self.merger.to_device(d)?; for m in &mut self.deepstack_merger_list { m.to_device(d)?; } Ok(())
-    }
+    pub fn to_device(&mut self, d: &Device) -> Result<()> { self.patch_embed.to_device(d)?; for b in &mut self.blocks { b.to_device(d)?; } self.merger.to_device(d)?; Ok(()) }
 }
 
 // --- Text ---
@@ -369,15 +293,13 @@ impl Qwen3VLModel {
         let head = if safe_probe(&vb, "model.language_model.lm_head.weight", map_r) {
             get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
         } else if safe_probe(&vb, "model.lm_head.weight", map_r) {
-            get_qlinear_safe(vb.pp("model").pp("lm_head"), "weight", map_r)?
+            get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
         } else if bo {
             println!("[MODEL] Baking Mode: lm_head missing, using dummy zero head.");
             let tc = cfg.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
             let shape = vec![tc.vocab_size, tc.hidden_size];
             let total_el: usize = shape.iter().product();
             let dev = vb.device();
-            // Create minimal valid QLinear structure to satisfy struct requirements.
-            // Since we skip forward(), the content doesn't matter much, but dimensions should be valid.
             let p = Tensor::zeros(((total_el + 31) / 32,), DType::U32, dev)?;
             let s = Tensor::ones(((total_el + 31) / 32,), DType::F32, dev)?;
             QLinear::new(p, s, shape, None, dev.clone())
@@ -389,7 +311,7 @@ impl Qwen3VLModel {
     pub fn forward(&mut self, ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, vthw: Option<&Tensor>, _cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let mut embs = self.language_model.embed.forward(ids)?;
         let (mut im, mut dse) = (None, None);
-        if let Some(vm) = &self.visual { if let (Some(p), Some(t)) = (pv, thw) {
+        if let Some(vm) = &mut self.visual { if let (Some(p), Some(t)) = (pv, thw) {
             let (ie, ds) = vm.forward(p, t)?; let vm_m = ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], ids.device())?)?.to_dtype(DType::U32)?;
             embs = masked_scatter_dim0(&embs, &Tensor::cat(&[ie], 0)?, &vm_m)?; im = Some(vm_m); dse = Some(ds);
         } }
@@ -474,13 +396,14 @@ fn comp_bit_static(i: usize, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<
     }
 }
 
-fn apply_bridge_static(x: &Tensor, target: usize) -> Result<Tensor> {
-    let (b, h, s, d) = x.dims4()?; let xf = x.to_dtype(DType::F32)?;
-    let rms = (xf.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt()).max(1e-6);
-    let sc = ((d as f64 / target as f64).sqrt() * 0.7071067811865476_f64) / (rms as f64);
-    if target >= d {
-        let up = if target > d { (Tensor::stack(&[xf.clone(), ((xf.clone() + xf.roll(1, D::Minus1)?)? * 0.5)?], D::Minus1)?.affine(sc, 0.0))?.reshape((b, h, s, target))? }
-        else { xf.affine(sc * (rms as f64), 0.0)? };
-        Ok(up.clamp(-10.0, 10.0)?.to_dtype(x.dtype())?)
-    } else { Ok((x.narrow(D::Minus1, 0, target)?.to_dtype(DType::F32)?.affine(((d as f64 / target as f64).sqrt()) / (rms as f64), 0.0))?.to_dtype(x.dtype())?) }
+fn apply_bridge_static(x: &Tensor, td: usize) -> Result<Tensor> {
+    let (b, h, s, d) = x.dims4()?; let x_f = x.to_dtype(DType::F32)?;
+    let rms = (x_f.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt()).max(1e-6);
+    let sc = (d as f64 / td as f64).sqrt() * 0.707 / (rms as f64);
+    if td >= d {
+        let l = x_f.clone();
+        let u = if td > d { let r = x_f.roll(1, D::Minus1)?; let lr = ((l + r)? * 0.5)?; Tensor::stack(&[x_f, lr], D::Minus1)?.reshape((b, h, s, td))? }
+        else { x_f.affine(sc * (rms as f64), 0.0)? };
+        Ok(u.clamp(-10.0, 10.0)?.to_dtype(x.dtype())?)
+    } else { Ok(x.narrow(D::Minus1, 0, td)?.to_dtype(DType::F32)?.affine(sc, 0.0)?.to_dtype(x.dtype())?) }
 }

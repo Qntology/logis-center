@@ -75,7 +75,7 @@ impl Qwen3VLGenerateModel {
     }
     pub fn init_with_config(path: &str, tokenizer_path: Option<&str>, config_path: Option<&str>, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>, force_text_only: bool, baking_only: bool, _high_fidelity: bool) -> Result<Self> {
         println!("[DEBUG-GEN] Starting init_with_config at path: {}", path);
-        let path = if let Some(s) = path.strip_prefix(r"\\\\") { s } else { path };
+        let path = if let Some(s) = path.strip_prefix(r"\\") { s } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
         let cfg_path = config_path.unwrap_or(path);
         
@@ -149,11 +149,12 @@ impl Qwen3VLGenerateModel {
             
             println!("[DEBUG-GEN] Building VarBuilder from {} tensors...", merged_data.len());
             let vb = VarBuilder::from_tensors(merged_data.clone(), dtype, &text_dev);
+            
             println!("[MODEL-DEBUG] Constructing Qwen3VLModel...");
             let model = Qwen3VLModel::new_ext(m_cfg, vb, Some(merged_data), force_text_only, baking_only || is_anchor)?;
             println!("[MODEL-DEBUG] Qwen3VLModel constructed. Building GenerateModel...");
             return Ok(Self { 
-                chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, 
+                chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?,
                 qwen3_vl: ModelVariant::Standard(model), text_device: text_dev, vision_device: vision_dev, 
                 eos_token_id1: 151643, eos_token_id2: 151645, generation_config: Qwen3VLGenerationConfig::default(), 
                 model_name: if is_anchor { "qwen3-anchor" } else { "qwen3-bitserial-full" }.to_string(), hard_token_limit 
@@ -220,7 +221,7 @@ impl Qwen3VLGenerateModel {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid); 
                 println!("[GENERATE] Saving intermediate KV cache to: {:?}", path);
                 if !path.exists() { let _ = fs::create_dir_all(&path); } 
-                self.save_kv_to_disk(&path)?; 
+                self.save_kv_to_disk(&path)?;
             }
             current_pos = end;
         }
@@ -239,7 +240,7 @@ impl Qwen3VLGenerateModel {
             let path = crate::utils::paths::get_kv_dir(None).join(sid); 
             println!("[GENERATE] Saving chunk KV cache to: {:?}", path);
             if !path.exists() { let _ = fs::create_dir_all(&path); } 
-            self.save_kv_to_disk(&path)?; 
+            self.save_kv_to_disk(&path)?;
         }
         Ok(chunk_size)
     }
@@ -267,14 +268,12 @@ impl Qwen3VLGenerateModel {
             } 
         }
 
-        // [FIX] local_pos should track where we are in the CURRENT prompt.
-        // If we resumed from a snapshot, we should skip tokens already in the cache.
         let mut local_pos = seqlen_offset.min(total_tokens);
         let chunk_size = if self.text_device.is_cpu() { 1024 } else { 256 };
 
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos; 
-            if remaining <= 1 && generated_text.is_empty() { break; } // Leave last token for generation loop
+            if remaining <= 1 && generated_text.is_empty() { break; } 
             
             let mut c_size = remaining.min(chunk_size); 
             if local_pos + c_size >= total_tokens && generated_text.is_empty() { 
@@ -300,8 +299,6 @@ impl Qwen3VLGenerateModel {
         for _i in 0..mes.max_tokens.unwrap_or(2048) {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [FIX] Correctly determine the next token to feed. 
-            // If we just finished prefilling, feed the very last token of the prompt.
             let input_ids = if generated_text.is_empty() {
                 let start = local_pos.min(total_tokens.saturating_sub(1));
                 Tensor::new(&full_input_ids_vec[start..total_tokens], &self.text_device)?.unsqueeze(0)?
@@ -314,7 +311,7 @@ impl Qwen3VLGenerateModel {
             
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
             
-            let logits = logits.squeeze(0)?; 
+            let logits = logits.squeeze(0)?;
             let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
             
             logits = apply_repeat_penalty(&logits, 1.1, if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] })?;
@@ -335,7 +332,7 @@ impl Qwen3VLGenerateModel {
         Ok(generated_text)
     }
 
-    pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } }
+    pub fn get_kv_len(&self) -> usize { match &self.qwen3_vl { ModelVariant::QuantizedVL(m) => m.language_model.get_kv_len(), ModelVariant::QuantizedText(m) => m.language_model.get_kv_len(), _ => 0 } } 
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
         let mut ks: Vec<Tensor> = Vec::new(); 
         let mut vs: Vec<Tensor> = Vec::new();

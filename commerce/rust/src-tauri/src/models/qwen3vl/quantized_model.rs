@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor, Module};
-use candle_nn::{Embedding, VarBuilder};
+use candle_nn::{Activation, Embedding, VarBuilder};
 use candle_core::quantized::gguf_file;
 use rayon::prelude::*;
 use std::path::Path;
@@ -36,7 +36,11 @@ pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, re
         ct.tensor(reader, &scales_name, device),
         ct.tensor(reader, &shape_name, device)
     ) {
-        let packed_tensor = packed.dequantize(device)?;
+        let mut packed_tensor = packed.dequantize(device)?;
+        // Candle might load it as I64, but we need U32 patterns.
+        if packed_tensor.dtype() != DType::U32 {
+            packed_tensor = packed_tensor.to_dtype(DType::U32)?;
+        }
         let scales_tensor = scales.dequantize(device)?.to_dtype(DType::F32)?;
         let shape_vec: Vec<usize> = shape_t.dequantize(device)?.to_dtype(DType::F32)?.to_vec1::<f32>()?.iter().map(|&x| x as usize).collect();
         let bias = ct.tensor(reader, &bias_name, device).ok().map(|t| t.dequantize(device).unwrap().to_dtype(dtype).unwrap());
@@ -51,6 +55,30 @@ pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, re
     let scales = Tensor::ones((total_el / 32).max(1), DType::F32, device)?;
     let packed = Tensor::zeros((total_el / 32).max(1), DType::U32, device)?;
     Ok(QLinear::new(packed, scales, s, bias, device.clone()))
+}
+
+pub fn get_qlinear_safe(vb: VarBuilder, name: &str, map: Option<&HashMap<String, Tensor>>) -> Result<QLinear> {
+    let prefix = vb.prefix();
+    let get_path = |p: &str| -> String {
+        if prefix.is_empty() { p.to_string() }
+        else if prefix.ends_with('.') { format!("{}{}", prefix, p) }
+        else { format!("{}.{}", prefix, p) }
+    };
+    let packed_path = get_path(&format!("{}.packed", name));
+    if let Some(m) = map {
+        if m.contains_key(&packed_path) {
+            let mut p = m.get(&packed_path).unwrap().clone();
+            if p.dtype() != DType::U32 { p = p.to_dtype(DType::U32)?; }
+            let s = m.get(&get_path(&format!("{}.scales", name))).unwrap().clone().to_dtype(DType::F32)?;
+            let sh_t = m.get(&get_path(&format!("{}.shape", name))).unwrap().clone();
+            let sh: Vec<usize> = sh_t.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.to_vec1::<u32>()?.iter().map(|&x| x as usize).collect();
+            let b = m.get(&get_path(&format!("{}.bias", name))).cloned();
+            return Ok(QLinear::new(p, s, sh, b, vb.device().clone()));
+        }
+    }
+    let w = vb.get_with_hints((1,), name, candle_nn::Init::Const(0.0))?;
+    let s = w.dims().to_vec(); let t = s.iter().product::<usize>();
+    Ok(QLinear::new(Tensor::zeros((t/32).max(1), DType::U32, vb.device())?, Tensor::ones((t/32).max(1), DType::F32, vb.device())?, s, None, vb.device().clone()))
 }
 
 pub fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {
@@ -81,7 +109,6 @@ pub struct QLinear {
 }
 impl QLinear {
     pub fn new(packed_weight: Tensor, scales: Tensor, original_shape: Vec<usize>, bias: Option<Tensor>, device: Device) -> Self { 
-        // Force F32 for better compatibility with CUDA kernels
         let dtype = DType::F32;
         Self { packed_weight, scales, original_shape, bias, device, dtype } 
     }
@@ -96,34 +123,30 @@ impl QLinear {
         Ok(())
     }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // println!("[TRACE-QL] QLinear forward start. Input: {:?}", xs.dims());
         let (b, s, h) = xs.dims3()?;
-        // println!("[TRACE-QL] Dequantizing...");
         let weight = self.dequantize_on_the_fly(xs.device())?;
-        
-        // Ensure both inputs to matmul are F32
         let xs_flat = xs.reshape((b * s, h))?.to_dtype(DType::F32)?;
         let weight_f32 = weight.to_dtype(DType::F32)?;
-        
-        // println!("[TRACE-QL] MatMul executing...");
         let mut out = xs_flat.matmul(&weight_f32.t()?)?;
         if let Some(bias) = &self.bias { out = out.broadcast_add(&bias.to_dtype(DType::F32)?)?; }
         let res = out.reshape((b, s, ()))?.to_dtype(xs.dtype())?;
-        // println!("[TRACE-QL] QLinear forward success.");
         Ok(res)
     }
     fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
         let s = &self.original_shape;
         let total_el = s.iter().product::<usize>();
-        
-        // println!("[TRACE-QL] Dequantize params: shape={:?}, total={}", s, total_el);
-        
         let packed_cpu = self.packed_weight.to_device(&Device::Cpu)?;
         let scales_cpu = self.scales.to_device(&Device::Cpu)?;
-        let packed_data = packed_cpu.to_vec1::<u32>()?;
+        
+        // Handle potentially different bit patterns from Safetensors
+        let packed_data = if packed_cpu.dtype() != DType::U32 {
+            packed_cpu.to_dtype(DType::U32)?.to_vec1::<u32>()?
+        } else {
+            packed_cpu.to_vec1::<u32>()?
+        };
         let scales_data = scales_cpu.to_vec1::<f32>()?;
-        let mut weights = Vec::with_capacity(total_el);
-        unsafe { weights.set_len(total_el); }
+        
+        let mut weights = vec![0.0f32; total_el];
         weights.par_chunks_exact_mut(32).enumerate().for_each(|(b_i, block_out)| {
             if b_i < scales_data.len() && b_i < packed_data.len() {
                 let s_val = scales_data[b_i];
@@ -177,6 +200,18 @@ impl QuantizedQwen3VLTextAttention {
     pub fn get_kv_len(&self) -> usize { self.kv_cache.as_ref().map(|(k, _)| k.dim(2).unwrap_or(0)).unwrap_or(0) }
 }
 
+#[derive(Debug, Clone)]
+pub struct QGateUpDownMLP { pub g: QLinear, pub u: QLinear, pub d: QLinear, pub act: Activation }
+impl QGateUpDownMLP {
+    pub fn new(vb: VarBuilder, act: Activation, map: Option<&HashMap<String, Tensor>>) -> Result<Self> {
+        Ok(Self { g: get_qlinear_safe(vb.pp("gate_proj"), "weight", map)?, u: get_qlinear_safe(vb.pp("up_proj"), "weight", map)?, d: get_qlinear_safe(vb.pp("down_proj"), "weight", map)?, act })
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let g = self.g.forward(x)?; let gate = self.act.forward(&g)?;
+        let u = self.u.forward(x)?; Ok(self.d.forward(&gate.mul(&u)?)?)
+    }
+}
+
 #[derive(Clone)]
 pub struct QuantizedQwen3VLTextDecoderLayer {
     pub self_attn: QuantizedQwen3VLTextAttention,
@@ -194,8 +229,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
         } else { Ok(xs) }
     }
     pub fn new<R: std::io::Seek + std::io::Read>(cfg: &Qwen3VLTextConfig, ct: &gguf_file::Content, r: &mut R, b_n: &str, dev: &Device, dt: DType, l_i: usize, b_o: bool) -> Result<Self> {
-        // [ADAPTIVE-NAMING] Check if using GGUF style (blk.0) or Safetensors style (model.layers.0)
-        // If b_n contains "layers", use standard suffixes. If "blk", use gguf suffixes.
         let is_g = b_n.contains("blk.");
         let (q, k, v, o, qn, kn, g, u, d, n, in_ln) = if is_g {
             ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm", "ffn_gate", "ffn_up", "ffn_down", "ffn_norm", "attn_norm")
@@ -237,59 +270,50 @@ impl QuantizedQwen3VLTextModel {
     pub fn new_with_mmap(config: &Qwen3VLTextConfig, ct: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, _base_name: &str, device: &Device, _device_id: usize, dtype: DType, _kv_reserve: u64, baking_only: bool) -> Result<Self> {
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
-        
-        // [AUTO-DETECT] Prefix
         let prefix = if ct.tensor(&mut reader, "model.layers.0.input_layernorm.weight", device).is_ok() { "model.layers" }
                      else if ct.tensor(&mut reader, "model.language_model.layers.0.input_layernorm.weight", device).is_ok() { "model.language_model.layers" }
                      else { "blk" };
-        
         let emb_name = if prefix == "blk" { "token_embd.weight" } else if prefix.contains("language_model") { "model.language_model.embed_tokens.weight" } else { "model.embed_tokens.weight" };
         let norm_name = if prefix == "blk" { "output_norm.weight" } else if prefix.contains("language_model") { "model.language_model.norm.weight" } else { "model.norm.weight" };
-
         let (embed_tokens, actual_h) = if let Ok(tensor) = ct.tensor(&mut reader, emb_name, device) {
              let t = tensor.dequantize(device)?.to_dtype(dtype)?; let h = t.dim(1)?; (Embedding::new(t, h), h)
         } else { return Err(anyhow!("Failed to load embed_tokens: {}", emb_name)); };
-        
         let mut p_cfg = config.clone(); p_cfg.hidden_size = actual_h;
-        let mut layers = vec![]; 
-        let nl = if baking_only { 1 } else { p_cfg.num_hidden_layers };
-        
+        let mut layers = vec![]; let nl = if baking_only { 1 } else { p_cfg.num_hidden_layers };
         for i in 0..nl { 
             let layer_prefix = if prefix == "blk" { format!("blk.{i}") } else { format!("{prefix}.{i}") };
             layers.push(QuantizedQwen3VLTextDecoderLayer::new(&p_cfg, ct, &mut reader, &layer_prefix, device, dtype, i, baking_only)?); 
         }
-        
         let norm = get_rms_norm(ct, &mut reader, norm_name, p_cfg.rms_norm_eps, device, dtype)?;
         let mut mrope = p_cfg.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         let hh = p_cfg.head_dim / 2; let ss: usize = mrope.iter().sum();
         if ss != hh && ss > 0 { let r = hh as f32 / ss as f32; mrope = mrope.iter().map(|&s| (s as f32 * r).round() as usize).collect(); }
         Ok(Self { embed_tokens, layers, norm, rotary_emb: Qwen3VLTextRotaryEmbedding::new(p_cfg.head_dim, p_cfg.rope_theta), mrope_section: mrope, mmap: mmap_handle, is_forced_cpu: device.is_cpu(), is_baking: baking_only })
     }
-    pub fn forward(&mut self, embeds: &Tensor, seqlen_offset: usize, pos_ids: Option<&Tensor>, visual_mask: Option<&Tensor>, ds_embeds: Option<Vec<Tensor>>) -> Result<Tensor> {
-        let (b, s, _) = embeds.dims3()?;
-        let pos_ids = match pos_ids { Some(ids) => ids.clone(), None => Tensor::arange(seqlen_offset as u32, (s + seqlen_offset) as u32, embeds.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b, s))? };
-        let (cos, sin) = self.rotary_emb.forward(&pos_ids, embeds.dtype(), self.mrope_section.clone())?;
-        let mask = if s <= 1 { None } else { Some(prepare_causal_attention_mask(b, s, seqlen_offset, embeds.device())?) };
-        let mut xs = embeds.clone();
-        let layer_limit = if self.is_baking { 1 } else { self.layers.len() };
-        for (i, layer) in self.layers.iter_mut().enumerate().take(layer_limit) {
-            xs = layer.forward_with_params(&xs, &cos, &sin, mask.as_ref())?;
-            if let (Some(m), Some(ds)) = (visual_mask, ds_embeds.as_ref()) { if i < ds.len() { xs = mask_index_add(&xs.squeeze(0)?, &m.squeeze(0)?, &ds[i])?.unsqueeze(0)?; } }
+    pub fn forward(&mut self, x: &Tensor, offset: usize, pids: Option<&Tensor>, visual_mask: Option<&Tensor>, ds_embeds: Option<Vec<Tensor>>) -> Result<Tensor> {
+        let (bs, sl, _) = x.dims3()?;
+        let pi = match pids { Some(ids) => ids.clone(), None => Tensor::arange(offset as u32, (sl + offset) as u32, x.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))? };
+        let (cos, sin) = self.rotary_emb.forward(&pi, x.dtype(), self.mrope_section.clone())?;
+        let mask = if sl <= 1 { None } else { Some(prepare_causal_attention_mask(bs, sl, offset, x.device())?) };
+        let mut x = x.clone(); let limit = if self.is_baking { 1 } else { self.layers.len() };
+        for (i, layer) in self.layers.iter_mut().enumerate().take(limit) {
+            x = layer.forward_with_params(&x, &cos, &sin, mask.as_ref())?;
+            if let (Some(m), Some(ds)) = (visual_mask, ds_embeds.as_ref()) { if i < ds.len() { x = mask_index_add(&x.squeeze(0)?, &m.squeeze(0)?, &ds[i])?.unsqueeze(0)?; } }
         }
-        Ok(xs.apply(&self.norm)?)
+        Ok(x.apply(&self.norm)?)
     }
     pub fn clear_kv_cache(&mut self) { for l in &mut self.layers { l.self_attn.clear_kv_cache(); } }
     pub fn get_kv_len(&self) -> usize { self.layers[0].self_attn.get_kv_len() }
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         let w = self.embed_tokens.embeddings().to_device(device)?; self.embed_tokens = Embedding::new(w, self.embed_tokens.hidden_size());
         for l in &mut self.layers { l.to_device(device)?; }
-        self.norm.to_device(device)?; Ok(())
+        let nw = self.norm.weight.to_device(device)?; self.norm = RmsNorm::new(nw, self.norm.eps); Ok(())
     }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _: usize) -> Result<()> {
         if !path.exists() { fs::create_dir_all(path)?; }
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if let Some((k, v)) = &layer.self_attn.kv_cache {
-                let rk = Self::compress_to_bitkv_static(i, k)?; let rv = Self::compress_to_bitkv_static(i, v)?;
+                let rk = compress_to_bitkv_static(i, k)?; let rv = compress_to_bitkv_static(i, v)?;
                 let mut m = HashMap::new(); m.insert("k_a".to_string(), rk.0); m.insert("k_p".to_string(), rk.1); m.insert("k_s".to_string(), rk.2);
                 m.insert("v_a".to_string(), rv.0); m.insert("v_p".to_string(), rv.1); m.insert("v_s".to_string(), rv.2);
                 m.insert("shape".to_string(), Tensor::new(rk.3.iter().map(|&x| x as u32).collect::<Vec<_>>().as_slice(), k.device())?);
@@ -307,7 +331,7 @@ impl QuantizedQwen3VLTextModel {
             let (mut k, mut v) = if p.exists() {
                 let m = candle_core::safetensors::load(p, &target_device)?;
                 let shape: Vec<usize> = m.get("shape").unwrap().to_vec1::<u32>()?.into_iter().map(|x| x as usize).collect();
-                let (dk, dv) = Self::decompress_kv_static(i, (m.get("k_a").unwrap().clone(), m.get("k_p").unwrap().clone(), m.get("k_s").unwrap().clone()), (m.get("v_a").unwrap().clone(), m.get("v_p").unwrap().clone(), m.get("v_s").unwrap().clone()), &shape, &target_device)?;
+                let (dk, dv) = decompress_kv_static(i, (m.get("k_a").unwrap().clone(), m.get("k_p").unwrap().clone(), m.get("k_s").unwrap().clone()), (m.get("v_a").unwrap().clone(), m.get("v_p").unwrap().clone(), m.get("v_s").unwrap().clone()), &shape, &target_device)?;
                 (dk, dv)
             } else if let Some((ref fk, ref fv)) = first_layer_kv {
                 (fk.clone(), fv.clone())
@@ -317,136 +341,33 @@ impl QuantizedQwen3VLTextModel {
                 if target_h % h == 0 { let rep = target_h / h; k = k.repeat((1, rep, 1, 1))?; v = v.repeat((1, rep, 1, 1))?; }
                 else { k = k.narrow(1, 0, h.min(target_h))?; v = v.narrow(1, 0, h.min(target_h))?; }
             }
-            if d != target_d { k = Self::apply_linear_bridge(&k, target_d)?; v = Self::apply_linear_bridge(&v, target_d)?; }
+            if d != target_d { k = apply_linear_bridge(&k, target_d)?; v = apply_linear_bridge(&v, target_d)?; }
             if first_layer_kv.is_none() { first_layer_kv = Some((k.clone(), v.clone())); }
             layer.self_attn.kv_cache = Some((k, v));
         }
         println!("[MODEL-OPTIM] Full Restoration (Quantized): Loaded all present layers via Bridge.");
         Ok(())
     }
-    fn apply_linear_bridge(x: &Tensor, target_dim: usize) -> Result<Tensor> {
-        let (b, h, s, d) = x.dims4()?; let x_f32 = x.to_dtype(candle_core::DType::F32)?;
-        let rms = (x_f32.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt()).max(1e-6);
-        let theory_scale = (d as f64 / target_dim as f64).sqrt();
-        let alignment_coeff = 0.7071067811865476_f64; 
-        let dynamic_bridge_scale = (theory_scale * alignment_coeff) / (rms as f64);
-        if target_dim >= d {
-            let left = x_f32.clone();
-            let upscaled = if target_dim > d {
-                 let right = x_f32.roll(1, D::Minus1)?; let lerp = ((left + right)? * 0.5)?; 
-                 (Tensor::stack(&[x_f32, lerp], D::Minus1)?.affine(dynamic_bridge_scale, 0.0))?.reshape((b, h, s, target_dim))?
-            } else { x_f32.affine(dynamic_bridge_scale * (rms as f64), 0.0)? };
-            Ok(upscaled.clamp(-10.0, 10.0)?.to_dtype(x.dtype())?)
-        } else {
-            let downscaled = x.narrow(D::Minus1, 0, target_dim)?;
-            let inv_scale = ((d as f64 / target_dim as f64).sqrt()) / (rms as f64);
-            Ok((downscaled.to_dtype(candle_core::DType::F32)?.affine(inv_scale, 0.0))?.to_dtype(x.dtype())?)
-        }
-    }
-    fn compress_to_bitkv_static(l_i: usize, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
-        let s = t.dims().to_vec(); let d = t.device(); if l_i == 0 { return Ok((t.clone(), Tensor::zeros(1, DType::U8, d)?, Tensor::zeros(1, DType::F32, d)?, s)); }
-        let f = t.flatten_all()?; let n = f.dim(0)?;
-        if l_i <= 4 {
-            let sc = (f.abs()?.max_all()?.to_scalar::<f32>()? / 3.0).max(1e-6);
-            let q = f.to_vec1::<f32>()?; let mut p = vec![0u8; (n + 3) / 4];
-            for (i, &v) in q.iter().enumerate() { let qv = ((v / sc + 1.0).round() as u8).clamp(0, 3); p[i / 4] |= qv << ((i % 4) * 2); }
-            Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n + 3) / 4,), d)?, Tensor::new(&[sc], d)?, s))
-        } else {
-            let sc = f.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-6);
-            let sv = f.ge(0.0)?.to_vec1::<u8>()?; let mut p = vec![0u8; (n + 7) / 8];
-            for (i, &sv) in sv.iter().enumerate() { if sv > 0 { p[i / 8] |= 1 << (i % 8); } }
-            Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n + 7) / 8,), d)?, Tensor::new(&[sc], d)?, s))
-        }
-    }
-    fn decompress_kv_static(l_i: usize, kr: (Tensor, Tensor, Tensor), vr: (Tensor, Tensor, Tensor), os: &[usize], td: &Device) -> Result<(Tensor, Tensor)> {
-        let dt = if td.is_cpu() { DType::F32 } else { DType::BF16 };
-        let dec = |res: (Tensor, Tensor, Tensor)| -> Result<Tensor> {
-            if l_i == 0 { return Ok(res.0.to_device(td)?.to_dtype(dt)?); }
-            let sc = res.2.to_scalar::<f32>()?; let pv = res.1.to_vec1::<u8>()?; 
-            let total_el = os.iter().product(); let mut o = vec![0.0f32; total_el];
-            if l_i <= 4 { for i in 0..total_el { o[i] = (((pv[i / 4] >> ((i % 4) * 2)) & 0x03) as f32 - 1.0) * sc; } }
-            else { for i in 0..total_el { o[i] = if (pv[i / 8] >> (i % 8)) & 0x01 == 1 { sc } else { -sc }; } }
-            Ok(Tensor::from_vec(o, os, &Device::Cpu)?.to_device(td)?.to_dtype(dt)?.contiguous()?)
-        };
-        Ok((dec(kr)?, dec(vr)?))
-    }
-    pub fn compress_to_bitkv(&self, l_i: usize, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> { Self::compress_to_bitkv_static(l_i, t) }
-    pub fn inject_live_kv_bitkv(&mut self, l_i: usize, kr: (Tensor, Tensor, Tensor), vr: (Tensor, Tensor, Tensor), os: &[usize]) -> Result<()> {
-        let td = if self.is_forced_cpu { Device::Cpu } else { self.embed_tokens.embeddings().device().clone() };
-        let (mut kd, mut vd) = Self::decompress_kv_static(l_i, kr, vr, os, &td)?;
-        if let Some(l) = self.layers.get_mut(l_i) {
-            let th = l.self_attn.num_key_value_heads; let ch = kd.dims()[1];
-            if ch != th {
-                let ex = |t: Tensor| -> Result<Tensor> {
-                    if ch < th && th % ch == 0 { let rep = th / ch; let mut r = t.clone(); for _ in 1..rep { r = Tensor::cat(&[r, t.clone()], 1)?; } Ok(r.contiguous()?) }
-                    else if ch > th { Ok(t.narrow(1, 0, th)?.contiguous()?) } else { Ok(t.contiguous()?) }
-                };
-                kd = ex(kd)?; vd = ex(vd)?;
-            }
-            l.self_attn.kv_cache = Some((kd, vd));
-        }
-        Ok(())
-    }
 }
 
-pub fn load_vision_tensors_to_vb(ct: &gguf_file::Content, reader: &mut std::io::Cursor<&[u8]>, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
-    let mut data = HashMap::new();
-    for (name, _) in ct.tensor_infos.iter() {
-        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") { continue; }
-        
-        let mut clean = name.to_string();
-        if clean.starts_with("mm.") {
-            let rest = &clean[3..]; 
-            if rest.starts_with("0") { clean = "merger.linear_fc1".to_string() + &rest[1..]; } 
-            else if rest.starts_with("2") { clean = "merger.linear_fc2".to_string() + &rest[1..]; }
-        } else if clean.starts_with("visual.blk.") {
-            clean = clean.replace("visual.blk.", "blocks."); 
-        } else if clean.starts_with("visual.") {
-            clean = clean[7..].to_string(); // remove visual.
-        } else if clean.starts_with("v.") {
-            clean = clean[2..].to_string();
-        }
-        
-        if clean.contains("attn_qkvisual") { clean = clean.replace("attn_qkvisual", "attn.qkv"); }
-        if clean.contains("attn_out") { clean = clean.replace("attn_out", "attn.proj"); }
-        if clean.contains("ffn_up") { clean = clean.replace("ffn_up", "mlp.linear_fc1"); }
-        if clean.contains("ffn_down") { clean = clean.replace("ffn_down", "mlp.linear_fc2"); }
-        if clean.contains("post_ln") { clean = clean.replace("post_ln", "merger.norm"); }
-        if clean.contains("patch_embd") { clean = clean.replace("patch_embd", "patch_embed.proj"); }
-        if clean.contains("position_embd") { clean = clean.replace("position_embd", "pos_embed"); }
-        
-        let t = ct.tensor(reader, name, device)?.dequantize(device)?.to_dtype(dtype)?;
-        data.insert(clean, t);
-    }
-    Ok(VarBuilder::from_tensors(data, dtype, device))
-}
+// --- Main ---
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLModel {
-    pub config: Qwen3VLConfig,
-    pub visual: Option<Qwen3VLVisionModel>,
-    pub language_model: QuantizedQwen3VLTextModel,
-    pub lm_head: QLinear,
-    pub text_device: Device,
-    pub vision_device: Device,
-    pub is_baking: bool,
+    pub config: Qwen3VLConfig, pub visual: Option<Qwen3VLVisionModel>, pub language_model: QuantizedQwen3VLTextModel,
+    pub lm_head: QLinear, pub text_device: Device, pub vision_device: Device, pub is_baking: bool,
 }
 
 impl QuantizedQwen3VLModel {
     pub fn new_with_mmap(cfg: &Qwen3VLConfig, ctm: &gguf_file::Content, mm: Option<Arc<Mmap>>, _ctv: &gguf_file::Content, vmm: Option<Arc<Mmap>>, td: &Device, tdi: usize, vd: &Device, _vi: usize, dt: DType, kvr: u64, bo: bool, force_text_only: bool) -> Result<Self> {
         let visual = if !force_text_only && cfg.vision_config.is_some() {
+            let v_cfg = cfg.vision_config.as_ref().unwrap();
             let v_map = vmm.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut v_reader = std::io::Cursor::new(v_map);
-            let vb_v = if !v_map.is_empty() {
-                load_vision_tensors_to_vb(_ctv, &mut v_reader, vd, dt)?
-            } else {
-                let m_map = mm.as_ref().map(|m| &m[..]).unwrap_or(&[]);
-                let mut m_reader = std::io::Cursor::new(m_map);
-                load_vision_tensors_to_vb(ctm, &mut m_reader, vd, dt)?
-            };
-            Some(Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), vb_v, None)?)
+            let vb_v = if !v_map.is_empty() { load_vision_tensors_to_vb(_ctv, &mut v_reader, vd, dt)? }
+            else { let m_map = mm.as_ref().map(|m| &m[..]).unwrap_or(&[]); let mut m_reader = std::io::Cursor::new(m_map); load_vision_tensors_to_vb(ctm, &mut m_reader, vd, dt)? };
+            Some(Qwen3VLVisionModel::new(v_cfg.clone(), vb_v, None)?)
         } else { None };
-
         let lm = QuantizedQwen3VLTextModel::new_with_mmap(cfg.text_config.as_ref().unwrap(), ctm, mm.clone(), "model", td, tdi, dt, kvr, bo)?;
         let mut r = std::io::Cursor::new(mm.as_ref().map(|m| &m[..]).unwrap_or(&[]));
         let base_head = if lm.embed_tokens.embeddings().dim(1)? == 1024 { "output" } else { "lm_head" };
@@ -456,9 +377,8 @@ impl QuantizedQwen3VLModel {
     pub fn forward(&mut self, input_ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, _vthw: Option<&Tensor>, cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let (bs, sl) = input_ids.dims2()?;
         let mut embs = self.language_model.embed_tokens.forward(&input_ids.flatten_all()?)?.reshape((bs, sl, ()))?;
-        if let (Some(visual_model), Some(pv), Some(thw)) = (&self.visual, pv, thw) {
-            let (ie, _) = visual_model.forward(pv, thw)?;
-            let ie = ie.to_device(&self.text_device)?;
+        if let (Some(ref mut visual_model), Some(pv), Some(thw)) = (&mut self.visual, pv, thw) {
+            let (ie, _) = visual_model.forward(pv, thw)?; let ie = ie.to_device(&self.text_device)?;
             let mask = input_ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], input_ids.device())?)?.to_dtype(DType::U32)?;
             embs = masked_scatter_dim0(&embs, &ie, &mask)?;
         }
@@ -487,8 +407,7 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model: lm, lm_head: lh, text_device: td.clone() })
     }
     pub fn forward(&mut self, ids: &Tensor, cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let (bs, sl) = ids.dims2()?; 
-        let embs = self.language_model.embed_tokens.forward(&ids.flatten_all()?)?.reshape((bs, sl, ()))?;
+        let (bs, sl) = ids.dims2()?; let embs = self.language_model.embed_tokens.forward(&ids.flatten_all()?)?.reshape((bs, sl, ()))?;
         let pos = match cp { Some(p) => p.flatten_all()?.i(0)?.to_scalar::<u32>()? as usize, None => offset };
         let pids = Tensor::arange(pos as u32, (pos + sl) as u32, ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))?;
         let out = self.language_model.forward(&embs, offset, Some(&pids), None, None)?;
@@ -502,66 +421,103 @@ impl QuantizedQwen3TextModel {
 }
 
 pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _baking: bool) -> Result<HashMap<String, Tensor>> {
-    let file = std::fs::File::open(path)?;
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-    let safetensors = SafeTensors::deserialize(&mmap)?;
-    let mut tensors = HashMap::new();
-
+    let file = std::fs::File::open(path)?; let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let safetensors = SafeTensors::deserialize(&mmap)?; let mut tensors = HashMap::new();
     for (name, view) in safetensors.tensors() {
-        println!("[DEBUG-LOAD] Tensor Key: {}", name);
-        let dtype = match view.dtype() {
-            safetensors::Dtype::BOOL => DType::U8,
-            safetensors::Dtype::U8 => DType::U8,
-            safetensors::Dtype::I8 => DType::U8, 
-            safetensors::Dtype::I16 => DType::U32,
-            safetensors::Dtype::U16 => DType::U32, 
-            safetensors::Dtype::F16 => DType::F16,
-            safetensors::Dtype::BF16 => DType::BF16,
-            safetensors::Dtype::I32 => DType::I64, 
-            safetensors::Dtype::U32 => DType::U32,
-            safetensors::Dtype::F32 => DType::F32,
-            safetensors::Dtype::F64 => DType::F64,
-            safetensors::Dtype::I64 => DType::I64,
-            _ => return Err(anyhow!("Unsupported safetensor dtype: {:?}", view.dtype())),
-        };
-
-        let shape = view.shape().to_vec();
-        let data = view.data();
-        
-        let tensor = if dtype == DType::U8 && (view.dtype() == safetensors::Dtype::I8 || view.dtype() == safetensors::Dtype::BOOL) {
-             Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+        println!("[DEBUG-LOAD] Tensor Key: {} | DType: {:?}", name, view.dtype());
+        let shape = view.shape().to_vec(); let data = view.data();
+        if name.ends_with(".packed") && (view.dtype() == safetensors::Dtype::I32 || view.dtype() == safetensors::Dtype::U8 || view.dtype() == safetensors::Dtype::I8) {
+             let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
+             let mut new_shape = shape.clone(); if view.dtype() != safetensors::Dtype::I32 { if let Some(last) = new_shape.last_mut() { *last /= 4; } }
+             tensors.insert(name.to_string(), Tensor::from_slice(u_data, new_shape.as_slice(), &Device::Cpu)?.to_device(device)?);
         } else {
             match view.dtype() {
-                safetensors::Dtype::F32 => {
-                    let f_data: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
-                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::U32 => {
-                    let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
-                    Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::I32 => {
-                     let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
-                     Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::U8 => {
-                    Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::F16 => {
-                    let f_data: &[half::f16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2) };
-                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::BF16 => {
-                    let f_data: &[half::bf16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2) };
-                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                _ => {
-                    return Err(anyhow!("Manual loading for dtype {:?} not implemented", view.dtype()));
-                }
+                safetensors::Dtype::F32 => { let f_data: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
+                safetensors::Dtype::U32 => { let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) }; tensors.insert(name.to_string(), Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
+                safetensors::Dtype::I32 => { let i_data: &[i32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len() / 4) }; let u_data: Vec<u32> = i_data.iter().map(|&x| x as u32).collect(); tensors.insert(name.to_string(), Tensor::from_vec(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
+                safetensors::Dtype::U8 | safetensors::Dtype::I8 | safetensors::Dtype::BOOL => { tensors.insert(name.to_string(), Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
+                safetensors::Dtype::F16 => { let f_data: &[half::f16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
+                safetensors::Dtype::BF16 => { let f_data: &[half::bf16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2) }; tensors.insert(name.to_string(), Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?); },
+                _ => return Err(anyhow!("Manual loading for dtype {:?} not implemented", view.dtype())),
             }
         };
-        tensors.insert(name.to_string(), tensor);
     }
-
     Ok(tensors)
+}
+
+fn apply_linear_bridge(x: &Tensor, target_dim: usize) -> Result<Tensor> {
+    let (b, h, s, d) = x.dims4()?; let x_f32 = x.to_dtype(candle_core::DType::F32)?;
+    let rms = (x_f32.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt()).max(1e-6);
+    let theory_scale = (d as f64 / target_dim as f64).sqrt();
+    let dynamic_bridge_scale = (theory_scale * 0.7071067811865476_f64) / (rms as f64);
+    if target_dim >= d {
+        let left = x_f32.clone();
+        let upscaled = if target_dim > d {
+             let right = x_f32.roll(1, D::Minus1)?; let lerp = ((left + right)? * 0.5)?; 
+             (Tensor::stack(&[x_f32, lerp], D::Minus1)?.affine(dynamic_bridge_scale, 0.0))?.reshape((b, h, s, target_dim))?
+        } else { x_f32.affine(dynamic_bridge_scale * (rms as f64), 0.0)? };
+        Ok(upscaled.clamp(-10.0, 10.0)?.to_dtype(x.dtype())?)
+    } else {
+        let downscaled = x.narrow(D::Minus1, 0, target_dim)?;
+        let inv_scale = ((d as f64 / target_dim as f64).sqrt()) / (rms as f64);
+        Ok((downscaled.to_dtype(candle_core::DType::F32)?.affine(inv_scale, 0.0))?.to_dtype(x.dtype())?)
+    }
+}
+
+fn compress_to_bitkv_static(l_i: usize, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+    let s = t.dims().to_vec(); let d = t.device(); if l_i == 0 { return Ok((t.clone(), Tensor::zeros(1, DType::U8, d)?, Tensor::zeros(1, DType::F32, d)?, s)); }
+    let f = t.flatten_all()?; let n = f.dim(0)?;
+    if l_i <= 4 {
+        let sc = (f.abs()?.max_all()?.to_scalar::<f32>()? / 3.0).max(1e-6);
+        let q = f.to_vec1::<f32>()?; let mut p = vec![0u8; (n + 3) / 4];
+        for (i, &v) in q.iter().enumerate() { let qv = ((v / sc + 1.0).round() as u8).clamp(0, 3); p[i / 4] |= qv << ((i % 4) * 2); }
+        Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n + 3) / 4,), d)?, Tensor::new(&[sc], d)?, s))
+    } else {
+        let sc = f.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-6);
+        let sv = f.ge(0.0)?.to_vec1::<u8>()?; let mut p = vec![0u8; (n + 7) / 8];
+        for (i, &sv) in sv.iter().enumerate() { if sv > 0 { p[i / 8] |= 1 << (i % 8); } }
+        Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n + 7) / 8,), d)?, Tensor::new(&[sc], d)?, s))
+    }
+}
+
+fn decompress_kv_static(l_i: usize, kr: (Tensor, Tensor, Tensor), vr: (Tensor, Tensor, Tensor), os: &[usize], td: &Device) -> Result<(Tensor, Tensor)> {
+    let dt = if td.is_cpu() { DType::F32 } else { DType::BF16 };
+    let dec = |res: (Tensor, Tensor, Tensor)| -> Result<Tensor> {
+        if l_i == 0 { return Ok(res.0.to_device(td)?.to_dtype(dt)?); }
+        let sc = res.2.to_scalar::<f32>()?; let pv = res.1.to_vec1::<u8>()?; 
+        let total_el = os.iter().product(); let mut o = vec![0.0f32; total_el];
+        if l_i <= 4 { for i in 0..total_el { o[i] = (((pv[i / 4] >> ((i % 4) * 2)) & 0x03) as f32 - 1.0) * sc; } }
+        else { for i in 0..total_el { o[i] = if (pv[i / 8] >> (i % 8)) & 0x01 == 1 { sc } else { -sc }; } }
+        Ok(Tensor::from_vec(o, os, &Device::Cpu)?.to_device(td)?.to_dtype(dt)?.contiguous()?)
+    };
+    Ok((dec(kr)?, dec(vr)?))
+}
+
+pub fn load_vision_tensors_to_vb(ct: &gguf_file::Content, reader: &mut std::io::Cursor<&[u8]>, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
+    let mut data = HashMap::new();
+    for (name, _) in ct.tensor_infos.iter() {
+        if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") { continue; }
+        let mut clean = name.to_string();
+        if clean.starts_with("mm.") {
+            let rest = &clean[3..]; 
+            if rest.starts_with("0") { clean = "merger.linear_fc1".to_string() + &rest[1..]; } 
+            else if rest.starts_with("2") { clean = "merger.linear_fc2".to_string() + &rest[1..]; }
+        } else if clean.starts_with("visual.blk.") {
+            clean = clean.replace("visual.blk.", "blocks."); 
+        } else if clean.starts_with("visual.") {
+            clean = clean[7..].to_string();
+        } else if clean.starts_with("v.") {
+            clean = clean[2..].to_string();
+        }
+        if clean.contains("attn_qkvisual") { clean = clean.replace("attn_qkvisual", "attn.qkv"); }
+        if clean.contains("attn_out") { clean = clean.replace("attn_out", "attn.proj"); }
+        if clean.contains("ffn_up") { clean = clean.replace("ffn_up", "mlp.linear_fc1"); }
+        if clean.contains("ffn_down") { clean = clean.replace("ffn_down", "mlp.linear_fc2"); }
+        if clean.contains("post_ln") { clean = clean.replace("post_ln", "merger.norm"); }
+        if clean.contains("patch_embd") { clean = clean.replace("patch_embd", "patch_embed.proj"); }
+        if clean.contains("position_embd") { clean = clean.replace("position_embd", "pos_embed"); }
+        let t = ct.tensor(reader, name, device)?.dequantize(device)?.to_dtype(dtype)?;
+        data.insert(clean, t);
+    }
+    Ok(VarBuilder::from_tensors(data, dtype, device))
 }
