@@ -168,25 +168,25 @@ impl Qwen3VLTextModel {
     }
 }
 
-// --- Main ---
 #[derive(Debug, Clone)] pub struct Qwen3VLModel { pub config: Qwen3VLConfig, pub visual: Option<Qwen3VLVisionModel>, pub language_model: Qwen3VLTextModel, pub lm_head: QLinear, pub is_baking: bool }
 impl Qwen3VLModel {
     pub fn set_baking(&mut self, b: bool) { self.is_baking = b; self.language_model.is_baking = b; }
     pub fn new_ext(cfg: Qwen3VLConfig, vb: VarBuilder, _map: Option<HashMap<String, Tensor>>, fto: bool, bo: bool) -> Result<Self> {
         let map_r = _map.as_ref();
-        let root = if vb.get_with_hints((1,), "model.layers.0.input_layernorm.weight", Init::Const(0.)).is_ok() { "model" } else if vb.get_with_hints((1,), "language_model.layers.0.input_layernorm.weight", Init::Const(0.)).is_ok() { "language_model" } else { "" };
-        let vb_base = if root.is_empty() { vb.clone() } else { vb.pp(root) };
-        let vb_lm = if vb_base.get_with_hints((1,), "language_model.layers.0.input_layernorm.weight", Init::Const(0.)).is_ok() { vb_base.pp("language_model") } else { vb_base.clone() };
-        let vis = if !fto && cfg.vision_config.is_some() { Some(Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), vb_base.pp("visual"))?) } else { None };
         
-        let (nh, hd, nkv, hs, is, eps, theta, mrope, nl, vs) = if let Some(tc) = &cfg.text_config {
-            (tc.num_attention_heads, tc.head_dim, tc.num_key_value_heads, tc.hidden_size, tc.intermediate_size, tc.rms_norm_eps, tc.rope_theta, tc.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), tc.num_hidden_layers, tc.vocab_size)
+        // --- FINAL PREFIX LOGIC (Verified by inspect_gguf_tensors.py) ---
+        let model_vb = if vb.get_with_hints((1,), "model.embed_tokens.weight", Init::Const(0.)).is_ok() { vb.pp("model") } else { vb.clone() };
+        
+        let vis = if !fto && cfg.vision_config.is_some() { Some(Qwen3VLVisionModel::new(cfg.vision_config.as_ref().unwrap().clone(), model_vb.pp("visual"))?) } else { None };
+        
+        let (nh, hd, nkv, hs, eps, theta, mrope, nl, vs) = if let Some(tc) = &cfg.text_config {
+            (tc.num_attention_heads, tc.head_dim, tc.num_key_value_heads, tc.hidden_size, tc.rms_norm_eps, tc.rope_theta, tc.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), tc.num_hidden_layers, tc.vocab_size)
         } else {
-            (cfg.hidden_size.unwrap_or(1024)/128, 128, cfg.hidden_size.unwrap_or(1024)/128, cfg.hidden_size.unwrap_or(1024), cfg.hidden_size.unwrap_or(1024)*3, 1e-6, 1000000.0, vec![], 28, 151936)
+            (cfg.hidden_size.unwrap_or(1024)/128, 128, cfg.hidden_size.unwrap_or(1024)/128, cfg.hidden_size.unwrap_or(1024), 1e-6, 1000000.0, vec![], 28, 151936)
         };
 
         let mut blks = vec![]; for i in 0..(if bo { 1 } else { nl }) {
-            let vbl = vb_lm.pp("layers").pp(&i.to_string());
+            let vbl = model_vb.pp("layers").pp(&i.to_string());
             let q_proj = crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("self_attn.q_proj"), "weight", map_r)?;
             let k_proj = crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("self_attn.k_proj"), "weight", map_r)?;
             let v_proj = crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("self_attn.v_proj"), "weight", map_r)?;
@@ -198,13 +198,13 @@ impl Qwen3VLModel {
             let d = crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("mlp.down_proj"), "weight", map_r)?;
             blks.push(Some(Qwen3VLTextDecoderLayer { attn, mlp: QGateUpDownMLP { g, u, d, act: Activation::Silu }, in_ln: RmsNorm::new(vbl.get(hs, "input_layernorm.weight")?, eps), post_ln: RmsNorm::new(vbl.get(hs, "post_attention_layernorm.weight")?, eps) }));
         }
-        let ew = vb_lm.get((vs, hs), "embed_tokens.weight")?;
-        let lm = Qwen3VLTextModel { embed: Embedding::new(ew, hs), layers: blks, norm: RmsNorm::new(vb_lm.get(hs, "norm.weight")?, eps), rotary: Qwen3VLTextRotaryEmbedding::new(hd, theta), mrope, is_baking: bo };
-        let head = crate::models::qwen3vl::quantized_model::get_qlinear_safe(vb_lm.pp("lm_head"), "weight", map_r)?;
+        let ew = model_vb.get((vs, hs), "embed_tokens.weight")?;
+        let lm = Qwen3VLTextModel { embed: Embedding::new(ew, hs), layers: blks, norm: RmsNorm::new(model_vb.get(hs, if model_vb.get_with_hints((1,), "norm.weight", Init::Const(0.)).is_ok() { "norm.weight" } else { "output_norm.weight" })?, eps), rotary: Qwen3VLTextRotaryEmbedding::new(hd, theta), mrope, is_baking: bo };
+        let head = crate::models::qwen3vl::quantized_model::get_qlinear_safe(model_vb.pp("lm_head"), "weight", map_r)?;
         Ok(Self { config: cfg, visual: vis, language_model: lm, lm_head: head, is_baking: bo })
     }
     pub fn forward(&mut self, ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, vthw: Option<&Tensor>, _cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let (_bs, sl) = ids.dims2()?; let mut embs = self.language_model.embed.forward(&ids.to_dtype(DType::U32)?.contiguous()?)?;
+        let (bs, sl) = ids.dims2()?; let mut embs = self.language_model.embed.forward(&ids.to_dtype(DType::U32)?.contiguous()?)?;
         if let Some(ref mut vm) = &mut self.visual { if let (Some(p), Some(t)) = (pv, thw) { let (ie, _) = vm.forward(p, t)?; let m = ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], ids.device())?)?.to_dtype(DType::U32)?; embs = masked_scatter_dim0(&embs, &ie.to_device(ids.device())?, &m)?; } }
         let (pids, _) = Qwen3VLModel::get_rope_index_static(&self.config, ids, thw, vthw, None)?;
         let out = self.language_model.forward(&embs, offset, Some(&pids))?;
