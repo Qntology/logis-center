@@ -171,6 +171,7 @@ impl Qwen3VLGenerateModel {
         let dtype = get_dtype(dtype, cfg_dtype);
 
         let gguf_files = find_type_files(path, "gguf")?;
+        let sf_files = find_type_files(path, "safetensors")?;
         let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
         
         // [OPTIMIZATION] If force_text_only is enabled, treat it as a non-vision model
@@ -178,10 +179,18 @@ impl Qwen3VLGenerateModel {
 
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
-        let qwen3_vl = if !gguf_files.is_empty() {
-            let mut model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
-            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
-            if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
+        let qwen3_vl = if !gguf_files.is_empty() || sf_files.iter().any(|f| f.contains("BITSERIAL")) {
+            // [BITSERIAL-HYBRID] Check for BITSERIAL safetensors first
+            let mut model_path = sf_files.iter().find(|f| f.contains("BITSERIAL_LAYER0")).cloned();
+            if model_path.is_none() { model_path = sf_files.iter().find(|f| f.contains("BITSERIAL_INFERENCE")).cloned(); }
+            if model_path.is_none() { model_path = sf_files.iter().find(|f| f.contains("BITSERIAL_ALL")).cloned(); }
+            
+            // If no bitserial, fallback to standard GGUF
+            if model_path.is_none() {
+                model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
+                if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
+                if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
+            }
 
             let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;  
             let reserve_tokens = limit_tokens.min(8192);
@@ -189,29 +198,58 @@ impl Qwen3VLGenerateModel {
 
             if is_vision_model {
                 let mmproj = mmproj_path.ok_or(anyhow!("Missing mmproj GGUF"))?;
-                let main = model_path.ok_or(anyhow!("Missing main GGUF for VL model"))?;
+                let main = model_path.ok_or(anyhow!("Missing main model file for VL model"))?;
                 let main_file = std::fs::File::open(&main)?;
                 let main_mmap = unsafe { memmap2::MmapOptions::new().map(&main_file)? };
                 let mmproj_file = std::fs::File::open(&mmproj)?;
                 let mmproj_mmap = unsafe { memmap2::MmapOptions::new().map(&mmproj_file)? };
 
                 let mut main_cursor = std::io::Cursor::new(&main_mmap[..]);
-                let main_content = gguf_file::Content::read(&mut main_cursor)?;
+                let main_content = if main.contains(".safetensors") {
+                    let mut dummy_gguf = vec![0u8; 32];
+                    dummy_gguf[0..4].copy_from_slice(b"GGUF");
+                    dummy_gguf[4..8].copy_from_slice(&3u32.to_le_bytes()); 
+                    let mut dummy_cursor = std::io::Cursor::new(dummy_gguf);
+                    gguf_file::Content::read(&mut dummy_cursor)?
+                } else {
+                    gguf_file::Content::read(&mut main_cursor)?
+                };
+
                 let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
-                let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
+                let mmproj_content = if mmproj.contains(".safetensors") {
+                    let mut dummy_gguf = vec![0u8; 32];
+                    dummy_gguf[0..4].copy_from_slice(b"GGUF");
+                    dummy_gguf[4..8].copy_from_slice(&3u32.to_le_bytes()); 
+                    let mut dummy_cursor = std::io::Cursor::new(dummy_gguf);
+                    gguf_file::Content::read(&mut dummy_cursor)?
+                } else {
+                    gguf_file::Content::read(&mut mmproj_cursor)?
+                };
 
                 let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve)?;
                 ModelVariant::QuantizedVL(model)
             } else {
-                let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
+                let main = model_path.ok_or(anyhow!("No model file found"))?;
                 let file = std::fs::File::open(&main)?;
                 let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
                 let mut cursor = std::io::Cursor::new(&mmap[..]);        
-                let content = gguf_file::Content::read(&mut cursor)?;
                 
-                let is_06b = path.contains("0.6B");
+                // [HYBRID-LOAD] BitSerial safetensors don't have GGUF headers, 
+                // but we can wrap them in a pseudo-content if needed or use safetensors directly.
+                // For now, we reuse the Content structure by detecting format.
+                let content = if main.contains(".safetensors") {
+                    let mut dummy_gguf = vec![0u8; 32];
+                    dummy_gguf[0..4].copy_from_slice(b"GGUF");
+                    dummy_gguf[4..8].copy_from_slice(&3u32.to_le_bytes()); 
+                    let mut dummy_cursor = std::io::Cursor::new(dummy_gguf);
+                    gguf_file::Content::read(&mut dummy_cursor)?
+                } else {
+                    gguf_file::Content::read(&mut cursor)?
+                };
+                
+                let is_06b = path.contains("0.6B") || main.contains("LAYER0");
                 let baking_only = is_06b;
-                let single_layer_mode = is_06b;
+                let single_layer_mode = main.contains("LAYER0");
                 
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)

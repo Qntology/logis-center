@@ -72,6 +72,157 @@ pub struct QLinear {
     device: Device, // Track device explicitly
 }
 
+#[derive(Clone)]
+pub struct BitSerialLinear {
+    pub packed: Tensor, // [N, K/32] DType::U32
+    pub scales: Tensor, // [N, 1] DType::F16
+    pub bias: Option<Tensor>,
+    pub in_features: usize,
+    pub out_features: usize,
+    pub device: Device,
+}
+
+impl BitSerialLinear {
+    pub fn new(packed: Tensor, scales: Tensor, bias: Option<Tensor>, device: Device) -> Result<Self> {
+        let shape = packed.shape().dims();
+        let out_features = shape[0];
+        let in_features = shape[1] * 32;
+        Ok(Self {
+            packed,
+            scales,
+            bias,
+            in_features,
+            out_features,
+            device,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        if self.device.is_cuda() {
+            // [GPU] On-the-fly dequantization (Temporary expansion for matmul)
+            let w = self.dequantize_on_gpu()?;
+            let x_typed = x.to_dtype(w.dtype())?;
+            let res = x_typed.matmul(&w.t()?)?;
+            if let Some(bias) = &self.bias {
+                Ok(res.broadcast_add(&bias.to_device(x.device())?.to_dtype(res.dtype())?)?)
+            } else {
+                Ok(res)
+            }
+        } else {
+            // [CPU] Bit-serial optimized forward via Rayon
+            self.forward_cpu(x)
+        }
+    }
+
+    fn dequantize_on_gpu(&self) -> Result<Tensor> {
+        let dev = &self.device;
+        let dtype = DType::BF16;
+        let (out_f, packed_k) = self.packed.dims2()?;
+        let in_f = packed_k * 32;
+
+        // [TURBO-EXPAND] Expand bits to signs (-1, 1) directly on GPU
+        // This is a temporary tensor that exists only during the forward pass of this layer
+        let mut full_weight = vec![0.0f32; out_f * in_f];
+        let packed_cpu = self.packed.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let scales_cpu = self.scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+
+        full_weight.par_chunks_mut(in_f).enumerate().for_each(|(i, row)| {
+            let p_row = &packed_cpu[i];
+            let s = scales_cpu[i][0];
+            for j in 0..packed_k {
+                let p = p_row[j];
+                for bit in 0..32 {
+                    let sign = if (p >> bit) & 1 == 1 { 1.0 } else { -1.0 };
+                    row[j * 32 + bit] = sign * s;
+                }
+            }
+        });
+
+        Ok(Tensor::from_vec(full_weight, (out_f, in_f), &Device::Cpu)?.to_device(dev)?.to_dtype(dtype)?)
+    }
+
+    fn forward_cpu(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, s, k) = x.dims3()?;
+        let x_f32 = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let x_data = x_f32.to_vec3::<f32>()?;
+        
+        let packed_data = self.packed.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+        let scales_data = self.scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        
+        let mut out_data = vec![0.0f32; b * s * self.out_features];
+
+        out_data.par_chunks_mut(s * self.out_features).enumerate().for_each(|(b_idx, batch_out)| {
+            for s_idx in 0..s {
+                let x_row = &x_data[b_idx][s_idx];
+                let row_out = &mut batch_out[s_idx * self.out_features .. (s_idx + 1) * self.out_features];
+                
+                for out_idx in 0..self.out_features {
+                    let mut sum = 0.0f32;
+                    let p_row = &packed_data[out_idx];
+                    let scale = scales_data[out_idx][0];
+                    
+                    for (i, &p) in p_row.iter().enumerate() {
+                        let base_k = i * 32;
+                        for bit in 0..32 {
+                            if base_k + bit < k {
+                                let sign = if (p >> bit) & 1 == 1 { 1.0f32 } else { -1.0f32 };
+                                sum += x_row[base_k + bit] * sign;
+                            }
+                        }
+                    }
+                    row_out[out_idx] = sum * scale;
+                }
+            }
+        });
+
+        let res = Tensor::from_vec(out_data, (b, s, self.out_features), &Device::Cpu)?;
+        if let Some(bias) = &self.bias {
+            Ok(res.broadcast_add(&bias.to_device(&Device::Cpu)?.to_dtype(DType::F32)?)?)
+        } else {
+            Ok(res)
+        }
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.packed = self.packed.to_device(device)?;
+        self.scales = self.scales.to_device(device)?;
+        if let Some(b) = &self.bias {
+            self.bias = Some(b.to_device(device)?);
+        }
+        self.device = device.clone();
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub enum LinearLayer {
+    Standard(QLinear),
+    BitSerial(BitSerialLinear),
+}
+
+impl LinearLayer {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Standard(l) => l.forward(x),
+            Self::BitSerial(l) => l.forward(x),
+        }
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        match self {
+            Self::Standard(l) => l.to_device(device),
+            Self::BitSerial(l) => l.to_device(device),
+        }
+    }
+
+    pub fn device(&self) -> &Device {
+        match self {
+            Self::Standard(l) => l.device(),
+            Self::BitSerial(l) => &l.device,
+        }
+    }
+}
+
 impl QLinear {
     pub fn new(inner: QMatMul, bias: Option<Tensor>, device: Device) -> Self {
         Self { inner, bias, device }
@@ -156,10 +307,10 @@ struct QuantizedKV {
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLTextAttention {
-    pub q_proj: QLinear,
-    pub k_proj: QLinear,
-    pub v_proj: QLinear,
-    pub o_proj: QLinear,
+    pub q_proj: LinearLayer,
+    pub k_proj: LinearLayer,
+    pub v_proj: LinearLayer,
+    pub o_proj: LinearLayer,
     pub q_norm: RmsNorm,
     pub k_norm: RmsNorm,
     pub num_attention_heads: usize,
@@ -241,10 +392,10 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
-        let k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
-        let v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
-        let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+        let q_proj = get_any_linear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
+        let k_proj = get_any_linear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
+        let v_proj = get_any_linear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
+        let o_proj = get_any_linear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
 
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
@@ -674,9 +825,9 @@ impl QuantizedQwen3VLTextAttention {
 #[derive(Clone)]
 pub struct QuantizedQwen3VLTextDecoderLayer {
     pub self_attn: QuantizedQwen3VLTextAttention,
-    pub mlp_gate: Option<QLinear>,
-    pub mlp_up: Option<QLinear>,
-    pub mlp_down: Option<QLinear>,
+    pub mlp_gate: Option<LinearLayer>,
+    pub mlp_up: Option<LinearLayer>,
+    pub mlp_down: Option<LinearLayer>,
     pub input_layernorm: RmsNorm,
     pub post_attention_layernorm: Option<RmsNorm>,
 }
@@ -715,9 +866,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         
         // [OPTIMIZATION] Skip MLP loading if we only need to bake KV cache (MLP 0% Mode)
         let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
-            let mg = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
-            let mu = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
-            let md = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
+            let mg = Some(get_any_linear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
+            let mu = Some(get_any_linear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
+            let md = Some(get_any_linear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
             let pln = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?);
             (mg, mu, md, pln)
         } else {
@@ -825,7 +976,104 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let device = self.input_layernorm.weight().device();
         self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len)
     }
+
+    pub fn new_from_sf(
+        config: &Qwen3VLTextConfig,
+        vb: &VarBuilder,
+        base_name: &str,
+        device: &Device,
+        dtype: DType,
+        layer_idx: usize,
+        baking_only: bool,
+    ) -> Result<Self> {
+        let attn_base = format!("{}.self_attn", base_name);
+        
+        let self_attn = QuantizedQwen3VLTextAttention::new_from_sf(config, vb, &attn_base, device, dtype, layer_idx)?;
+        
+        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
+            let mg = Some(get_any_linear_sf(vb, &format!("{base_name}.mlp.gate_proj"), device, dtype)?);
+            let mu = Some(get_any_linear_sf(vb, &format!("{base_name}.mlp.up_proj"), device, dtype)?);
+            let md = Some(get_any_linear_sf(vb, &format!("{base_name}.mlp.down_proj"), device, dtype)?);
+            let pln = Some(get_rms_norm_sf(vb, &format!("{base_name}.post_attention_layernorm"), config.rms_norm_eps, device, dtype)?);
+            (mg, mu, md, pln)
+        } else {
+            (None, None, None, None)
+        };
+
+        let input_layernorm = get_rms_norm_sf(vb, &format!("{base_name}.input_layernorm"), config.rms_norm_eps, device, dtype)?;
+
+        Ok(Self {
+            self_attn,
+            mlp_gate,
+            mlp_up,
+            mlp_down,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
 }
+
+impl QuantizedQwen3VLTextAttention {
+    pub fn new_from_sf(
+        config: &Qwen3VLTextConfig,
+        vb: &VarBuilder,
+        base_name: &str,
+        device: &Device,
+        dtype: DType,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let head_dim = config.head_dim;
+        let scaling = 1f64 / f64::sqrt(head_dim as f64);
+
+        let q_proj = get_any_linear_sf(vb, &format!("{base_name}.q_proj"), device, dtype)?;
+        let k_proj = get_any_linear_sf(vb, &format!("{base_name}.k_proj"), device, dtype)?;
+        let v_proj = get_any_linear_sf(vb, &format!("{base_name}.v_proj"), device, dtype)?;
+        let o_proj = get_any_linear_sf(vb, &format!("{base_name}.o_proj"), device, dtype)?;
+
+        let q_norm = get_rms_norm_sf(vb, &format!("{base_name}.q_norm"), config.rms_norm_eps, device, dtype)?;
+        let k_norm = get_rms_norm_sf(vb, &format!("{base_name}.k_norm"), config.rms_norm_eps, device, dtype)?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_attention_heads: config.num_attention_heads,
+            num_key_value_heads: config.num_key_value_heads,
+            num_kv_groups: config.num_attention_heads / config.num_key_value_heads.max(1),
+            head_dim,
+            scaling,
+            kv_cache: None,
+            layer_idx,
+        })
+    }
+}
+
+pub fn get_any_linear_sf(
+    vb: &VarBuilder,
+    name: &str,
+    device: &Device,
+    _dtype: DType,
+) -> Result<LinearLayer> {
+    if vb.contains_tensor(&format!("{name}.packed")) {
+        let packed = vb.get_with_hints((), &format!("{name}.packed"), candle_nn::Init::Const(0.0))?;
+        let scales = vb.get_with_hints((), &format!("{name}.scales"), candle_nn::Init::Const(0.0))?;
+        let bias = vb.get_with_hints((), &format!("{name}.bias"), candle_nn::Init::Const(0.0)).ok();
+        Ok(LinearLayer::BitSerial(BitSerialLinear::new(packed, scales, bias, device.clone())?))
+    } else {
+        let weight = vb.get_with_hints((), &format!("{name}.weight"), candle_nn::Init::Const(0.0))?;
+        let bias = vb.get_with_hints((), &format!("{name}.bias"), candle_nn::Init::Const(0.0)).ok();
+        Ok(LinearLayer::Standard(QLinear::new(QMatMul::Tensor(weight), bias, device.clone())))
+    }
+}
+
+pub fn get_rms_norm_sf(vb: &VarBuilder, name: &str, eps: f64, _device: &Device, _dtype: DType) -> Result<RmsNorm> {
+    let weight = vb.get_with_hints((), &format!("{name}.weight"), candle_nn::Init::Const(1.0))?;
+    Ok(RmsNorm::new(weight, eps))
+}
+
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLTextModel {
@@ -914,8 +1162,6 @@ impl QuantizedQwen3VLTextModel {
              }
         }
 
-        let mut layer_devices = vec![];
-        
         // [FORCE-OPTIMIZATION] 4GB 내외의 VRAM 환경에서는 2B 모델이 충분히 들어갑니다.
         let _force_gpu = if current_device.is_cuda() && is_vram_checked {
             simulated_free_vram > 3_000_000_000 
@@ -923,22 +1169,27 @@ impl QuantizedQwen3VLTextModel {
             false
         };
 
-        for _ in 0..config.num_hidden_layers {
-            let actual_cost = cost_per_layer;
-            if current_device.is_cuda() && is_vram_checked {
-                 // [SAFE-ALLOC] 가용 VRAM에서 20% 여유를 두고 할당 (OOM 방지)
-                 // buffer_factor 1.2 = 레이어 크기의 1.2배 공간이 있어야 할당함
-                 let buffer_factor = 1.2; 
-                 if simulated_free_vram > ( (actual_cost as f64 * buffer_factor) as u64 + safety_floor ) {
-                     simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
-                     layer_devices.push(current_device.clone());
-                 } else {
-                     // 공간 부족 시 CPU로 할당 (속도는 조금 느려지지만 절대 죽지 않음)
-                     layer_devices.push(Device::Cpu);
-                 }
-            } else {
-                // CPU 모드거나 VRAM 확인 불가 시 기본 장치 사용
-                layer_devices.push(current_device.clone());
+        let mut layer_devices = vec![];
+        
+        // [BITSERIAL-FIX] If loading from safetensors, populate layer_devices and skip VRAM cost check for now
+        let is_sf = ct.tensor_infos.is_empty();
+        
+        if is_sf {
+            for _ in 0..config.num_hidden_layers { layer_devices.push(current_device.clone()); }
+        } else {
+            for _ in 0..config.num_hidden_layers {
+                let actual_cost = cost_per_layer;
+                if current_device.is_cuda() && is_vram_checked {
+                    let buffer_factor = 1.2; 
+                    if simulated_free_vram > ( (actual_cost as f64 * buffer_factor) as u64 + safety_floor ) {
+                        simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
+                        layer_devices.push(current_device.clone());
+                    } else {
+                        layer_devices.push(Device::Cpu);
+                    }
+                } else {
+                    layer_devices.push(current_device.clone());
+                }
             }
         }
 
@@ -948,8 +1199,16 @@ impl QuantizedQwen3VLTextModel {
         
         let pool = rayon::ThreadPoolBuilder::new().num_threads(thread_config.thread_count).build()?;
         
-        // Ensure we capture the PATCHED config, not the original one
         let final_config = config; 
+        
+        // [BITSERIAL-FIX] Create a VarBuilder from safetensors if needed
+        let sf_vb = if is_sf {
+            let mmap = mmap_handle.as_ref().ok_or(anyhow!("Mmap required for safetensors"))?;
+            let tensors = candle_core::safetensors::load_buffer(&mmap[..], device)?;
+            Some(VarBuilder::from_tensors(tensors, dtype, device))
+        } else {
+            None
+        };
 
         let layers: Result<Vec<_>> = pool.install(|| {
             (0..final_config.num_hidden_layers).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
@@ -957,21 +1216,34 @@ impl QuantizedQwen3VLTextModel {
                 let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
                 let standard = format!("{base_name}.layers.{layer_idx}");
                 let gguf_blk = format!("blk.{layer_idx}");
-                let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
-                QuantizedQwen3VLTextDecoderLayer::new(
-                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
-                )
+                
+                // Detection logic for safetensors vs GGUF
+                if let Some(vb) = &sf_vb {
+                    QuantizedQwen3VLTextDecoderLayer::new_from_sf(
+                        final_config, vb, &standard, &layer_device, layer_dtype, layer_idx, baking_only
+                    )
+                } else {
+                    let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
+                    QuantizedQwen3VLTextDecoderLayer::new(
+                        final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
+                    )
+                }
             }).collect()
         });
         
         let layers = layers?;
         
-        let norm_name = format!("{base_name}.norm");
-        let alt_norm = "output_norm";
-        let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
         let last_device = layers.last().map(|l| l.device()).unwrap_or(device);
         let norm_dtype = if last_device.is_cpu() { DType::F32 } else { dtype };
-        let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype)?;
+
+        let norm = if let Some(vb) = &sf_vb {
+            get_rms_norm_sf(vb, &format!("{base_name}.norm"), config.rms_norm_eps, last_device, norm_dtype)?
+        } else {
+            let norm_name = format!("{base_name}.norm");
+            let alt_norm = "output_norm";
+            let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
+            get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype)?
+        };
         
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
@@ -1392,7 +1664,7 @@ pub struct QuantizedQwen3VLModel {
     pub config: Qwen3VLConfig,
     pub visual: Qwen3VLVisionModel, 
     pub language_model: QuantizedQwen3VLTextModel,
-    pub lm_head: QLinear,
+    pub lm_head: LinearLayer,
     pub rope_deltas: Option<Tensor>,
     pub text_device: Device,
     pub vision_device: Device,
@@ -1429,12 +1701,12 @@ impl QuantizedQwen3VLModel {
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader_main = std::io::Cursor::new(main_mmap);
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
+        let lm_head = if let Ok(l) = get_any_linear(ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
             l
-        } else if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "output", text_device, head_dtype) {
+        } else if let Ok(l) = get_any_linear(ct_main, &mut reader_main, "output", text_device, head_dtype) {
             l
         } else {
-            get_qlinear(ct_main, &mut reader_main, "token_embd", text_device, head_dtype)?
+            get_any_linear(ct_main, &mut reader_main, "token_embd", text_device, head_dtype)?
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: main_mmap_handle, mmproj_mmap: mmproj_mmap_handle })
@@ -1462,12 +1734,12 @@ impl QuantizedQwen3VLModel {
         let language_model = QuantizedQwen3VLTextModel::new(t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, false)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
+        let lm_head = if let Ok(l) = get_any_linear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
             l
-        } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
+        } else if let Ok(l) = get_any_linear(ct_main, reader_main, "output", text_device, head_dtype) {
             l
         } else {
-            get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+            get_any_linear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: None, mmproj_mmap: None })
@@ -1535,7 +1807,7 @@ impl QuantizedQwen3VLModel {
 #[derive(Clone)]
 pub struct QuantizedQwen3TextModel {
     pub language_model: QuantizedQwen3VLTextModel,
-    pub lm_head: Option<QLinear>,
+    pub lm_head: Option<LinearLayer>,
     pub text_device: Device,
     pub mmap: Option<Arc<Mmap>>,
 }
@@ -1551,9 +1823,9 @@ impl QuantizedQwen3TextModel {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-            if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) { Some(l) }
-            else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) { Some(l) }
-            else { get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype).ok() }
+            if let Ok(l) = get_any_linear(ct_main, &mut reader, "lm_head", text_device, head_dtype) { Some(l) }
+            else if let Ok(l) = get_any_linear(ct_main, &mut reader, "output", text_device, head_dtype) { Some(l) }
+            else { get_any_linear(ct_main, &mut reader, "token_embd", text_device, head_dtype).ok() }
         } else { None };
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle })
     }
@@ -1566,12 +1838,13 @@ impl QuantizedQwen3TextModel {
         let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
         let lm_head = if !baking_only {
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-            if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) { Some(l) }
-            else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) { Some(l) }
-            else { get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype).ok() }
+            if let Ok(l) = get_any_linear(ct_main, reader_main, "lm_head", text_device, head_dtype) { Some(l) }
+            else if let Ok(l) = get_any_linear(ct_main, reader_main, "output", text_device, head_dtype) { Some(l) }
+            else { get_any_linear(ct_main, reader_main, "token_embd", text_device, head_dtype).ok() }
         } else { None };
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
     }
+
 
     pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
@@ -1598,6 +1871,39 @@ impl QuantizedQwen3TextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
+}
+
+pub fn get_any_linear<R: std::io::Seek + std::io::Read>(
+    ct: &gguf_file::Content,
+    reader: &mut R,
+    name: &str,
+    device: &Device,
+    dtype: DType,
+) -> Result<LinearLayer> {
+    // 1. Check for BitSerial (.packed)
+    let packed_name = format!("{name}.packed");
+    if ct.tensor_infos.contains_key(&packed_name) {
+        return Ok(LinearLayer::BitSerial(get_bit_serial_linear(ct, reader, name, device)?));
+    }
+
+    // 2. Fallback to Standard QLinear
+    Ok(LinearLayer::Standard(get_qlinear(ct, reader, name, device, dtype)?))
+}
+
+fn get_bit_serial_linear<R: std::io::Seek + std::io::Read>(
+    ct: &gguf_file::Content,
+    reader: &mut R,
+    name: &str,
+    device: &Device,
+) -> Result<BitSerialLinear> {
+    let packed = ct.tensor(reader, &format!("{name}.packed"), device)?.dequantize(device)?;
+    let scales = ct.tensor(reader, &format!("{name}.scales"), device)?.dequantize(device)?;
+    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) {
+        Some(t.dequantize(device)?.to_dtype(DType::F32)?)
+    } else {
+        None
+    };
+    BitSerialLinear::new(packed, scales, bias, device.clone())
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
