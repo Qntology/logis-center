@@ -219,11 +219,7 @@ impl LogisModel {
         if let Ok(mut gen) = self.generator.try_lock() { *gen = None; }
         if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
         if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
-        if let Ok(mut emb) = self.embedding_model.try_lock() { *emb = None; }
         
-        // [FIX] Do not reset current_size here. State management is caller's responsibility.
-        // This prevents race conditions during relay.
-
         // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]
         unsafe {
@@ -333,7 +329,7 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
                 gen.save_kv_to_disk(&path)?;
                 Ok(path.to_string_lossy().to_string())
@@ -350,7 +346,7 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
                     gen.load_kv_from_disk(&path)?;
@@ -366,18 +362,11 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, high_fidelity: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {}, High-Fidelity: {})...", target_size, is_baking, high_fidelity);
-        
-        // [FIX] Reserve slot immediately to block Embedding from taking GPU (moved BEFORE purge)
-        {
-            let mut size_guard = self.current_size.lock().await;
-            *size_guard = Some(target_size); 
-        } // Lock released
-
+        println!("[RELAY] Performing Deep Purge before loading {:?}...", target_size);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
@@ -388,8 +377,8 @@ impl LogisModel {
 
         // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
         // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
-        let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
-        self.ensure_generator_ext(target_size, text_only, is_baking, high_fidelity).await?;
+        let text_only = target_size == ModelSize::Large && task_id.is_some();
+        self.ensure_generator_ext(target_size, text_only).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -402,30 +391,31 @@ impl LogisModel {
 
     // --- [NEW] Base Context Baking (One-time Heavy Lifting) ---
     pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        // [FIX] Session naming parity with scheduler
-        let base_session = format!("{}_step_a", task_id); 
+        let base_session = format!("{}_base", task_id);
         
-        // 1. Load Small Model Isolated (Baking: true, Force4bit: false)
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
+        // 1. Load Small Model Isolated
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone()).await?;
 
         // 2. Ingest PUG content
         {
             let gen_clone = self.generator.clone();
             let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
             let token_clone = cancel_token.clone();
-            let session_id = Some(base_session.clone());
+            
+            // We use prefill_only via a manual chat construct or direct access if possible
+            // Reusing chat_params_with_spinner for convenience but with empty generation
             
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    // [CRITICAL-FIX] Pass session_id to prefill_chunk to trigger automatic Disk-Save
-                    gen.prefill_chunk(prompt, token_clone, None, session_id)?;
+                    // Just prefill, no generation needed for base context
+                    gen.prefill_chunk(prompt, token_clone, None)?;
                 }
                 Ok(())
             }).await??;
         }
 
-        // 3. Save Final Snapshot (Just in case, although prefill_chunk does it)
+        // 3. Save Base Snapshot
         self.save_kv_snapshot(&base_session).await?;
         
         // 4. Unload immediately to free VRAM for 2B
@@ -440,42 +430,40 @@ impl LogisModel {
         
         // Only load if not already loaded or if current loaded session is different?
         // secure_vram_relay checks size but not session content.
+        // We force a relay if we are not Large. If we are Large, we assume we might need to reset or just continue.
+        // For safety in this new flow, we can check if we need to load.
         
-        // [FIX] Force 4-bit for high-precision inference (Baking: false, Force4bit: true)
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, true).await
+        {
+            let current_size = *self.current_size.lock().await;
+            if current_size == Some(ModelSize::Large) {
+                // Already Large. Assuming context is preserved or we manage it.
+                // But if we just switched from Small, we need to load base.
+                // The safest is to rely on secure_vram_relay's logic:
+                // If we pass the base_session as task_id, it will load that snapshot.
+            }
+        }
+
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, baking_only: bool, high_fidelity: bool, device_override: Option<Device>) -> anyhow::Result<Qwen3VLGenerateModel> {
-        let suffix = if baking_only {
-            "model-BITSERIAL_LAYER0.safetensors"
-        } else {
-            "model-BITSERIAL_INFERENCE.safetensors"
-        };
-        
-        // Handle path joining safely
-        let model_file_path = std::path::Path::new(path).join(suffix);
-        let model_file_str = model_file_path.to_string_lossy().to_string();
-
-        println!("[MODEL] Loading Generator from {} (Text-Only: {}, Baking: {})...", model_file_str, force_text_only, baking_only);
-        let dev = device_override.unwrap_or_else(|| self.device_config.device.clone());
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
+        let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
 
         let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
-        
-        // Pass the directory as config path if not shared, but pass specific model file as model path
-        let config_path = shared_config_path.map(|s| s.to_string()).or_else(|| Some(path.to_string()));
+        let path_clone = path.to_string();
+        let shared_path = shared_config_path.map(|s| s.to_string());
 
         let generator = tokio::task::spawn_blocking(move || {
             // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
             Qwen3VLGenerateModel::init_with_config(
-                &model_file_str, 
-                config_path.as_deref(), // Tokenizer path (directory)
-                config_path.as_deref(), // Config path (directory)
+                &path_clone, 
+                shared_path.as_deref(), // Tokenizer path
+                shared_path.as_deref(), // Config path
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
-                force_text_only,
-                baking_only,
-                high_fidelity
+                force_text_only
             )
         }).await??;
         
@@ -483,20 +471,20 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.ensure_generator_ext(size, false, false, false).await
+        self.ensure_generator_ext(size, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool, high_fidelity: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
         let mut large_slot = self.large_hibernation.lock().await;
 
-        if *current_size_guard == Some(size) && gen_guard.is_some() && !baking_only && !high_fidelity {
+        if *current_size_guard == Some(size) && gen_guard.is_some() {
             return Ok(());
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {}, High-Fidelity: {})...", size, force_text_only, baking_only, high_fidelity);
+        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {})...", size, force_text_only);
         // ... (rest of the switching logic remains similar but uses the new loading)
 
         // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
@@ -551,8 +539,21 @@ impl LogisModel {
             }
         }
 
-        // Use the helper method with updated signature
-        let gen = self.load_generator_internal(path, shared_path, force_text_only, baking_only, high_fidelity, Some(target_device)).await?;
+        let dev_id = self.device_config.gpu_id;
+        let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
+        let limit = self.max_tokens_limit;
+        let path_clone = path.to_string();
+        let shared_path_clone = shared_path.map(|s| s.to_string());
+
+        let gen = tokio::task::spawn_blocking(move || {
+            Qwen3VLGenerateModel::init_with_config(
+                &path_clone, 
+                shared_path_clone.as_deref(), 
+                shared_path_clone.as_deref(), 
+                Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
+                force_text_only
+            )
+        }).await??;
 
         // Move current main to slot
         if let Some(old_m) = gen_guard.take() {
@@ -573,16 +574,32 @@ impl LogisModel {
     pub async fn ensure_embedding(&self) -> anyhow::Result<()> {
         let current_size = { *self.current_size.lock().await };
         
-        // [STRICT-ISOLATION] Do NOT load Embedding model if an LLM is currently active.
-        // This prevents the "vicious cycle" of resource contention during heavy Baking/Inference.
-        if current_size.is_some() {
-            return Err(anyhow::anyhow!("Resource Busy: LLM is active ({:?}). Embedding load blocked.", current_size));
+        // [STRATEGY] High-priority exclusion logic
+        match current_size {
+            Some(ModelSize::Large) => {
+                // If Large is active, Embedding must stay on CPU to avoid OOM
+                println!("[MODEL] Large model active. Forcing Embedding to CPU to prevent swapping.");
+            },
+            Some(ModelSize::Small) => {
+                // Small and Embedding can coexist. 
+                println!("[MODEL] Small model active. Embedding and 0.6B will coexist.");
+            },
+            None => {
+                // No generator active, safe to clean up any leftovers
+                self.unload_generator().await;
+            }
         }
 
         let mut emb_guard = self.embedding_model.lock().await;
         if emb_guard.is_none() {
             let self_clone = self.embedding_path.clone();
-            let target_device = self.device_config.device.clone();
+            
+            // Determine target device: CPU if Large is active, else use default GPU
+            let target_device = if current_size == Some(ModelSize::Large) { 
+                candle_core::Device::Cpu 
+            } else { 
+                self.device_config.device.clone() 
+            };
             
             println!("[MODEL] Loading Embedding Model on {:?}...", if target_device.is_cpu() { "CPU" } else { "GPU" });
             
@@ -616,19 +633,11 @@ impl LogisModel {
         }
 
         let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models"))?;
+        let small_gguf_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
+        let large_gguf_dir = base_path.join("Qwen3-VL-2B-Instruct-gguf");
         
-        // [FIX] Normalize UNC paths for Windows to prevent "builder error" in model loaders
-        let normalize_path = |path: std::path::PathBuf| -> String {
-            let s = path.to_string_lossy().to_string();
-            if s.starts_with(r"\\?\") {
-                s[4..].to_string()
-            } else {
-                s
-            }
-        };
-
-        let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
-        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
+        let small_model_path = small_gguf_dir.to_str().unwrap().to_string();
+        let large_model_path = large_gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 
@@ -659,29 +668,27 @@ impl LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
-        // [FIX] Do NOT force reload. Use current generator (Large should be already loaded via relay)
-        {
-            let gen_guard = self.generator.lock().await;
-            if gen_guard.is_none() {
-                drop(gen_guard);
-                self.ensure_generator(ModelSize::Large).await?;
-            }
-        }
+        // [LOG-ONLY] Removed intermediate UI emit. Log the progress instead.
+        crate::scheduler::log_task_progress(app_handle, &task_id, &json!({ 
+            "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
+        }));
+
+        // Ensure LARGE generator is loaded for Vision tasks
+        self.ensure_generator(ModelSize::Large).await?;
 
         if let Ok(img) = image::open(&image_path) {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             let prompt = get_image_extraction_prompt("kr", &language, "tracking", "");
             
-            // [IMPORTANT] Pass task_id as session_id to continue from the baked relay snapshot
             let result_str = self.chat_with_image_spinner(
                 prompt, 
                 Some(dynamic_image), 
                 app_handle, 
                 "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image with baked context..." }), 
+                json!({ "category": "Vision Analysis", "summary": "Analyzing image content..." }), 
                 1024, 
                 cancel_token.clone(), 
-                Some(task_id.clone()) 
+                Some(task_id.clone())
             ).await?;
 
             let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
@@ -1087,17 +1094,7 @@ impl LogisModel {
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
-        // [RESOURCE-CHECK] If LLM is active, return a zero vector immediately instead of attempting to load.
-        // This stops background search/UI tasks from interfering with the Baking process.
-        {
-            let size_guard = self.current_size.lock().await;
-            if size_guard.is_some() {
-                println!("[MODEL-WATCH] Embedding request IGNORED (LLM is busy). Returning zero vector.");
-                return Ok(vec![0.0; 768]);
-            }
-        }
-
-        // Ensure embedding model is loaded
+        // Ensure embedding model is loaded (and generator is unloaded)
         self.ensure_embedding().await?;
 
         let embedding_model_arc = self.embedding_model.clone();
@@ -1107,6 +1104,7 @@ impl LogisModel {
             if let Some(model) = guard.as_ref() {
                 model.embed(&text).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
             } else {
+                // Fallback to zeros if model failed to load
                 Ok(vec![0.0; 768])
             }
         }).await?

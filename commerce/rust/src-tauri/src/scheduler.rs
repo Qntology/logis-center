@@ -309,21 +309,14 @@ pub async fn start_background_worker(
                                         continue; 
                                     }
         
-                                    let store_guard = store.lock().await;                            
-                                    if let Some(db) = store_guard.as_ref() {
-                                        let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
-                                        let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
-                                    }
-                                    
-                                    // [NEW] Explicitly notify UI of failure to stop spinner
-                                    let _ = app_handle.emit("extraction-progress", json!({
-                                        "task_id": task.id,
-                                        "category": "Error", "summary": format!("Failed: {}", err_msg), "spinner": "❌"
-                                    }));
-                                }
+                                    let store_guard = store.lock().await;                            if let Some(db) = store_guard.as_ref() {
+                                let _ = db.update_task_status(&task.id, crate::logic::parse_status("error")).await;
+                                let _ = db.update_message_status(&task.id, crate::logic::parse_status("error"), Some(&format!("Error: {}", err_msg))).await;
                             }
                         }
                     }
+                }
+            }
             
             // Reset token after batch is done or broken, for the next poll
             cancellation_token.store(false, Ordering::SeqCst);
@@ -387,100 +380,9 @@ async fn process_task(
     
     let language = "english"; 
 
-    // [LOCK] Acquire Model Access
-    let model = {
-        let mut model_lock = model_mutex.lock().await;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        // [FIX] If current model doesn't match preference, unload it to force switch (CPU <-> GPU)
-        if let Some(m) = model_lock.as_ref() {
-            let wants_cpu = effective_device_pref == Some("cpu");
-            if m.is_cpu_mode != wants_cpu {
-                println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
-                m.unload_generator().await;
-                *model_lock = None;
-            }
-        }
-
-        if model_lock.is_none() {
-            // [LOG-ONLY] No emit here to keep UI clean
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
-            
-            match LogisModel::new(effective_device_pref).await {
-                Ok(m) => *model_lock = Some(m),
-                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
-            }
-        }
-        model_lock.as_ref().unwrap().clone()
-    };
-
-    // --- Image Extraction Logic (Vision Baker Pipeline) ---
+    // --- Image Extraction Logic ---
     if task.r#type == "image_extraction" {
-        let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        if !image_path.is_empty() {
-            println!("[Scheduler] Starting VISION BAKER (1-Layer 2B) for {}", task.id);
-            
-            let snapshot_id = format!("{}_img", task.id);
-            let prompt = crate::model::get_image_extraction_prompt("kr", "korean", "tracking", "");
-
-            // 1. [Vision Baker] Load 1-layer 1-BIT 2B model and bake image
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer IQ1_S)...", "spinner": "⠋" }));
-            
-            // Activate 2B in Baking mode (Large, NoSnapshot, CancelToken, Baking:true, Force4bit:false)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
-            
-            // Perform prefill with image to create visual KV cache
-            let model_clone = model.clone();
-            let image_path_clone = image_path.clone();
-            let prompt_clone = prompt.clone();
-            let token_clone = cancellation_token.clone();
-            let session_clone = Some(snapshot_id.clone());
-
-            use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestMessageContentPartImage, ImageURL};
-
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut gen_guard = model_clone.generator.blocking_lock();
-                if let Some(worker) = gen_guard.as_mut() {
-                    worker.clear_kv_cache();
-                    
-                    let params = ChatCompletionParameters {
-                        messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                            content: ChatCompletionRequestUserMessageContent::Array(vec![
-                                ChatCompletionRequestMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
-                                    text: prompt_clone,
-                                }),
-                                ChatCompletionRequestMessageContentPart::ImageURL(ChatCompletionRequestMessageContentPartImage {
-                                    image_url: ImageURL { url: format!("file://{}", image_path_clone), detail: None }
-                                })
-                            ]),
-                            name: None,
-                        })],
-                        ..Default::default()
-                    };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
-                }
-                Ok(())
-            }).await??;
-
-            model.save_kv_snapshot(&snapshot_id).await?;
-
-            // 2. [Full Vision] Reload full 4-BIT 2B model and inject baked cache
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 4-BIT VL...", "spinner": "⠋" }));
-            
-            // Transition to full Large model (Large, Snapshot, CancelToken, Baking:false, Force4bit:true)
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
-
-            model.extract_from_image(
-                task.id.clone(),
-                image_path,
-                "korean".to_string(),
-                app_handle,
-                Some(cancellation_token.clone()),
-                store_mutex,
-            ).await?;
-            
-            return Ok(()); 
-        }
+        // ... (Image logic)
     }
 
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
@@ -549,8 +451,32 @@ async fn process_task(
         pug
     };
 
-    // [LOCK] Removed (Moved up)
+    // [LOCK] Acquire Model Access
+    let model = {
+        let mut model_lock = model_mutex.lock().await;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+        // [FIX] If current model doesn't match preference, unload it to force switch (CPU <-> GPU)
+        if let Some(m) = model_lock.as_ref() {
+            let wants_cpu = effective_device_pref == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
+                m.unload_generator().await;
+                *model_lock = None;
+            }
+        }
+
+        if model_lock.is_none() {
+            // [LOG-ONLY] No emit here to keep UI clean
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
+            
+            match LogisModel::new(effective_device_pref).await {
+                Ok(m) => *model_lock = Some(m),
+                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
+            }
+        }
+        model_lock.as_ref().unwrap().clone()
+    };
 
     use crate::openai_types::{
         ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
@@ -589,7 +515,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             
             let model_clone = model.clone();
             let question_clone = task_question.clone();
@@ -615,9 +541,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Generate (Automatic Skip Redundant Context)
+        // 2. [2B] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -628,16 +554,18 @@ async fn process_task(
                 ..Default::default()
             };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step A: Context loaded via Bridge. Generating answer...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
-                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                
-                let _ = data_manager.offload(&res, "step_a_res");
-                let type_info = parsing::parse_json_from_llm(&res); 
-                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                
+                        if let Some(gen) = model.generator.lock().await.as_mut() {
+                            println!("[Scheduler] 2B Step A: Asking classification question...");
+                            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                            println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                            
+                            // [DEBUG] AI 응답 저장
+                            let _ = data_manager.offload(&res, "step_a_res");
+            
+                            let type_info = parsing::parse_json_from_llm(&res); 
+                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
                 if page_type.is_empty() {
+                    println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
                     page_type = match task.r#type.as_str() {
                         "image_extraction" => "tracking".to_string(),
                         _ => "unknown".to_string(),
@@ -677,9 +605,9 @@ async fn process_task(
         let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
-            // 1. [0.6B] Bake Full Context with 0.6B (Layer Melting)
+            // 1. [0.6B] Bake Full Context
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
@@ -704,9 +632,9 @@ async fn process_task(
             println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Generate
+        // 2. [2B] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -718,11 +646,13 @@ async fn process_task(
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step B: Context loaded via Bridge. Identifying selectors...");
+                println!("[Scheduler] 2B Step B: Asking selector question...");
                 let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
+                // [DEBUG] AI 응답 저장
                 let _ = data_manager.offload(&res, "step_b_res");
+
                 selector_info = parsing::parse_json_from_llm(&res);
                 println!("[Scheduler] Selectors Identified.");
             }
@@ -741,19 +671,19 @@ async fn process_task(
     // [PARITY] Store 'Page' Entity
     {
         // Acquire Store lock briefly
-        let _store = {
+        let store = {
             let store_guard = store_mutex.lock().await;
             store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
         };
         
-        let _team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
+        let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
         let origin_str = task_data.get("origin").and_then(|s| s.as_str()).unwrap_or("http://localhost");
         let base_url = url::Url::parse(origin_str).unwrap_or_else(|_| url::Url::parse("http://localhost").unwrap());
         let url_obj = base_url.join(&url).unwrap_or(base_url);
         let raw_path = url_obj.path();
-        let _page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+        let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
         let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-        let _bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+        let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
 
         let mut page_data: serde_json::Value = selector_info.clone();
         if let Some(obj) = page_data.as_object_mut() {
@@ -762,10 +692,7 @@ async fn process_task(
             obj.insert("type".to_string(), json!(page_type));
         }
 
-        // [STRICT ISOLATION] Skip intermediate upsert to prevent early Embedding load.
-        // Let the Handover phase handle all DB writes that require vectors.
-        println!("[Scheduler] Skipping intermediate Page upsert to isolate VRAM.");
-        // let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
+        let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
     }
 
     let item_selector = final_page_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
@@ -826,14 +753,12 @@ async fn process_task(
             let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
             if !has_snapshot {
-                        // 1. [Baking Phase] Load 2B model in light Vision-Baker mode
-                        log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Baking visual context (Light Mode)...", "spinner": "⠋" }));
-                        
-                        // [FIX] Use Large model with is_baking=true for vision tasks (Small model has no vision)
-                        model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
-            
-                        let model_clone = model.clone();
-            
+                // 1. [0.6B] Bake Detail Context
+                println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
+                
+                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone())).await?;
+                let model_clone = model.clone();
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
                 let session_clone = Some(snapshot_id.clone());
@@ -859,7 +784,7 @@ async fn process_task(
 
             // 2. [2B] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -891,15 +816,14 @@ async fn process_task(
 
     // --- PHASE 3: HANDOVER (Unload 2B -> Load Embedding) ---
     {
-        println!("[Scheduler] PHASE 3: Handover - Unloading LLM, Preparing for Embedding...");
+        println!("[Scheduler] PHASE 3: Handover - Unloading 2B, Preparing for Embedding...");
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
-        // 1. Explicitly Unload LLM to free VRAM for Embedding Model
+        // 1. Explicitly Unload 2B to free VRAM for Embedding Model
         model.unload_generator().await;
         
         // 2. Wait for VRAM to settle (Driver latency)
-        wait_for_resources_settled(1500, 1000, Some(cancellation_token)).await?;
-        println!("[Scheduler] LLM Unloaded. Safe to proceed with Embedding.");
+        wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
     }
 
     // --- DB OPS & SIDE EFFECTS ---

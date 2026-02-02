@@ -82,7 +82,7 @@ pub struct Qwen3VLTextConfig {
     pub dtype: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Qwen3VLConfig {
     pub architectures: Option<Vec<String>>, 
     pub auto_map: Option<std::collections::HashMap<String, String>>,

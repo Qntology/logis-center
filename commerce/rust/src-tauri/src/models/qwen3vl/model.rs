@@ -1,175 +1,1284 @@
 use anyhow::{Result, anyhow};
-use candle_core::{D, DType, Device, IndexOp, Tensor, Module};
-use candle_nn::{Activation, Embedding, Init, Linear, VarBuilder};
-pub use crate::models::common::RmsNorm;
-use std::collections::HashMap;
+use candle_nn::{
+    Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
+    linear_no_bias, rms_norm,
+};
 
 use crate::{
     models::{
-        common::{GateUpDownMLP, NaiveAttention, TwoLinearMLP, eager_attention_forward, LayerNorm},
+        common::{GateUpDownMLP, TwoLinearMLP, eager_attention_forward, get_layer_norm},
+        qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig},
     },
     position_embed::rope::{
         Qwen2_5VisionRotaryEmbedding, Qwen3VLTextRotaryEmbedding, apply_rotary_pos_emb,
+        apply_rotary_pos_emb_vision,
     },
     utils::tensor_utils::{
-        mask_index_add, masked_scatter_dim0,
-        nonzero_index,
-        get_vision_next_indices,
+        bitor_tensor, get_vision_next_indices, linspace, mask_index_add, masked_scatter_dim0,
+        nonzero_index, prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
+        zero_index,
     },
 };
 
-// --- QLinear ---
 #[derive(Debug, Clone)]
-pub struct QLinear { pub weight: Tensor, pub bias: Option<Tensor> }
-impl QLinear {
-    pub fn new_direct(weight: Tensor, bias: Option<Tensor>) -> Self { Self { weight, bias } }
+pub struct Qwen3VLVisionPatchEmbed {
+    conv3d_weight: Tensor,
+    conv3d_bias: Tensor,
+}
+
+impl Qwen3VLVisionPatchEmbed {
+    pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+        let patch_size = cfg.patch_size;
+        let temporal_patch_size = cfg.temporal_patch_size;
+        let in_channels = cfg.in_channels;
+        // Use embed_dim if present, otherwise fallback to hidden_size
+        let embed_dim = cfg.embed_dim.unwrap_or(cfg.hidden_size);
+        
+        // conv3d weight key: visual.patch_embed.proj.weight, value: Tensor[dims 1024, 3, 2, 16, 16; bf16, cuda:0]
+        // (1024, 3, 2, 16, 16) -> (1024, 1536) -> (1536, 1024)
+        let conv3d_weight = vb
+            .get_with_hints(
+                (
+                    embed_dim,
+                    in_channels,
+                    temporal_patch_size,
+                    patch_size,
+                    patch_size,
+                ),
+                "proj.weight",
+                Init::Const(1.),
+            )?
+            .flatten(1, 4)?
+            .t()?;
+        // (1024) -> (1, 1024)
+        let conv3d_bias = vb
+            .get_with_hints((embed_dim,), "proj.bias", Init::Const(0.))?
+            .unsqueeze(0)?;
+        Ok(Self {
+            conv3d_weight,
+            conv3d_bias,
+        })
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        self.weight = self.weight.to_device(device)?;
-        if let Some(b) = &mut self.bias { *b = b.to_device(device)?; } Ok(())
+        self.conv3d_weight = self.conv3d_weight.to_device(device)?;
+        self.conv3d_bias = self.conv3d_bias.to_device(device)?;
+        Ok(())
     }
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b, s, _) = xs.dims3()?;
-        let xs_flat = xs.flatten(0, 1)?.contiguous()?;
-        let mut out = xs_flat.matmul(&self.weight.t()?.contiguous()?)?;
-        if let Some(bias) = &self.bias { out = out.broadcast_add(bias)?; }
-        Ok(out.reshape((b, s, ()))?)
+
+    pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        // hidden_states shape:  (grid_t*grid_h*grid_w, c*temporal_patch_size*patch_size*patch_size)
+        // ((), 1536) matmul (1536, 1024) -> ((), 1024)
+        let hidden_states = hidden_states.matmul(&self.conv3d_weight)?;
+        let hidden_states = hidden_states.broadcast_add(&self.conv3d_bias)?;
+        Ok(hidden_states)
     }
 }
 
-// --- Vision (Minimal for Text Stability) ---
-#[derive(Debug, Clone)] pub struct Qwen3VLVisionModel { patch_embed: Tensor }
-impl Qwen3VLVisionModel {
-    pub fn new(_cfg: crate::models::qwen3vl::config::Qwen3VLVisionConfig, _vb: VarBuilder) -> Result<Self> {
-        Ok(Self { patch_embed: Tensor::zeros(1, DType::F32, &_vb.device())? })
-    }
-    pub fn forward(&mut self, x: &Tensor, _thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> { Ok((x.clone(), vec![])) }
-    pub fn to_device(&mut self, _d: &Device) -> Result<()> { Ok(()) }
+#[derive(Debug, Clone)]
+pub struct Qwen3VLVisionPatchMerger {
+    hidden_size: usize,
+    use_postshuffle_norm: bool,
+    norm: LayerNorm,
+    linear_fc1: Linear,
+    act_fn: Activation,
+    linear_fc2: Linear,
 }
 
-// --- Text Components ---
-#[derive(Debug, Clone)] pub struct Qwen3VLTextAttention {
-    pub q_proj: QLinear, pub k_proj: QLinear, pub v_proj: QLinear, pub o_proj: QLinear,
-    pub q_norm: RmsNorm, pub k_norm: RmsNorm, pub num_attention_heads: usize, pub num_key_value_heads: usize, pub num_kv_groups: usize,
-    pub head_dim: usize, pub scaling: f64, pub kv_cache: Option<(Tensor, Tensor)>,
-}
-impl Qwen3VLTextAttention {
-    pub fn forward(&mut self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
-        let (bs, ql, _) = x.dims3()?;
-        let qs = self.q_norm.forward(&self.q_proj.forward(x)?.reshape((bs, ql, self.num_attention_heads, self.head_dim))?)?.transpose(1, 2)?.contiguous()?;
-        let ks = self.k_norm.forward(&self.k_proj.forward(x)?.reshape((bs, ql, self.num_key_value_heads, self.head_dim))?)?.transpose(1, 2)?.contiguous()?;
-        let vs = self.v_proj.forward(x)?.reshape((bs, ql, self.num_key_value_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
-        let (qs, ks) = apply_rotary_pos_emb(&qs, &ks, cos, sin, false)?;
-        let (ks, vs) = match &self.kv_cache { None => (ks, vs), Some((pk, pv)) => (Tensor::cat(&[pk, &ks], 2)?, Tensor::cat(&[pv, &vs], 2)?) };
-        self.kv_cache = Some((ks.clone(), vs.clone()));
-        let out = eager_attention_forward(&qs, &ks, &vs, Some(self.num_kv_groups), mask, self.scaling)?;
-        Ok(self.o_proj.forward(&out.reshape((bs, ql, ()))?)?)
-    }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> {
-        self.q_proj.to_device(d)?; self.k_proj.to_device(d)?; self.v_proj.to_device(d)?; self.o_proj.to_device(d)?;
-        self.q_norm.weight = self.q_norm.weight.to_device(d)?; self.k_norm.weight = self.k_norm.weight.to_device(d)?;
-        if let Some((k, v)) = &mut self.kv_cache { *k = k.to_device(d)?; *v = v.to_device(d)?; } Ok(())
-    }
-}
-#[derive(Debug, Clone)] pub struct QGateUpDownMLP { pub g: QLinear, pub u: QLinear, pub d: QLinear, pub act: Activation }
-#[derive(Debug, Clone)] pub struct Qwen3VLTextDecoderLayer { pub attn: Qwen3VLTextAttention, pub mlp: QGateUpDownMLP, pub in_ln: RmsNorm, pub post_ln: RmsNorm }
-
-#[derive(Debug, Clone)] pub struct Qwen3VLTextModel { pub embed: Embedding, pub layers: Vec<Option<Qwen3VLTextDecoderLayer>>, pub norm: RmsNorm, pub rotary: Qwen3VLTextRotaryEmbedding, pub mrope: Vec<usize>, pub is_baking: bool }
-impl Qwen3VLTextModel {
-    pub fn forward(&mut self, x: &Tensor, offset: usize, pids: Option<&Tensor>) -> Result<Tensor> {
-        let (bs, sl, _) = x.dims3()?;
-        let pi = match pids { Some(ids) => ids.to_dtype(DType::F32)?.contiguous()?, None => Tensor::arange(offset as f32, (sl + offset) as f32, x.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, bs, sl))? };
-        let (cos, sin) = self.rotary.forward(&pi.to_dtype(DType::U32)?, x.dtype(), self.mrope.clone())?;
-        let (cos, sin) = (cos.contiguous()?, sin.contiguous()?);
-        let mask = if sl <= 1 { None } else {
-            let q = Tensor::arange(0f32, sl as f32, x.device())?.reshape((1, 1, sl, 1))?;
-            let k = Tensor::arange(0f32, (offset + sl) as f32, x.device())?.reshape((1, 1, 1, offset + sl))?;
-            Some(k.broadcast_gt(&(q.broadcast_add(&Tensor::new(offset as f32, x.device())?)?))?.to_dtype(x.dtype())?.affine(-65504.0, 0.0)?)
+impl Qwen3VLVisionPatchMerger {
+    pub fn new(
+        config: &Qwen3VLVisionConfig,
+        vb: VarBuilder,
+        use_postshuffle_norm: bool,
+    ) -> Result<Self> {
+        let hidden_size = config.hidden_size * config.spatial_merge_size.pow(2);
+        let norm_size = if use_postshuffle_norm {
+            hidden_size
+        } else {
+            config.hidden_size
         };
-        let mut x = x.clone(); let limit = if self.is_baking { 1 } else { self.layers.len() };
-        for l_opt in self.layers.iter_mut().take(limit) { if let Some(l) = l_opt {
-            let res = x.clone(); let x_norm = l.in_ln.forward(&x)?; let x_attn = l.attn.forward(&x_norm, &cos, &sin, mask.as_ref())?; x = res.add(&x_attn)?;
-            let res = x.clone(); let x_norm = l.post_ln.forward(&x)?; let gate = l.mlp.act.forward(&l.mlp.g.forward(&x_norm)?)?; let up = l.mlp.u.forward(&x_norm)?; x = res.add(&l.mlp.d.forward(&gate.mul(&up)?)?)?;
-        } }
-        Ok(x.apply(&self.norm)?)
+        let norm = get_layer_norm(vb.pp("norm"), 1e-6, norm_size)?;
+        let linear_fc1 = linear(hidden_size, hidden_size, vb.pp("linear_fc1"))?;
+        let act_fn = Activation::Gelu;
+        let linear_fc2 = linear(hidden_size, config.out_hidden_size, vb.pp("linear_fc2"))?;
+        Ok(Self {
+            hidden_size,
+            use_postshuffle_norm,
+            norm,
+            linear_fc1,
+            act_fn,
+            linear_fc2,
+        })
     }
-    pub fn get_kv_len(&self) -> usize { for l in &self.layers { if let Some(li) = l { if let Some((k, _)) = &li.attn.kv_cache { return k.dim(2).unwrap_or(0); } } } 0 }
-    pub fn clear_kv_cache(&mut self) { for l in &mut self.layers { if let Some(li) = l { li.attn.kv_cache = None; } } }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> {
-        let ew = self.embed.embeddings().to_device(d)?; self.embed = Embedding::new(ew, self.embed.hidden_size());
-        for l in &mut self.layers { if let Some(li) = l { li.attn.to_device(d)?; li.in_ln.weight = li.in_ln.weight.to_device(d)?; li.post_ln.weight = li.post_ln.weight.to_device(d)?; } }
-        self.norm.weight = self.norm.weight.to_device(d)?; Ok(())
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        // [MEMORY-FIX] LayerNorm/Linear don't have to_device, so we recreate with moved tensors
+        let n_w = self.norm.weight().to_device(device)?;
+        let n_b = self.norm.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm = LayerNorm::new(n_w, n_b, 1e-6);
+    
+        let l1_w = self.linear_fc1.weight().to_device(device)?;
+        let l1_b = self.linear_fc1.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear_fc1 = Linear::new(l1_w, l1_b);
+    
+        let l2_w = self.linear_fc2.weight().to_device(device)?;
+        let l2_b = self.linear_fc2.bias().map(|b| b.to_device(device)).transpose()?;
+        self.linear_fc2 = Linear::new(l2_w, l2_b);
+        Ok(())
+    }
+        pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = if self.use_postshuffle_norm {
+            xs.reshape(((), self.hidden_size))?
+        } else {
+            xs.clone()
+        };
+        let xs = self.norm.forward(&xs)?.reshape(((), self.hidden_size))?;
+        let xs = self
+            .linear_fc2
+            .forward(&self.act_fn.forward(&self.linear_fc1.forward(&xs)?)?)?;
+        Ok(xs)
     }
 }
 
-// --- Main ---
-#[derive(Debug, Clone)] pub struct Qwen3VLModel { pub config: crate::models::qwen3vl::config::Qwen3VLConfig, pub visual: Option<Qwen3VLVisionModel>, pub language_model: Qwen3VLTextModel, pub lm_head: QLinear, pub is_baking: bool }
-impl Qwen3VLModel {
-    pub fn set_baking(&mut self, b: bool) { self.is_baking = b; self.language_model.is_baking = b; }
-    pub fn new_ext(cfg: crate::models::qwen3vl::config::Qwen3VLConfig, vb: VarBuilder, _map: Option<HashMap<String, Tensor>>, _fto: bool, bo: bool) -> Result<Self> {
-        let map_r = _map.as_ref().ok_or(anyhow!("Map required"))?;
-        let model_vb = if vb.get_with_hints((1,), "model.embed_tokens.weight", Init::Const(0.)).is_ok() { vb.pp("model") } else { vb.clone() };
-        let vb_lm = if model_vb.get_with_hints((1,), "language_model.layers.0.input_layernorm.weight", Init::Const(0.)).is_ok() { model_vb.pp("language_model") } else { model_vb.clone() };
-        let (nh, hd, nkv, hs, eps, theta, mrope, nl, vs) = if let Some(tc) = &cfg.text_config { (tc.num_attention_heads, tc.head_dim, tc.num_key_value_heads, tc.hidden_size, tc.rms_norm_eps, tc.rope_theta, tc.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default(), tc.num_hidden_layers, tc.vocab_size) } else { (16, 128, 8, 1024, 1e-6, 1000000.0, vec![], 28, 151936) };
-        let mut blks = vec![]; for i in 0..(if bo { 1 } else { nl }) {
-            let vbl = vb_lm.pp("layers").pp(&i.to_string());
-            // CRITICAL: Use empty string as name to avoid .weight.weight duplication
-            let attn = Qwen3VLTextAttention { 
-                q_proj: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("self_attn").pp("q_proj"), "", Some(map_r))?, 
-                k_proj: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("self_attn").pp("k_proj"), "", Some(map_r))?, 
-                v_proj: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("self_attn").pp("v_proj"), "", Some(map_r))?, 
-                o_proj: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("self_attn").pp("o_proj"), "", Some(map_r))?, 
-                q_norm: RmsNorm::new(vbl.get(hd, "self_attn.q_norm.weight")?, eps), k_norm: RmsNorm::new(vbl.get(hd, "self_attn.k_norm.weight")?, eps), num_attention_heads: nh, num_key_value_heads: nkv, num_kv_groups: nh/nkv, head_dim: hd, scaling: 1.0/(hd as f64).sqrt(), kv_cache: None 
-            };
-            blks.push(Some(Qwen3VLTextDecoderLayer { attn, mlp: QGateUpDownMLP { g: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("mlp").pp("gate_proj"), "", Some(map_r))?, u: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("mlp").pp("up_proj"), "", Some(map_r))?, d: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vbl.pp("mlp").pp("down_proj"), "", Some(map_r))?, act: Activation::Silu }, in_ln: RmsNorm::new(vbl.get(hs, "input_layernorm.weight")?, eps), post_ln: RmsNorm::new(vbl.get(hs, "post_attention_layernorm.weight")?, eps) }));
+#[derive(Debug, Clone)]
+pub struct Qwen3VLVisionAttention {
+    num_heads: usize,
+    qkv: Linear,
+    proj: Linear,
+    scaling: f64,
+}
+
+impl Qwen3VLVisionAttention {
+    pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_heads;
+        let head_dim = hidden_size / num_heads;
+        let qkv = linear(hidden_size, hidden_size * 3, vb.pp("qkv"))?;
+        let proj = linear(hidden_size, hidden_size, vb.pp("proj"))?;
+        let scaling = 1.0 / (head_dim as f64).sqrt();
+
+        Ok(Self {
+            num_heads,
+            qkv,
+            proj,
+            scaling,
+        })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let qkv_w = self.qkv.weight().to_device(device)?;
+        let qkv_b = self.qkv.bias().map(|b| b.to_device(device)).transpose()?;
+        self.qkv = Linear::new(qkv_w, qkv_b);
+
+        let proj_w = self.proj.weight().to_device(device)?;
+        let proj_b = self.proj.bias().map(|b| b.to_device(device)).transpose()?;
+        self.proj = Linear::new(proj_w, proj_b);
+        Ok(())
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cu_seqlens: &Tensor,
+    ) -> Result<Tensor> {
+        // xs: (seq_len, hidden_size)
+        let seq_length = xs.dim(0)?;
+        // (seq_len, hidden_size) -> (seq_len, hidden_size*3)
+        // -> (seq_len, 3, num_heads, head_dim)
+        // -> (3, seq_len, num_heads, head_dim)
+        let qkv_states = xs
+            .apply(&self.qkv)?
+            .reshape((seq_length, 3, self.num_heads, ()))?
+            .permute((1, 0, 2, 3))?;
+        // (seq_len, num_heads, head_dim)
+        let query_states = qkv_states.i(0)?.contiguous()?;
+        let key_states = qkv_states.i(1)?.contiguous()?;
+        let value_states = qkv_states.i(2)?.contiguous()?;
+        let (query_states, key_states) =
+            apply_rotary_pos_emb_vision(&query_states, &key_states, cos, sin)?;
+        // (seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim) -> (1, num_heads, seq_len, head_dim)
+        let query_states = query_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let key_states = key_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let value_states = value_states.transpose(0, 1)?.unsqueeze(0)?.contiguous()?;
+        let cu_last_id = cu_seqlens.dim(0)? - 1;
+        let lengths = cu_seqlens.i(1..)?.sub(&cu_seqlens.i(..cu_last_id)?)?;
+        let chunks: Vec<usize> = lengths
+            .to_vec1::<u32>()?
+            .iter()
+            .map(|&x| x as usize)
+            .collect();
+        let q_splits = split_tensor(&query_states, &chunks, 2)?;
+        let k_splits = split_tensor(&key_states, &chunks, 2)?;
+        let v_splits = split_tensor(&value_states, &chunks, 2)?;
+
+        let mut attn_outputs = Vec::new();
+        for (q, (k, v)) in q_splits.iter().zip(k_splits.iter().zip(v_splits.iter())) {
+            let output = eager_attention_forward(q, k, v, None, None, self.scaling)?;
+            attn_outputs.push(output);
         }
-        let lm = Qwen3VLTextModel { embed: Embedding::new(vb_lm.get((vs, hs), "embed_tokens.weight")?, hs), layers: blks, norm: RmsNorm::new(vb_lm.get(hs, if vb_lm.get_with_hints((1,), "norm.weight", Init::Const(0.)).is_ok() { "norm.weight" } else { "output_norm.weight" })?, eps), rotary: Qwen3VLTextRotaryEmbedding::new(hd, theta), mrope, is_baking: bo };
-        Ok(Self { config: cfg, visual: None, language_model: lm, lm_head: crate::models::qwen3vl::quantized_model::get_qlinear_safe(vb_lm.pp("lm_head"), "", Some(map_r))?, is_baking: bo })
-    }
-    pub fn forward(&mut self, ids: &Tensor, _pv: Option<&Tensor>, _thw: Option<&Tensor>, _vpv: Option<&Tensor>, _vthw: Option<&Tensor>, _cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
-        let (bs, sl) = ids.dims2()?; let mut embs = self.language_model.embed.forward(&ids.to_dtype(DType::U32)?.contiguous()?)?;
-        if let Some(ref mut vm) = &mut self.visual { if let (Some(p), Some(t)) = (_pv, _thw) { let (ie, _) = vm.forward(p, t)?; embs = masked_scatter_dim0(&embs, &ie.to_device(ids.device())?, &ids.broadcast_eq(&Tensor::new(vec![self.config.image_token_id.unwrap_or(0) as u32], ids.device())?)?.to_dtype(DType::U32)?)?; } }
-        let out = self.language_model.forward(&embs, offset, None)?;
-        let out_last = out.narrow(1, sl - 1, 1)?; if self.is_baking { return Ok(out_last); } Ok(self.lm_head.forward(&out_last)?)
-    }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> { if let Some(v) = &mut self.visual { v.to_device(d)?; } self.language_model.to_device(d)?; self.lm_head.to_device(d)?; Ok(()) }
-    pub fn device(&self) -> &Device { self.language_model.embed.embeddings().device() }
-    pub fn get_kv_len(&self) -> usize { self.language_model.get_kv_len() }
-    pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
-    pub fn save_kv_cache(&mut self, p: &std::path::Path) -> Result<()> {
-        if !p.exists() { std::fs::create_dir_all(p)?; }
-        for (i, l_opt) in self.language_model.layers.iter_mut().enumerate() {
-            if let Some(l) = l_opt { if let Some((k, v)) = &l.attn.kv_cache {
-                let mut m = HashMap::new(); let rk = comp_bit_static(i, k)?; let rv = comp_bit_static(i, v)?;
-                m.insert("k_a".to_string(), rk.0); m.insert("k_p".to_string(), rk.1); m.insert("k_s".to_string(), rk.2);
-                m.insert("v_a".to_string(), rv.0); m.insert("v_p".to_string(), rv.1); m.insert("v_s".to_string(), rv.2);
-                m.insert("shape".to_string(), Tensor::from_vec(rk.3.iter().map(|&x| x as u32).collect::<Vec<_>>(), (rk.3.len(),), k.device())?);
-                candle_core::safetensors::save(&m, p.join(format!("layer_{}_bitkv.safetensors", i)))?;
-            } }
-        } Ok(())
-    }
-    pub fn load_kv_cache(&mut self, _p: &std::path::Path, _d: &Device) -> Result<()> { Ok(()) }
-}
-fn comp_bit_static(i: usize, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
-    let s = t.dims().to_vec(); let d = t.device(); if i == 0 { return Ok((t.clone(), Tensor::zeros(1, DType::U8, d)?, Tensor::zeros(1, DType::F32, d)?, s)); }
-    let f = t.flatten_all()?; let n = f.dim(0)?; let sc = if i <= 4 { (f.abs()?.max_all()?.to_scalar::<f32>()? / 3.0).max(1e-6) } else { f.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-6) };
-    if i <= 4 {
-        let q = f.to_vec1::<f32>()?; let mut p = vec![0u8; (n + 3) / 4];
-        for (j, &v) in q.iter().enumerate() { p[j/4] |= ((v/sc + 1.0).round() as u8).clamp(0,3) << ((j%4)*2); }
-        Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n+3)/4,), d)?, Tensor::new(&[sc], d)?, s))
-    } else {
-        let sv = f.ge(0.0)?.to_vec1::<u8>()?; let mut p = vec![0u8; (n + 7) / 8];
-        for (j, &v) in sv.iter().enumerate() { if v > 0 { p[j/8] |= 1 << (j%8); } }
-        Ok((Tensor::zeros(1, t.dtype(), d)?, Tensor::from_vec(p, ((n+7)/8,), d)?, Tensor::new(&[sc], d)?, s))
+        let attn_output = Tensor::cat(&attn_outputs, 1)?;
+        let attn_output = attn_output.reshape((seq_length, ()))?.contiguous()?;
+        let attn_ouput = attn_output.apply(&self.proj)?;
+        Ok(attn_ouput)
     }
 }
-fn apply_bridge_static(x: &Tensor, td: usize) -> Result<Tensor> {
-    let (b, h, s, d) = x.dims4()?; let x_f = x.to_dtype(DType::F32)?;
-    let rms = (x_f.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt()).max(1e-6);
-    let sc = (d as f64 / td as f64).sqrt() * 0.707 / (rms as f64);
-    if td >= d {
-        let l = x_f.clone();
-        let u = if td > d { let r = x_f.roll(1, D::Minus1)?; let lr = ((l + r)? * 0.5)?; Tensor::stack(&[x_f, lr], D::Minus1)?.reshape((b, h, s, td))? }
-        else { x_f.affine(sc * (rms as f64), 0.0)? };
-        Ok(u.clamp(-10.0, 10.0)?.to_dtype(x.dtype())?)
-    } else { Ok(x.narrow(D::Minus1, 0, td)?.to_dtype(DType::F32)?.affine(sc, 0.0)?.to_dtype(x.dtype())?) }
+
+#[derive(Debug, Clone)]
+pub struct Qwen3VLVisionBlock {
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    attn: Qwen3VLVisionAttention,
+    mlp: TwoLinearMLP,
+}
+
+impl Qwen3VLVisionBlock {
+    pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+        let norm1 = get_layer_norm(vb.pp("norm1"), 1e-6, config.hidden_size)?;
+        let norm2 = get_layer_norm(vb.pp("norm2"), 1e-6, config.hidden_size)?;
+        let attn = Qwen3VLVisionAttention::new(config.clone(), vb.pp("attn"))?;
+        let mlp = TwoLinearMLP::new(
+            vb.pp("mlp"),
+            config.hidden_size,
+            config.intermediate_size,
+            Activation::Gelu,
+            false,
+            "linear_fc1",
+            "linear_fc2",
+        )?;
+        Ok(Self {
+            norm1,
+            norm2,
+            attn,
+            mlp,
+        })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        let n1_w = self.norm1.weight().to_device(device)?;
+        let n1_b = self.norm1.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm1 = LayerNorm::new(n1_w, n1_b, 1e-6);
+
+        let n2_w = self.norm2.weight().to_device(device)?;
+        let n2_b = self.norm2.bias().map(|b| b.to_device(device)).transpose()?.expect("LayerNorm bias is required");
+        self.norm2 = LayerNorm::new(n2_w, n2_b, 1e-6);
+
+        self.attn.to_device(device)?;
+        self.mlp.to_device(device)?;
+        Ok(())
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        cu_seqlens: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let residual = xs.clone();
+        let xs = self.norm1.forward(xs)?;
+        let xs = self.attn.forward(&xs, cos, sin, cu_seqlens)?;
+        let xs = residual.add(&xs)?;
+        let residual = xs.clone();
+        let xs = self.mlp.forward(&self.norm2.forward(&xs)?)?;
+        let xs = residual.add(&xs)?;
+        Ok(xs)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3VLVisionModel {
+    pub spatial_merge_size: usize,
+    pub patch_embed: Qwen3VLVisionPatchEmbed,
+    pub pos_embed: Embedding,
+    pub num_grid_per_side: u32,
+    pub rotary_pos_emb: Qwen2_5VisionRotaryEmbedding,
+    pub blocks: Vec<Qwen3VLVisionBlock>,
+    pub merger: Qwen3VLVisionPatchMerger,
+    pub deepstack_visual_indexes: Vec<usize>,
+    pub deepstack_merger_list: Vec<Qwen3VLVisionPatchMerger>,
+    pub dtype: DType,
+}
+
+impl Qwen3VLVisionModel {
+    pub fn new(config: Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
+        let spatial_merge_size = config.spatial_merge_size;
+        let patch_embed = Qwen3VLVisionPatchEmbed::new(&config, vb.pp("patch_embed"))?;
+        let pos_embed = embedding(
+            config.num_position_embeddings,
+            config.hidden_size,
+            vb.pp("pos_embed"),
+        )?;
+        let num_grid_per_side = (config.num_position_embeddings as f32).sqrt() as u32;
+        let head_dim = config.hidden_size / config.num_heads;
+        let rotary_pos_emb = Qwen2_5VisionRotaryEmbedding::new(head_dim / 2, None);
+        let mut blocks = Vec::new();
+        let vb_blocks = vb.pp("blocks");
+        for i in 0..config.depth {
+            let block = Qwen3VLVisionBlock::new(config.clone(), vb_blocks.pp(i))?;
+            blocks.push(block);
+        }
+        let merger = Qwen3VLVisionPatchMerger::new(&config, vb.pp("merger"), false)?;
+        let deepstack_visual_indexes = config.deepstack_visual_indexes.clone();
+        let mut deepstack_merger_list = Vec::new();
+        let vb_deepstack = vb.pp("deepstack_merger_list");
+        for i in 0..deepstack_visual_indexes.len() {
+            let merger_i = Qwen3VLVisionPatchMerger::new(&config, vb_deepstack.pp(i), true)?;
+            deepstack_merger_list.push(merger_i);
+        }
+        Ok(Self {
+            spatial_merge_size,
+            patch_embed,
+            pos_embed,
+            num_grid_per_side,
+            rotary_pos_emb,
+            blocks,
+            merger,
+            deepstack_visual_indexes,
+            deepstack_merger_list,
+            dtype: vb.dtype(),
+        })
+    }
+
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.patch_embed.to_device(device)?;
+        
+        let p_w = self.pos_embed.embeddings().to_device(device)?;
+        self.pos_embed = Embedding::new(p_w, self.pos_embed.hidden_size());
+
+        for block in self.blocks.iter_mut() {
+            block.to_device(device)?;
+        }
+        self.merger.to_device(device)?;
+        for merger in self.deepstack_merger_list.iter_mut() {
+            merger.to_device(device)?;
+        }
+        Ok(())
+    }
+
+    pub fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {
+        let mut idx_list = vec![vec![]; 4];
+        let mut weight_list = vec![vec![]; 4];
+        let mut split_idx = vec![];
+        for i in 0..grid_thw.dim(0)? {
+            let [_, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
+                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
+            };
+            split_idx.push((h * w) as usize);
+            let num_grid_per_side_sub_one = (self.num_grid_per_side - 1) as f32;
+            let h_idxs = linspace(
+                0.0,
+                num_grid_per_side_sub_one,
+                h as usize,
+                grid_thw.device(),
+            )?;
+            let w_idxs = linspace(
+                0.0,
+                num_grid_per_side_sub_one,
+                w as usize,
+                grid_thw.device(),
+            )?;
+            let h_idxs_floor = h_idxs.to_dtype(candle_core::DType::U32)?;
+            let w_idxs_floor = w_idxs.to_dtype(candle_core::DType::U32)?;
+            let h_idxs_ceil = h_idxs_floor
+                .affine(1.0, 1.0)?
+                .clamp(0u32, num_grid_per_side_sub_one as u32)?;
+            let w_idxs_ceil = w_idxs_floor
+                .affine(1.0, 1.0)?
+                .clamp(0u32, num_grid_per_side_sub_one as u32)?;
+            let dh = h_idxs
+                .sub(&h_idxs_floor.to_dtype(h_idxs.dtype())?)?
+                .unsqueeze(D::Minus1)?;
+            let dw = w_idxs
+                .sub(&w_idxs_floor.to_dtype(h_idxs.dtype())?)?
+                .unsqueeze(0)?;
+            let base_h = h_idxs_floor
+                .affine(self.num_grid_per_side as f64, 0.0)?
+                .unsqueeze(D::Minus1)?;
+            let base_h_ceil = h_idxs_ceil
+                .affine(self.num_grid_per_side as f64, 0.0)?
+                .unsqueeze(D::Minus1)?;
+            idx_list[0].extend_from_slice(
+                &base_h
+                    .broadcast_add(&w_idxs_floor.unsqueeze(0)?)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?,
+            );
+            idx_list[1].extend_from_slice(
+                &base_h
+                    .broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?,
+            );
+            idx_list[2].extend_from_slice(
+                &base_h_ceil
+                    .broadcast_add(&w_idxs_floor.unsqueeze(0)?)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?,
+            );
+            idx_list[3].extend_from_slice(
+                &base_h_ceil
+                    .broadcast_add(&w_idxs_ceil.unsqueeze(0)?)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?,
+            );
+
+            let one_sub_dh = Tensor::ones_like(&dh)?.sub(&dh)?;
+            let one_sub_dw = Tensor::ones_like(&dw)?.sub(&dw)?;
+
+            weight_list[0].extend_from_slice(
+                &one_sub_dh
+                    .broadcast_mul(&one_sub_dw)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            );
+            weight_list[1].extend_from_slice(
+                &one_sub_dh
+                    .broadcast_mul(&dw)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            );
+            weight_list[2].extend_from_slice(
+                &dh.broadcast_mul(&one_sub_dw)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            );
+            weight_list[3]
+                .extend_from_slice(&dh.broadcast_mul(&dw)?.flatten_all()?.to_vec1::<f32>()?);
+        }
+        let idx_tensor = Tensor::new(idx_list, grid_thw.device())?;
+        let weight_tensor = Tensor::new(weight_list, grid_thw.device())?.to_dtype(self.dtype)?;
+        let pos_embeds = self
+            .pos_embed
+            .forward(&idx_tensor)?
+            .broadcast_mul(&weight_tensor.unsqueeze(D::Minus1)?)?;
+        let patch_pos_embeds = pos_embeds
+            .i(0)?
+            .add(&pos_embeds.i(1)?)?
+            .add(&pos_embeds.i(2)?)?
+            .add(&pos_embeds.i(3)?)?;
+        let mut patch_pos_embeds_permute = vec![];
+        let patch_pos_embeds = split_tensor(&patch_pos_embeds, &split_idx, 0)?;
+        let merge_size = self.spatial_merge_size;
+        for (i, pos_embed) in patch_pos_embeds.iter().enumerate() {
+            let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
+                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
+            };
+            // let pos_embed = &patch_pos_embeds[i];
+            let pos_emebd_last_dim: usize = pos_embed.dim(D::Minus1)?;
+            let pos_embed = pos_embed.repeat((t as usize, 1))?;
+            let shape = Shape::from(vec![
+                t as usize,
+                h as usize / merge_size,
+                merge_size,
+                w as usize / merge_size,
+                merge_size,
+                pos_emebd_last_dim,
+            ]);
+            let pos_embed = pos_embed
+                .reshape(shape)?
+                .permute((0, 1, 3, 2, 4, 5))?
+                .flatten(0, 4)?;
+            patch_pos_embeds_permute.push(pos_embed);
+        }
+        let patch_pos_embeds = Tensor::cat(&patch_pos_embeds_permute, 0)?;
+        Ok(patch_pos_embeds)
+    }
+
+    pub fn rot_pos_emb(&self, grid_thw: &Tensor) -> Result<Tensor> {
+        let merge_size = self.spatial_merge_size;
+        let max_hw = grid_thw.i((.., 1..))?.max_all()?.to_scalar::<u32>()?;
+        let freq_table = self
+            .rotary_pos_emb
+            .forward(max_hw as usize, grid_thw.device())?;
+        let mut pos_ids_vec = vec![];
+        for i in 0..grid_thw.dim(0)? {
+            let [t, h, w] = grid_thw.i(i)?.to_vec1::<u32>()?[..] else {
+                return Err(anyhow!(format!("grid_thw Expected exactly 3 elements")));
+            };
+            let merged_h = h / merge_size as u32;
+            let merged_w = w / merge_size as u32;
+            let blocks_rows = Tensor::arange(0, merged_h, grid_thw.device())?;
+            let blocks_cols = Tensor::arange(0, merged_w, grid_thw.device())?;
+            let intra_row = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
+            let intra_col = Tensor::arange(0, merge_size as u32, grid_thw.device())?;
+
+            let row_idx = blocks_rows
+                .reshape(((), 1, 1, 1))?
+                .contiguous()?
+                .affine(merge_size as f64, 0.0)?
+                .broadcast_add(&intra_row.reshape((1, 1, (), 1))?.contiguous()?)?;
+            let col_idx = blocks_cols
+                .reshape((1, (), 1, 1))?
+                .contiguous()?
+                .affine(merge_size as f64, 0.0)?
+                .broadcast_add(&intra_col.reshape((1, 1, 1, ()))?.contiguous()?)?;
+            let row_idx = row_idx
+                .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
+                .flatten_all()?;
+            let col_idx = col_idx
+                .expand((merged_h as usize, merged_w as usize, merge_size, merge_size))?
+                .flatten_all()?;
+            let mut coords = Tensor::stack(&[row_idx, col_idx], D::Minus1)?.contiguous()?;
+            if t > 1 {
+                coords = coords.repeat((t as usize, 1))?;
+            }
+            pos_ids_vec.push(coords);
+        }
+        let pos_ids = Tensor::cat(&pos_ids_vec, 0)?;
+        let pos_ids_h = pos_ids.i((.., 0))?.contiguous()?;
+        // 第二列是w维度的索引
+        let pos_ids_w = pos_ids.i((.., 1))?.contiguous()?;
+        let rotary_pos_emb_h = freq_table.index_select(&pos_ids_h, 0)?;
+        let rotary_pos_emb_w = freq_table.index_select(&pos_ids_w, 0)?;
+        // 每个patch融合h索引和w索引两个的位置编码信息
+        let rotary_pos_emb = Tensor::cat(&[rotary_pos_emb_h, rotary_pos_emb_w], 1)?.contiguous()?;
+        Ok(rotary_pos_emb)
+    }
+
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        grid_thw: &Tensor,
+    ) -> Result<(Tensor, Vec<Tensor>)> {
+        let hidden_states = self.patch_embed.forward(hidden_states)?;
+        let pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?;
+        let hidden_states = hidden_states.broadcast_add(&pos_embeds)?;
+        let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
+        let seq_len = hidden_states.dim(0)?;
+        let mut hidden_states = hidden_states.reshape((seq_len, ()))?;
+        let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
+        let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
+        let cos = emb.cos()?;
+        let sin = emb.sin()?;
+        let cu_seqlens = grid_thw.i((.., 1))?.mul(&grid_thw.i((.., 2))?)?;
+        let grid_t = grid_thw.i((.., 0))?.to_vec1::<u32>()?;
+        let mut cu_seqlens_repeat = Vec::new();
+        for (index, t) in grid_t.iter().enumerate() {
+            cu_seqlens_repeat.push(cu_seqlens.i(index)?.repeat(*t as usize)?);
+        }
+        let cu_seqlens_full = Tensor::cat(&cu_seqlens_repeat, 0)?.flatten_all()?;
+        let cu_seqlens = cu_seqlens_full
+            .to_dtype(DType::F64)?
+            .cumsum(0)?
+            .to_dtype(DType::U32)?
+            .pad_with_zeros(D::Minus1, 1, 0)?;
+        let mut deepstack_feature_lists = vec![];
+        for (layer_num, block) in self.blocks.iter().enumerate() {
+            hidden_states = block.forward(&hidden_states, &cu_seqlens, &cos, &sin)?;
+            if self.deepstack_visual_indexes.contains(&layer_num) {
+                if let Some(index) = self
+                    .deepstack_visual_indexes
+                    .iter()
+                    .position(|&x| x == layer_num)
+                {
+                    let deepstack_feature =
+                        self.deepstack_merger_list[index].forward(&hidden_states)?;
+                    deepstack_feature_lists.push(deepstack_feature);
+                } else {
+                    println!("Value not found");
+                }
+            }
+        }
+        hidden_states = self.merger.forward(&hidden_states)?;
+        Ok((hidden_states, deepstack_feature_lists))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3VLTextAttention {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
+    pub q_norm: RmsNorm,
+    pub k_norm: RmsNorm,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub num_kv_groups: usize,
+    pub scaling: f64,
+    pub kv_cache: Option<(Tensor, Tensor)>,
+}
+
+impl Qwen3VLTextAttention {
+    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let num_attention_heads = config.num_attention_heads;
+        let head_dim = config.head_dim;
+        let num_key_value_heads = config.num_key_value_heads;
+        let num_kv_groups = num_attention_heads / num_key_value_heads;
+        let scaling = 1f64 / f64::sqrt(head_dim as f64);
+        let (q_proj, k_proj, v_proj, o_proj) = if config.attention_bias {
+            let q_proj = linear(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?;
+            let k_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?;
+            let v_proj = linear(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?;
+            let o_proj = linear(num_attention_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
+            (q_proj, k_proj, v_proj, o_proj)
+        } else {
+            let q_proj =
+                linear_no_bias(hidden_size, num_attention_heads * head_dim, vb.pp("q_proj"))?;
+            let k_proj =
+                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("k_proj"))?;
+            let v_proj =
+                linear_no_bias(hidden_size, num_key_value_heads * head_dim, vb.pp("v_proj"))?;
+            let o_proj =
+                linear_no_bias(num_attention_heads * head_dim, hidden_size, vb.pp("o_proj"))?;
+            (q_proj, k_proj, v_proj, o_proj)
+        };
+        let q_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_attention_heads,
+            num_key_value_heads,
+            num_kv_groups,
+            head_dim,
+            scaling,
+            kv_cache: None,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        let query_states = self.q_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_attention_heads,
+            self.head_dim,
+        ))?;
+        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
+        let key_states = self.k_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?;
+        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
+        let value_states = self.v_proj.forward(xs)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let (query_states, key_states) =
+            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        let (key_states, value_states) = match &self.kv_cache {
+            None => (key_states, value_states),
+            Some((prev_k, prev_v)) => {
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (key_states, value_states)
+            }
+        };
+        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        let attn_output = eager_attention_forward(
+            &query_states,
+            &key_states,
+            &value_states,
+            Some(self.num_kv_groups),
+            attention_mask,
+            self.scaling,
+        )?;
+        let attn_output =
+            attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+        let attn_output = attn_output.apply(&self.o_proj)?;
+        Ok(attn_output)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.kv_cache = None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3VLTextDecoderLayer {
+    pub self_attn: Qwen3VLTextAttention,
+    pub mlp: GateUpDownMLP,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
+}
+
+impl Qwen3VLTextDecoderLayer {
+    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+        let self_attn = Qwen3VLTextAttention::new(config.clone(), vb.pp("self_attn"))?;
+        let mlp = GateUpDownMLP::new(
+            vb.pp("mlp"),
+            config.hidden_size,
+            config.intermediate_size,
+            config.hidden_act,
+            false,
+        )?;
+        let input_layernorm = rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            vb.pp("input_layernorm"),
+        )?;
+        let post_attention_layernorm = rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let residual = xs.clone();
+        let xs = self.input_layernorm.forward(xs)?;
+        let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
+        let xs = residual.add(&xs)?;
+        let residual = xs.clone();
+        let xs = self.post_attention_layernorm.forward(&xs)?;
+        let xs = self.mlp.forward(&xs)?;
+        let xs = residual.add(&xs)?;
+        Ok(xs)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3VLTextModel {
+    pub embed_tokens: Embedding,
+    pub layers: Vec<Qwen3VLTextDecoderLayer>,
+    pub norm: RmsNorm,
+    pub rotary_emb: Qwen3VLTextRotaryEmbedding,
+    pub mrope_section: Vec<usize>,
+}
+
+impl Qwen3VLTextModel {
+    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+        let vocab_size = config.vocab_size;
+        let embed_tokens = embedding(vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+        let mut layers = vec![];
+        let vb_l = vb.pp("layers");
+        for layer_idx in 0..config.num_hidden_layers {
+            let layer = Qwen3VLTextDecoderLayer::new(config.clone(), vb_l.pp(layer_idx))?;
+            layers.push(layer)
+        }
+        let norm = rms_norm(config.hidden_size, config.rms_norm_eps, vb.pp("norm"))?;
+        let head_dim = config.head_dim;
+        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
+        // [FIX] rope_scaling is now optional. Assuming it exists if we are here, or panic/default.
+        // Given Qwen3 config flow, if it was missing it should have failed earlier or defaults populated.
+        let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary_emb,
+            mrope_section,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        inputs_embeds: &Tensor,
+        seqlen_offset: usize,
+        position_ids: Option<&Tensor>,
+        visual_pos_masks: Option<&Tensor>,
+        deepstack_visual_embeds: Option<Vec<Tensor>>,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len, _) = inputs_embeds.dims3()?;
+        let position_ids = match position_ids {
+            Some(ids) => ids.clone(),
+            None => Tensor::arange(
+                seqlen_offset as u32,
+                (seq_len + seqlen_offset) as u32,
+                inputs_embeds.device(),
+            )?
+            .unsqueeze(0)?
+            .unsqueeze(0)?
+            .broadcast_as((3, b_size, seq_len))?,
+        };
+        let (cos, sin) = self.rotary_emb.forward(
+            &position_ids,
+            inputs_embeds.dtype(),
+            self.mrope_section.clone(),
+        )?;
+        let mut xs = inputs_embeds.clone();
+        let attention_mask: Option<Tensor> = {
+            if seq_len <= 1 {
+                None
+            } else {
+                Some(prepare_causal_attention_mask(
+                    b_size,
+                    seq_len,
+                    0,
+                    inputs_embeds.device(),
+                )?)
+            }
+        };
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+            if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
+                if layer_idx < deepstack_embeds.len() {
+                    xs = mask_index_add(
+                        &xs.squeeze(0)?,
+                        &visual_pos_masks.unwrap().squeeze(0)?,
+                        &deepstack_embeds[layer_idx],
+                    )?
+                    .unsqueeze(0)?;
+                }
+            }
+        }
+        let xs = xs.apply(&self.norm)?;
+        Ok(xs)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.clear_kv_cache()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3VLModel {
+    config: Qwen3VLConfig,
+    visual: Qwen3VLVisionModel,
+    language_model: Qwen3VLTextModel,
+    lm_head: Linear,
+    rope_deltas: Option<Tensor>,
+}
+
+impl Qwen3VLModel {
+    pub fn new(config: Qwen3VLConfig, vb: VarBuilder) -> Result<Self> {
+        let vb_m = vb.pp("model");
+        let config = config.clone();
+        let v_config = config.vision_config.clone().ok_or(anyhow!("Missing vision_config for Qwen3VLModel"))?;
+        let visual = Qwen3VLVisionModel::new(v_config, vb_m.pp("visual"))?;
+        
+        // [FIX] text_config is optional, but required for Qwen3VLModel
+        let text_config = config.text_config.clone().ok_or(anyhow!("Missing text_config for Qwen3VLModel"))?;
+        
+        let language_model =
+            Qwen3VLTextModel::new(text_config.clone(), vb_m.pp("language_model"))?;
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(language_model.embed_tokens.embeddings().clone(), None)
+        } else {
+            linear_no_bias(
+                text_config.hidden_size,
+                text_config.vocab_size,
+                vb.pp("lm_head"),
+            )?
+        };
+        Ok(Self {
+            config,
+            visual,
+            language_model,
+            lm_head,
+            rope_deltas: None,
+        })
+    }
+
+    fn get_vision_features(
+        &self,
+        pixel_values: &Tensor,
+        image_grid_thw: &Tensor,
+    ) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
+        let (image_embeds, deepstack_image_embeds) =
+            self.visual.forward(pixel_values, image_grid_thw)?;
+        
+        let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
+        let split_sizes: Vec<usize> = prod_tensor_last_dim(image_grid_thw)?
+            .to_vec1::<u32>()?
+            .iter()
+            .map(|&x| x as usize / spatial_merge_size.pow(2))
+            .collect();
+        let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;
+        Ok((image_embeds, deepstack_image_embeds))
+    }
+
+    fn get_placeholder_mask(&self, input_ids: &Tensor, is_image: bool) -> Result<Tensor> {
+        let special_token_id = if is_image {
+            self.config.image_token_id.unwrap_or(0) as u32
+        } else {
+            self.config.video_token_id.unwrap_or(0) as u32
+        };
+        let special_token = Tensor::new(vec![special_token_id], input_ids.device())?;
+        let special_mask = input_ids
+            .broadcast_eq(&special_token)?
+            .to_dtype(candle_core::DType::U32)?;
+        Ok(special_mask)
+    }
+
+    fn get_rope_index(
+        &self,
+        input_ids: &Tensor,
+        image_grid_thw: Option<&Tensor>,
+        video_grid_thw: Option<&Tensor>,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        // ... (previous logic)
+        let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
+        let image_token_id = self.config.image_token_id.unwrap_or(0);
+        let video_token_id = self.config.video_token_id.unwrap_or(0);
+        let vision_start_token_id = self.config.vision_start_token_id.unwrap_or(0);
+        let mut mrope_position_deltas = vec![];
+        if image_grid_thw.is_some() || video_grid_thw.is_some() {
+            let total_input_ids = input_ids.clone();
+            let mask_ = mask
+                .cloned()
+                .unwrap_or(Tensor::ones_like(&total_input_ids)?)
+                .to_device(input_ids.device())?;
+            let mut position_ids = Tensor::ones(
+                (3, input_ids.dim(0)?, input_ids.dim(1)?),
+                input_ids.dtype(),
+                input_ids.device(),
+            )?;
+            let mut image_index = 0;
+            let mut video_index = 0;
+
+            for i in 0..total_input_ids.dim(0)? {
+                let mut input_ids_i = total_input_ids.i(i)?;
+                let mask_i = mask_.i(i)?;
+                // 推理时, attention_mask如果是全1向量,取非0索引的操作没必要
+                if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
+                    let nonzero_idx = nonzero_index(&mask_i)?;
+                    input_ids_i = input_ids_i.gather(&nonzero_idx, 0)?;
+                }
+                let mut text_start = 0;
+                let mut text_end = 0;
+                let mut thw = vec![];
+                let mut llm_pos_ids_list: Vec<Tensor> = Vec::new();
+                // vision start的下一个索引
+                let vision_indices =
+                    get_vision_next_indices(&input_ids_i, vision_start_token_id as u32);
+
+                match vision_indices {
+                    Ok(indeices) => {
+                        let vision_tokens = input_ids_i.gather(&indeices, 0)?.to_vec1::<u32>()?;
+                        let vision_indices_vec = indeices.to_vec1::<u32>()?;
+                        for (j, &token) in vision_tokens.iter().enumerate() {
+                            if token == image_token_id as u32 {
+                                thw = image_grid_thw.unwrap().i(image_index)?.to_vec1::<u32>()?;
+                                image_index += 1;
+                                text_end = vision_indices_vec[j];
+                            }
+                            if token == video_token_id as u32 {
+                                thw = video_grid_thw
+                                    .as_ref()
+                                    .unwrap()
+                                    .i(video_index)?
+                                    .to_vec1::<u32>()?;
+                                text_end = vision_indices_vec[j];
+                                video_index += 1;
+                            }
+                            let llm_grid_t = thw[0];
+                            let llm_grid_h = thw[1] / spatial_merge_size as u32;
+                            let llm_grid_w = thw[2] / spatial_merge_size as u32;
+                            let text_len = text_end - text_start;
+                            let start_idx = if !llm_pos_ids_list.is_empty() {
+                                llm_pos_ids_list[llm_pos_ids_list.len() - 1]
+                                    .max_all()?
+                                    .to_scalar::<u32>()?
+                                    + 1
+                            } else {
+                                0
+                            };
+                            let pos_ids = Tensor::arange(
+                                start_idx,
+                                start_idx + text_len,
+                                input_ids_i.device(),
+                            )?
+                            .unsqueeze(0)?
+                            .broadcast_as((3usize, text_len as usize))?;
+                            llm_pos_ids_list.push(pos_ids);
+
+                            let t_index = Tensor::arange(
+                                start_idx + text_len,
+                                start_idx + text_len + llm_grid_t,
+                                input_ids_i.device(),
+                            )?
+                            .unsqueeze(D::Minus1)?
+                            .broadcast_as((
+                                llm_grid_t as usize,
+                                llm_grid_h as usize * llm_grid_w as usize,
+                            ))?
+                            .flatten_all()?;
+                            let h_index = Tensor::arange(
+                                start_idx + text_len,
+                                start_idx + text_len + llm_grid_h,
+                                input_ids_i.device(),
+                            )?
+                            .unsqueeze(0)?
+                            .unsqueeze(D::Minus1)?
+                            .broadcast_as((
+                                llm_grid_t as usize,
+                                llm_grid_h as usize,
+                                llm_grid_w as usize,
+                            ))?
+                            .flatten_all()?;
+                            let w_index = Tensor::arange(
+                                start_idx + text_len,
+                                start_idx + text_len + llm_grid_w,
+                                input_ids_i.device(),
+                            )?
+                            .unsqueeze(0)?
+                            .unsqueeze(0)?
+                            .broadcast_as((
+                                llm_grid_t as usize,
+                                llm_grid_h as usize,
+                                llm_grid_w as usize,
+                            ))?
+                            .flatten_all()?;
+
+                            let thw_index = Tensor::stack(&[t_index, h_index, w_index], 0)?;
+                            llm_pos_ids_list.push(thw_index);
+                            text_start = text_end + llm_grid_t * llm_grid_h * llm_grid_w;
+                        }
+                    }
+                    Err(e) => {
+                        println!("get vision_indices err: {e}");
+                    }
+                };
+                if text_start < input_ids_i.dim(0)? as u32 {
+                    let start_idx = if !llm_pos_ids_list.is_empty() {
+                        llm_pos_ids_list[llm_pos_ids_list.len() - 1]
+                            .max_all()?
+                            .to_scalar::<u32>()?
+                            + 1
+                    } else {
+                        0
+                    };
+                    let text_len = input_ids_i.dim(0)? as u32 - text_start;
+                    let pos_ids =
+                        Tensor::arange(start_idx, start_idx + text_len, input_ids_i.device())?
+                            .unsqueeze(0)?
+                            .broadcast_as((3usize, text_len as usize))?;
+                    llm_pos_ids_list.push(pos_ids);
+                }
+                let llm_position = Tensor::cat(&llm_pos_ids_list, 1)?.reshape((3, 1, ()))?;
+                position_ids = position_ids
+                    .slice_assign(&[(0..3), (i..i + 1), (0..input_ids.dim(1)?)], &llm_position)?;
+                let position_deltas = llm_position.max_all()?.to_scalar::<u32>()? as i64 + 1
+                    - input_ids_i.dim(0)? as i64;
+                mrope_position_deltas.push(position_deltas);
+            }
+            let mut mrope_position_deltas = Tensor::new(mrope_position_deltas, input_ids.device())?;
+            if mrope_position_deltas.rank() == 1 {
+                mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?;
+            }
+            Ok((position_ids.contiguous()?, mrope_position_deltas))
+        } else if let Some(mask) = mask {
+            let mut position_ids = mask
+                .to_dtype(candle_core::DType::F64)?
+                .cumsum(D::Minus1)?
+                .to_dtype(candle_core::DType::U32)?
+                .broadcast_sub(&Tensor::new(vec![1_u32], input_ids.device())?)?;
+            for i in 0..position_ids.dim(0)? {
+                let mut position_ids_i = position_ids.i(i)?;
+                let mask_i = mask.i(i)?;
+                // 如果有pad, 将填充位置置为1
+                // 当bs>1, 可能存在不同序列长度，需要添加pad使seq_len长度一致
+                if mask_i.sum_all()?.to_scalar::<u32>()? != mask_i.dim(0)? as u32 {
+                    let zero_indices = zero_index(&mask_i)?;
+                    let replace_1 = Tensor::ones(
+                        zero_indices.dim(0)?,
+                        candle_core::DType::U32,
+                        input_ids.device(),
+                    )?;
+                    position_ids_i = position_ids_i
+                        .scatter(&zero_indices, &replace_1, 0)?
+                        .unsqueeze(0)?;
+                    position_ids = position_ids
+                        .slice_assign(&[(i..i + 1), (0..position_ids.dim(1)?)], &position_ids_i)?;
+                }
+            }
+            position_ids = position_ids
+                .unsqueeze(0)?
+                .broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?
+                .contiguous()?;
+            let mut mrope_position_deltas = position_ids
+                .max(0)?
+                .max(D::Minus1)?
+                .broadcast_sub(&Tensor::new(
+                    vec![mask.dim(D::Minus1)? as u32 - 1],
+                    input_ids.device(),
+                )?)?
+                .contiguous()?;
+            if mrope_position_deltas.rank() == 1 {
+                mrope_position_deltas = mrope_position_deltas.unsqueeze(0)?;
+            }
+            Ok((position_ids, mrope_position_deltas))
+        } else {
+            let position_ids =
+                Tensor::arange(0_u32, input_ids.dim(D::Minus1)? as u32, input_ids.device())?
+                    .unsqueeze(0)?
+                    .unsqueeze(0)?
+                    .broadcast_as((3, input_ids.dim(0)?, input_ids.dim(D::Minus1)?))?
+                    .contiguous()?;
+            let mrope_position_deltas = Tensor::zeros(
+                (input_ids.dim(0)?, 1),
+                input_ids.dtype(),
+                input_ids.device(),
+            )?;
+            Ok((position_ids, mrope_position_deltas))
+        }
+    }
+
+    pub fn forward(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: Option<&Tensor>,
+        image_grid_thw: Option<&Tensor>,
+        pixel_values_video: Option<&Tensor>,
+        video_grid_thw: Option<&Tensor>,
+        cache_position: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        let mut image_mask = None;
+        let mut video_mask = None;
+        let mut deepstack_image_embeds = None;
+        let mut deepstack_video_embeds = None;
+        if let Some(pixel_values) = pixel_values {
+            if let Some(image_grid_thw) = image_grid_thw {
+                let (image_embeds, deepstack_img_embed) =
+                    self.get_vision_features(pixel_values, image_grid_thw)?;
+                let image_embeds = Tensor::cat(&image_embeds, 0)?;
+                let vision_mask = self.get_placeholder_mask(input_ids, true)?;
+                let n_image_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                if n_image_tokens as usize != image_embeds.dim(0)? {
+                    return Err(anyhow!(format!(
+                        "n_image_token num: {} not equal to image_embed len: {}",
+                        n_image_tokens,
+                        image_embeds.dim(0)?
+                    )));
+                }
+                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?;
+                image_mask = Some(vision_mask);
+                deepstack_image_embeds = Some(deepstack_img_embed);
+            }
+        }
+        if let Some(pixel_values_video) = pixel_values_video {
+            if let Some(video_grid_thw) = video_grid_thw {
+                let (video_embeds, deepstack_video_embed) =
+                    self.get_vision_features(pixel_values_video, video_grid_thw)?;
+                let video_embeds = Tensor::cat(&video_embeds, 0)?;
+                let vision_mask = self.get_placeholder_mask(input_ids, false)?;
+                let n_video_tokens = vision_mask.sum_all()?.to_scalar::<u32>()?;
+                if n_video_tokens as usize != video_embeds.dim(0)? {
+                    return Err(anyhow!(format!(
+                        "n_image_token num: {} not equal to image_embed len: {}",
+                        n_video_tokens,
+                        video_embeds.dim(0)?
+                    )));
+                }
+                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &video_embeds, &vision_mask)?;
+                video_mask = Some(vision_mask);
+                deepstack_video_embeds = Some(deepstack_video_embed);
+            }
+        }
+        let mut visual_pos_mask = None;
+        let mut deepstack_visual_embeds = None;
+        if let Some(image_mask_) = image_mask {
+            if let Some(video_mask_) = video_mask {
+                let image_mask_ = image_mask_.squeeze(0)?;
+                let video_mask_ = video_mask_.squeeze(0)?;
+                let visual_mask = bitor_tensor(&image_mask_, &video_mask_)?;
+                let visual_none_zero_index = nonzero_index(&visual_mask)?;
+                let image_mask_joint = image_mask_.gather(&visual_none_zero_index, 0)?;
+                let image_nonzero_joint = nonzero_index(&image_mask_joint)?;
+                let video_mask_joint = video_mask_.gather(&visual_none_zero_index, 0)?;
+                let video_nonzero_joint = nonzero_index(&video_mask_joint)?;
+                let mut deepstack_embeds = vec![];
+                let visual_len = visual_none_zero_index.dim(0)?;
+                for (img_embed, vid_embed) in deepstack_image_embeds
+                    .unwrap()
+                    .iter()
+                    .zip(deepstack_video_embeds.unwrap().iter())
+                {
+                    let embed_joint = Tensor::zeros(
+                        (visual_len, img_embed.dim(D::Minus1)?),
+                        img_embed.dtype(),
+                        img_embed.device(),
+                    )?;
+                    let embed_joint = embed_joint.index_add(&image_nonzero_joint, img_embed, 0)?;
+                    let embed_joint = embed_joint.index_add(&video_nonzero_joint, vid_embed, 0)?;
+                    deepstack_embeds.push(embed_joint);
+                }
+                visual_pos_mask = Some(visual_mask.unsqueeze(0)?);
+                deepstack_visual_embeds = Some(deepstack_embeds);
+            } else {
+                visual_pos_mask = Some(image_mask_);
+                deepstack_visual_embeds = deepstack_image_embeds;
+            }
+        } else if let Some(video_mask_) = video_mask {
+            visual_pos_mask = Some(video_mask_);
+            deepstack_visual_embeds = deepstack_video_embeds;
+        }
+
+        let position_ids;
+        let rope_deltas;
+        if (cache_position.is_some() && cache_position.unwrap().i(0)?.to_scalar::<u32>()? == 0)
+            || self.rope_deltas.is_none()
+        {
+            (position_ids, rope_deltas) =
+                self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
+            self.rope_deltas = Some(rope_deltas);
+        } else {
+            let (bs, seq_len, _) = inputs_embeds.dims3()?;
+            let delta = if let Some(cache_position) = cache_position {
+                cache_position
+                    .i(0)?
+                    .to_dtype(self.rope_deltas.as_ref().unwrap().dtype())?
+                    .broadcast_add(self.rope_deltas.as_ref().unwrap())?
+                    .contiguous()?
+                    .to_dtype(candle_core::DType::U32)?
+            } else {
+                Tensor::zeros(1, inputs_embeds.dtype(), inputs_embeds.device())?
+            };
+            position_ids = Tensor::arange(0u32, seq_len as u32, input_ids.device())?
+                .unsqueeze(0)?
+                .broadcast_as((bs, seq_len))?
+                .broadcast_add(&delta)?
+                .unsqueeze(0)?
+                .broadcast_as((3, bs, seq_len))?
+                .contiguous()?;
+        }
+        let outputs = self.language_model.forward(
+            &inputs_embeds,
+            seqlen_offset,
+            Some(&position_ids),
+            visual_pos_mask.as_ref(),
+            deepstack_visual_embeds,
+        )?;
+        let seq_len = outputs.dim(1)?;
+        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
+        let logits = self.lm_head.forward(&hidden_state)?;
+        Ok(logits)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.language_model.clear_kv_cache();
+    }
+
+    pub fn device(&self) -> &Device {
+        self.lm_head.weight().device()
+    }
 }
