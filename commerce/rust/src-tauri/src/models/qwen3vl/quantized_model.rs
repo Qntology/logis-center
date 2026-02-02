@@ -97,14 +97,20 @@ impl QLinear {
         Ok(())
     }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // println!("[TRACE-QL] QLinear forward start. Input: {:?}", xs.dims());
         let (b, s, h) = xs.dims3()?;
         let weight = self.dequantize_on_the_fly(xs.device())?;
+        
         // Ensure both inputs to matmul are F32
         let xs_flat = xs.reshape((b * s, h))?.to_dtype(DType::F32)?;
         let weight_f32 = weight.to_dtype(DType::F32)?;
+        
+        // println!("[TRACE-QL] MatMul executing...");
         let mut out = xs_flat.matmul(&weight_f32.t()?)?;
         if let Some(bias) = &self.bias { out = out.broadcast_add(&bias.to_dtype(DType::F32)?)?; }
-        Ok(out.reshape((b, s, ()))?.to_dtype(xs.dtype())?)
+        let res = out.reshape((b, s, ()))?.to_dtype(xs.dtype())?;
+        // println!("[TRACE-QL] QLinear forward success.");
+        Ok(res)
     }
     fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
         let s = &self.original_shape;

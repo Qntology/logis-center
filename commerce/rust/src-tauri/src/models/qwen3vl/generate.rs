@@ -74,126 +74,116 @@ impl Qwen3VLGenerateModel {
         Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, high_fidelity) 
     }
     pub fn init_with_config(path: &str, tokenizer_path: Option<&str>, config_path: Option<&str>, text_device: Option<&Device>, text_device_id: usize, vision_device: Option<&Device>, vision_device_id: usize, dtype: Option<DType>, hard_token_limit: Option<usize>, force_text_only: bool, baking_only: bool, _high_fidelity: bool) -> Result<Self> {
+        println!("[DEBUG-GEN] Starting init_with_config at path: {}", path);
         let path = if let Some(s) = path.strip_prefix(r"\\\\") { s } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
         let cfg_path = config_path.unwrap_or(path);
+        
+        println!("[DEBUG-GEN] Loading ChatTemplate and Tokenizer...");
         let chat_template = ChatTemplate::init(tok_path)?;
         let tokenizer = TokenizerModel::init(tok_path)?;
-        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(std::path::Path::new(cfg_path).join("config.json"))?)?;
+        
+        let config_file = std::path::Path::new(cfg_path).join("config.json");
+        println!("[DEBUG-GEN] Reading config from: {:?}", config_file);
+        let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(config_file)?)?;
         let mut cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() { serde_json::from_value(raw_config)? } else {
             let mut tc: crate::models::qwen3vl::config::Qwen3VLTextConfig = serde_json::from_value(raw_config.clone())?;
             if let Some(h) = raw_config.get("head_dim").and_then(|v| v.as_u64()) { tc.head_dim = h as usize; }
             Qwen3VLConfig { text_config: Some(tc), model_type: "qwen2".to_string(), ..Default::default() }
         };
+        
         if path.contains("0.6B") { 
+            println!("[DEBUG-GEN] Detected 0.6B model, applying synergetic reconfig.");
             if let Some(ref mut tc) = cfg.text_config { 
-                // 1. Precise architecture mapping for 0.6B (1024 -> 3072 FFN)
-                tc.hidden_size = 1024; 
-                tc.intermediate_size = 3072; 
-                
-                // 2. [BRIDGE-PROTOCOL] Unified Frequency Space
-                tc.rope_theta = 5000000.0;
-
-                // 3. [BRIDGE-PROTOCOL] Multimodal-RoPE Topology Mapping
-                // Pre-align 0.6B baking to 2B-VL's 3D positional manifold
+                tc.hidden_size = 1024; tc.intermediate_size = 3072; tc.rope_theta = 5000000.0;
                 tc.rope_scaling = Some(crate::models::qwen3vl::config::RopeScaling {
-                    mrope_section: vec![24, 20, 20], 
-                    rope_type: "default".to_string(),
-                    mrope_interleaved: Some(true),
+                    mrope_section: vec![24, 20, 20], rope_type: "default".to_string(), mrope_interleaved: Some(true),
                 });
-
-                println!("[BRIDGE] Mathematical Synergy: 0.6B reconfigured for 2B-VL compatibility.");
             } 
         }
+        
         let text_dev = get_device(text_device); let vision_dev = get_device(vision_device);
         let dtype = get_dtype(dtype, cfg.text_config.as_ref().and_then(|tc| tc.dtype.as_deref()).unwrap_or("float16"));
+        println!("[DEBUG-GEN] Devices: Text={:?}, Vision={:?}. DType: {:?}", text_dev, vision_dev, dtype);
         
-        // [FIX] Support direct file paths to avoid "Not a directory" errors
         let path_obj = Path::new(path);
         let (model_path, gguf_files, st_files_for_mmproj) = if path_obj.is_file() {
+            println!("[DEBUG-GEN] Path is a direct file.");
             let p_str = path.to_string();
             if p_str.ends_with(".safetensors") {
-                // If direct safetensors provided, use it. Mmproj must be in same dir if needed.
                 let parent = path_obj.parent().unwrap_or(Path::new("."));
                 let st_files = find_type_files(parent.to_str().unwrap(), "safetensors").unwrap_or_default();
                 (Some(p_str), vec![], st_files)
             } else if p_str.ends_with(".gguf") {
                 (None, vec![p_str], vec![])
-            } else {
-                (None, vec![], vec![])
-            }
+            } else { (None, vec![], vec![]) }
         } else {
+            println!("[DEBUG-GEN] Scanning directory for model files...");
             let st = find_type_files(path, "safetensors")?;
             let gf = find_type_files(path, "gguf")?;
-            let mp = if baking_only { 
-                st.iter().find(|f| f.contains("ANCHOR_IQ0.safetensors") && !f.contains("mmproj")).cloned() 
-            } else { 
-                st.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors") && !f.contains("mmproj")).cloned() 
-            };
+            let mp = if baking_only { st.iter().find(|f| f.contains("ANCHOR_IQ0.safetensors") || f.contains("LAYER0")).cloned() } 
+                     else { st.iter().find(|f| f.contains("model-BITSERIAL_ALL.safetensors") && !f.contains("mmproj")).cloned() };
             (mp, gf, st)
         };
 
         if let Some(st_path) = model_path {
+            println!("[DEBUG-GEN] Loading Safetensors variant: {}", st_path);
             let is_anchor = st_path.contains("ANCHOR_IQ0") || st_path.contains("LAYER0");
             let mut m_cfg = cfg.clone(); 
-            // [BAKING-OPTIM] If loading a Layer 0 model, force num_hidden_layers to 1
-            if baking_only || is_anchor { 
-                if let Some(ref mut tc) = m_cfg.text_config { tc.num_hidden_layers = 1; } 
-            }
+            if baking_only || is_anchor { if let Some(ref mut tc) = m_cfg.text_config { tc.num_hidden_layers = 1; } }
             
+            println!("[DEBUG-GEN] Loading Tensors via manual loader...");
             let mut merged_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(&st_path), &text_dev, dtype, baking_only)?;
             
             if !force_text_only {
-                // [AUTO-MATCH] Look for corresponding mmproj based on text model suffix
                 let suffix = if st_path.contains("LAYER0") { "mmproj-BITSERIAL_LAYER0.safetensors" }
                              else if st_path.contains("INFERENCE") { "mmproj-BITSERIAL_INFERENCE.safetensors" }
                              else { "mmproj-BITSERIAL_ALL.safetensors" };
-                             
                 let mmproj_st = st_files_for_mmproj.iter().find(|f| f.contains(suffix)).or_else(|| st_files_for_mmproj.iter().find(|f| f.contains("mmproj-BITSERIAL_ALL.safetensors")));
-                
                 if let Some(mm_path) = mmproj_st {
-                    println!("[MODEL] Loading Vision from: {}", mm_path);
+                    println!("[DEBUG-GEN] Loading Vision mmproj: {}", mm_path);
                     let vision_data = crate::models::qwen3vl::quantized_model::load_tensors_from_true_iq0(Path::new(mm_path), &vision_dev, dtype, baking_only)?;
                     for (k, v) in vision_data { merged_data.insert(k, v); }
-                } else {
-                    println!("[MODEL] Warning: Vision model ({}) not found. Proceeding text-only.", suffix);
                 }
             }
+            
+            println!("[DEBUG-GEN] Building VarBuilder from {} tensors...", merged_data.len());
             let vb = VarBuilder::from_tensors(merged_data, dtype, &text_dev);
+            println!("[MODEL-DEBUG] Constructing Qwen3VLModel...");
             let model = Qwen3VLModel::new_ext(m_cfg, vb, force_text_only, baking_only || is_anchor)?;
+            println!("[MODEL-DEBUG] Qwen3VLModel constructed. Building GenerateModel...");
             return Ok(Self { 
-                chat_template, 
-                tokenizer, 
-                pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, 
-                qwen3_vl: ModelVariant::Standard(model), 
-                text_device: text_dev, 
-                vision_device: vision_dev, 
-                eos_token_id1: 151643, 
-                eos_token_id2: 151645, 
-                generation_config: Qwen3VLGenerationConfig::default(), 
-                model_name: if is_anchor { "qwen3-anchor" } else { "qwen3-bitserial-full" }.to_string(), 
-                hard_token_limit 
+                chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, 
+                qwen3_vl: ModelVariant::Standard(model), text_device: text_dev, vision_device: vision_dev, 
+                eos_token_id1: 151643, eos_token_id2: 151645, generation_config: Qwen3VLGenerationConfig::default(), 
+                model_name: if is_anchor { "qwen3-anchor" } else { "qwen3-bitserial-full" }.to_string(), hard_token_limit 
             });
         }
+        
+        println!("[DEBUG-GEN] No Safetensors found, trying GGUF files...");
         let kv_reserve = 512 * 1024 * 1024;
         let qwen3_vl = if !gguf_files.is_empty() {
             let model_p = if !baking_only { gguf_files.iter().find(|f| f.contains("Qwen3VL-2B") && f.contains("Q4_K_M")).cloned() } else { gguf_files.iter().find(|f| f.contains("Qwen3VL-2B") && f.contains("IQ1_S")).cloned() };
             let main = model_p.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF found"))?;
+            println!("[DEBUG-GEN] Loading GGUF: {}", main);
             let file = std::fs::File::open(&main)?;
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
             let mut cursor = std::io::Cursor::new(&mmap[..]);
             let content = gguf_file::Content::read(&mut cursor)?;
             let mmproj_p = if !force_text_only { gguf_files.iter().find(|f| f.contains("mmproj") && (if baking_only { f.contains("IQ1_S") } else { f.contains("Q8_0") })).cloned() } else { None };
             if let Some(mmproj) = mmproj_p {
+                println!("[DEBUG-GEN] Loading GGUF mmproj: {}", mmproj);
                 let mm_file = std::fs::File::open(&mmproj)?;
                 let mm_mmap = unsafe { memmap2::MmapOptions::new().map(&mm_file)? };
                 let mut mm_cursor = std::io::Cursor::new(&mm_mmap[..]);
                 let mm_content = gguf_file::Content::read(&mut mm_cursor)?;
                 ModelVariant::QuantizedVL(QuantizedQwen3VLModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &mm_content, Some(Arc::new(mm_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only, force_text_only)?)
             } else {
+                println!("[DEBUG-GEN] Initializing GGUF Text variant...");
                 ModelVariant::QuantizedText(QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, baking_only, path.contains("0.6B"))?)
             }
         } else { return Err(anyhow!("No model files found")); };
+        println!("[DEBUG-GEN] init_with_config complete.");
         Ok(Self { chat_template, tokenizer, pre_processor: Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1: 151643, eos_token_id2: 151645, generation_config: Qwen3VLGenerationConfig::default(), model_name: "qwen3-gguf".to_string(), hard_token_limit })
     }
 

@@ -959,11 +959,114 @@ pub struct QGateUpDownMLP {
     pub act_fn: Activation,
 }
 
+impl Qwen3VLTextAttention {
+    pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+        println!("[DEBUG-ATTN] Creating Attention. Prefix: {}", vb.prefix());
+        let _hidden_size = config.hidden_size;
+        let num_attention_heads = config.num_attention_heads;
+        let head_dim = config.head_dim;
+        let num_key_value_heads = config.num_key_value_heads;
+        let num_kv_groups = num_attention_heads / num_key_value_heads;
+        let scaling = 1f64 / f64::sqrt(head_dim as f64);
+        
+        println!("[DEBUG-ATTN] Loading projections...");
+        let q_proj = get_qlinear_from_vb(vb.pp("q_proj"), "weight")?;
+        let k_proj = get_qlinear_from_vb(vb.pp("k_proj"), "weight")?;
+        let v_proj = get_qlinear_from_vb(vb.pp("v_proj"), "weight")?;
+        let o_proj = get_qlinear_from_vb(vb.pp("o_proj"), "weight")?;
+
+        println!("[DEBUG-ATTN] Loading norms...");
+        let q_norm = get_rms_norm(head_dim, config.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = get_rms_norm(head_dim, config.rms_norm_eps, vb.pp("k_norm"))?;
+        println!("[DEBUG-ATTN] Attention created successfully.");
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_attention_heads,
+            num_key_value_heads,
+            num_kv_groups,
+            head_dim,
+            scaling,
+            kv_cache: None,
+        })
+    }
+
+    pub fn forward(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        println!("[DEBUG-ATTN] forward start. xs: {:?}", xs.dims());
+        let (b_sz, q_len, _) = xs.dims3()?;
+        let query_states = self.q_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_attention_heads,
+            self.head_dim,
+        ))?;
+        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
+        let key_states = self.k_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?;
+        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
+        let value_states = self.v_proj.forward(xs)?;
+        let value_states = value_states
+            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let (query_states, key_states) =
+            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        let (key_states, value_states) = match &self.kv_cache {
+            None => (key_states, value_states),
+            Some((prev_k, prev_v)) => {
+                let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
+                let value_states = Tensor::cat(&[prev_v, &value_states], 2)?;
+                (key_states, value_states)
+            }
+        };
+        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        let attn_output = eager_attention_forward(
+            &query_states,
+            &key_states,
+            &value_states,
+            Some(self.num_kv_groups),
+            attention_mask,
+            self.scaling,
+        )?;
+        let attn_output =
+            attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+        let attn_output = self.o_proj.forward(&attn_output)?; // Changed from .apply()
+        Ok(attn_output)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.kv_cache = None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QGateUpDownMLP {
+    pub gate_proj: QLinear,
+    pub up_proj: QLinear,
+    pub down_proj: QLinear,
+    pub act_fn: Activation,
+}
+
 impl QGateUpDownMLP {
     pub fn new(vb: VarBuilder, _hidden: usize, _inter: usize, act: Activation) -> Result<Self> {
+        println!("[DEBUG-MLP] Creating MLP. Prefix: {}", vb.prefix());
         let gate_proj = get_qlinear_from_vb(vb.pp("gate_proj"), "weight")?;
         let up_proj = get_qlinear_from_vb(vb.pp("up_proj"), "weight")?;
         let down_proj = get_qlinear_from_vb(vb.pp("down_proj"), "weight")?;
+        println!("[DEBUG-MLP] MLP created successfully.");
         Ok(Self { gate_proj, up_proj, down_proj, act_fn: act })
     }
     
@@ -987,6 +1090,7 @@ pub struct Qwen3VLTextDecoderLayer {
 
 impl Qwen3VLTextDecoderLayer {
     pub fn new(config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+        println!("[DEBUG-LAYER] Creating Layer. Prefix: {}", vb.prefix());
         let self_attn = Qwen3VLTextAttention::new(config.clone(), vb.pp("self_attn"))?;
         let mlp = QGateUpDownMLP::new(
             vb.pp("mlp"),
@@ -995,6 +1099,7 @@ impl Qwen3VLTextDecoderLayer {
             config.hidden_act,
         )?;
         
+        println!("[DEBUG-LAYER] Loading norms...");
         let input_layernorm = {
             let w = get_any(&vb.pp("input_layernorm"), "weight")?;
             RmsNorm::new(w, config.rms_norm_eps)
@@ -1003,6 +1108,7 @@ impl Qwen3VLTextDecoderLayer {
             let w = get_any(&vb.pp("post_attention_layernorm"), "weight")?;
             RmsNorm::new(w, config.rms_norm_eps)
         };
+        println!("[DEBUG-LAYER] Layer created successfully.");
         Ok(Self {
             self_attn,
             mlp,
@@ -1018,6 +1124,7 @@ impl Qwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        println!("[DEBUG-LAYER] forward start. xs: {:?}", xs.dims());
         let residual = xs.clone();
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
@@ -1046,12 +1153,15 @@ pub struct Qwen3VLTextModel {
 
 impl Qwen3VLTextModel {
     pub fn new(mut config: Qwen3VLTextConfig, vb: VarBuilder) -> Result<Self> {
+        println!("[DEBUG-TEXT] Creating TextModel. Prefix: {}", vb.prefix());
         let vocab_size = config.vocab_size;
         
         // [SMART-PROBE] Check if embeddings exist (Baking model has them, Inference model might not)
+        println!("[DEBUG-TEXT] Loading embeddings...");
         let embed_tokens_weight = if probe(&vb.pp("embed_tokens"), "weight") {
             get_any(&vb.pp("embed_tokens"), "weight")?
         } else {
+            println!("[DEBUG-TEXT] Embeddings missing, using dummy.");
             Tensor::zeros((vocab_size, config.hidden_size), DType::F32, vb.device())?
         };
 
@@ -1065,6 +1175,7 @@ impl Qwen3VLTextModel {
         let mut layers = vec![];
         let vb_l = vb.pp("layers");
         
+        println!("[DEBUG-TEXT] Loading {} layers...", config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             // [SMART-PROBE] Check if this layer exists in the file (RESILIENT)
             let check_path = vb_l.pp(layer_idx).pp("input_layernorm");
@@ -1091,6 +1202,7 @@ impl Qwen3VLTextModel {
             }
         }
         
+        println!("[DEBUG-TEXT] Loading final norm...");
         // Norm might be missing in Baking-Only file
         let norm = if probe(&vb.pp("norm"), "weight") {
             let w = get_any(&vb.pp("norm"), "weight")?;
@@ -1099,14 +1211,17 @@ impl Qwen3VLTextModel {
             let w = get_any(&vb.pp("output_norm"), "weight")?;
             RmsNorm::new(w, config.rms_norm_eps)
         } else {
+             println!("[DEBUG-TEXT] Final norm missing, using dummy.");
              // Create dummy norm
              RmsNorm::new(Tensor::ones(config.hidden_size, DType::F32, vb.device())?, config.rms_norm_eps)
         };
 
+        println!("[DEBUG-TEXT] Initializing RoPE...");
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
 
+        println!("[DEBUG-TEXT] TextModel created successfully.");
         Ok(Self {
             embed_tokens,
             layers,
@@ -1125,6 +1240,7 @@ impl Qwen3VLTextModel {
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
+        println!("[TRACE] TextModel::forward started. Shape: {:?}", inputs_embeds.dims());
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         let position_ids = match position_ids {
             Some(ids) => ids.clone(),
@@ -1137,16 +1253,20 @@ impl Qwen3VLTextModel {
             .unsqueeze(0)?
             .broadcast_as((3, b_size, seq_len))?,
         };
+        
+        println!("[TRACE] Computing RoPE cos/sin...");
         let (cos, sin) = self.rotary_emb.forward(
             &position_ids,
             inputs_embeds.dtype(),
             self.mrope_section.clone(),
         )?;
+        
         let mut xs = inputs_embeds.clone();
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
                 None
             } else {
+                println!("[TRACE] Preparing attention mask...");
                 Some(prepare_causal_attention_mask(
                     b_size,
                     seq_len,
@@ -1155,11 +1275,13 @@ impl Qwen3VLTextModel {
                 )?)
             }
         };
+
         let layer_limit = if self.is_baking { 1 } else { self.layers.len() };
         let mut layers_executed = 0;
 
         for (layer_idx, layer_opt) in self.layers.iter_mut().enumerate().take(layer_limit) {
             if let Some(layer) = layer_opt {
+                println!("[TRACE] Layer {} forward started", layer_idx);
                 xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
                 layers_executed += 1;
                 if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
@@ -1172,23 +1294,17 @@ impl Qwen3VLTextModel {
                         .unsqueeze(0)?;
                     }
                 }
+                println!("[TRACE] Layer {} forward completed", layer_idx);
             }
         }
 
         if layers_executed == 0 {
              println!("[MODEL-WARNING] Forward pass completed with 0 layers executed! is_baking={}, layer_limit={}", self.is_baking, layer_limit);
-        } else {
-             if self.is_baking {
-                 println!("[MODEL-DEBUG] Baking: Executed {} layer(s).", layers_executed);
-             }
         }
 
-        // [STRICT RELAY] If baking, we already got the KV from layer 0. 
-        // The KV cache is managed internally by each layer.
-        if self.is_baking {
-            println!("[MODEL-OPTIM] Single-layer baking complete. Cache-resident state preserved.");
-        }
+        println!("[TRACE] Applying final norm...");
         let xs = xs.apply(&self.norm)?;
+        println!("[TRACE] TextModel::forward completed.");
         Ok(xs)
     }
 
@@ -1468,6 +1584,7 @@ impl Qwen3VLModel {
         }
         
         // 3. [SMART-PROBE] Find LM Head
+        println!("[MODEL-DEBUG] Probing for LM Head...");
         let lm_head = {
             let probe_h = |v: &VarBuilder, path: &str| -> bool {
                 for suffix in &["", ".packed", ".min"] {
@@ -1494,6 +1611,7 @@ impl Qwen3VLModel {
             };
 
             if let Some(vh) = vb_head {
+                println!("[MODEL-PROBE] Found LM Head at {:?}", vh.prefix());
                 get_qlinear_from_vb(vh, "weight")?
             } else {
                 println!("[MODEL-PROBE] lm_head not found. Creating dummy tied weights.");
@@ -1505,11 +1623,16 @@ impl Qwen3VLModel {
             }
         };
 
+        println!("[MODEL-DEBUG] Creating Qwen3VLModel struct...");
         let mut model = Self {
             config, visual, language_model, lm_head,
             rope_deltas: None, is_baking,
         };
+        
+        println!("[MODEL-DEBUG] Propagating baking state...");
         model.set_baking(is_baking);
+        
+        println!("[MODEL-DEBUG] Initialization complete.");
         Ok(model)
     }
 
@@ -1778,7 +1901,12 @@ impl Qwen3VLModel {
         cache_position: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        println!("[TRACE-0] Qwen3VLModel::forward entry. input_ids: {:?}", input_ids.dims());
+        
+        println!("[TRACE-1] Computing inputs_embeds...");
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        println!("[TRACE-2] inputs_embeds computed. Shape: {:?}", inputs_embeds.dims());
+
         let mut image_mask = None;
         let mut video_mask = None;
         let mut deepstack_image_embeds: Option<Vec<Tensor>> = None;
@@ -1786,6 +1914,7 @@ impl Qwen3VLModel {
         
         // [FIX] Only process vision if visual component is initialized
         if let Some(visual_model) = &self.visual {
+            println!("[TRACE-3] Processing visual features...");
             if let Some(pixel_values) = pixel_values {
                 if let Some(image_grid_thw) = image_grid_thw {
                     let (image_embeds, ds_embeds) =
@@ -1825,9 +1954,11 @@ impl Qwen3VLModel {
                 }
             }
         }
+        
         let mut visual_pos_mask: Option<Tensor> = None;
         let mut deepstack_visual_embeds: Option<Vec<Tensor>> = None;
         if let Some(image_mask_) = image_mask {
+            println!("[TRACE-4] Masking visual positions...");
             if let Some(video_mask_) = video_mask {
                 let image_mask_ = image_mask_.squeeze(0)?;
                 let video_mask_ = video_mask_.squeeze(0)?;
@@ -1869,10 +2000,12 @@ impl Qwen3VLModel {
         if (cache_position.is_some() && cache_position.unwrap().i((0, 0))?.to_scalar::<u32>()? == 0)
             || self.rope_deltas.is_none()
         {
+            println!("[TRACE-5] Computing RoPE index...");
             (position_ids, rope_deltas) =
                 self.get_rope_index(input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(rope_deltas);
         } else {
+            println!("[TRACE-5] Computing dynamic RoPE position...");
             let (bs, seq_len, _) = inputs_embeds.dims3()?;
             let delta = if let Some(cache_position) = cache_position {
                 cache_position
@@ -1892,6 +2025,8 @@ impl Qwen3VLModel {
                 .broadcast_as((3, bs, seq_len))?
                 .contiguous()?;
         }
+        
+        println!("[TRACE-6] Calling language_model.forward...");
         let outputs = self.language_model.forward(
             &inputs_embeds,
             seqlen_offset,
@@ -1899,9 +2034,12 @@ impl Qwen3VLModel {
             visual_pos_mask.as_ref(),
             deepstack_visual_embeds,
         )?;
+        
+        println!("[TRACE-7] Computing logits...");
         let seq_len = outputs.dim(1)?;
         let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
         let logits = self.lm_head.forward(&hidden_state)?;
+        println!("[TRACE-8] Qwen3VLModel::forward success.");
         Ok(logits)
     }
 

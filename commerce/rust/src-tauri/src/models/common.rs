@@ -24,6 +24,37 @@ pub fn find_flexible_weight(v: &VarBuilder, name: &str, out_dim: usize, in_dim: 
     Ok(v.get((out_dim, in_dim), name)?)
 }
 
+// [SAFE-OPS] Avoid CUDA_ERROR_NOT_FOUND by using basic ops instead of optimized kernels
+pub fn safe_softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
+    let xs_f32 = xs.to_dtype(DType::F32)?;
+    let max = xs_f32.max_keepdim(D::Minus1)?;
+    let diff = xs_f32.broadcast_sub(&max)?;
+    let exp = diff.exp()?;
+    let sum = exp.sum_keepdim(D::Minus1)?;
+    Ok(exp.broadcast_div(&sum)?.to_dtype(xs.dtype())?)
+}
+
+pub fn safe_sigmoid(xs: &Tensor) -> Result<Tensor> {
+    let xs_f32 = xs.to_dtype(DType::F32)?;
+    let exp_neg_x = xs_f32.neg()?.exp()?;
+    let den = exp_neg_x.affine(1.0, 1.0)?;
+    Ok(den.recip()?.to_dtype(xs.dtype())?)
+}
+
+pub fn safe_silu(xs: &Tensor) -> Result<Tensor> {
+    let sig = safe_sigmoid(xs)?;
+    Ok(xs.broadcast_mul(&sig)?)
+}
+
+pub fn safe_gelu(xs: &Tensor) -> Result<Tensor> {
+    let xs_f32 = xs.to_dtype(DType::F32)?;
+    let c1 = (2.0f32 / std::f32::consts::PI).sqrt();
+    let x_cube = xs_f32.sqr()?.broadcast_mul(&xs_f32)?;
+    let inner = xs_f32.broadcast_add(&x_cube.affine(0.044715, 0.0)?)?.affine(c1 as f64, 0.0)?;
+    let tanh = inner.tanh()?;
+    Ok(xs_f32.broadcast_mul(&tanh.affine(1.0, 1.0)?)?.affine(0.5, 0.0)?.to_dtype(xs.dtype())?)
+}
+
 #[derive(Debug, Clone)]
 pub struct RmsNorm {
     pub weight: Tensor,
@@ -34,7 +65,6 @@ impl RmsNorm {
     pub fn new(weight: Tensor, eps: f64) -> Self {
         Self { weight, eps }
     }
-    // Add methods for compatibility
     pub fn weight(&self) -> &Tensor { &self.weight }
 }
 
@@ -120,7 +150,12 @@ impl GateUpDownMLP {
 
 impl Module for GateUpDownMLP {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
+        let gate = xs.apply(&self.gate_proj)?;
+        let lhs = match self.act_fn {
+            Activation::Silu => safe_silu(&gate).map_err(|e| candle_core::Error::Msg(e.to_string()))?,
+            Activation::Gelu => safe_gelu(&gate).map_err(|e| candle_core::Error::Msg(e.to_string()))?,
+            _ => gate.apply(&self.act_fn)?,
+        };
         let rhs = xs.apply(&self.up_proj)?;
         (lhs * rhs)?.apply(&self.down_proj)
     }
@@ -149,7 +184,13 @@ impl TwoLinearMLP {
         self.linear2 = Linear::new(l2_w, l2_b); Ok(())
     }
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = xs.apply(&self.linear1)?.apply(&self.act)?.apply(&self.linear2)?; Ok(xs)
+        let l1 = xs.apply(&self.linear1)?;
+        let act = match self.act {
+            Activation::Silu => safe_silu(&l1)?,
+            Activation::Gelu => safe_gelu(&l1)?,
+            _ => l1.apply(&self.act)?,
+        };
+        Ok(act.apply(&self.linear2)?)
     }
 }
 
@@ -251,6 +292,7 @@ impl NaiveAttnGateUpDownMLPBlock {
 }
 
 pub fn eager_attention_forward(query_states: &Tensor, key_states: &Tensor, value_states: &Tensor, num_key_value_groups: Option<usize>, attention_mask: Option<&Tensor>, scaling: f64) -> Result<Tensor> {
+    // println!("[TRACE] Attention forward: Q={:?}, K={:?}, V={:?}", query_states.dims(), key_states.dims(), value_states.dims());
     let ks = match num_key_value_groups { Some(g) => repeat_kv(key_states.clone(), g)?.contiguous()?, None => key_states.clone() };
     let vs = match num_key_value_groups { Some(g) => repeat_kv(value_states.clone(), g)?.contiguous()?, None => value_states.clone() };
     let qs = query_states.contiguous()?; let ks = ks.contiguous()?; let vs = vs.contiguous()?;
@@ -267,7 +309,7 @@ pub fn eager_attention_forward(query_states: &Tensor, key_states: &Tensor, value
                 weights_f32.broadcast_add(&mask_f32)?.to_dtype(attn_weights.dtype())?
             }
         };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_weights = safe_softmax_last_dim(&attn_weights).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
         attn_weights.matmul(&vs)?
     };
     Ok(attn_output.transpose(1, 2)?.contiguous()?)
