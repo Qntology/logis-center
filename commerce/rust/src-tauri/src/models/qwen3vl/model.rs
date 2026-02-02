@@ -25,13 +25,21 @@ use crate::{
 // --- Safe Loading Helpers ---
 
 fn safe_probe(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> bool {
-    let path = if v.prefix().is_empty() { p.to_string() } else { format!("{}{}", v.prefix(), p) };
+    let prefix = v.prefix();
+    let path = if prefix.is_empty() { p.to_string() } 
+    else if prefix.ends_with('.') { format!("{}{}", prefix, p) } 
+    else { format!("{}.{}", prefix, p) };
+
     if let Some(m) = map { return m.contains_key(&path); }
     v.get_with_hints((1,), p, Init::Const(0.)).is_ok()
 }
 
 fn safe_get(v: &VarBuilder, p: &str, map: Option<&HashMap<String, Tensor>>) -> Result<Tensor> {
-    let path = if v.prefix().is_empty() { p.to_string() } else { format!("{}{}", v.prefix(), p) };
+    let prefix = v.prefix();
+    let path = if prefix.is_empty() { p.to_string() } 
+    else if prefix.ends_with('.') { format!("{}{}", prefix, p) } 
+    else { format!("{}.{}", prefix, p) };
+
     if let Some(m) = map {
         if let Some(t) = m.get(&path) { return Ok(t.clone()); }
         return Err(anyhow!("Missing tensor: {}", path));
@@ -358,10 +366,24 @@ impl Qwen3VLModel {
         else { vb.pp("model").pp("language_model") };
         let lm = Qwen3VLTextModel::new(t_cfg, vb_lm, map_r)?;
         if bo && !lm.layers.is_empty() && lm.layers[0].is_none() { return Err(anyhow!("Layer 0 missing")); }
-        let vb_h = if safe_probe(&vb, "model.language_model.lm_head.weight", map_r) { vb.pp("model").pp("language_model").pp("lm_head") }
-        else if safe_probe(&vb, "model.lm_head.weight", map_r) { vb.pp("model").pp("lm_head") }
-        else { vb.pp("model").pp("language_model").pp("lm_head") };
-        let head = get_qlinear_safe(vb_h, "weight", map_r)?;
+        let head = if safe_probe(&vb, "model.language_model.lm_head.weight", map_r) {
+            get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
+        } else if safe_probe(&vb, "model.lm_head.weight", map_r) {
+            get_qlinear_safe(vb.pp("model").pp("lm_head"), "weight", map_r)?
+        } else if bo {
+            println!("[MODEL] Baking Mode: lm_head missing, using dummy zero head.");
+            let tc = cfg.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
+            let shape = vec![tc.vocab_size, tc.hidden_size];
+            let total_el: usize = shape.iter().product();
+            let dev = vb.device();
+            // Create minimal valid QLinear structure to satisfy struct requirements.
+            // Since we skip forward(), the content doesn't matter much, but dimensions should be valid.
+            let p = Tensor::zeros(((total_el + 31) / 32,), DType::U32, dev)?;
+            let s = Tensor::ones(((total_el + 31) / 32,), DType::F32, dev)?;
+            QLinear::new(p, s, shape, None, dev.clone())
+        } else {
+             get_qlinear_safe(vb.pp("model").pp("language_model").pp("lm_head"), "weight", map_r)?
+        };
         let mut model = Self { config: cfg, visual: vis, language_model: lm, lm_head: head, is_baking: bo }; model.set_baking(bo); Ok(model)
     }
     pub fn forward(&mut self, ids: &Tensor, pv: Option<&Tensor>, thw: Option<&Tensor>, _vpv: Option<&Tensor>, vthw: Option<&Tensor>, _cp: Option<&Tensor>, offset: usize) -> Result<Tensor> {
@@ -373,6 +395,9 @@ impl Qwen3VLModel {
         } }
         let (pids, _) = Qwen3VLModel::get_rope_index_static(&self.config, ids, thw, vthw, None)?;
         let out = self.language_model.forward(&embs, offset, Some(&pids), im.as_ref(), dse)?;
+        if self.is_baking {
+            return Ok(out.narrow(1, out.dim(1)? - 1, 1)?);
+        }
         Ok(self.lm_head.forward(&out.narrow(1, out.dim(1)? - 1, 1)?)?)
     }
     pub fn to_device(&mut self, d: &Device) -> Result<()> { if let Some(v) = &mut self.visual { v.to_device(d)?; } self.language_model.to_device(d)?; Ok(()) }

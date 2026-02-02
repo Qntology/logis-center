@@ -25,7 +25,6 @@ use crate::{
     },
 };
 
-// ... (Keep existing QLinear, RmsNorm, get_qlinear, get_rms_norm as they are correct) ...
 pub fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let packed_name = format!("{}.weight.packed", name);
     let scales_name = format!("{}.weight.scales", name);
@@ -99,6 +98,7 @@ impl QLinear {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // println!("[TRACE-QL] QLinear forward start. Input: {:?}", xs.dims());
         let (b, s, h) = xs.dims3()?;
+        // println!("[TRACE-QL] Dequantizing...");
         let weight = self.dequantize_on_the_fly(xs.device())?;
         
         // Ensure both inputs to matmul are F32
@@ -115,6 +115,9 @@ impl QLinear {
     fn dequantize_on_the_fly(&self, device: &Device) -> Result<Tensor> {
         let s = &self.original_shape;
         let total_el = s.iter().product::<usize>();
+        
+        // println!("[TRACE-QL] Dequantize params: shape={:?}, total={}", s, total_el);
+        
         let packed_cpu = self.packed_weight.to_device(&Device::Cpu)?;
         let scales_cpu = self.scales.to_device(&Device::Cpu)?;
         let packed_data = packed_cpu.to_vec1::<u32>()?;
@@ -386,86 +389,10 @@ impl QuantizedQwen3VLTextModel {
     }
 }
 
-pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _baking: bool) -> Result<HashMap<String, Tensor>> {
-    let file = std::fs::File::open(path)?;
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-    let safetensors = SafeTensors::deserialize(&mmap)?;
-    let mut tensors = HashMap::new();
-
-    for (name, view) in safetensors.tensors() {
-        println!("[DEBUG-LOAD] Tensor Key: {}", name);
-        let dtype = match view.dtype() {
-            safetensors::Dtype::BOOL => DType::U8,
-            safetensors::Dtype::U8 => DType::U8,
-            safetensors::Dtype::I8 => DType::U8, // [FIX] Reinterpret I8 as U8 for candle
-            safetensors::Dtype::I16 => DType::U32, // Not directly supported, but maybe not used
-            safetensors::Dtype::U16 => DType::U32, // Not directly supported
-            safetensors::Dtype::F16 => DType::F16,
-            safetensors::Dtype::BF16 => DType::BF16,
-            safetensors::Dtype::I32 => DType::I64, // Candle uses I64/U32
-            safetensors::Dtype::U32 => DType::U32,
-            safetensors::Dtype::F32 => DType::F32,
-            safetensors::Dtype::F64 => DType::F64,
-            safetensors::Dtype::I64 => DType::I64,
-            _ => return Err(anyhow!("Unsupported safetensor dtype: {:?}", view.dtype())),
-        };
-
-        let shape = view.shape().to_vec();
-        let data = view.data();
-        
-        let tensor = if dtype == DType::U8 && (view.dtype() == safetensors::Dtype::I8 || view.dtype() == safetensors::Dtype::BOOL) {
-             // Just load as U8, same byte size. 
-             Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-        } else {
-            // Standard load. Note: candle_core::safetensors::load uses more complex logic for some types.
-            // For bitserial we mostly care about U8 (packed) and F32 (scales).
-            match view.dtype() {
-                safetensors::Dtype::F32 => {
-                    let f_data: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
-                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::U32 => {
-                    let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
-                    Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::I32 => {
-                    let i_data: &[i32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const i32, data.len() / 4) };
-                    let i64_data: Vec<i64> = i_data.iter().map(|&x| x as i64).collect();
-                    Tensor::from_vec(i64_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::U8 => {
-                    Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::F16 => {
-                    let f_data: &[half::f16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2) };
-                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                safetensors::Dtype::BF16 => {
-                    let f_data: &[half::bf16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2) };
-                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
-                },
-                _ => {
-                    // Fallback to candle's internal if possible, or just error
-                    return Err(anyhow!("Manual loading for dtype {:?} not implemented", view.dtype()));
-                }
-            }
-        };
-        tensors.insert(name.to_string(), tensor);
-    }
-
-    Ok(tensors)
-}
-
-// [HELPER] Load Vision Tensors with correct Mapping
 pub fn load_vision_tensors_to_vb(ct: &gguf_file::Content, reader: &mut std::io::Cursor<&[u8]>, device: &Device, dtype: DType) -> Result<VarBuilder<'static>> {
     let mut data = HashMap::new();
     for (name, _) in ct.tensor_infos.iter() {
         if name.ends_with(".scales") || name.ends_with(".scale") || name.ends_with(".shape") { continue; }
-        
-        // Map keys: mm.0 -> visual.merger.linear_fc1, visual.blk.0 -> visual.blocks.0, etc.
-        // Or if the model expects "blocks.0" from its local root:
-        // We will construct a flat map like "blocks.0.attn.qkv.weight"
-        // and wrap it in a VB.
         
         let mut clean = name.to_string();
         if clean.starts_with("mm.") {
@@ -480,7 +407,6 @@ pub fn load_vision_tensors_to_vb(ct: &gguf_file::Content, reader: &mut std::io::
             clean = clean[2..].to_string();
         }
         
-        // Handle submodule mappings
         if clean.contains("attn_qkvisual") { clean = clean.replace("attn_qkvisual", "attn.qkv"); }
         if clean.contains("attn_out") { clean = clean.replace("attn_out", "attn.proj"); }
         if clean.contains("ffn_up") { clean = clean.replace("ffn_up", "mlp.linear_fc1"); }
@@ -512,10 +438,8 @@ impl QuantizedQwen3VLModel {
             let v_map = vmm.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut v_reader = std::io::Cursor::new(v_map);
             let vb_v = if !v_map.is_empty() {
-                // If we have a separate vision file (mmproj), load from it
                 load_vision_tensors_to_vb(_ctv, &mut v_reader, vd, dt)?
             } else {
-                // Otherwise load from main model file
                 let m_map = mm.as_ref().map(|m| &m[..]).unwrap_or(&[]);
                 let mut m_reader = std::io::Cursor::new(m_map);
                 load_vision_tensors_to_vb(ctm, &mut m_reader, vd, dt)?
@@ -575,4 +499,69 @@ impl QuantizedQwen3TextModel {
     pub fn save_kv_cache(&mut self, p: &Path, c: bool, b: usize) -> Result<()> { self.language_model.save_kv_cache(p, c, b) }
     pub fn load_kv_cache(&mut self, p: &Path, d: &Device, e: usize, u: usize) -> Result<()> { self.language_model.load_kv_cache(p, d, e, u) }
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
+}
+
+pub fn load_tensors_from_true_iq0(path: &Path, device: &Device, _dtype: DType, _baking: bool) -> Result<HashMap<String, Tensor>> {
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+    let safetensors = SafeTensors::deserialize(&mmap)?;
+    let mut tensors = HashMap::new();
+
+    for (name, view) in safetensors.tensors() {
+        println!("[DEBUG-LOAD] Tensor Key: {}", name);
+        let dtype = match view.dtype() {
+            safetensors::Dtype::BOOL => DType::U8,
+            safetensors::Dtype::U8 => DType::U8,
+            safetensors::Dtype::I8 => DType::U8, 
+            safetensors::Dtype::I16 => DType::U32,
+            safetensors::Dtype::U16 => DType::U32, 
+            safetensors::Dtype::F16 => DType::F16,
+            safetensors::Dtype::BF16 => DType::BF16,
+            safetensors::Dtype::I32 => DType::I64, 
+            safetensors::Dtype::U32 => DType::U32,
+            safetensors::Dtype::F32 => DType::F32,
+            safetensors::Dtype::F64 => DType::F64,
+            safetensors::Dtype::I64 => DType::I64,
+            _ => return Err(anyhow!("Unsupported safetensor dtype: {:?}", view.dtype())),
+        };
+
+        let shape = view.shape().to_vec();
+        let data = view.data();
+        
+        let tensor = if dtype == DType::U8 && (view.dtype() == safetensors::Dtype::I8 || view.dtype() == safetensors::Dtype::BOOL) {
+             Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+        } else {
+            match view.dtype() {
+                safetensors::Dtype::F32 => {
+                    let f_data: &[f32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, data.len() / 4) };
+                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+                },
+                safetensors::Dtype::U32 => {
+                    let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
+                    Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+                },
+                safetensors::Dtype::I32 => {
+                     let u_data: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, data.len() / 4) };
+                     Tensor::from_slice(u_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+                },
+                safetensors::Dtype::U8 => {
+                    Tensor::from_slice(data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+                },
+                safetensors::Dtype::F16 => {
+                    let f_data: &[half::f16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, data.len() / 2) };
+                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+                },
+                safetensors::Dtype::BF16 => {
+                    let f_data: &[half::bf16] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, data.len() / 2) };
+                    Tensor::from_slice(f_data, shape.as_slice(), &Device::Cpu)?.to_device(device)?
+                },
+                _ => {
+                    return Err(anyhow!("Manual loading for dtype {:?} not implemented", view.dtype()));
+                }
+            }
+        };
+        tensors.insert(name.to_string(), tensor);
+    }
+
+    Ok(tensors)
 }
