@@ -399,12 +399,26 @@ impl NativeQwen3VLModel {
             });
         }
         let norm = get_t("model.norm.weight")?;
+        
+        // [SMART-HEAD-LOADER] Handle tied weights (common in 2B models)
         let head_res = get_l("lm_head.weight", t_c.hidden_size, 151936)
             .or_else(|_| get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936))
-            .or_else(|_| get_l("model.lm_head.weight", t_c.hidden_size, 151936));
+            .or_else(|_| {
+                println!("[LOAD] lm_head not found, checking for tied weights in embed_tokens...");
+                get_l("model.embed_tokens.weight", 151936, t_c.hidden_size)
+                    .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))
+                    .map(|mut emb| {
+                        println!("[LOAD] Success! Using tied weights from embed_tokens for lm_head.");
+                        // Standard tied weights: embed[vocab, hidden] -> head[hidden, vocab]
+                        // Our BitSerial logic handles this via in_features/out_features swap during forward.
+                        emb.in_features = t_c.hidden_size;
+                        emb.out_features = 151936;
+                        emb
+                    })
+            });
             
         let head = head_res.map_err(|e| {
-            println!("[CRITICAL-LOAD-ERROR] ALL attempts to find lm_head tensor failed: {}.", e);
+            println!("[CRITICAL-LOAD-ERROR] ALL attempts to find lm_head or tied weights failed: {}.", e);
             anyhow!("LMHeadNotFound")
         })?;
 
