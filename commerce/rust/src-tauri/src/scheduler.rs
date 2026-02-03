@@ -250,6 +250,15 @@ async fn process_task(
     });
 
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
+
+    // [IMAGE-PIPELINE] Detect and handle pure image tasks first
+    if !image_path.is_empty() {
+        let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
+        model.extract_from_image(task.id.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
+        return Ok(());
+    }
+
     if url.is_empty() { return Ok(()); }
 
     // 2. Fetch & Convert to PUG
@@ -309,15 +318,13 @@ async fn process_task(
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
-        // [SCENARIO-A] 텍스트 전처리 베이킹
-        model.ingest_pug_to_ssd(&task.id, &light_pug, Some(cancellation_token.clone())).await?;
+        // [SCENARIO-A] 텍스트 전처리 베이킹 (0.6B 1-Layer)
+        model.bake_text_kv(&task.id, &light_pug, Some(cancellation_token.clone())).await?;
 
-        // [SCENARIO-A] 텍스트 전용 하이브리드 추론 준비
-        model.ensure_large_with_text_base(&task.id, Some(cancellation_token.clone())).await?;
-        
+        // [SCENARIO-A] 텍스트 전용 하이브리드 추론 (2B Full-Layer with Injected BitKV)
         let type_prompt = parsing::page_type_prompt();
         let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", type_prompt);
-        let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
+        let res = model.run_text_inference_full(&task.id, "", &task_question, Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_a_res")?;
         
         let type_info = parsing::parse_json_from_llm(&res);
@@ -334,7 +341,8 @@ async fn process_task(
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
         let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", selector_prompt);
-        let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
+        // [SCENARIO-A] 2B Full-Layer Inference (Reuse injected KV)
+        let res = model.run_text_inference_full(&task.id, "", &task_question, Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_b_res")?;
         selector_info = parsing::parse_json_from_llm(&res);
     }
@@ -382,7 +390,8 @@ async fn process_task(
         if !content_pug.trim().is_empty() {
              let extraction_instruction = parsing::item2json(&page_type, &url, "english");
              let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", extraction_instruction);
-             let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
+             // [SCENARIO-A] 2B Full-Layer Inference (Reuse injected KV)
+             let res = model.run_text_inference_full(&task.id, "", &task_question, Some(cancellation_token.clone())).await?;
              data_manager.offload(&res, "step_c_res")?;
              extracted_data = parsing::parse_json_from_llm(&res);
         }

@@ -275,16 +275,17 @@ impl LogisModel {
         Ok(())
     }
 
-    // --- [SCENARIO A] Text Preprocessing (HTML/PUG) ---
-    pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    // --- [SCENARIO A] Text Preprocessing (0.6B 1L Baking -> 2B Full Inference) ---
+    pub async fn bake_text_kv(&self, task_id: &str, content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let text_session = format!("{}_text", task_id);
+        println!("[BAKE-TEXT] Starting 0.6B 1-Layer Baking for task: {}", task_id);
         
-        // 1. Baking: 0.6B Small model, Text-Only
+        // 1. Baking: 0.6B Small model, 1-Layer, Text-Only
         self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true).await?;
 
         {
             let gen_clone = self.generator.clone();
-            let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
+            let prompt = format!("{}\n\n[SYSTEM] Analyze document structure.", content);
             let token_clone = cancel_token.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
@@ -295,23 +296,38 @@ impl LogisModel {
             }).await??;
         }
 
-        // 2. Save KV and Unload
+        // 2. Save BitKV and Unload
         self.save_kv_snapshot(&text_session).await?;
         self.unload_generator().await;
         Ok(())
     }
 
-    // --- [SCENARIO B] Image Preprocessing (Hybrid Double-Baking) ---
-    pub async fn ingest_image_to_ssd_hybrid(&self, task_id: &str, system_prompt: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn run_text_inference_full(&self, task_id: &str, system: &str, user: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        let text_session = format!("{}_text", task_id);
+        println!("[INFERENCE-TEXT] Starting 2B Full-Layer Inference with injected KV for task: {}", task_id);
+
+        // 1. Load 2B Full Model (Text-Only Mode for speed)
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true).await?;
+        
+        // 2. Inject Baked BitKV
+        self.load_stitched_kv(task_id, &["text"]).await?;
+
+        // 3. Chat with injected context (Prefill skipped internally by native_model)
+        self.chat(system, user, cancel_token, Some(text_session)).await
+    }
+
+    // --- [SCENARIO B] Image Preprocessing (0.6B 1L Bake -> 2B 1L Vision Bake -> 2B Full Inf) ---
+    pub async fn bake_image_kv(&self, task_id: &str, region: &str, language: &str, page_type: &str, address: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let sys_session = format!("{}_sys", task_id);
         let img_session = format!("{}_img", task_id);
+        let system_prompt = Self::get_image_extraction_prompt(region, language, page_type, address);
 
-        // [Step 1] System Prompt Baking: 0.6B Small model, Text-Only
-        println!("[HYBRID-BAKE] Step 1: Baking System Prompt with 0.6B...");
+        // [Step 1] System Prompt Baking: 0.6B Small model, 1-Layer, Text-Only
+        println!("[BAKE-IMAGE] Step 1: Baking System Prompt with 0.6B (1-Layer)...");
         self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true).await?;
         {
             let gen_clone = self.generator.clone();
-            let sys_text = system_prompt.to_string();
+            let sys_text = system_prompt.clone();
             let token_clone = cancel_token.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
@@ -324,25 +340,93 @@ impl LogisModel {
         self.save_kv_snapshot(&sys_session).await?;
         self.unload_generator().await;
 
-        // [Step 2] Image Data Baking: 2B Large model, Vision Enabled
-        println!("[HYBRID-BAKE] Step 2: Baking Image Data with 2B...");
+        // [Step 2] Image Data Baking: 2B Large model, 1-Layer (Strict Baking Mode), Vision Enabled
+        println!("[BAKE-IMAGE] Step 2: Baking Image Data with 2B (1-Layer Vision)...");
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), true, false).await?;
         {
             let _ = self.chat_with_image_spinner(
-                "[SYSTEM] Process Image Data.".to_string(), 
+                "[IMAGE-BAKE] Vision feature extraction.".to_string(), 
                 Some(image), 
                 &unsafe { std::mem::zeroed() }, 
                 "", 
                 json!({}), 
                 1, 
                 cancel_token.clone(), 
-                None // 이미지 자체의 순수 KV만 필요하므로 session_id 없이 prefill
+                None 
             ).await?;
         }
         self.save_kv_snapshot(&img_session).await?;
         self.unload_generator().await;
 
         Ok(())
+    }
+
+    pub async fn extract_from_image(
+        &self,
+        task_id: String,
+        image_path: String,
+        language: String,
+        app_handle: &tauri::AppHandle,
+        cancel_token: Option<Arc<AtomicBool>>,
+        store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
+    ) -> anyhow::Result<()> {
+        crate::scheduler::log_task_progress(app_handle, &task_id, &json!({
+            "category": "Image Loading", "summary": "Starting 3-step vision pipeline...", "spinner": "⠋"
+        }));
+
+        if let Ok(img) = image::open(&image_path) {
+            let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
+            
+            // 1 & 2. Bake KV (0.6B 1L Sys -> 2B 1L Img)
+            self.bake_image_kv(&task_id, "kr", &language, "tracking", "", dynamic_image, cancel_token.clone()).await?;
+
+            // 3. Full Inference (2B Full with Injected KV)
+            crate::scheduler::log_task_progress(app_handle, &task_id, &json!({
+                "category": "Vision Analysis", "summary": "Injecting baked cache & performing full inference..."
+            }));
+            
+            let result_str = self.run_hybrid_inference_full(&task_id, "Extract all structured information from the label.", cancel_token.clone()).await?;
+
+            let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
+            
+            let nl = crate::parsing::json_to_natural_language(&extracted_data);
+            let item_digest = crate::utils::hash::digest(&nl);
+
+            let store_guard = store_mutex.lock().await;
+            if let Some(db) = store_guard.as_ref() {
+                let from_addr = "0x0000000000000000000000000000000000000000";
+                let team_id = crate::utils::hash::hash_id(from_addr);
+                let hashed_cc = crate::utils::hash::hash_id("local.image");
+                let raw_no = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
+                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
+                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_no)));
+                let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
+                let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
+                let mut final_data = extracted_data.clone();
+                final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
+                final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
+
+                let _ = db.upsert_item(
+                    "commerce_tracking", &hashed_id, "tracking", final_data, None,
+                    Some(from_addr), Some(&team_id), Some(&hashed_cc),
+                    Some(&crate::utils::hash::hash_id(&format!("tracking{}", hashed_cc))),
+                    Some(&ref_val), Some(&item_digest)
+                ).await;
+            }
+            
+            let _ = app_handle.emit("extraction-progress", json!({ 
+               "task_id": task_id.clone(),
+               "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
+            }));
+            
+            Ok(())
+        } else {
+            let _ = app_handle.emit("extraction-progress", json!({ 
+               "task_id": task_id.clone(),
+               "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
+            }));
+            Ok(())
+        }
     }
 
     // --- [HYBRID UTILS] Combined KV Loading ---
@@ -974,19 +1058,6 @@ Return valid JSON only. No explanation.
         let extracted_data = crate::parsing::parse_json_from_llm(&response);
         
         Ok(extracted_data)
-    }
-
-    // --- [INFERENCE PREP] ---
-    pub async fn ensure_large_with_text_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        // [텍스트 전용] 2B 모델 로드 (비전 차단) -> 0.6B로 구운 'text' 레이어 0 로드
-        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token, false, true).await?;
-        self.load_stitched_kv(task_id, &["text"]).await
-    }
-
-    pub async fn ensure_large_with_hybrid_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        // [이미지 포함] 2B 모델 로드 (비전 포함) -> 0.6B의 'sys' + 2B의 'img' 레이어 0을 합쳐서 로드
-        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token, false, false).await?;
-        self.load_stitched_kv(task_id, &["sys", "img"]).await
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
