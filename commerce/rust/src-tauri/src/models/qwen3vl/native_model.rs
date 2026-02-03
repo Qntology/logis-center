@@ -31,6 +31,13 @@ impl NativeLinear {
                 #[cfg(feature = "cuda")]
                 {
                     if self.device_id >= 0 && weight_packed.gpu_ptr.is_some() {
+                        static mut PRINT_COUNT: i32 = 0;
+                        unsafe {
+                            if PRINT_COUNT < 1 {
+                                println!("[BACKEND] Linear -> GPU Active (Bit-serial CUDA)");
+                                PRINT_COUNT += 1;
+                            }
+                        }
                         let mut res = bit_serial_matmul_gpu(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize);
                         if let Some(b) = bias { 
                             let b_cow = b.get_slice::<f16>();
@@ -41,6 +48,7 @@ impl NativeLinear {
                     }
                 }
 
+                println!("[BACKEND] Linear -> CPU Fallback (Bit-serial AVX2/Rayon)");
                 let wp_cow = weight_packed.get_slice::<u32>(); 
                 let s_cow = scales.get_slice::<f16>();
                 let mut out = bit_serial_matmul_f32_extreme(x, wp_cow.as_ref(), s_cow.as_ref(), m, self.out_features, self.in_features);
@@ -62,8 +70,12 @@ impl NativeLinear {
     }
     pub fn move_to_gpu(&mut self, device_id: i32) {
         self.device_id = device_id;
-        if let LinearVariant::BitSerial { weight_packed, .. } = &mut self.variant {
-            #[cfg(feature = "cuda")] weight_packed.move_to_gpu(device_id);
+        if let LinearVariant::BitSerial { weight_packed, scales, .. } = &mut self.variant {
+            #[cfg(feature = "cuda")] 
+            {
+                weight_packed.move_to_gpu(device_id);
+                scales.move_to_gpu(device_id);
+            }
         }
     }
 }
@@ -117,6 +129,7 @@ impl NativeLayer {
             use cudarc::driver::sys::*;
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
+                println!("[BACKEND] Attention -> GPU (Allocating VRAM KV Cache)");
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
                     let cuda_lib = lib();
@@ -260,6 +273,7 @@ impl NativeQwen3VLModel {
                 target.to_string(),
                 target.replace("model.", "model.language_model."),
                 target.replace("model.layers", "model.language_model.layers"),
+                target.replace("lm_head", "model.lm_head"),
                 format!("model.language_model.{}", target.replace("model.", ""))
             ];
             for v in variations {
@@ -321,9 +335,17 @@ impl NativeQwen3VLModel {
             });
         }
         let norm = get_t("model.norm.weight")?;
-        let head = get_l("lm_head.weight", t_c.hidden_size, 151936)
+        let head_res = get_l("lm_head.weight", t_c.hidden_size, 151936)
             .or_else(|_| get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936))
-            .unwrap_or_else(|_| NativeLinear { in_features: t_c.hidden_size, out_features: 1, variant: LinearVariant::Standard { weight: norm.clone(), bias: None }, device_id: -1 });
+            .or_else(|_| get_l("model.lm_head.weight", t_c.hidden_size, 151936));
+            
+        let head = match head_res {
+            Ok(h) => h,
+            Err(e) => {
+                println!("[CRITICAL-LOAD-ERROR] Failed to find lm_head tensor: {}. Falling back to norm-based dummy.", e);
+                NativeLinear { in_features: t_c.hidden_size, out_features: 151936, variant: LinearVariant::Standard { weight: norm.clone(), bias: None }, device_id: -1 }
+            }
+        };
 
         let visual = if let Some(vm) = v_mmap {
             let vst = SafeTensors::deserialize(&vm)?;

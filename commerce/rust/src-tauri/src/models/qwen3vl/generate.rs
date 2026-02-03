@@ -137,7 +137,19 @@ impl Qwen3VLGenerateModel {
         };
 
         let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only)?;
-        let qwen3_vl = ModelVariant::Native(Arc::new(native_model));
+        let mut qwen3_vl_native = Arc::new(native_model);
+
+        // [CRITICAL] Move to GPU immediately while reference count is 1
+        if _text_device_id < 8 { // Valid GPU ID check (0-7)
+            println!("[LOAD] Moving Native Model to GPU-{}...", _text_device_id);
+            if let Some(m) = Arc::get_mut(&mut qwen3_vl_native) {
+                m.move_to_gpu(_text_device_id as i32);
+            } else {
+                println!("[ERROR] Failed to get mutable reference for GPU offloading during initialization.");
+            }
+        }
+
+        let qwen3_vl = ModelVariant::Native(qwen3_vl_native);
 
         let pre_processor = Qwen3VLProcessor::new_native(tok_path)?;
 
@@ -185,11 +197,15 @@ impl Qwen3VLGenerateModel {
             
             all_ids.push(next_id);
             let new_word = self.tokenizer.token_decode(vec![next_id])?;
+            print!("{}", new_word); 
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
             generated_text.push_str(&new_word);
             
             seqlen_offset += input_ids.len();
         }
 
+        println!("\n[INFERENCE-RESULT] {}", generated_text);
         Ok(generated_text)
     }
 
@@ -258,6 +274,10 @@ impl Qwen3VLGenerateModel {
 
     fn sample_greedy(&self, logits: &[f16]) -> u32 {
         let vocab_size = 151936;
+        if logits.len() < vocab_size {
+            println!("[ERROR] Logits length ({}) is smaller than vocab_size ({})", logits.len(), vocab_size);
+            return 0; // Fallback to safe token
+        }
         let last_logits = &logits[logits.len() - vocab_size ..];
         let mut max_val = f32::MIN;
         let mut max_idx = 0;
@@ -273,7 +293,12 @@ impl Qwen3VLGenerateModel {
             ModelVariant::Native(m) => {
                 let cache = m.text_model.layers[0].kv_cache.lock().unwrap();
                 if let Some((k, _)) = cache.as_ref() {
-                    k.len() / (m.text_model.config.num_key_value_heads * m.text_model.config.head_dim)
+                    let head_dim = m.text_model.config.head_dim;
+                    let n_kv = m.text_model.config.num_key_value_heads;
+                    // Bit-serial packing: Each u32 stores 32 bits (signs)
+                    // k.len() is number of u32s. Total bits = k.len() * 32.
+                    // seq_len = Total bits / (n_kv * head_dim)
+                    (k.len() * 32) / (n_kv * head_dim)
                 } else { 0 }
             }
         }

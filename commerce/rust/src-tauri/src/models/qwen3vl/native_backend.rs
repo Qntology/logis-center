@@ -74,13 +74,28 @@ impl NativeTensor {
     #[cfg(feature = "cuda")]
     pub fn move_to_gpu(&mut self, device_id: i32) {
         if self.gpu_ptr.is_some() { return; }
-        let size = self.shape.iter().product::<usize>() * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
+        
+        let size_raw = self.shape.iter().product::<usize>();
         unsafe {
             let mut ptr: CUdeviceptr = 0;
             let lib = lib();
-            let _ = lib.cuMemAlloc_v2(&mut ptr, size);
-            let _ = lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size);
-            self.gpu_ptr = Some(GpuPtr(ptr as *mut _)); self.device_id = device_id;
+            
+            // [OPTIMIZATION] If dtype is F16 but we need F32 on GPU (for scales), convert during transfer
+            if self.dtype == NativeDType::F16 && self.shape.last() == Some(&1) {
+                let data_f16 = self.get_slice::<f16>();
+                let data_f32: Vec<f32> = data_f16.iter().map(|v| v.to_f32()).collect();
+                let size_bytes = data_f32.len() * 4;
+                let _ = lib.cuMemAlloc_v2(&mut ptr, size_bytes);
+                let _ = lib.cuMemcpyHtoD_v2(ptr, data_f32.as_ptr() as *const _, size_bytes);
+                println!("[GPU-PIN] Transferred & Converted F16->F32 scale tensor to GPU");
+            } else {
+                let size_bytes = size_raw * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
+                let _ = lib.cuMemAlloc_v2(&mut ptr, size_bytes);
+                let _ = lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size_bytes);
+            }
+            
+            self.gpu_ptr = Some(GpuPtr(ptr as *mut _)); 
+            self.device_id = device_id;
         }
     }
 }
@@ -101,12 +116,22 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
     unsafe {
         let lib = lib();
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
+        
+        // [TODO] Use a persistent scratch buffer for Q and O to avoid Alloc/Free
         let q_f32: Vec<f32> = q.iter().map(|v| v.to_f32()).collect();
-        lib.cuMemAlloc_v2(&mut d_q, q.len() * 4); lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
+        lib.cuMemAlloc_v2(&mut d_q, q.len() * 4); 
+        lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
+        
         lib.cuMemAlloc_v2(&mut d_o, q.len() * 4);
+        
         bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32);
-        let mut o_f = vec![0.0f32; q.len()]; lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);
-        lib.cuMemFree_v2(d_q); lib.cuMemFree_v2(d_o);
+        
+        let mut o_f = vec![0.0f32; q.len()]; 
+        lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);
+        
+        lib.cuMemFree_v2(d_q); 
+        lib.cuMemFree_v2(d_o);
+        
         o_f.into_iter().map(f16::from_f32).collect()
     }
 }
@@ -115,16 +140,28 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
 pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: usize, n: usize, k: usize, dev: usize) -> Vec<f16> {
     unsafe {
         let lib = lib();
-        let mut d_i: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0; let mut d_s: CUdeviceptr = 0;
+        let mut d_i: CUdeviceptr = 0; 
+        let mut d_o: CUdeviceptr = 0;
+        
+        // Input: Still need to convert and transfer (unless we pre-pack inputs)
         let i_f32: Vec<f32> = i.iter().map(|v| v.to_f32()).collect();
-        lib.cuMemAlloc_v2(&mut d_i, m * k * 4); lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
+        lib.cuMemAlloc_v2(&mut d_i, m * k * 4); 
+        lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
+        
         lib.cuMemAlloc_v2(&mut d_o, m * n * 4);
-        let s_data = s.get_slice::<f16>();
-        let s_f32: Vec<f32> = s_data.iter().map(|v| v.to_f32()).collect();
-        lib.cuMemAlloc_v2(&mut d_s, n * 4); lib.cuMemcpyHtoD_v2(d_s, s_f32.as_ptr() as *const _, n * 4);
-        bit_serial_matmul_cuda_direct(d_i as *const f32, w.gpu_ptr.unwrap().0 as *const u32, d_s as *const f32, d_o as *mut f32, m as i32, n as i32, k as i32, dev as i32);
-        let mut o_f = vec![0.0f32; m * n]; lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
-        lib.cuMemFree_v2(d_i); lib.cuMemFree_v2(d_o); lib.cuMemFree_v2(d_s);
+        
+        // [CRITICAL-FIX] Reuse pre-allocated GPU pointers for Weights and Scales
+        let d_w = w.gpu_ptr.expect("Weight must be on GPU").0 as *const u32;
+        let d_s = s.gpu_ptr.expect("Scale must be on GPU").0 as *const f32;
+        
+        bit_serial_matmul_cuda_direct(d_i as *const f32, d_w, d_s, d_o as *mut f32, m as i32, n as i32, k as i32, dev as i32);
+        
+        let mut o_f = vec![0.0f32; m * n]; 
+        lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
+        
+        lib.cuMemFree_v2(d_i); 
+        lib.cuMemFree_v2(d_o);
+        
         o_f.into_iter().map(f16::from_f32).collect()
     }
 }

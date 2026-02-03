@@ -503,39 +503,13 @@ impl LogisModel {
             )
         }).await??;
 
-        // [HYBRID-ACTIVATION] Choose between Path 1 (GPU) and Path 2 (Optimized CPU)
+        // [GPU-ACTIVATION-LOG] Status reporting only
         if !self.is_cpu_mode {
-            let gpu_id = self.device_config.gpu_id as i32;
-            println!("[MODEL] Offloading to GPU-{} (Path 1: Max Speed)...", gpu_id);
-            if let Some(m) = Arc::get_mut(gen.qwen3_vl.get_native_mut()) {
-                m.move_to_gpu(gpu_id);
-            } else {
-                println!("[WARNING] Could not get mutable reference to model for GPU offloading.");
-            }
+            println!("[MODEL] Offloading to GPU-{} (Integrated Path)...", self.device_config.gpu_id);
         } else {
-            println!("[MODEL] Staying on CPU (Path 2: Extreme Optimized Bit-serial)...");
+            println!("[MODEL] Staying on CPU (Extreme Optimized Bit-serial Path)...");
         }
 
-        // [GPU-ACTIVATION] Move layers to VRAM for high-speed baking/inference
-        if !self.is_cpu_mode {
-            let gpu_id = self.device_config.gpu_id as i32;
-            println!("[MODEL] Offloading layers to GPU-{}...", gpu_id);
-            match &mut gen.qwen3_vl {
-                ModelVariant::Native(m_arc) => {
-                    // We need a mutable reference to move to GPU. 
-                    // Since it's an Arc, we use get_mut or redesign. 
-                    // For now, let's ensure the move happens inside the generator's initialization or via a proxy.
-                    if let Some(m) = Arc::get_mut(&mut gen.qwen3_vl.get_native_mut()) {
-                        m.move_to_gpu(gpu_id);
-                    } else {
-                        // Fallback: If shared, we can't move. But fresh loads are not shared.
-                        println!("[WARNING] Could not get mutable ref to model for GPU offloading.");
-                    }
-                }
-            }
-        }
-
-        // ... 나머지 캐싱 로직 ...
         if let Some(old_m) = gen_guard.take() {
             if let Some(old_size) = *current_size_guard {
                 match old_size {
