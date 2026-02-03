@@ -230,12 +230,23 @@ impl NativeQwen3TextModel {
                 let w_cow = weight.get_slice::<f16>();
                 native_embedding_lookup_f16(input_ids, w_cow.as_ref(), hid)
             },
-            _ => vec![f16::ZERO; input_ids.len() * hid],
+            LinearVariant::BitSerial { weight_packed, .. } => {
+                // If quantized embedding is used, we still need a lookup. 
+                // For now, most embeddings are Standard f16.
+                let w_cow = weight_packed.get_slice::<f16>();
+                native_embedding_lookup_f16(input_ids, w_cow.as_ref(), hid)
+            }
         };
         let mut cur_x = x;
         for (i, layer) in self.layers.iter().enumerate() { cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i); }
         let norm_cow = self.norm.get_slice::<f16>();
         native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid)
+    }
+
+    pub fn move_to_gpu(&mut self, device_id: i32) {
+        self.embed_tokens.move_to_gpu(device_id);
+        self.norm.move_to_gpu(device_id);
+        for layer in &mut self.layers { layer.move_to_gpu(device_id); }
     }
 
     pub fn clear_kv_cache(&self) {
@@ -262,6 +273,14 @@ pub struct NativeVisionModel {
 
 unsafe impl Send for NativeVisionModel {}
 unsafe impl Sync for NativeVisionModel {}
+
+impl NativeVisionModel {
+    pub fn move_to_gpu(&mut self, device_id: i32) {
+        self.patch_embed.move_to_gpu(device_id);
+        for block in &mut self.blocks { block.move_to_gpu(device_id); }
+        self.merger.move_to_gpu(device_id);
+    }
+}
 
 impl NativeQwen3VLModel {
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool) -> Result<Self> {
@@ -436,8 +455,13 @@ impl NativeQwen3VLModel {
     pub fn forward(&self, i_ids: &[u32], _p_v: Option<&[f16]>, _g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
         let x = self.text_model.forward(i_ids, s_o); self.lm_head.forward(&x)
     }
-    pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
-    pub fn move_to_gpu(&mut self, device_id: i32) {
-        for layer in &mut self.text_model.layers { layer.move_to_gpu(device_id); }
+        pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
+        pub fn move_to_gpu(&mut self, device_id: i32) {
+            self.text_model.move_to_gpu(device_id);
+            self.lm_head.move_to_gpu(device_id);
+            if let Some(ref mut v) = self.visual {
+                v.move_to_gpu(device_id);
+            }
+        }
     }
-}
+    
