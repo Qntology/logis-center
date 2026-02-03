@@ -150,6 +150,7 @@ pub fn native_rms_norm_f16(input: &[f16], weight: &[f16], eps: f32, hidden_size:
         let inv_std = 1.0 / (variance + eps).sqrt();
 
         for j in 0..hidden_size {
+            if j >= weight.len() { break; } // [SAFETY] Prevent index out of bounds
             let val = in_row[j].to_f32() * inv_std * weight[j].to_f32();
             out_row[j] = f16::from_f32(val);
         }
@@ -223,8 +224,9 @@ pub fn native_add_pos_embed_f16(
     num_grid_per_side: u32,
     hidden_size: usize,
 ) {
+    let num_pos = pos_embed.len() / hidden_size;
     x.par_chunks_exact_mut(hidden_size).enumerate().for_each(|(i, patch)| {
-        let p_idx = i % pos_embed.len();
+        let p_idx = i % num_pos;
         for d in 0..hidden_size {
             let val = patch[d].to_f32() + pos_embed[p_idx * hidden_size + d].to_f32();
             patch[d] = f16::from_f32(val);

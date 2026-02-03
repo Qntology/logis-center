@@ -60,44 +60,50 @@ impl Qwen3VLGenerateModel {
 
         let chat_template = ChatTemplate::init(tok_path)?;
         let tokenizer = TokenizerModel::init(tok_path)?;
-        let final_config_path = Path::new(cfg_path).join("config.json");
-        let raw_config_bytes = std::fs::read(&final_config_path)?;
-        let raw_json: Value = serde_json::from_slice(&raw_config_bytes)?;
+        
+        // [FIX] Load Text Config from Text Model Directory (path) to match weights
+        let text_config_path = path_obj.join("config.json");
+        let text_raw_bytes = std::fs::read(&text_config_path)?;
+        let text_json: Value = serde_json::from_slice(&text_raw_bytes)?;
+        
+        // [FIX] Load Vision Config from Vision Model Directory (cfg_path)
+        let vision_config_path = Path::new(cfg_path).join("config.json");
+        let vision_raw_bytes = std::fs::read(&vision_config_path)?;
+        let vision_json: Value = serde_json::from_slice(&vision_raw_bytes)?;
 
-        // [ROBUST-CONFIG] Handle both flat (0.6B) and nested (VL-2B) formats
-        let vl_config: Qwen3VLConfig = if raw_json.get("text_config").is_some() {
-            serde_json::from_value(raw_json)?
+        // [ROBUST-CONFIG] Merge configurations: Text params from 0.6B, Vision params from 2B
+        let mut vl_config: Qwen3VLConfig = if vision_json.get("text_config").is_some() {
+            serde_json::from_value(vision_json)?
         } else {
-            let text_cfg = crate::models::qwen3vl::config::Qwen3VLTextConfig {
-                hidden_size: raw_json.get("hidden_size").and_then(|v: &Value| v.as_u64()).unwrap_or(1024) as usize,
-                intermediate_size: raw_json.get("intermediate_size").and_then(|v: &Value| v.as_u64()).unwrap_or(3072) as usize,
-                num_hidden_layers: raw_json.get("num_hidden_layers").and_then(|v: &Value| v.as_u64()).unwrap_or(28) as usize,
-                num_attention_heads: raw_json.get("num_attention_heads").and_then(|v: &Value| v.as_u64()).unwrap_or(16) as usize,
-                num_key_value_heads: raw_json.get("num_key_value_heads").and_then(|v: &Value| v.as_u64()).unwrap_or(8) as usize,
-                head_dim: raw_json.get("head_dim").and_then(|v: &Value| v.as_u64()).unwrap_or(128) as usize,
-                rms_norm_eps: raw_json.get("rms_norm_eps").and_then(|v: &Value| v.as_f64()).unwrap_or(1e-6),
-                rope_theta: raw_json.get("rope_theta").and_then(|v: &Value| v.as_f64()).unwrap_or(1000000.0) as f32,
-                vocab_size: raw_json.get("vocab_size").and_then(|v: &Value| v.as_u64()).unwrap_or(151936) as usize,
-                max_position_embeddings: raw_json.get("max_position_embeddings").and_then(|v: &Value| v.as_u64()).unwrap_or(40960) as usize,
-                dtype: raw_json.get("torch_dtype").and_then(|v: &Value| v.as_str()).map(|s: &str| s.to_string()),
+            // Fallback for flat config, but we must override text params
+            serde_json::from_value(vision_json.clone())?
+        };
+
+        // OVERRIDE text_config with the actual 0.6B parameters
+        let correct_text_config = if text_json.get("text_config").is_some() {
+             serde_json::from_value(text_json.get("text_config").unwrap().clone())?
+        } else {
+             // Flat config (0.6B style)
+             crate::models::qwen3vl::config::Qwen3VLTextConfig {
+                hidden_size: text_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(1024) as usize,
+                intermediate_size: text_json.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(3072) as usize,
+                num_hidden_layers: text_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(28) as usize,
+                num_attention_heads: text_json.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
+                num_key_value_heads: text_json.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
+                head_dim: text_json.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
+                rms_norm_eps: text_json.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6),
+                rope_theta: text_json.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1000000.0) as f32,
+                vocab_size: text_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(151936) as usize,
+                max_position_embeddings: text_json.get("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(40960) as usize,
+                dtype: text_json.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 rope_scaling: None,
-            };
-            crate::models::qwen3vl::config::Qwen3VLConfig {
-                architectures: raw_json.get("architectures").and_then(|v: &Value| v.as_array()).map(|a: &Vec<Value>| a.iter().filter_map(|v: &Value| v.as_str().map(|s: &str| s.to_string())).collect()),
-                auto_map: raw_json.get("auto_map").cloned(),
-                hidden_size: raw_json.get("hidden_size").and_then(|v: &Value| v.as_u64()).map(|v: u64| v as usize),
-                image_token_id: None,
-                model_type: "qwen3".to_string(),
-                text_config: Some(text_cfg),
-                tie_word_embeddings: raw_json.get("tie_word_embeddings").and_then(|v: &Value| v.as_bool()).unwrap_or(true),
-                torch_dtype: raw_json.get("torch_dtype").and_then(|v: &Value| v.as_str()).map(|s: &str| s.to_string()),
-                transformers_version: raw_json.get("transformers_version").and_then(|v: &Value| v.as_str()).unwrap_or("").to_string(),
-                video_token_id: None,
-                vision_config: None,
-                vision_start_token_id: None,
-                vision_end_token_id: None,
             }
         };
+        
+        vl_config.text_config = Some(correct_text_config);
+        
+        // Ensure hidden_size at root matches text config for consistency
+        vl_config.hidden_size = Some(vl_config.text_config.as_ref().unwrap().hidden_size);
 
         // [HYBRID-FILE-SELECTION] 
         // 텍스트는 path(0.6B)에서, 비전은 config_path(2B-VL)에서 가져옴
@@ -118,7 +124,7 @@ impl Qwen3VLGenerateModel {
             let vision_file = std::fs::File::open(vision_path)?;
             Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? })
         } else {
-            let placeholder_file = std::fs::File::open(&final_config_path)?;
+            let placeholder_file = std::fs::File::open(&vision_config_path)?;
             Arc::new(unsafe { memmap2::MmapOptions::new().map(&placeholder_file)? })
         };
 
