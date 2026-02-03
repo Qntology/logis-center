@@ -31,8 +31,8 @@ impl NativeLinear {
                 let s = scales.get_slice::<f16>();
                 let b = bias.as_ref().map(|t| t.get_slice::<f16>());
                 
-                let x_f32: Vec<f32> = x.iter().map(|&v| v.to_f32()).collect();
-                let mut out_f32 = bit_serial_matmul_f32(&x_f32, wp, s, m, self.out_features, self.in_features);
+                // [OPTIMIZATION] Pass f16 slice directly, avoid alloc
+                let mut out_f32 = bit_serial_matmul_f32(x, wp, s, m, self.out_features, self.in_features);
                 
                 if let Some(bias_data) = b {
                     for i in 0..m {

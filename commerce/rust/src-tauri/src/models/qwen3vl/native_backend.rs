@@ -1,43 +1,10 @@
-// --- CUDA Interface ---
-
-#[cfg(feature = "cuda")]
-extern "C" {
-    fn bit_serial_matmul_kernel_wrapper(
-        input: *const f32,
-        weight: *const u32,
-        scales: *const f32,
-        output: *mut f32,
-        m: i32, n: i32, k: i32
-    );
-}
-
-pub fn bit_serial_matmul_gpu(
-    input: &[f32],
-    weight_packed: &[u32],
-    scales: &[f32],
-    m: usize, n: usize, k: usize
-) -> Vec<f32> {
-    #[cfg(feature = "cuda")]
-    unsafe {
-        let mut output = vec![0.0f32; m * n];
-        bit_serial_matmul_kernel_wrapper(
-            input.as_ptr(),
-            weight_packed.as_ptr(),
-            scales.as_ptr(),
-            output.as_mut_ptr(),
-            m as i32, n as i32, k as i32
-        );
-        output
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        panic!("CUDA support not enabled");
-    }
-}
 use std::sync::Arc;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use half::f16;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NativeDType {
@@ -273,49 +240,132 @@ pub fn native_vision_attn_f16(
     output
 }
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+// --- SIMD Accelerated Bit Operations ---
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-pub unsafe fn pack_f32_to_u32_avx2(src: *const f32) -> u32 {
-    let zero = _mm256_setzero_ps();
-    let m0 = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(src), zero, _CMP_GE_OQ)) as u32;
-    let m1 = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(src.add(8)), zero, _CMP_GE_OQ)) as u32;
-    let m2 = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(src.add(16)), zero, _CMP_GE_OQ)) as u32;
-    let m3 = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(src.add(24)), zero, _CMP_GE_OQ)) as u32;
-    m0 | (m1 << 8) | (m2 << 16) | (m3 << 24)
+unsafe fn pack_f16_to_u32_avx2(src: *const f16) -> u32 {
+    // 1. Load 8 f16s (128-bit)
+    let v_half = _mm_loadu_si128(src as *const __m128i);
+    // 2. Convert to 8 f32s (256-bit) - Requires F16C instruction set (Standard with AVX2)
+    let v_float = _mm256_cvtph_ps(v_half);
+    // 3. Compare >= 0.0
+    let v_cmp = _mm256_cmp_ps(v_float, _mm256_setzero_ps(), _CMP_GE_OQ);
+    // 4. Movemask to get 8 bits
+    _mm256_movemask_ps(v_cmp) as u32
 }
 
 pub fn bit_serial_matmul_f32(
-    input: &[f32],
+    input: &[f16],
     weight_packed: &[u32],
     scales: &[f16], 
     m: usize, n: usize, k: usize,
 ) -> Vec<f32> {
     let mut output = vec![0.0f32; m * n];
     let k_blocks = k / 32;
+    
+    // [OPTIMIZATION] Parallelize over Output Rows (m), but compute blocks of columns (n)
+    // to improve cache locality for Input.
     output.par_chunks_mut(n).enumerate().for_each(|(i, row_out)| {
-        let input_ptr = unsafe { input.as_ptr().add(i * k) };
+        let input_offset = i * k;
+        let input_row = &input[input_offset .. input_offset + k];
+        
+        // 1. Pack Input Row (F16 -> U32 bits)
+        // Using stack-allocated vector to avoid heap allocation overhead in loop
         let mut input_packed = vec![0u32; k_blocks];
-        for kb in 0..k_blocks {
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_x86_feature_detected!("avx2") { input_packed[kb] = unsafe { pack_f32_to_u32_avx2(input_ptr.add(kb * 32)) }; }
-                else { let mut bits = 0u32; let row = unsafe { std::slice::from_raw_parts(input_ptr.add(kb * 32), 32) }; for b in 0..32 { if row[b] >= 0.0 { bits |= 1 << b; } } input_packed[kb] = bits; }
+        
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("f16c") {
+                let mut kb = 0;
+                // Process 32 elements at a time (4 * 8-bit AVX packs)
+                while kb < k_blocks {
+                    unsafe {
+                        let ptr = input_row.as_ptr().add(kb * 32);
+                        // Unroll 4 AVX2 calls to fill one u32 (32 bits)
+                        let b0 = pack_f16_to_u32_avx2(ptr);
+                        let b1 = pack_f16_to_u32_avx2(ptr.add(8));
+                        let b2 = pack_f16_to_u32_avx2(ptr.add(16));
+                        let b3 = pack_f16_to_u32_avx2(ptr.add(24));
+                        input_packed[kb] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                    }
+                    kb += 1;
+                }
+            } else {
+                // Fallback for non-AVX2
+                for kb in 0..k_blocks {
+                    let mut bits = 0u32;
+                    let start = kb * 32;
+                    for b in 0..32 {
+                        if input_row[start + b].to_f32() >= 0.0 { bits |= 1 << b; }
+                    }
+                    input_packed[kb] = bits;
+                }
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            { let mut bits = 0u32; let row = unsafe { std::slice::from_raw_parts(input_ptr.add(kb * 32), 32) }; for b in 0..32 { if row[b] >= 0.0 { bits |= 1 << b; } } input_packed[kb] = bits; }
         }
-        for j in 0..n {
-            let mut total_dot = 0i32;
-            let weight_row = &weight_packed[j * k_blocks .. (j + 1) * k_blocks];
-            let scale = scales[j].to_f32();
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            // ARM / Others
             for kb in 0..k_blocks {
-                let xor_val = input_packed[kb] ^ weight_row[kb];
-                total_dot += 32 - 2 * (xor_val.count_ones() as i32);
+                let mut bits = 0u32;
+                let start = kb * 32;
+                for b in 0..32 {
+                    if input_row[start + b].to_f32() >= 0.0 { bits |= 1 << b; }
+                }
+                input_packed[kb] = bits;
             }
-            row_out[j] = (total_dot as f32) * scale;
+        }
+
+        // 2. Blocked Matrix Multiplication
+        // Process columns in blocks of 4 to allow loop unrolling and better pipelining
+        let mut j = 0;
+        while j + 4 <= n {
+            let mut dot0 = 0i32; let mut dot1 = 0i32;
+            let mut dot2 = 0i32; let mut dot3 = 0i32;
+            
+            let idx0 = j * k_blocks;
+            let w_ptr0 = &weight_packed[idx0 .. idx0 + k_blocks];
+            let idx1 = (j+1) * k_blocks;
+            let w_ptr1 = &weight_packed[idx1 .. idx1 + k_blocks];
+            let idx2 = (j+2) * k_blocks;
+            let w_ptr2 = &weight_packed[idx2 .. idx2 + k_blocks];
+            let idx3 = (j+3) * k_blocks;
+            let w_ptr3 = &weight_packed[idx3 .. idx3 + k_blocks];
+
+            for kb in 0..k_blocks {
+                let inp = input_packed[kb];
+                let x0 = inp ^ w_ptr0[kb];
+                let x1 = inp ^ w_ptr1[kb];
+                let x2 = inp ^ w_ptr2[kb];
+                let x3 = inp ^ w_ptr3[kb];
+                
+                dot0 += x0.count_ones() as i32;
+                dot1 += x1.count_ones() as i32;
+                dot2 += x2.count_ones() as i32;
+                dot3 += x3.count_ones() as i32;
+            }
+            
+            // Formula: dot = (32*k_blocks) - 2*popcnt(XOR)
+            let total_bits = (k_blocks * 32) as i32;
+            row_out[j]   = ((total_bits - 2 * dot0) as f32) * scales[j].to_f32();
+            row_out[j+1] = ((total_bits - 2 * dot1) as f32) * scales[j+1].to_f32();
+            row_out[j+2] = ((total_bits - 2 * dot2) as f32) * scales[j+2].to_f32();
+            row_out[j+3] = ((total_bits - 2 * dot3) as f32) * scales[j+3].to_f32();
+            
+            j += 4;
+        }
+
+        // Handle remaining columns
+        while j < n {
+            let mut dot = 0i32;
+            let idx = j * k_blocks;
+            let w_ptr = &weight_packed[idx .. idx + k_blocks];
+            for kb in 0..k_blocks {
+                dot += (input_packed[kb] ^ w_ptr[kb]).count_ones() as i32;
+            }
+            let total_bits = (k_blocks * 32) as i32;
+            row_out[j] = ((total_bits - 2 * dot) as f32) * scales[j].to_f32();
+            j += 1;
         }
     });
     output
