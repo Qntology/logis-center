@@ -85,7 +85,7 @@ pub fn log_task_progress(app_handle: &tauri::AppHandle, task_id: &str, payload: 
 
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
-    model: Arc<LogisModel>, 
+    model: Arc<Mutex<Option<LogisModel>>>, 
     cancellation_token: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
 ) {
@@ -166,7 +166,13 @@ pub async fn start_background_worker(
                     Err(e) => {
                         let err_msg = e.to_string();
                         // Emergency Cleanup
-                        model.deep_purge_resources().await;
+                        {
+                            let mut model_lock = model.lock().await;
+                            if let Some(m) = model_lock.as_ref() {
+                                m.unload_generator().await;
+                            }
+                            *model_lock = None;
+                        }
                         
                         if err_msg.contains("Task cancelled") {
                             let store_guard = store.lock().await;
@@ -179,12 +185,11 @@ pub async fn start_background_worker(
                         } else {
                             println!("[Scheduler] Task failed: {}. Error: {}", task.id, err_msg);
                             
-                            // OOM Recovery Logic
                             if err_msg.contains("out of memory") || err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") {
                                 println!("[Scheduler] OOM Detected! Forcing CPU mode for retry.");
                                 current_device_pref = Some("cpu".to_string());
                                 log_task_progress(&app_handle, &task.id, &json!({
-                                    "category": "Warning", "summary": "Memory pressure. Retrying on CPU...", "spinner": "⚠️"
+                                    "category": "Warning", "summary": "Memory pressure detected. Retrying on CPU...", "spinner": "⚠️"
                                 }));
                                 sleep(Duration::from_secs(2)).await;
                                 continue;
@@ -207,7 +212,7 @@ pub async fn start_background_worker(
 async fn process_task(
     task: Task,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
-    model: &Arc<LogisModel>,
+    model_mutex: &Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
@@ -216,18 +221,15 @@ async fn process_task(
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     let _ = fs::create_dir_all(&pug_logs_dir);
     
-    // Check for existing KV
     let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
     if kv_path.exists() { println!("[PROCESS] Found existing KV cache for {}", task.id); }
 
-    // [SSD-BRIDGE] Start warming up 2B weights in background RAM immediately
     let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
         .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
     if let Some(p) = large_model_path_hint {
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
-    // Initial Progress Log
     log_task_progress(app_handle, &task.id, &json!({ 
         "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋" 
     }));
@@ -237,7 +239,6 @@ async fn process_task(
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
     let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
-    // Device Preference Handling
     let effective_device_pref = device_preference.or_else(|| {
         task_data.get("device_preference").and_then(|v| {
             if v.as_str() == Some("cpu") || v.as_bool() == Some(true) { Some("cpu".to_string()) } else { None }
@@ -253,7 +254,6 @@ async fn process_task(
         if light_pug_path.exists() {
             data_manager.load(&light_pug_path)?
         } else {
-            // Fetch HTML if not present
             let raw_html_path = data_manager.get_path("raw_html");
             let raw_content = if raw_html_path.exists() {
                 data_manager.load(&raw_html_path)?
@@ -263,17 +263,38 @@ async fn process_task(
             } else {
                  let res = reqwest::get(&url).await?;
                  let bytes = res.bytes().await?;
-                 let content = String::from_utf8_lossy(&bytes).to_string(); // Simple decoding for now
+                 let content = String::from_utf8_lossy(&bytes).to_string();
                  data_manager.offload(&content, "raw_html")?;
                  content
             };
             
-            // Clean & Convert
             let clean = parsing::pre_clean_html(&raw_content);
             let p = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
             data_manager.offload(&p, "light_pug")?;
             p
         }
+    };
+
+    // [LOCK] Acquire Model Access
+    let model = {
+        let mut model_lock = model_mutex.lock().await;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        if let Some(m) = model_lock.as_ref() {
+            let wants_cpu = effective_device_pref.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                m.unload_generator().await;
+                *model_lock = None;
+            }
+        }
+
+        if model_lock.is_none() {
+            match LogisModel::new(effective_device_pref.as_deref()).await {
+                Ok(m) => *model_lock = Some(m),
+                Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
+            }
+        }
+        model_lock.as_ref().unwrap().clone()
     };
 
     // --- PIPELINE STEP A: CLASSIFICATION ---
@@ -288,10 +309,8 @@ async fn process_task(
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", light_pug, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
 
-        // Checkpoint Check
         let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
         if !kv_dir.exists() {
-            // [0.6B] Bake
              model.secure_vram_relay(ModelSize::Small, None, Some(cancellation_token.clone())).await?;
              let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
              if let Some(gen) = gen_guard.as_mut() {
@@ -301,7 +320,6 @@ async fn process_task(
              }
         }
 
-        // [2B] Inference
         model.secure_vram_relay(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone())).await?;
         let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
         data_manager.offload(&res, "step_a_res")?;
@@ -311,10 +329,9 @@ async fn process_task(
         println!("[Scheduler] Classified as: {}", page_type);
     }
     
-    if page_type == "unknown" { return Ok(()); }
+    if page_type == "unknown" { return Ok(()); } 
     
     // --- PIPELINE STEP B: SELECTORS ---
-    // Clear resources between heavy steps
     model.deep_purge_resources().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
@@ -343,13 +360,10 @@ async fn process_task(
         selector_info = parsing::parse_json_from_llm(&res);
     }
 
-    // Save Page Info to DB (Intermediate)
     let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-
     let mut extracted_data = json!({});
 
     if !is_detail {
-        // [LIST MODE]
         let item_selector = selector_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
         let mut all_extracted_items = Vec::new();
         {
@@ -370,7 +384,6 @@ async fn process_task(
         }
         extracted_data = json!({ "items": all_extracted_items, "type": page_type, "detail": false });
     } else {
-        // [DETAIL MODE]
         log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting details...", "spinner": "⠋" }));
         
         let node_selector = selector_info.get("node").and_then(|s| s.as_str()).unwrap_or("body");
@@ -427,7 +440,6 @@ async fn process_task(
 
     let text_to_embed = parsing::json_to_natural_language(&extracted_data);
     let item_digest = crate::utils::hash::digest(&text_to_embed); 
-    
     let vector = model.get_embedding(text_to_embed).await?;
 
     let generated_id = crate::utils::hash::hash_id(&format!("{}{}", task.to, task.id)); 
