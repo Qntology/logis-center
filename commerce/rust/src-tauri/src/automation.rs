@@ -146,11 +146,14 @@ pub(crate) static LAST_DETECTED_STATE: Lazy<Arc<tokio::sync::Mutex<DetectedState
 });
 
 fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
+    println!("[AUTO] Browser monitor loop started.");
     tokio::spawn(async move {
         let mut last_detected_url = String::new();
         let mut last_is_shop = false;
 
         loop {
+            // [DEBUG] Monitor tick
+            // println!("[AUTO] Monitoring tick...");
             // [CRITICAL] Stop monitoring if global stop signal is active
             if crate::utils::is_extraction_stopped() {
                 println!("[AUTO] Global stop signal detected. Exiting browser monitor.");
@@ -214,6 +217,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             // Notify UI only if URL changed OR if it's a shop page
             // [FIX] Always emit when URL changes so frontend can sync btn-extract and btn-auto-launch
             if (active_url != last_detected_url || current_is_shop != last_is_shop) && !active_url.is_empty() {
+                println!("[AUTO] URL Changed: {} (Shop: {})", active_url, current_is_shop);
                 let payload = json!({
                     "url": active_url.clone(),
                     "is_client": is_client,
