@@ -277,42 +277,41 @@ impl LogisModel {
 
     // --- [SCENARIO A] Text Preprocessing (0.6B 1L Baking -> 2B Full Inference) ---
     pub async fn bake_text_kv(&self, task_id: &str, content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        let text_session = format!("{}_text", task_id);
-        println!("[BAKE-TEXT] Starting 0.6B 1-Layer Baking for task: {}", task_id);
+        println!("[BAKE-TEXT] Starting 0.6B 1-Layer Split-Baking for task: {}", task_id);
         
-        // 1. Baking: 0.6B Small model, 1-Layer, Text-Only
-        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true).await?;
+        // 1. Load: 0.6B Small model, 1-Layer, Text-Only
+        self.ensure_generator_ext(ModelSize::Small, true, true).await?;
 
         {
             let gen_clone = self.generator.clone();
-            let prompt = format!("{}\n\n[SYSTEM] Analyze document structure.", content);
+            let text_to_bake = content.to_string();
+            let tid = task_id.to_string();
             let token_clone = cancel_token.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    gen.prefill_chunk(prompt, token_clone, None)?;
+                    // [NEW] Use part-based baking for 50k+ tokens
+                    gen.bake_text_in_parts(text_to_bake, &tid, "text", token_clone)?;
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
         }
 
-        // 2. Save BitKV and Unload
-        self.save_kv_snapshot(&text_session).await?;
         self.unload_generator().await;
         Ok(())
     }
 
     pub async fn run_text_inference_full(&self, task_id: &str, system: &str, user: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let text_session = format!("{}_text", task_id);
-        println!("[INFERENCE-TEXT] Starting 2B Full-Layer Inference with injected KV for task: {}", task_id);
+        println!("[INFERENCE-TEXT] Starting 2B Full-Layer Inference with injected Multi-part KV for task: {}", task_id);
 
-        // 1. Load 2B Full Model (Text-Only Mode for speed)
+        // 1. Load 2B Full Model (Text-Only Mode)
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true).await?;
         
-        // 2. Inject Baked BitKV
+        // 2. Inject ALL Baked Parts
         self.load_stitched_kv(task_id, &["text"]).await?;
 
-        // 3. Chat with injected context (Prefill skipped internally by native_model)
+        // 3. Chat with injected context
         self.chat(system, user, cancel_token, Some(text_session)).await
     }
 
@@ -432,15 +431,40 @@ impl LogisModel {
     // --- [HYBRID UTILS] Combined KV Loading ---
     pub async fn load_stitched_kv(&self, task_id: &str, components: &[&str]) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
-        let paths: Vec<std::path::PathBuf> = components.iter()
-            .map(|c| crate::utils::paths::get_kv_dir(None).join(format!("{}_{}.safetensors", task_id, c)))
-            .collect();
+        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
+
+        // [AUTO-DISCOVERY] Find all parts for each component
+        for comp in components {
+            let mut parts = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&kv_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    // Match task_id_comp.safetensors OR task_id_comp_partN.safetensors
+                    if name.starts_with(&format!("{}_{}", task_id, comp)) && name.ends_with(".safetensors") {
+                        parts.push(entry.path());
+                    }
+                }
+            }
+            // Sort by name to ensure part1 < part2 < part10
+            parts.sort_by(|a, b| {
+                let na = a.file_name().unwrap().to_string_lossy();
+                let nb = b.file_name().unwrap().to_string_lossy();
+                alphanumeric_sort::compare(&na, &nb)
+            });
+            all_paths.extend(parts);
+        }
+
+        if all_paths.is_empty() {
+            println!("[KV-STITCH] WARNING: No KV components found for task {}", task_id);
+            return Ok(());
+        }
 
         tokio::task::spawn_blocking(move || {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                println!("[SSD-BRIDGE] Stitching {} KV components...", paths.len());
-                gen.load_kv_stitched(&paths)?;
+                println!("[SSD-BRIDGE] Stitching {} KV files...", all_paths.len());
+                gen.load_kv_stitched(&all_paths)?;
                 Ok(())
             } else {
                 Err(anyhow!("No active generator for KV stitching"))

@@ -32,11 +32,12 @@ impl NativeLinear {
                 {
                     if self.device_id >= 0 {
                         if weight_packed.gpu_ptr.is_some() {
-                            static mut PRINT_COUNT: i32 = 0;
+                            static mut LAST_LOG_TIME: usize = 0;
                             unsafe {
-                                if PRINT_COUNT < 1 {
+                                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
+                                if now > LAST_LOG_TIME + 2 {
                                     println!("[BACKEND] Linear -> GPU Active (Bit-serial CUDA)");
-                                    PRINT_COUNT += 1;
+                                    LAST_LOG_TIME = now;
                                 }
                             }
                             let mut res = bit_serial_matmul_gpu(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize);
@@ -59,6 +60,7 @@ impl NativeLinear {
                         }
                     }
                 }
+
                 let wp_cow = weight_packed.get_slice::<u32>(); 
                 let s_cow = scales.get_slice::<f16>();
                 let mut out = bit_serial_matmul_f32_extreme(x, wp_cow.as_ref(), s_cow.as_ref(), m, self.out_features, self.in_features);

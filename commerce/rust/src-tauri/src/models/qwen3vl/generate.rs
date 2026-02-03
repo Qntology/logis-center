@@ -216,26 +216,97 @@ impl Qwen3VLGenerateModel {
         Ok(ids.len())
     }
 
+    /// [NEW] Context-aware splitting for large documents
+    pub fn bake_text_in_parts(&mut self, text: String, task_id: &str, suffix: &str, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut current_chunk = String::new();
+        let mut current_tokens = 0;
+        let mut part_idx = 1;
+
+        println!("[BAKE-PARTS] Starting split-baking for {} (Target: 2048 per part)", task_id);
+
+        for line in lines {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
+            }
+
+            let line_text = format!("{}\n", line);
+            let line_ids = self.tokenizer.text_encode_vec(line_text.clone(), false)?;
+            let line_token_count = line_ids.len();
+
+            // Check if adding this line exceeds 2048 tokens
+            if current_tokens + line_token_count > 2048 && !current_chunk.is_empty() {
+                // 1. Bake the current accumulated chunk
+                let chunk_ids = self.tokenizer.text_encode_vec(current_chunk.clone(), false)?;
+                self.qwen3_vl.forward(&chunk_ids, None, None, 0); // Always 0 because we clear cache each time
+
+                // 2. Save KV snapshot for this part
+                let part_path = crate::utils::paths::get_kv_dir(None).join(format!("{}_{}_part{}.safetensors", task_id, suffix, part_idx));
+                self.save_kv_to_disk(&part_path)?;
+
+                // 3. Clear memory for next part
+                self.clear_kv_cache();
+                println!("[BAKE-PARTS] Completed part {} ({} tokens)", part_idx, current_tokens);
+
+                // 4. Reset for next part
+                current_chunk.clear();
+                current_tokens = 0;
+                part_idx += 1;
+            }
+
+            current_chunk.push_str(&line_text);
+            current_tokens += line_token_count;
+        }
+
+        // Handle remaining text
+        if !current_chunk.is_empty() {
+            let chunk_ids = self.tokenizer.text_encode_vec(current_chunk, false)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, 0);
+            let part_path = crate::utils::paths::get_kv_dir(None).join(format!("{}_{}_part{}.safetensors", task_id, suffix, part_idx));
+            self.save_kv_to_disk(&part_path)?;
+            self.clear_kv_cache();
+            println!("[BAKE-PARTS] Completed final part {} ({} tokens)", part_idx, current_tokens);
+        }
+
+        Ok(())
+    }
+
     pub fn save_kv_to_disk(&self, path: &Path) -> Result<()> {
         let kvs = match &self.qwen3_vl {
             ModelVariant::Native(m) => m.text_model.get_all_kv(),
         };
 
-        if kvs.is_empty() { return Ok(()); }
+        if kvs.is_empty() { 
+            println!("[KV-DISK] WARNING: KV cache is empty, nothing to save.");
+            return Ok(()); 
+        }
+
+        let abs_path = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))
+            .map(|p| p.join(path.file_name().unwrap()))
+            .unwrap_or(path.to_path_buf());
+            
+        println!("[KV-DISK] Attempting to save {} layers to {:?}", kvs.len(), abs_path);
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                println!("[KV-DISK] Creating missing directory: {:?}", parent);
+                std::fs::create_dir_all(parent)?;
+            }
+        }
 
         let mut tensors = std::collections::HashMap::new();
         for (i, (k, v)) in kvs.into_iter().enumerate() {
-            // Packed K: Vec<u32> -> [N]
             let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
             tensors.insert(format!("layer.{}.k", i), safetensors::tensor::TensorView::new(safetensors::Dtype::U32, vec![k.len()], k_u8)?);
-            
-            // V: Vec<f16> -> [N]
             let v_u8 = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
             tensors.insert(format!("layer.{}.v", i), safetensors::tensor::TensorView::new(safetensors::Dtype::F16, vec![v.len()], v_u8)?);
         }
 
-        safetensors::tensor::serialize_to_file(tensors, &None, path)?;
-        println!("[KV-DISK] Saved KV Cache to {:?}", path);
+        match safetensors::tensor::serialize_to_file(tensors, &None, path) {
+            Ok(_) => println!("[KV-DISK] SUCCESS: Saved KV Cache to {:?}", abs_path),
+            Err(e) => println!("[KV-DISK] ERROR: Failed to save safetensors: {}", e),
+        }
         Ok(())
     }
 
