@@ -421,6 +421,15 @@ impl LogisModel {
             )
         }).await??;
 
+        // [HYBRID-ACTIVATION] Choose between Path 1 (GPU) and Path 2 (Optimized CPU)
+        if !self.is_cpu_mode {
+            let gpu_id = self.device_config.gpu_id as i32;
+            println!("[MODEL] Offloading to GPU-{} (Path 1: Max Speed)...", gpu_id);
+            gen.qwen3_vl.get_native_mut().move_to_gpu(gpu_id);
+        } else {
+            println!("[MODEL] Staying on CPU (Path 2: Extreme Optimized Bit-serial)...");
+        }
+
         // [GPU-ACTIVATION] Move layers to VRAM for high-speed baking/inference
         if !self.is_cpu_mode {
             let gpu_id = self.device_config.gpu_id as i32;
