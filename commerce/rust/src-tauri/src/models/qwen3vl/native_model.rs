@@ -297,21 +297,21 @@ impl NativeQwen3VLModel {
         let st = SafeTensors::deserialize(&m_mmap)?; 
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         
-        // [DEBUG] Print first 10 tensor names to check prefixing
-        println!("[LOAD] Inspecting safetensors keys (total {}):", st.names().len());
-        for (i, name) in st.names().iter().enumerate().take(10) {
-            println!("  - Key {}: {}", i, name);
+        // [DEBUG] Print non-layer tensor names to find lm_head
+        println!("[LOAD] Inspecting non-layer keys (total {}):", st.names().len());
+        for name in st.names() {
+            if !name.contains(".layers.") && !name.contains(".blk.") && !name.contains(".blocks.") {
+                println!("  - Top-level Key: {}", name);
+            }
         }
-        if let Some(lm_key) = st.names().iter().find(|n| n.contains("lm_head") || n.contains("output.weight")) {
-            println!("[LOAD] Found potential LM Head key: {}", lm_key);
-        }
-
+        
         let find_key = |target: &str| -> Option<String> {
             let variations = vec![
                 target.to_string(),
                 target.replace("model.", "model.language_model."),
                 target.replace("model.layers", "model.language_model.layers"),
                 target.replace("lm_head", "model.lm_head"),
+                target.replace("lm_head", "output"),
                 format!("model.language_model.{}", target.replace("model.", "")),
                 format!("model.{}", target),
             ];
