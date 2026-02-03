@@ -58,6 +58,7 @@ memmap2 = "0.9"
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_System_Memory"] }
 libc = "0.2"
 half = { version = "2.7.1", features = ["num-traits"] }
+cudarc = { version = "0.13.5", features = ["driver", "cuda-version-from-build-system"] }
 
 [features]
 default = ["cuda"]

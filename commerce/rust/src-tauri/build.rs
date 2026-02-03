@@ -10,15 +10,26 @@ fn main() {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         
         // 1. CUDA 커널 컴파일 (정적 라이브러리 .lib 생성)
-        let status = std::process::Command::new("nvcc")
-            .args(&[
-                "-O3",
-                "-lib",
-                "src/models/qwen3vl/native_backend.cu",
-                "-o",
-                &format!("{}/native_backend.lib", out_dir),
-            ])
-            .status()
+        let mut nvcc_cmd = std::process::Command::new("nvcc");
+        
+        // 환경변수에서 CCBIN 경로 가져오기 (없으면 제공된 기본값 사용)
+        let ccbin = std::env::var("NVCC_CCBIN")
+            .unwrap_or_else(|_| "C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSVC/14.29.30133/bin/Hostx64/x64/cl.exe".to_string());
+
+        nvcc_cmd.args(&[
+            "-O3",
+            "-lib",
+            "src/models/qwen3vl/native_backend.cu",
+            "-o",
+            &format!("{}/native_backend.lib", out_dir),
+            "-ccbin", &ccbin,
+            // 아키텍처 타겟 (Turing, Ampere)
+            "--generate-code=arch=compute_75,code=[compute_75,sm_75]",
+            "--generate-code=arch=compute_80,code=[compute_80,sm_80]",
+            "--generate-code=arch=compute_86,code=[compute_86,sm_86]",
+        ]);
+        
+        let status = nvcc_cmd.status()
             .expect("Failed to run nvcc. Is CUDA Toolkit installed?");
 
         if status.success() {

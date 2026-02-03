@@ -15,6 +15,9 @@ pub struct NativeLinear {
     pub in_features: usize, pub out_features: usize, pub variant: LinearVariant, pub device_id: i32,
 }
 
+unsafe impl Send for NativeLinear {}
+unsafe impl Sync for NativeLinear {}
+
 impl NativeLinear {
     pub fn forward(&self, x: &[f16]) -> Vec<f16> {
         let m = x.len() / self.in_features;
@@ -60,10 +63,12 @@ pub struct NativeLayer {
     pub up_proj: NativeLinear,
     pub down_proj: NativeLinear,
     pub device_id: i32,
-    // [HYBRID-CACHE] CPU: (Vec<u32>, Vec<f16>), GPU: (*mut void, *mut void)
     pub kv_cache: std::sync::Mutex<Option<(Vec<u32>, Vec<f16>)>>, 
-    pub gpu_kv_cache: std::sync::Mutex<Option<(*mut std::ffi::c_void, *mut std::ffi::c_void, usize)>>, // (K_ptr, V_ptr, len)
+    pub gpu_kv_cache: std::sync::Mutex<Option<(GpuPtr, GpuPtr, usize)>>, 
 }
+
+unsafe impl Send for NativeLayer {}
+unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
     pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize) -> Vec<f16> {
@@ -82,16 +87,17 @@ impl NativeLayer {
 
         native_apply_rope_f16_with_offset(&mut q, &mut k, q_len, seqlen_offset, n_h, head_dim, config.rope_theta);
 
-        // --- PERFECT GPU BRANCHING ---
         #[cfg(feature = "cuda")]
         if self.device_id >= 0 {
             use cudarc::driver::sys::*;
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
-                // Pre-allocate 32k tokens buffer for speed
-                unsafe { cuMemAlloc_v2(&mut kp, 32768 * n_kv * (head_dim/32) * 4); cuMemAlloc_v2(&mut vp, 32768 * n_kv * head_dim * 4); }
-                (kp as *mut _, vp as *mut _, 0)
+                unsafe { 
+                    cuMemAlloc_v2(&mut kp, 32768 * n_kv * (head_dim/32) * 4); 
+                    cuMemAlloc_v2(&mut vp, 32768 * n_kv * head_dim * 4); 
+                }
+                (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
 
             let k_packed = pack_f16_to_bits(&k);
@@ -99,8 +105,8 @@ impl NativeLayer {
             unsafe {
                 let k_offset = current_len * n_kv * (head_dim/32) * 4;
                 let v_offset = current_len * n_kv * head_dim * 4;
-                cuMemcpyHtoD_v2((k_ptr as usize + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
-                cuMemcpyHtoD_v2((v_ptr as usize + v_offset) as CUdeviceptr, v_f32.as_ptr() as *const _, v_f32.len() * 4);
+                cuMemcpyHtoD_v2((k_ptr.0 as usize + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+                cuMemcpyHtoD_v2((v_ptr.0 as usize + v_offset) as CUdeviceptr, v_f32.as_ptr() as *const _, v_f32.len() * 4);
             }
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
@@ -116,7 +122,6 @@ impl NativeLayer {
             return x_m;
         }
 
-        // --- OPTIMIZED CPU FALLBACK ---
         let mut cache_guard = self.kv_cache.lock().unwrap();
         let (k_p_f, v_f_f) = if let Some((pk, pv)) = cache_guard.take() {
             let mut nk = pk; let mut nv = pv; nk.extend_from_slice(&pack_f16_to_bits(&k)); nv.extend_from_slice(&v); (nk, nv)
@@ -142,11 +147,28 @@ impl NativeLayer {
         self.gate_proj.move_to_gpu(device_id); self.up_proj.move_to_gpu(device_id);
         self.down_proj.move_to_gpu(device_id);
     }
+
+    pub fn clear_kv_cache(&self) {
+        let mut cache = self.kv_cache.lock().unwrap();
+        *cache = None;
+        let mut gpu_cache = self.gpu_kv_cache.lock().unwrap();
+        if let Some((k, v, _)) = gpu_cache.take() {
+            #[cfg(feature = "cuda")]
+            unsafe {
+                use cudarc::driver::sys::*;
+                cuMemFree_v2(k.0 as CUdeviceptr);
+                cuMemFree_v2(v.0 as CUdeviceptr);
+            }
+        }
+    }
 }
 
 pub struct NativeQwen3TextModel {
     pub config: Qwen3VLTextConfig, pub embed_tokens: NativeLinear, pub layers: Vec<NativeLayer>, pub norm: NativeTensor,
 }
+
+unsafe impl Send for NativeQwen3TextModel {}
+unsafe impl Sync for NativeQwen3TextModel {}
 
 impl NativeQwen3TextModel {
     pub fn forward(&self, input_ids: &[u32], seqlen_offset: usize) -> Vec<f16> {
@@ -159,11 +181,18 @@ impl NativeQwen3TextModel {
         for (i, layer) in self.layers.iter().enumerate() { cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i); }
         native_rms_norm_f16(&cur_x, self.norm.get_slice::<f16>(), self.config.rms_norm_eps as f32, hid)
     }
+
+    pub fn clear_kv_cache(&self) {
+        for layer in &self.layers { layer.clear_kv_cache(); }
+    }
 }
 
 pub struct NativeQwen3VLModel {
     pub config: Qwen3VLConfig, pub text_model: NativeQwen3TextModel, pub lm_head: NativeLinear,
 }
+
+unsafe impl Send for NativeQwen3VLModel {}
+unsafe impl Sync for NativeQwen3VLModel {}
 
 impl NativeQwen3VLModel {
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, _v_mmap: Arc<Mmap>, baking: bool) -> Result<Self> {

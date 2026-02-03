@@ -1,6 +1,6 @@
 use crate::utils;
 use anyhow::anyhow;
-use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
+use crate::models::qwen3vl::generate::{Qwen3VLGenerateModel, ModelVariant};
 use crate::models::native_embedding::NativeEmbeddingModel;
 use crate::openai_types::{
     ChatCompletionParameters,
@@ -425,7 +425,11 @@ impl LogisModel {
         if !self.is_cpu_mode {
             let gpu_id = self.device_config.gpu_id as i32;
             println!("[MODEL] Offloading to GPU-{} (Path 1: Max Speed)...", gpu_id);
-            gen.qwen3_vl.get_native_mut().move_to_gpu(gpu_id);
+            if let Some(m) = Arc::get_mut(gen.qwen3_vl.get_native_mut()) {
+                m.move_to_gpu(gpu_id);
+            } else {
+                println!("[WARNING] Could not get mutable reference to model for GPU offloading.");
+            }
         } else {
             println!("[MODEL] Staying on CPU (Path 2: Extreme Optimized Bit-serial)...");
         }

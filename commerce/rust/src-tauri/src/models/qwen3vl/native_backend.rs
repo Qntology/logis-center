@@ -4,10 +4,19 @@ use rayon::prelude::*;
 use half::f16;
 
 #[cfg(feature = "cuda")]
+use cudarc::driver::sys::*;
+
+#[cfg(feature = "cuda")]
 extern "C" {
     fn bit_serial_matmul_cuda_direct(d_i: *const f32, d_w: *const u32, d_s: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, dev: i32);
     fn bit_serial_attn_cuda_direct(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, h_d: i32, t_s: i32, scale: f32, dev: i32);
 }
+
+// Thread-safe wrapper for raw CUDA pointers
+#[derive(Clone, Copy, Debug)]
+pub struct GpuPtr(pub *mut std::ffi::c_void);
+unsafe impl Send for GpuPtr {}
+unsafe impl Sync for GpuPtr {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NativeDType { F32, F16, BF16, U32 }
@@ -15,7 +24,7 @@ pub enum NativeDType { F32, F16, BF16, U32 }
 #[derive(Clone)]
 pub struct NativeTensor {
     pub data_ptr: *const u8,
-    pub gpu_ptr: Option<*mut std::ffi::c_void>, 
+    pub gpu_ptr: Option<GpuPtr>, 
     pub shape: Vec<usize>,
     pub dtype: NativeDType,
     pub _mmap: Option<Arc<Mmap>>,
@@ -38,11 +47,11 @@ impl NativeTensor {
         if self.gpu_ptr.is_some() { return; }
         let size = self.shape.iter().product::<usize>() * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
         unsafe {
-            use cudarc::driver::sys::*;
             let mut ptr: CUdeviceptr = 0;
+            // cuInit(0); // Should be called globally
             cuMemAlloc_v2(&mut ptr, size);
             cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size);
-            self.gpu_ptr = Some(ptr as *mut _); self.device_id = device_id;
+            self.gpu_ptr = Some(GpuPtr(ptr as *mut _)); self.device_id = device_id;
         }
     }
 }
@@ -60,18 +69,17 @@ pub fn pack_f16_to_bits(src: &[f16]) -> Vec<u32> {
 
 #[cfg(feature = "cuda")]
 pub fn native_bit_serial_attn_gpu(
-    q: &[f16], k_packed_ptr: *mut std::ffi::c_void, v_f16_ptr: *mut std::ffi::c_void,
+    q: &[f16], k_packed_ptr: GpuPtr, v_f16_ptr: GpuPtr,
     n_h: usize, h_d: usize, t_s: usize, dev: usize
 ) -> Vec<f16> {
     unsafe {
-        use cudarc::driver::sys::*;
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         let q_f32: Vec<f32> = q.iter().map(|v| v.to_f32()).collect();
         cuMemAlloc_v2(&mut d_q, q.len() * 4);
         cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
         cuMemAlloc_v2(&mut d_o, q.len() * 4);
 
-        bit_serial_attn_cuda_direct(d_q as *const f32, k_packed_ptr as *const u32, v_f16_ptr as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32);
+        bit_serial_attn_cuda_direct(d_q as *const f32, k_packed_ptr.0 as *const u32, v_f16_ptr.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32);
 
         let mut o_f32 = vec![0.0f32; q.len()];
         cuMemcpyDtoH_v2(o_f32.as_mut_ptr() as *mut _, d_o, q.len() * 4);
@@ -122,14 +130,13 @@ pub fn bit_serial_matmul_f32_extreme(i: &[f16], w: &[u32], s: &[f16], m: usize, 
 #[cfg(feature = "cuda")]
 pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: usize, n: usize, k: usize, dev: usize) -> Vec<f16> {
     unsafe {
-        use cudarc::driver::sys::*;
         let mut d_i: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0; let mut d_s: CUdeviceptr = 0;
         let i_f32: Vec<f32> = i.iter().map(|v| v.to_f32()).collect();
         cuMemAlloc_v2(&mut d_i, m * k * 4); cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
         cuMemAlloc_v2(&mut d_o, m * n * 4);
         let s_f32: Vec<f32> = s.get_slice::<f16>().iter().map(|v| v.to_f32()).collect();
         cuMemAlloc_v2(&mut d_s, n * 4); cuMemcpyHtoD_v2(d_s, s_f32.as_ptr() as *const _, n * 4);
-        bit_serial_matmul_cuda_direct(d_i as *const f32, w.gpu_ptr.unwrap() as *const u32, d_s as *const f32, d_o as *mut f32, m as i32, n as i32, k as i32, dev as i32);
+        bit_serial_matmul_cuda_direct(d_i as *const f32, w.gpu_ptr.unwrap().0 as *const u32, d_s as *const f32, d_o as *mut f32, m as i32, n as i32, k as i32, dev as i32);
         let mut o_f = vec![0.0f32; m * n]; cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
         cuMemFree_v2(d_i); cuMemFree_v2(d_o); cuMemFree_v2(d_s);
         o_f.into_iter().map(f16::from_f32).collect()

@@ -1625,6 +1625,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.13.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486c221362668c63a1636cfa51463b09574433b39029326cff40864b3ba12b6e"
+dependencies = [
+ "libloading 0.8.9",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7931,6 +7940,7 @@ dependencies = [
  "base64 0.22.1",
  "chromiumoxide",
  "chrono",
+ "cudarc",
  "dirs",
  "ego-tree",
  "encoding_rs",
