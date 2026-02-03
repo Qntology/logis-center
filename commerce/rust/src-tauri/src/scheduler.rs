@@ -252,14 +252,7 @@ async fn process_task(
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
     let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
-    // [IMAGE-PIPELINE] Detect and handle pure image tasks first
-    if !image_path.is_empty() {
-        let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
-        model.extract_from_image(task.id.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
-        return Ok(());
-    }
-
-    if url.is_empty() { return Ok(()); }
+    if url.is_empty() && image_path.is_empty() { return Ok(()); }
 
     // 2. Fetch & Convert to PUG
     let light_pug = {
@@ -309,6 +302,13 @@ async fn process_task(
         }
         model_lock.as_ref().unwrap().clone()
     };
+
+    // [IMAGE-PIPELINE] Detect and handle pure image tasks first
+    if !image_path.is_empty() {
+        let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
+        model.extract_from_image(task.id.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
+        return Ok(());
+    }
 
     // --- PIPELINE STEP A: CLASSIFICATION ---
     let mut page_type = String::new();

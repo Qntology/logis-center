@@ -660,81 +660,6 @@ Return valid JSON only. No explanation.
         }
     }
 
-    pub async fn extract_from_image(
-        &self,
-        task_id: String,
-        image_path: String,
-        language: String,
-        app_handle: &tauri::AppHandle,
-        cancel_token: Option<Arc<AtomicBool>>,
-        store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
-    ) -> anyhow::Result<()> {
-        crate::scheduler::log_task_progress(app_handle, &task_id, &json!({
-            "category": "Image Loading", "summary": "Loading image...", "spinner": "⠋"
-        }));
-
-        self.ensure_generator(ModelSize::Large).await?;
-
-        if let Ok(img) = image::open(&image_path) {
-            let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
-            let prompt = Self::get_image_extraction_prompt("kr", &language, "tracking", "");
-            
-            let result_str = self.chat_with_image_spinner(
-                prompt, 
-                Some(dynamic_image), 
-                app_handle, 
-                "extraction-progress", 
-                json!({ "category": "Vision Analysis", "summary": "Analyzing image content..." }), 
-                1024, 
-                cancel_token.clone(), 
-                Some(task_id.clone())
-            ).await?;
-
-            let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
-            
-            let nl = crate::parsing::json_to_natural_language(&extracted_data);
-            let item_digest = crate::utils::hash::digest(&nl);
-
-            let store_guard = store_mutex.lock().await;
-            if let Some(db) = store_guard.as_ref() {
-                let from_addr = "0x0000000000000000000000000000000000000000";
-                let team_id = crate::utils::hash::hash_id(from_addr);
-                let hashed_cc = crate::utils::hash::hash_id("local.image");
-
-                let raw_no = extracted_data.get("tracking_number").and_then(|s| s.as_str()).unwrap_or(&task_id);
-                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(raw_no).replace("-", "").replace("_", "");
-                
-                let index_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("tracking{}{}", team_id, clean_no)));
-                let hashed_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, index_val));
-                let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, hashed_cc, clean_no));
-
-                let mut final_data = extracted_data.clone();
-                final_data.as_object_mut().unwrap().insert("index".to_string(), json!(index_val));
-                final_data.as_object_mut().unwrap().insert("id".to_string(), json!(hashed_id));
-
-                let _ = db.upsert_item(
-                    "commerce_tracking", &hashed_id, "tracking", final_data, None,
-                    Some(from_addr), Some(&team_id), Some(&hashed_cc),
-                    Some(&crate::utils::hash::hash_id(&format!("tracking{}", hashed_cc))),
-                    Some(&ref_val), Some(&item_digest)
-                ).await;
-            }
-            
-            let _ = app_handle.emit("extraction-progress", json!({ 
-               "task_id": task_id.clone(),
-               "category": "Done", "summary": "Analysis Complete", "spinner": "✅", "data": extracted_data
-            }));
-            
-            Ok(())
-        } else {
-            let _ = app_handle.emit("extraction-progress", json!({ 
-               "task_id": task_id.clone(),
-               "category": "Error", "summary": "Failed to load image file.", "spinner": "❌"
-            }));
-            Ok(())
-        }
-    }
-
     pub fn is_cpu(&self) -> bool {
         self.is_cpu_mode
     }
@@ -1058,6 +983,20 @@ Return valid JSON only. No explanation.
         let extracted_data = crate::parsing::parse_json_from_llm(&response);
         
         Ok(extracted_data)
+    }
+
+    pub async fn run_hybrid_inference_full(&self, task_id: &str, user: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        let combined_session = format!("{}_hybrid", task_id);
+        println!("[INFERENCE-HYBRID] Starting 2B Full-Layer VL Inference for task: {}", task_id);
+
+        // 1. Load 2B Full Model (Vision Enabled)
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, false).await?;
+
+        // 2. Inject Stitched BitKV (System + Image)
+        self.load_stitched_kv(task_id, &["sys", "img"]).await?;
+
+        // 3. Chat with hybrid context
+        self.chat("", user, cancel_token, Some(combined_session)).await
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
