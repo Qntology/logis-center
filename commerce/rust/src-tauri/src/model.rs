@@ -399,12 +399,10 @@ impl LogisModel {
             return Ok(())
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Baking-Only: {})", size, baking_only);
-
-        // ... [SWITCH 로직 생략 - Fresh 로드 위주로 수정] ...
+        println!("[MODEL] Activating engine -> Size: {:?}, Mode: {}", size, if baking_only { "BAKING (Layer 0)" } else { "INFERENCE (Full)" });
 
         // 2. [LOAD] Load from disk
-        println!("[LOAD] Fresh loading {:?} from disk...", size);
+        println!("[LOAD] Fresh loading {:?} model from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
         
