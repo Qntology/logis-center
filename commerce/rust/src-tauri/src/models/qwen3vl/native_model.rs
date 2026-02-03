@@ -368,6 +368,13 @@ impl NativeQwen3VLModel {
             }
         };
 
+        let get_t = |name: &str| -> Result<NativeTensor> {
+            let key = find_key(name).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
+            let v = st.tensor(&key)?;
+            let off = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
+            Ok(NativeTensor::from_mmap(m_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+        };
+
         // 임베딩 로드 로직: 여러 경로를 시도하여 양자화된 임베딩을 찾음
         let emb = get_l("model.embed_tokens.weight", 151936, t_c.hidden_size)
             .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))?;
