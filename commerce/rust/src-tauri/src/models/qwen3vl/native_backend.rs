@@ -47,6 +47,7 @@ pub enum NativeDType {
     U32, 
 }
 
+#[derive(Clone)]
 pub struct NativeTensor {
     pub data_ptr: *const u8,
     pub shape: Vec<usize>,

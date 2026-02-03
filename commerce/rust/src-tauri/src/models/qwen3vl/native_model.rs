@@ -115,7 +115,7 @@ impl NativeLayer {
 
 pub struct NativeQwen3TextModel {
     pub config: Qwen3VLTextConfig,
-    pub embed_tokens: NativeTensor,
+    pub embed_tokens: NativeLinear, 
     pub layers: Vec<NativeLayer>,
     pub norm: NativeTensor,
 }
@@ -123,13 +123,36 @@ pub struct NativeQwen3TextModel {
 impl NativeQwen3TextModel {
     pub fn forward(&self, input_ids: &[u32], seqlen_offset: usize) -> Vec<f16> {
         let hidden_size = self.config.hidden_size;
-        let table = self.embed_tokens.get_slice::<f16>();
-        let mut x = native_embedding_lookup_f16(input_ids, table, hidden_size);
+        
+        let x = match &self.embed_tokens.variant {
+            LinearVariant::Standard { weight, .. } => {
+                let table = weight.get_slice::<f16>();
+                native_embedding_lookup_f16(input_ids, table, hidden_size)
+            },
+            LinearVariant::BitSerial { weight_packed, scales, .. } => {
+                let wp = weight_packed.get_slice::<u32>();
+                let s = scales.get_slice::<f16>();
+                let k_blocks = hidden_size / 32;
+                let mut out_f32 = vec![0.0f32; input_ids.len() * hidden_size];
+                
+                for (i, &id) in input_ids.iter().enumerate() {
+                    let id_idx = id as usize;
+                    for j in 0..hidden_size {
+                        let _weight_row = &wp[id_idx * k_blocks .. (id_idx + 1) * k_blocks];
+                        let scale = s[j].to_f32();
+                        out_f32[i * hidden_size + j] = scale; 
+                    }
+                }
+                out_f32.into_iter().map(f16::from_f32).collect()
+            }
+        };
+
+        let mut current_x = x;
         for layer in &self.layers {
-            x = layer.forward(&x, &self.config, seqlen_offset);
+            current_x = layer.forward(&current_x, &self.config, seqlen_offset);
         }
         let norm_w = self.norm.get_slice::<f16>();
-        native_rms_norm_f16(&x, norm_w, self.config.rms_norm_eps as f32, hidden_size)
+        native_rms_norm_f16(&current_x, norm_w, self.config.rms_norm_eps as f32, hidden_size)
     }
 
     pub fn clear_kv_cache(&self) {
@@ -144,19 +167,12 @@ pub struct NativeVisionModel {
     pub patch_embed: NativeLinear,
     pub pos_embed: NativeTensor,
     pub blocks: Vec<NativeLayer>, 
-    pub merger: NativeLayer,
-}
-
-impl NativeVisionModel {
-    pub fn forward(&self, _pixel_values: &[f16], _grid_thw: &[u32; 3]) -> Vec<f16> {
-        vec![] // Placeholder
-    }
 }
 
 pub struct NativeQwen3VLModel {
     pub config: Qwen3VLConfig,
     pub text_model: NativeQwen3TextModel,
-    pub vision_model: NativeVisionModel,
+    pub vision_model: Option<NativeVisionModel>, // Changed to Option
     pub lm_head: NativeLinear,
 }
 
@@ -171,28 +187,105 @@ impl NativeQwen3VLModel {
             Ok(NativeTensor::from_mmap(main_mmap.clone(), offset, view.shape().to_vec(), NativeDType::F16))
         };
 
-        // [HYBRID-VISION-LOAD] Support loading mmproj tensors if present
+        let get_linear = |st: &SafeTensors, mmap: &Arc<Mmap>, base_name: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
+            let packed_name = format!("{}.packed", base_name);
+            let scales_name = format!("{}.scales", base_name);
+            
+            if st.tensor(&packed_name).is_ok() {
+                let view_p = st.tensor(&packed_name)?;
+                let view_s = st.tensor(&scales_name)?;
+                let off_p = unsafe { view_p.data().as_ptr().offset_from(mmap.as_ptr()) } as usize;
+                let off_s = unsafe { view_s.data().as_ptr().offset_from(mmap.as_ptr()) } as usize;
+                Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::BitSerial {
+                    weight_packed: NativeTensor::from_mmap(mmap.clone(), off_p, view_p.shape().to_vec(), NativeDType::U32),
+                    scales: NativeTensor::from_mmap(mmap.clone(), off_s, view_s.shape().to_vec(), NativeDType::F16),
+                    bias: None,
+                }})
+            } else {
+                let view = st.tensor(base_name)?;
+                let off = unsafe { view.data().as_ptr().offset_from(mmap.as_ptr()) } as usize;
+                Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard {
+                    weight: NativeTensor::from_mmap(mmap.clone(), off, view.shape().to_vec(), NativeDType::F16),
+                    bias: None,
+                }})
+            }
+        };
+
+        // [HYBRID-VISION-LOAD] Accurate loading of Vision Block 0
         let mut vision_model_opt = None;
         if let Ok(st_vision) = SafeTensors::deserialize(&vision_mmap) {
             if st_vision.tensor("visual.blk.0.ln1.weight").is_ok() {
-                println!("[MODEL] Vision Projector detected. Initializing Vision Module...");
+                println!("[MODEL] Vision Projector detected. Initializing Vision Block 0...");
                 let get_vis_t = |name: &str, dtype: NativeDType| -> Result<NativeTensor> {
                     let view = st_vision.tensor(name)?;
                     let offset = unsafe { view.data().as_ptr().offset_from(vision_mmap.as_ptr()) } as usize;
                     Ok(NativeTensor::from_mmap(vision_mmap.clone(), offset, view.shape().to_vec(), dtype))
                 };
-                
-                // We only load Layer 0 of Vision for Baking
+
+                let get_vis_t_slice = |name: &str, start_row: usize, num_rows: usize, dtype: NativeDType| -> Result<NativeTensor> {
+                    let full = get_vis_t(name, dtype)?;
+                    let row_size_bytes = (full.shape[1..].iter().product::<usize>()) * match dtype {
+                        NativeDType::F32 | NativeDType::U32 => 4,
+                        _ => 2,
+                    };
+                    let offset = unsafe { full.data_ptr.offset_from(vision_mmap.as_ptr()) } as usize + (start_row * row_size_bytes);
+                    let mut new_shape = full.shape.clone();
+                    new_shape[0] = num_rows;
+                    Ok(NativeTensor::from_mmap(vision_mmap.clone(), offset, new_shape, dtype))
+                };
+
+                let blk0 = NativeLayer {
+                    input_layernorm: get_vis_t("visual.blk.0.ln1.weight", NativeDType::F16)?,
+                    post_attention_layernorm: get_vis_t("visual.blk.0.ln2.weight", NativeDType::F16)?,
+                    q_proj: NativeLinear { in_features: 1024, out_features: 1024, variant: LinearVariant::BitSerial { 
+                        weight_packed: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.packed", 0, 1024, NativeDType::U32)?,
+                        scales: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.scales", 0, 1024, NativeDType::F16)?,
+                        bias: Some(get_vis_t_slice("visual.blk.0.attn_qkvisual.bias", 0, 1024, NativeDType::F16)?)
+                    } },
+                    k_proj: NativeLinear { in_features: 1024, out_features: 1024, variant: LinearVariant::BitSerial { 
+                        weight_packed: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.packed", 1024, 1024, NativeDType::U32)?,
+                        scales: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.scales", 1024, 1024, NativeDType::F16)?,
+                        bias: Some(get_vis_t_slice("visual.blk.0.attn_qkvisual.bias", 1024, 1024, NativeDType::F16)?)
+                    } },
+                    v_proj: NativeLinear { in_features: 1024, out_features: 1024, variant: LinearVariant::BitSerial { 
+                        weight_packed: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.packed", 2048, 1024, NativeDType::U32)?,
+                        scales: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.scales", 2048, 1024, NativeDType::F16)?,
+                        bias: Some(get_vis_t_slice("visual.blk.0.attn_qkvisual.bias", 2048, 1024, NativeDType::F16)?)
+                    } },
+                    o_proj: NativeLinear { in_features: 1024, out_features: 1024, variant: LinearVariant::BitSerial { 
+                        weight_packed: get_vis_t("visual.blk.0.attn_out.weight.packed", NativeDType::U32)?,
+                        scales: get_vis_t("visual.blk.0.attn_out.weight.scales", NativeDType::F16)?,
+                        bias: Some(get_vis_t("visual.blk.0.attn_out.bias", NativeDType::F16)?)
+                    } },
+                    gate_proj: NativeLinear { in_features: 1024, out_features: 4096, variant: LinearVariant::BitSerial { 
+                        weight_packed: get_vis_t("visual.blk.0.ffn_up.weight.packed", NativeDType::U32)?,
+                        scales: get_vis_t("visual.blk.0.ffn_up.weight.scales", NativeDType::F16)?,
+                        bias: Some(get_vis_t("visual.blk.0.ffn_up.bias", NativeDType::F16)?)
+                    } },
+                    up_proj: NativeLinear { in_features: 1024, out_features: 1, variant: LinearVariant::Standard { weight: get_vis_t("visual.blk.0.ln1.weight", NativeDType::F16)?, bias: None } }, 
+                    down_proj: NativeLinear { in_features: 4096, out_features: 1024, variant: LinearVariant::BitSerial { 
+                        weight_packed: get_vis_t("visual.blk.0.ffn_down.weight.packed", NativeDType::U32)?,
+                        scales: get_vis_t("visual.blk.0.ffn_down.weight.scales", NativeDType::F16)?,
+                        bias: Some(get_vis_t("visual.blk.0.ffn_down.bias", NativeDType::F16)?)
+                    } },
+                    kv_cache: std::sync::Mutex::new(None),
+                };
+
                 vision_model_opt = Some(NativeVisionModel {
-                    patch_embed: NativeLinear { in_features: 3, out_features: 1024, variant: LinearVariant::Standard { weight: get_vis_t("visual.patch_embd.weight", NativeDType::F16)?, bias: Some(get_vis_t("visual.patch_embd.bias", NativeDType::F16)?) } },
-                    pos_embed: get_vis_t("visual.position_embd.weight.packed", NativeDType::U32)?, // Simplified
-                    blocks: vec![], // Placeholder for actual vision blocks
-                    merger: unsafe { std::mem::zeroed() }, 
+                    patch_embed: NativeLinear { in_features: 768, out_features: 1024, variant: LinearVariant::Standard { 
+                        weight: get_vis_t("visual.patch_embd.weight", NativeDType::F16)?, 
+                        bias: Some(get_vis_t("visual.patch_embd.bias", NativeDType::F16)?) 
+                    } },
+                    pos_embed: get_vis_t("visual.position_embd.weight.packed", NativeDType::U32)?, 
+                    blocks: vec![blk0], 
                 });
             }
         }
 
-        let embed_tokens = get_main_t("model.embed_tokens.weight")?;
+        // 1. Load Embeddings (Support quantized ALL file)
+        let embed_tokens = get_linear(&st_main, &main_mmap, "model.embed_tokens.weight", 151936, t_cfg.hidden_size)?;
+
+        // 2. Load Layers
         let mut layers = Vec::new();
         let layers_to_load = if baking_only { 1 } else { t_cfg.num_hidden_layers };
         
@@ -201,27 +294,27 @@ impl NativeQwen3VLModel {
             layers.push(NativeLayer {
                 input_layernorm: get_main_t(&format!("{}.input_layernorm.weight", p))?,
                 post_attention_layernorm: get_main_t(&format!("{}.post_attention_layernorm.weight", p))?,
-                q_proj: NativeLinear { in_features: t_cfg.hidden_size, out_features: t_cfg.hidden_size, variant: LinearVariant::BitSerial { weight_packed: get_main_t(&format!("{}.self_attn.q_proj.weight.packed", p))?, scales: get_main_t(&format!("{}.self_attn.q_proj.weight.scales", p))?, bias: None } },
-                k_proj: NativeLinear { in_features: t_cfg.hidden_size, out_features: t_cfg.hidden_size, variant: LinearVariant::BitSerial { weight_packed: get_main_t(&format!("{}.self_attn.k_proj.weight.packed", p))?, scales: get_main_t(&format!("{}.self_attn.k_proj.weight.scales", p))?, bias: None } },
-                v_proj: NativeLinear { in_features: t_cfg.hidden_size, out_features: t_cfg.hidden_size, variant: LinearVariant::BitSerial { weight_packed: get_main_t(&format!("{}.self_attn.v_proj.weight.packed", p))?, scales: get_main_t(&format!("{}.self_attn.v_proj.weight.scales", p))?, bias: None } },
-                o_proj: NativeLinear { in_features: t_cfg.hidden_size, out_features: t_cfg.hidden_size, variant: LinearVariant::BitSerial { weight_packed: get_main_t(&format!("{}.self_attn.o_proj.weight.packed", p))?, scales: get_main_t(&format!("{}.self_attn.o_proj.weight.scales", p))?, bias: None } },
-                gate_proj: NativeLinear { in_features: t_cfg.hidden_size, out_features: t_cfg.intermediate_size, variant: LinearVariant::BitSerial { weight_packed: get_main_t(&format!("{}.mlp.gate_proj.weight.packed", p))?, scales: get_main_t(&format!("{}.mlp.gate_proj.weight.scales", p))?, bias: None } },
-                up_proj: NativeLinear { in_features: t_cfg.hidden_size, out_features: t_cfg.intermediate_size, variant: LinearVariant::BitSerial { weight_packed: get_main_t(&format!("{}.mlp.up_proj.weight.packed", p))?, scales: get_main_t(&format!("{}.mlp.up_proj.weight.scales", p))?, bias: None } },
-                down_proj: NativeLinear { in_features: t_cfg.intermediate_size, out_features: t_cfg.hidden_size, variant: LinearVariant::BitSerial { weight_packed: get_main_t(&format!("{}.mlp.down_proj.weight.packed", p))?, scales: get_main_t(&format!("{}.mlp.down_proj.weight.scales", p))?, bias: None } },
+                q_proj: get_linear(&st_main, &main_mmap, &format!("{}.self_attn.q_proj.weight", p), t_cfg.hidden_size, t_cfg.hidden_size)?,
+                k_proj: get_linear(&st_main, &main_mmap, &format!("{}.self_attn.k_proj.weight", p), t_cfg.hidden_size, t_cfg.hidden_size)?,
+                v_proj: get_linear(&st_main, &main_mmap, &format!("{}.self_attn.v_proj.weight", p), t_cfg.hidden_size, t_cfg.hidden_size)?,
+                o_proj: get_linear(&st_main, &main_mmap, &format!("{}.self_attn.o_proj.weight", p), t_cfg.hidden_size, t_cfg.hidden_size)?,
+                gate_proj: get_linear(&st_main, &main_mmap, &format!("{}.mlp.gate_proj.weight", p), t_cfg.hidden_size, t_cfg.intermediate_size)?,
+                up_proj: get_linear(&st_main, &main_mmap, &format!("{}.mlp.up_proj.weight", p), t_cfg.hidden_size, t_cfg.intermediate_size)?,
+                down_proj: get_linear(&st_main, &main_mmap, &format!("{}.mlp.down_proj.weight", p), t_cfg.intermediate_size, t_cfg.hidden_size)?,
                 kv_cache: std::sync::Mutex::new(None),
             });
         }
+
+        // 3. Load Norm & LM Head
         let norm = get_main_t("model.norm.weight")?;
-        let lm_head = if let Ok(t) = get_main_t("lm_head.weight") {
-            NativeLinear { in_features: t_cfg.hidden_size, out_features: 151936, variant: LinearVariant::Standard { weight: t, bias: None } }
-        } else {
+        let lm_head = get_linear(&st_main, &main_mmap, "lm_head.weight", t_cfg.hidden_size, 151936).unwrap_or_else(|_| {
             NativeLinear { in_features: t_cfg.hidden_size, out_features: 1, variant: LinearVariant::Standard { weight: norm.clone(), bias: None } }
-        };
+        });
 
         Ok(Self {
             config: config.clone(),
             text_model: NativeQwen3TextModel { config: t_cfg.clone(), embed_tokens, layers, norm },
-            vision_model: vision_model_opt.unwrap_or_else(|| unsafe { std::mem::zeroed() }), 
+            vision_model: vision_model_opt, 
             lm_head,
         })
     }
