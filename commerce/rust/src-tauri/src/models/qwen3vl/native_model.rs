@@ -327,14 +327,32 @@ impl NativeQwen3VLModel {
 
         let visual = if let Some(vm) = v_mmap {
             let vst = SafeTensors::deserialize(&vm)?;
+            
+            // [SMART-VISION-LOADER] 비전용 지능형 키 검색
+            let find_vkey = |target: &str| -> Option<String> {
+                let variations = vec![
+                    target.to_string(),
+                    target.replace("patch_embed.proj", "patch_embd"),
+                    target.replace("patch_embed", "patch_embd"),
+                    target.replace(".attn.q_proj", ".attn.qkv"), // QKV가 통합된 경우 대비
+                ];
+                for v in variations {
+                    if vst.tensor(&v).is_ok() || vst.tensor(&format!("{}.packed", v)).is_ok() { return Some(v); }
+                }
+                vst.names().iter().find(|&n| n.contains(target)).map(|n| n.to_string())
+            };
+
             let get_vt = |name: &str| -> Result<NativeTensor> {
-                let v = vst.tensor(name)?;
+                let key = find_vkey(name).ok_or_else(|| anyhow!("VisionTensorNotFound: {}", name))?;
+                let v = vst.tensor(&key)?;
                 let off = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
                 Ok(NativeTensor::from_mmap(vm.clone(), off, v.shape().to_vec(), NativeDType::F16))
             };
+
             let get_vl = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
-                let p_n = format!("{}.packed", base);
-                let s_n = format!("{}.scales", base);
+                let key = find_vkey(base).ok_or_else(|| anyhow!("VisionLinearTensorNotFound: {}", base))?;
+                let p_n = format!("{}.packed", key);
+                let s_n = format!("{}.scales", key);
                 if vst.tensor(&p_n).is_ok() {
                     let vp = vst.tensor(&p_n)?; let vs = vst.tensor(&s_n)?;
                     let op = unsafe { vp.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
@@ -345,14 +363,17 @@ impl NativeQwen3VLModel {
                         bias: None,
                     }, device_id: -1 })
                 } else {
-                    let v = vst.tensor(base)?;
+                    let v = vst.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
                     Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
                 }
             };
+
             let v_cfg = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
             let v_intermediate = v_cfg.hidden_size * 4;
             let v_out_hidden = v_cfg.out_hidden_size.unwrap_or(v_cfg.hidden_size * 2);
+            
+            // patch_embed -> patch_embd 자동 변환됨
             let patch_embed = get_vl("visual.patch_embed.proj.weight", 1536, v_cfg.hidden_size)?;
             let mut blocks = Vec::new();
             let b_to_l = if baking { 1 } else { v_cfg.depth };
@@ -374,7 +395,7 @@ impl NativeQwen3VLModel {
             }
             let merger = NativeLayer {
                 input_layernorm: get_vt("visual.merger.norm.weight")?,
-                post_attention_layernorm: get_vt("visual.merger.norm.weight")?,
+                post_attention_layernorm: get_vt("visual.merger.norm.weight")?, // Placeholder
                 q_norm: None, k_norm: None,
                 q_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
                 k_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,

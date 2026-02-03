@@ -325,8 +325,8 @@ async fn process_task(
              }
         }
 
-        // [FIX] Load Large model in Inference Mode (Full Layers)
-        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, false).await?;
+        // [FIX] Load Large model in Inference Mode (Full Layers), but keep Text-Only for Classification
+        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
         let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
         data_manager.offload(&res, "step_a_res")?;
         
@@ -361,8 +361,8 @@ async fn process_task(
              }
         }
 
-        // [FIX] Load Large model in Inference Mode (Full Layers)
-        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, false).await?;
+        // [FIX] Load Large model in Inference Mode (Full Layers), but keep Text-Only for Classification
+        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
         let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
         data_manager.offload(&res, "step_b_res")?;
         selector_info = parsing::parse_json_from_llm(&res);
@@ -436,9 +436,15 @@ async fn process_task(
 
              
 
-                         // [FIX] Load Large model in Inference Mode (Full Layers)
+                                     // [FIX] Load Large model in Inference Mode (Full Layers), but keep Text-Only for PUG Extraction
 
-                         model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, false).await?;
+             
+
+                                     model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+
+             
+
+                         
 
              
              let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
