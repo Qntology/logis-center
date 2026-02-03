@@ -30,25 +30,35 @@ impl NativeLinear {
             LinearVariant::BitSerial { weight_packed, scales, bias } => {
                 #[cfg(feature = "cuda")]
                 {
-                    if self.device_id >= 0 && weight_packed.gpu_ptr.is_some() {
-                        static mut PRINT_COUNT: i32 = 0;
+                    if self.device_id >= 0 {
+                        if weight_packed.gpu_ptr.is_some() {
+                            static mut PRINT_COUNT: i32 = 0;
+                            unsafe {
+                                if PRINT_COUNT < 1 {
+                                    println!("[BACKEND] Linear -> GPU Active (Bit-serial CUDA)");
+                                    PRINT_COUNT += 1;
+                                }
+                            }
+                            let mut res = bit_serial_matmul_gpu(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize);
+                            if let Some(b) = bias { 
+                                let b_cow = b.get_slice::<f16>();
+                                let b_ref = b_cow.as_ref();
+                                for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } } 
+                            }
+                            return res;
+                        } else {
+                            println!("[BACKEND] Linear -> CPU Fallback (Bit-serial AVX2/Rayon) - Reason: GPU ptr missing");
+                        }
+                    } else {
+                        static mut CPU_PRINT_COUNT: i32 = 0;
                         unsafe {
-                            if PRINT_COUNT < 1 {
-                                println!("[BACKEND] Linear -> GPU Active (Bit-serial CUDA)");
-                                PRINT_COUNT += 1;
+                            if CPU_PRINT_COUNT < 1 {
+                                println!("[BACKEND] Linear -> CPU (Bit-serial AVX2/Rayon) - Reason: Intentional CPU Mode");
+                                CPU_PRINT_COUNT += 1;
                             }
                         }
-                        let mut res = bit_serial_matmul_gpu(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize);
-                        if let Some(b) = bias { 
-                            let b_cow = b.get_slice::<f16>();
-                            let b_ref = b_cow.as_ref();
-                            for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } } 
-                        }
-                        return res;
                     }
                 }
-
-                println!("[BACKEND] Linear -> CPU Fallback (Bit-serial AVX2/Rayon)");
                 let wp_cow = weight_packed.get_slice::<u32>(); 
                 let s_cow = scales.get_slice::<f16>();
                 let mut out = bit_serial_matmul_f32_extreme(x, wp_cow.as_ref(), s_cow.as_ref(), m, self.out_features, self.in_features);
@@ -287,46 +297,74 @@ impl NativeQwen3VLModel {
         let st = SafeTensors::deserialize(&m_mmap)?; 
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         
+        // [DEBUG] Print first 10 tensor names to check prefixing
+        println!("[LOAD] Inspecting safetensors keys (total {}):", st.names().len());
+        for (i, name) in st.names().iter().enumerate().take(10) {
+            println!("  - Key {}: {}", i, name);
+        }
+        if let Some(lm_key) = st.names().iter().find(|n| n.contains("lm_head") || n.contains("output.weight")) {
+            println!("[LOAD] Found potential LM Head key: {}", lm_key);
+        }
+
         let find_key = |target: &str| -> Option<String> {
             let variations = vec![
                 target.to_string(),
                 target.replace("model.", "model.language_model."),
                 target.replace("model.layers", "model.language_model.layers"),
                 target.replace("lm_head", "model.lm_head"),
-                format!("model.language_model.{}", target.replace("model.", ""))
+                format!("model.language_model.{}", target.replace("model.", "")),
+                format!("model.{}", target),
             ];
             for v in variations {
-                if st.tensor(&v).is_ok() || st.tensor(&format!("{}.packed", v)).is_ok() { 
-                    return Some(v); 
+                if st.tensor(&v).is_ok() { return Some(v); }
+                let packed_v = format!("{}.packed", v);
+                if st.tensor(&packed_v).is_ok() { return Some(v); }
+            }
+            // Final fallback: Comprehensive search for any key containing the target
+            for name in st.names() {
+                if name.contains(target) {
+                    let base = name.replace(".packed", "").replace(".scales", "").replace(".shape", "");
+                    return Some(base);
                 }
             }
             None
-        };
-
-        let get_t = |name: &str| -> Result<NativeTensor> {
-            let key = find_key(name).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
-            let v = st.tensor(&key)?;
-            let off = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
-            Ok(NativeTensor::from_mmap(m_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
         };
 
         let get_l = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
             let key = find_key(base).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
             let p_n = format!("{}.packed", key);
             let s_n = format!("{}.scales", key);
+            
             if st.tensor(&p_n).is_ok() {
-                let vp = st.tensor(&p_n)?; let vs = st.tensor(&s_n)?;
+                let vp = st.tensor(&p_n)?; 
+                let vs = st.tensor(&s_n)?;
                 let op = unsafe { vp.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
                 let os = unsafe { vs.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
-                Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::BitSerial {
-                    weight_packed: NativeTensor::from_mmap(m_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
-                    scales: NativeTensor::from_mmap(m_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
-                    bias: None,
-                }, device_id: -1 })
+                
+                println!("[LOAD] Bit-serial layer: {} -> [{}, {}]", key, in_f, out_f);
+                Ok(NativeLinear { 
+                    in_features: in_f, 
+                    out_features: out_f, 
+                    variant: LinearVariant::BitSerial {
+                        weight_packed: NativeTensor::from_mmap(m_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
+                        scales: NativeTensor::from_mmap(m_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
+                        bias: None,
+                    }, 
+                    device_id: -1 
+                })
             } else {
                 let v = st.tensor(&key)?;
                 let o = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
-                Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(m_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                println!("[LOAD] Standard layer: {} -> [{}, {}]", key, in_f, out_f);
+                Ok(NativeLinear { 
+                    in_features: in_f, 
+                    out_features: out_f, 
+                    variant: LinearVariant::Standard { 
+                        weight: NativeTensor::from_mmap(m_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
+                        bias: None 
+                    }, 
+                    device_id: -1 
+                })
             }
         };
 
@@ -358,13 +396,10 @@ impl NativeQwen3VLModel {
             .or_else(|_| get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936))
             .or_else(|_| get_l("model.lm_head.weight", t_c.hidden_size, 151936));
             
-        let head = match head_res {
-            Ok(h) => h,
-            Err(e) => {
-                println!("[CRITICAL-LOAD-ERROR] Failed to find lm_head tensor: {}. Falling back to norm-based dummy.", e);
-                NativeLinear { in_features: t_c.hidden_size, out_features: 151936, variant: LinearVariant::Standard { weight: norm.clone(), bias: None }, device_id: -1 }
-            }
-        };
+        let head = head_res.map_err(|e| {
+            println!("[CRITICAL-LOAD-ERROR] ALL attempts to find lm_head tensor failed: {}.", e);
+            anyhow!("LMHeadNotFound")
+        })?;
 
         let visual = if let Some(vm) = v_mmap {
             let vst = SafeTensors::deserialize(&vm)?;

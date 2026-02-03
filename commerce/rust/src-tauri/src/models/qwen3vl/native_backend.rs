@@ -15,19 +15,6 @@ extern "C" {
     fn bit_serial_attn_cuda_direct(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, h_d: i32, t_s: i32, scale: f32, dev: i32);
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn avx2_popcnt_epi32(v: __m256i) -> __m256i {
-    let lookup = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
-    let low_mask = _mm256_set1_epi8(0x0f);
-    let lo = _mm256_and_si256(v, low_mask);
-    let hi = _mm256_and_si256(_mm256_srli_epi32(v, 4), low_mask);
-    let pop_lo = _mm256_shuffle_epi8(lookup, lo);
-    let pop_hi = _mm256_shuffle_epi8(lookup, hi);
-    let total8 = _mm256_add_epi8(pop_lo, pop_hi);
-    _mm256_sad_epu8(total8, _mm256_setzero_si256())
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct GpuPtr(pub *mut std::ffi::c_void);
 unsafe impl Send for GpuPtr {}
@@ -197,7 +184,7 @@ pub unsafe fn bit_serial_matmul_f32_avx2(i: &[f16], w: &[u32], s: &[f16], m: usi
             let w_ptr = w.as_ptr().add(w_off);
             let s_ptr = s.as_ptr().add(w_off);
             
-            let mut sums = _mm256_setzero_ps();
+            let mut accum = _mm256_setzero_ps();
             
             for kb in 0..k_b {
                 let input_bits = *ir_ptr.add(kb);
@@ -205,30 +192,25 @@ pub unsafe fn bit_serial_matmul_f32_avx2(i: &[f16], w: &[u32], s: &[f16], m: usi
                 let v_w = _mm256_loadu_si256(w_ptr.add(kb * 8) as *const __m256i);
                 let v_xor = _mm256_xor_si256(v_in, v_w);
                 
-                // Popcount emulation for AVX2
-                let lookup = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
-                let low_mask = _mm256_set1_epi8(0x0f);
-                
-                let lo = _mm256_and_si256(v_xor, low_mask);
-                let hi = _mm256_and_si256(_mm256_srli_epi32(v_xor, 4), low_mask);
-                let pop_lo = _mm256_shuffle_epi8(lookup, lo);
-                let pop_hi = _mm256_shuffle_epi8(lookup, hi);
-                let total8 = _mm256_add_epi8(pop_lo, pop_hi);
-                
-                // Sum up bytes to u32 slots
-                let t0 = _mm256_cvtepu8_epi32(_mm256_extracti128_si256(total8, 0));
-                let t1 = _mm256_cvtepu8_epi32(_mm256_extracti128_si256(total8, 1));
-                // This is a bit simplified, but SAD approach is better. Let's use SAD.
-                let v_pop = _mm256_sad_epu8(total8, _mm256_setzero_si256());
-                
-                // Actual popcount per 32-bit element needs more care. 
-                // Let's use a simpler but correct AVX2 popcount for 8x u32.
-                let mut pcounts = [0i32; 8];
+                // Vectorized calculation of (32 - 2 * popcount) * scale
+                let mut dots = [0.0f32; 8];
                 for i_ch in 0..8 {
                     let weight_bits = *w_ptr.add(kb * 8 + i_ch);
                     let scale = *s_ptr.add(kb * 8 + i_ch);
+                    // Use the built-in popcount (count_ones) which is very fast on modern CPUs
                     let dot = 32 - 2 * (input_bits ^ weight_bits).count_ones() as i32;
-                    row_o[n_base + i_ch] += (dot as f32) * scale.to_f32();
+                    dots[i_ch] = (dot as f32) * scale.to_f32();
+                }
+                
+                let v_dots = _mm256_loadu_ps(dots.as_ptr());
+                accum = _mm256_add_ps(accum, v_dots);
+            }
+            
+            let mut final_sums = [0.0f32; 8];
+            _mm256_storeu_ps(final_sums.as_mut_ptr(), accum);
+            for i_ch in 0..8 {
+                if n_base + i_ch < n {
+                    row_o[n_base + i_ch] = final_sums[i_ch];
                 }
             }
         }

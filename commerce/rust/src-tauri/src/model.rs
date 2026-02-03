@@ -571,7 +571,7 @@ impl LogisModel {
                 classify_chunk_size: 12000,
                 extract_chunk_size: 12000,
                 name: "CPU-Forced".to_string(),
-                gpu_id: 0,
+                gpu_id: 999, // Use 999 to signal CPU-only
             };
         } else {
             println!("🚀 [MODEL] Running in default mode ({})", config.name);

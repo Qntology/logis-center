@@ -522,6 +522,17 @@ async fn check_query_intent(_state: State<'_, AppState>, _query: String) -> Resu
 #[tauri::command]
 async fn ai_search_complex(state: State<'_, AppState>, query: String, language: String, device_preference: Option<String>) -> Result<Value, String> {
     let mut model_guard = state.model.lock().await;
+    
+    // Check if mode needs to be switched
+    if let Some(m) = model_guard.as_ref() {
+        let wants_cpu = device_preference.as_deref() == Some("cpu");
+        if m.is_cpu_mode != wants_cpu {
+            println!("[LIB] Switching model mode (CPU: {})", wants_cpu);
+            m.unload_generator().await;
+            *model_guard = None;
+        }
+    }
+
     if model_guard.is_none() { *model_guard = Some(LogisModel::new(device_preference.as_deref()).await.map_err(|e| e.to_string())?); }
     let model = model_guard.as_ref().unwrap();
     let structured = model.parse_query_structured(query.clone(), &language).await.map_err(|e| e.to_string())?;
@@ -531,6 +542,17 @@ async fn ai_search_complex(state: State<'_, AppState>, query: String, language: 
 #[tauri::command]
 async fn deep_research_command(state: State<'_, AppState>, app_handle: tauri::AppHandle, query: String, _doc_id: Option<String>, device_preference: Option<String>) -> Result<String, String> {
     let mut model_guard = state.model.lock().await;
+    
+    // Check if mode needs to be switched
+    if let Some(m) = model_guard.as_ref() {
+        let wants_cpu = device_preference.as_deref() == Some("cpu");
+        if m.is_cpu_mode != wants_cpu {
+            println!("[LIB] Switching model mode (CPU: {})", wants_cpu);
+            m.unload_generator().await;
+            *model_guard = None;
+        }
+    }
+
     if model_guard.is_none() { *model_guard = Some(LogisModel::new(device_preference.as_deref()).await.map_err(|e| e.to_string())?); }
     let model = model_guard.as_ref().unwrap();
     model.run_deep_research(query, "".to_string(), &app_handle, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
