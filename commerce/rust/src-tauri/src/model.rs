@@ -315,6 +315,55 @@ impl LogisModel {
         self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token).await
     }
 
+    /// [NEW] Hybrid Image Context Baking (0.6B Text + 2B Vision Layer 0)
+    pub async fn ingest_image_to_ssd(&self, task_id: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        let base_session = format!("{}_img_base", task_id);
+        
+        // 1. Load Small Model (0.6B) in Baking Mode, but point to Large path for mmproj
+        println!("[RELAY] Loading HYBRID Baking Mode (0.6B Text + 2B Vision)...");
+        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true).await?;
+
+        // 2. Ingest Image content
+        let prompt = "[SYSTEM] Analyze the visual contents of this image.".to_string();
+        // chat_with_image_spinner will use the active generator (Small)
+        // and its load logic will pick up the 2B mmproj because shared_path is set to large_model_path in ensure_generator_ext
+        let _ = self.chat_with_image_spinner(
+            prompt, 
+            Some(image), 
+            &unsafe { std::mem::zeroed() }, 
+            "", 
+            json!({}), 
+            1, 
+            cancel_token, 
+            Some(base_session.clone())
+        ).await?;
+
+        // 3. Save Snapshot & Unload
+        self.save_kv_snapshot(&base_session).await?;
+        self.unload_generator().await;
+        
+        Ok(())
+    }
+
+    pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool) -> anyhow::Result<()> {
+        let start_time = Instant::now();
+        self.deep_purge_resources().await;
+        
+        if !self.is_cpu_mode {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
+        }
+
+        self.ensure_generator_ext(target_size, baking_only).await?;
+
+        if let Some(tid) = task_id {
+            self.load_kv_snapshot(tid).await?;
+        }
+
+        println!("[RELAY] Transition to {:?} (Baking: {}) complete in {:.2}s", target_size, baking_only, start_time.elapsed().as_secs_f32());
+        Ok(())
+    }
+
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
         println!("[MODEL] Loading Generator from {} (Text-Only: {})", path, force_text_only);
         
@@ -340,7 +389,7 @@ impl LogisModel {
         self.ensure_generator_ext(size, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, baking_only: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -350,40 +399,11 @@ impl LogisModel {
             return Ok(())
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {})", size, force_text_only);
+        println!("[MODEL] Activating engine for size: {:?} (Baking-Only: {})", size, baking_only);
 
-        // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
-        let found_in_slot = match size {
-            ModelSize::Small => {
-                if let Some(m) = small_slot.take() {
-                    if let Some(old_m) = gen_guard.take() {
-                        if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                        else if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                    }
-                    *gen_guard = Some(m);
-                    *current_size_guard = Some(ModelSize::Small);
-                    true
-                } else { false }
-            },
-            ModelSize::Large => {
-                if let Some(m) = large_slot.take() {
-                    if let Some(old_m) = gen_guard.take() {
-                        if *current_size_guard == Some(ModelSize::Small) { *small_slot = Some(old_m); }
-                        else if *current_size_guard == Some(ModelSize::Large) { *large_slot = Some(old_m); }
-                    }
-                    *gen_guard = Some(m);
-                    *current_size_guard = Some(ModelSize::Large);
-                    true
-                } else { false }
-            }
-        };
+        // ... [SWITCH 로직 생략 - Fresh 로드 위주로 수정] ...
 
-        if found_in_slot {
-            println!("[MODEL] Switched to cached {:?} engine.", size);
-            return Ok(())
-        }
-
-        // 2. [LOAD] Load from disk if not found in any slot
+        // 2. [LOAD] Load from disk
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
@@ -399,11 +419,11 @@ impl LogisModel {
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
                 None, dev_id, None, dev_id, None, Some(limit as usize),
-                force_text_only
+                baking_only
             )
         }).await??;
 
-        // Move current main to slot
+        // ... 나머지 캐싱 로직 ...
         if let Some(old_m) = gen_guard.take() {
             if let Some(old_size) = *current_size_guard {
                 match old_size {

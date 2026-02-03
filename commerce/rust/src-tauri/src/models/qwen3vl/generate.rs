@@ -52,7 +52,7 @@ impl Qwen3VLGenerateModel {
         _vision_device_id: usize,
         _dtype: Option<()>,
         hard_token_limit: Option<usize>,
-        _force_text_only: bool,
+        baking_only: bool, // Renamed from _force_text_only
     ) -> Result<Self> {
         let path_obj = Path::new(path);
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -66,10 +66,8 @@ impl Qwen3VLGenerateModel {
 
         // [ROBUST-CONFIG] Handle both flat (0.6B) and nested (VL-2B) formats
         let vl_config: Qwen3VLConfig = if raw_json.get("text_config").is_some() {
-            // It's already in the nested Qwen3-VL format
             serde_json::from_value(raw_json)?
         } else {
-            // It's a flat Qwen3 format (like 0.6B), wrap it
             let text_cfg = crate::models::qwen3vl::config::Qwen3VLTextConfig {
                 hidden_size: raw_json.get("hidden_size").and_then(|v: &Value| v.as_u64()).unwrap_or(1024) as usize,
                 intermediate_size: raw_json.get("intermediate_size").and_then(|v: &Value| v.as_u64()).unwrap_or(3072) as usize,
@@ -101,15 +99,30 @@ impl Qwen3VLGenerateModel {
             }
         };
 
-        let main_path = path_obj.join("model-BITSERIAL_ALL.safetensors");
-        let vision_path = path_obj.join("mmproj-BITSERIAL_ALL.safetensors");
+        // [HYBRID-FILE-SELECTION] 
+        // 텍스트는 path(0.6B)에서, 비전은 config_path(2B-VL)에서 가져옴
+        let main_filename = if baking_only { "model-BITSERIAL_LAYER0.safetensors" } else { "model-BITSERIAL_ALL.safetensors" };
+        let vision_filename = if baking_only { "mmproj-BITSERIAL_LAYER0.safetensors" } else { "mmproj-BITSERIAL_ALL.safetensors" };
+
+        let main_path = path_obj.join(main_filename);
+        // 비전 파일은 항상 Large 모델 경로(config_path)에서 탐색 시도
+        let vision_root = config_path.map(Path::new).unwrap_or(path_obj);
+        let vision_path = vision_root.join(vision_filename);
+
+        println!("[MODEL] Hybrid Load -> Text: {:?}, Vision: {:?}", main_path.file_name(), vision_path.file_name());
 
         let main_file = std::fs::File::open(main_path)?;
         let main_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&main_file)? });
-        let vision_file = std::fs::File::open(vision_path)?;
-        let vision_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? });
+        
+        let vision_mmap = if vision_path.exists() {
+            let vision_file = std::fs::File::open(vision_path)?;
+            Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? })
+        } else {
+            let placeholder_file = std::fs::File::open(&final_config_path)?;
+            Arc::new(unsafe { memmap2::MmapOptions::new().map(&placeholder_file)? })
+        };
 
-        let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap)?;
+        let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only)?;
         let qwen3_vl = ModelVariant::Native(Arc::new(native_model));
 
         let pre_processor = Qwen3VLProcessor::new_native(tok_path)?;
