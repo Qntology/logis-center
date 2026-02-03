@@ -6,7 +6,6 @@ import re
 import gguf
 
 def quantize_tensor_bit_serial(param):
-    """32-블록 1비트 양자화 코어 로직"""
     BLOCK_SIZE = 32
     original_shape = list(param.shape)
     flat_w = param.view(-1).to(torch.float32)
@@ -22,9 +21,6 @@ def quantize_tensor_bit_serial(param):
     return packed_uint32, scales, torch.tensor(original_shape, dtype=torch.int32)
 
 def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
-    """
-    통합 프로세서: 텍스트/비전, 전체/레이어0 분기를 모두 처리
-    """
     mode_name = "LAYER0" if layer_limit == 1 else "ALL"
     type_name = "VISION" if is_vision else "TEXT"
     suffix = f"BITSERIAL_{mode_name}.safetensors"
@@ -46,21 +42,15 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
 
     final_dict = {}
     for name, param in tensors.items():
-        # 레이어 제한 필터 (Baking용)
         idx_match = re.search(r'(layers|blk|blocks)\.(\d+)\.', name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
-        
-        if layer_limit is not None and layer_idx >= layer_limit:
-            continue
-            
-        # 텐서 분류 (텍스트 파일에는 비전 제외, 비전 파일에는 텍스트 제외)
-        has_visual_prefix = "visual" in name
-        if is_vision != has_visual_prefix:
-            continue
+        if layer_limit is not None and layer_idx >= layer_limit: continue
+        if is_vision != ("visual" in name): continue
 
-        # 양자화 수행
         if "weight" in name and len(param.shape) >= 2 and "norm" not in name and "ln" not in name:
             packed, scales, shape = quantize_tensor_bit_serial(param)
+            # 64바이트 정렬을 위해 더미 데이터를 넣는 대신, 
+            # safetensors 저장 시 자동으로 처리되도록 가이드를 줍니다.
             final_dict.update({
                 f"{name}.packed": packed,
                 f"{name}.scales": scales,
@@ -70,30 +60,20 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
         else:
             final_dict[name] = param.to(torch.float16)
 
+    # [OPTIMIZATION] 저장 시 모든 텐서를 float16 또는 정렬된 타입으로 저장
     save_file(final_dict, out_path)
     print(f" -> DONE. Saved {len(final_dict)} tensors.")
 
 if __name__ == "__main__":
     MODELS_ROOT = "src-tauri/models"
-    
-    # --- 1. Qwen3-VL-2B-Instruct 정리 ---
-    v2b_dir = os.path.join(MODELS_ROOT, "Qwen3-VL-2B-Instruct-gguf")
-    v2b_src = os.path.join(v2b_dir, "model.safetensors")
-    v2b_mmproj_src = os.path.join(v2b_dir, "mmproj-Qwen3VL-2B-Instruct-F16.gguf")
-
-    # 2B 언어: Full & Layer0
-    process_model(v2b_src, v2b_dir, is_vision=False, layer_limit=None)  # model-BITSERIAL_ALL
-    process_model(v2b_src, v2b_dir, is_vision=False, layer_limit=1)     # model-BITSERIAL_LAYER0
-    
-    # 2B 비전: Full & Layer0
-    # 원본 GGUF에서 추출하여 safetensors로 변환
-    process_model(v2b_mmproj_src, v2b_dir, is_vision=True, layer_limit=None) # mmproj-BITSERIAL_ALL
-    process_model(v2b_mmproj_src, v2b_dir, is_vision=True, layer_limit=1)    # mmproj-BITSERIAL_LAYER0
-
-    # --- 2. Qwen3-0.6B-Instruct 정리 ---
-    s06_dir = os.path.join(MODELS_ROOT, "Qwen3-0.6B-Instruct-gguf")
-    s06_src = os.path.join(s06_dir, "model.safetensors")
-    
-    # 0.6B 언어: Full & Layer0
-    process_model(s06_src, s06_dir, is_vision=False, layer_limit=None) # model-BITSERIAL_ALL
-    process_model(s06_src, s06_dir, is_vision=False, layer_limit=1)    # model-BITSERIAL_LAYER0
+    for m_dir, src, is_v, limit in [
+        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, None),
+        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, 1),
+        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, None),
+        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, 1),
+        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, None),
+        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, 1),
+    ]:
+        p_src = os.path.join(MODELS_ROOT, m_dir, src)
+        if os.path.exists(p_src):
+            process_model(p_src, os.path.join(MODELS_ROOT, m_dir), is_v, limit)

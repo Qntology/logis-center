@@ -89,14 +89,14 @@ impl NativeEmbeddingModel {
         };
 
         let table = self.embed_tokens.get_slice::<f16>();
-        let mut x = native_embedding_lookup_f16(token_ids, table, self.hidden_size);
+        let mut x = native_embedding_lookup_f16(token_ids, &table, self.hidden_size);
 
         for (i, layer) in self.layers.iter().enumerate() {
             x = layer.forward(&x, &cfg, 0, i);
         }
 
         let norm_w = self.norm.get_slice::<f16>();
-        let x_norm = native_rms_norm_f16(&x, norm_w, 1e-6, self.hidden_size);
+        let x_norm = native_rms_norm_f16(&x, &norm_w, 1e-6, self.hidden_size);
         
         let mut pooled = vec![0.0f32; self.hidden_size];
         for i in 0..token_ids.len() {
