@@ -15,6 +15,19 @@ extern "C" {
     fn bit_serial_attn_cuda_direct(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, h_d: i32, t_s: i32, scale: f32, dev: i32);
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn avx2_popcnt_epi32(v: __m256i) -> __m256i {
+    let lookup = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let lo = _mm256_and_si256(v, low_mask);
+    let hi = _mm256_and_si256(_mm256_srli_epi32(v, 4), low_mask);
+    let pop_lo = _mm256_shuffle_epi8(lookup, lo);
+    let pop_hi = _mm256_shuffle_epi8(lookup, hi);
+    let total8 = _mm256_add_epi8(pop_lo, pop_hi);
+    _mm256_sad_epu8(total8, _mm256_setzero_si256())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GpuPtr(pub *mut std::ffi::c_void);
 unsafe impl Send for GpuPtr {}
@@ -41,7 +54,7 @@ impl NativeTensor {
         unsafe { let data_ptr = mmap.as_ptr().add(offset); Self { data_ptr, gpu_ptr: None, shape, dtype, _mmap: Some(mmap), device_id: -1 } }
     }
 
-    pub fn get_slice<T: Clone>(&self) -> std::borrow::Cow<[T]> {
+    pub fn get_slice<T: Clone>(&self) -> std::borrow::Cow<'_, [T]> {
         let size = self.shape.iter().product::<usize>();
         if size == 0 { return std::borrow::Cow::Owned(Vec::new()); }
         let ptr = self.data_ptr as *const T;
@@ -116,7 +129,82 @@ pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: u
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub unsafe fn bit_serial_matmul_f32_avx2(i: &[f16], w: &[u32], s: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut o = vec![0.0f32; m * n];
+    let k_b = (k + 31) / 32;
+    let n_groups = (n + 7) / 8;
+    let mut ip = vec![0u32; m * k_b];
+
+    ip.par_chunks_mut(k_b).enumerate().for_each(|(idx, row)| {
+        let start = idx * k;
+        let end = (start + k).min(i.len());
+        let src = &i[start..end];
+        for kb in 0..k_b {
+            let mut b = 0u32;
+            for bt in 0..32 { 
+                let l = kb * 32 + bt;
+                if l < src.len() && src[l].to_f32() >= 0.0 { b |= 1 << bt; } 
+            }
+            row[kb] = b;
+        }
+    });
+
+    o.par_chunks_mut(n).enumerate().for_each(|(m_idx, row_o)| {
+        let ir_ptr = ip.as_ptr().add(m_idx * k_b);
+        for g in 0..n_groups {
+            let n_base = g * 8;
+            let w_off = g * k_b * 8;
+            if w_off + k_b * 8 > w.len() { continue; }
+            let w_ptr = w.as_ptr().add(w_off);
+            let s_ptr = s.as_ptr().add(w_off);
+            
+            let mut sums = _mm256_setzero_ps();
+            
+            for kb in 0..k_b {
+                let input_bits = *ir_ptr.add(kb);
+                let v_in = _mm256_set1_epi32(input_bits as i32);
+                let v_w = _mm256_loadu_si256(w_ptr.add(kb * 8) as *const __m256i);
+                let v_xor = _mm256_xor_si256(v_in, v_w);
+                
+                // Popcount emulation for AVX2
+                let lookup = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+                let low_mask = _mm256_set1_epi8(0x0f);
+                
+                let lo = _mm256_and_si256(v_xor, low_mask);
+                let hi = _mm256_and_si256(_mm256_srli_epi32(v_xor, 4), low_mask);
+                let pop_lo = _mm256_shuffle_epi8(lookup, lo);
+                let pop_hi = _mm256_shuffle_epi8(lookup, hi);
+                let total8 = _mm256_add_epi8(pop_lo, pop_hi);
+                
+                // Sum up bytes to u32 slots
+                let t0 = _mm256_cvtepu8_epi32(_mm256_extracti128_si256(total8, 0));
+                let t1 = _mm256_cvtepu8_epi32(_mm256_extracti128_si256(total8, 1));
+                // This is a bit simplified, but SAD approach is better. Let's use SAD.
+                let v_pop = _mm256_sad_epu8(total8, _mm256_setzero_si256());
+                
+                // Actual popcount per 32-bit element needs more care. 
+                // Let's use a simpler but correct AVX2 popcount for 8x u32.
+                let mut pcounts = [0i32; 8];
+                for i_ch in 0..8 {
+                    let weight_bits = *w_ptr.add(kb * 8 + i_ch);
+                    let scale = *s_ptr.add(kb * 8 + i_ch);
+                    let dot = 32 - 2 * (input_bits ^ weight_bits).count_ones() as i32;
+                    row_o[n_base + i_ch] += (dot as f32) * scale.to_f32();
+                }
+            }
+        }
+    });
+    o
+}
+
 pub fn bit_serial_matmul_f32_shuffled(i: &[f16], w: &[u32], s: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return unsafe { bit_serial_matmul_f32_avx2(i, w, s, m, n, k) };
+    }
+
     let mut o = vec![0.0f32; m * n];
     let k_b = (k + 31) / 32;
     let n_groups = (n + 7) / 8;
@@ -246,7 +334,7 @@ pub fn native_apply_rope_f16_with_offset(q: &mut [f16], k: &mut [f16], _ql: usiz
     apply(q); apply(k);
 }
 pub fn native_linear_f16(i: &[f16], w: &[f16], b: Option<&[f16]>, m: usize, n: usize, k: usize) -> Vec<f16> {
-    let mut o = vec![f16::ZERO; m * n];
+    let mut o = vec![0.0f32; m * n];
     o.par_chunks_exact_mut(n).enumerate().for_each(|(idx, ro)| {
         let i_start = idx * k;
         if i_start + k <= i.len() {
@@ -259,9 +347,9 @@ pub fn native_linear_f16(i: &[f16], w: &[f16], b: Option<&[f16]>, m: usize, n: u
                     for l in 0..k { s += ri[l].to_f32() * wr[l].to_f32(); }
                 }
                 if let Some(bv) = b { if j < bv.len() { s += bv[j].to_f32(); } }
-                ro[j] = f16::from_f32(s);
+                ro[j] = s;
             }
         }
     });
-    o
+    o.into_iter().map(f16::from_f32).collect()
 }

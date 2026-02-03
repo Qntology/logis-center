@@ -303,13 +303,31 @@ async fn process_task(
         model_lock.as_ref().unwrap().clone()
     };
 
-    // [IMAGE-PIPELINE] Detect and handle pure image tasks first
+    // [PIPELINE-FORK] Separate Image and Text preprocessing flows
     if !image_path.is_empty() {
+        // SCENARIO B: Image Preprocessing (0.6B Bake -> 2B Vision Bake -> 2B Full Inference)
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Image Pipeline", "summary": "Starting 3-step vision extraction...", "spinner": "⠋" }));
         let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
         model.extract_from_image(task.id.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
         return Ok(());
+    } else if !url.is_empty() {
+        // SCENARIO A: Text Preprocessing (0.6B Bake -> 2B Full Inference)
+        process_text_pipeline(task, &model, cancellation_token, app_handle, &light_pug, &mut data_manager, store_mutex).await?;
+        return Ok(());
     }
 
+    Ok(())
+}
+
+async fn process_text_pipeline(
+    task: Task,
+    model: &LogisModel,
+    cancellation_token: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    light_pug: &str,
+    data_manager: &mut TaskDataManager,
+    store_mutex: &Arc<Mutex<Option<VectorStore>>>,
+) -> Result<()> {
     // --- PIPELINE STEP A: CLASSIFICATION ---
     let mut page_type = String::new();
     let mut selector_info = json!({});
@@ -388,7 +406,7 @@ async fn process_task(
         };
 
         if !content_pug.trim().is_empty() {
-             let extraction_instruction = parsing::item2json(&page_type, &url, "english");
+             let extraction_instruction = parsing::item2json(&page_type, &task.data_json, "english");
              let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", extraction_instruction);
              // [SCENARIO-A] 2B Full-Layer Inference (Reuse injected KV)
              let res = model.run_text_inference_full(&task.id, "", &task_question, Some(cancellation_token.clone())).await?;
@@ -399,7 +417,6 @@ async fn process_task(
 
     // --- PHASE 3: HANDOVER & EMBEDDING ---
     model.unload_generator().await;
-    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
     
     if let Some(obj) = extracted_data.as_object_mut() {
         if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
