@@ -297,14 +297,6 @@ impl NativeQwen3VLModel {
         let st = SafeTensors::deserialize(&m_mmap)?; 
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         
-        // [DEBUG] Print non-layer tensor names to find lm_head
-        println!("[LOAD] Inspecting non-layer keys (total {}):", st.names().len());
-        for name in st.names() {
-            if !name.contains(".layers.") && !name.contains(".blk.") && !name.contains(".blocks.") {
-                println!("  - Top-level Key: {}", name);
-            }
-        }
-        
         let find_key = |target: &str| -> Option<String> {
             let variations = vec![
                 target.to_string(),
@@ -317,14 +309,12 @@ impl NativeQwen3VLModel {
             ];
             for v in variations {
                 if st.tensor(&v).is_ok() { return Some(v); }
-                let packed_v = format!("{}.packed", v);
-                if st.tensor(&packed_v).is_ok() { return Some(v); }
+                if st.tensor(&format!("{}.packed", v)).is_ok() { return Some(v); }
             }
-            // Final fallback: Comprehensive search for any key containing the target
+            // Exhaustive search for tied weights or renamed heads
             for name in st.names() {
                 if name.contains(target) {
-                    let base = name.replace(".packed", "").replace(".scales", "").replace(".shape", "");
-                    return Some(base);
+                    return Some(name.replace(".packed", "").replace(".scales", "").replace(".shape", "").replace(".format", ""));
                 }
             }
             None
@@ -341,10 +331,8 @@ impl NativeQwen3VLModel {
                 let op = unsafe { vp.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
                 let os = unsafe { vs.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
                 
-                println!("[LOAD] Bit-serial layer: {} -> [{}, {}]", key, in_f, out_f);
                 Ok(NativeLinear { 
-                    in_features: in_f, 
-                    out_features: out_f, 
+                    in_features: in_f, out_features: out_f, 
                     variant: LinearVariant::BitSerial {
                         weight_packed: NativeTensor::from_mmap(m_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(m_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
@@ -355,10 +343,8 @@ impl NativeQwen3VLModel {
             } else {
                 let v = st.tensor(&key)?;
                 let o = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
-                println!("[LOAD] Standard layer: {} -> [{}, {}]", key, in_f, out_f);
                 Ok(NativeLinear { 
-                    in_features: in_f, 
-                    out_features: out_f, 
+                    in_features: in_f, out_features: out_f, 
                     variant: LinearVariant::Standard { 
                         weight: NativeTensor::from_mmap(m_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
                         bias: None 
@@ -375,7 +361,9 @@ impl NativeQwen3VLModel {
             Ok(NativeTensor::from_mmap(m_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
         };
 
-        // 임베딩 로드 로직: 여러 경로를 시도하여 양자화된 임베딩을 찾음
+        println!("[LOAD] Initializing Native Engine (Baking: {})...", baking);
+
+        // 임베딩 로드
         let emb = get_l("model.embed_tokens.weight", 151936, t_c.hidden_size)
             .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))?;
             
@@ -400,20 +388,17 @@ impl NativeQwen3VLModel {
         }
         let norm = get_t("model.norm.weight")?;
         
-        // [SMART-HEAD-LOADER] Handle tied weights (common in 2B models)
+        // [SMART-HEAD-LOADER] 가중치 공유(tied weights) 대응 강화
         let head_res = get_l("lm_head.weight", t_c.hidden_size, 151936)
             .or_else(|_| get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936))
             .or_else(|_| {
-                println!("[LOAD] lm_head not found, checking for tied weights in embed_tokens...");
+                println!("[LOAD] lm_head not found, using tied weights from embed_tokens.");
                 get_l("model.embed_tokens.weight", 151936, t_c.hidden_size)
                     .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))
-                    .map(|mut emb| {
-                        println!("[LOAD] Success! Using tied weights from embed_tokens for lm_head.");
-                        // Standard tied weights: embed[vocab, hidden] -> head[hidden, vocab]
-                        // Our BitSerial logic handles this via in_features/out_features swap during forward.
-                        emb.in_features = t_c.hidden_size;
-                        emb.out_features = 151936;
-                        emb
+                    .map(|mut emb_l| {
+                        emb_l.in_features = t_c.hidden_size;
+                        emb_l.out_features = 151936;
+                        emb_l
                     })
             });
             
