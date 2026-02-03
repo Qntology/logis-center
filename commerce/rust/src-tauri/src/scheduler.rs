@@ -200,6 +200,10 @@ pub async fn start_background_worker(
                                 let _ = db.update_task_status(&task.id, 6).await; // 6 = Error
                                 let _ = db.update_message_status(&task.id, 6, Some(&format!("Error: {}", err_msg))).await;
                             }
+                            // [UI-FIX] Explicitly notify frontend of failure
+                            log_task_progress(&app_handle, &task.id, &json!({
+                                "category": "Error", "summary": format!("Error: {}", err_msg), "spinner": "❌"
+                            }));
                         }
                     }
                 }

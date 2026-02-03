@@ -71,15 +71,17 @@ pub struct RopeScaling {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Qwen3VLVisionConfig {
     pub depth: usize,
-    pub embed_dim: usize,
-    pub head_dim: usize,
     pub hidden_size: usize,
-    pub mlp_ratio: f32,
     pub num_heads: usize,
-    pub out_features: usize,
     pub patch_size: usize,
     pub spatial_merge_size: usize,
     pub temporal_patch_size: usize,
+    // Add optional fields to handle variations across versions
+    pub embed_dim: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub mlp_ratio: Option<f32>,
+    pub out_features: Option<usize>,
+    pub out_hidden_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
