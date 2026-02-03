@@ -6,7 +6,7 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::{LogisModel, ModelSize};
-use crate::models::qwen3vl::generate::Qwen3VLGenerateModel; // Import added
+use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::{AppHandle, Manager, Emitter};
@@ -17,7 +17,6 @@ use tokio::sync::Notify;
 use once_cell::sync::Lazy;
 
 // --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
-// Handles offloading of large text data to disk to prevent RAM/VRAM bloating.
 pub struct TaskDataManager {
     pub task_id: String,
     created_files: Vec<PathBuf>,
@@ -229,23 +228,23 @@ async fn process_task(
     }
 
     // Initial Progress Log
-    log_task_progress(app_handle, &task.id, &json!({
-        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋"
+    log_task_progress(app_handle, &task.id, &json!({ 
+        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋" 
     }));
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
-    let _task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
     // Device Preference Handling
-    let _effective_device_pref = device_preference.or_else(|| {
-        _task_data.get("device_preference").and_then(|v| {
+    let effective_device_pref = device_preference.or_else(|| {
+        task_data.get("device_preference").and_then(|v| {
             if v.as_str() == Some("cpu") || v.as_bool() == Some(true) { Some("cpu".to_string()) } else { None }
         })
     });
 
-    let url = _task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
     if url.is_empty() { return Ok(()); }
 
     // 2. Fetch & Convert to PUG
@@ -258,7 +257,7 @@ async fn process_task(
             let raw_html_path = data_manager.get_path("raw_html");
             let raw_content = if raw_html_path.exists() {
                 data_manager.load(&raw_html_path)?
-            } else if let Some(h) = _task_data.get("html").and_then(|s| s.as_str()) {
+            } else if let Some(h) = task_data.get("html").and_then(|s| s.as_str()) {
                  data_manager.offload(h, "raw_html")?;
                  h.to_string()
             } else {
@@ -276,11 +275,6 @@ async fn process_task(
             p
         }
     };
-
-    // 3. Ensure Model Loaded (Native Switch)
-    // The model logic in `LogisModel` handles the internal switching between Small/Large/CPU/GPU
-    // based on `effective_device_pref` (though currently new() takes the pref, we can't re-init easily, 
-    // but `secure_vram_relay` helps manage resources).
 
     // --- PIPELINE STEP A: CLASSIFICATION ---
     let mut page_type = String::new();
@@ -303,7 +297,7 @@ async fn process_task(
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?; // Save Native Snapshot
+                 gen.save_kv_to_disk(&kv_dir)?;
              }
         }
 
@@ -317,7 +311,7 @@ async fn process_task(
         println!("[Scheduler] Classified as: {}", page_type);
     }
     
-    if page_type == "unknown" { return Ok(()); } 
+    if page_type == "unknown" { return Ok(()); }
     
     // --- PIPELINE STEP B: SELECTORS ---
     // Clear resources between heavy steps
@@ -339,7 +333,7 @@ async fn process_task(
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?; 
+                 gen.save_kv_to_disk(&kv_dir)?;
              }
         }
 
@@ -351,7 +345,6 @@ async fn process_task(
 
     // Save Page Info to DB (Intermediate)
     let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-    // ... (Skipping full DB upsert for Page entity for brevity, but crucial parts are here)
 
     let mut extracted_data = json!({});
 
@@ -360,9 +353,8 @@ async fn process_task(
         let item_selector = selector_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
         let mut all_extracted_items = Vec::new();
         {
-            let clean_html_path = data_manager.get_path("clean_html"); // Assuming created earlier or now
+            let clean_html_path = data_manager.get_path("clean_html");
             if !clean_html_path.exists() {
-                // If clean html missing, regen from raw
                  let raw = data_manager.load(&data_manager.get_path("raw_html"))?;
                  let c = parsing::pre_clean_html(&raw);
                  data_manager.offload(&c, "clean_html")?;
@@ -407,7 +399,7 @@ async fn process_task(
                  if let Some(gen) = gen_guard.as_mut() {
                      gen.clear_kv_cache();
                      gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                     gen.save_kv_to_disk(&kv_dir)?; 
+                     gen.save_kv_to_disk(&kv_dir)?;
                  }
              }
              
@@ -422,7 +414,6 @@ async fn process_task(
     model.unload_generator().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
     
-    // Normalize Data
     if let Some(obj) = extracted_data.as_object_mut() {
         if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
     }
@@ -437,11 +428,9 @@ async fn process_task(
     let text_to_embed = parsing::json_to_natural_language(&extracted_data);
     let item_digest = crate::utils::hash::digest(&text_to_embed); 
     
-    // Embedding (Native)
     let vector = model.get_embedding(text_to_embed).await?;
 
-    // Upsert
-    let generated_id = crate::utils::hash::hash_id(&format!("{}{}", task.to, task.id)); // Simplified ID logic
+    let generated_id = crate::utils::hash::hash_id(&format!("{}{}", task.to, task.id)); 
     let _ = store.upsert_item(
         &page_type, &generated_id, &page_type, extracted_data.clone(), Some(vector),
         Some(&task.from), Some(&task.to), Some(&task.cc), None, None, Some(&item_digest)
@@ -459,7 +448,6 @@ fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) 
     let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
 }
 
-// [3번 가속: PRE-FETCH] OS 페이지 캐시에 무게추 파일을 미리 로드함
 fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     use std::io::Read;
     println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
@@ -470,8 +458,7 @@ fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
                     let p = entry.path();
                     if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
                         if let Ok(mut file) = std::fs::File::open(p) {
-                            let mut buffer = [0u8; 1024 * 1024]; // 1MB buffer
-                            // 파일 전체를 읽어서 OS가 램에 캐싱하도록 유도함
+                            let mut buffer = [0u8; 1024 * 1024]; 
                             while let Ok(n) = file.read(&mut buffer) {
                                 if n == 0 { break; }
                             }
@@ -536,19 +523,16 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
         let meets_ram = current_ram >= target_ram_bytes;
         
         if meets_vram && meets_ram {
-            break; // Perfect state reached
+            break; 
         }
 
-        // [STABILITY-LOGIC] Even if below target, if memory release has stopped changing,
-        // it means we've recovered all we can. Don't wait forever.
         let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
-        if delta < 5_000_000 { // Change < 5MB
+        if delta < 5_000_000 { 
             stable_ticks += 1;
         } else {
             stable_ticks = 0;
         }
 
-        // If stable for 3 seconds AND we have at least 1.2GB free (enough for Large model weights)
         if stable_ticks >= 6 && current_vram > 1_200_000_000 {
             println!("[RESOURCE-WATCH] Memory stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
             break;
@@ -560,7 +544,6 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             last_report = std::time::Instant::now();
         }
 
-        // Absolute maximum wait 20s
         if start_time.elapsed().as_secs() > 20 {
             println!("[RESOURCE-WATCH] Max wait reached. Proceeding anyway.");
             break;
@@ -572,7 +555,6 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
     Ok(())
 }
 
-// Helper to chunk text, strictly respecting Pug line boundaries (\n)
 fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut start = 0;
@@ -580,28 +562,21 @@ fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
 
     while start < text.len() {
         let mut end = (start + target_size).min(text.len());
-
-        // [BACKTRACKING] If mid-line, move back until we find a newline
         if end < text.len() {
             let mut temp_end = end;
             while temp_end > start && bytes[temp_end] != b'\n' {
                 temp_end -= 1;
             }
-            
-            // If found a newline, use it as the end
             if temp_end > start {
-                end = temp_end + 1; // Include the \n
+                end = temp_end + 1; 
             } else {
-                // No newline found in the whole chunk? Force char boundary to avoid hang
                 while end < text.len() && !text.is_char_boundary(end) {
                     end += 1;
                 }
             }
         } else {
-            // Reached the end of string
             end = text.len();
         }
-
         let slice = &text[start..end];
         if !slice.trim().is_empty() {
             chunks.push(slice.to_string());
@@ -611,16 +586,13 @@ fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
     chunks
 }
 
-// Deep merge for JSON objects
 fn merge_json_results(target: &mut Value, source: &Value) {
     if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
         for (k, v) in source_obj {
-            // If value is null or empty string/array, ignore
             if v.is_null() { continue; }
             if let Some(s) = v.as_str() { if s.is_empty() { continue; } }
             if let Some(a) = v.as_array() { if a.is_empty() { continue; } }
             
-            // If target doesn't have it or target is empty, overwrite
             let should_update = match target_obj.get(k) {
                 None => true,
                 Some(tv) => {
@@ -633,11 +605,9 @@ fn merge_json_results(target: &mut Value, source: &Value) {
             if should_update {
                 target_obj.insert(k.clone(), v.clone());
             } else if let Some(target_inner) = target_obj.get_mut(k) {
-                // If both are objects, recurse
                 if target_inner.is_object() && v.is_object() {
                     merge_json_results(target_inner, v);
                 }
-                // Lists? Simply append for now (might duplicate, but safe for search)
                 else if let (Some(ta), Some(sa)) = (target_inner.as_array_mut(), v.as_array()) {
                     ta.extend(sa.clone());
                 }
