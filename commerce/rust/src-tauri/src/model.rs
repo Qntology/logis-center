@@ -411,7 +411,7 @@ impl LogisModel {
         let path_clone = path.to_string();
         let shared_path_clone = shared_path.map(|s| s.to_string());
 
-        let gen = tokio::task::spawn_blocking(move || {
+        let mut gen = tokio::task::spawn_blocking(move || {
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path_clone.as_deref(), 
@@ -420,6 +420,25 @@ impl LogisModel {
                 baking_only
             )
         }).await??;
+
+        // [GPU-ACTIVATION] Move layers to VRAM for high-speed baking/inference
+        if !self.is_cpu_mode {
+            let gpu_id = self.device_config.gpu_id as i32;
+            println!("[MODEL] Offloading layers to GPU-{}...", gpu_id);
+            match &mut gen.qwen3_vl {
+                ModelVariant::Native(m_arc) => {
+                    // We need a mutable reference to move to GPU. 
+                    // Since it's an Arc, we use get_mut or redesign. 
+                    // For now, let's ensure the move happens inside the generator's initialization or via a proxy.
+                    if let Some(m) = Arc::get_mut(&mut gen.qwen3_vl.get_native_mut()) {
+                        m.move_to_gpu(gpu_id);
+                    } else {
+                        // Fallback: If shared, we can't move. But fresh loads are not shared.
+                        println!("[WARNING] Could not get mutable ref to model for GPU offloading.");
+                    }
+                }
+            }
+        }
 
         // ... 나머지 캐싱 로직 ...
         if let Some(old_m) = gen_guard.take() {

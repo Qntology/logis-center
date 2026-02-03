@@ -18,37 +18,37 @@ pub struct DeviceConfig {
 }
 
 pub fn get_optimal_device_config() -> DeviceConfig {
-    #[cfg(feature = "cuda")]
-    {
-        if let Ok(nvml) = Nvml::init() {
-            if let Ok(count) = nvml.device_count() {
-                let mut best_id = 0;
-                let mut max_free = 0;
-                
-                for i in 0..count {
-                    if let Ok(device) = nvml.device_by_index(i) {
-                        if let Ok(mem) = device.memory_info() {
-                            if mem.free > max_free {
-                                max_free = mem.free;
-                                best_id = i;
-                            }
+    if let Ok(nvml) = Nvml::init() {
+        if let Ok(count) = nvml.device_count() {
+            let mut best_id = 0;
+            let mut max_free = 0;
+            
+            for i in 0..count {
+                if let Ok(device) = nvml.device_by_index(i) {
+                    if let Ok(mem) = device.memory_info() {
+                        println!("[DEVICE-CHECK] GPU-{} Free VRAM: {:.2} GB", i, mem.free as f64 / 1e9);
+                        if mem.free > max_free {
+                            max_free = mem.free;
+                            best_id = i;
                         }
                     }
                 }
-                
-                if max_free > 0 {
-                    return DeviceConfig {
-                        is_cpu: false,
-                        classify_chunk_size: 12_000, 
-                        extract_chunk_size: 12_000,
-                        name: format!("GPU-{}", best_id),
-                        gpu_id: best_id as usize,
-                    };
-                }
+            }
+            
+            if max_free > 500 * 1024 * 1024 { // At least 500MB free
+                println!("[DEVICE-SELECT] Choosing GPU-{} with {:.2} GB free.", best_id, max_free as f64 / 1e9);
+                return DeviceConfig {
+                    is_cpu: false,
+                    classify_chunk_size: 12_000, 
+                    extract_chunk_size: 12_000,
+                    name: format!("GPU-{}", best_id),
+                    gpu_id: best_id as usize,
+                };
             }
         }
     }
 
+    println!("[DEVICE-SELECT] No suitable GPU found. Falling back to CPU.");
     DeviceConfig {
         is_cpu: true,
         classify_chunk_size: 12_000,  

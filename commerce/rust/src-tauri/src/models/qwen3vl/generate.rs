@@ -27,6 +27,12 @@ impl ModelVariant {
             Self::Native(m) => m.forward(input_ids, pixel_values, grid_thw, seqlen_offset),
         }
     }
+
+    pub fn get_native_mut(&mut self) -> &mut Arc<NativeQwen3VLModel> {
+        match self {
+            Self::Native(m) => m,
+        }
+    }
 }
 
 pub struct Qwen3VLGenerateModel {
