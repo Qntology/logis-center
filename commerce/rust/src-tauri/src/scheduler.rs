@@ -328,6 +328,10 @@ async fn process_text_pipeline(
     data_manager: &mut TaskDataManager,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
 ) -> Result<()> {
+    // [MODULAR-PIPELINE] Step 0: One-time PUG Baking
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Baking PUG context (once)...", "spinner": "⠋" }));
+    model.bake_pug_context(&task.id, light_pug, Some(cancellation_token.clone())).await?;
+
     // --- PIPELINE STEP A: CLASSIFICATION ---
     let mut page_type = String::new();
     let mut selector_info = json!({});
@@ -336,13 +340,10 @@ async fn process_text_pipeline(
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
-        // [SCENARIO-A] 텍스트 전처리 베이킹 (0.6B 1-Layer)
-        model.bake_text_kv(&task.id, &light_pug, Some(cancellation_token.clone())).await?;
-
-        // [SCENARIO-A] 텍스트 전용 하이브리드 추론 (2B Full-Layer with Injected BitKV)
         let type_prompt = parsing::page_type_prompt();
         let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", type_prompt);
-        let res = model.run_text_inference_full(&task.id, "", &task_question, Some(cancellation_token.clone())).await?;
+        // Reuse pre-baked PUG
+        let res = model.run_modular_inference(&task.id, "class", &task_question, "Classify this page.", Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_a_res")?;
         
         let type_info = parsing::parse_json_from_llm(&res);
@@ -359,8 +360,8 @@ async fn process_text_pipeline(
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
         let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", selector_prompt);
-        // [SCENARIO-A] 2B Full-Layer Inference (Reuse injected KV)
-        let res = model.run_text_inference_full(&task.id, "", &task_question, Some(cancellation_token.clone())).await?;
+        // Reuse pre-baked PUG
+        let res = model.run_modular_inference(&task.id, "sel", &task_question, "Identify selectors.", Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_b_res")?;
         selector_info = parsing::parse_json_from_llm(&res);
     }
@@ -408,8 +409,8 @@ async fn process_text_pipeline(
         if !content_pug.trim().is_empty() {
              let extraction_instruction = parsing::item2json(&page_type, &task.data_json, "english");
              let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", extraction_instruction);
-             // [SCENARIO-A] 2B Full-Layer Inference (Reuse injected KV)
-             let res = model.run_text_inference_full(&task.id, "", &task_question, Some(cancellation_token.clone())).await?;
+             // Reuse pre-baked PUG
+             let res = model.run_modular_inference(&task.id, "ext", &task_question, "Extract JSON data.", Some(cancellation_token.clone())).await?;
              data_manager.offload(&res, "step_c_res")?;
              extracted_data = parsing::parse_json_from_llm(&res);
         }

@@ -275,44 +275,60 @@ impl LogisModel {
         Ok(())
     }
 
-    // --- [SCENARIO A] Text Preprocessing (0.6B 1L Baking -> 2B Full Inference) ---
-    pub async fn bake_text_kv(&self, task_id: &str, content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        println!("[BAKE-TEXT] Starting 0.6B 1-Layer Split-Baking for task: {}", task_id);
-        
-        // 1. Load: 0.6B Small model, 1-Layer, Text-Only
+    // --- [SCENARIO A-Modular] Optimized Text Preprocessing ---
+    
+    /// Step 1: Bake the heavy PUG content once
+    pub async fn bake_pug_context(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        println!("[BAKE-PUG] One-time PUG baking for task: {}", task_id);
         self.ensure_generator_ext(ModelSize::Small, true, true).await?;
-
         {
             let gen_clone = self.generator.clone();
-            let text_to_bake = content.to_string();
+            let text = pug_content.to_string();
             let tid = task_id.to_string();
             let token_clone = cancel_token.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    // [NEW] Use part-based baking for 50k+ tokens
-                    gen.bake_text_in_parts(text_to_bake, &tid, "text", token_clone)?;
+                    gen.bake_text_in_parts(text, &tid, "pug_base", token_clone)?;
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
         }
-
         self.unload_generator().await;
         Ok(())
     }
 
-    pub async fn run_text_inference_full(&self, task_id: &str, system: &str, user: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let text_session = format!("{}_text", task_id);
-        println!("[INFERENCE-TEXT] Starting 2B Full-Layer Inference with injected Multi-part KV for task: {}", task_id);
+    /// Step 2: Bake a specific prompt and run inference by stitching with PUG base
+    pub async fn run_modular_inference(&self, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        let prompt_session = format!("{}_prompt_{}", task_id, prompt_name);
+        println!("[MODULAR-INF] Running inference for step: {}", prompt_name);
 
-        // 1. Load 2B Full Model (Text-Only Mode)
+        // 1. Bake the specific system prompt (Quick 1-layer bake)
+        self.ensure_generator_ext(ModelSize::Small, true, true).await?;
+        {
+            let gen_clone = self.generator.clone();
+            let sp = system_prompt.to_string();
+            let psid = prompt_session.clone();
+            let token_clone = cancel_token.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut gen_guard = gen_clone.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.bake_text_in_parts(sp, &psid, "baked", token_clone)?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }).await??;
+        }
+        self.unload_generator().await;
+
+        // 2. Load 2B Full Model and Stitch [PUG + PROMPT]
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true).await?;
         
-        // 2. Inject ALL Baked Parts
-        self.load_stitched_kv(task_id, &["text"]).await?;
+        // Load the shared PUG base + this step's baked prompt
+        self.load_stitched_kv(task_id, &["pug_base"]).await?;
+        self.load_stitched_kv(&prompt_session, &["baked"]).await?;
 
-        // 3. Chat with injected context
-        self.chat(system, user, cancel_token, Some(text_session)).await
+        // 3. Final Chat
+        self.chat("", user_input, cancel_token, Some(format!("{}_final", prompt_name))).await
     }
 
     // --- [SCENARIO B] Image Preprocessing (0.6B 1L Bake -> 2B 1L Vision Bake -> 2B Full Inf) ---
