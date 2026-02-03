@@ -114,22 +114,25 @@ impl Qwen3VLGenerateModel {
 
         // [HYBRID-FILE-SELECTION] 
         let main_filename = if baking_only { "model-BITSERIAL_LAYER0.safetensors" } else { "model-BITSERIAL_ALL.safetensors" };
-        let vision_filename = if baking_only { "mmproj-BITSERIAL_LAYER0.safetensors" } else { "mmproj-BITSERIAL_ALL.safetensors" };
-
         let main_path = path_obj.join(main_filename);
-        let vision_root = config_path.map(Path::new).unwrap_or(path_obj);
-        let vision_path = vision_root.join(vision_filename);
-
         let main_file = std::fs::File::open(main_path)?;
         let main_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&main_file)? });
         
-        // [VISION-BRANCH] 비전 파일이 존재하고, 텍스트 전용 모드가 아닐 때만 로드
-        let vision_mmap = if !force_text_only && vision_path.exists() {
-            println!("[LOAD] Activating Vision Module from {:?}", vision_path.file_name());
-            let vision_file = std::fs::File::open(vision_path)?;
-            Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? }))
+        // [VISION-BRANCH] 원안대로 텍스트 전용일 때는 비전 파일을 "절대" 쳐다보지도 않음
+        let vision_mmap = if !force_text_only {
+            let vision_filename = if baking_only { "mmproj-BITSERIAL_LAYER0.safetensors" } else { "mmproj-BITSERIAL_ALL.safetensors" };
+            let vision_root = config_path.map(Path::new).unwrap_or(path_obj);
+            let vision_path = vision_root.join(vision_filename);
+            
+            if vision_path.exists() {
+                println!("[LOAD] Activating Vision Module from {:?}", vision_path.file_name());
+                let vision_file = std::fs::File::open(vision_path)?;
+                Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? }))
+            } else {
+                None
+            }
         } else {
-            println!("[LOAD] Text-Only Mode. Skipping Vision Module.");
+            println!("[LOAD] Strict Text-Only Mode. Vision Module blocked.");
             None
         };
 
