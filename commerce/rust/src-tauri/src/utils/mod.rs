@@ -21,22 +21,29 @@ pub fn get_optimal_device_config() -> DeviceConfig {
     if let Ok(nvml) = Nvml::init() {
         if let Ok(count) = nvml.device_count() {
             let mut best_id = 0;
-            let mut max_free = 0;
+            let mut max_total = 0;
+            let mut best_free = 0;
             
             for i in 0..count {
                 if let Ok(device) = nvml.device_by_index(i) {
+                    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
                     if let Ok(mem) = device.memory_info() {
-                        println!("[DEVICE-CHECK] GPU-{} Free VRAM: {:.2} GB", i, mem.free as f64 / 1e9);
-                        if mem.free > max_free {
-                            max_free = mem.free;
+                        let total_gib = mem.total as f64 / (1024.0 * 1024.0 * 1024.0);
+                        let free_gib = mem.free as f64 / (1024.0 * 1024.0 * 1024.0);
+                        println!("[DEVICE-CHECK] GPU-{}: {} (Total: {:.2} GiB, Free: {:.2} GiB)", i, name, total_gib, free_gib);
+                        
+                        // Choose based on physical capacity first, then availability
+                        if mem.total > max_total {
+                            max_total = mem.total;
+                            best_free = mem.free;
                             best_id = i;
                         }
                     }
                 }
             }
             
-            if max_free > 500 * 1024 * 1024 { // At least 500MB free
-                println!("[DEVICE-SELECT] Choosing GPU-{} with {:.2} GB free.", best_id, max_free as f64 / 1e9);
+            if max_total > 500 * 1024 * 1024 { // At least 500MB total capacity
+                println!("[DEVICE-SELECT] Choosing GPU-{} with {:.2} GiB free out of {:.2} GiB.", best_id, best_free as f64 / 1073741824.0, max_total as f64 / 1073741824.0);
                 return DeviceConfig {
                     is_cpu: false,
                     classify_chunk_size: 12_000, 
