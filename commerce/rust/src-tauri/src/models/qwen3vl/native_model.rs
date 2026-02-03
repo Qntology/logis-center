@@ -467,75 +467,155 @@ impl NativeQwen3VLModel {
 
         
 
-                    let v_cfg = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
+                                let v_cfg = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
+
+        
+
+                                let v_intermediate = v_cfg.hidden_size * 4; // Standard transformer ratio fallback
+
+        
+
+                                let v_out_hidden = v_cfg.out_hidden_size.unwrap_or(v_cfg.hidden_size * 2);
+
+        
+
+                                
+
+        
+
+                                let patch_embed = get_vl("visual.patch_embed.proj.weight", 1536, v_cfg.hidden_size)?;
+
+        
+
+                                let mut blocks = Vec::new();
+
+        
+
+                                let b_to_l = if baking { 1 } else { v_cfg.depth };
+
+        
+
+                                for i in 0..b_to_l {
+
+        
+
+                                    let p = format!("visual.blocks.{}", i);
+
+        
+
+                                    blocks.push(NativeLayer {
+
+        
+
+                                        input_layernorm: get_vt(&format!("{}.norm1.weight", p))?,
+
+        
+
+                                        post_attention_layernorm: get_vt(&format!("{}.norm2.weight", p))?,
+
+        
+
+                                        q_norm: None, k_norm: None,
+
+        
+
+                                        q_proj: get_vl(&format!("{}.attn.q_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
+
+        
+
+                                        k_proj: get_vl(&format!("{}.attn.k_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
+
+        
+
+                                        v_proj: get_vl(&format!("{}.attn.v_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
+
+        
+
+                                        o_proj: get_vl(&format!("{}.attn.proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
+
+        
+
+                                        gate_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?,
+
+        
+
+                                        up_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?, 
+
+        
+
+                                        down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_cfg.hidden_size)?,
+
+        
+
+                                        device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
+
+        
+
+                                    });
+
+        
+
+                                }
+
+        
+
+                                
+
+        
+
+                                let merger = NativeLayer {
+
+        
+
+                                    input_layernorm: get_vt("visual.merger.norm.weight")?,
+
+        
+
+                                    post_attention_layernorm: get_vt("visual.merger.norm.weight")?, // Placeholder
+
+        
+
+                                    q_norm: None, k_norm: None,
+
+        
+
+                                    q_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
+
+        
+
+                                    k_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
+
+        
+
+                                    v_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
+
+        
+
+                                    o_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
+
+        
+
+                                    gate_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
+
+        
+
+                                    up_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
+
+        
+
+                                    down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
+
+        
+
+                                    device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
+
+        
+
+                                };
+
+        
 
                     
-
-                    let patch_embed = get_vl("visual.patch_embed.proj.weight", 1536, v_cfg.hidden_size)?;
-
-                    let mut blocks = Vec::new();
-
-                    let b_to_l = if baking { 1 } else { v_cfg.depth };
-
-                    for i in 0..b_to_l {
-
-                        let p = format!("visual.blocks.{}", i);
-
-                        blocks.push(NativeLayer {
-
-                            input_layernorm: get_vt(&format!("{}.norm1.weight", p))?,
-
-                            post_attention_layernorm: get_vt(&format!("{}.norm2.weight", p))?,
-
-                            q_norm: None, k_norm: None,
-
-                            q_proj: get_vl(&format!("{}.attn.q_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-
-                            k_proj: get_vl(&format!("{}.attn.k_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-
-                            v_proj: get_vl(&format!("{}.attn.v_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-
-                            o_proj: get_vl(&format!("{}.attn.proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-
-                            gate_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_cfg.intermediate_size)?,
-
-                            up_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_cfg.intermediate_size)?, // Qwen3 VL uses fc1/fc2
-
-                            down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_cfg.intermediate_size, v_cfg.hidden_size)?,
-
-                            device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
-
-                        });
-
-                    }
-
-                    
-
-                    let merger = NativeLayer {
-
-                        input_layernorm: get_vt("visual.merger.norm.weight")?,
-
-                        post_attention_layernorm: get_vt("visual.merger.norm.weight")?, // Placeholder
-
-                        q_norm: None, k_norm: None,
-
-                        q_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-
-                        k_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-
-                        v_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-
-                        o_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_cfg.out_hidden_size)?,
-
-                        gate_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-
-                        up_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-
-                        down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_cfg.out_hidden_size)?,
-
-                        device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
-
-                    };
 
         
 

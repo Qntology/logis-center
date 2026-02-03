@@ -316,7 +316,7 @@ async fn process_task(
         let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
         if !kv_dir.exists() {
              // [FIX] Load Small model in Baking Mode (Layer 0) explicitly
-             model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+             model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true).await?;
              let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
@@ -326,7 +326,7 @@ async fn process_task(
         }
 
         // [FIX] Load Large model in Inference Mode (Full Layers)
-        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, false).await?;
         let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
         data_manager.offload(&res, "step_a_res")?;
         
@@ -352,7 +352,7 @@ async fn process_task(
 
         if !kv_dir.exists() {
              // [FIX] Load Small model in Baking Mode (Layer 0) explicitly
-             model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+             model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true).await?;
              let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
              if let Some(gen) = gen_guard.as_mut() {
                  gen.clear_kv_cache();
@@ -362,7 +362,7 @@ async fn process_task(
         }
 
         // [FIX] Load Large model in Inference Mode (Full Layers)
-        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, false).await?;
         let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
         data_manager.offload(&res, "step_b_res")?;
         selector_info = parsing::parse_json_from_llm(&res);
@@ -414,19 +414,33 @@ async fn process_task(
              let snapshot_id = format!("{}_detail", task.id);
              let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
 
-             if !kv_dir.exists() {
-                 // [FIX] Load Small model in Baking Mode (Layer 0) explicitly
-                 model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
-                 let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
-                 if let Some(gen) = gen_guard.as_mut() {
-                     gen.clear_kv_cache();
-                     gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                     gen.save_kv_to_disk(&kv_dir)?;
-                 }
-             }
+                         if !kv_dir.exists() {
+
+                              // [FIX] Load Small model in Baking Mode (Layer 0) explicitly
+
+                              model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true).await?;
+
+                              let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
+
+                              if let Some(gen) = gen_guard.as_mut() {
+
+                                  gen.clear_kv_cache();
+
+                                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
+
+                                  gen.save_kv_to_disk(&kv_dir)?;
+
+                              }
+
+                         }
+
              
-             // [FIX] Load Large model in Inference Mode (Full Layers)
-             model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+
+                         // [FIX] Load Large model in Inference Mode (Full Layers)
+
+                         model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, false).await?;
+
+             
              let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
              data_manager.offload(&res, "step_c_res")?;
              extracted_data = parsing::parse_json_from_llm(&res);
