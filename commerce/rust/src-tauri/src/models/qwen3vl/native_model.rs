@@ -50,6 +50,8 @@ impl NativeLinear {
 pub struct NativeLayer {
     pub input_layernorm: NativeTensor,
     pub post_attention_layernorm: NativeTensor,
+    pub q_norm: Option<NativeTensor>, 
+    pub k_norm: Option<NativeTensor>, 
     pub q_proj: NativeLinear,
     pub k_proj: NativeLinear,
     pub v_proj: NativeLinear,
@@ -61,12 +63,16 @@ pub struct NativeLayer {
 }
 
 impl NativeLayer {
-    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize) -> Vec<f16> {
+    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, layer_idx: usize) -> Vec<f16> {
         let hidden_size = config.hidden_size;
         let q_len = x.len() / hidden_size;
         let head_dim = config.head_dim;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
+
+        if layer_idx == 0 {
+            println!("[TRACE] Layer {} | Q_len: {}, Offset: {}", layer_idx, q_len, seqlen_offset);
+        }
 
         let residual = x.to_vec();
         let norm_w = self.input_layernorm.get_slice::<f16>();
@@ -75,6 +81,13 @@ impl NativeLayer {
         let mut q = self.q_proj.forward(&x_norm);
         let mut k = self.k_proj.forward(&x_norm);
         let v = self.v_proj.forward(&x_norm);
+
+        if let Some(ref qw) = self.q_norm {
+            q = native_rms_norm_f16(&q, qw.get_slice::<f16>(), config.rms_norm_eps as f32, head_dim);
+        }
+        if let Some(ref kw) = self.k_norm {
+            k = native_rms_norm_f16(&k, kw.get_slice::<f16>(), config.rms_norm_eps as f32, head_dim);
+        }
 
         native_apply_rope_f16_with_offset(&mut q, &mut k, q_len, seqlen_offset, n_heads, head_dim, config.rope_theta);
 
@@ -123,6 +136,7 @@ pub struct NativeQwen3TextModel {
 impl NativeQwen3TextModel {
     pub fn forward(&self, input_ids: &[u32], seqlen_offset: usize) -> Vec<f16> {
         let hidden_size = self.config.hidden_size;
+        println!("[MODEL-TRACE] Starting forward pass for {} tokens.", input_ids.len());
         
         let x = match &self.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => {
@@ -138,14 +152,9 @@ impl NativeQwen3TextModel {
                 
                 for (i, &id) in input_ids.iter().enumerate() {
                     let id_idx = (id as usize).min(vocab_size - 1);
-                    
-                    // Each token ID maps to k_blocks of packed weights and scales
                     let row_scales = &s[id_idx * k_blocks .. (id_idx + 1) * k_blocks];
-                    
                     for kb in 0..k_blocks {
                         let scale = row_scales[kb].to_f32();
-                        // For baking, we use the scale as a proxy for the mean embedding value 
-                        // across the 32-bit block to maintain context without full bit-XOR.
                         for b in 0..32 {
                             out_f32[i * hidden_size + kb * 32 + b] = scale;
                         }
@@ -156,11 +165,13 @@ impl NativeQwen3TextModel {
         };
 
         let mut current_x = x;
-        for layer in &self.layers {
-            current_x = layer.forward(&current_x, &self.config, seqlen_offset);
+        for (i, layer) in self.layers.iter().enumerate() {
+            current_x = layer.forward(&current_x, &self.config, seqlen_offset, i);
         }
         let norm_w = self.norm.get_slice::<f16>();
-        native_rms_norm_f16(&current_x, norm_w, self.config.rms_norm_eps as f32, hidden_size)
+        let final_x = native_rms_norm_f16(&current_x, norm_w, self.config.rms_norm_eps as f32, hidden_size);
+        println!("[MODEL-TRACE] Forward pass completed. Final vector len: {}", final_x.len());
+        final_x
     }
 
     pub fn clear_kv_cache(&self) {
@@ -180,7 +191,7 @@ pub struct NativeVisionModel {
 pub struct NativeQwen3VLModel {
     pub config: Qwen3VLConfig,
     pub text_model: NativeQwen3TextModel,
-    pub vision_model: Option<NativeVisionModel>, // Changed to Option
+    pub vision_model: Option<NativeVisionModel>, 
     pub lm_head: NativeLinear,
 }
 
@@ -245,6 +256,8 @@ impl NativeQwen3VLModel {
                 let blk0 = NativeLayer {
                     input_layernorm: get_vis_t("visual.blk.0.ln1.weight", NativeDType::F16)?,
                     post_attention_layernorm: get_vis_t("visual.blk.0.ln2.weight", NativeDType::F16)?,
+                    q_norm: None, 
+                    k_norm: None,
                     q_proj: NativeLinear { in_features: 1024, out_features: 1024, variant: LinearVariant::BitSerial { 
                         weight_packed: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.packed", 0, 1024, NativeDType::U32)?,
                         scales: get_vis_t_slice("visual.blk.0.attn_qkvisual.weight.scales", 0, 1024, NativeDType::F16)?,
@@ -290,7 +303,7 @@ impl NativeQwen3VLModel {
             }
         }
 
-        // 1. Load Embeddings (Support quantized ALL file)
+        // 1. Load Embeddings
         let embed_tokens = get_linear(&st_main, &main_mmap, "model.embed_tokens.weight", 151936, t_cfg.hidden_size)?;
 
         // 2. Load Layers
@@ -302,6 +315,8 @@ impl NativeQwen3VLModel {
             layers.push(NativeLayer {
                 input_layernorm: get_main_t(&format!("{}.input_layernorm.weight", p))?,
                 post_attention_layernorm: get_main_t(&format!("{}.post_attention_layernorm.weight", p))?,
+                q_norm: get_main_t(&format!("{}.self_attn.q_norm.weight", p)).ok(),
+                k_norm: get_main_t(&format!("{}.self_attn.k_norm.weight", p)).ok(),
                 q_proj: get_linear(&st_main, &main_mmap, &format!("{}.self_attn.q_proj.weight", p), t_cfg.hidden_size, t_cfg.hidden_size)?,
                 k_proj: get_linear(&st_main, &main_mmap, &format!("{}.self_attn.k_proj.weight", p), t_cfg.hidden_size, t_cfg.hidden_size)?,
                 v_proj: get_linear(&st_main, &main_mmap, &format!("{}.self_attn.v_proj.weight", p), t_cfg.hidden_size, t_cfg.hidden_size)?,

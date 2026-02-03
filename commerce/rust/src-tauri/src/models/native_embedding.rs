@@ -48,6 +48,8 @@ impl NativeEmbeddingModel {
             layers.push(NativeLayer {
                 input_layernorm: get_t(&format!("{}.input_layernorm.weight", p))?,
                 post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p))?,
+                q_norm: None,
+                k_norm: None,
                 q_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.q_proj.weight", p))?, bias: None } },
                 k_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.k_proj.weight", p))?, bias: None } },
                 v_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.v_proj.weight", p))?, bias: None } },
@@ -69,7 +71,6 @@ impl NativeEmbeddingModel {
         let token_ids = tokens.get_ids();
         if token_ids.is_empty() { return Ok(vec![0.0; 768]); }
 
-        // 임베딩용 간이 config 생성 (Default가 없으므로 수동 초기화)
         let cfg = Qwen3VLTextConfig {
             hidden_size: self.hidden_size,
             num_attention_heads: 12,
@@ -88,8 +89,8 @@ impl NativeEmbeddingModel {
         let table = self.embed_tokens.get_slice::<f16>();
         let mut x = native_embedding_lookup_f16(token_ids, table, self.hidden_size);
 
-        for layer in &self.layers {
-            x = layer.forward(&x, &cfg, 0);
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward(&x, &cfg, 0, i);
         }
 
         let norm_w = self.norm.get_slice::<f16>();
