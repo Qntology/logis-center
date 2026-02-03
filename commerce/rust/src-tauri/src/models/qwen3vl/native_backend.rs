@@ -48,9 +48,9 @@ impl NativeTensor {
         let size = self.shape.iter().product::<usize>() * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
         unsafe {
             let mut ptr: CUdeviceptr = 0;
-            // cuInit(0); // Should be called globally
-            cuMemAlloc_v2(&mut ptr, size);
-            cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size);
+            let cuda_lib = lib();
+            cuda_lib.cuMemAlloc_v2(&mut ptr, size);
+            cuda_lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size);
             self.gpu_ptr = Some(GpuPtr(ptr as *mut _)); self.device_id = device_id;
         }
     }
@@ -73,17 +73,18 @@ pub fn native_bit_serial_attn_gpu(
     n_h: usize, h_d: usize, t_s: usize, dev: usize
 ) -> Vec<f16> {
     unsafe {
+        let cuda_lib = lib();
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         let q_f32: Vec<f32> = q.iter().map(|v| v.to_f32()).collect();
-        cuMemAlloc_v2(&mut d_q, q.len() * 4);
-        cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
-        cuMemAlloc_v2(&mut d_o, q.len() * 4);
+        cuda_lib.cuMemAlloc_v2(&mut d_q, q.len() * 4);
+        cuda_lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
+        cuda_lib.cuMemAlloc_v2(&mut d_o, q.len() * 4);
 
         bit_serial_attn_cuda_direct(d_q as *const f32, k_packed_ptr.0 as *const u32, v_f16_ptr.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32);
 
         let mut o_f32 = vec![0.0f32; q.len()];
-        cuMemcpyDtoH_v2(o_f32.as_mut_ptr() as *mut _, d_o, q.len() * 4);
-        cuMemFree_v2(d_q); cuMemFree_v2(d_o);
+        cuda_lib.cuMemcpyDtoH_v2(o_f32.as_mut_ptr() as *mut _, d_o, q.len() * 4);
+        cuda_lib.cuMemFree_v2(d_q); cuda_lib.cuMemFree_v2(d_o);
         o_f32.into_iter().map(f16::from_f32).collect()
     }
 }
@@ -130,15 +131,16 @@ pub fn bit_serial_matmul_f32_extreme(i: &[f16], w: &[u32], s: &[f16], m: usize, 
 #[cfg(feature = "cuda")]
 pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: usize, n: usize, k: usize, dev: usize) -> Vec<f16> {
     unsafe {
+        let cuda_lib = lib();
         let mut d_i: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0; let mut d_s: CUdeviceptr = 0;
         let i_f32: Vec<f32> = i.iter().map(|v| v.to_f32()).collect();
-        cuMemAlloc_v2(&mut d_i, m * k * 4); cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
-        cuMemAlloc_v2(&mut d_o, m * n * 4);
+        cuda_lib.cuMemAlloc_v2(&mut d_i, m * k * 4); cuda_lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
+        cuda_lib.cuMemAlloc_v2(&mut d_o, m * n * 4);
         let s_f32: Vec<f32> = s.get_slice::<f16>().iter().map(|v| v.to_f32()).collect();
-        cuMemAlloc_v2(&mut d_s, n * 4); cuMemcpyHtoD_v2(d_s, s_f32.as_ptr() as *const _, n * 4);
+        cuda_lib.cuMemAlloc_v2(&mut d_s, n * 4); cuda_lib.cuMemcpyHtoD_v2(d_s, s_f32.as_ptr() as *const _, n * 4);
         bit_serial_matmul_cuda_direct(d_i as *const f32, w.gpu_ptr.unwrap().0 as *const u32, d_s as *const f32, d_o as *mut f32, m as i32, n as i32, k as i32, dev as i32);
-        let mut o_f = vec![0.0f32; m * n]; cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
-        cuMemFree_v2(d_i); cuMemFree_v2(d_o); cuMemFree_v2(d_s);
+        let mut o_f = vec![0.0f32; m * n]; cuda_lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
+        cuda_lib.cuMemFree_v2(d_i); cuda_lib.cuMemFree_v2(d_o); cuda_lib.cuMemFree_v2(d_s);
         o_f.into_iter().map(f16::from_f32).collect()
     }
 }

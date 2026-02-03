@@ -94,8 +94,9 @@ impl NativeLayer {
             let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
-                    cuMemAlloc_v2(&mut kp, 32768 * n_kv * (head_dim/32) * 4); 
-                    cuMemAlloc_v2(&mut vp, 32768 * n_kv * head_dim * 4); 
+                    let cuda_lib = lib();
+                    cuda_lib.cuMemAlloc_v2(&mut kp, 32768 * n_kv * (head_dim/32) * 4); 
+                    cuda_lib.cuMemAlloc_v2(&mut vp, 32768 * n_kv * head_dim * 4); 
                 }
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
@@ -103,10 +104,11 @@ impl NativeLayer {
             let k_packed = pack_f16_to_bits(&k);
             let v_f32: Vec<f32> = v.iter().map(|val| val.to_f32()).collect();
             unsafe {
+                let cuda_lib = lib();
                 let k_offset = current_len * n_kv * (head_dim/32) * 4;
                 let v_offset = current_len * n_kv * head_dim * 4;
-                cuMemcpyHtoD_v2((k_ptr.0 as usize + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
-                cuMemcpyHtoD_v2((v_ptr.0 as usize + v_offset) as CUdeviceptr, v_f32.as_ptr() as *const _, v_f32.len() * 4);
+                cuda_lib.cuMemcpyHtoD_v2((k_ptr.0 as usize + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+                cuda_lib.cuMemcpyHtoD_v2((v_ptr.0 as usize + v_offset) as CUdeviceptr, v_f32.as_ptr() as *const _, v_f32.len() * 4);
             }
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
@@ -156,8 +158,8 @@ impl NativeLayer {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                cuMemFree_v2(k.0 as CUdeviceptr);
-                cuMemFree_v2(v.0 as CUdeviceptr);
+                lib().cuMemFree_v2(k.0 as CUdeviceptr);
+                lib().cuMemFree_v2(v.0 as CUdeviceptr);
             }
         }
     }
