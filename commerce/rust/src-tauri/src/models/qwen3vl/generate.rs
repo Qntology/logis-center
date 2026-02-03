@@ -58,7 +58,8 @@ impl Qwen3VLGenerateModel {
         _vision_device_id: usize,
         _dtype: Option<()>,
         hard_token_limit: Option<usize>,
-        baking_only: bool, // Renamed from _force_text_only
+        baking_only: bool,
+        force_text_only: bool,
     ) -> Result<Self> {
         let path_obj = Path::new(path);
         let tok_path = tokenizer_path.unwrap_or(path);
@@ -112,26 +113,24 @@ impl Qwen3VLGenerateModel {
         vl_config.hidden_size = Some(vl_config.text_config.as_ref().unwrap().hidden_size);
 
         // [HYBRID-FILE-SELECTION] 
-        // 텍스트는 path(0.6B)에서, 비전은 config_path(2B-VL)에서 가져옴
         let main_filename = if baking_only { "model-BITSERIAL_LAYER0.safetensors" } else { "model-BITSERIAL_ALL.safetensors" };
         let vision_filename = if baking_only { "mmproj-BITSERIAL_LAYER0.safetensors" } else { "mmproj-BITSERIAL_ALL.safetensors" };
 
         let main_path = path_obj.join(main_filename);
-        // 비전 파일은 항상 Large 모델 경로(config_path)에서 탐색 시도
         let vision_root = config_path.map(Path::new).unwrap_or(path_obj);
         let vision_path = vision_root.join(vision_filename);
-
-        println!("[MODEL] Hybrid Load -> Text: {:?}, Vision: {:?}", main_path.file_name(), vision_path.file_name());
 
         let main_file = std::fs::File::open(main_path)?;
         let main_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&main_file)? });
         
-        let vision_mmap = if vision_path.exists() {
+        // [VISION-BRANCH] 비전 파일이 존재하고, 텍스트 전용 모드가 아닐 때만 로드
+        let vision_mmap = if !force_text_only && vision_path.exists() {
+            println!("[LOAD] Activating Vision Module from {:?}", vision_path.file_name());
             let vision_file = std::fs::File::open(vision_path)?;
-            Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? })
+            Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? }))
         } else {
-            let placeholder_file = std::fs::File::open(&vision_config_path)?;
-            Arc::new(unsafe { memmap2::MmapOptions::new().map(&placeholder_file)? })
+            println!("[LOAD] Text-Only Mode. Skipping Vision Module.");
+            None
         };
 
         let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only)?;

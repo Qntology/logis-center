@@ -258,15 +258,13 @@ impl LogisModel {
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
-            // VRAM이 실제로 비워질 때까지 대기
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
-        let text_only = target_size == ModelSize::Large && task_id.is_some();
-        self.ensure_generator_ext(target_size, text_only).await?;
+        // 2. [LOAD] 새 모델 로드 (Relay 시에는 기본적으로 텍스트 전용으로 시도 가능)
+        let text_only = task_id.is_some(); // Snapshot 로드 시점은 대부분 텍스트 기반 추론
+        self.ensure_generator_ext(target_size, false, text_only).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -281,8 +279,8 @@ impl LogisModel {
     pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
         
-        // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone()).await?;
+        // 1. Load Small Model Isolated (Baking: true, Text-Only: true)
+        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true).await?;
 
         // 2. Ingest PUG content
         {
@@ -312,21 +310,19 @@ impl LogisModel {
     // --- [NEW] 2B Continuous Inference Helper ---
     pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token).await
+        self.secure_vram_relay_ext(ModelSize::Large, Some(&base_session), cancel_token, false, true).await
     }
 
     /// [NEW] Hybrid Image Context Baking (0.6B Text + 2B Vision Layer 0)
     pub async fn ingest_image_to_ssd(&self, task_id: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let base_session = format!("{}_img_base", task_id);
         
-        // 1. Load Small Model (0.6B) in Baking Mode, but point to Large path for mmproj
+        // 1. Load Small Model (0.6B) in Baking Mode, but enable Vision (Baking: true, Text-Only: false)
         println!("[RELAY] Loading HYBRID Baking Mode (0.6B Text + 2B Vision)...");
-        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true).await?;
+        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
 
         // 2. Ingest Image content
         let prompt = "[SYSTEM] Analyze the visual contents of this image.".to_string();
-        // chat_with_image_spinner will use the active generator (Small)
-        // and its load logic will pick up the 2B mmproj because shared_path is set to large_model_path in ensure_generator_ext
         let _ = self.chat_with_image_spinner(
             prompt, 
             Some(image), 
@@ -345,7 +341,7 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool, force_text_only: bool) -> anyhow::Result<()> {
         let start_time = Instant::now();
         self.deep_purge_resources().await;
         
@@ -354,42 +350,21 @@ impl LogisModel {
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        self.ensure_generator_ext(target_size, baking_only).await?;
+        self.ensure_generator_ext(target_size, baking_only, force_text_only).await?;
 
         if let Some(tid) = task_id {
             self.load_kv_snapshot(tid).await?;
         }
 
-        println!("[RELAY] Transition to {:?} (Baking: {}) complete in {:.2}s", target_size, baking_only, start_time.elapsed().as_secs_f32());
+        println!("[RELAY] Transition to {:?} (Baking: {}, Text-Only: {}) complete in {:.2}s", target_size, baking_only, force_text_only, start_time.elapsed().as_secs_f32());
         Ok(())
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})", path, force_text_only);
-        
-        let dev_id = self.device_config.gpu_id;
-        let limit = self.max_tokens_limit;
-        let path_clone = path.to_string();
-        let shared_path = shared_config_path.map(|s| s.to_string());
-
-        let generator = tokio::task::spawn_blocking(move || {
-            Qwen3VLGenerateModel::init_with_config(
-                &path_clone, 
-                shared_path.as_deref(), 
-                shared_path.as_deref(), 
-                None, dev_id, None, dev_id, None, Some(limit as usize),
-                force_text_only
-            )
-        }).await??;
-        
-        Ok(generator)
-    }
-
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.ensure_generator_ext(size, false).await
+        self.ensure_generator_ext(size, false, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, baking_only: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, baking_only: bool, force_text_only: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -399,7 +374,7 @@ impl LogisModel {
             return Ok(())
         }
 
-        println!("[MODEL] Activating engine -> Size: {:?}, Mode: {}", size, if baking_only { "BAKING (Layer 0)" } else { "INFERENCE (Full)" });
+        println!("[MODEL] Activating engine -> Size: {:?}, Mode: {}, Vision: {}", size, if baking_only { "BAKING (Layer 0)" } else { "INFERENCE (Full)" }, !force_text_only);
 
         // 2. [LOAD] Load from disk
         println!("[LOAD] Fresh loading {:?} model from disk...", size);
@@ -417,7 +392,7 @@ impl LogisModel {
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
                 None, dev_id, None, dev_id, None, Some(limit as usize),
-                baking_only
+                baking_only, force_text_only
             )
         }).await??;
 
