@@ -224,26 +224,35 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn load_kv_from_disk(&self, path: &Path) -> Result<()> {
-        if !path.exists() { return Ok(()); }
-        
-        let file = std::fs::read(path)?;
-        let st = safetensors::SafeTensors::deserialize(&file)?;
-        
+        self.load_kv_stitched(&[path.to_path_buf()])
+    }
+
+    pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<()> {
         match &self.qwen3_vl {
             ModelVariant::Native(m) => {
-                for i in 0..m.text_model.layers.len() {
-                    let k_name = format!("layer.{}.k", i);
-                    let v_name = format!("layer.{}.v", i);
+                let mut combined_k = Vec::new();
+                let mut combined_v = Vec::new();
+
+                for path in paths {
+                    if !path.exists() { continue; }
+                    let file = std::fs::read(path)?;
+                    let st = safetensors::SafeTensors::deserialize(&file)?;
                     
-                    if let (Ok(kt), Ok(vt)) = (st.tensor(&k_name), st.tensor(&v_name)) {
+                    // 레이어 0의 데이터만 수집 (Baking 결과물은 항상 레이어 0)
+                    if let (Ok(kt), Ok(vt)) = (st.tensor("layer.0.k"), st.tensor("layer.0.v")) {
                         let k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
                         let v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
-                        m.text_model.layers[i].set_kv_data(k_data, v_data);
+                        combined_k.extend(k_data);
+                        combined_v.extend(v_data);
                     }
+                }
+
+                if !combined_k.is_empty() {
+                    m.text_model.layers[0].set_kv_data(combined_k, combined_v);
+                    println!("[KV-STITCH] Successfully merged {} KV segments into Layer 0", paths.len());
                 }
             }
         }
-        println!("[KV-DISK] Loaded KV Cache from {:?}", path);
         Ok(())
     }
 

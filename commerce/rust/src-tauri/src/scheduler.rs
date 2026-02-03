@@ -309,24 +309,14 @@ async fn process_task(
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
+        // [SCENARIO-A] 텍스트 전처리 베이킹
+        model.ingest_pug_to_ssd(&task.id, &light_pug, Some(cancellation_token.clone())).await?;
+
+        // [SCENARIO-A] 텍스트 전용 하이브리드 추론 준비
+        model.ensure_large_with_text_base(&task.id, Some(cancellation_token.clone())).await?;
+        
         let type_prompt = parsing::page_type_prompt();
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", light_pug, type_prompt);
-        let snapshot_id = format!("{}_step_a", task.id);
-
-        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-        if !kv_dir.exists() {
-             // [FIX] Load Small model in Baking Mode (Layer 0) explicitly
-             model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true).await?;
-             let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
-             if let Some(gen) = gen_guard.as_mut() {
-                 gen.clear_kv_cache();
-                 gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?;
-             }
-        }
-
-        // [FIX] Load Large model in Inference Mode (Full Layers), but keep Text-Only for Classification
-        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+        let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", type_prompt);
         let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
         data_manager.offload(&res, "step_a_res")?;
         
@@ -338,31 +328,12 @@ async fn process_task(
     if page_type == "unknown" { return Ok(()); } 
     
     // --- PIPELINE STEP B: SELECTORS ---
-    model.deep_purge_resources().await;
-    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
-
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", light_pug, selector_prompt);
-        let snapshot_id = format!("{}_step_b", task.id);
-        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-
-        if !kv_dir.exists() {
-             // [FIX] Load Small model in Baking Mode (Layer 0) explicitly
-             model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true).await?;
-             let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
-             if let Some(gen) = gen_guard.as_mut() {
-                 gen.clear_kv_cache();
-                 gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-                 gen.save_kv_to_disk(&kv_dir)?;
-             }
-        }
-
-        // [FIX] Load Large model in Inference Mode (Full Layers), but keep Text-Only for Classification
-        model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
+        let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", selector_prompt);
         let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
         data_manager.offload(&res, "step_b_res")?;
         selector_info = parsing::parse_json_from_llm(&res);
@@ -410,43 +381,7 @@ async fn process_task(
 
         if !content_pug.trim().is_empty() {
              let extraction_instruction = parsing::item2json(&page_type, &url, "english");
-             let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", content_pug, extraction_instruction);
-             let snapshot_id = format!("{}_detail", task.id);
-             let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-
-                         if !kv_dir.exists() {
-
-                              // [FIX] Load Small model in Baking Mode (Layer 0) explicitly
-
-                              model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true).await?;
-
-                              let mut gen_guard: tokio::sync::MutexGuard<Option<Qwen3VLGenerateModel>> = model.generator.lock().await;
-
-                              if let Some(gen) = gen_guard.as_mut() {
-
-                                  gen.clear_kv_cache();
-
-                                  gen.prefill_chunk(task_question.clone(), Some(cancellation_token.clone()), None)?;
-
-                                  gen.save_kv_to_disk(&kv_dir)?;
-
-                              }
-
-                         }
-
-             
-
-                                     // [FIX] Load Large model in Inference Mode (Full Layers), but keep Text-Only for PUG Extraction
-
-             
-
-                                     model.secure_vram_relay_ext(ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, true).await?;
-
-             
-
-                         
-
-             
+             let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", extraction_instruction);
              let res = model.chat("", &task_question, Some(cancellation_token.clone()), None).await?;
              data_manager.offload(&res, "step_c_res")?;
              extracted_data = parsing::parse_json_from_llm(&res);

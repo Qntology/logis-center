@@ -275,71 +275,93 @@ impl LogisModel {
         Ok(())
     }
 
-    // --- [NEW] Base Context Baking (One-time Heavy Lifting) ---
+    // --- [SCENARIO A] Text Preprocessing (HTML/PUG) ---
     pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        let base_session = format!("{}_base", task_id);
+        let text_session = format!("{}_text", task_id);
         
-        // 1. Load Small Model Isolated (Baking: true, Text-Only: true)
+        // 1. Baking: 0.6B Small model, Text-Only
         self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true).await?;
 
-        // 2. Ingest PUG content
         {
             let gen_clone = self.generator.clone();
             let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
             let token_clone = cancel_token.clone();
-            
-            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    // Just prefill, no generation needed for base context
                     gen.prefill_chunk(prompt, token_clone, None)?;
                 }
-                Ok(())
+                Ok::<(), anyhow::Error>(())
             }).await??;
         }
 
-        // 3. Save Base Snapshot
-        self.save_kv_snapshot(&base_session).await?;
-        
-        // 4. Unload immediately to free VRAM for 2B
+        // 2. Save KV and Unload
+        self.save_kv_snapshot(&text_session).await?;
         self.unload_generator().await;
-        
         Ok(())
     }
 
-    // --- [NEW] 2B Continuous Inference Helper ---
-    pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        let base_session = format!("{}_base", task_id);
-        self.secure_vram_relay_ext(ModelSize::Large, Some(&base_session), cancel_token, false, true).await
-    }
+    // --- [SCENARIO B] Image Preprocessing (Hybrid Double-Baking) ---
+    pub async fn ingest_image_to_ssd_hybrid(&self, task_id: &str, system_prompt: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        let sys_session = format!("{}_sys", task_id);
+        let img_session = format!("{}_img", task_id);
 
-    /// [NEW] Hybrid Image Context Baking (2B Text L0 + 2B Vision Layer 0)
-    pub async fn ingest_image_to_ssd(&self, task_id: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        let base_session = format!("{}_img_base", task_id);
-        
-        // [FIX] 이미지 베이킹은 반드시 2B(Large) 모델을 사용해야 차원(2048)이 일치함
-        // 0.6B(Small)는 차원이 1024이므로 비전 모델과 호환되지 않음
-        println!("[RELAY] Loading 2B Vision Baking Mode (2B Text L0 + 2B Vision L0)...");
+        // [Step 1] System Prompt Baking: 0.6B Small model, Text-Only
+        println!("[HYBRID-BAKE] Step 1: Baking System Prompt with 0.6B...");
+        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true).await?;
+        {
+            let gen_clone = self.generator.clone();
+            let sys_text = system_prompt.to_string();
+            let token_clone = cancel_token.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut gen_guard = gen_clone.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.prefill_chunk(sys_text, token_clone, None)?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }).await??;
+        }
+        self.save_kv_snapshot(&sys_session).await?;
+        self.unload_generator().await;
+
+        // [Step 2] Image Data Baking: 2B Large model, Vision Enabled
+        println!("[HYBRID-BAKE] Step 2: Baking Image Data with 2B...");
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), true, false).await?;
-
-        // 2. Ingest Image content
-        let prompt = "[SYSTEM] Analyze the visual contents of this image.".to_string();
-        let _ = self.chat_with_image_spinner(
-            prompt, 
-            Some(image), 
-            &unsafe { std::mem::zeroed() }, 
-            "", 
-            json!({}), 
-            1, 
-            cancel_token, 
-            Some(base_session.clone())
-        ).await?;
-
-        // 3. Save Snapshot & Unload
-        self.save_kv_snapshot(&base_session).await?;
+        {
+            let _ = self.chat_with_image_spinner(
+                "[SYSTEM] Process Image Data.".to_string(), 
+                Some(image), 
+                &unsafe { std::mem::zeroed() }, 
+                "", 
+                json!({}), 
+                1, 
+                cancel_token.clone(), 
+                None // 이미지 자체의 순수 KV만 필요하므로 session_id 없이 prefill
+            ).await?;
+        }
+        self.save_kv_snapshot(&img_session).await?;
         self.unload_generator().await;
-        
+
         Ok(())
+    }
+
+    // --- [HYBRID UTILS] Combined KV Loading ---
+    pub async fn load_stitched_kv(&self, task_id: &str, components: &[&str]) -> anyhow::Result<()> {
+        let generator_arc = self.generator.clone();
+        let paths: Vec<std::path::PathBuf> = components.iter()
+            .map(|c| crate::utils::paths::get_kv_dir(None).join(format!("{}_{}.safetensors", task_id, c)))
+            .collect();
+
+        tokio::task::spawn_blocking(move || {
+            let mut gen_guard = generator_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                println!("[SSD-BRIDGE] Stitching {} KV components...", paths.len());
+                gen.load_kv_stitched(&paths)?;
+                Ok(())
+            } else {
+                Err(anyhow!("No active generator for KV stitching"))
+            }
+        }).await?
     }
 
     pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool, force_text_only: bool) -> anyhow::Result<()> {
@@ -952,6 +974,19 @@ Return valid JSON only. No explanation.
         let extracted_data = crate::parsing::parse_json_from_llm(&response);
         
         Ok(extracted_data)
+    }
+
+    // --- [INFERENCE PREP] ---
+    pub async fn ensure_large_with_text_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        // [텍스트 전용] 2B 모델 로드 (비전 차단) -> 0.6B로 구운 'text' 레이어 0 로드
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token, false, true).await?;
+        self.load_stitched_kv(task_id, &["text"]).await
+    }
+
+    pub async fn ensure_large_with_hybrid_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        // [이미지 포함] 2B 모델 로드 (비전 포함) -> 0.6B의 'sys' + 2B의 'img' 레이어 0을 합쳐서 로드
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token, false, false).await?;
+        self.load_stitched_kv(task_id, &["sys", "img"]).await
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
