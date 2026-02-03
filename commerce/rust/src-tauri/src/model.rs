@@ -277,19 +277,30 @@ impl LogisModel {
 
     // --- [SCENARIO A-Modular] Optimized Text Preprocessing ---
     
-    /// Step 1: Bake the heavy PUG content once
-    pub async fn bake_pug_context(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
-        println!("[BAKE-PUG] One-time PUG baking for task: {}", task_id);
+    /// Step 1: Bake the heavy PUG content once per address
+    pub async fn bake_pug_context(&self, address_hash: &str, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        let kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
+        let final_path = kv_dir.join(format!("{}_pug_base.safetensors", task_id));
+        
+        if final_path.exists() {
+            println!("[BAKE-PUG] Found existing PUG base for {}, skipping baking.", address_hash);
+            return Ok(());
+        }
+
+        println!("[BAKE-PUG] One-time PUG baking for address: {}", address_hash);
         self.ensure_generator_ext(ModelSize::Small, true, true).await?;
         {
             let gen_clone = self.generator.clone();
             let text = pug_content.to_string();
             let tid = task_id.to_string();
+            let ah = address_hash.to_string();
             let token_clone = cancel_token.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    gen.bake_text_in_parts(text, &tid, "pug_base", token_clone)?;
+                    // Custom save path inside address-specific folder
+                    let path = crate::utils::paths::get_kv_dir(None, Some(&ah)).join(format!("{}_pug_base.safetensors", tid));
+                    gen.bake_text_in_parts_to_path(text, &path, "pug_base", token_clone)?;
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
@@ -299,21 +310,26 @@ impl LogisModel {
     }
 
     /// Step 2: Bake a specific prompt and run inference by stitching with PUG base
-    pub async fn run_modular_inference(&self, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+    pub async fn run_modular_inference(&self, address_hash: &str, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let prompt_session = format!("{}_prompt_{}", task_id, prompt_name);
-        println!("[MODULAR-INF] Running inference for step: {}", prompt_name);
+        let kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
+        
+        println!("[MODULAR-INF] Running inference for step: {} (Address: {})", prompt_name, address_hash);
 
         // 1. Bake the specific system prompt (Quick 1-layer bake)
         self.ensure_generator_ext(ModelSize::Small, true, true).await?;
         {
             let gen_clone = self.generator.clone();
             let sp = system_prompt.to_string();
-            let psid = prompt_session.clone();
+            let ah = address_hash.to_string();
+            let tid = task_id.to_string();
+            let p_name = prompt_name.to_string();
             let token_clone = cancel_token.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    gen.bake_text_in_parts(sp, &psid, "baked", token_clone)?;
+                    let path = crate::utils::paths::get_kv_dir(None, Some(&ah)).join(format!("{}_prompt_{}.safetensors", tid, p_name));
+                    gen.bake_text_in_parts_to_path(sp, &path, "baked", token_clone)?;
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
@@ -323,9 +339,9 @@ impl LogisModel {
         // 2. Load 2B Full Model and Stitch [PUG + PROMPT]
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true).await?;
         
-        // Load the shared PUG base + this step's baked prompt
-        self.load_stitched_kv(task_id, &["pug_base"]).await?;
-        self.load_stitched_kv(&prompt_session, &["baked"]).await?;
+        // Load from the address-specific folder
+        self.load_stitched_kv(address_hash, task_id, &["pug_base"]).await?;
+        self.load_stitched_kv(address_hash, task_id, &[&format!("prompt_{}", prompt_name)]).await?;
 
         // 3. Final Chat
         self.chat("", user_input, cancel_token, Some(format!("{}_final", prompt_name))).await
@@ -445,18 +461,17 @@ impl LogisModel {
     }
 
     // --- [HYBRID UTILS] Combined KV Loading ---
-    pub async fn load_stitched_kv(&self, task_id: &str, components: &[&str]) -> anyhow::Result<()> {
+    pub async fn load_stitched_kv(&self, address_hash: &str, task_id: &str, components: &[&str]) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
         let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
 
-        // [AUTO-DISCOVERY] Find all parts for each component
+        // [AUTO-DISCOVERY] Find all parts for each component in the address-specific folder
         for comp in components {
             let mut parts = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&kv_dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    // Match task_id_comp.safetensors OR task_id_comp_partN.safetensors
                     if name.starts_with(&format!("{}_{}", task_id, comp)) && name.ends_with(".safetensors") {
                         parts.push(entry.path());
                     }

@@ -11,8 +11,11 @@ pub fn get_app_tmp_root(_app: Option<&AppHandle>) -> PathBuf {
     path
 }
 
-pub fn get_kv_dir(app: Option<&AppHandle>) -> PathBuf {
-    let path = get_app_tmp_root(app).join("kv");
+pub fn get_kv_dir(app: Option<&AppHandle>, sub_folder: Option<&str>) -> PathBuf {
+    let mut path = get_app_tmp_root(app).join("kv");
+    if let Some(sub) = sub_folder {
+        path = path.join(sub);
+    }
     if !path.exists() { let _ = fs::create_dir_all(&path); }
     path
 }

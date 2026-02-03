@@ -328,9 +328,11 @@ async fn process_text_pipeline(
     data_manager: &mut TaskDataManager,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
 ) -> Result<()> {
-    // [MODULAR-PIPELINE] Step 0: One-time PUG Baking
-    log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Baking PUG context (once)...", "spinner": "⠋" }));
-    model.bake_pug_context(&task.id, light_pug, Some(cancellation_token.clone())).await?;
+    let address_hash = &task.r#ref; // Use the URL hash from LanceDB
+    
+    // [MODULAR-PIPELINE] Step 0: One-time PUG Baking (Branching by address_hash)
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Baking PUG context (address-based)...", "spinner": "⠋" }));
+    model.bake_pug_context(address_hash, &task.id, light_pug, Some(cancellation_token.clone())).await?;
 
     // --- PIPELINE STEP A: CLASSIFICATION ---
     let mut page_type = String::new();
@@ -342,8 +344,8 @@ async fn process_text_pipeline(
 
         let type_prompt = parsing::page_type_prompt();
         let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", type_prompt);
-        // Reuse pre-baked PUG
-        let res = model.run_modular_inference(&task.id, "class", &task_question, "Classify this page.", Some(cancellation_token.clone())).await?;
+        // Reuse pre-baked PUG from address folder
+        let res = model.run_modular_inference(address_hash, &task.id, "class", &task_question, "Classify this page.", Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_a_res")?;
         
         let type_info = parsing::parse_json_from_llm(&res);
@@ -355,13 +357,13 @@ async fn process_text_pipeline(
     
     // --- PIPELINE STEP B: SELECTORS ---
     {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::any_how!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
         let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", selector_prompt);
         // Reuse pre-baked PUG
-        let res = model.run_modular_inference(&task.id, "sel", &task_question, "Identify selectors.", Some(cancellation_token.clone())).await?;
+        let res = model.run_modular_inference(address_hash, &task.id, "sel", &task_question, "Identify selectors.", Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_b_res")?;
         selector_info = parsing::parse_json_from_llm(&res);
     }
@@ -410,7 +412,7 @@ async fn process_text_pipeline(
              let extraction_instruction = parsing::item2json(&page_type, &task.data_json, "english");
              let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", extraction_instruction);
              // Reuse pre-baked PUG
-             let res = model.run_modular_inference(&task.id, "ext", &task_question, "Extract JSON data.", Some(cancellation_token.clone())).await?;
+             let res = model.run_modular_inference(address_hash, &task.id, "ext", &task_question, "Extract JSON data.", Some(cancellation_token.clone())).await?;
              data_manager.offload(&res, "step_c_res")?;
              extracted_data = parsing::parse_json_from_llm(&res);
         }

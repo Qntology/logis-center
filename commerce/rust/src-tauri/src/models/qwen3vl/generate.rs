@@ -284,7 +284,54 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
-    pub fn save_raw_kv_to_disk(&self, path: &Path, k: &Vec<u32>, v: &Vec<f16>) -> Result<()> {
+    /// [NEW] Context-aware splitting - Save to specific path
+    pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, suffix: &str, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut current_chunk = String::new();
+        let mut current_tokens = 0;
+        let mut master_k: Vec<u32> = Vec::new();
+        let mut master_v: Vec<f16> = Vec::new();
+
+        println!("[BAKE-PATH] Baking to {:?}", final_path);
+
+        for line in lines {
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
+            }
+            let line_text = format!("{}\n", line);
+            let line_ids = self.tokenizer.text_encode_vec(line_text.clone(), false)?;
+            let line_token_count = line_ids.len();
+
+            if current_tokens + line_token_count > 512 && !current_chunk.is_empty() {
+                let chunk_ids = self.tokenizer.text_encode_vec(current_chunk.clone(), false)?;
+                self.qwen3_vl.forward(&chunk_ids, None, None, 0);
+                let ModelVariant::Native(m) = &self.qwen3_vl;
+                if let Some((k, v)) = m.text_model.layers[0].get_kv_data(m.text_model.config.head_dim, m.text_model.config.num_key_value_heads) {
+                    master_k.extend(k); master_v.extend(v);
+                }
+                self.clear_kv_cache();
+                current_chunk.clear(); current_tokens = 0;
+            }
+            current_chunk.push_str(&line_text);
+            current_tokens += line_token_count;
+        }
+
+        if !current_chunk.is_empty() {
+            let chunk_ids = self.tokenizer.text_encode_vec(current_chunk, false)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, 0);
+            let ModelVariant::Native(m) = &self.qwen3_vl;
+            if let Some((k, v)) = m.text_model.layers[0].get_kv_data(m.text_model.config.head_dim, m.text_model.config.num_key_value_heads) {
+                master_k.extend(k); master_v.extend(v);
+            }
+            self.clear_kv_cache();
+        }
+
+        if !master_k.is_empty() {
+            self.save_raw_kv_to_disk(final_path, &master_k, &master_v)?;
+            println!("[BAKE-PATH] SUCCESS: Saved context to {:?}", final_path);
+        }
+        Ok(())
+    }
         let mut tensors = std::collections::HashMap::new();
         
         let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
