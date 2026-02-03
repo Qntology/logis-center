@@ -446,11 +446,16 @@ impl LogisModel {
                     }
                 }
             }
-            // Sort by name to ensure part1 < part2 < part10
+            // Sort by part number to ensure part1 < part2 < part10
             parts.sort_by(|a, b| {
-                let na = a.file_name().unwrap().to_string_lossy();
-                let nb = b.file_name().unwrap().to_string_lossy();
-                alphanumeric_sort::compare(&na, &nb)
+                let extract_part = |p: &std::path::Path| -> usize {
+                    p.file_name().and_then(|n| n.to_str())
+                        .and_then(|s| s.split("_part").last())
+                        .and_then(|s| s.split('.').next())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0)
+                };
+                extract_part(a).cmp(&extract_part(b))
             });
             all_paths.extend(parts);
         }
