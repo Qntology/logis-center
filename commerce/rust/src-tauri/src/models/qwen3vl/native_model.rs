@@ -216,7 +216,29 @@ impl NativeLayer {
         }
     }
 
-    pub fn get_kv_data(&self) -> Option<(Vec<u32>, Vec<f16>)> {
+    pub fn get_kv_data(&self, head_dim: usize, n_kv: usize) -> Option<(Vec<u32>, Vec<f16>)> {
+        #[cfg(feature = "cuda")]
+        if self.device_id >= 0 {
+            use cudarc::driver::sys::lib;
+            let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
+            if let Some((k_ptr, v_ptr, current_len)) = *gpu_cache_guard {
+                let k_size = current_len * n_kv * (head_dim / 32);
+                let v_size = current_len * n_kv * head_dim;
+                
+                let mut k_host = vec![0u32; k_size];
+                let mut v_host_f32 = vec![0.0f32; v_size];
+                
+                unsafe {
+                    let cuda_lib = lib();
+                    let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, k_ptr.0 as usize as u64, k_size * 4);
+                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host_f32.as_mut_ptr() as *mut _, v_ptr.0 as usize as u64, v_size * 4);
+                }
+                
+                let v_host: Vec<f16> = v_host_f32.into_iter().map(f16::from_f32).collect();
+                return Some((k_host, v_host));
+            }
+        }
+
         let cache = self.kv_cache.lock().unwrap();
         cache.clone()
     }
@@ -266,7 +288,9 @@ impl NativeQwen3TextModel {
     }
 
     pub fn get_all_kv(&self) -> Vec<(Vec<u32>, Vec<f16>)> {
-        self.layers.iter().filter_map(|l| l.get_kv_data()).collect()
+        let h_d = self.config.head_dim;
+        let n_kv = self.config.num_key_value_heads;
+        self.layers.iter().filter_map(|l| l.get_kv_data(h_d, n_kv)).collect()
     }
 }
 
