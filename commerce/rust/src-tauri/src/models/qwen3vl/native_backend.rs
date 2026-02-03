@@ -43,6 +43,7 @@ impl NativeTensor {
 
     pub fn get_slice<T: Clone>(&self) -> std::borrow::Cow<[T]> {
         let size = self.shape.iter().product::<usize>();
+        if size == 0 { return std::borrow::Cow::Owned(Vec::new()); }
         let ptr = self.data_ptr as *const T;
         let alignment = std::mem::align_of::<T>();
         if (ptr as usize) % alignment == 0 {
@@ -97,60 +98,71 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
     }
 }
 
-// --- [OPTIMIZATION] AVX2 & Tiled Kernels ---
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn popcount_avx2_256(v: __m256i) -> u32 {
-    let mut temp = [0u64; 4];
-    _mm256_storeu_si256(temp.as_mut_ptr() as *mut __m256i, v);
-    temp[0].count_ones() + temp[1].count_ones() + temp[2].count_ones() + temp[3].count_ones()
+#[cfg(feature = "cuda")]
+pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: usize, n: usize, k: usize, dev: usize) -> Vec<f16> {
+    unsafe {
+        let lib = lib();
+        let mut d_i: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0; let mut d_s: CUdeviceptr = 0;
+        let i_f32: Vec<f32> = i.iter().map(|v| v.to_f32()).collect();
+        lib.cuMemAlloc_v2(&mut d_i, m * k * 4); lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
+        lib.cuMemAlloc_v2(&mut d_o, m * n * 4);
+        let s_data = s.get_slice::<f16>();
+        let s_f32: Vec<f32> = s_data.iter().map(|v| v.to_f32()).collect();
+        lib.cuMemAlloc_v2(&mut d_s, n * 4); lib.cuMemcpyHtoD_v2(d_s, s_f32.as_ptr() as *const _, n * 4);
+        bit_serial_matmul_cuda_direct(d_i as *const f32, w.gpu_ptr.unwrap().0 as *const u32, d_s as *const f32, d_o as *mut f32, m as i32, n as i32, k as i32, dev as i32);
+        let mut o_f = vec![0.0f32; m * n]; lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
+        lib.cuMemFree_v2(d_i); lib.cuMemFree_v2(d_o); lib.cuMemFree_v2(d_s);
+        o_f.into_iter().map(f16::from_f32).collect()
+    }
 }
 
-pub fn bit_serial_matmul_f32_extreme(i: &[f16], w: &[u32], s: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
-    let mut o = vec![0.0f32; m * n]; 
-    let k_b = k / 32; 
+pub fn bit_serial_matmul_f32_shuffled(i: &[f16], w: &[u32], s: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut o = vec![0.0f32; m * n];
+    let k_b = (k + 31) / 32;
+    let n_groups = (n + 7) / 8;
     let mut ip = vec![0u32; m * k_b];
 
     ip.par_chunks_mut(k_b).enumerate().for_each(|(idx, row)| {
-        let r = &i[idx * k .. (idx + 1) * k];
+        let start = idx * k;
+        let end = (start + k).min(i.len());
+        let src = &i[start..end];
         for kb in 0..k_b {
             let mut b = 0u32;
-            for bt in 0..32 { if kb * 32 + bt < k && r[kb * 32 + bt].to_f32() >= 0.0 { b |= 1 << bt; } }
+            for bt in 0..32 { 
+                let l = kb * 32 + bt;
+                if l < src.len() && src[l].to_f32() >= 0.0 { b |= 1 << bt; } 
+            }
             row[kb] = b;
         }
     });
 
-    let has_avx2 = is_x86_feature_detected!("avx2");
-    let tile_n = 64; 
-
     o.par_chunks_mut(n).enumerate().for_each(|(m_idx, row_o)| {
-        let ir = &ip[m_idx * k_b .. (m_idx + 1) * k_b];
-        for n_start in (0..n).step_by(tile_n) {
-            let n_end = (n_start + tile_n).min(n);
-            for j in n_start..n_end {
-                let mut d = 0u32;
-                let w_row = &w[j * k_b .. (j + 1) * k_b];
-                if has_avx2 && k_b >= 8 {
-                    unsafe {
-                        let mut kb = 0;
-                        while kb + 8 <= k_b {
-                            let v_i = _mm256_loadu_si256(ir.as_ptr().add(kb) as *const __m256i);
-                            let v_w = _mm256_loadu_si256(w_row.as_ptr().add(kb) as *const __m256i);
-                            let v_xor = _mm256_xor_si256(v_i, v_w);
-                            d += popcount_avx2_256(v_xor);
-                            kb += 8;
-                        }
-                        while kb < k_b { d += (ir[kb] ^ w_row[kb]).count_ones(); kb += 1; }
+        let ir_ptr = unsafe { ip.as_ptr().add(m_idx * k_b) };
+        for g in 0..n_groups {
+            let n_base = g * 8;
+            let w_off = g * k_b * 8;
+            if w_off + k_b * 8 > w.len() { continue; }
+            let w_ptr = unsafe { w.as_ptr().add(w_off) };
+            let s_ptr = unsafe { s.as_ptr().add(w_off) };
+            
+            for kb in 0..k_b {
+                let input_bits = unsafe { *ir_ptr.add(kb) };
+                for i_ch in 0..8 {
+                    if n_base + i_ch < n {
+                        let weight_bits = unsafe { *w_ptr.add(kb * 8 + i_ch) };
+                        let scale = unsafe { *s_ptr.add(kb * 8 + i_ch) };
+                        let dot = 32 - 2 * (input_bits ^ weight_bits).count_ones() as i32;
+                        row_o[n_base + i_ch] += (dot as f32) * scale.to_f32();
                     }
-                } else {
-                    for kb in 0..k_b { d += (ir[kb] ^ w_row[kb]).count_ones(); }
                 }
-                row_o[j] = ((k_b as i32 * 32 - 2 * (d as i32)) as f32) * s[j].to_f32();
             }
         }
     });
     o
+}
+
+pub fn bit_serial_matmul_f32_extreme(i: &[f16], w: &[u32], s: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
+    bit_serial_matmul_f32_shuffled(i, w, s, m, n, k)
 }
 
 pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usize, n_h: usize, q_l: usize, t_s: usize) -> Vec<f16> {
@@ -158,37 +170,38 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
     let k_b = (h_d + 31) / 32; 
     let mut o = vec![f16::ZERO; q_l * hid]; 
     let sc = 1.0 / (h_d as f32).sqrt();
-    let has_avx2 = is_x86_feature_detected!("avx2");
 
     o.par_chunks_exact_mut(hid).enumerate().for_each(|(i, out)| {
         for h in 0..n_h {
             let mut scores = vec![0.0f32; t_s];
-            let qi = &q[(i * n_h + h) * h_d .. (i * n_h + h + 1) * h_d];
+            let q_start = (i * n_h + h) * h_d;
+            if q_start + h_d > q.len() { continue; }
+            let qi = &q[q_start .. q_start + h_d];
+            
             let mut qp = [0u32; 8]; 
             for kb in 0..k_b { 
                 let mut bts = 0u32; 
-                for b in 0..32 { if kb * 32 + b < h_d && qi[kb * 32 + b].to_f32() >= 0.0 { bts |= 1 << b; } } 
+                for b in 0..32 { 
+                    let idx = kb * 32 + b;
+                    if idx < h_d && qi[idx].to_f32() >= 0.0 { bts |= 1 << b; } 
+                } 
                 qp[kb] = bts; 
             }
             for j in 0..t_s {
-                let kj = &k_p[(j * n_h + h) * k_b .. (j * n_h + h + 1) * k_b];
-                let mut d = 0u32;
-                if has_avx2 && k_b >= 8 {
-                    unsafe {
-                        let v_q = _mm256_loadu_si256(qp.as_ptr() as *const __m256i);
-                        let v_k = _mm256_loadu_si256(kj.as_ptr() as *const __m256i);
-                        d = popcount_avx2_256(_mm256_xor_si256(v_q, v_k));
-                    }
-                } else {
-                    for kb in 0..k_b { d += (qp[kb] ^ kj[kb]).count_ones(); }
-                }
-                scores[j] = ((k_b as i32 * 32 - 2 * (d as i32)) as f32) * sc;
+                let k_start = (j * n_h + h) * k_b;
+                if k_start + k_b > k_p.len() { continue; }
+                let kj = &k_p[k_start .. k_start + k_b];
+                let mut dot = 0i32;
+                for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
+                scores[j] = (dot as f32) * sc;
             }
             let max_s = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
             let mut sum_e = 0.0f32;
             for x in scores.iter_mut() { *x = (*x - max_s).exp(); sum_e += *x; }
             for j in 0..t_s {
-                let vj = &v_f[(j * n_h + h) * h_d .. (j * n_h + h + 1) * h_d];
+                let v_start = (j * n_h + h) * h_d;
+                if v_start + h_d > v_f.len() { continue; }
+                let vj = &v_f[v_start .. v_start + h_d];
                 let s_final = scores[j] / sum_e;
                 for d in 0..h_d { out[h * h_d + d] = f16::from_f32(out[h * h_d + d].to_f32() + s_final * vj[d].to_f32()); }
             }
@@ -203,7 +216,10 @@ pub fn native_rms_norm_f16(i: &[f16], w: &[f16], e: f32, hid: usize) -> Vec<f16>
     i.par_chunks_exact(hid).zip(o.par_chunks_exact_mut(hid)).for_each(|(r_i, r_o)| {
         let mut v = 0.0f32; for &x in r_i { let val = x.to_f32(); v += val * val; }
         let inv = 1.0 / (v / hid as f32 + e).sqrt();
-        for j in 0..hid { if j < w.len() { r_o[j] = f16::from_f32(r_i[j].to_f32() * inv * w[j].to_f32()); } }
+        for j in 0..hid { 
+            let weight = if j < w.len() { w[j].to_f32() } else { 1.0 };
+            r_o[j] = f16::from_f32(r_i[j].to_f32() * inv * weight); 
+        }
     });
     o
 }
@@ -232,12 +248,19 @@ pub fn native_apply_rope_f16_with_offset(q: &mut [f16], k: &mut [f16], _ql: usiz
 pub fn native_linear_f16(i: &[f16], w: &[f16], b: Option<&[f16]>, m: usize, n: usize, k: usize) -> Vec<f16> {
     let mut o = vec![f16::ZERO; m * n];
     o.par_chunks_exact_mut(n).enumerate().for_each(|(idx, ro)| {
-        let ri = &i[idx * k .. (idx + 1) * k];
-        for j in 0..n {
-            let mut s = 0.0f32; let wr = &w[j * k .. (j + 1) * k];
-            for l in 0..k { s += ri[l].to_f32() * wr[l].to_f32(); }
-            if let Some(bv) = b { s += bv[j].to_f32(); }
-            ro[j] = f16::from_f32(s);
+        let i_start = idx * k;
+        if i_start + k <= i.len() {
+            let ri = &i[i_start .. i_start + k];
+            for j in 0..n {
+                let mut s = 0.0f32; 
+                let w_start = j * k;
+                if w_start + k <= w.len() {
+                    let wr = &w[w_start .. w_start + k];
+                    for l in 0..k { s += ri[l].to_f32() * wr[l].to_f32(); }
+                }
+                if let Some(bv) = b { if j < bv.len() { s += bv[j].to_f32(); } }
+                ro[j] = f16::from_f32(s);
+            }
         }
     });
     o

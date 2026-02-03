@@ -28,7 +28,6 @@ impl NativeLinear {
                 native_linear_f16(x, w_cow.as_ref(), b_cow.as_ref().map(|b| b.as_ref()), m, self.out_features, self.in_features)
             },
             LinearVariant::BitSerial { weight_packed, scales, bias } => {
-                // [GPU-PATH]
                 #[cfg(feature = "cuda")]
                 {
                     if self.device_id >= 0 && weight_packed.gpu_ptr.is_some() {
@@ -42,7 +41,6 @@ impl NativeLinear {
                     }
                 }
 
-                // [CPU-PATH] Optimized with AVX2/Tiling (inside backend)
                 let wp_cow = weight_packed.get_slice::<u32>(); 
                 let s_cow = scales.get_slice::<f16>();
                 let mut out = bit_serial_matmul_f32_extreme(x, wp_cow.as_ref(), s_cow.as_ref(), m, self.out_features, self.in_features);
@@ -52,7 +50,9 @@ impl NativeLinear {
                     let b_ref = b_cow.as_ref();
                     for i in 0..m {
                         for j in 0..self.out_features {
-                            out[i * self.out_features + j] += b_ref[j].to_f32();
+                            if i * self.out_features + j < out.len() && j < b_ref.len() {
+                                out[i * self.out_features + j] += b_ref[j].to_f32();
+                            }
                         }
                     }
                 }
@@ -132,8 +132,8 @@ impl NativeLayer {
                 let cuda_lib = lib();
                 let k_offset = current_len * n_kv * (head_dim/32) * 4;
                 let v_offset = current_len * n_kv * head_dim * 4;
-                cuda_lib.cuMemcpyHtoD_v2((k_ptr.0 as usize + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
-                cuda_lib.cuMemcpyHtoD_v2((v_ptr.0 as usize + v_offset) as CUdeviceptr, v_f32.as_ptr() as *const _, v_f32.len() * 4);
+                let _ = cuda_lib.cuMemcpyHtoD_v2((k_ptr.0 as usize + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+                let _ = cuda_lib.cuMemcpyHtoD_v2((v_ptr.0 as usize + v_offset) as CUdeviceptr, v_f32.as_ptr() as *const _, v_f32.len() * 4);
             }
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
@@ -151,7 +151,7 @@ impl NativeLayer {
         }
 
         let mut cache_guard = self.kv_cache.lock().unwrap();
-        let (k_p_f, v_f_f) = if let Some((pk, pv)) = cache_guard.take() {
+        let (k_p_f, v_f_f): (Vec<u32>, Vec<f16>) = if let Some((pk, pv)) = cache_guard.take() {
             let mut nk = pk; let mut nv = pv; nk.extend_from_slice(&pack_f16_to_bits(&k)); nv.extend_from_slice(&v); (nk, nv)
         } else { (pack_f16_to_bits(&k), v) };
         let t_s = v_f_f.len() / (n_kv * head_dim);
@@ -185,8 +185,8 @@ impl NativeLayer {
             #[cfg(feature = "cuda")]
             unsafe {
                 use cudarc::driver::sys::*;
-                lib().cuMemFree_v2(k.0 as CUdeviceptr);
-                lib().cuMemFree_v2(v.0 as CUdeviceptr);
+                let _ = lib().cuMemFree_v2(k.0 as CUdeviceptr);
+                let _ = lib().cuMemFree_v2(v.0 as CUdeviceptr);
             }
         }
     }
@@ -259,12 +259,15 @@ impl NativeQwen3VLModel {
             let variations = vec![
                 target.to_string(),
                 target.replace("model.", "model.language_model."),
+                target.replace("model.layers", "model.language_model.layers"),
                 format!("model.language_model.{}", target.replace("model.", ""))
             ];
             for v in variations {
-                if st.tensor(&v).is_ok() { return Some(v); }
+                if st.tensor(&v).is_ok() || st.tensor(&format!("{}.packed", v)).is_ok() { 
+                    return Some(v); 
+                }
             }
-            st.names().iter().find(|&n| n.contains(target)).map(|n| n.to_string())
+            None
         };
 
         let get_t = |name: &str| -> Result<NativeTensor> {
@@ -294,8 +297,9 @@ impl NativeQwen3VLModel {
             }
         };
 
+        // 임베딩 로드 로직: 여러 경로를 시도하여 양자화된 임베딩을 찾음
         let emb = get_l("model.embed_tokens.weight", 151936, t_c.hidden_size)
-            .or_else(|_| get_l("model.layers.0.input_layernorm.weight", t_c.hidden_size, t_c.hidden_size))?;
+            .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))?;
             
         let mut layers = Vec::new(); 
         let l_to_l = if baking { 1 } else { t_c.num_hidden_layers };

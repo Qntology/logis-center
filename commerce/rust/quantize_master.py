@@ -5,29 +5,51 @@ import os
 import re
 import gguf
 
-def quantize_tensor_bit_serial(param):
+def quantize_tensor_bit_serial_shuffled(param):
+    """
+    [OPTIMIZED] 1-bit Quantization with Layout Shuffling
+    Rearranges weights into [N/8, K/32, 8] for direct AVX2 register loading.
+    """
     BLOCK_SIZE = 32
-    original_shape = list(param.shape)
-    flat_w = param.view(-1).to(torch.float32)
-    pad_len = (BLOCK_SIZE - (flat_w.numel() % BLOCK_SIZE)) % BLOCK_SIZE
-    if pad_len > 0: flat_w = torch.cat([flat_w, torch.zeros(pad_len)])
-    num_blocks = flat_w.numel() // BLOCK_SIZE
-    blocks = flat_w.view(num_blocks, BLOCK_SIZE)
-    scales = torch.mean(torch.abs(blocks), dim=1).to(torch.float16)
-    binary = (blocks >= 0).to(torch.uint8)
-    packed_uint32 = torch.zeros(num_blocks, dtype=torch.int32)
-    for i in range(32):
-        packed_uint32 |= (binary[:, i].to(torch.int32) << i)
-    return packed_uint32, scales, torch.tensor(original_shape, dtype=torch.int32)
+    N, K = param.shape[0], param.shape[1]
+    
+    # 1. Padding K to multiple of 32
+    pad_k = (BLOCK_SIZE - (K % BLOCK_SIZE)) % BLOCK_SIZE
+    if pad_k > 0:
+        param = torch.nn.functional.pad(param, (0, pad_k))
+    K_padded = K + pad_k
+    K_blocks = K_padded // BLOCK_SIZE
+
+    # 2. Basic Bit-packing [N, K_blocks]
+    flat_w = param.view(N, K_blocks, BLOCK_SIZE)
+    # Scales are also stored per block
+    scales = torch.mean(torch.abs(flat_w), dim=2).to(torch.float16)
+    binary = (flat_w >= 0).to(torch.int32)
+    
+    packed_rows = torch.zeros((N, K_blocks), dtype=torch.int32)
+    for i in range(BLOCK_SIZE):
+        packed_rows |= (binary[:, :, i] << i)
+
+    # 3. [LAYOUT SHUFFLING] Group 8 output channels together
+    pad_n = (8 - (N % 8)) % 8
+    if pad_n > 0:
+        packed_rows = torch.nn.functional.pad(packed_rows, (0, 0, 0, pad_n))
+        scales = torch.nn.functional.pad(scales, (0, 0, 0, pad_n))
+    
+    N_padded = N + pad_n
+    # Change layout to [N/8, K_blocks, 8]
+    shuffled_w = packed_rows.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
+    shuffled_s = scales.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
+
+    return shuffled_w.view(-1), shuffled_s.view(-1), torch.tensor([N, K], dtype=torch.int32)
 
 def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
     mode_name = "LAYER0" if layer_limit == 1 else "ALL"
-    type_name = "VISION" if is_vision else "TEXT"
     suffix = f"BITSERIAL_{mode_name}.safetensors"
     prefix = "mmproj-" if is_vision else "model-"
     out_path = os.path.join(output_dir, f"{prefix}{suffix}")
 
-    print(f"[{type_name}-{mode_name}] Processing: {input_path} -> {out_path}")
+    print(f"[{'VISION' if is_vision else 'TEXT'}-{mode_name}] Shuffling Layout: {input_path}")
     
     tensors = {}
     if input_path.endswith(".gguf"):
@@ -42,38 +64,35 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
 
     final_dict = {}
     for name, param in tensors.items():
-        idx_match = re.search(r'(layers|blk|blocks)\.(\d+)\.', name)
+        idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
         if layer_limit is not None and layer_idx >= layer_limit: continue
         if is_vision != ("visual" in name): continue
 
-        if "weight" in name and len(param.shape) >= 2 and "norm" not in name and "ln" not in name:
-            packed, scales, shape = quantize_tensor_bit_serial(param)
-            # 64바이트 정렬을 위해 더미 데이터를 넣는 대신, 
-            # safetensors 저장 시 자동으로 처리되도록 가이드를 줍니다.
+        if "weight" in name and len(param.shape) == 2 and "norm" not in name and "ln" not in name:
+            packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
             final_dict.update({
                 f"{name}.packed": packed,
                 f"{name}.scales": scales,
                 f"{name}.shape": shape,
-                f"{name}.format": torch.tensor([0], dtype=torch.int8)
+                f"{name}.format": torch.tensor([1], dtype=torch.int8) # Format 1 = Shuffled
             })
         else:
             final_dict[name] = param.to(torch.float16)
 
-    # [OPTIMIZATION] 저장 시 모든 텐서를 float16 또는 정렬된 타입으로 저장
     save_file(final_dict, out_path)
-    print(f" -> DONE. Saved {len(final_dict)} tensors.")
+    print(f" -> DONE. Shuffled model saved to {out_path}")
 
 if __name__ == "__main__":
     MODELS_ROOT = "src-tauri/models"
-    for m_dir, src, is_v, limit in [
+    tasks = [
         ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, None),
         ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, 1),
         ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, None),
-        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, 1),
         ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, None),
         ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, 1),
-    ]:
+    ]
+    for m_dir, src, is_v, limit in tasks:
         p_src = os.path.join(MODELS_ROOT, m_dir, src)
         if os.path.exists(p_src):
             process_model(p_src, os.path.join(MODELS_ROOT, m_dir), is_v, limit)
