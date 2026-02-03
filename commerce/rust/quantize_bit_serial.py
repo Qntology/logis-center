@@ -15,8 +15,8 @@ def quantize_iq0_gguf_style(input_path, output_path):
         idx_match = re.search(r'(layers|blk|blocks)\.(\d+)\.', name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
         
-        # 앵커 레이어는 원본 유지 (GGUF 전략)
-        if layer_idx == 0 or "patch_embed" in name:
+        # [FIX] 레이어 0도 동일하게 양자화 진행 (Baking 모델과 일치시키기 위함)
+        if "patch_embed" in name:
             quantized_dict[name] = param.to(torch.float16)
             continue
 
