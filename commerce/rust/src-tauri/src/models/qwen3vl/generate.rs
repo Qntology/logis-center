@@ -199,12 +199,49 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn save_kv_to_disk(&self, path: &Path) -> Result<()> {
-        // [NATIVE-KV-SAVE] Implement state serialization if needed
+        let kvs = match &self.qwen3_vl {
+            ModelVariant::Native(m) => m.text_model.get_all_kv(),
+        };
+
+        if kvs.is_empty() { return Ok(()); }
+
+        let mut tensors = std::collections::HashMap::new();
+        for (i, (k, v)) in kvs.into_iter().enumerate() {
+            // Packed K: Vec<u32> -> [N]
+            let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
+            tensors.insert(format!("layer.{}.k", i), safetensors::tensor::TensorView::new(safetensors::Dtype::U32, vec![k.len()], k_u8)?);
+            
+            // V: Vec<f16> -> [N]
+            let v_u8 = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
+            tensors.insert(format!("layer.{}.v", i), safetensors::tensor::TensorView::new(safetensors::Dtype::F16, vec![v.len()], v_u8)?);
+        }
+
+        safetensors::tensor::serialize_to_file(tensors, &None, path)?;
+        println!("[KV-DISK] Saved KV Cache to {:?}", path);
         Ok(())
     }
 
     pub fn load_kv_from_disk(&self, path: &Path) -> Result<()> {
-        // [NATIVE-KV-LOAD] Implement state deserialization if needed
+        if !path.exists() { return Ok(()); }
+        
+        let file = std::fs::read(path)?;
+        let st = safetensors::SafeTensors::deserialize(&file)?;
+        
+        match &self.qwen3_vl {
+            ModelVariant::Native(m) => {
+                for i in 0..m.text_model.layers.len() {
+                    let k_name = format!("layer.{}.k", i);
+                    let v_name = format!("layer.{}.v", i);
+                    
+                    if let (Ok(kt), Ok(vt)) = (st.tensor(&k_name), st.tensor(&v_name)) {
+                        let k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                        let v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
+                        m.text_model.layers[i].set_kv_data(k_data, v_data);
+                    }
+                }
+            }
+        }
+        println!("[KV-DISK] Loaded KV Cache from {:?}", path);
         Ok(())
     }
 

@@ -163,6 +163,16 @@ impl NativeLayer {
             }
         }
     }
+
+    pub fn get_kv_data(&self) -> Option<(Vec<u32>, Vec<f16>)> {
+        let cache = self.kv_cache.lock().unwrap();
+        cache.clone()
+    }
+
+    pub fn set_kv_data(&self, k: Vec<u32>, v: Vec<f16>) {
+        let mut cache = self.kv_cache.lock().unwrap();
+        *cache = Some((k, v));
+    }
 }
 
 pub struct NativeQwen3TextModel {
@@ -187,6 +197,10 @@ impl NativeQwen3TextModel {
     pub fn clear_kv_cache(&self) {
         for layer in &self.layers { layer.clear_kv_cache(); }
     }
+
+    pub fn get_all_kv(&self) -> Vec<(Vec<u32>, Vec<f16>)> {
+        self.layers.iter().filter_map(|l| l.get_kv_data()).collect()
+    }
 }
 
 pub struct NativeQwen3VLModel {
@@ -200,7 +214,11 @@ impl NativeQwen3VLModel {
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, _v_mmap: Arc<Mmap>, baking: bool) -> Result<Self> {
         let st = SafeTensors::deserialize(&m_mmap)?; let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         let get_t = |name: &str| -> Result<NativeTensor> {
-            let v = st.tensor(name)?; let off = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
+            let v = st.tensor(name).map_err(|e| {
+                println!("[ERROR] Tensor not found: {} (Available: {})", name, st.names().len());
+                anyhow!("TensorNotFound: {} - {:?}", name, e)
+            })?;
+            let off = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
             Ok(NativeTensor::from_mmap(m_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
         };
         let get_l = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
@@ -215,7 +233,9 @@ impl NativeQwen3VLModel {
                     bias: None,
                 }
             } else {
-                let v = st.tensor(base)?; let o = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
+                // Fallback to non-packed version (Original FP16)
+                let v = st.tensor(base).map_err(|_| anyhow!("LinearTensorNotFound: {}", base))?; 
+                let o = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
                 LinearVariant::Standard { weight: NativeTensor::from_mmap(m_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }
             };
             Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: var, device_id: -1 })
@@ -225,7 +245,7 @@ impl NativeQwen3VLModel {
         for i in 0..l_to_l {
             let p = format!("model.layers.{}", i);
             layers.push(NativeLayer {
-                input_layernorm: get_t(&format!("{}.input_layernorm.weight", p))?,
+                input_layernorm: get_t(&format!("{}.input_layernorm.weight", p)).or_else(|_| get_t(&format!("{}.input_layernorm.weight", p)))?,
                 post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p))?,
                 q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p)).ok(),
                 k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p)).ok(),
