@@ -254,15 +254,32 @@ async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<
     Ok(logs)
 }
 
+#[derive(serde::Serialize)]
+struct InitialSyncData {
+    tasks: Vec<crate::store::Task>,
+    pages: Vec<crate::store::TradeDocument>,
+    users: Vec<crate::store::TradeDocument>,
+    items: Vec<crate::store::TradeDocument>,
+    browser_status: String,
+    current_url: String,
+    is_client: bool,
+    is_admin: bool,
+}
+
 #[tauri::command]
-async fn mark_ui_ready(state: State<'_, AppState>) -> Result<Value, String> {
+async fn mark_ui_ready(state: State<'_, AppState>) -> Result<InitialSyncData, String> {
     scheduler::mark_ui_ready();
     let store_guard = state.store.lock().await;
     let mut tasks = Vec::new();
     let mut pages = Vec::new();
+    let mut users = Vec::new();
+    let mut items = Vec::new();
+    
     if let Some(db) = store_guard.as_ref() {
         tasks = db.get_pending_tasks(10).await.unwrap_or_default();
         pages = db.get_all_items("pages", 50, 0, None).await.unwrap_or_default();
+        users = db.get_all_items("users", 20, 0, None).await.unwrap_or_default();
+        items = db.get_all_items("items", 10, 0, None).await.unwrap_or_default();
     }
     
     let browser_status = {
@@ -270,11 +287,21 @@ async fn mark_ui_ready(state: State<'_, AppState>) -> Result<Value, String> {
         if guard.is_some() || automation::is_browser_reachable().await { "running".to_string() } else { "stopped".to_string() }
     };
 
-    Ok(json!({
-        "tasks": tasks,
-        "pages": pages,
-        "browser_status": browser_status,
-    }))
+    let (current_url, is_client, is_admin) = {
+        let state = automation::LAST_DETECTED_STATE.lock().await;
+        (state.url.clone(), state.is_client, state.is_admin)
+    };
+
+    Ok(InitialSyncData {
+        tasks,
+        pages,
+        users,
+        items,
+        browser_status,
+        current_url,
+        is_client,
+        is_admin,
+    })
 }
 
 #[tauri::command]
@@ -525,6 +552,11 @@ pub fn run() {
             cancellation_token: cancellation_token.clone(),
         })
         .setup(|app| {
+            // [CRITICAL] Reset stop signals IMMEDIATELY and SYNCHRONOUSLY on startup
+            crate::utils::set_extraction_stop_signal(false);
+            app.state::<AppState>().cancellation_token.store(false, Ordering::SeqCst);
+            println!("[Setup] Global stop signals cleared.");
+
             let setup_store = app.state::<AppState>().store.clone();
             tauri::async_runtime::spawn(async move {
                 let mut store_guard = setup_store.lock().await;

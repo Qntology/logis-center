@@ -152,14 +152,6 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         let mut last_is_shop = false;
 
         loop {
-            // [DEBUG] Monitor tick
-            // println!("[AUTO] Monitoring tick...");
-            // [CRITICAL] Stop monitoring if global stop signal is active
-            if crate::utils::is_extraction_stopped() {
-                println!("[AUTO] Global stop signal detected. Exiting browser monitor.");
-                break;
-            }
-
             let pages = match browser.pages().await {
                 Ok(p) => p,
                 Err(e) => {
