@@ -313,13 +313,14 @@ impl LogisModel {
         self.secure_vram_relay_ext(ModelSize::Large, Some(&base_session), cancel_token, false, true).await
     }
 
-    /// [NEW] Hybrid Image Context Baking (0.6B Text + 2B Vision Layer 0)
+    /// [NEW] Hybrid Image Context Baking (2B Text L0 + 2B Vision Layer 0)
     pub async fn ingest_image_to_ssd(&self, task_id: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let base_session = format!("{}_img_base", task_id);
         
-        // 1. Load Small Model (0.6B) in Baking Mode, but enable Vision (Baking: true, Text-Only: false)
-        println!("[RELAY] Loading HYBRID Baking Mode (0.6B Text + 2B Vision)...");
-        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
+        // [FIX] 이미지 베이킹은 반드시 2B(Large) 모델을 사용해야 차원(2048)이 일치함
+        // 0.6B(Small)는 차원이 1024이므로 비전 모델과 호환되지 않음
+        println!("[RELAY] Loading 2B Vision Baking Mode (2B Text L0 + 2B Vision L0)...");
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), true, false).await?;
 
         // 2. Ingest Image content
         let prompt = "[SYSTEM] Analyze the visual contents of this image.".to_string();
