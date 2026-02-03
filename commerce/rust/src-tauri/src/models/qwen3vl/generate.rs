@@ -223,7 +223,7 @@ impl Qwen3VLGenerateModel {
         let mut current_tokens = 0;
         let mut part_idx = 1;
 
-        println!("[BAKE-PARTS] Starting split-baking for {} (Target: 2048 per part)", task_id);
+        println!("[BAKE-PARTS] Starting split-baking for {} (Target: 512 per part)", task_id);
 
         for line in lines {
             if let Some(flag) = &cancel_flag {
@@ -234,8 +234,8 @@ impl Qwen3VLGenerateModel {
             let line_ids = self.tokenizer.text_encode_vec(line_text.clone(), false)?;
             let line_token_count = line_ids.len();
 
-            // Check if adding this line exceeds 2048 tokens
-            if current_tokens + line_token_count > 2048 && !current_chunk.is_empty() {
+            // Check if adding this line exceeds 512 tokens
+            if current_tokens + line_token_count > 512 && !current_chunk.is_empty() {
                 // 1. Bake the current accumulated chunk
                 let chunk_ids = self.tokenizer.text_encode_vec(current_chunk.clone(), false)?;
                 self.qwen3_vl.forward(&chunk_ids, None, None, 0); // Always 0 because we clear cache each time
