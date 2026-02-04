@@ -224,11 +224,50 @@ async fn process_task(
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
     let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
+    // [RESTORED] Pre-fetch weights to OS Page Cache with settle delay
+    let large_model_dir = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
+        .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
+    if let Some(ref p) = large_model_dir {
+        let path_clone = p.clone();
+        println!("[PROCESS] Warming up weight cache for large model...");
+        tokio::task::spawn_blocking(move || { let _ = pre_fetch_weights(&path_clone); });
+        // Give OS time to settle the cache after heavy read
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // 2. Acquire Model with Stability Protocol
     let model = {
         let mut model_lock = model_mutex.lock().await;
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+
+        // Ensure clean state if switching between CPU/GPU modes
+        if let Some(m) = model_lock.as_ref() {
+            let wants_cpu = effective_device_pref.as_deref() == Some("cpu");
+            if m.is_cpu_mode != wants_cpu {
+                println!("[PROCESS] Device mismatch detected. Purging current model...");
+                m.unload_generator().await;
+                *model_lock = None;
+                // Wait for VRAM/RAM to actually release
+                let _ = wait_for_resources_settled(1000, 500, Some(cancellation_token)).await;
+            }
+        }
+
         if model_lock.is_none() {
+            println!("[PROCESS] Initializing LogisModel Engine (Pref: {:?})...", effective_device_pref);
+            
+            // [RESTORED] Prevent UI hang during heavy MSVC/NVCC initialization
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Threading::*;
+                let thread = GetCurrentThread();
+                SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+            }
+
             match LogisModel::new(effective_device_pref.as_deref()).await {
-                Ok(m) => *model_lock = Some(m),
+                Ok(m) => {
+                    println!("[PROCESS] Model Engine Ready.");
+                    *model_lock = Some(m);
+                },
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
         }
@@ -278,14 +317,23 @@ async fn process_task(
     let mut selector_info = json!({});
     let mut is_detail = false;
 
+    // --- PHASE 1: CLASSIFICATION ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        println!("[PROCESS] Phase 1: Classification (Incremental Query)");
         let type_prompt = parsing::page_type_prompt();
+        let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
+        
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋" }));
-        let res = model.run_modular_inference(&task.r#ref, &task.id, "class", &type_prompt, "Classify this page.", Some(cancellation_token.clone())).await?;
+
+        let res = model.run_modular_inference(&task.r#ref, &task.id, "class", &query_text, "Classify this page.", Some(cancellation_token.clone())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
-        if page_type == "unknown" || page_type.is_empty() { return Ok(()); }
+        
+        if page_type == "unknown" || page_type.is_empty() { 
+            println!("[PROCESS] Identification failed for task {}.", task.id);
+            return Ok(()); 
+        }
 
         // [RESTORED] State Sync: Update DB with intermediate result & refresh timestamp
         {
@@ -302,11 +350,16 @@ async fn process_task(
     model.deep_purge_resources(false).await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
+    // --- PHASE 2: SELECTOR IDENTIFICATION ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+        println!("[PROCESS] Phase 2: Selector ID (Incremental Query)");
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
+        let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
+
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Analyzing structural selectors...", "spinner": "⠋" }));
-        let res = model.run_modular_inference(&task.r#ref, &task.id, "sel", &selector_prompt, "Identify selectors.", Some(cancellation_token.clone())).await?;
+
+        let res = model.run_modular_inference(&task.r#ref, &task.id, "sel", &query_text, "Identify selectors.", Some(cancellation_token.clone())).await?;
         selector_info = parsing::parse_json_from_llm(&res);
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -392,18 +445,42 @@ async fn process_task(
                         }
                 
                         if !is_detail && !all_extracted_items.is_empty() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Refinement", "summary": format!("Refining {} items with AI...", all_extracted_items.len()), "spinner": "⠋" }));
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Refinement", "summary": format!("AI Refinement loop for {} items...", all_extracted_items.len()), "spinner": "⠋" }));
             let mut refined_items = Vec::new();
-            for (batch_idx, batch) in all_extracted_items.chunks(10).enumerate() {
+            let batch_size = 10;
+            
+            for (batch_idx, batch) in all_extracted_items.chunks(batch_size).enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { break; }
+                let start_item = batch_idx * batch_size + 1;
+                let end_item = std::cmp::min(start_item + batch.len() - 1, all_extracted_items.len());
+                
                 let batch_text: String = batch.iter().enumerate().map(|(i, it)| format!("Item {}:\n{}", i + 1, it.to_string())).collect::<Vec<_>>().join("\n\n");
                 let ins = parsing::list2json(&page_type, "english");
-                // [RESTORED] Use 'refine' suffix for audit logs
-                let res = model.run_modular_inference(&task.r#ref, &task.id, &format!("refine_{}", batch_idx), &ins, &batch_text, Some(cancellation_token.clone())).await?;
+                
+                // [RESTORED] Explicit action flag for batch progression
+                let action_flag = if end_item == all_extracted_items.len() { "ACTION: SAVE" } else { "ACTION: INGEST" };
+                let query_text = format!("{}\n\n{}", batch_text, action_flag);
+
+                let res = model.run_modular_inference(&task.r#ref, &task.id, &format!("refine_{}", batch_idx), &ins, &query_text, Some(cancellation_token.clone())).await?;
                 let parsed = parsing::parse_json_from_llm(&res);
+                
                 if let Some(arr) = parsed.as_array().or_else(|| parsed.get("items").and_then(|v| v.as_array())) {
-                    for (i, refined) in arr.iter().enumerate() { if i < batch.len() { let mut m = batch[i].clone(); merge_json_results(&mut m, refined); refined_items.push(m); } }
-                } else { refined_items.extend_from_slice(batch); }
+                    for (i, refined) in arr.iter().enumerate() {
+                        if i < batch.len() {
+                            let mut merged = batch[i].clone();
+                            merge_json_results(&mut merged, refined);
+                            refined_items.push(merged);
+                        }
+                    }
+                } else {
+                    refined_items.extend_from_slice(batch);
+                }
+
+                // [RESTORED] Detailed Progress Tracking
+                log_task_progress(app_handle, &task.id, &json!({ 
+                    "category": "Refinement", 
+                    "summary": format!("Processed items {}-{} of {}...", start_item, end_item, all_extracted_items.len()) 
+                }));
             }
             all_extracted_items = refined_items;
         }
