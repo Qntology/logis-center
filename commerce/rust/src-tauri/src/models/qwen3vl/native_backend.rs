@@ -358,7 +358,7 @@ pub struct PagedKV {
 }
 
 #[cfg(feature = "cuda")]
-pub fn native_bit_serial_attn_gpu_paged(q: &[f16], paged_kv: &PagedKV, n_h: usize, h_d: usize, dev: usize) -> Vec<f16> {
+pub fn native_bit_serial_attn_gpu_paged(_q: &[f16], _paged_kv: &PagedKV, _n_h: usize, _h_d: usize, _dev: usize) -> Vec<f16> {
     // [2025-H2-RESEARCH] Sequential paging for Zero-Prefill
     // Instead of stitching files on disk, we pass multiple pointers to the kernel
     // [STUB] 실제 구현은 multi-pointer 전용 CUDA 커널과 연동됩니다.

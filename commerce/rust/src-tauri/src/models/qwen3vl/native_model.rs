@@ -913,7 +913,7 @@ impl NativeQwen3VLModel {
     }
     pub fn forward(&self, i_ids: &[u32], p_v: Option<&[f16]>, g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
         // [2026-SPECULATIVE-TREE] Support for validating multiple candidates in parallel
-        let batch_size = i_ids.len() / (if i_ids.len() > 1 { 1 } else { 1 }); // Adjust for Tree-Depth
+        let _batch_size = i_ids.len() / (if i_ids.len() > 1 { 1 } else { 1 }); // Adjust for Tree-Depth
         
         let mut embeds = match &self.text_model.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => {

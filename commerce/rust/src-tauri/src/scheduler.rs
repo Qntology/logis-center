@@ -301,21 +301,21 @@ async fn process_task(
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
         }
-        let model = model_lock.as_ref().unwrap().clone();
-        drop(model_lock); // Release lock early to allow background streaming
+        model_lock.as_ref().unwrap().clone()
+    };
 
-        // [PIPELINE-FORK] Separate Image and Text preprocessing flows
-        if !image_path.is_empty() {
-            // SCENARIO B: Image Preprocessing (0.6B Bake -> 2B Vision Bake -> 2B Full Inference)
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Image Pipeline", "summary": "2026-Speculative vision extraction...", "spinner": "⠋" }));
-            let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
-            model.extract_from_image(task.id.clone(), task.r#ref.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
-            return Ok(());
-        } else if !url.is_empty() {
-            // SCENARIO A: Text Preprocessing (0.6B Bake -> 2B Full Inference)
-            process_text_pipeline(task, &model, cancellation_token, app_handle, &light_pug, &mut data_manager, store_mutex).await?;
-            return Ok(());
-        }
+    // [PIPELINE-FORK] Separate Image and Text preprocessing flows
+    if !image_path.is_empty() {
+        // SCENARIO B: Image Preprocessing (0.6B Bake -> 2B Vision Bake -> 2B Full Inference)
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Image Pipeline", "summary": "2026-Speculative vision extraction...", "spinner": "⠋" }));
+        let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
+        model.extract_from_image(task.id.clone(), task.r#ref.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
+        return Ok(());
+    } else if !url.is_empty() {
+        // SCENARIO A: Text Preprocessing (0.6B Bake -> 2B Full Inference)
+        process_text_pipeline(task, &model, cancellation_token, app_handle, &light_pug, &mut data_manager, store_mutex).await?;
+        return Ok(());
+    }
 
     Ok(())
 }
@@ -452,7 +452,7 @@ fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) 
     let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
 }
 
-fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
+pub fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     use std::io::Read;
     println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
     if path.is_dir() {
