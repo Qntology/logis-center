@@ -195,11 +195,31 @@ impl NativeLayer {
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
-            q = native_rms_norm_f16(&q, qw_cow.as_ref(), config.rms_norm_eps as f32, head_dim); 
+            // [FIX] Correct per-head normalization: each head (128 dims) uses its own weights if available
+            q.par_chunks_exact_mut(head_dim).enumerate().for_each(|(h_idx, head_data)| {
+                let w_off = (h_idx * head_dim) % qw_cow.len();
+                let head_w = &qw_cow[w_off .. w_off + head_dim];
+                
+                let mut v = 0.0f32; for &x in head_data.iter() { let val = x.to_f32(); v += val * val; }
+                let inv = 1.0 / (v / head_dim as f32 + config.rms_norm_eps as f32).sqrt();
+                for j in 0..head_dim { 
+                    head_data[j] = f16::from_f32(head_data[j].to_f32() * inv * head_w[j].to_f32()); 
+                }
+            });
         }
         if let Some(ref kw) = self.k_norm { 
             let kw_cow = kw.get_slice::<f16>();
-            k = native_rms_norm_f16(&k, kw_cow.as_ref(), config.rms_norm_eps as f32, head_dim); 
+            // [FIX] Correct per-head normalization for keys
+            k.par_chunks_exact_mut(head_dim).enumerate().for_each(|(h_idx, head_data)| {
+                let w_off = (h_idx * head_dim) % kw_cow.len();
+                let head_w = &kw_cow[w_off .. w_off + head_dim];
+                
+                let mut v = 0.0f32; for &x in head_data.iter() { let val = x.to_f32(); v += val * val; }
+                let inv = 1.0 / (v / head_dim as f32 + config.rms_norm_eps as f32).sqrt();
+                for j in 0..head_dim { 
+                    head_data[j] = f16::from_f32(head_data[j].to_f32() * inv * head_w[j].to_f32()); 
+                }
+            });
         }
 
         native_apply_rope_f16_with_offset(&mut q, &mut k, q_len, seqlen_offset, n_h, head_dim, config.rope_theta);
@@ -414,21 +434,22 @@ unsafe impl Send for NativeQwen3TextModel {}
 unsafe impl Sync for NativeQwen3TextModel {}
 
 impl NativeQwen3TextModel {
-    pub fn forward(&self, input_ids: &[u32], seqlen_offset: usize) -> Vec<f16> {
+    pub fn forward(&self, input_ids: &[u32], pixel_values: Option<&[f16]>, grid_thw: Option<&[u32; 3]>, seqlen_offset: usize) -> Vec<f16> {
         let hid = self.config.hidden_size;
-        let x = match &self.embed_tokens.variant {
+        let mut cur_x = match &self.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => {
                 let w_cow = weight.get_slice::<f16>();
                 native_embedding_lookup_f16(input_ids, w_cow.as_ref(), hid)
             },
             LinearVariant::BitSerial { weight_packed, .. } => {
-                // If quantized embedding is used, we still need a lookup. 
-                // For now, most embeddings are Standard f16.
                 let w_cow = weight_packed.get_slice::<f16>();
                 native_embedding_lookup_f16(input_ids, w_cow.as_ref(), hid)
             }
         };
-        let mut cur_x = x;
+
+        // [VISION-FUSION] Replace image tokens with vision features if applicable (This part belongs here if we want deep stack support)
+        // For simplicity, we moved fusion to NativeQwen3VLModel::forward.
+
         for (i, layer) in self.layers.iter().enumerate() { cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i); }
         let norm_cow = self.norm.get_slice::<f16>();
         native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid)

@@ -198,7 +198,7 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>) -> Result<String> {
-        let mut seqlen_offset = self.get_kv_len();
+        let seqlen_offset = self.get_kv_len();
         println!("[GENERATE] Initial KV Offset: {}", seqlen_offset);
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
@@ -206,10 +206,43 @@ impl Qwen3VLGenerateModel {
         let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
-        // [FIX] In 'Zero Prefill' / 'Relay' mode, we ALWAYS append the new prompt 
-        // to the existing baked KV cache. seqlen_offset represents the baked tokens.
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
+
+        if seqlen_offset > 0 {
+            // [DIAGNOSTIC] Print first 20 tokens of the new prompt to see the structure
+            let head_len = all_ids.len().min(20);
+            let head_text = self.tokenizer.token_decode(all_ids[..head_len].to_vec()).unwrap_or_default();
+            println!("[ZERO-PREFILL-DIAG] New Prompt (Head): '{}'", head_text.replace("\n", "\\n"));
+
+            if all_ids.len() >= seqlen_offset {
+                // CASE A: Standard Full-Text Match
+                println!("[ZERO-PREFILL-VERIFY] Standard Match Mode. Skipping {} tokens.", seqlen_offset);
+                local_pos = seqlen_offset;
+            } else {
+                // CASE B: Modular Extension (Prompt is shorter than cache)
+                println!("[ZERO-PREFILL-MODULAR] Modular Mode. Cache ({}) > Prompt ({}).", seqlen_offset, all_ids.len());
+                
+                let mut found_split = 0;
+                for i in 0..all_ids.len().min(20) {
+                    if all_ids[i] == 151645 { // <|im_end|>
+                        found_split = i + 1;
+                        if found_split < all_ids.len() && all_ids[found_split] == 198 { // \n
+                            found_split += 1;
+                        }
+                        break;
+                    }
+                }
+
+                if found_split > 0 {
+                    println!("[ZERO-PREFILL-MODULAR] Detected header block ({} tokens). Appending from offset {}.", found_split, seqlen_offset);
+                    local_pos = found_split;
+                } else {
+                    println!("[ZERO-PREFILL-MODULAR] No clear header found. Appending entire prompt to cache.");
+                    local_pos = 0;
+                }
+            }
+        }
 
         let prefill_chunk_size = 512;
         while local_pos < all_ids.len() {
@@ -224,8 +257,7 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
             }
 
-            // Append to GPU KV cache at the correct offset
-            self.qwen3_vl.forward(chunk, None, None, current_kv_offset);
+            self.qwen3_vl.forward(chunk, input.pixel_values.as_deref(), input.image_grid_thw.as_ref(), current_kv_offset);
             
             let processed = chunk.len();
             local_pos += processed;
@@ -235,6 +267,8 @@ impl Qwen3VLGenerateModel {
         let mut generated_text = String::new();
         let max_new_tokens = mes.max_tokens.unwrap_or(1024) as usize;
         let mut current_all_ids = all_ids.clone();
+
+        println!("[GENERATE] Starting token generation loop...");
 
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag {
@@ -252,28 +286,48 @@ impl Qwen3VLGenerateModel {
                 vec![*current_all_ids.last().unwrap()] 
             };
 
-            let (pixels, grid) = if i == 0 && current_kv_offset == 0 { 
+            let (pixels, grid) = if i == 0 && seqlen_offset == 0 { 
                 (input.pixel_values.as_deref(), input.image_grid_thw.as_ref()) 
             } else { 
                 (None, None) 
             };
 
             let logits = self.qwen3_vl.forward(&input_ids, pixels, grid, current_kv_offset);
+            
+            // [DIST-AUDIT] Logit Confidence check at Step 0
+            if i == 0 {
+                let mut indexed_logits: Vec<(usize, f32)> = logits.iter().enumerate().map(|(idx, &val)| (idx, val.to_f32())).collect();
+                indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                println!("[DIST-AUDIT] Top 5 logits at first step:");
+                for j in 0..5 {
+                    if j >= indexed_logits.len() { break; }
+                    let (id, val) = indexed_logits[j];
+                    let text = self.tokenizer.token_decode(vec![id as u32]).unwrap_or_default();
+                    println!("  #{} -> ID: {}, val: {:.4}, text: '{}'", j+1, id, val, text.replace("\n", "\\n"));
+                }
+            }
+
             let next_id = self.sample_greedy(&logits);
             
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+            // [DIAGNOSTIC] 실시간 생성 로그
+            if i < 10 || i % 20 == 0 {
+                let decoded = self.tokenizer.token_decode(vec![next_id]).unwrap_or_default();
+                println!("[GENERATE-STEP] step: {}, id: {}, text: '{}'", i, next_id, decoded.replace("\n", "\\n"));
+            }
+
+            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { 
+                println!("[GENERATE] EOS detected at step {}.", i);
+                break; 
+            }
             
             current_all_ids.push(next_id);
             let new_word = self.tokenizer.token_decode(vec![next_id])?;
-            print!("{}", new_word); 
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
             generated_text.push_str(&new_word);
             
             current_kv_offset += input_ids.len();
         }
 
-        println!("\n[INFERENCE-RESULT] {}", generated_text);
+        println!("[GENERATE] Complete. Total generated length: {} chars.", generated_text.len());
         Ok(generated_text)
     }
 
@@ -285,83 +339,95 @@ impl Qwen3VLGenerateModel {
     }
 
     /// [OPTIMIZED] Context-aware splitting for large documents - Encode once, Bake in chunks
-    pub fn bake_text_in_parts(&mut self, text: String, task_id: &str, suffix: &str, address_hash: Option<&str>, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
-        println!("[BAKE-STREAM] Starting optimized baking for {} (Target: 512 tokens per chunk)", task_id);
+    pub fn bake_text_in_parts(&mut self, text: String, task_id: &str, suffix: &str, address_hash: Option<&str>, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
+        println!("[BAKE-STREAM] Starting optimized baking for {} (Global Pos: {}, Target: 512 tokens per chunk)", task_id, initial_offset);
         
         // 1. Encode the entire text ONCE
         let all_ids = self.tokenizer.text_encode_vec(text, false)?;
         
-        let mut master_k: Vec<u32> = Vec::new();
-        let mut master_v: Vec<f16> = Vec::new();
+        self.clear_kv_cache(); 
 
-        // 2. Process in 512-token chunks
+        // 2. Process in 512-token chunks INCREMENTALLY
+        let mut current_offset = initial_offset;
         for (chunk_idx, chunk) in all_ids.chunks(512).enumerate() {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
             }
 
-            println!("[BAKE-STREAM] Processing chunk {}/{}", chunk_idx + 1, (all_ids.len() + 511) / 512);
+            println!("[BAKE-STREAM] Processing chunk {}/{} (Offset: {})", chunk_idx + 1, (all_ids.len() + 511) / 512, current_offset);
 
-            // Forward Pass (Always from offset 0 because we clear cache every time)
-            self.qwen3_vl.forward(chunk, None, None, 0);
-
-            // Pull KV from GPU to RAM
-            let ModelVariant::Native(m) = &self.qwen3_vl;
-            let h_d = m.text_model.config.head_dim;
-            let n_kv = m.text_model.config.num_key_value_heads;
-            if let Some((k, v)) = m.text_model.layers[0].get_kv_data(h_d, n_kv) {
-                master_k.extend(k);
-                master_v.extend(v);
-            }
-
-            // Clear VRAM for next chunk
-            self.clear_kv_cache();
+            // Forward Pass with proper incremental offset
+            self.qwen3_vl.forward(chunk, None, None, current_offset);
+            current_offset += chunk.len();
         }
 
-        // 3. Final Save
-        if !master_k.is_empty() {
+        // 3. Final Pull: Extract the COMPLETE KV state from Layer 0 once
+        let ModelVariant::Native(m) = &self.qwen3_vl;
+        let h_d = m.text_model.config.head_dim;
+        let n_kv = m.text_model.config.num_key_value_heads;
+        if let Some((k, v)) = m.text_model.layers[0].get_kv_data(h_d, n_kv) {
             let final_path = crate::utils::paths::get_kv_dir(None, address_hash).join(format!("{}_{}.safetensors", task_id, suffix));
-            self.save_raw_kv_to_disk(&final_path, &master_k, &master_v)?;
-            println!("[BAKE-STREAM] SUCCESS: Saved giant KV context ({} tokens) to {:?}", master_v.len() / (8 * 128), final_path);
+            self.save_raw_kv_to_disk(&final_path, &k, &v)?;
+            println!("[BAKE-STREAM] SUCCESS: Saved context ({} tokens) to {:?}", k.len() * 32 / (n_kv * h_d), final_path);
         }
 
+        self.clear_kv_cache(); 
         Ok(())
     }
 
     /// [OPTIMIZED] Context-aware splitting - Save to specific path
-    pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, _suffix: &str, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
-        println!("[BAKE-PATH] Baking to {:?}", final_path);
+    pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, _suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
+        println!("[BAKE-PATH] Baking incrementally to {:?} (Starting Offset: {})", final_path, initial_offset);
         
         let all_ids = self.tokenizer.text_encode_vec(text, false)?;
         let total_tokens = all_ids.len();
         
-        let mut master_k: Vec<u32> = Vec::new();
-        let mut master_v: Vec<f16> = Vec::new();
+        self.clear_kv_cache();
 
+        let mut current_offset = initial_offset;
         for chunk in all_ids.chunks(512) {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
             }
             
-            self.qwen3_vl.forward(chunk, None, None, 0);
-            
-            let ModelVariant::Native(m) = &self.qwen3_vl;
-            if let Some((k, v)) = m.text_model.layers[0].get_kv_data(m.text_model.config.head_dim, m.text_model.config.num_key_value_heads) {
-                master_k.extend(k); master_v.extend(v);
-            }
-            self.clear_kv_cache();
+            self.qwen3_vl.forward(chunk, None, None, current_offset);
+            current_offset += chunk.len();
         }
 
-        if !master_k.is_empty() {
-            self.save_raw_kv_to_disk(final_path, &master_k, &master_v)?;
-            println!("[BAKE-PATH] SUCCESS: Saved context to {:?}", final_path);
+        let ModelVariant::Native(m) = &self.qwen3_vl;
+        if let Some((k, v)) = m.text_model.layers[0].get_kv_data(m.text_model.config.head_dim, m.text_model.config.num_key_value_heads) {
+            self.save_raw_kv_to_disk(final_path, &k, &v)?;
+            println!("[BAKE-PATH] SUCCESS: Saved context ({} tokens) to {:?}", k.len() * 32 / (m.text_model.config.num_key_value_heads * m.text_model.config.head_dim), final_path);
         }
+        
+        self.clear_kv_cache();
         Ok(())
+    }
+
+    pub fn get_kv_file_token_count(&self, path: &Path) -> Result<usize> {
+        let ModelVariant::Native(m) = &self.qwen3_vl;
+        let target_dim = m.text_model.config.head_dim * m.text_model.config.num_key_value_heads;
+        
+        let file = std::fs::read(path)?;
+        let st = safetensors::SafeTensors::deserialize(&file)?;
+        if let Ok(kt) = st.tensor("layer.0.k") {
+            let k_len_u32 = kt.data().len() / 4;
+            Ok((k_len_u32 * 32) / target_dim)
+        } else {
+            Err(anyhow!("Invalid KV file: layer.0.k not found"))
+        }
     }
 
     pub fn save_raw_kv_to_disk(&self, path: &Path, k: &[u32], v: &[f16]) -> Result<()> {
         let mut tensors = std::collections::HashMap::new();
         
+        // [DIST-AUDIT] Calculate stats for V-cache (Values are more sensitive to distribution)
+        let v_f32: Vec<f32> = v.iter().map(|&x| x.to_f32()).collect();
+        let sum: f32 = v_f32.iter().sum();
+        let mean = sum / v_f32.len() as f32;
+        let max_abs = v_f32.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        println!("[DIST-AUDIT-BAKE] V-Cache Stats -> Mean: {:.6}, MaxAbs: {:.6}", mean, max_abs);
+
         let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
         tensors.insert("layer.0.k".to_string(), safetensors::tensor::TensorView::new(safetensors::Dtype::U32, vec![k.len()], k_u8)?);
         
@@ -471,7 +537,15 @@ impl Qwen3VLGenerateModel {
                     m.text_model.force_free_kv_cache();
                     
                     let total_tokens = (combined_k.len() * 32) / target_dim;
-                    println!("[KV-STITCH] SUCCESS: Loaded {} tokens. Ready for Zero-Prefill inference.", total_tokens);
+                    
+                    // [DIST-AUDIT] Restored Stats check
+                    let v_f32: Vec<f32> = combined_v.iter().map(|&x| x.to_f32()).collect();
+                    let sum: f32 = v_f32.iter().sum();
+                    let mean = sum / v_f32.len() as f32;
+                    let max_abs = v_f32.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                    println!("[DIST-AUDIT-LOAD] Restored V-Cache Stats -> Mean: {:.6}, MaxAbs: {:.6}", mean, max_abs);
+
+                    println!("[KV-STITCH-VERIFY] Load Complete: {} tokens (Dim: {})", total_tokens, target_dim);
                     
                     if total_tokens > 0 {
                         m.text_model.batch_upload_stitched_cache(combined_k, combined_v);

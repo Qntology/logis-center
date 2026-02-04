@@ -343,9 +343,8 @@ async fn process_text_pipeline(
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
         let type_prompt = parsing::page_type_prompt();
-        let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", type_prompt);
         // Reuse pre-baked PUG from address folder
-        let res = model.run_modular_inference(address_hash, &task.id, "class", &task_question, "Classify this page.", Some(cancellation_token.clone())).await?;
+        let res = model.run_modular_inference(address_hash, &task.id, "class", &type_prompt, "Classify this page.", Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_a_res")?;
         
         let type_info = parsing::parse_json_from_llm(&res);
@@ -361,9 +360,8 @@ async fn process_text_pipeline(
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", selector_prompt);
         // Reuse pre-baked PUG
-        let res = model.run_modular_inference(address_hash, &task.id, "sel", &task_question, "Identify selectors.", Some(cancellation_token.clone())).await?;
+        let res = model.run_modular_inference(address_hash, &task.id, "sel", &selector_prompt, "Identify selectors.", Some(cancellation_token.clone())).await?;
         data_manager.offload(&res, "step_b_res")?;
         selector_info = parsing::parse_json_from_llm(&res);
     }
@@ -410,9 +408,8 @@ async fn process_text_pipeline(
 
         if !content_pug.trim().is_empty() {
              let extraction_instruction = parsing::item2json(&page_type, &task.data_json, "english");
-             let task_question = format!("[TASK] {}\n\n[ACTION] RETURN JSON ONLY", extraction_instruction);
              // Reuse pre-baked PUG
-             let res = model.run_modular_inference(address_hash, &task.id, "ext", &task_question, "Extract JSON data.", Some(cancellation_token.clone())).await?;
+             let res = model.run_modular_inference(address_hash, &task.id, "ext", &extraction_instruction, "Extract JSON data.", Some(cancellation_token.clone())).await?;
              data_manager.offload(&res, "step_c_res")?;
              extracted_data = parsing::parse_json_from_llm(&res);
         }

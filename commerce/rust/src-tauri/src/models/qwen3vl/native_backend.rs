@@ -356,9 +356,15 @@ pub fn native_apply_rope_f16_with_offset(q: &mut [f16], k: &mut [f16], _ql: usiz
         data.par_chunks_exact_mut(h_d).enumerate().for_each(|(i, h)| {
             let p = (off + i) as f32;
             for d in 0..h_d_2 {
-                let (sn, cs) = (p / th.powf(2.0 * d as f32 / h_d as f32)).sin_cos();
-                let (v0, v1) = (h[d].to_f32(), h[d + h_d_2].to_f32());
-                h[d] = f16::from_f32(v0 * cs - v1 * sn); h[d+h_d_2] = f16::from_f32(v0 * sn + v1 * cs);
+                let exponent = (2.0 * d as f32) / (h_d as f32);
+                let freq = 1.0 / th.powf(exponent);
+                let (sn, cs) = (p * freq).sin_cos();
+                
+                // Qwen2/3 Standard Rotate-Half
+                let v0 = h[d].to_f32();
+                let v1 = h[d + h_d_2].to_f32();
+                h[d] = f16::from_f32(v0 * cs - v1 * sn);
+                h[d + h_d_2] = f16::from_f32(v0 * sn + v1 * cs);
             }
         });
     };

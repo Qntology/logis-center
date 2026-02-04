@@ -309,7 +309,7 @@ impl LogisModel {
                 if let Some(gen) = gen_guard.as_mut() {
                     // Custom save path inside address-specific folder
                     let path = crate::utils::paths::get_kv_dir(None, Some(&ah)).join(format!("{}_pug_base.safetensors", tid));
-                    gen.bake_text_in_parts_to_path(text, &path, "pug_base", token_clone)?;
+                    gen.bake_text_in_parts_to_path(text, &path, "pug_base", 0, token_clone)?;
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
@@ -321,12 +321,14 @@ impl LogisModel {
     /// Step 2: Bake a specific prompt and run inference by stitching with PUG base
     pub async fn run_modular_inference(&self, address_hash: &str, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let _prompt_session = format!("{}_prompt_{}", task_id, prompt_name);
-        let _kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
         
         println!("[MODULAR-INF] Running inference for step: {} (Address: {})", prompt_name, address_hash);
 
+        // 0. Get offset from pug_base
+        let pug_base_path = crate::utils::paths::get_kv_dir(None, Some(address_hash)).join(format!("{}_pug_base.safetensors", task_id));
+
         // 1. Bake the specific system prompt (Quick 1-layer bake)
-        // [FIX] Wrap in ChatML template so the model knows it's a system instruction
+        // [FIX] Use EXACT same formatting as ChatML template would use
         let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
 
         self.ensure_generator_ext(ModelSize::Small, true, true).await?;
@@ -337,25 +339,29 @@ impl LogisModel {
             let tid = task_id.to_string();
             let p_name = prompt_name.to_string();
             let token_clone = cancel_token.clone();
+            let p_path = pug_base_path.clone();
+            
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
+                    let offset = if p_path.exists() { gen.get_kv_file_token_count(&p_path).unwrap_or(0) } else { 0 };
                     let path = crate::utils::paths::get_kv_dir(None, Some(&ah)).join(format!("{}_prompt_{}.safetensors", tid, p_name));
-                    gen.bake_text_in_parts_to_path(sp, &path, "baked", token_clone)?;
-                }
-                Ok::<(), anyhow::Error>(())
+                    gen.bake_text_in_parts_to_path(sp, &path, "baked", offset, token_clone)?;
+                    Ok::<(), anyhow::Error>(())
+                } else { Ok(()) }
             }).await??;
         }
         self.unload_generator().await;
 
         // 2. Load 2B Full Model and Stitch [PUG + PROMPT]
-        // [RESTORE] Use full layers for inference to ensure high quality and complete output
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true, Some(address_hash)).await?;
-        
-        // Load both PUG base and the specific prompt in ONE call to prevent overwriting
         self.load_stitched_kv(address_hash, task_id, &["pug_base", &format!("prompt_{}", prompt_name)]).await?;
 
         // 3. Final Chat
+        // [MODULAR-MATCH] Pass empty system prompt to 'chat'. 
+        // The KV cache already contains the PUG + SYSTEM_PROMPT.
+        // 'chat' will produce: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n...
+        // 'generate' will skip the empty system block and append the user message to the cache.
         self.chat("", user_input, cancel_token, Some(format!("{}_final", prompt_name))).await
     }
 
