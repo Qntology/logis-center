@@ -426,15 +426,13 @@ impl Qwen3VLGenerateModel {
                 }
 
                 if !combined_k.is_empty() {
-                    // [STABILITY-FIX] Inject only into first 4 layers instead of all 28
-                    // This prevents numerical divergence in deep layers while still providing context.
-                    let inject_limit = 4.min(m.text_model.layers.len());
-                    println!("[KV-STITCH] Replicating baked context across first {} layers.", inject_limit);
+                    // [CRITICAL-FIX] Clear any existing GPU cache to force a fresh start with new data.
+                    // This prevents using old 'current_len' (e.g., 200) from previous inference steps.
+                    m.text_model.force_free_kv_cache();
                     
-                    for i in 0..inject_limit {
-                        m.text_model.layers[i].set_kv_data(combined_k.clone(), combined_v.clone());
-                    }
-                    println!("[KV-STITCH] SUCCESS: Multi-layer context injection complete.");
+                    println!("[KV-STITCH] Injecting {} tokens into Layer 0.", combined_k.len() / (target_dim / 32));
+                    m.text_model.layers[0].set_kv_data(combined_k, combined_v);
+                    println!("[KV-STITCH] SUCCESS: Context injected. Next forward pass will upload to GPU.");
                 }
             }
         }

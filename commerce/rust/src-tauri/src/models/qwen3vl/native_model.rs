@@ -345,7 +345,7 @@ impl NativeLayer {
         if self.device_id >= 0 {
             let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             if let Some((_, _, current_len)) = *gpu_cache_guard {
-                return current_len;
+                if current_len > 0 { return current_len; }
             }
         }
 
