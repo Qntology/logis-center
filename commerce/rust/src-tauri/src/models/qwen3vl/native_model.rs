@@ -515,14 +515,49 @@ impl NativeVisionModel {
         for block in &mut self.blocks { block.move_to_gpu(device_id); }
         self.merger.move_to_gpu(device_id);
     }
+
+    pub fn forward(&self, pixel_values: &[f16], grid_thw: &[u32; 3]) -> Vec<f16> {
+        // [VISION-TRANSFORMER-PIPELINE]
+        // Hidden states: (patches, hidden_size)
+        // grid_thw: [T, H, W]
+        let patches = (grid_thw[1] * grid_thw[2]) as usize;
+        
+        // 1. Patch Embedding
+        let mut x = self.patch_embed.forward(pixel_values);
+        
+        // 2. Transformer Blocks
+        // Vision blocks usually don't use KV cache (full attention per image)
+        for block in &self.blocks {
+            // [STUB] Vision attention is full attention, no RoPE/Cache offset needed here usually
+            // Simplified: treat as a single sequence of patches
+            x = block.forward(&x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
+                hidden_size: self.patch_embed.out_features,
+                intermediate_size: block.gate_proj.out_features,
+                num_hidden_layers: 1,
+                num_attention_heads: 16, // Fixed for vision usually
+                num_key_value_heads: 16,
+                head_dim: self.patch_embed.out_features / 16,
+                rms_norm_eps: 1e-6,
+                rope_theta: 10000.0,
+                vocab_size: 0,
+                max_position_embeddings: 4096,
+                dtype: None,
+                rope_scaling: None,
+            }, 0, 0);
+        }
+        
+        // 3. Patch Merger
+        self.merger.forward(&x)
+    }
 }
 
 impl NativeQwen3VLModel {
-    pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool) -> Result<Self> {
+    pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>) -> Result<Self> {
         let st = SafeTensors::deserialize(&m_mmap)?; 
+        let st_sec = s_mmap.as_ref().map(|m| SafeTensors::deserialize(m)).transpose()?;
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         
-        let find_key = |target: &str| -> Option<String> {
+        let find_key_ext = |target: &str, primary: &SafeTensors, secondary: Option<&SafeTensors>| -> Option<(String, bool)> {
             let variations = vec![
                 target.to_string(),
                 target.replace("model.", "model.language_model."),
@@ -532,35 +567,57 @@ impl NativeQwen3VLModel {
                 format!("model.language_model.{}", target.replace("model.", "")),
                 format!("model.{}", target),
             ];
-            for v in variations {
-                if st.tensor(&v).is_ok() { return Some(v); }
-                if st.tensor(&format!("{}.packed", v)).is_ok() { return Some(v); }
+            
+            // 1. Try Primary
+            for v in variations.iter() {
+                if primary.tensor(v).is_ok() || primary.tensor(&format!("{}.packed", v)).is_ok() { return Some((v.clone(), true)); }
             }
-            // Exhaustive search for tied weights or renamed heads
-            for name in st.names() {
-                if name.contains(target) {
-                    return Some(name.replace(".packed", "").replace(".scales", "").replace(".shape", "").replace(".format", ""));
+            
+            // 2. Try Secondary (if baking)
+            if let Some(sec) = secondary {
+                for v in variations.iter() {
+                    if sec.tensor(v).is_ok() || sec.tensor(&format!("{}.packed", v)).is_ok() { return Some((v.clone(), false)); }
                 }
             }
+
+            // 3. Exhaustive search in Primary
+            for name in primary.names() {
+                if name.contains(target) {
+                    return Some((name.replace(".packed", "").replace(".scales", "").replace(".shape", "").replace(".format", ""), true));
+                }
+            }
+            
+            // 4. Exhaustive search in Secondary
+            if let Some(sec) = secondary {
+                for name in sec.names() {
+                    if name.contains(target) {
+                        return Some((name.replace(".packed", "").replace(".scales", "").replace(".shape", "").replace(".format", ""), false));
+                    }
+                }
+            }
+
             None
         };
 
         let get_l = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
-            let key = find_key(base).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
+            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
+            let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
+            let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
+
             let p_n = format!("{}.packed", key);
             let s_n = format!("{}.scales", key);
             
-            if st.tensor(&p_n).is_ok() {
-                let vp = st.tensor(&p_n)?; 
-                let vs = st.tensor(&s_n)?;
-                let op = unsafe { vp.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
-                let os = unsafe { vs.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
+            if current_st.tensor(&p_n).is_ok() {
+                let vp = current_st.tensor(&p_n)?; 
+                let vs = current_st.tensor(&s_n)?;
+                let op = unsafe { vp.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                let os = unsafe { vs.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                 
                 Ok(NativeLinear { 
                     in_features: in_f, out_features: out_f, 
                     variant: LinearVariant::BitSerial {
-                        weight_packed: NativeTensor::from_mmap(m_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
-                        scales: NativeTensor::from_mmap(m_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
+                        weight_packed: NativeTensor::from_mmap(current_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
+                        scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                         bias: None,
                     }, 
                     device_id: -1,
@@ -568,12 +625,12 @@ impl NativeQwen3VLModel {
                     scratch_o: std::sync::Mutex::new(None),
                 })
             } else {
-                let v = st.tensor(&key)?;
-                let o = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
+                let v = current_st.tensor(&key)?;
+                let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                 Ok(NativeLinear { 
                     in_features: in_f, out_features: out_f, 
                     variant: LinearVariant::Standard { 
-                        weight: NativeTensor::from_mmap(m_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
+                        weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
                         bias: None 
                     }, 
                     device_id: -1,
@@ -584,10 +641,13 @@ impl NativeQwen3VLModel {
         };
 
         let get_t = |name: &str| -> Result<NativeTensor> {
-            let key = find_key(name).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
-            let v = st.tensor(&key)?;
-            let off = unsafe { v.data().as_ptr().offset_from(m_mmap.as_ptr()) } as usize;
-            Ok(NativeTensor::from_mmap(m_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+            let (key, is_primary) = find_key_ext(name, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
+            let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
+            let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
+
+            let v = current_st.tensor(&key)?;
+            let off = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+            Ok(NativeTensor::from_mmap(current_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
         };
 
         println!("[LOAD] Initializing Native Engine (Baking: {})...", baking);
@@ -722,8 +782,44 @@ impl NativeQwen3VLModel {
             
         Ok(Self { config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm }, lm_head: head, visual })
     }
-    pub fn forward(&self, i_ids: &[u32], _p_v: Option<&[f16]>, _g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
-        let x = self.text_model.forward(i_ids, s_o); self.lm_head.forward(&x)
+    pub fn forward(&self, i_ids: &[u32], p_v: Option<&[f16]>, g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
+        let mut embeds = match &self.text_model.embed_tokens.variant {
+            LinearVariant::Standard { weight, .. } => {
+                let w_cow = weight.get_slice::<f16>();
+                native_embedding_lookup_f16(i_ids, w_cow.as_ref(), self.text_model.config.hidden_size)
+            },
+            _ => Vec::new(),
+        };
+
+        // [VISION-FUSION] Replace <|image_pad|> tokens with vision features
+        if let (Some(pv), Some(gt)) = (p_v, g_t) {
+            if let Some(ref visual) = self.visual {
+                let vision_features = visual.forward(pv, gt);
+                let img_token_id = 151655; // <|image_pad|>
+                let hid = self.text_model.config.hidden_size;
+                
+                let mut vision_idx = 0;
+                for (i, &id) in i_ids.iter().enumerate() {
+                    if id == img_token_id && vision_idx < (vision_features.len() / hid) {
+                        let target_slice = &mut embeds[i * hid .. (i + 1) * hid];
+                        let source_slice = &vision_features[vision_idx * hid .. (vision_idx + 1) * hid];
+                        target_slice.copy_from_slice(source_slice);
+                        vision_idx += 1;
+                    }
+                }
+                if vision_idx > 0 {
+                    println!("[VISION-FUSION] Injected {} vision patches into text stream.", vision_idx);
+                }
+            }
+        }
+
+        let mut cur_x = embeds;
+        for (i, layer) in self.text_model.layers.iter().enumerate() { 
+            cur_x = layer.forward(&cur_x, &self.text_model.config, s_o, i); 
+        }
+        let norm_cow = self.text_model.norm.get_slice::<f16>();
+        let norm_x = native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.text_model.config.rms_norm_eps as f32, self.text_model.config.hidden_size);
+        self.lm_head.forward(&norm_x)
     }
         pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
         pub fn force_free_kv_cache(&self) { self.text_model.force_free_kv_cache(); }

@@ -87,7 +87,7 @@ impl Qwen3VLGenerateModel {
         };
 
         // OVERRIDE text_config with the actual 0.6B parameters
-        let correct_text_config = if text_json.get("text_config").is_some() {
+        let mut correct_text_config = if text_json.get("text_config").is_some() {
              serde_json::from_value(text_json.get("text_config").unwrap().clone())?
         } else {
              // Flat config (0.6B style)
@@ -106,6 +106,19 @@ impl Qwen3VLGenerateModel {
                 rope_scaling: None,
             }
         };
+
+        // [CRITICAL] Inherit RoPE settings from the 2B model if we are in baking mode (cross-model relay)
+        if baking_only && vision_json.get("text_config").is_some() {
+            let v_text_cfg = vision_json.get("text_config").unwrap();
+            if let Some(v_theta) = v_text_cfg.get("rope_theta").and_then(|v| v.as_f64()) {
+                println!("[LOAD] Baking Mode: Inheriting rope_theta ({}) from 2B config", v_theta);
+                correct_text_config.rope_theta = v_theta as f32;
+            }
+            if let Some(v_scaling) = v_text_cfg.get("rope_scaling") {
+                println!("[LOAD] Baking Mode: Inheriting rope_scaling from 2B config");
+                correct_text_config.rope_scaling = serde_json::from_value(v_scaling.clone()).ok();
+            }
+        }
         
         vl_config.text_config = Some(correct_text_config);
         
@@ -136,7 +149,18 @@ impl Qwen3VLGenerateModel {
             None
         };
 
-        let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only)?;
+        // [UPSCALE-LOADER] If we are baking with a small model for a large model context,
+        // we might need architectural tensors (like q_norm/k_norm) from the large model.
+        let secondary_mmap = if baking_only && tokenizer_path.is_some() {
+            let large_path = Path::new(tokenizer_path.unwrap()).join("model-BITSERIAL_ALL.safetensors");
+            if large_path.exists() {
+                println!("[LOAD] Baking Mode: Loading secondary tensors from {:?}", large_path.file_name());
+                let large_file = std::fs::File::open(large_path)?;
+                Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&large_file)? }))
+            } else { None }
+        } else { None };
+
+        let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only, secondary_mmap)?;
         let mut qwen3_vl_native = Arc::new(native_model);
 
         // [CRITICAL] Move to GPU immediately while reference count is 1
