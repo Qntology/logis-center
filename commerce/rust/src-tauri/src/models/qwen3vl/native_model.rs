@@ -180,14 +180,16 @@ impl NativeLayer {
         let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
         let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
         
-        // [RAYON-PARALLEL] Correctly nested join for 3 operations
-        let (mut q, (mut k, v)) = rayon::join(
-            || self.q_proj.forward(&x_norm),
-            || rayon::join(
-                || self.k_proj.forward(&x_norm),
-                || self.v_proj.forward(&x_norm)
-            )
-        );
+        // [RAYON-STRATEGY] Only use parallel join if processing multiple tokens (prefill)
+        let (mut q, mut k, v) = if q_len > 1 {
+            let (q_p, (k_p, v_p)) = rayon::join(
+                || self.q_proj.forward(&x_norm),
+                || rayon::join(|| self.k_proj.forward(&x_norm), || self.v_proj.forward(&x_norm))
+            );
+            (q_p, k_p, v_p)
+        } else {
+            (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
+        };
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
@@ -205,7 +207,6 @@ impl NativeLayer {
             use cudarc::driver::sys::*;
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, mut current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
-                println!("[BACKEND] Attention -> GPU (Allocating VRAM KV Cache)");
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
                     let cuda_lib = lib();
@@ -214,12 +215,10 @@ impl NativeLayer {
                     cuda_lib.cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
                 }
                 
-                // [CRITICAL-FIX] Check if there's stitched data in CPU cache to upload
                 let mut initial_len = 0;
                 let mut cpu_cache = self.kv_cache.lock().unwrap();
                 if let Some((ck, cv)) = cpu_cache.take() {
                     initial_len = (ck.len() * 32) / (n_kv * head_dim);
-                    println!("[GPU-UPLOAD] Moving stitched KV cache to VRAM ({} tokens)...", initial_len);
                     let cv_f32: Vec<f32> = cv.par_iter().map(|val: &f16| val.to_f32()).collect();
                     unsafe {
                         let cuda_lib = lib();
@@ -231,7 +230,7 @@ impl NativeLayer {
             };
 
             let k_packed = pack_f16_to_bits(&k);
-            let v_f32: Vec<f32> = v.par_iter().map(|val: &f16| val.to_f32()).collect();
+            let v_f32: Vec<f32> = v.iter().map(|val: &f16| val.to_f32()).collect();
             unsafe {
                 let cuda_lib = lib();
                 let k_offset = current_len * n_kv * (head_dim/32) * 4;
@@ -249,11 +248,11 @@ impl NativeLayer {
             let post_ln_weight_cow = self.post_attention_layernorm.get_slice::<f16>();
             let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
             
-            // [RAYON-PARALLEL] Run MLP projections in parallel
-            let (mut gate, up) = rayon::join(
-                || self.gate_proj.forward(&x_n_m),
-                || self.up_proj.forward(&x_n_m)
-            );
+            let (mut gate, up) = if q_len > 1 {
+                rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
+            } else {
+                (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
+            };
             
             native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
             let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }

@@ -426,14 +426,15 @@ impl Qwen3VLGenerateModel {
                 }
 
                 if !combined_k.is_empty() {
-                    // [STRICT-NO-PREFILL] Inject the same context into EVERY layer of the 2B model
-                    let num_layers = m.text_model.layers.len();
-                    println!("[KV-STITCH] Replicating baked context across ALL {} layers to skip Prefill.", num_layers);
+                    // [STABILITY-FIX] Inject only into first 4 layers instead of all 28
+                    // This prevents numerical divergence in deep layers while still providing context.
+                    let inject_limit = 4.min(m.text_model.layers.len());
+                    println!("[KV-STITCH] Replicating baked context across first {} layers.", inject_limit);
                     
-                    for i in 0..num_layers {
+                    for i in 0..inject_limit {
                         m.text_model.layers[i].set_kv_data(combined_k.clone(), combined_v.clone());
                     }
-                    println!("[KV-STITCH] SUCCESS: Prefill-skip enabled for 2B Full Model.");
+                    println!("[KV-STITCH] SUCCESS: Multi-layer context injection complete.");
                 }
             }
         }
