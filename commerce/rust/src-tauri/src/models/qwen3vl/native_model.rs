@@ -5,6 +5,7 @@ use crate::models::qwen3vl::native_backend::*;
 use half::f16;
 use safetensors::SafeTensors;
 use anyhow::{Result, anyhow};
+use rayon::prelude::*;
 
 pub enum LinearVariant {
     Standard { weight: NativeTensor, bias: Option<NativeTensor> },
@@ -121,9 +122,14 @@ impl NativeLayer {
         let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
         let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
         
-        let mut q = self.q_proj.forward(&x_norm);
-        let mut k = self.k_proj.forward(&x_norm);
-        let v = self.v_proj.forward(&x_norm);
+        // [RAYON-PARALLEL] Correctly nested join for 3 operations
+        let (mut q, (mut k, v)) = rayon::join(
+            || self.q_proj.forward(&x_norm),
+            || rayon::join(
+                || self.k_proj.forward(&x_norm),
+                || self.v_proj.forward(&x_norm)
+            )
+        );
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
@@ -140,20 +146,33 @@ impl NativeLayer {
         if self.device_id >= 0 {
             use cudarc::driver::sys::*;
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
-            let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
+            let (k_ptr, v_ptr, mut current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 println!("[BACKEND] Attention -> GPU (Allocating VRAM KV Cache)");
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
                     let cuda_lib = lib();
-                    // Reduce pre-allocation to 8192 tokens to save VRAM on smaller GPUs (4GB)
                     cuda_lib.cuMemAlloc_v2(&mut kp, 8192 * n_kv * (head_dim/32) * 4); 
                     cuda_lib.cuMemAlloc_v2(&mut vp, 8192 * n_kv * head_dim * 4); 
                 }
-                (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
+                
+                // [CRITICAL-FIX] Check if there's stitched data in CPU cache to upload
+                let mut initial_len = 0;
+                let mut cpu_cache = self.kv_cache.lock().unwrap();
+                if let Some((ck, cv)) = cpu_cache.take() {
+                    initial_len = (ck.len() * 32) / (n_kv * head_dim);
+                    println!("[GPU-UPLOAD] Moving stitched KV cache to VRAM ({} tokens)...", initial_len);
+                    let cv_f32: Vec<f32> = cv.par_iter().map(|val: &f16| val.to_f32()).collect();
+                    unsafe {
+                        let cuda_lib = lib();
+                        let _ = cuda_lib.cuMemcpyHtoD_v2(kp as CUdeviceptr, ck.as_ptr() as *const _, ck.len() * 4);
+                        let _ = cuda_lib.cuMemcpyHtoD_v2(vp as CUdeviceptr, cv_f32.as_ptr() as *const _, cv_f32.len() * 4);
+                    }
+                }
+                (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), initial_len)
             };
 
             let k_packed = pack_f16_to_bits(&k);
-            let v_f32: Vec<f32> = v.iter().map(|val| val.to_f32()).collect();
+            let v_f32: Vec<f32> = v.par_iter().map(|val: &f16| val.to_f32()).collect();
             unsafe {
                 let cuda_lib = lib();
                 let k_offset = current_len * n_kv * (head_dim/32) * 4;
@@ -170,7 +189,13 @@ impl NativeLayer {
             let r_mlp = x_at.clone();
             let post_ln_weight_cow = self.post_attention_layernorm.get_slice::<f16>();
             let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
-            let mut gate = self.gate_proj.forward(&x_n_m); let up = self.up_proj.forward(&x_n_m);
+            
+            // [RAYON-PARALLEL] Run MLP projections in parallel
+            let (mut gate, up) = rayon::join(
+                || self.gate_proj.forward(&x_n_m),
+                || self.up_proj.forward(&x_n_m)
+            );
+            
             native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
             let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
             return x_m;
@@ -235,6 +260,7 @@ impl NativeLayer {
             use cudarc::driver::sys::lib;
             let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             if let Some((k_ptr, v_ptr, current_len)) = *gpu_cache_guard {
+                if current_len == 0 { return None; }
                 let k_size = current_len * n_kv * (head_dim / 32);
                 let v_size = current_len * n_kv * head_dim;
                 
@@ -254,6 +280,23 @@ impl NativeLayer {
 
         let cache = self.kv_cache.lock().unwrap();
         cache.clone()
+    }
+
+    pub fn get_kv_len(&self, head_dim: usize, n_kv: usize) -> usize {
+        #[cfg(feature = "cuda")]
+        if self.device_id >= 0 {
+            let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
+            if let Some((_, _, current_len)) = *gpu_cache_guard {
+                return current_len;
+            }
+        }
+
+        let cache = self.kv_cache.lock().unwrap();
+        if let Some((k, _)) = cache.as_ref() {
+            (k.len() * 32) / (n_kv * head_dim)
+        } else {
+            0
+        }
     }
 
     pub fn set_kv_data(&self, k: Vec<u32>, v: Vec<f16>) {
@@ -302,6 +345,12 @@ impl NativeQwen3TextModel {
 
     pub fn force_free_kv_cache(&self) {
         for layer in &self.layers { layer.force_free_kv_cache(); }
+    }
+
+    pub fn get_kv_len(&self) -> usize {
+        let h_d = self.config.head_dim;
+        let n_kv = self.config.num_key_value_heads;
+        self.layers[0].get_kv_len(h_d, n_kv)
     }
 
     pub fn get_all_kv(&self) -> Vec<(Vec<u32>, Vec<f16>)> {

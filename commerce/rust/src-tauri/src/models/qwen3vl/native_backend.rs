@@ -104,8 +104,8 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
         let lib = lib();
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         
-        // [TODO] Use a persistent scratch buffer for Q and O to avoid Alloc/Free
-        let q_f32: Vec<f32> = q.iter().map(|v| v.to_f32()).collect();
+        // Parallel conversion f16 -> f32
+        let q_f32: Vec<f32> = q.par_iter().map(|v| v.to_f32()).collect();
         lib.cuMemAlloc_v2(&mut d_q, q.len() * 4); 
         lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
         
@@ -119,7 +119,8 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
         lib.cuMemFree_v2(d_q); 
         lib.cuMemFree_v2(d_o);
         
-        o_f.into_iter().map(f16::from_f32).collect()
+        // Parallel conversion f32 -> f16
+        o_f.into_par_iter().map(f16::from_f32).collect()
     }
 }
 
@@ -130,8 +131,8 @@ pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: u
         let mut d_i: CUdeviceptr = 0; 
         let mut d_o: CUdeviceptr = 0;
         
-        // Input: Still need to convert and transfer (unless we pre-pack inputs)
-        let i_f32: Vec<f32> = i.iter().map(|v| v.to_f32()).collect();
+        // Parallel conversion f16 -> f32
+        let i_f32: Vec<f32> = i.par_iter().map(|v| v.to_f32()).collect();
         lib.cuMemAlloc_v2(&mut d_i, m * k * 4); 
         lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
         
@@ -149,7 +150,8 @@ pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: u
         lib.cuMemFree_v2(d_i); 
         lib.cuMemFree_v2(d_o);
         
-        o_f.into_iter().map(f16::from_f32).collect()
+        // Parallel conversion f32 -> f16
+        o_f.into_par_iter().map(f16::from_f32).collect()
     }
 }
 
