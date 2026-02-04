@@ -145,8 +145,9 @@ impl NativeLayer {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
                     let cuda_lib = lib();
-                    cuda_lib.cuMemAlloc_v2(&mut kp, 32768 * n_kv * (head_dim/32) * 4); 
-                    cuda_lib.cuMemAlloc_v2(&mut vp, 32768 * n_kv * head_dim * 4); 
+                    // Reduce pre-allocation to 8192 tokens to save VRAM on smaller GPUs (4GB)
+                    cuda_lib.cuMemAlloc_v2(&mut kp, 8192 * n_kv * (head_dim/32) * 4); 
+                    cuda_lib.cuMemAlloc_v2(&mut vp, 8192 * n_kv * head_dim * 4); 
                 }
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
