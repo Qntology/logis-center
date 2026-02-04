@@ -12,7 +12,7 @@ use cudarc::driver::sys::*;
 #[cfg(feature = "cuda")]
 extern "C" {
     fn bit_serial_matmul_cuda_direct(d_i: *const f32, d_w: *const u32, d_s: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, dev: i32);
-    fn bit_serial_attn_cuda_direct(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, h_d: i32, t_s: i32, scale: f32, dev: i32);
+    fn bit_serial_attn_cuda_direct(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +109,7 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
     unsafe {
         let lib = lib();
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
+        let q_len = q.len() / (n_h * h_d);
         
         // Parallel conversion f16 -> f32
         let q_f32: Vec<f32> = q.par_iter().map(|v| v.to_f32()).collect();
@@ -117,7 +118,7 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
         
         lib.cuMemAlloc_v2(&mut d_o, q.len() * 4);
         
-        bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32);
+        bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, q_len as i32);
         
         let mut o_f = vec![0.0f32; q.len()]; 
         lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);

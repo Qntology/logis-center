@@ -210,14 +210,13 @@ impl NativeLayer {
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, mut current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
+                let max_tokens = 131072; // Consistent with LogisModel limit
                 unsafe { 
                     let cuda_lib = lib();
-                    lib().cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
-                    lib().cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
+                    lib().cuMemAlloc_v2(&mut kp, max_tokens * n_kv * (head_dim/32) * 4); 
+                    lib().cuMemAlloc_v2(&mut vp, max_tokens * n_kv * head_dim * 4); 
                 }
                 
-                // Note: Stitched cache is now handled by batch_upload_stitched_cache
-                // so we don't need the individual 'cpu_cache.take()' upload here.
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
 
@@ -371,9 +370,9 @@ impl NativeLayer {
             let lib = lib();
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            // Allocate full buffer (16k)
-            lib.cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
-            lib.cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
+            // Allocate full buffer (128k)
+            lib.cuMemAlloc_v2(&mut kp, 131072 * n_kv * (head_dim/32) * 4); 
+            lib.cuMemAlloc_v2(&mut vp, 131072 * n_kv * head_dim * 4); 
             
             // Copy data
             lib.cuMemcpyHtoD_v2(kp, k_data.as_ptr() as *const _, k_data.len() * 4);
@@ -392,9 +391,9 @@ impl NativeLayer {
             let lib = lib();
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            // Allocate full buffer (16k)
-            lib.cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
-            lib.cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
+            // Allocate full buffer (128k)
+            lib.cuMemAlloc_v2(&mut kp, 131072 * n_kv * (head_dim/32) * 4); 
+            lib.cuMemAlloc_v2(&mut vp, 131072 * n_kv * head_dim * 4); 
             
             // Copy data via DtoD (Device to Device)
             let k_size = tokens * n_kv * (head_dim / 32) * 4;

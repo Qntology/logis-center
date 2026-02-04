@@ -182,18 +182,10 @@ impl Qwen3VLGenerateModel {
         let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
         // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
-        // [FIX] Distinguish between Resume (same prompt) and Relay (new suffix prompt)
-        let mut local_pos = if seqlen_offset > 0 && seqlen_offset < all_ids.len() {
-             // Case A: Resuming within the same long prompt
-             println!("[SKIP-PREFILL] Context matching. Resuming from token {}/{}", seqlen_offset, all_ids.len());
-             seqlen_offset
-        } else if seqlen_offset > 0 {
-             // Case B: Relay mode. Current prompt is a new instruction to be added AFTER baked KV.
-             println!("[SKIP-PREFILL] Relay mode. Appending new prompt ({} tokens) at offset {}", all_ids.len(), seqlen_offset);
-             0 
-        } else {
-             0
-        };
+        // [FIX] In 'Zero Prefill' / 'Relay' mode, we ALWAYS append the new prompt 
+        // to the existing baked KV cache. seqlen_offset represents the baked tokens.
+        let mut local_pos = 0;
+        let mut current_kv_offset = seqlen_offset;
 
         let prefill_chunk_size = 512;
         while local_pos < all_ids.len() {
@@ -208,11 +200,12 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
             }
 
-            self.qwen3_vl.forward(chunk, None, None, seqlen_offset);
+            // Append to GPU KV cache at the correct offset
+            self.qwen3_vl.forward(chunk, None, None, current_kv_offset);
             
             let processed = chunk.len();
             local_pos += processed;
-            seqlen_offset += processed;
+            current_kv_offset += processed;
         }
 
         let mut generated_text = String::new();
@@ -235,13 +228,13 @@ impl Qwen3VLGenerateModel {
                 vec![*current_all_ids.last().unwrap()] 
             };
 
-            let (pixels, grid) = if i == 0 && seqlen_offset == 0 { 
+            let (pixels, grid) = if i == 0 && current_kv_offset == 0 { 
                 (input.pixel_values.as_deref(), input.image_grid_thw.as_ref()) 
             } else { 
                 (None, None) 
             };
 
-            let logits = self.qwen3_vl.forward(&input_ids, pixels, grid, seqlen_offset);
+            let logits = self.qwen3_vl.forward(&input_ids, pixels, grid, current_kv_offset);
             let next_id = self.sample_greedy(&logits);
             
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
@@ -253,7 +246,7 @@ impl Qwen3VLGenerateModel {
             let _ = std::io::stdout().flush();
             generated_text.push_str(&new_word);
             
-            seqlen_offset += input_ids.len();
+            current_kv_offset += input_ids.len();
         }
 
         println!("\n[INFERENCE-RESULT] {}", generated_text);
@@ -419,31 +412,23 @@ impl Qwen3VLGenerateModel {
                         let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
                         let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
                         
-                        // [DYNAMIC-DIMENSION-MATCHING] Calculate source dim from shape
-                        // kt.shape() is [total_units], where each unit is 32 bits of one token's KV dim.
-                        // vt.shape() is [total_elements], where each element is 16 bits of one token's KV dim.
-                        // tokens = vt.shape[0] / source_kv_dim.
-                        // So, source_kv_dim = vt.shape[0] / (kt.shape[0] * 32 / source_kv_dim) ... wait.
-                        // Simpler: source_kv_dim = (kt.shape[0] * 32) / (vt.shape[0] / source_kv_dim)
-                        // Actually, source_kv_dim is just (bits per token). 
-                        // Each token has (source_kv_dim / 32) u32s.
-                        let source_tokens = v_data.len() / (k_data.len() * 32 / v_data.len()).max(1); // Rough estimate
-                        let source_dim = v_data.len() / (if source_tokens == 0 { 1 } else { v_data.len() / (k_data.len() * 32 / (v_data.len() / k_data.len().max(1) * 32).max(1)).max(1) }).max(1);
-                        
-                        // Let's use a more robust way: Qwen 0.5B/0.6B is 1024, 1.5B/2B is 2048 or 1024 depending on GQA.
-                        // Based on shapes: source_dim = (v_data.len() / num_tokens).
-                        // Since we know k_data.len() * 32 == v_data.len() * (something), 
-                        // and for bit-serial it's 1 bit per value: source_dim = v_data.len() / (k_data.len() * 32 / v_data.len())
-                        let actual_source_dim = if k_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
+                        // [DYNAMIC-DIMENSION-MATCHING] Robust mapping for Qwen family.
+                        // 0.6B models usually have 8 KV heads * 128 head_dim = 1024.
+                        // 2B models vary (e.g., 1536 or 2048).
+                        let actual_source_dim = if k_data.len() > 0 && v_data.len() > 0 {
+                            (v_data.len() * 32) / k_data.len()
+                        } else { 1024 };
                         
                         if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
                             let ratio = target_dim / actual_source_dim;
-                            println!("[KV-UPscale] Scaling context: {} -> {} (Ratio: {})", actual_source_dim, target_dim, ratio);
+                            println!("[KV-UPscale] Mapping context: Small ({}) -> Large {} (Ratio: {})", actual_source_dim, target_dim, ratio);
                             
                             let mut new_k = Vec::with_capacity(k_data.len() * ratio);
                             let mut new_v = Vec::with_capacity(v_data.len() * ratio);
                             
-                            for chunk in k_data.chunks_exact(actual_source_dim / 32) {
+                            // Replicate heads/dimensions to match Large model's architecture
+                            let k_units_per_token = actual_source_dim / 32;
+                            for chunk in k_data.chunks_exact(k_units_per_token) {
                                 for _ in 0..ratio { new_k.extend_from_slice(chunk); }
                             }
                             for chunk in v_data.chunks_exact(actual_source_dim) {
@@ -463,23 +448,11 @@ impl Qwen3VLGenerateModel {
                     m.text_model.force_free_kv_cache();
                     
                     let total_tokens = (combined_k.len() * 32) / target_dim;
-                    println!("[KV-STITCH] Loaded {} tokens. Dropping last token for re-evaluation parity.", total_tokens);
+                    println!("[KV-STITCH] SUCCESS: Loaded {} tokens. Ready for Zero-Prefill inference.", total_tokens);
                     
-                    if total_tokens > 1 {
-                        let tokens_to_keep = total_tokens - 1;
-                        let k_keep = tokens_to_keep * (target_dim / 32);
-                        let v_keep = tokens_to_keep * target_dim;
-                        combined_k.truncate(k_keep);
-                        combined_v.truncate(v_keep);
-                        
-                        println!("[KV-STITCH] Replicating {} tokens across all available layers.", tokens_to_keep);
+                    if total_tokens > 0 {
                         m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
-                    } else {
-                        println!("[KV-STITCH] Only 1 token found, clearing cache for full prefill.");
-                        m.text_model.clear_kv_cache();
                     }
-                    
-                    println!("[KV-STITCH] SUCCESS: Ready for high-speed full-model inference.");
                 }
             }
         }
