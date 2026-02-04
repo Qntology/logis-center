@@ -356,6 +356,9 @@ impl LogisModel {
         self.load_stitched_kv(address_hash, task_id, &["pug_base", &format!("prompt_{}", prompt_name)]).await?;
 
         // 3. Final Chat
+        // [FIX] Since system prompt is already baked into KV, we pass empty string to 'system'
+        // and ensure the prompt is just the user block to avoid duplication.
+        println!("[MODULAR-INF] Finalizing with user input...");
         self.chat("", user_input, cancel_token, Some(format!("{}_final", prompt_name))).await
     }
 

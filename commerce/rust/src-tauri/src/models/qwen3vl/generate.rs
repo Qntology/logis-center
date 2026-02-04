@@ -185,13 +185,15 @@ impl Qwen3VLGenerateModel {
         // [FIX] Distinguish between Resume (same prompt) and Relay (new suffix prompt)
         let mut local_pos = if seqlen_offset > 0 && seqlen_offset < all_ids.len() {
              // Case A: Resuming within the same long prompt
-             println!("[SKIP-PREFILL] Context matching. Resuming from token {}/{}", seqlen_offset, all_ids.len());
+             println!("[GENERATE] Resuming prompt. Cached: {}, Total: {}, Remaining: {}", seqlen_offset, all_ids.len(), all_ids.len() - seqlen_offset);
              seqlen_offset
         } else if seqlen_offset > 0 {
-             // Case B: Relay mode. Current prompt is a new instruction to be added AFTER baked KV.
-             println!("[SKIP-PREFILL] Relay mode. Appending new prompt ({} tokens) at offset {}", all_ids.len(), seqlen_offset);
+             // Case B: Relay mode. Appending new prompt (new instructions) AFTER baked KV.
+             // We treat the *entire* all_ids as new tokens to append.
+             println!("[GENERATE] Relay Mode: Using {} baked tokens. Processing {} tokens of new prompt suffix.", seqlen_offset, all_ids.len());
              0 
         } else {
+             println!("[GENERATE] Fresh Start. Prefilling {} tokens.", all_ids.len());
              0
         };
 
@@ -465,17 +467,19 @@ impl Qwen3VLGenerateModel {
                     let total_tokens = (combined_k.len() * 32) / target_dim;
                     println!("[KV-STITCH] Loaded {} tokens. Dropping last token for re-evaluation parity.", total_tokens);
                     
-                    if total_tokens > 1 {
-                        let tokens_to_keep = total_tokens - 1;
+                    if total_tokens > 0 {
+                        let tokens_to_keep = if total_tokens > 1 { total_tokens - 1 } else { total_tokens };
                         let k_keep = tokens_to_keep * (target_dim / 32);
                         let v_keep = tokens_to_keep * target_dim;
-                        combined_k.truncate(k_keep);
-                        combined_v.truncate(v_keep);
+                        
+                        // Only truncate if we actually have more than we need
+                        if combined_k.len() > k_keep { combined_k.truncate(k_keep); }
+                        if combined_v.len() > v_keep { combined_v.truncate(v_keep); }
                         
                         println!("[KV-STITCH] Replicating {} tokens across all available layers.", tokens_to_keep);
                         m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
                     } else {
-                        println!("[KV-STITCH] Only 1 token found, clearing cache for full prefill.");
+                        println!("[KV-STITCH] Token calculation resulted in 0. Clearing cache.");
                         m.text_model.clear_kv_cache();
                     }
                     
