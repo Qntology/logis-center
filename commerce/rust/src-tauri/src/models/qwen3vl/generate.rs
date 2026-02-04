@@ -217,7 +217,7 @@ impl Qwen3VLGenerateModel {
     }
 
     /// [NEW] Context-aware splitting for large documents - Accumulate in RAM, Save once
-    pub fn bake_text_in_parts(&mut self, text: String, task_id: &str, suffix: &str, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
+    pub fn bake_text_in_parts(&mut self, text: String, task_id: &str, suffix: &str, address_hash: Option<&str>, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
         let lines: Vec<&str> = text.lines().collect();
         let mut current_chunk = String::new();
         let mut current_tokens = 0;
@@ -276,7 +276,7 @@ impl Qwen3VLGenerateModel {
 
         // Final step: Save the one giant file
         if !master_k.is_empty() {
-            let final_path = crate::utils::paths::get_kv_dir(None).join(format!("{}_{}.safetensors", task_id, suffix));
+            let final_path = crate::utils::paths::get_kv_dir(None, address_hash).join(format!("{}_{}.safetensors", task_id, suffix));
             self.save_raw_kv_to_disk(&final_path, &master_k, &master_v)?;
             println!("[BAKE-STREAM] SUCCESS: Saved giant KV context ({} tokens) to {:?}", master_v.len() / (8 * 128), final_path);
         }

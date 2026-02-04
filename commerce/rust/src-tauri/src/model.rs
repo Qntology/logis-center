@@ -210,14 +210,15 @@ impl LogisModel {
     }
 
     // --- [NEW] SSD Bridge Operations ---
-    pub async fn save_kv_snapshot(&self, task_id: &str) -> anyhow::Result<String> {
+    pub async fn save_kv_snapshot(&self, task_id: &str, address_hash: Option<&str>) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
+        let addr_hash = address_hash.map(|s| s.to_string());
         
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                let path = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref()).join(format!("{}.safetensors", task_id_str));
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
                 gen.save_kv_to_disk(&path)?;
                 Ok(path.to_string_lossy().to_string())
@@ -227,14 +228,15 @@ impl LogisModel {
         }).await?
     }
 
-    pub async fn load_kv_snapshot(&self, task_id: &str) -> anyhow::Result<()> {
+    pub async fn load_kv_snapshot(&self, task_id: &str, address_hash: Option<&str>) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
+        let addr_hash = address_hash.map(|s| s.to_string());
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                let path = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref()).join(format!("{}.safetensors", task_id_str));
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
                     gen.load_kv_from_disk(&path)?;
@@ -250,7 +252,7 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, address_hash: Option<&str>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
@@ -268,7 +270,7 @@ impl LogisModel {
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
-            self.load_kv_snapshot(tid).await?;
+            self.load_kv_snapshot(tid, address_hash).await?;
         }
 
         println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
@@ -337,7 +339,7 @@ impl LogisModel {
         self.unload_generator().await;
 
         // 2. Load 2B Full Model and Stitch [PUG + PROMPT]
-        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true).await?;
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true, Some(address_hash)).await?;
         
         // Load from the address-specific folder
         self.load_stitched_kv(address_hash, task_id, &["pug_base"]).await?;
@@ -348,14 +350,14 @@ impl LogisModel {
     }
 
     // --- [SCENARIO B] Image Preprocessing (0.6B 1L Bake -> 2B 1L Vision Bake -> 2B Full Inf) ---
-    pub async fn bake_image_kv(&self, task_id: &str, region: &str, language: &str, page_type: &str, address: &str, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn bake_image_kv(&self, task_id: &str, region: &str, language: &str, page_type: &str, address: &str, address_hash: Option<&str>, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         let sys_session = format!("{}_sys", task_id);
         let img_session = format!("{}_img", task_id);
         let system_prompt = Self::get_image_extraction_prompt(region, language, page_type, address);
 
         // [Step 1] System Prompt Baking: 0.6B Small model, 1-Layer, Text-Only
         println!("[BAKE-IMAGE] Step 1: Baking System Prompt with 0.6B (1-Layer)...");
-        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true).await?;
+        self.secure_vram_relay_ext(ModelSize::Small, None, cancel_token.clone(), true, true, address_hash).await?;
         {
             let gen_clone = self.generator.clone();
             let sys_text = system_prompt.clone();
@@ -368,12 +370,12 @@ impl LogisModel {
                 Ok::<(), anyhow::Error>(())
             }).await??;
         }
-        self.save_kv_snapshot(&sys_session).await?;
+        self.save_kv_snapshot(&sys_session, address_hash).await?;
         self.unload_generator().await;
 
         // [Step 2] Image Data Baking: 2B Large model, 1-Layer (Strict Baking Mode), Vision Enabled
         println!("[BAKE-IMAGE] Step 2: Baking Image Data with 2B (1-Layer Vision)...");
-        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), true, false).await?;
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), true, false, address_hash).await?;
         {
             let _ = self.chat_with_image_spinner(
                 "[IMAGE-BAKE] Vision feature extraction.".to_string(), 
@@ -386,7 +388,7 @@ impl LogisModel {
                 None 
             ).await?;
         }
-        self.save_kv_snapshot(&img_session).await?;
+        self.save_kv_snapshot(&img_session, address_hash).await?;
         self.unload_generator().await;
 
         Ok(())
@@ -395,6 +397,7 @@ impl LogisModel {
     pub async fn extract_from_image(
         &self,
         task_id: String,
+        address_hash: String,
         image_path: String,
         language: String,
         app_handle: &tauri::AppHandle,
@@ -409,14 +412,14 @@ impl LogisModel {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             
             // 1 & 2. Bake KV (0.6B 1L Sys -> 2B 1L Img)
-            self.bake_image_kv(&task_id, "kr", &language, "tracking", "", dynamic_image, cancel_token.clone()).await?;
+            self.bake_image_kv(&task_id, "kr", &language, "tracking", "", Some(&address_hash), dynamic_image, cancel_token.clone()).await?;
 
             // 3. Full Inference (2B Full with Injected KV)
             crate::scheduler::log_task_progress(app_handle, &task_id, &json!({
                 "category": "Vision Analysis", "summary": "Injecting baked cache & performing full inference..."
             }));
             
-            let result_str = self.run_hybrid_inference_full(&task_id, "Extract all structured information from the label.", cancel_token.clone()).await?;
+            let result_str = self.run_hybrid_inference_full(&task_id, &address_hash, "Extract all structured information from the label.", cancel_token.clone()).await?;
 
             let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
             
@@ -508,7 +511,7 @@ impl LogisModel {
         }).await?
     }
 
-    pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool, force_text_only: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool, force_text_only: bool, address_hash: Option<&str>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         self.deep_purge_resources().await;
         
@@ -520,7 +523,7 @@ impl LogisModel {
         self.ensure_generator_ext(target_size, baking_only, force_text_only).await?;
 
         if let Some(tid) = task_id {
-            self.load_kv_snapshot(tid).await?;
+            self.load_kv_snapshot(tid, address_hash).await?;
         }
 
         println!("[RELAY] Transition to {:?} (Baking: {}, Text-Only: {}) complete in {:.2}s", target_size, baking_only, force_text_only, start_time.elapsed().as_secs_f32());
@@ -1019,15 +1022,15 @@ Return valid JSON only. No explanation.
         Ok(extracted_data)
     }
 
-    pub async fn run_hybrid_inference_full(&self, task_id: &str, user: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+    pub async fn run_hybrid_inference_full(&self, task_id: &str, address_hash: &str, user: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let combined_session = format!("{}_hybrid", task_id);
         println!("[INFERENCE-HYBRID] Starting 2B Full-Layer VL Inference for task: {}", task_id);
 
         // 1. Load 2B Full Model (Vision Enabled)
-        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, false).await?;
+        self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, false, Some(address_hash)).await?;
 
         // 2. Inject Stitched BitKV (System + Image)
-        self.load_stitched_kv(task_id, &["sys", "img"]).await?;
+        self.load_stitched_kv(address_hash, task_id, &["sys", "img"]).await?;
 
         // 3. Chat with hybrid context
         self.chat("", user, cancel_token, Some(combined_session)).await

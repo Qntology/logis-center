@@ -225,8 +225,8 @@ async fn process_task(
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     let _ = fs::create_dir_all(&pug_logs_dir);
     
-    let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
-    if kv_path.exists() { println!("[PROCESS] Found existing KV cache for {}", task.id); }
+    let kv_dir = utils::paths::get_kv_dir(Some(app_handle), Some(&task.r#ref));
+    if kv_dir.exists() { println!("[PROCESS] Found existing KV directory for address: {}", task.r#ref); }
 
     let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
         .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
@@ -308,7 +308,7 @@ async fn process_task(
         // SCENARIO B: Image Preprocessing (0.6B Bake -> 2B Vision Bake -> 2B Full Inference)
         log_task_progress(app_handle, &task.id, &json!({ "category": "Image Pipeline", "summary": "Starting 3-step vision extraction...", "spinner": "⠋" }));
         let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
-        model.extract_from_image(task.id.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
+        model.extract_from_image(task.id.clone(), task.r#ref.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
         return Ok(());
     } else if !url.is_empty() {
         // SCENARIO A: Text Preprocessing (0.6B Bake -> 2B Full Inference)
