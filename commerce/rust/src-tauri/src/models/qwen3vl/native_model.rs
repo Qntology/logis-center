@@ -262,7 +262,8 @@ impl NativeLayer {
             if current_len + q_len > max_tokens {
                 println!("[STABILITY-RECOVERY] Sequence length ({}) exceeds GPU limit ({}). Falling back to CPU...", current_len + q_len, max_tokens);
                 if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                    return native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, current_len + q_len);
+                    let cpu_attn = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, current_len + q_len, 0.1f32);
+                    return cpu_attn;
                 }
             }
 
@@ -282,23 +283,26 @@ impl NativeLayer {
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
+            // [STABILITY] Dynamic alpha: Baking needs more bias than inference
+            let is_baking = config.num_hidden_layers <= 1;
+            let alpha = if is_baking { 0.3f32 } else { 0.1f32 }; // Higher floor for 1-layer baking
+
             // [OPTIMIZATION] Reuse scratch buffers for Attention
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
-            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.1f32);
+            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, alpha);
             
             // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
-            if !attn_out.is_empty() && attn_out[0].to_f32() == 0.0 && attn_out.iter().take(50).all(|x| x.to_f32() == 0.0) {
-                println!("[STABILITY] Signal Death detected at layer {}. Attempting Relaxed-Scaling (Alpha: 0.5) GPU recovery...", _idx);
+            if !attn_out.is_empty() && (attn_out[0].to_f32().abs() < 1e-9) && attn_out.iter().take(20).all(|x| x.to_f32().abs() < 1e-9) {
+                println!("[STABILITY] Signal Death at layer {} (Baking: {}). Attempting GPU recovery with alpha {}...", _idx, is_baking, alpha + 0.4);
                 
-                // [2026-FIX] Apply much stronger bias during recovery to force signal survival
-                if new_len > 1 {
-                     attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.5f32);
-                }
+                attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, alpha + 0.4);
 
-                if attn_out[0].to_f32() == 0.0 {
+                if attn_out[0].to_f32().abs() < 1e-9 {
                     println!("[STABILITY-CRITICAL] GPU recovery failed. Falling back to Hybrid-SIMD (CPU)...");
+                    // [FIX] DROP LOCK before calling get_kv_data to prevent Deadlock
+                    drop(gpu_cache_guard);
                     if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len);
+                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, alpha + 0.5);
                     }
                 } else {
                     println!("[STABILITY] GPU recovery SUCCESSFUL at layer {}.", _idx);
@@ -332,7 +336,7 @@ impl NativeLayer {
         let t_s = v_f_f.len() / (n_kv * head_dim);
         *cache_guard = Some((k_p_f.clone(), v_f_f.clone())); drop(cache_guard);
 
-        let attn_out = native_bit_serial_attn_f16(&q, &k_p_f, &v_f_f, hidden_size, n_h, n_kv, q_len, t_s);
+        let attn_out = native_bit_serial_attn_f16(&q, &k_p_f, &v_f_f, hidden_size, n_h, n_kv, q_len, t_s, 0.1f32);
         let mut x_at = self.o_proj.forward(&attn_out);
         for i in 0..x_at.len() { x_at[i] += residual[i]; }
         let r_mlp = x_at.clone();

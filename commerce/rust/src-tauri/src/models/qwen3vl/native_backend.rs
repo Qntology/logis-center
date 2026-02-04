@@ -304,16 +304,16 @@ pub fn bit_serial_matmul_f32_extreme(i: &[f16], w: &[u32], s: &[f16], m: usize, 
     bit_serial_matmul_f32_shuffled(i, w, s, m, n, k)
 }
 
-pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usize, n_h: usize, n_kv: usize, q_l: usize, t_s: usize) -> Vec<f16> {
+pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usize, n_h: usize, n_kv: usize, q_l: usize, t_s: usize, alpha: f32) -> Vec<f16> {
     let h_d = hid / n_h; 
     let k_b = (h_d + 31) / 32; 
     let mut o = vec![f16::ZERO; q_l * hid]; 
     let sc = 1.0 / (h_d as f32).sqrt();
     
-    // [STABILITY] Match GPU fix to prevent signal collapse
-    const KEEP_ALIVE_BIAS: f32 = 0.1f32;
+    // [STABILITY] Prevent exp(x) underflow to zero
+    const MIN_SCORE: f32 = -15.0f32;
 
-    // [2026-CPU-OPTIMIZATION] Pre-pack all Query bits once to avoid redundant work in the loop
+    // [2026-CPU-OPTIMIZATION] Pre-pack all Query bits once
     let mut q_p = vec![0u32; q_l * n_h * k_b];
     q_p.par_chunks_exact_mut(k_b).enumerate().for_each(|(idx, packed_q)| {
         let q_start = idx * h_d;
@@ -330,7 +330,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
         }
     });
 
-    println!("[CPU-ATTN] Processing {} queries over {} context tokens...", q_l, t_s);
+    println!("[CPU-ATTN] Processing {} queries over {} context tokens (Alpha: {})...", q_l, t_s, alpha);
 
     // Main Attention Loop with Hardware POPCNT 가속
     o.par_chunks_exact_mut(hid).enumerate().for_each(|(i, out)| {
@@ -359,8 +359,8 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
                             let mut dot = 0i32;
                             let vals: [u32; 4] = std::mem::transmute(xor_v);
                             for v in vals { dot += 32 - 2 * v.count_ones() as i32; }
-                            // Add KEEP_ALIVE_BIAS for stability
-                            scores[j] = ((dot as f32) + KEEP_ALIVE_BIAS) * sc;
+                            // Add alpha for stability and clamp with MIN_SCORE
+                            scores[j] = (((dot as f32) + alpha) * sc).max(MIN_SCORE);
                         }
                     }
                 } else {
@@ -369,7 +369,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
                         let kj = &k_p[k_start .. k_start + k_b];
                         let mut dot = 0i32;
                         for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
-                        scores[j] = ((dot as f32) + KEEP_ALIVE_BIAS) * sc;
+                        scores[j] = (((dot as f32) + alpha) * sc).max(MIN_SCORE);
                     }
                 }
             }
@@ -380,7 +380,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
                     let kj = &k_p[k_start .. k_start + k_b];
                     let mut dot = 0i32;
                     for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
-                    scores[j] = ((dot as f32) + KEEP_ALIVE_BIAS) * sc;
+                    scores[j] = (((dot as f32) + alpha) * sc).max(MIN_SCORE);
                 }
             }
             

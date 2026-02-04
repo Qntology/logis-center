@@ -290,17 +290,20 @@ async fn process_task(
     let clean = parsing::pre_clean_html(&raw_html);
     let light_pug = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
     
-    // [RESTORED] Defensive Guard: Skip if content is too thin to be useful
-    if light_pug.trim().len() < 50 {
-        println!("[PROCESS] Content too thin ({} chars), skipping AI analysis.", light_pug.len());
+    // [RESTORED] Always save log even if thin for transparency
+    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let log_subdir = pug_logs_dir.join(format!("{}_{}", task.id, ts_nano));
+    let _ = fs::create_dir_all(&log_subdir);
+    let _ = std::fs::write(log_subdir.join("raw_thin.pug"), &light_pug);
+
+    // [RESTORED] Defensive Guard: Skip only if absolutely empty or meta-only
+    if light_pug.trim().len() < 10 {
+        println!("[PROCESS] Content too thin ({} chars): '{}', skipping AI analysis.", light_pug.len(), light_pug.trim());
         return Ok(());
     }
 
     data_manager.offload(&light_pug, "light_pug")?;
     
-    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let log_subdir = pug_logs_dir.join(format!("{}_{}", task.id, ts_nano));
-    let _ = fs::create_dir_all(&log_subdir);
     let pug_chunks = chunk_text(&light_pug, 3072);
     let mut chunk_index = Vec::new();
     for (i, chunk) in pug_chunks.iter().enumerate() {

@@ -100,8 +100,10 @@ __global__ void bit_serial_attn_kernel_v2026(
     }
     __syncthreads();
 
-    // 2. Tiled Processing (Chunk size: 32 tokens for warp-alignment)
+    // [2. Tiled Processing (Chunk size: 32 tokens for warp-alignment)]
     const int TILE_SIZE = 32;
+    const float MIN_SCORE = -15.0f; // Prevent expf from underflowing to zero in 1-bit logic
+
     for (int t_start = 0; t_start < t_s; t_start += TILE_SIZE) {
         int j = t_start + (tid % TILE_SIZE); 
         float score = -1e20f;
@@ -112,8 +114,8 @@ __global__ void bit_serial_attn_kernel_v2026(
             for (int kb = 0; kb < k_b; ++kb) {
                 dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * k_b + kb]));
             }
-            // Apply scale and stability bias
-            score = ((float)dot + KEEP_ALIVE_BIAS) * sc;
+            // Apply scale and stability bias with a hard floor
+            score = fmaxf(((float)dot + alpha) * sc, MIN_SCORE);
         }
 
         // Warp-level Max reduction (since TILE_SIZE=32)
@@ -197,7 +199,8 @@ __global__ void bit_serial_attn_kernel_tile_fused(
     const int* __restrict__ segment_lens,  // Length of each segment
     int num_segments,
     float* __restrict__ O,
-    int n_h, int h_d, float sc, int q_len
+    int n_h, int h_d, float sc, int q_len,
+    float alpha
 ) {
     int q_idx = blockIdx.x; 
     int h = blockIdx.y;     
@@ -208,6 +211,7 @@ __global__ void bit_serial_attn_kernel_tile_fused(
     extern __shared__ float s_tile[]; 
     __shared__ uint32_t s_q_bits[8]; 
     int k_b = (h_d + 31) / 32;
+    const float MIN_SCORE = -15.0f;
 
     // 1. One-time Q-packing in shared memory
     if (tid < k_b) {
@@ -232,10 +236,9 @@ __global__ void bit_serial_attn_kernel_tile_fused(
             int dot = 0;
             #pragma unroll
             for (int kb = 0; kb < k_b; ++kb) {
-                // [GQA-FIX-TODO] Update this kernel as well if used, for now focusing on v2026
                  dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_seg[(j * n_h + h) * k_b + kb]));
             }
-            float score = (float)dot * sc;
+            float score = fmaxf(((float)dot + alpha) * sc, MIN_SCORE);
             
             // Online Softmax update (FlashAttention style)
             float prev_max = local_max;
@@ -257,12 +260,12 @@ extern "C" {
         bit_serial_attn_kernel_v2026<<<grid, block, smem>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha);
     }
 
-    void bit_serial_attn_cuda_fused(const float* d_q, const uint32_t** d_k_table, const float** d_v_table, const int* d_lens, int n_segs, float* d_o, int n_h, int h_d, float scale, int dev, int q_len) {
+    void bit_serial_attn_cuda_fused(const float* d_q, const uint32_t** d_k_table, const float** d_v_table, const int* d_lens, int n_segs, float* d_o, int n_h, int h_d, float scale, int dev, int q_len, float alpha) {
         cudaSetDevice(dev);
         dim3 block(256);
         dim3 grid(q_len, n_h);
         // [2026-FUSION] Maximize shared memory usage for tiling
         size_t smem = 16384; 
-        bit_serial_attn_kernel_tile_fused<<<grid, block, smem>>>(d_q, d_k_table, d_v_table, d_lens, n_segs, d_o, n_h, h_d, scale, q_len);
+        bit_serial_attn_kernel_tile_fused<<<grid, block, smem>>>(d_q, d_k_table, d_v_table, d_lens, n_segs, d_o, n_h, h_d, scale, q_len, alpha);
     }
 }
