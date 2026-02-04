@@ -164,13 +164,16 @@ impl Qwen3VLGenerateModel {
         let mut qwen3_vl_native = Arc::new(native_model);
 
         // [CRITICAL] Move to GPU immediately while reference count is 1
-        if _text_device_id < 8 { // Valid GPU ID check (0-7)
+        // [STABILITY] Skip GPU offloading if baking_only is true to ensure 100% reliable cache generation
+        if _text_device_id < 8 && !baking_only { 
             println!("[LOAD] Moving Native Model to GPU-{}...", _text_device_id);
             if let Some(m) = Arc::get_mut(&mut qwen3_vl_native) {
                 m.move_to_gpu(_text_device_id as i32);
             } else {
                 println!("[ERROR] Failed to get mutable reference for GPU offloading during initialization.");
             }
+        } else if baking_only {
+            println!("[LOAD] Baking Mode: Forcing CPU-only execution for 100% stability.");
         }
 
         let qwen3_vl = ModelVariant::Native(qwen3_vl_native);
@@ -376,7 +379,7 @@ impl Qwen3VLGenerateModel {
     }
 
     /// [OPTIMIZED] Context-aware splitting - Save to specific path
-    pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, _suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
+    pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
         println!("[BAKE-PATH] Baking incrementally to {:?} (Starting Offset: {})", final_path, initial_offset);
         
         let all_ids = self.tokenizer.text_encode_vec(text, false)?;
@@ -385,10 +388,12 @@ impl Qwen3VLGenerateModel {
         self.clear_kv_cache();
 
         let mut current_offset = initial_offset;
-        for chunk in all_ids.chunks(512) {
+        for (chunk_idx, chunk) in all_ids.chunks(512).enumerate() {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
             }
+            
+            println!("[BAKE-PATH] Processing chunk {}/{} (Global Pos: {})", chunk_idx + 1, (total_tokens + 511) / 512, current_offset);
             
             self.qwen3_vl.forward(chunk, None, None, current_offset);
             current_offset += chunk.len();

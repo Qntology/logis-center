@@ -43,6 +43,16 @@ impl NativeLinear {
                             let (d_i, d_o) = self.ensure_gpu_buffers(m);
                             let mut res = bit_serial_matmul_gpu_buffered(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o);
                             
+                            // [STABILITY-FALLBACK] If GPU returned zeros, retry on CPU
+                            if !res.is_empty() && res[0].to_f32() == 0.0 && res.iter().take(50).all(|val| val.to_f32() == 0.0) {
+                                unsafe {
+                                    let wp_ref = weight_packed.get_raw_slice::<u32>(); 
+                                    let s_ref = scales.get_raw_slice::<f16>();
+                                    let mut out = bit_serial_matmul_f32_extreme(x, wp_ref, s_ref, m, self.out_features, self.in_features);
+                                    res = out.into_iter().map(f16::from_f32).collect();
+                                }
+                            }
+
                             if let Some(b) = bias { 
                                 unsafe {
                                     let b_ref = b.get_raw_slice::<f16>();
@@ -193,6 +203,12 @@ impl NativeLayer {
             (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
         };
 
+        // [STABILITY-AUDIT] Log distribution before Norm
+        if _idx == 0 && !q.is_empty() {
+            let q_max = q.iter().fold(0.0f32, |a, &b| a.max(b.to_f32().abs()));
+            if q_max == 0.0 { println!("[STABILITY-CRITICAL] Q-proj returned ALL ZEROS at layer {}!", _idx); }
+        }
+
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
             // [FIX] Correct per-head normalization: each head (128 dims) uses its own weights if available
@@ -230,7 +246,7 @@ impl NativeLayer {
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, mut current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
-                let max_tokens = 131072; // Consistent with LogisModel limit
+                let max_tokens = 16384; 
                 unsafe { 
                     let cuda_lib = lib();
                     lib().cuMemAlloc_v2(&mut kp, max_tokens * n_kv * (head_dim/32) * 4); 
@@ -239,6 +255,14 @@ impl NativeLayer {
                 
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
+
+            let max_tokens = 16384;
+            if current_len + q_len > max_tokens {
+                println!("[STABILITY-RECOVERY] Sequence length ({}) exceeds GPU limit ({}). Falling back to CPU...", current_len + q_len, max_tokens);
+                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                    return native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, q_len, current_len + q_len);
+                }
+            }
 
             let k_packed = pack_f16_to_bits(&k);
             let v_f32: Vec<f32> = if q_len > 1 {
@@ -256,7 +280,16 @@ impl NativeLayer {
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
-            let attn_out = native_bit_serial_attn_gpu(&q, k_ptr, v_ptr, n_h, head_dim, new_len, self.device_id as usize);
+            let mut attn_out = native_bit_serial_attn_gpu(&q, k_ptr, v_ptr, n_h, head_dim, new_len, self.device_id as usize);
+            
+            // [STABILITY-FALLBACK] If GPU returned zeros, retry on CPU immediately
+            if !attn_out.is_empty() && attn_out[0].to_f32() == 0.0 && attn_out.iter().take(50).all(|x| x.to_f32() == 0.0) {
+                println!("[STABILITY-RECOVERY] CUDA Attention failed (returned zeros). Falling back to CPU for this layer...");
+                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                    attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, q_len, new_len);
+                }
+            }
+
             let mut x_at = self.o_proj.forward(&attn_out);
             for i in 0..x_at.len() { x_at[i] += residual[i]; }
             let r_mlp = x_at.clone();
@@ -447,10 +480,26 @@ impl NativeQwen3TextModel {
             }
         };
 
-        // [VISION-FUSION] Replace image tokens with vision features if applicable (This part belongs here if we want deep stack support)
-        // For simplicity, we moved fusion to NativeQwen3VLModel::forward.
+        // [STABILITY-AUDIT] Check embedding output
+        if !cur_x.is_empty() {
+            let first_val = cur_x[0].to_f32();
+            if first_val == 0.0 && cur_x.iter().take(100).all(|x| x.to_f32() == 0.0) {
+                println!("[STABILITY-WARN] Embedding returned ALL ZEROS for {} tokens!", input_ids.len());
+            }
+        }
 
-        for (i, layer) in self.layers.iter().enumerate() { cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i); }
+        for (i, layer) in self.layers.iter().enumerate() { 
+            let prev_val = cur_x[0].to_f32();
+            cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i); 
+            
+            // [STABILITY-AUDIT] Check layer output
+            if i == 0 && !cur_x.is_empty() {
+                let current_val = cur_x[0].to_f32();
+                if current_val == 0.0 && prev_val != 0.0 {
+                    println!("[STABILITY-CRITICAL] Layer 0 killed the signal (became ALL ZEROS)!");
+                }
+            }
+        }
         let norm_cow = self.norm.get_slice::<f16>();
         native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid)
     }
@@ -686,12 +735,35 @@ impl NativeQwen3VLModel {
 
         println!("[LOAD] Initializing Native Engine (Baking: {})...", baking);
 
-        // 임베딩 로드
-        let emb = get_l("model.embed_tokens.weight", 151936, t_c.hidden_size)
-            .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))?;
+        // [CRITICAL-FIX] 임베딩 로더: 임베딩은 항상 F16 룩업 테이블이어야 함
+        let get_embed = |base: &str, vocab: usize, hid: usize| -> Result<NativeLinear> {
+            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("EmbedTensorNotFound: {}", base))?;
+            let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
+            let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
+
+            if current_st.tensor(&format!("{}.packed", key)).is_ok() {
+                println!("[LOAD] WARNING: embed_tokens was bit-quantized. Reverting to F16 for lookup table...");
+                // 양자화된 경우 matmul을 통해 F16으로 복구 (단순 lookup이 불가능하므로 로딩 시점에 미리 계산)
+                // 하지만 여기서는 간결성을 위해 Standard로 강제 로드 시도 (GGUF 원본이 F16인 경우 대비)
+                if current_st.tensor(&key).is_ok() {
+                    let v = current_st.tensor(&key)?;
+                    let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                    return Ok(NativeLinear { in_features: vocab, out_features: hid, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) });
+                }
+            }
+            get_l(base, vocab, hid)
+        };
+
+        let emb = get_embed("model.embed_tokens.weight", 151936, t_c.hidden_size)
+            .or_else(|_| get_embed("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))?;
             
         let mut layers = Vec::new(); 
         let l_to_l = if baking { 1 } else { t_c.num_hidden_layers };
+
+        // [FIX] Correct Dimensionality Calculation for Attention Block
+        let q_out = t_c.num_attention_heads * t_c.head_dim;
+        let kv_out = t_c.num_key_value_heads * t_c.head_dim;
+
         for i in 0..l_to_l {
             let p = format!("model.layers.{}", i);
             layers.push(NativeLayer {
@@ -699,10 +771,10 @@ impl NativeQwen3VLModel {
                 post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p))?,
                 q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p)).ok(),
                 k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p)).ok(),
-                q_proj: get_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, t_c.hidden_size)?,
-                k_proj: get_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, t_c.hidden_size)?,
-                v_proj: get_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, t_c.hidden_size)?,
-                o_proj: get_l(&format!("{}.self_attn.o_proj.weight", p), t_c.hidden_size, t_c.hidden_size)?,
+                q_proj: get_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out)?,
+                k_proj: get_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out)?,
+                v_proj: get_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out)?,
+                o_proj: get_l(&format!("{}.self_attn.o_proj.weight", p), q_out, t_c.hidden_size)?,
                 gate_proj: get_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 up_proj: get_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
