@@ -418,45 +418,58 @@ impl Qwen3VLGenerateModel {
                     let st = safetensors::SafeTensors::deserialize(&file)?;
                     
                     if let (Ok(kt), Ok(vt)) = (st.tensor("layer.0.k"), st.tensor("layer.0.v")) {
-                        let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
-                        let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
+                        let k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                        let v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
                         
-                        // [DYNAMIC-DIMENSION-MATCHING] Calculate source dim from shape
-                        // kt.shape() is [total_units], where each unit is 32 bits of one token's KV dim.
-                        // vt.shape() is [total_elements], where each element is 16 bits of one token's KV dim.
-                        // tokens = vt.shape[0] / source_kv_dim.
-                        // So, source_kv_dim = vt.shape[0] / (kt.shape[0] * 32 / source_kv_dim) ... wait.
-                        // Simpler: source_kv_dim = (kt.shape[0] * 32) / (vt.shape[0] / source_kv_dim)
-                        // Actually, source_kv_dim is just (bits per token). 
-                        // Each token has (source_kv_dim / 32) u32s.
-                        let source_tokens = v_data.len() / (k_data.len() * 32 / v_data.len()).max(1); // Rough estimate
-                        let source_dim = v_data.len() / (if source_tokens == 0 { 1 } else { v_data.len() / (k_data.len() * 32 / (v_data.len() / k_data.len().max(1) * 32).max(1)).max(1) }).max(1);
-                        
-                        // Let's use a more robust way: Qwen 0.5B/0.6B is 1024, 1.5B/2B is 2048 or 1024 depending on GQA.
-                        // Based on shapes: source_dim = (v_data.len() / num_tokens).
-                        // Since we know k_data.len() * 32 == v_data.len() * (something), 
-                        // and for bit-serial it's 1 bit per value: source_dim = v_data.len() / (k_data.len() * 32 / v_data.len())
-                        let actual_source_dim = if k_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
-                        
-                        if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
-                            let ratio = target_dim / actual_source_dim;
-                            println!("[KV-UPscale] Scaling context: {} -> {} (Ratio: {})", actual_source_dim, target_dim, ratio);
-                            
-                            let mut new_k = Vec::with_capacity(k_data.len() * ratio);
-                            let mut new_v = Vec::with_capacity(v_data.len() * ratio);
-                            
-                            for chunk in k_data.chunks_exact(actual_source_dim / 32) {
-                                for _ in 0..ratio { new_k.extend_from_slice(chunk); }
+                        let packed_head_dim = target_head_dim / 32; // 128/32 = 4
+                        let mut final_k = Vec::new();
+                        let mut final_v = Vec::new();
+
+                        // [HEAD-BY-HEAD EXPANSION] 이전 Candle 버전의 로직을 Native Bit-serial로 완벽 복원
+                        // 소스 모델(0.6B)의 특징: Head Dim 64, KV Heads 2.
+                        let s_head_dim = 64;
+                        let s_n_kv = 2;
+                        let s_packed_dim = s_head_dim / 32; // 2
+
+                        let s_k_per_token = s_n_kv * s_packed_dim; // 4
+                        let s_v_per_token = s_n_kv * s_head_dim;   // 128
+
+                        if k_data.len() % s_k_per_token == 0 && v_data.len() % s_v_per_token == 0 {
+                            println!("[KV-STITCH] 0.6B(64-dim) -> 2B(128-dim) Structured Expansion Active.");
+                            let k_chunks = k_data.chunks_exact(s_k_per_token);
+                            let v_chunks = v_data.chunks_exact(s_v_per_token);
+
+                            for (kc, vc) in k_chunks.zip(v_chunks) {
+                                // 1. 먼저 소스의 2개 Head 각각을 128차원으로 확장
+                                let mut expanded_heads_k = Vec::new();
+                                let mut expanded_heads_v = Vec::new();
+                                
+                                for h in 0..s_n_kv {
+                                    let kh = &kc[h * s_packed_dim .. (h+1) * s_packed_dim];
+                                    let vh = &vc[h * s_head_dim .. (h+1) * s_head_dim];
+                                    
+                                    // Dimension Doubling (64 -> 128)
+                                    expanded_heads_k.extend_from_slice(kh);
+                                    expanded_heads_k.extend_from_slice(kh);
+                                    expanded_heads_v.extend_from_slice(vh);
+                                    expanded_heads_v.extend_from_slice(vh);
+                                }
+
+                                // 2. 타겟 모델의 Head 수(target_n_kv)에 맞춰 순환 할당
+                                for h_idx in 0..target_n_kv {
+                                    let src_h = h_idx % s_n_kv;
+                                    final_k.extend_from_slice(&expanded_heads_k[src_h * packed_head_dim .. (src_h + 1) * packed_head_dim]);
+                                    final_v.extend_from_slice(&expanded_heads_v[src_h * target_head_dim .. (src_h + 1) * target_head_dim]);
+                                }
                             }
-                            for chunk in v_data.chunks_exact(actual_source_dim) {
-                                for _ in 0..ratio { new_v.extend_from_slice(chunk); }
-                            }
-                            k_data = new_k;
-                            v_data = new_v;
+                        } else {
+                            println!("[KV-STITCH] Data format unknown, falling back to direct copy.");
+                            final_k = k_data;
+                            final_v = v_data;
                         }
                         
-                        combined_k.extend(k_data);
-                        combined_v.extend(v_data);
+                        combined_k.extend(final_k);
+                        combined_v.extend(final_v);
                     }
                 }
 
