@@ -518,13 +518,15 @@ impl Qwen3VLGenerateModel {
                         
                         if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
                             let ratio = target_dim / actual_source_dim;
-                            println!("[KV-UPSCALE] 2025-Research: Bridging Small ({}) -> Large {} (Ratio: {})", actual_source_dim, target_dim, ratio);
+                            println!("[KV-UPSCALE] 2025-H2 Drift Compensation: Bridging 1-bit Small -> Large");
                             
                             let mut new_k = Vec::with_capacity(k_data.len() * ratio);
                             let mut new_v = Vec::with_capacity(v_data.len() * ratio);
                             
-                            // Apply Semantic Bridge multiplier to Values (V) to compensate for 1-bit drift
-                            let semantic_multiplier = f16::from_f32(1.12); 
+                            // [2025-H2-RESEARCH] Drift Compensation Factor
+                            // Shift the 1-bit signal mean to match Large model's activation center
+                            let semantic_multiplier = f16::from_f32(1.12);
+                            let drift_bias = f16::from_f32(0.005); 
 
                             let k_units_per_token = actual_source_dim / 32;
                             for chunk in k_data.chunks_exact(k_units_per_token) {
@@ -533,7 +535,10 @@ impl Qwen3VLGenerateModel {
                             for chunk in v_data.chunks_exact(actual_source_dim) {
                                 for _ in 0..ratio { 
                                     let mut v_scaled = chunk.to_vec();
-                                    for val in v_scaled.iter_mut() { *val = *val * semantic_multiplier; }
+                                    for val in v_scaled.iter_mut() { 
+                                        // Apply both Scale and Drift Bias for 1-bit stability
+                                        *val = (*val * semantic_multiplier) + drift_bias; 
+                                    }
                                     new_v.extend_from_slice(&v_scaled); 
                                 }
                             }
