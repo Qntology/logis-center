@@ -168,8 +168,6 @@ pub struct NativeLayer {
     pub device_id: i32,
     pub kv_cache: std::sync::Mutex<Option<(Vec<u32>, Vec<f16>)>>, 
     pub gpu_kv_cache: std::sync::Mutex<Option<(GpuPtr, GpuPtr, usize)>>, 
-    pub scratch_q: std::sync::Mutex<Option<(GpuPtr, usize)>>, 
-    pub scratch_o: std::sync::Mutex<Option<(GpuPtr, usize)>>,
 }
 
 unsafe impl Send for NativeLayer {}
@@ -213,9 +211,13 @@ impl NativeLayer {
             let (k_ptr, v_ptr, mut current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
+                    let cuda_lib = lib();
                     lib().cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
                     lib().cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
                 }
+                
+                // Note: Stitched cache is now handled by batch_upload_stitched_cache
+                // so we don't need the individual 'cpu_cache.take()' upload here.
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
 
@@ -235,8 +237,7 @@ impl NativeLayer {
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
-            let (d_q, d_o) = self.ensure_attn_buffers(q_len, n_h, head_dim);
-            let attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, head_dim, new_len, self.device_id as usize, d_q, d_o);
+            let attn_out = native_bit_serial_attn_gpu(&q, k_ptr, v_ptr, n_h, head_dim, new_len, self.device_id as usize);
             let mut x_at = self.o_proj.forward(&attn_out);
             for i in 0..x_at.len() { x_at[i] += residual[i]; }
             let r_mlp = x_at.clone();
@@ -276,33 +277,6 @@ impl NativeLayer {
         x_m
     }
 
-    #[cfg(feature = "cuda")]
-    fn ensure_attn_buffers(&self, q_len: usize, n_h: usize, h_d: usize) -> (CUdeviceptr, CUdeviceptr) {
-        use cudarc::driver::sys::*;
-        let req_bytes = q_len * n_h * h_d * 4; // F32 buffers
-        
-        let mut sq_guard = self.scratch_q.lock().unwrap();
-        let d_q = if let Some((ptr, size)) = *sq_guard {
-            if size >= req_bytes { ptr.0 as CUdeviceptr }
-            else {
-                unsafe { let mut n_ptr: CUdeviceptr = 0; let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr); let _ = lib().cuMemAlloc_v2(&mut n_ptr, req_bytes); *sq_guard = Some((GpuPtr(n_ptr as *mut _), req_bytes)); n_ptr }
-            }
-        } else {
-            unsafe { let mut n_ptr: CUdeviceptr = 0; let _ = lib().cuMemAlloc_v2(&mut n_ptr, req_bytes); *sq_guard = Some((GpuPtr(n_ptr as *mut _), req_bytes)); n_ptr }
-        };
-
-        let mut so_guard = self.scratch_o.lock().unwrap();
-        let d_o = if let Some((ptr, size)) = *so_guard {
-            if size >= req_bytes { ptr.0 as CUdeviceptr }
-            else {
-                unsafe { let mut n_ptr: CUdeviceptr = 0; let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr); let _ = lib().cuMemAlloc_v2(&mut n_ptr, req_bytes); *so_guard = Some((GpuPtr(n_ptr as *mut _), req_bytes)); n_ptr }
-            }
-        } else {
-            unsafe { let mut n_ptr: CUdeviceptr = 0; let _ = lib().cuMemAlloc_v2(&mut n_ptr, req_bytes); *so_guard = Some((GpuPtr(n_ptr as *mut _), req_bytes)); n_ptr }
-        };
-        (d_q, d_o)
-    }
-
     pub fn move_to_gpu(&mut self, device_id: i32) {
         self.device_id = device_id;
         self.q_proj.move_to_gpu(device_id); self.k_proj.move_to_gpu(device_id);
@@ -334,12 +308,6 @@ impl NativeLayer {
                 let _ = lib().cuMemFree_v2(k.0 as CUdeviceptr);
                 let _ = lib().cuMemFree_v2(v.0 as CUdeviceptr);
             }
-        }
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            if let Some((ptr, _)) = self.scratch_q.lock().unwrap().take() { let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr); }
-            if let Some((ptr, _)) = self.scratch_o.lock().unwrap().take() { let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr); }
         }
     }
 
@@ -645,11 +613,7 @@ impl NativeQwen3VLModel {
                 gate_proj: get_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 up_proj: get_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
-                device_id: -1, 
-                kv_cache: std::sync::Mutex::new(None), 
-                gpu_kv_cache: std::sync::Mutex::new(None),
-                scratch_q: std::sync::Mutex::new(None),
-                scratch_o: std::sync::Mutex::new(None),
+                device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
             });
         }
         let norm = get_t("model.norm.weight")?;
@@ -738,11 +702,7 @@ impl NativeQwen3VLModel {
                     gate_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?,
                     up_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?, 
                     down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_cfg.hidden_size)?,
-                    device_id: -1, 
-                    kv_cache: std::sync::Mutex::new(None), 
-                    gpu_kv_cache: std::sync::Mutex::new(None),
-                    scratch_q: std::sync::Mutex::new(None),
-                    scratch_o: std::sync::Mutex::new(None),
+                    device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
                 });
             }
             let merger = NativeLayer {
@@ -756,11 +716,7 @@ impl NativeQwen3VLModel {
                 gate_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
                 up_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
                 down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
-                device_id: -1, 
-                kv_cache: std::sync::Mutex::new(None), 
-                gpu_kv_cache: std::sync::Mutex::new(None),
-                scratch_q: std::sync::Mutex::new(None),
-                scratch_o: std::sync::Mutex::new(None),
+                device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
             };
             Some(NativeVisionModel { patch_embed, blocks, merger })
         } else { None };
@@ -769,12 +725,6 @@ impl NativeQwen3VLModel {
     }
     pub fn forward(&self, i_ids: &[u32], _p_v: Option<&[f16]>, _g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
         let x = self.text_model.forward(i_ids, s_o); self.lm_head.forward(&x)
-    }
-    
-    /// [ACCELERATION] Update KV Cache without computing logits.
-    /// Used during prefill/relay phase to eliminate overhead.
-    pub fn forward_kv_only(&self, i_ids: &[u32], s_o: usize) {
-        let _ = self.text_model.forward(i_ids, s_o);
     }
         pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
         pub fn force_free_kv_cache(&self) { self.text_model.force_free_kv_cache(); }
@@ -786,3 +736,4 @@ impl NativeQwen3VLModel {
             }
         }
     }
+    

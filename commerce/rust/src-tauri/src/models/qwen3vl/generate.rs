@@ -9,11 +9,7 @@ use crate::{
         },
     },
     tokenizer::TokenizerModel,
-    openai_types::{
-        ChatCompletionParameters, 
-        ChatCompletionRequestMessage, 
-        ChatCompletionRequestUserMessageContent
-    },
+    openai_types::ChatCompletionParameters,
 };
 use serde_json::Value;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -82,42 +78,36 @@ impl Qwen3VLGenerateModel {
         let vision_raw_bytes = std::fs::read(&vision_config_path)?;
         let vision_json: Value = serde_json::from_slice(&vision_raw_bytes)?;
 
-        // [STRICT-CONFIG-ISOLATION] 
-        let mut vl_config: Qwen3VLConfig = if baking_only {
-            // In Baking mode, we ONLY care about the text model's own parameters.
-            let mut cfg: Qwen3VLConfig = serde_json::from_value(text_json.clone())?;
-            cfg.text_config = Some(serde_json::from_value(text_json)?);
-            cfg
+        // [ROBUST-CONFIG] Merge configurations: Text params from 0.6B, Vision params from 2B
+        let mut vl_config: Qwen3VLConfig = if vision_json.get("text_config").is_some() {
+            serde_json::from_value(vision_json)?
         } else {
-            // In Inference mode, we use 2B's structure but override with 0.6B's text params.
-            let mut cfg: Qwen3VLConfig = if vision_json.get("text_config").is_some() {
-                serde_json::from_value(vision_json)?
-            } else {
-                serde_json::from_value(vision_json.clone())?
-            };
-            
-            let correct_text_config = if text_json.get("text_config").is_some() {
-                 serde_json::from_value(text_json.get("text_config").unwrap().clone())?
-            } else {
-                 // Flat config (0.6B style)
-                 crate::models::qwen3vl::config::Qwen3VLTextConfig {
-                    hidden_size: text_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(1024) as usize,
-                    intermediate_size: text_json.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(3072) as usize,
-                    num_hidden_layers: text_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(28) as usize,
-                    num_attention_heads: text_json.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
-                    num_key_value_heads: text_json.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
-                    head_dim: text_json.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
-                    rms_norm_eps: text_json.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6),
-                    rope_theta: text_json.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1000000.0) as f32,
-                    vocab_size: text_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(151936) as usize,
-                    max_position_embeddings: text_json.get("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(40960) as usize,
-                    dtype: text_json.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    rope_scaling: None,
-                }
-            };
-            cfg.text_config = Some(correct_text_config);
-            cfg
+            // Fallback for flat config, but we must override text params
+            serde_json::from_value(vision_json.clone())?
         };
+
+        // OVERRIDE text_config with the actual 0.6B parameters
+        let correct_text_config = if text_json.get("text_config").is_some() {
+             serde_json::from_value(text_json.get("text_config").unwrap().clone())?
+        } else {
+             // Flat config (0.6B style)
+             crate::models::qwen3vl::config::Qwen3VLTextConfig {
+                hidden_size: text_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(1024) as usize,
+                intermediate_size: text_json.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(3072) as usize,
+                num_hidden_layers: text_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(28) as usize,
+                num_attention_heads: text_json.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
+                num_key_value_heads: text_json.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
+                head_dim: text_json.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
+                rms_norm_eps: text_json.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6),
+                rope_theta: text_json.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1000000.0) as f32,
+                vocab_size: text_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(151936) as usize,
+                max_position_embeddings: text_json.get("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(40960) as usize,
+                dtype: text_json.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                rope_scaling: None,
+            }
+        };
+        
+        vl_config.text_config = Some(correct_text_config);
         
         // Ensure hidden_size at root matches text config for consistency
         vl_config.hidden_size = Some(vl_config.text_config.as_ref().unwrap().hidden_size);
@@ -185,53 +175,30 @@ impl Qwen3VLGenerateModel {
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>) -> Result<String> {
         let mut seqlen_offset = self.get_kv_len();
-        println!("[DIAG] Start Generate. Current KV Cache Offset: {}", seqlen_offset);
+        println!("[GENERATE] Initial KV Offset: {}", seqlen_offset);
 
-        // [RAW-BYPASS] 
-        let mes_render_default = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info_native(&mes, &mes_render_default)?;
-
-        let input_text = if let Some(ChatCompletionRequestMessage::User(u)) = mes.messages.last() {
-            match &u.content {
-                ChatCompletionRequestUserMessageContent::String(s) if s.contains("<|im_start|>") => s.clone(),
-                _ => input.replace_text.clone()
-            }
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
+        let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
+        
+        // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
+        // [FIX] Distinguish between Resume (same prompt) and Relay (new suffix prompt)
+        let mut local_pos = if seqlen_offset > 0 && seqlen_offset < all_ids.len() {
+             // Case A: Resuming within the same long prompt
+             println!("[SKIP-PREFILL] Context matching. Resuming from token {}/{}", seqlen_offset, all_ids.len());
+             seqlen_offset
+        } else if seqlen_offset > 0 {
+             // Case B: Relay mode. Current prompt is a new instruction to be added AFTER baked KV.
+             println!("[SKIP-PREFILL] Relay mode. Appending new prompt ({} tokens) at offset {}", all_ids.len(), seqlen_offset);
+             0 
         } else {
-            input.replace_text.clone()
+             0
         };
 
-        let all_ids = self.tokenizer.text_encode_vec(input_text, false)?;
-        
-        if all_ids.len() > 10 {
-            println!("[DIAG] Current Prompt Fingerprint (first 10): {:?}", &all_ids[..10]);
-        }
-        println!("[DIAG] Total Tokens in this request: {}", all_ids.len());
-
-        // [RESUME-LOGIC] Determine if we can skip prefill based on existing KV cache
-        let mut local_pos = 0;
-        if seqlen_offset > 0 {
-            if seqlen_offset < all_ids.len() {
-                // Scenario: We have partial context (e.g. baked PUG + System Prompt).
-                // We skip what is already in VRAM and process only the new user suffix.
-                println!("[DIAG] Perfect Match Detected. Skipping {} baked tokens. Remaining: {}", seqlen_offset, all_ids.len() - seqlen_offset);
-                local_pos = seqlen_offset;
-            } else {
-                // Scenario: Unexpected offset (e.g. cache is larger than prompt)
-                // Fallback: Clear and restart to be safe, or treat as relay.
-                println!("[DIAG] Cache Offset ({}) >= Total Tokens ({}). Restarting Prefill.", seqlen_offset, all_ids.len());
-                self.clear_kv_cache();
-                seqlen_offset = 0;
-                local_pos = 0;
-            }
-        } else {
-            println!("[DIAG] Fresh Start (No Cache). Prefilling {} tokens.", all_ids.len());
-        }
-
-        let prefill_start = std::time::Instant::now();
         let prefill_chunk_size = 512;
         while local_pos < all_ids.len() {
             let remaining = all_ids.len() - local_pos;
-            if remaining <= 1 { break; } 
+            if remaining <= 1 { break; } // Keep the last token for generation trigger
             
             let chunk_size = remaining.min(prefill_chunk_size);
             let end = (local_pos + chunk_size).min(all_ids.len() - 1);
@@ -241,23 +208,11 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
             }
 
-            // [BATCH-ACCELERATION] Process the entire chunk at once for maximum speed
-            match &mut self.qwen3_vl {
-                ModelVariant::Native(m) => m.forward_kv_only(chunk, seqlen_offset),
-            }
+            self.qwen3_vl.forward(chunk, None, None, seqlen_offset);
             
-            seqlen_offset += chunk.len();
-            local_pos += chunk.len();
-        }
-        
-        // Final token always gets a full forward pass to start generation
-        if local_pos < all_ids.len() {
-            let last_id = all_ids[all_ids.len() - 1];
-            self.qwen3_vl.forward(&[last_id], None, None, seqlen_offset);
-        }
-
-        if all_ids.len() > 1 {
-            println!("[DIAG] Total Suffix Batch Ingestion took {}ms", prefill_start.elapsed().as_millis());
+            let processed = chunk.len();
+            local_pos += processed;
+            seqlen_offset += processed;
         }
 
         let mut generated_text = String::new();
@@ -366,25 +321,19 @@ impl Qwen3VLGenerateModel {
         
         let mut master_k: Vec<u32> = Vec::new();
         let mut master_v: Vec<f16> = Vec::new();
-        let mut current_offset = 0;
 
         for chunk in all_ids.chunks(512) {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
             }
             
-            // [FIX] Pass incremental offset to ensure correct Positional Embeddings
-            self.qwen3_vl.forward(chunk, None, None, current_offset);
+            self.qwen3_vl.forward(chunk, None, None, 0);
             
             let ModelVariant::Native(m) = &self.qwen3_vl;
             if let Some((k, v)) = m.text_model.layers[0].get_kv_data(m.text_model.config.head_dim, m.text_model.config.num_key_value_heads) {
-                // We only want the NEW tokens' KV from this forward pass
-                // But forward() appends to cache. However, since we call clear_kv_cache() 
-                // at the end of the loop, get_kv_data() will return exactly the current chunk.
                 master_k.extend(k); master_v.extend(v);
             }
             self.clear_kv_cache();
-            current_offset += chunk.len();
         }
 
         if !master_k.is_empty() {
@@ -467,59 +416,45 @@ impl Qwen3VLGenerateModel {
                     let st = safetensors::SafeTensors::deserialize(&file)?;
                     
                     if let (Ok(kt), Ok(vt)) = (st.tensor("layer.0.k"), st.tensor("layer.0.v")) {
-                        let k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
-                        let v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
+                        let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                        let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
                         
-                        let packed_head_dim = target_head_dim / 32; // 4
-                        let mut final_k = Vec::new();
-                        let mut final_v = Vec::new();
-
-                        // [STRICT-PARITY] 0.6B(Small) -> 2B(Large) Semantic Bridge
-                        let s_head_dim = 64; 
-                        let s_n_kv = 2; // Assuming 0.6B has 2 KV heads
-                        let s_packed_dim = s_head_dim / 32; // 2
-
-                        let s_k_per_token = s_n_kv * s_packed_dim; // 4
-                        let s_v_per_token = s_n_kv * s_head_dim;   // 128
-
-                        if k_data.len() % s_k_per_token == 0 && v_data.len() % s_v_per_token == 0 {
-                            let total_tokens = k_data.len() / s_k_per_token;
-                            println!("[KV-STITCH] Expanding {} tokens: 0.6B(Small) -> 2B(Large) Head-Aware Mapping.", total_tokens);
+                        // [DYNAMIC-DIMENSION-MATCHING] Calculate source dim from shape
+                        // kt.shape() is [total_units], where each unit is 32 bits of one token's KV dim.
+                        // vt.shape() is [total_elements], where each element is 16 bits of one token's KV dim.
+                        // tokens = vt.shape[0] / source_kv_dim.
+                        // So, source_kv_dim = vt.shape[0] / (kt.shape[0] * 32 / source_kv_dim) ... wait.
+                        // Simpler: source_kv_dim = (kt.shape[0] * 32) / (vt.shape[0] / source_kv_dim)
+                        // Actually, source_kv_dim is just (bits per token). 
+                        // Each token has (source_kv_dim / 32) u32s.
+                        let source_tokens = v_data.len() / (k_data.len() * 32 / v_data.len()).max(1); // Rough estimate
+                        let source_dim = v_data.len() / (if source_tokens == 0 { 1 } else { v_data.len() / (k_data.len() * 32 / (v_data.len() / k_data.len().max(1) * 32).max(1)).max(1) }).max(1);
+                        
+                        // Let's use a more robust way: Qwen 0.5B/0.6B is 1024, 1.5B/2B is 2048 or 1024 depending on GQA.
+                        // Based on shapes: source_dim = (v_data.len() / num_tokens).
+                        // Since we know k_data.len() * 32 == v_data.len() * (something), 
+                        // and for bit-serial it's 1 bit per value: source_dim = v_data.len() / (k_data.len() * 32 / v_data.len())
+                        let actual_source_dim = if k_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
+                        
+                        if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
+                            let ratio = target_dim / actual_source_dim;
+                            println!("[KV-UPscale] Scaling context: {} -> {} (Ratio: {})", actual_source_dim, target_dim, ratio);
                             
-                            for t in 0..total_tokens {
-                                let kc = &k_data[t * s_k_per_token .. (t+1) * s_k_per_token];
-                                let vc = &v_data[t * s_v_per_token .. (t+1) * s_v_per_token];
-
-                                // 1. 먼저 소스의 Head들을 128차원으로 각각 확장
-                                let mut expanded_heads_k = Vec::with_capacity(s_n_kv * packed_head_dim);
-                                let mut expanded_heads_v = Vec::with_capacity(s_n_kv * target_head_dim);
-                                
-                                for h in 0..s_n_kv {
-                                    let kh = &kc[h * s_packed_dim .. (h+1) * s_packed_dim];
-                                    let vh = &vc[h * s_head_dim .. (h+1) * s_head_dim];
-                                    
-                                    // Dimension Doubling (64 -> 128)
-                                    expanded_heads_k.extend_from_slice(kh);
-                                    expanded_heads_k.extend_from_slice(kh);
-                                    expanded_heads_v.extend_from_slice(vh);
-                                    expanded_heads_v.extend_from_slice(vh);
-                                }
-
-                                // 2. 타겟 모델의 Head 수(target_n_kv)에 맞춰 순환 할당 (Cycling)
-                                for h_idx in 0..target_n_kv {
-                                    let src_h = h_idx % s_n_kv;
-                                    final_k.extend_from_slice(&expanded_heads_k[src_h * packed_head_dim .. (src_h + 1) * packed_head_dim]);
-                                    final_v.extend_from_slice(&expanded_heads_v[src_h * target_head_dim .. (src_h + 1) * target_head_dim]);
-                                }
+                            let mut new_k = Vec::with_capacity(k_data.len() * ratio);
+                            let mut new_v = Vec::with_capacity(v_data.len() * ratio);
+                            
+                            for chunk in k_data.chunks_exact(actual_source_dim / 32) {
+                                for _ in 0..ratio { new_k.extend_from_slice(chunk); }
                             }
-                        } else {
-                            println!("[KV-STITCH] Warning: 0.6B format mismatch. Falling back to direct replication.");
-                            final_k = k_data;
-                            final_v = v_data;
+                            for chunk in v_data.chunks_exact(actual_source_dim) {
+                                for _ in 0..ratio { new_v.extend_from_slice(chunk); }
+                            }
+                            k_data = new_k;
+                            v_data = new_v;
                         }
                         
-                        combined_k.extend(final_k);
-                        combined_v.extend(final_v);
+                        combined_k.extend(k_data);
+                        combined_v.extend(v_data);
                     }
                 }
 
@@ -530,19 +465,17 @@ impl Qwen3VLGenerateModel {
                     let total_tokens = (combined_k.len() * 32) / target_dim;
                     println!("[KV-STITCH] Loaded {} tokens. Dropping last token for re-evaluation parity.", total_tokens);
                     
-                    if total_tokens > 0 {
-                        let tokens_to_keep = if total_tokens > 1 { total_tokens - 1 } else { total_tokens };
+                    if total_tokens > 1 {
+                        let tokens_to_keep = total_tokens - 1;
                         let k_keep = tokens_to_keep * (target_dim / 32);
                         let v_keep = tokens_to_keep * target_dim;
-                        
-                        // Only truncate if we actually have more than we need
-                        if combined_k.len() > k_keep { combined_k.truncate(k_keep); }
-                        if combined_v.len() > v_keep { combined_v.truncate(v_keep); }
+                        combined_k.truncate(k_keep);
+                        combined_v.truncate(v_keep);
                         
                         println!("[KV-STITCH] Replicating {} tokens across all available layers.", tokens_to_keep);
                         m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
                     } else {
-                        println!("[KV-STITCH] Token calculation resulted in 0. Clearing cache.");
+                        println!("[KV-STITCH] Only 1 token found, clearing cache for full prefill.");
                         m.text_model.clear_kv_cache();
                     }
                     

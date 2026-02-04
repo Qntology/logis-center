@@ -105,40 +105,32 @@ pub fn pack_f16_to_bits(src: &[f16]) -> Vec<u32> {
 }
 
 #[cfg(feature = "cuda")]
-pub fn native_bit_serial_attn_gpu_buffered(
-    q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, h_d: usize, t_s: usize, dev: usize,
-    d_q: CUdeviceptr, d_o: CUdeviceptr
-) -> Vec<f16> {
+pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, h_d: usize, t_s: usize, dev: usize) -> Vec<f16> {
     unsafe {
         let lib = lib();
+        let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         
-        // 1. Prepare Q on GPU (F32 conversion)
-        let q_f32: Vec<f32> = if q.len() > 1024 {
-            q.par_iter().map(|v| v.to_f32()).collect()
-        } else {
-            q.iter().map(|v| v.to_f32()).collect()
-        };
+        // Parallel conversion f16 -> f32
+        let q_f32: Vec<f32> = q.par_iter().map(|v| v.to_f32()).collect();
+        lib.cuMemAlloc_v2(&mut d_q, q.len() * 4); 
         lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
         
-        // 2. Execute Kernel (Shared memory allocated based on context length t_s)
-        // [SAFETY] Qwen3 usually has h_d=128. sc = 1/sqrt(128).
-        let scale = 1.0 / (h_d as f32).sqrt();
-        bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, scale, dev as i32);
+        lib.cuMemAlloc_v2(&mut d_o, q.len() * 4);
         
-        // 3. Copy Result back to Host
+        bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32);
+        
         let mut o_f = vec![0.0f32; q.len()]; 
         lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);
         
-        if o_f.len() > 1024 {
-            o_f.into_par_iter().map(f16::from_f32).collect()
-        } else {
-            o_f.into_iter().map(f16::from_f32).collect()
-        }
+        lib.cuMemFree_v2(d_q); 
+        lib.cuMemFree_v2(d_o);
+        
+        // Parallel conversion f32 -> f16
+        o_f.into_par_iter().map(f16::from_f32).collect()
     }
 }
 
-// Old function removed to force usage of buffered version for performance.
-
+#[cfg(feature = "cuda")]
 pub fn bit_serial_matmul_gpu_buffered(
     i: &[f16], w: &NativeTensor, s: &NativeTensor, 
     m: usize, n: usize, k: usize, dev: usize,
