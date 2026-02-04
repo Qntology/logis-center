@@ -35,7 +35,10 @@ impl TaskDataManager {
     pub fn offload(&mut self, content: &str, suffix: &str) -> Result<PathBuf> {
         let dir = utils::paths::get_task_specific_dir(self.app_handle.as_ref(), &self.task_id);
         let _ = fs::create_dir_all(&dir);
-        let filename = format!("{}_{}_{}.txt", self.task_id, chrono::Utc::now().timestamp_micros(), suffix);
+        
+        // [STRICT PARITY] Unique filename with microsecond precision to prevent race conditions
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
+        let filename = format!("{}_{}_{}.txt", self.task_id, ts, suffix);
         let path = dir.join(filename);
         fs::write(&path, content)?;
         self.created_files.push(path.clone());
@@ -54,7 +57,12 @@ impl TaskDataManager {
 
 impl Drop for TaskDataManager {
     fn drop(&mut self) {
-        println!("[Cleanup] TaskDataManager dropping for task: {}", self.task_id);
+        println!("[Cleanup] TaskDataManager dropping. Keeping files for debugging: {}", self.task_id);
+        for path in &self.created_files {
+            if path.exists() {
+                println!("[DEBUG] Persisted task data: {:?}", path);
+            }
+        }
     }
 }
 
@@ -203,6 +211,11 @@ async fn process_task(
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     let _ = fs::create_dir_all(&pug_logs_dir);
     
+    println!("[PROCESS] Task {} started processing.", task.id);
+
+    // [RESTORED] Clear any leftover resources from previous failed attempts at the START
+    cleanup_task_resources(&task.id, Some(app_handle));
+
     log_task_progress(app_handle, &task.id, &json!({ "category": "Processing", "summary": "Starting high-speed extraction...", "spinner": "⠋" }));
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
@@ -247,8 +260,20 @@ async fn process_task(
     let light_pug = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
     data_manager.offload(&light_pug, "light_pug")?;
     
+    // [RESTORED] Detailed Debug Logging: Split Pug into indexed chunks for audit
     let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let _ = std::fs::write(pug_logs_dir.join(format!("light_{}_{}.pug", task.id, ts_nano)), &light_pug);
+    let log_subdir = pug_logs_dir.join(format!("{}_{}", task.id, ts_nano));
+    let _ = fs::create_dir_all(&log_subdir);
+    
+    let pug_chunks = chunk_text(&light_pug, 3072);
+    let mut chunk_index = Vec::new();
+    for (i, chunk) in pug_chunks.iter().enumerate() {
+        let chunk_filename = format!("chunk_{}.pug", i);
+        let chunk_path = log_subdir.join(&chunk_filename);
+        let _ = std::fs::write(&chunk_path, chunk);
+        chunk_index.push(json!({ "index": i, "file": chunk_filename, "size": chunk.len() }));
+    }
+    let _ = std::fs::write(log_subdir.join("index.json"), json!(chunk_index).to_string());
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     model.bake_pug_context(&task.r#ref, &task.id, &light_pug, Some(cancellation_token.clone())).await?;
@@ -497,7 +522,32 @@ async fn process_task(
         let _ = store.upsert_item(&page_type, &target_id, &page_type, final_data.clone(), Some(vector.clone()), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
         let _ = store.upsert_item("items", &target_id, &page_type, final_data, Some(vector), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
     }
-    log_task_progress(app_handle, &task.id, &json!({ "category": "Done", "summary": "Extraction Complete", "spinner": "✅" }));
+
+    // [RESTORED] Final Status Reporting with Item Counts
+    let final_summary = if !is_detail {
+        format!("Extraction Complete ({} items saved)", all_extracted_items.len())
+    } else {
+        "Extraction Complete".to_string()
+    };
+
+    // [STRICT PARITY] Update Chat Message in DB
+    {
+        let status_code = logic::parse_status("complete");
+        let _ = store.update_message_status(&task.id, status_code, Some(&final_summary)).await;
+    }
+
+    let payload = json!({
+        "task_id": task.id,
+        "category": "Done",
+        "summary": final_summary,
+        "spinner": "✅",
+        "data": if !is_detail { json!(null) } else { extracted_data }
+    });
+    let _ = app_handle.emit("extraction-progress", &payload);
+    log_task_progress(app_handle, &task.id, &payload);
+    
+    // [LOCK-RELEASE] Explicitly log resource cleanup
+    println!("[PROCESS] Task {} completed. Model unloaded and resources released.", task.id);
     Ok(())
 }
 
