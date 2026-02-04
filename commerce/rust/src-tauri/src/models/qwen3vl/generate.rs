@@ -445,10 +445,21 @@ impl Qwen3VLGenerateModel {
                     m.text_model.force_free_kv_cache();
                     
                     let total_tokens = (combined_k.len() * 32) / target_dim;
-                    println!("[KV-STITCH] Replicating {} tokens across all available layers.", total_tokens);
+                    println!("[KV-STITCH] Loaded {} tokens. Dropping last token for re-evaluation parity.", total_tokens);
                     
-                    // Replicate across all layers
-                    m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
+                    if total_tokens > 1 {
+                        let tokens_to_keep = total_tokens - 1;
+                        let k_keep = tokens_to_keep * (target_dim / 32);
+                        let v_keep = tokens_to_keep * target_dim;
+                        combined_k.truncate(k_keep);
+                        combined_v.truncate(v_keep);
+                        
+                        println!("[KV-STITCH] Replicating {} tokens across all available layers.", tokens_to_keep);
+                        m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
+                    } else {
+                        println!("[KV-STITCH] Only 1 token found, clearing cache for full prefill.");
+                        m.text_model.clear_kv_cache();
+                    }
                     
                     println!("[KV-STITCH] SUCCESS: Ready for high-speed full-model inference.");
                 }

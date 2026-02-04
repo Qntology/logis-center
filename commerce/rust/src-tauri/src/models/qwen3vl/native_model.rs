@@ -382,6 +382,29 @@ impl NativeLayer {
             *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
         }
     }
+
+    /// [NEW] Direct GPU-to-GPU injection for extremely fast layer replication
+    #[cfg(feature = "cuda")]
+    pub fn inject_gpu_kv_direct(&self, k_src: GpuPtr, v_src: GpuPtr, tokens: usize, n_kv: usize, head_dim: usize) {
+        let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
+        
+        unsafe {
+            let lib = lib();
+            let mut kp: CUdeviceptr = 0;
+            let mut vp: CUdeviceptr = 0;
+            // Allocate full buffer (16k)
+            lib.cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
+            lib.cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
+            
+            // Copy data via DtoD (Device to Device)
+            let k_size = tokens * n_kv * (head_dim / 32) * 4;
+            let v_size = tokens * n_kv * head_dim * 4;
+            lib.cuMemcpyDtoD_v2(kp, k_src.0 as CUdeviceptr, k_size);
+            lib.cuMemcpyDtoD_v2(vp, v_src.0 as CUdeviceptr, v_size);
+            
+            *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
+        }
+    }
 }
 
 pub struct NativeQwen3TextModel {
@@ -433,15 +456,22 @@ impl NativeQwen3TextModel {
         
         #[cfg(feature = "cuda")]
         if self.layers[0].device_id >= 0 {
-            println!("[GPU-BATCH-UPLOAD] Converting KV to f32 once for {} layers...", self.layers.len());
+            println!("[GPU-BATCH-UPLOAD] Optimizing PCIe: HtoD once, then DtoD for {} layers...", self.layers.len());
+            
             // 1. Convert to f32 ONCE
             let v_f32: Vec<f32> = v.par_iter().map(|val: &f16| val.to_f32()).collect();
             
-            // 2. Inject to every layer (Alloc & HtoD)
-            for layer in &self.layers {
-                layer.inject_gpu_kv(&k, &v_f32, n_kv, h_d);
+            // 2. Inject to FIRST layer (HtoD)
+            self.layers[0].inject_gpu_kv(&k, &v_f32, n_kv, h_d);
+            
+            // 3. Replicate from Layer 0 to all other layers (DtoD)
+            if let Some((k_src, v_src, tokens)) = *self.layers[0].gpu_kv_cache.lock().unwrap() {
+                for i in 1..self.layers.len() {
+                    self.layers[i].inject_gpu_kv_direct(k_src, v_src, tokens, n_kv, h_d);
+                }
             }
-            println!("[GPU-BATCH-UPLOAD] SUCCESS: All layers ready in VRAM.");
+            
+            println!("[GPU-BATCH-UPLOAD] SUCCESS: All layers ready in VRAM via DtoD.");
             return;
         }
 

@@ -101,7 +101,6 @@ extern "C" {
         dim3 grid((n + 7) / 8, (m + 15) / 16);
         
         bit_serial_matmul_kernel_shuffled<<<grid, block>>>(d_i, d_w, d_s, d_o, m, n, k);
-        cudaDeviceSynchronize();
     }
 
     void bit_serial_attn_cuda_direct(const float* d_q, const uint32_t* d_k, const float* d_v, float* d_o, int n_h, int h_d, int t_s, float scale, int dev) {
