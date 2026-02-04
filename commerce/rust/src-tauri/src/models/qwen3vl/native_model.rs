@@ -44,31 +44,33 @@ impl NativeLinear {
                             let mut res = bit_serial_matmul_gpu_buffered(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o);
                             
                             if let Some(b) = bias { 
-                                let b_cow = b.get_slice::<f16>();
-                                let b_ref = b_cow.as_ref();
-                                for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } } 
+                                unsafe {
+                                    let b_ref = b.get_raw_slice::<f16>();
+                                    for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } } 
+                                }
                             }
                             return res;
                         }
                     }
                 }
 
-                let wp_cow = weight_packed.get_slice::<u32>(); 
-                let s_cow = scales.get_slice::<f16>();
-                let mut out = bit_serial_matmul_f32_extreme(x, wp_cow.as_ref(), s_cow.as_ref(), m, self.out_features, self.in_features);
-                
-                if let Some(b) = bias {
-                    let b_cow = b.get_slice::<f16>();
-                    let b_ref = b_cow.as_ref();
-                    for i in 0..m {
-                        for j in 0..self.out_features {
-                            if i * self.out_features + j < out.len() && j < b_ref.len() {
-                                out[i * self.out_features + j] += b_ref[j].to_f32();
+                unsafe {
+                    let wp_ref = weight_packed.get_raw_slice::<u32>(); 
+                    let s_ref = scales.get_raw_slice::<f16>();
+                    let mut out = bit_serial_matmul_f32_extreme(x, wp_ref, s_ref, m, self.out_features, self.in_features);
+                    
+                    if let Some(b) = bias {
+                        let b_ref = b.get_raw_slice::<f16>();
+                        for i in 0..m {
+                            for j in 0..self.out_features {
+                                if i * self.out_features + j < out.len() && j < b_ref.len() {
+                                    out[i * self.out_features + j] += b_ref[j].to_f32();
+                                }
                             }
                         }
                     }
+                    out.into_iter().map(f16::from_f32).collect()
                 }
-                out.into_iter().map(f16::from_f32).collect()
             }
         }
     }

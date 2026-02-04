@@ -58,6 +58,12 @@ impl NativeTensor {
         }
     }
 
+    /// [OPTIMIZED] Zero-copy access to raw data
+    pub unsafe fn get_raw_slice<T>(&self) -> &[T] {
+        let size = self.shape.iter().product::<usize>();
+        std::slice::from_raw_parts(self.data_ptr as *const T, size)
+    }
+
     #[cfg(feature = "cuda")]
     pub fn move_to_gpu(&mut self, device_id: i32) {
         if self.gpu_ptr.is_some() { return; }
@@ -133,10 +139,13 @@ pub fn bit_serial_matmul_gpu_buffered(
     unsafe {
         let lib = lib();
         
-        // Parallel conversion f16 -> f32
-        let i_f32: Vec<f32> = i.par_iter().map(|v: &f16| v.to_f32()).collect();
+        // [OPTIMIZED-CONVERSION] 
+        let i_f32: Vec<f32> = if m * k > 1024 {
+            i.par_iter().map(|v: &f16| v.to_f32()).collect()
+        } else {
+            i.iter().map(|v: &f16| v.to_f32()).collect()
+        };
         
-        // Transfer to pre-allocated buffer
         lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
         
         let d_w = w.gpu_ptr.expect("Weight must be on GPU").0 as *const u32;
@@ -147,7 +156,11 @@ pub fn bit_serial_matmul_gpu_buffered(
         let mut o_f = vec![0.0f32; m * n]; 
         lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
         
-        o_f.into_par_iter().map(f16::from_f32).collect()
+        if m * n > 1024 {
+            o_f.into_par_iter().map(f16::from_f32).collect()
+        } else {
+            o_f.into_iter().map(f16::from_f32).collect()
+        }
     }
 }
 

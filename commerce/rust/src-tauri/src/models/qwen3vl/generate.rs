@@ -427,12 +427,11 @@ impl Qwen3VLGenerateModel {
 
                 if !combined_k.is_empty() {
                     // [CRITICAL-FIX] Clear any existing GPU cache to force a fresh start with new data.
-                    // This prevents using old 'current_len' (e.g., 200) from previous inference steps.
                     m.text_model.force_free_kv_cache();
                     
-                    println!("[KV-STITCH] Injecting {} tokens into Layer 0.", combined_k.len() / (target_dim / 32));
+                    println!("[KV-STITCH] Injecting {} tokens into Layer 0 only for stability.", combined_k.len() / (target_dim / 32));
                     m.text_model.layers[0].set_kv_data(combined_k, combined_v);
-                    println!("[KV-STITCH] SUCCESS: Context injected. Next forward pass will upload to GPU.");
+                    println!("[KV-STITCH] SUCCESS: Layer 0 context ready.");
                 }
             }
         }
