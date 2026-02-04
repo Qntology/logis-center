@@ -441,16 +441,16 @@ impl Qwen3VLGenerateModel {
                 }
 
                 if !combined_k.is_empty() {
+                    // [CRITICAL-FIX] Clear any existing GPU cache to force a fresh start with new data.
                     m.text_model.force_free_kv_cache();
                     
-                    let num_layers = m.text_model.layers.len();
                     let total_tokens = (combined_k.len() * 32) / target_dim;
-                    println!("[KV-STITCH] Replicating {} total tokens across ALL {} layers.", total_tokens, num_layers);
+                    println!("[KV-STITCH] Batch uploading {} total tokens to all layers.", total_tokens);
                     
-                    for i in 0..num_layers {
-                        m.text_model.layers[i].set_kv_data(combined_k.clone(), combined_v.clone());
-                    }
-                    println!("[KV-STITCH] SUCCESS: Multi-layer Stitching complete.");
+                    // Use the optimized batch upload instead of manual layer-by-layer set
+                    m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
+                    
+                    println!("[KV-STITCH] SUCCESS: Multi-layer Stitching and GPU upload complete.");
                 }
             }
         }

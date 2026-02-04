@@ -3,7 +3,7 @@ use memmap2::Mmap;
 use crate::models::qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig};
 use crate::models::qwen3vl::native_backend::*;
 #[cfg(feature = "cuda")]
-use cudarc::driver::sys::CUdeviceptr;
+use cudarc::driver::sys::{CUdeviceptr, lib};
 use half::f16;
 use safetensors::SafeTensors;
 use anyhow::{Result, anyhow};
@@ -212,27 +212,21 @@ impl NativeLayer {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
                     let cuda_lib = lib();
-                    // Increase to 16384 to support larger web pages (current PUG is ~10k tokens)
-                    cuda_lib.cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
-                    cuda_lib.cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
+                    lib().cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
+                    lib().cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
                 }
                 
-                let mut initial_len = 0;
-                let mut cpu_cache = self.kv_cache.lock().unwrap();
-                if let Some((ck, cv)) = cpu_cache.take() {
-                    initial_len = (ck.len() * 32) / (n_kv * head_dim);
-                    let cv_f32: Vec<f32> = cv.par_iter().map(|val: &f16| val.to_f32()).collect();
-                    unsafe {
-                        let cuda_lib = lib();
-                        let _ = cuda_lib.cuMemcpyHtoD_v2(kp as CUdeviceptr, ck.as_ptr() as *const _, ck.len() * 4);
-                        let _ = cuda_lib.cuMemcpyHtoD_v2(vp as CUdeviceptr, cv_f32.as_ptr() as *const _, cv_f32.len() * 4);
-                    }
-                }
-                (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), initial_len)
+                // Note: Stitched cache is now handled by batch_upload_stitched_cache
+                // so we don't need the individual 'cpu_cache.take()' upload here.
+                (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
 
             let k_packed = pack_f16_to_bits(&k);
-            let v_f32: Vec<f32> = v.iter().map(|val: &f16| val.to_f32()).collect();
+            let v_f32: Vec<f32> = if q_len > 1 {
+                v.par_iter().map(|val: &f16| val.to_f32()).collect()
+            } else {
+                v.iter().map(|val: &f16| val.to_f32()).collect()
+            };
             unsafe {
                 let cuda_lib = lib();
                 let k_offset = current_len * n_kv * (head_dim/32) * 4;
@@ -247,8 +241,11 @@ impl NativeLayer {
             let mut x_at = self.o_proj.forward(&attn_out);
             for i in 0..x_at.len() { x_at[i] += residual[i]; }
             let r_mlp = x_at.clone();
-            let post_ln_weight_cow = self.post_attention_layernorm.get_slice::<f16>();
-            let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
+            
+            let x_n_m = unsafe {
+                let post_ln_weight_ref = self.post_attention_layernorm.get_raw_slice::<f16>();
+                native_rms_norm_f16(&x_at, post_ln_weight_ref, config.rms_norm_eps as f32, hidden_size)
+            };
             
             let (mut gate, up) = if q_len > 1 {
                 rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
@@ -363,6 +360,28 @@ impl NativeLayer {
         let mut cache = self.kv_cache.lock().unwrap();
         *cache = Some((k, v));
     }
+
+    /// [NEW] Direct GPU injection to prevent redundant CPU conversions
+    #[cfg(feature = "cuda")]
+    pub fn inject_gpu_kv(&self, k_data: &[u32], v_data_f32: &[f32], n_kv: usize, head_dim: usize) {
+        let tokens = (k_data.len() * 32) / (n_kv * head_dim);
+        let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
+        
+        unsafe {
+            let lib = lib();
+            let mut kp: CUdeviceptr = 0;
+            let mut vp: CUdeviceptr = 0;
+            // Allocate full buffer (16k)
+            lib.cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
+            lib.cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
+            
+            // Copy data
+            lib.cuMemcpyHtoD_v2(kp, k_data.as_ptr() as *const _, k_data.len() * 4);
+            lib.cuMemcpyHtoD_v2(vp, v_data_f32.as_ptr() as *const _, v_data_f32.len() * 4);
+            
+            *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
+        }
+    }
 }
 
 pub struct NativeQwen3TextModel {
@@ -405,6 +424,31 @@ impl NativeQwen3TextModel {
 
     pub fn force_free_kv_cache(&self) {
         for layer in &self.layers { layer.force_free_kv_cache(); }
+    }
+
+    /// [NEW] Optimized batch upload for stitched cache
+    pub fn batch_upload_stitched_cache(&self, k: Vec<u32>, v: Vec<f16>) {
+        let h_d = self.config.head_dim;
+        let n_kv = self.config.num_key_value_heads;
+        
+        #[cfg(feature = "cuda")]
+        if self.layers[0].device_id >= 0 {
+            println!("[GPU-BATCH-UPLOAD] Converting KV to f32 once for {} layers...", self.layers.len());
+            // 1. Convert to f32 ONCE
+            let v_f32: Vec<f32> = v.par_iter().map(|val: &f16| val.to_f32()).collect();
+            
+            // 2. Inject to every layer (Alloc & HtoD)
+            for layer in &self.layers {
+                layer.inject_gpu_kv(&k, &v_f32, n_kv, h_d);
+            }
+            println!("[GPU-BATCH-UPLOAD] SUCCESS: All layers ready in VRAM.");
+            return;
+        }
+
+        // Fallback for CPU mode
+        for layer in &self.layers {
+            layer.set_kv_data(k.clone(), v.clone());
+        }
     }
 
     pub fn get_kv_len(&self) -> usize {
