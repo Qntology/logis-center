@@ -12,7 +12,7 @@ use cudarc::driver::sys::*;
 #[cfg(feature = "cuda")]
 extern "C" {
     fn bit_serial_matmul_cuda_direct(d_i: *const f32, d_w: *const u32, d_s: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, dev: i32);
-    fn bit_serial_attn_cuda_direct(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32);
+    fn bit_serial_attn_cuda_direct(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, n_kv: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -105,29 +105,49 @@ pub fn pack_f16_to_bits(src: &[f16]) -> Vec<u32> {
 }
 
 #[cfg(feature = "cuda")]
-pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, h_d: usize, t_s: usize, dev: usize) -> Vec<f16> {
+pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr) -> Vec<f16> {
+    unsafe {
+        let lib = lib();
+        let q_len = q.len() / (n_h * h_d);
+        
+        // Parallel conversion f16 -> f32
+        let q_f32: Vec<f32> = if q.len() > 1024 {
+            q.par_iter().map(|v| v.to_f32()).collect()
+        } else {
+            q.iter().map(|v| v.to_f32()).collect()
+        };
+        
+        lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
+        
+        bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, q_len as i32);
+        
+        let mut o_f = vec![0.0f32; q.len()]; 
+        lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);
+        
+        // Parallel conversion f32 -> f16
+        if q.len() > 1024 {
+            o_f.into_par_iter().map(f16::from_f32).collect()
+        } else {
+            o_f.into_iter().map(f16::from_f32).collect()
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize) -> Vec<f16> {
     unsafe {
         let lib = lib();
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         let q_len = q.len() / (n_h * h_d);
         
-        // Parallel conversion f16 -> f32
-        let q_f32: Vec<f32> = q.par_iter().map(|v| v.to_f32()).collect();
         lib.cuMemAlloc_v2(&mut d_q, q.len() * 4); 
-        lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
-        
         lib.cuMemAlloc_v2(&mut d_o, q.len() * 4);
         
-        bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, q_len as i32);
-        
-        let mut o_f = vec![0.0f32; q.len()]; 
-        lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);
+        let res = native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o);
         
         lib.cuMemFree_v2(d_q); 
         lib.cuMemFree_v2(d_o);
-        
-        // Parallel conversion f32 -> f16
-        o_f.into_par_iter().map(f16::from_f32).collect()
+        res
     }
 }
 
@@ -284,7 +304,7 @@ pub fn bit_serial_matmul_f32_extreme(i: &[f16], w: &[u32], s: &[f16], m: usize, 
     bit_serial_matmul_f32_shuffled(i, w, s, m, n, k)
 }
 
-pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usize, n_h: usize, q_l: usize, t_s: usize) -> Vec<f16> {
+pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usize, n_h: usize, n_kv: usize, q_l: usize, t_s: usize) -> Vec<f16> {
     let h_d = hid / n_h; 
     let k_b = (h_d + 31) / 32; 
     let mut o = vec![f16::ZERO; q_l * hid]; 
@@ -310,26 +330,55 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
     // Main Attention Loop with Hardware POPCNT 가속
     o.par_chunks_exact_mut(hid).enumerate().for_each(|(i, out)| {
         for h in 0..n_h {
+            let h_kv = h / (n_h / n_kv);
             let mut scores = vec![0.0f32; t_s];
             let qp_idx = (i * n_h + h) * k_b;
             let qp = &q_p[qp_idx .. qp_idx + k_b];
             
-            for j in 0..t_s {
-                let k_start = (j * n_h + h) * k_b;
-                if k_start + k_b > k_p.len() { continue; }
-                let kj = &k_p[k_start .. k_start + k_b];
-                
-                let mut dot = 0i32;
-                // [STRICT-SIMD] count_ones() compiles to hardware POPCNT instruction
-                for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
-                scores[j] = (dot as f32) * sc;
+            // [AVX2-OPTIMIZED-SCORES]
+            #[cfg(target_arch = "x86_64")]
+            {
+                if is_x86_feature_detected!("avx2") && k_b == 4 { // head_dim 128 (4 * 32)
+                    unsafe {
+                        let qp_v = _mm128_loadu_si128(qp.as_ptr() as *const __m128i);
+                        for j in 0..t_s {
+                            let k_start = (j * n_kv + h_kv) * k_b;
+                            let kj_v = _mm128_loadu_si128(k_p.as_ptr().add(k_start) as *const __m128i);
+                            let xor_v = _mm_xor_si128(qp_v, kj_v);
+                            
+                            // POPCNT for each 32-bit element
+                            let mut dot = 0i32;
+                            let vals: [u32; 4] = std::mem::transmute(xor_v);
+                            for v in vals { dot += 32 - 2 * v.count_ones() as i32; }
+                            scores[j] = (dot as f32) * sc;
+                        }
+                    }
+                } else {
+                    for j in 0..t_s {
+                        let k_start = (j * n_kv + h_kv) * k_b;
+                        let kj = &k_p[k_start .. k_start + k_b];
+                        let mut dot = 0i32;
+                        for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
+                        scores[j] = (dot as f32) * sc;
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                for j in 0..t_s {
+                    let k_start = (j * n_kv + h_kv) * k_b;
+                    let kj = &k_p[k_start .. k_start + k_b];
+                    let mut dot = 0i32;
+                    for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
+                    scores[j] = (dot as f32) * sc;
+                }
             }
             
             let max_s = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
             let mut sum_e = 0.0f32;
             for x in scores.iter_mut() { *x = (*x - max_s).exp(); sum_e += *x; }
             for j in 0..t_s {
-                let v_start = (j * n_h + h) * h_d;
+                let v_start = (j * n_kv + h_kv) * h_d;
                 if v_start + h_d > v_f.len() { continue; }
                 let vj = &v_f[v_start .. v_start + h_d];
                 let s_final = scores[j] / (sum_e + 1e-9f32);
