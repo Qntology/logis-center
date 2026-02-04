@@ -210,11 +210,14 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
             }
 
-            self.qwen3_vl.forward(chunk, None, None, seqlen_offset);
+            // [STABILITY-FIX] Process tokens one-by-one to ensure CUDA kernel compatibility
+            // 18 tokens will take milliseconds, but ensures no KV corruption.
+            for &id in chunk {
+                self.qwen3_vl.forward(&[id], None, None, seqlen_offset);
+                seqlen_offset += 1;
+            }
             
-            let processed = chunk.len();
-            local_pos += processed;
-            seqlen_offset += processed;
+            local_pos += chunk.len();
         }
 
         let mut generated_text = String::new();
@@ -421,28 +424,29 @@ impl Qwen3VLGenerateModel {
                         let k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
                         let v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
                         
-                        let packed_head_dim = target_head_dim / 32; // 128/32 = 4
+                        let packed_head_dim = target_head_dim / 32; // 4
                         let mut final_k = Vec::new();
                         let mut final_v = Vec::new();
 
-                        // [HEAD-BY-HEAD EXPANSION] 이전 Candle 버전의 로직을 Native Bit-serial로 완벽 복원
-                        // 소스 모델(0.6B)의 특징: Head Dim 64, KV Heads 2.
-                        let s_head_dim = 64;
-                        let s_n_kv = 2;
+                        // [STRICT-PARITY] 0.6B(Small) -> 2B(Large) Semantic Bridge
+                        let s_head_dim = 64; 
+                        let s_n_kv = 2; // Assuming 0.6B has 2 KV heads
                         let s_packed_dim = s_head_dim / 32; // 2
 
                         let s_k_per_token = s_n_kv * s_packed_dim; // 4
                         let s_v_per_token = s_n_kv * s_head_dim;   // 128
 
                         if k_data.len() % s_k_per_token == 0 && v_data.len() % s_v_per_token == 0 {
-                            println!("[KV-STITCH] 0.6B(64-dim) -> 2B(128-dim) Structured Expansion Active.");
-                            let k_chunks = k_data.chunks_exact(s_k_per_token);
-                            let v_chunks = v_data.chunks_exact(s_v_per_token);
+                            let total_tokens = k_data.len() / s_k_per_token;
+                            println!("[KV-STITCH] Expanding {} tokens: 0.6B(Small) -> 2B(Large) Head-Aware Mapping.", total_tokens);
+                            
+                            for t in 0..total_tokens {
+                                let kc = &k_data[t * s_k_per_token .. (t+1) * s_k_per_token];
+                                let vc = &v_data[t * s_v_per_token .. (t+1) * s_v_per_token];
 
-                            for (kc, vc) in k_chunks.zip(v_chunks) {
-                                // 1. 먼저 소스의 2개 Head 각각을 128차원으로 확장
-                                let mut expanded_heads_k = Vec::new();
-                                let mut expanded_heads_v = Vec::new();
+                                // 1. 먼저 소스의 Head들을 128차원으로 각각 확장
+                                let mut expanded_heads_k = Vec::with_capacity(s_n_kv * packed_head_dim);
+                                let mut expanded_heads_v = Vec::with_capacity(s_n_kv * target_head_dim);
                                 
                                 for h in 0..s_n_kv {
                                     let kh = &kc[h * s_packed_dim .. (h+1) * s_packed_dim];
@@ -455,7 +459,7 @@ impl Qwen3VLGenerateModel {
                                     expanded_heads_v.extend_from_slice(vh);
                                 }
 
-                                // 2. 타겟 모델의 Head 수(target_n_kv)에 맞춰 순환 할당
+                                // 2. 타겟 모델의 Head 수(target_n_kv)에 맞춰 순환 할당 (Cycling)
                                 for h_idx in 0..target_n_kv {
                                     let src_h = h_idx % s_n_kv;
                                     final_k.extend_from_slice(&expanded_heads_k[src_h * packed_head_dim .. (src_h + 1) * packed_head_dim]);
@@ -463,7 +467,7 @@ impl Qwen3VLGenerateModel {
                                 }
                             }
                         } else {
-                            println!("[KV-STITCH] Data format unknown, falling back to direct copy.");
+                            println!("[KV-STITCH] Warning: 0.6B format mismatch. Falling back to direct replication.");
                             final_k = k_data;
                             final_v = v_data;
                         }
