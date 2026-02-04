@@ -445,12 +445,12 @@ impl Qwen3VLGenerateModel {
                     m.text_model.force_free_kv_cache();
                     
                     let total_tokens = (combined_k.len() * 32) / target_dim;
-                    println!("[KV-STITCH] Batch uploading {} total tokens to all layers.", total_tokens);
+                    println!("[KV-STITCH] Replicating {} tokens across all available layers.", total_tokens);
                     
-                    // Use the optimized batch upload instead of manual layer-by-layer set
+                    // Replicate across all layers
                     m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
                     
-                    println!("[KV-STITCH] SUCCESS: Multi-layer Stitching and GPU upload complete.");
+                    println!("[KV-STITCH] SUCCESS: Ready for high-speed full-model inference.");
                 }
             }
         }

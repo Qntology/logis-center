@@ -346,6 +346,7 @@ impl LogisModel {
         self.unload_generator().await;
 
         // 2. Load 2B Full Model and Stitch [PUG + PROMPT]
+        // [RESTORE] Use full layers for inference to ensure high quality and complete output
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true, Some(address_hash)).await?;
         
         // Load both PUG base and the specific prompt in ONE call to prevent overwriting
