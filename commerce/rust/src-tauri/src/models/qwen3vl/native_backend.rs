@@ -311,7 +311,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
     let sc = 1.0 / (h_d as f32).sqrt();
     
     // [STABILITY] Match GPU fix to prevent signal collapse
-    const KEEP_ALIVE_BIAS: f32 = 0.1f;
+    const KEEP_ALIVE_BIAS: f32 = 0.1f32;
 
     // [2026-CPU-OPTIMIZATION] Pre-pack all Query bits once to avoid redundant work in the loop
     let mut q_p = vec![0u32; q_l * n_h * k_b];

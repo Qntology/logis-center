@@ -284,7 +284,7 @@ impl NativeLayer {
 
             // [OPTIMIZATION] Reuse scratch buffers for Attention
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
-            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.1f);
+            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.1f32);
             
             // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
             if !attn_out.is_empty() && attn_out[0].to_f32() == 0.0 && attn_out.iter().take(50).all(|x| x.to_f32() == 0.0) {
@@ -292,7 +292,7 @@ impl NativeLayer {
                 
                 // [2026-FIX] Apply much stronger bias during recovery to force signal survival
                 if new_len > 1 {
-                     attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.5f);
+                     attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.5f32);
                 }
 
                 if attn_out[0].to_f32() == 0.0 {
