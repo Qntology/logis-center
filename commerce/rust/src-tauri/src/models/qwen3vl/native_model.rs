@@ -598,11 +598,11 @@ impl NativeQwen3VLModel {
                         weight_packed: NativeTensor::from_mmap(vm.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(vm.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                         bias: None,
-                    }, device_id: -1 })
+                    }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) })
                 } else {
                     let v = vst.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) })
                 }
             };
 
