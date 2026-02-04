@@ -80,7 +80,7 @@ impl Qwen3VLGenerateModel {
 
         // [ROBUST-CONFIG] Merge configurations: Text params from 0.6B, Vision params from 2B
         let mut vl_config: Qwen3VLConfig = if vision_json.get("text_config").is_some() {
-            serde_json::from_value(vision_json)?
+            serde_json::from_value(vision_json.clone())?
         } else {
             // Fallback for flat config, but we must override text params
             serde_json::from_value(vision_json.clone())?
@@ -290,7 +290,6 @@ impl Qwen3VLGenerateModel {
         
         // 1. Encode the entire text ONCE
         let all_ids = self.tokenizer.text_encode_vec(text, false)?;
-        let total_tokens = all_ids.len();
         
         let mut master_k: Vec<u32> = Vec::new();
         let mut master_v: Vec<f16> = Vec::new();
@@ -301,7 +300,7 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
             }
 
-            println!("[BAKE-STREAM] Processing chunk {}/{}", chunk_idx + 1, (total_tokens + 511) / 512);
+            println!("[BAKE-STREAM] Processing chunk {}/{}", chunk_idx + 1, (all_ids.len() + 511) / 512);
 
             // Forward Pass (Always from offset 0 because we clear cache every time)
             self.qwen3_vl.forward(chunk, None, None, 0);

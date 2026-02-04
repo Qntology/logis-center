@@ -547,7 +547,20 @@ impl NativeVisionModel {
         }
         
         // 3. Patch Merger
-        self.merger.forward(&x)
+        self.merger.forward(&x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
+            hidden_size: x.len() / patches,
+            intermediate_size: x.len() / patches, // Placeholder
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: x.len() / patches,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            vocab_size: 0,
+            max_position_embeddings: 4096,
+            dtype: None,
+            rope_scaling: None,
+        }, 0, 0)
     }
 }
 
