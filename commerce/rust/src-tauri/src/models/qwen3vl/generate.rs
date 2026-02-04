@@ -429,9 +429,13 @@ impl Qwen3VLGenerateModel {
                     // [CRITICAL-FIX] Clear any existing GPU cache to force a fresh start with new data.
                     m.text_model.force_free_kv_cache();
                     
-                    println!("[KV-STITCH] Injecting {} tokens into Layer 0 only for stability.", combined_k.len() / (target_dim / 32));
-                    m.text_model.layers[0].set_kv_data(combined_k, combined_v);
-                    println!("[KV-STITCH] SUCCESS: Layer 0 context ready.");
+                    let num_layers = m.text_model.layers.len();
+                    println!("[KV-STITCH] Replicating baked context across ALL {} layers.", num_layers);
+                    
+                    for i in 0..num_layers {
+                        m.text_model.layers[i].set_kv_data(combined_k.clone(), combined_v.clone());
+                    }
+                    println!("[KV-STITCH] SUCCESS: Full-layer context injection complete. Ready for No-Prefill inference.");
                 }
             }
         }
