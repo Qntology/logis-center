@@ -69,7 +69,11 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
         if layer_limit is not None and layer_idx >= layer_limit: continue
         if is_vision != ("visual" in name): continue
 
-        if "weight" in name and len(param.shape) == 2 and "norm" not in name and "ln" not in name:
+        is_weight = "weight" in name and len(param.shape) == 2
+        # [CRITICAL] Skip layers that require high precision or are used for lookups
+        should_quantize = is_weight and "norm" not in name and "ln" not in name and "embed" not in name and "patch" not in name
+
+        if should_quantize:
             packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
             final_dict.update({
                 f"{name}.packed": packed,

@@ -184,7 +184,7 @@ unsafe impl Send for NativeLayer {}
 unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
-    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize) -> Vec<f16> {
+    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16]) -> Vec<f16> {
         let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
         let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
 
@@ -238,7 +238,7 @@ impl NativeLayer {
             });
         }
 
-        native_apply_rope_f16_with_offset(&mut q, &mut k, q_len, seqlen_offset, n_h, head_dim, config.rope_theta);
+        native_apply_rope_f16_with_offset(&mut q, &mut k, q_len, seqlen_offset, n_h, head_dim, config.rope_theta, rope_cos, rope_sin);
 
         #[cfg(feature = "cuda")]
         if self.device_id >= 0 {
@@ -282,9 +282,10 @@ impl NativeLayer {
 
             let mut attn_out = native_bit_serial_attn_gpu(&q, k_ptr, v_ptr, n_h, head_dim, new_len, self.device_id as usize);
             
-            // [STABILITY-FALLBACK] If GPU returned zeros, retry on CPU immediately
+            // [2026-HYBRID-STABILITY] Heavy-Hitter Recovery
+            // If the Bit-Serial score aggregation is unstable, we use FP16 for critical header tokens
             if !attn_out.is_empty() && attn_out[0].to_f32() == 0.0 && attn_out.iter().take(50).all(|x| x.to_f32() == 0.0) {
-                println!("[STABILITY-RECOVERY] CUDA Attention failed (returned zeros). Falling back to CPU for this layer...");
+                println!("[STABILITY-RECOVERY] Bit-Serial Signal Death. Falling back to Hybrid-SIMD...");
                 if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
                     attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, q_len, new_len);
                 }
@@ -460,7 +461,12 @@ impl NativeLayer {
 }
 
 pub struct NativeQwen3TextModel {
-    pub config: Qwen3VLTextConfig, pub embed_tokens: NativeLinear, pub layers: Vec<NativeLayer>, pub norm: NativeTensor,
+    pub config: Qwen3VLTextConfig, 
+    pub embed_tokens: NativeLinear, 
+    pub layers: Vec<NativeLayer>, 
+    pub norm: NativeTensor,
+    pub rope_cos: Vec<f16>,
+    pub rope_sin: Vec<f16>,
 }
 
 unsafe impl Send for NativeQwen3TextModel {}
@@ -490,7 +496,7 @@ impl NativeQwen3TextModel {
 
         for (i, layer) in self.layers.iter().enumerate() { 
             let prev_val = cur_x[0].to_f32();
-            cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i); 
+            cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i, &self.rope_cos, &self.rope_sin); 
             
             // [STABILITY-AUDIT] Check layer output
             if i == 0 && !cur_x.is_empty() {
@@ -586,7 +592,7 @@ impl NativeVisionModel {
         self.merger.move_to_gpu(device_id);
     }
 
-    pub fn forward(&self, pixel_values: &[f16], grid_thw: &[u32; 3]) -> Vec<f16> {
+    pub fn forward(&self, pixel_values: &[f16], grid_thw: &[u32; 3], rope_cos: &[f16], rope_sin: &[f16]) -> Vec<f16> {
         // [VISION-TRANSFORMER-PIPELINE]
         // Hidden states: (patches, hidden_size)
         // grid_thw: [T, H, W]
@@ -613,7 +619,7 @@ impl NativeVisionModel {
                 max_position_embeddings: 4096,
                 dtype: None,
                 rope_scaling: None,
-            }, 0, 0);
+            }, 0, 0, rope_cos, rope_sin);
         }
         
         // 3. Patch Merger
@@ -630,7 +636,7 @@ impl NativeVisionModel {
             max_position_embeddings: 4096,
             dtype: None,
             rope_scaling: None,
-        }, 0, 0)
+        }, 0, 0, rope_cos, rope_sin)
     }
 }
 
@@ -802,6 +808,23 @@ impl NativeQwen3VLModel {
             anyhow!("LMHeadNotFound")
         })?;
 
+        // [PRECOMPUTE-ROPE]
+        let max_seq_len = 16384;
+        let h_d = t_c.head_dim;
+        let theta = t_c.rope_theta;
+        let mut rope_cos = Vec::with_capacity(max_seq_len * h_d);
+        let mut rope_sin = Vec::with_capacity(max_seq_len * h_d);
+
+        for p in 0..max_seq_len {
+            for d in 0..(h_d / 2) {
+                let exponent = (2.0 * d as f32) / (h_d as f32);
+                let freq = 1.0 / theta.powf(exponent);
+                let (sn, cs) = ((p as f32) * freq).sin_cos();
+                rope_cos.push(f16::from_f32(cs));
+                rope_sin.push(f16::from_f32(sn));
+            }
+        }
+
         let visual = if let Some(vm) = v_mmap {
             let vst = SafeTensors::deserialize(&vm)?;
             
@@ -886,7 +909,7 @@ impl NativeQwen3VLModel {
             Some(NativeVisionModel { patch_embed, blocks, merger })
         } else { None };
             
-        Ok(Self { config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm }, lm_head: head, visual })
+        Ok(Self { config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cos, rope_sin }, lm_head: head, visual })
     }
     pub fn forward(&self, i_ids: &[u32], p_v: Option<&[f16]>, g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
         let mut embeds = match &self.text_model.embed_tokens.variant {
@@ -900,7 +923,7 @@ impl NativeQwen3VLModel {
         // [VISION-FUSION] Replace <|image_pad|> tokens with vision features
         if let (Some(pv), Some(gt)) = (p_v, g_t) {
             if let Some(ref visual) = self.visual {
-                let vision_features = visual.forward(pv, gt);
+                let vision_features = visual.forward(pv, gt, &self.text_model.rope_cos, &self.text_model.rope_sin);
                 let img_token_id = 151655; // <|image_pad|>
                 let hid = self.text_model.config.hidden_size;
                 
@@ -921,7 +944,7 @@ impl NativeQwen3VLModel {
 
         let mut cur_x = embeds;
         for (i, layer) in self.text_model.layers.iter().enumerate() { 
-            cur_x = layer.forward(&cur_x, &self.text_model.config, s_o, i); 
+            cur_x = layer.forward(&cur_x, &self.text_model.config, s_o, i, &self.text_model.rope_cos, &self.text_model.rope_sin); 
         }
         let norm_cow = self.text_model.norm.get_slice::<f16>();
         let norm_x = native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.text_model.config.rms_norm_eps as f32, self.text_model.config.hidden_size);

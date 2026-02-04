@@ -49,65 +49,80 @@ __global__ void bit_serial_matmul_kernel_shuffled(
     output[m * N + n] = sum * scale[n];
 }
 
-// [OPTIMIZATION] Bit-serial Attention Kernel (Supports Multi-token Prefill)
-__global__ void bit_serial_attn_kernel_shuffled(
-    const float* __restrict__ Q,        // [seq_len, head_dim]
-    const uint32_t* __restrict__ K_p,   // [total_kv_len, head_dim/32] (Packed)
-    const float* __restrict__ V,        // [total_kv_len, head_dim]
-    float* __restrict__ O,              // [seq_len, head_dim]
+// [2026-OPTIMIZATION] Fused Bit-Flash Attention Kernel
+// Uses Warp-Shuffle for zero-latency reduction and Shared-Memory for Q-bit caching
+__global__ void bit_serial_attn_kernel_optimized(
+    const float* __restrict__ Q,        
+    const uint32_t* __restrict__ K_p,   
+    const float* __restrict__ V,        
+    float* __restrict__ O,              
     int n_h, int h_d, int t_s, float sc, int q_len
 ) {
-    int q_idx = blockIdx.x; // Token index in current query
-    int h = blockIdx.y;     // Head index
+    int q_idx = blockIdx.x; 
+    int h = blockIdx.y;     
+    int tid = threadIdx.x;
     if (q_idx >= q_len || h >= n_h) return;
 
-    // Shared memory for softmax scores [t_s]. Must be allocated dynamically.
     extern __shared__ float s_scores[]; 
+    __shared__ uint32_t s_q_bits[8]; // Up to 256 dims
 
     int k_b = (h_d + 31) / 32;
     
-    // 1. Compute Dot Product (Q[q_idx] * K)
-    for (int j = threadIdx.x; j < t_s; j += blockDim.x) {
-        uint32_t q_bits[8]; // Max head_dim 256
+    // 1. Parallel Q-Packing (Only once per block)
+    if (tid < k_b) {
+        uint32_t bts = 0;
+        for (int b = 0; b < 32; ++b) {
+            int dim_idx = tid * 32 + b;
+            if (dim_idx < h_d) {
+                if (Q[(q_idx * n_h * h_d) + (h * h_d) + dim_idx] >= 0.0f) bts |= (1u << b);
+            }
+        }
+        s_q_bits[tid] = bts;
+    }
+    __syncthreads();
+
+    // 2. Cooperative Score Calculation
+    float thread_max = -1e20f;
+    for (int j = tid; j < t_s; j += blockDim.x) {
+        int dot = 0;
         #pragma unroll
         for (int kb = 0; kb < k_b; ++kb) {
-            uint32_t bts = 0;
-            for (int b = 0; b < 32; ++b) {
-                int dim_idx = kb * 32 + b;
-                if (dim_idx < h_d) {
-                    if (Q[(q_idx * n_h * h_d) + (h * h_d) + dim_idx] >= 0.0f) bts |= (1u << b);
-                }
-            }
-            q_bits[kb] = bts;
+            dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_p[(j * n_h + h) * k_b + kb]));
         }
-
-        int dot = 0;
-        for (int kb = 0; kb < k_b; ++kb) {
-            uint32_t kj = K_p[(j * n_h + h) * k_b + kb];
-            dot += (32 - 2 * __popc(q_bits[kb] ^ kj));
-        }
-        s_scores[j] = (float)dot * sc;
+        float score = (float)dot * sc;
+        s_scores[j] = score;
+        thread_max = fmaxf(thread_max, score);
     }
-    __syncthreads();
 
-    // 2. Softmax
-    float max_s = -1e20f;
-    for (int j = 0; j < t_s; ++j) if (s_scores[j] > max_s) max_s = s_scores[j];
+    // 3. Warp-Level Max Reduction
+    for (int offset = 16; offset > 0; offset /= 2)
+        thread_max = fmaxf(thread_max, __shfl_down_sync(0xFFFFFFFF, thread_max, offset));
     
-    float sum_e = 0.0f;
-    for (int j = 0; j < t_s; ++j) {
-        s_scores[j] = expf(s_scores[j] - max_s);
-        sum_e += s_scores[j];
-    }
-    float inv_sum = 1.0f / (sum_e + 1e-9f);
-    for (int j = 0; j < t_s; ++j) s_scores[j] *= inv_sum;
+    __shared__ float block_max;
+    if (tid == 0) block_max = thread_max;
     __syncthreads();
 
-    // 3. Weighted Sum (Score * V)
-    for (int d = threadIdx.x; d < h_d; d += blockDim.x) {
+    // 4. Parallel Softmax Exp and Sum
+    float thread_sum = 0.0f;
+    for (int j = tid; j < t_s; j += blockDim.x) {
+        float e = expf(s_scores[j] - block_max);
+        s_scores[j] = e;
+        thread_sum += e;
+    }
+
+    for (int offset = 16; offset > 0; offset /= 2)
+        thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+
+    __shared__ float block_sum;
+    if (tid == 0) block_sum = thread_sum + 1e-9f;
+    __syncthreads();
+
+    // 5. Weighted Sum (Score * V) with Coalesced memory access
+    float inv_block_sum = 1.0f / block_sum;
+    for (int d = tid; d < h_d; d += blockDim.x) {
         float out_val = 0.0f;
         for (int j = 0; j < t_s; ++j) {
-            out_val += s_scores[j] * V[(j * n_h + h) * h_d + d];
+            out_val += (s_scores[j] * inv_block_sum) * V[(j * n_h + h) * h_d + d];
         }
         O[(q_idx * n_h * h_d) + (h * h_d) + d] = out_val;
     }
@@ -116,20 +131,16 @@ __global__ void bit_serial_attn_kernel_shuffled(
 extern "C" {
     void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {
         cudaSetDevice(dev);
-        
         dim3 block(8, 16); 
         dim3 grid((n + 7) / 8, (m + 15) / 16);
-        
         bit_serial_matmul_kernel_shuffled<<<grid, block>>>(d_i, d_w, d_s, d_o, m, n, k);
     }
 
     void bit_serial_attn_cuda_direct(const float* d_q, const uint32_t* d_k, const float* d_v, float* d_o, int n_h, int h_d, int t_s, float scale, int dev, int q_len) {
         cudaSetDevice(dev);
-        
         dim3 block(256); 
         dim3 grid(q_len, n_h); 
         size_t shared_mem = t_s * sizeof(float);
-        
-        bit_serial_attn_kernel_shuffled<<<grid, block, shared_mem>>>(d_q, (const uint32_t*)d_k, d_v, d_o, n_h, h_d, t_s, scale, q_len);
+        bit_serial_attn_kernel_optimized<<<grid, block, shared_mem>>>(d_q, (const uint32_t*)d_k, d_v, d_o, n_h, h_d, t_s, scale, q_len);
     }
 }

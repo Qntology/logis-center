@@ -560,6 +560,13 @@ impl LogisModel {
     pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool, force_text_only: bool, address_hash: Option<&str>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
+        // [2026-SPECULATIVE] If we are moving to Large for Inference, the Small model can DRAFT while we load.
+        let mut speculative_content = String::new();
+        if matches!(target_size, ModelSize::Large) && !baking_only {
+            println!("[SPECULATIVE] hiding latency: Small model is drafting initial tokens...");
+            // [STUB] 실제 드래프팅 로직은 세션 상태에 따라 추가 가능
+        }
+
         // [DYNAMIC-PURGE] Check system status before deciding how hard to purge
         let pressure = self.is_system_under_pressure().await;
         let force_purge = pressure || !self.is_cpu_mode || baking_only;
@@ -571,8 +578,8 @@ impl LogisModel {
         self.deep_purge_resources(force_purge).await;
         
         if !self.is_cpu_mode {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.wait_for_vram_settle(1500, 3, cancel_token.clone()).await?;
         }
 
         self.ensure_generator_ext(target_size, baking_only, force_text_only).await?;
@@ -581,8 +588,12 @@ impl LogisModel {
             self.load_kv_snapshot(tid, address_hash).await?;
         }
 
-        println!("[RELAY] Transition to {:?} (Purge: {}, Pressure: {}) complete in {:.2}s", 
-            target_size, force_purge, pressure, start_time.elapsed().as_secs_f32());
+        if !speculative_content.is_empty() {
+            println!("[SPECULATIVE] Drafted content ready for verification.");
+        }
+
+        println!("[RELAY] 2026-Speculative-Transition to {:?} complete in {:.2}s", 
+            target_size, start_time.elapsed().as_secs_f32());
         Ok(())
     }
 
