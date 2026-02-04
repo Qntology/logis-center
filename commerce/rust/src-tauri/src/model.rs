@@ -348,9 +348,8 @@ impl LogisModel {
         // 2. Load 2B Full Model and Stitch [PUG + PROMPT]
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true, Some(address_hash)).await?;
         
-        // Load from the address-specific folder
-        self.load_stitched_kv(address_hash, task_id, &["pug_base"]).await?;
-        self.load_stitched_kv(address_hash, task_id, &[&format!("prompt_{}", prompt_name)]).await?;
+        // Load both PUG base and the specific prompt in ONE call to prevent overwriting
+        self.load_stitched_kv(address_hash, task_id, &["pug_base", &format!("prompt_{}", prompt_name)]).await?;
 
         // 3. Final Chat
         self.chat("", user_input, cancel_token, Some(format!("{}_final", prompt_name))).await

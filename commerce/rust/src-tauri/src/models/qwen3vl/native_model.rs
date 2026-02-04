@@ -207,6 +207,18 @@ impl NativeLayer {
         let mut cache = self.kv_cache.lock().unwrap();
         *cache = None;
         let mut gpu_cache = self.gpu_kv_cache.lock().unwrap();
+        if let Some((k, v, _)) = *gpu_cache {
+            // [OPTIMIZATION] Don't free VRAM, just reset length to 0. 
+            // This prevents expensive cuMemAlloc/Free cycles during Baking chunks.
+            *gpu_cache = Some((k, v, 0));
+        }
+    }
+
+    /// [NEW] Hard clear for when we really need to free VRAM (e.g., model unload)
+    pub fn force_free_kv_cache(&self) {
+        let mut cache = self.kv_cache.lock().unwrap();
+        *cache = None;
+        let mut gpu_cache = self.gpu_kv_cache.lock().unwrap();
         if let Some((k, v, _)) = gpu_cache.take() {
             #[cfg(feature = "cuda")]
             unsafe {
@@ -286,6 +298,10 @@ impl NativeQwen3TextModel {
 
     pub fn clear_kv_cache(&self) {
         for layer in &self.layers { layer.clear_kv_cache(); }
+    }
+
+    pub fn force_free_kv_cache(&self) {
+        for layer in &self.layers { layer.force_free_kv_cache(); }
     }
 
     pub fn get_all_kv(&self) -> Vec<(Vec<u32>, Vec<f16>)> {
@@ -524,6 +540,7 @@ impl NativeQwen3VLModel {
         let x = self.text_model.forward(i_ids, s_o); self.lm_head.forward(&x)
     }
         pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
+        pub fn force_free_kv_cache(&self) { self.text_model.force_free_kv_cache(); }
         pub fn move_to_gpu(&mut self, device_id: i32) {
             self.text_model.move_to_gpu(device_id);
             self.lm_head.move_to_gpu(device_id);
