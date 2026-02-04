@@ -290,30 +290,41 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
     let mut o = vec![f16::ZERO; q_l * hid]; 
     let sc = 1.0 / (h_d as f32).sqrt();
 
+    // [2026-CPU-OPTIMIZATION] Pre-pack all Query bits once to avoid redundant work in the loop
+    let mut q_p = vec![0u32; q_l * n_h * k_b];
+    q_p.par_chunks_exact_mut(k_b).enumerate().for_each(|(idx, packed_q)| {
+        let q_start = idx * h_d;
+        if q_start + h_d <= q.len() {
+            let qi = &q[q_start .. q_start + h_d];
+            for kb in 0..k_b {
+                let mut bts = 0u32;
+                for b in 0..32 {
+                    let d_idx = kb * 32 + b;
+                    if d_idx < h_d && qi[d_idx].to_f32() >= 0.0 { bts |= 1 << b; }
+                }
+                packed_q[kb] = bts;
+            }
+        }
+    });
+
+    // Main Attention Loop with Hardware POPCNT 가속
     o.par_chunks_exact_mut(hid).enumerate().for_each(|(i, out)| {
         for h in 0..n_h {
             let mut scores = vec![0.0f32; t_s];
-            let q_start = (i * n_h + h) * h_d;
-            if q_start + h_d > q.len() { continue; }
-            let qi = &q[q_start .. q_start + h_d];
+            let qp_idx = (i * n_h + h) * k_b;
+            let qp = &q_p[qp_idx .. qp_idx + k_b];
             
-            let mut qp = [0u32; 8]; 
-            for kb in 0..k_b { 
-                let mut bts = 0u32; 
-                for b in 0..32 { 
-                    let idx = kb * 32 + b;
-                    if idx < h_d && qi[idx].to_f32() >= 0.0 { bts |= 1 << b; } 
-                } 
-                qp[kb] = bts; 
-            }
             for j in 0..t_s {
                 let k_start = (j * n_h + h) * k_b;
                 if k_start + k_b > k_p.len() { continue; }
                 let kj = &k_p[k_start .. k_start + k_b];
+                
                 let mut dot = 0i32;
+                // [STRICT-SIMD] count_ones() compiles to hardware POPCNT instruction
                 for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
                 scores[j] = (dot as f32) * sc;
             }
+            
             let max_s = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
             let mut sum_e = 0.0f32;
             for x in scores.iter_mut() { *x = (*x - max_s).exp(); sum_e += *x; }
@@ -321,7 +332,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
                 let v_start = (j * n_h + h) * h_d;
                 if v_start + h_d > v_f.len() { continue; }
                 let vj = &v_f[v_start .. v_start + h_d];
-                let s_final = scores[j] / sum_e;
+                let s_final = scores[j] / (sum_e + 1e-9f32);
                 for d in 0..h_d { out[h * h_d + d] = f16::from_f32(out[h * h_d + d].to_f32() + s_final * vj[d].to_f32()); }
             }
         }

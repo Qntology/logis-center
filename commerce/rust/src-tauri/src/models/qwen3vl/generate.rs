@@ -164,16 +164,14 @@ impl Qwen3VLGenerateModel {
         let mut qwen3_vl_native = Arc::new(native_model);
 
         // [CRITICAL] Move to GPU immediately while reference count is 1
-        // [STABILITY] Skip GPU offloading if baking_only is true to ensure 100% reliable cache generation
-        if _text_device_id < 8 && !baking_only { 
+        // [2026-STABILITY] Re-enabled GPU baking now that dimensionality is fixed
+        if _text_device_id < 8 { 
             println!("[LOAD] Moving Native Model to GPU-{}...", _text_device_id);
             if let Some(m) = Arc::get_mut(&mut qwen3_vl_native) {
                 m.move_to_gpu(_text_device_id as i32);
             } else {
                 println!("[ERROR] Failed to get mutable reference for GPU offloading during initialization.");
             }
-        } else if baking_only {
-            println!("[LOAD] Baking Mode: Forcing CPU-only execution for 100% stability.");
         }
 
         let qwen3_vl = ModelVariant::Native(qwen3_vl_native);
