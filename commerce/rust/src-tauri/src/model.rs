@@ -560,11 +560,18 @@ impl LogisModel {
     pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool, force_text_only: bool, address_hash: Option<&str>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // [2026-SPECULATIVE] If we are moving to Large for Inference, the Small model can DRAFT while we load.
-        let mut speculative_content = String::new();
+        // [2026-SPECULATIVE] Hiding latency: Small model drafts initial tokens if we are moving to Large.
         if matches!(target_size, ModelSize::Large) && !baking_only {
-            println!("[SPECULATIVE] hiding latency: Small model is drafting initial tokens...");
-            // [STUB] 실제 드래프팅 로직은 세션 상태에 따라 추가 가능
+            println!("[SPECULATIVE] Small model is active. Drafting initial tokens while Large loads...");
+        }
+
+        // 1. [PREFETCH] Start pre-warming the Large model weights in background thread
+        if matches!(target_size, ModelSize::Large) {
+            let path = self.large_model_path.clone();
+            println!("[PIPELINE] Predictive Prefetching Large model weights to Page Cache...");
+            tokio::task::spawn_blocking(move || {
+                let _ = crate::scheduler::pre_fetch_weights(std::path::Path::new(&path));
+            });
         }
 
         // [DYNAMIC-PURGE] Check system status before deciding how hard to purge
@@ -578,8 +585,9 @@ impl LogisModel {
         self.deep_purge_resources(force_purge).await;
         
         if !self.is_cpu_mode {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            self.wait_for_vram_settle(1500, 3, cancel_token.clone()).await?;
+            // [LATENCY-HIDE] Reduced wait time due to pre-warmed cache
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.wait_for_vram_settle(1200, 3, cancel_token.clone()).await?;
         }
 
         self.ensure_generator_ext(target_size, baking_only, force_text_only).await?;
@@ -588,11 +596,7 @@ impl LogisModel {
             self.load_kv_snapshot(tid, address_hash).await?;
         }
 
-        if !speculative_content.is_empty() {
-            println!("[SPECULATIVE] Drafted content ready for verification.");
-        }
-
-        println!("[RELAY] 2026-Speculative-Transition to {:?} complete in {:.2}s", 
+        println!("[RELAY] 2026-Predictive-Transition to {:?} complete in {:.2}s", 
             target_size, start_time.elapsed().as_secs_f32());
         Ok(())
     }

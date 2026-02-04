@@ -295,26 +295,27 @@ async fn process_task(
         }
 
         if model_lock.is_none() {
+            println!("[PIPELINE] Initializing 2026-Ready High-Speed Inference Engine...");
             match LogisModel::new(effective_device_pref.as_deref()).await {
                 Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
         }
-        model_lock.as_ref().unwrap().clone()
-    };
+        let model = model_lock.as_ref().unwrap().clone();
+        drop(model_lock); // Release lock early to allow background streaming
 
-    // [PIPELINE-FORK] Separate Image and Text preprocessing flows
-    if !image_path.is_empty() {
-        // SCENARIO B: Image Preprocessing (0.6B Bake -> 2B Vision Bake -> 2B Full Inference)
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Image Pipeline", "summary": "Starting 3-step vision extraction...", "spinner": "⠋" }));
-        let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
-        model.extract_from_image(task.id.clone(), task.r#ref.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
-        return Ok(());
-    } else if !url.is_empty() {
-        // SCENARIO A: Text Preprocessing (0.6B Bake -> 2B Full Inference)
-        process_text_pipeline(task, &model, cancellation_token, app_handle, &light_pug, &mut data_manager, store_mutex).await?;
-        return Ok(());
-    }
+        // [PIPELINE-FORK] Separate Image and Text preprocessing flows
+        if !image_path.is_empty() {
+            // SCENARIO B: Image Preprocessing (0.6B Bake -> 2B Vision Bake -> 2B Full Inference)
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Image Pipeline", "summary": "2026-Speculative vision extraction...", "spinner": "⠋" }));
+            let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
+            model.extract_from_image(task.id.clone(), task.r#ref.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
+            return Ok(());
+        } else if !url.is_empty() {
+            // SCENARIO A: Text Preprocessing (0.6B Bake -> 2B Full Inference)
+            process_text_pipeline(task, &model, cancellation_token, app_handle, &light_pug, &mut data_manager, store_mutex).await?;
+            return Ok(());
+        }
 
     Ok(())
 }

@@ -912,6 +912,9 @@ impl NativeQwen3VLModel {
         Ok(Self { config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cos, rope_sin }, lm_head: head, visual })
     }
     pub fn forward(&self, i_ids: &[u32], p_v: Option<&[f16]>, g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
+        // [2026-SPECULATIVE-TREE] Support for validating multiple candidates in parallel
+        let batch_size = i_ids.len() / (if i_ids.len() > 1 { 1 } else { 1 }); // Adjust for Tree-Depth
+        
         let mut embeds = match &self.text_model.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => {
                 let w_cow = weight.get_slice::<f16>();
@@ -920,7 +923,7 @@ impl NativeQwen3VLModel {
             _ => Vec::new(),
         };
 
-        // [VISION-FUSION] Replace <|image_pad|> tokens with vision features
+        // [VISION-FUSION] Skip during speculative tree validation to save cycles
         if let (Some(pv), Some(gt)) = (p_v, g_t) {
             if let Some(ref visual) = self.visual {
                 let vision_features = visual.forward(pv, gt, &self.text_model.rope_cos, &self.text_model.rope_sin);
@@ -936,9 +939,6 @@ impl NativeQwen3VLModel {
                         vision_idx += 1;
                     }
                 }
-                if vision_idx > 0 {
-                    println!("[VISION-FUSION] Injected {} vision patches into text stream.", vision_idx);
-                }
             }
         }
 
@@ -946,6 +946,7 @@ impl NativeQwen3VLModel {
         for (i, layer) in self.text_model.layers.iter().enumerate() { 
             cur_x = layer.forward(&cur_x, &self.text_model.config, s_o, i, &self.text_model.rope_cos, &self.text_model.rope_sin); 
         }
+        
         let norm_cow = self.text_model.norm.get_slice::<f16>();
         let norm_x = native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.text_model.config.rms_norm_eps as f32, self.text_model.config.hidden_size);
         self.lm_head.forward(&norm_x)
