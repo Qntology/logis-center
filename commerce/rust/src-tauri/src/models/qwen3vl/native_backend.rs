@@ -125,20 +125,20 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
 }
 
 #[cfg(feature = "cuda")]
-pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: usize, n: usize, k: usize, dev: usize) -> Vec<f16> {
+pub fn bit_serial_matmul_gpu_buffered(
+    i: &[f16], w: &NativeTensor, s: &NativeTensor, 
+    m: usize, n: usize, k: usize, dev: usize,
+    d_i: CUdeviceptr, d_o: CUdeviceptr
+) -> Vec<f16> {
     unsafe {
         let lib = lib();
-        let mut d_i: CUdeviceptr = 0; 
-        let mut d_o: CUdeviceptr = 0;
         
         // Parallel conversion f16 -> f32
-        let i_f32: Vec<f32> = i.par_iter().map(|v| v.to_f32()).collect();
-        lib.cuMemAlloc_v2(&mut d_i, m * k * 4); 
+        let i_f32: Vec<f32> = i.par_iter().map(|v: &f16| v.to_f32()).collect();
+        
+        // Transfer to pre-allocated buffer
         lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
         
-        lib.cuMemAlloc_v2(&mut d_o, m * n * 4);
-        
-        // [CRITICAL-FIX] Reuse pre-allocated GPU pointers for Weights and Scales
         let d_w = w.gpu_ptr.expect("Weight must be on GPU").0 as *const u32;
         let d_s = s.gpu_ptr.expect("Scale must be on GPU").0 as *const f32;
         
@@ -147,10 +147,6 @@ pub fn bit_serial_matmul_gpu(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: u
         let mut o_f = vec![0.0f32; m * n]; 
         lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
         
-        lib.cuMemFree_v2(d_i); 
-        lib.cuMemFree_v2(d_o);
-        
-        // Parallel conversion f32 -> f16
         o_f.into_par_iter().map(f16::from_f32).collect()
     }
 }

@@ -2,6 +2,8 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use crate::models::qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig};
 use crate::models::qwen3vl::native_backend::*;
+#[cfg(feature = "cuda")]
+use cudarc::driver::sys::CUdeviceptr;
 use half::f16;
 use safetensors::SafeTensors;
 use anyhow::{Result, anyhow};
@@ -13,7 +15,12 @@ pub enum LinearVariant {
 }
 
 pub struct NativeLinear {
-    pub in_features: usize, pub out_features: usize, pub variant: LinearVariant, pub device_id: i32,
+    pub in_features: usize, 
+    pub out_features: usize, 
+    pub variant: LinearVariant, 
+    pub device_id: i32,
+    pub scratch_i: std::sync::Mutex<Option<(GpuPtr, usize)>>, // (Pointer, Current size in bytes)
+    pub scratch_o: std::sync::Mutex<Option<(GpuPtr, usize)>>,
 }
 
 unsafe impl Send for NativeLinear {}
@@ -33,31 +40,15 @@ impl NativeLinear {
                 {
                     if self.device_id >= 0 {
                         if weight_packed.gpu_ptr.is_some() {
-                            static mut LAST_LOG_TIME: usize = 0;
-                            unsafe {
-                                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as usize;
-                                if now > LAST_LOG_TIME + 2 {
-                                    println!("[BACKEND] Linear -> GPU Active (Bit-serial CUDA)");
-                                    LAST_LOG_TIME = now;
-                                }
-                            }
-                            let mut res = bit_serial_matmul_gpu(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize);
+                            let (d_i, d_o) = self.ensure_gpu_buffers(m);
+                            let mut res = bit_serial_matmul_gpu_buffered(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o);
+                            
                             if let Some(b) = bias { 
                                 let b_cow = b.get_slice::<f16>();
                                 let b_ref = b_cow.as_ref();
                                 for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } } 
                             }
                             return res;
-                        } else {
-                            println!("[BACKEND] Linear -> CPU Fallback (Bit-serial AVX2/Rayon) - Reason: GPU ptr missing");
-                        }
-                    } else {
-                        static mut CPU_PRINT_COUNT: i32 = 0;
-                        unsafe {
-                            if CPU_PRINT_COUNT < 1 {
-                                println!("[BACKEND] Linear -> CPU (Bit-serial AVX2/Rayon) - Reason: Intentional CPU Mode");
-                                CPU_PRINT_COUNT += 1;
-                            }
                         }
                     }
                 }
@@ -81,6 +72,62 @@ impl NativeLinear {
             }
         }
     }
+
+    #[cfg(feature = "cuda")]
+    fn ensure_gpu_buffers(&self, m: usize) -> (CUdeviceptr, CUdeviceptr) {
+        use cudarc::driver::sys::*;
+        let req_i = m * self.in_features * 4;
+        let req_o = m * self.out_features * 4;
+        
+        let mut si_guard = self.scratch_i.lock().unwrap();
+        let d_i = if let Some((ptr, size)) = *si_guard {
+            if size >= req_i { ptr.0 as CUdeviceptr }
+            else {
+                println!("[GPU-SCRATCH] Growing input buffer to {} bytes", req_i);
+                unsafe {
+                    let mut new_ptr: CUdeviceptr = 0;
+                    let lib = lib();
+                    let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
+                    let _ = lib.cuMemAlloc_v2(&mut new_ptr, req_i);
+                    *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
+                    new_ptr
+                }
+            }
+        } else {
+            unsafe {
+                let mut new_ptr: CUdeviceptr = 0;
+                let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_i);
+                *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
+                new_ptr
+            }
+        };
+
+        let mut so_guard = self.scratch_o.lock().unwrap();
+        let d_o = if let Some((ptr, size)) = *so_guard {
+            if size >= req_o { ptr.0 as CUdeviceptr }
+            else {
+                println!("[GPU-SCRATCH] Growing output buffer to {} bytes", req_o);
+                unsafe {
+                    let mut new_ptr: CUdeviceptr = 0;
+                    let lib = lib();
+                    let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
+                    let _ = lib.cuMemAlloc_v2(&mut new_ptr, req_o);
+                    *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
+                    new_ptr
+                }
+            }
+        } else {
+            unsafe {
+                let mut new_ptr: CUdeviceptr = 0;
+                let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_o);
+                *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
+                new_ptr
+            }
+        };
+
+        (d_i, d_o)
+    }
+
     pub fn move_to_gpu(&mut self, device_id: i32) {
         self.device_id = device_id;
         if let LinearVariant::BitSerial { weight_packed, scales, .. } = &mut self.variant {
@@ -89,6 +136,17 @@ impl NativeLinear {
                 weight_packed.move_to_gpu(device_id);
                 scales.move_to_gpu(device_id);
             }
+        }
+    }
+
+    pub fn force_free_kv_cache(&self) {
+        // Linear doesn't have KV cache but has scratch buffers
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            let lib = lib();
+            if let Some((ptr, _)) = self.scratch_i.lock().unwrap().take() { let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr); }
+            if let Some((ptr, _)) = self.scratch_o.lock().unwrap().take() { let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr); }
         }
     }
 }
@@ -151,8 +209,9 @@ impl NativeLayer {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 unsafe { 
                     let cuda_lib = lib();
-                    cuda_lib.cuMemAlloc_v2(&mut kp, 8192 * n_kv * (head_dim/32) * 4); 
-                    cuda_lib.cuMemAlloc_v2(&mut vp, 8192 * n_kv * head_dim * 4); 
+                    // Increase to 16384 to support larger web pages (current PUG is ~10k tokens)
+                    cuda_lib.cuMemAlloc_v2(&mut kp, 16384 * n_kv * (head_dim/32) * 4); 
+                    cuda_lib.cuMemAlloc_v2(&mut vp, 16384 * n_kv * head_dim * 4); 
                 }
                 
                 // [CRITICAL-FIX] Check if there's stitched data in CPU cache to upload
@@ -430,7 +489,9 @@ impl NativeQwen3VLModel {
                         scales: NativeTensor::from_mmap(m_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                         bias: None,
                     }, 
-                    device_id: -1 
+                    device_id: -1,
+                    scratch_i: std::sync::Mutex::new(None),
+                    scratch_o: std::sync::Mutex::new(None),
                 })
             } else {
                 let v = st.tensor(&key)?;
@@ -441,7 +502,9 @@ impl NativeQwen3VLModel {
                         weight: NativeTensor::from_mmap(m_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
                         bias: None 
                     }, 
-                    device_id: -1 
+                    device_id: -1,
+                    scratch_i: std::sync::Mutex::new(None),
+                    scratch_o: std::sync::Mutex::new(None),
                 })
             }
         };

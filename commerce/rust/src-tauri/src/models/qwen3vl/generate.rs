@@ -174,24 +174,27 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>) -> Result<String> {
+        let mut seqlen_offset = self.get_kv_len();
+        println!("[GENERATE] Initial KV Offset: {}", seqlen_offset);
+
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
         let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
-        let mut seqlen_offset = self.get_kv_len();
         let mut generated_text = String::new();
         let max_new_tokens = mes.max_tokens.unwrap_or(1024) as usize;
 
         // [SKIP-PREFILL] Determine tokens to process in the first step
         let mut current_ids = if seqlen_offset > 0 {
             if seqlen_offset < all_ids.len() {
-                println!("[SKIP-PREFILL] Resuming from token {}/{}", seqlen_offset, all_ids.len());
+                println!("[SKIP-PREFILL] Context already in KV. Resuming from token {}/{}", seqlen_offset, all_ids.len());
                 all_ids[seqlen_offset..].to_vec()
             } else {
-                // Already processed everything in prefill/bake, start with a dummy or empty
+                println!("[SKIP-PREFILL] Entire prompt already baked. Starting with last token.");
                 vec![] 
             }
         } else {
+            println!("[SKIP-PREFILL] WARNING: Offset is 0. Performing full prefill.");
             all_ids.clone()
         };
 
@@ -455,17 +458,7 @@ impl Qwen3VLGenerateModel {
 
     pub fn get_kv_len(&self) -> usize {
         match &self.qwen3_vl {
-            ModelVariant::Native(m) => {
-                let cache = m.text_model.layers[0].kv_cache.lock().unwrap();
-                if let Some((k, _)) = cache.as_ref() {
-                    let head_dim = m.text_model.config.head_dim;
-                    let n_kv = m.text_model.config.num_key_value_heads;
-                    // Bit-serial packing: Each u32 stores 32 bits (signs)
-                    // k.len() is number of u32s. Total bits = k.len() * 32.
-                    // seq_len = Total bits / (n_kv * head_dim)
-                    (k.len() * 32) / (n_kv * head_dim)
-                } else { 0 }
-            }
+            ModelVariant::Native(m) => m.text_model.get_kv_len()
         }
     }
 
