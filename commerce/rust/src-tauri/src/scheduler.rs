@@ -7,6 +7,7 @@ use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::{LogisModel, ModelSize};
 use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
+use crate::openai_types::ChatCompletionParameters;
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::{AppHandle, Manager, Emitter};
@@ -14,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::Notify;
-use once_cell::sync::Lazy;
 
 // --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
 pub struct TaskDataManager {
@@ -35,7 +35,7 @@ impl TaskDataManager {
     pub fn offload(&mut self, content: &str, suffix: &str) -> Result<PathBuf> {
         let dir = utils::paths::get_task_specific_dir(self.app_handle.as_ref(), &self.task_id);
         let _ = fs::create_dir_all(&dir);
-        let filename = format!("{}.txt", suffix);
+        let filename = format!("{}_{}_{}.txt", self.task_id, chrono::Utc::now().timestamp_micros(), suffix);
         let path = dir.join(filename);
         fs::write(&path, content)?;
         self.created_files.push(path.clone());
@@ -58,7 +58,44 @@ impl Drop for TaskDataManager {
     }
 }
 
-// [UI-SYNC] Instant notification system to wake up the worker
+// [RESTORED] Helper to chunk text
+pub fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    while start < text.len() {
+        let mut end = (start + target_size).min(text.len());
+        if end < text.len() {
+            let mut temp_end = end;
+            while temp_end > start && bytes[temp_end] != b'\n' { temp_end -= 1; }
+            if temp_end > start { end = temp_end + 1; }
+            else { while end < text.len() && !text.is_char_boundary(end) { end += 1; } }
+        }
+        let slice = &text[start..end];
+        if !slice.trim().is_empty() { chunks.push(slice.to_string()); }
+        start = end;
+    }
+    chunks
+}
+
+// [RESTORED] Deep merge
+pub fn merge_json_results(target: &mut Value, source: &Value) {
+    if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
+        for (k, v) in source_obj {
+            if v.is_null() { continue; }
+            let should_update = match target_obj.get(k) {
+                None => true,
+                Some(tv) => tv.is_null() || (tv.is_string() && tv.as_str() == Some("")) || (tv.is_array() && tv.as_array().unwrap().is_empty())
+            };
+            if should_update { target_obj.insert(k.clone(), v.clone()); }
+            else if let Some(target_inner) = target_obj.get_mut(k) {
+                if target_inner.is_object() && v.is_object() { merge_json_results(target_inner, v); }
+                else if let (Some(ta), Some(sa)) = (target_inner.as_array_mut(), v.as_array()) { ta.extend(sa.clone()); }
+            }
+        }
+    }
+}
+
 pub static UI_READY_SIGNAL: Notify = Notify::const_new();
 pub static TASK_QUEUED_SIGNAL: Notify = Notify::const_new();
 pub static UI_READY_FLAG: AtomicBool = AtomicBool::new(false);
@@ -66,7 +103,6 @@ pub static UI_READY_FLAG: AtomicBool = AtomicBool::new(false);
 pub fn mark_ui_ready() {
     UI_READY_FLAG.store(true, Ordering::SeqCst);
     UI_READY_SIGNAL.notify_waiters();
-    println!("[Scheduler] UI signaled ready.");
 }
 
 pub fn notify_new_task() {
@@ -89,121 +125,64 @@ pub async fn start_background_worker(
     cancellation_token: Arc<AtomicBool>,
     app_handle: tauri::AppHandle,
 ) {
-    println!("[Scheduler] Background worker waiting for UI Ready signal...");
-    
-    clear_all_temp_data(Some(&app_handle));
-
-    // Cleanup zombie tasks on startup
-    {
-        let store_clone = store.clone();
-        tokio::spawn(async move {
-            for _ in 0..10 {
-                if let Ok(guard) = store_clone.try_lock() {
-                    if let Some(db) = guard.as_ref() {
-                        let _ = db.cleanup_zombie_tasks().await;
-                        break;
-                    }
-                }
-                sleep(Duration::from_millis(500)).await;
-            }
-        });
-    }
-
+    println!("[Scheduler] Background worker started.");
     tokio::spawn(async move {
-        if !UI_READY_FLAG.load(Ordering::SeqCst) {
-            UI_READY_SIGNAL.notified().await;
-        }
-
+        if !UI_READY_FLAG.load(Ordering::SeqCst) { UI_READY_SIGNAL.notified().await; }
         let mut delay_secs = 1;
         let mut current_device_pref: Option<String> = None;
-
         loop {
-            if crate::utils::is_extraction_stopped() {
-                sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-
+            if crate::utils::is_extraction_stopped() { sleep(Duration::from_millis(500)).await; continue; }
             let mut pending_tasks = Vec::new();
             {
                 let store_opt = store.lock().await;
-                if let Some(db) = store_opt.as_ref() {
-                    if let Ok(tasks) = db.get_pending_tasks(5).await {
-                        pending_tasks = tasks;
-                    }
-                }
+                if let Some(db) = store_opt.as_ref() { if let Ok(tasks) = db.get_pending_tasks(5).await { pending_tasks = tasks; } }
             }
-
             if pending_tasks.is_empty() {
                 tokio::select! {
                     _ = sleep(Duration::from_secs(delay_secs)) => { delay_secs = (delay_secs + 1).min(10); }
                     _ = TASK_QUEUED_SIGNAL.notified() => { delay_secs = 1; }
                 }
                 continue;
-            } else {
-                delay_secs = 1;
-            }
+            } else { delay_secs = 1; }
 
             for task in pending_tasks {
                 if cancellation_token.load(Ordering::Relaxed) { break; } 
-                
                 {
                     let store_guard = store.lock().await;
-                    if let Some(db) = store_guard.as_ref() {
-                        let _ = db.update_task_status(&task.id, 1).await; // 1 = Progress
-                    }
+                    if let Some(db) = store_guard.as_ref() { let _ = db.update_task_status(&task.id, 1).await; }
                 }
-
-                // Process Task
                 match process_task(task.clone(), &store, &model, &cancellation_token, &app_handle, current_device_pref.clone()).await {
                     Ok(_) => {
                         let store_guard = store.lock().await;
-                        if let Some(db) = store_guard.as_ref() {
-                            let _ = db.update_task_status(&task.id, 9).await; // 9 = Complete
-                        }
+                        if let Some(db) = store_guard.as_ref() { let _ = db.update_task_status(&task.id, 9).await; }
                         cleanup_task_resources(&task.id, Some(&app_handle));
                         current_device_pref = None;
                     },
                     Err(e) => {
                         let err_msg = e.to_string();
-                        // Emergency Cleanup
                         {
                             let mut model_lock = model.lock().await;
-                            if let Some(m) = model_lock.as_ref() {
-                                m.unload_generator().await;
-                            }
+                            if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
                             *model_lock = None;
                         }
-                        
                         if err_msg.contains("Task cancelled") {
                             let store_guard = store.lock().await;
-                            if let Some(db) = store_guard.as_ref() {
-                                let _ = db.update_task_status(&task.id, 3).await; // 3 = Cancel
-                            }
+                            if let Some(db) = store_guard.as_ref() { let _ = db.update_task_status(&task.id, 3).await; }
                             cleanup_task_resources(&task.id, Some(&app_handle));
-                            current_device_pref = None;
                             break;
                         } else {
-                            println!("[Scheduler] Task failed: {}. Error: {}", task.id, err_msg);
-                            
                             if err_msg.contains("out of memory") || err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") {
-                                println!("[Scheduler] OOM Detected! Forcing CPU mode for retry.");
                                 current_device_pref = Some("cpu".to_string());
-                                log_task_progress(&app_handle, &task.id, &json!({
-                                    "category": "Warning", "summary": "Memory pressure detected. Retrying on CPU...", "spinner": "⚠️"
-                                }));
+                                log_task_progress(&app_handle, &task.id, &json!({ "category": "Error", "summary": "OOM retry on CPU", "spinner": "⚠️" }));
                                 sleep(Duration::from_secs(2)).await;
                                 continue;
                             }
-
                             let store_guard = store.lock().await;
                             if let Some(db) = store_guard.as_ref() {
-                                let _ = db.update_task_status(&task.id, 6).await; // 6 = Error
+                                let _ = db.update_task_status(&task.id, 6).await;
                                 let _ = db.update_message_status(&task.id, 6, Some(&format!("Error: {}", err_msg))).await;
                             }
-                            // [UI-FIX] Explicitly notify frontend of failure
-                            log_task_progress(&app_handle, &task.id, &json!({
-                                "category": "Error", "summary": format!("Error: {}", err_msg), "spinner": "❌"
-                            }));
+                            log_task_progress(&app_handle, &task.id, &json!({ "category": "Error", "summary": format!("Error: {}", err_msg), "spinner": "❌" }));
                         }
                     }
                 }
@@ -221,22 +200,10 @@ async fn process_task(
     app_handle: &tauri::AppHandle,
     device_preference: Option<String>,
 ) -> Result<()> {
-    // 1. Setup & Pre-check
     let pug_logs_dir = utils::paths::get_pug_logs_dir(Some(app_handle), &task.id);
     let _ = fs::create_dir_all(&pug_logs_dir);
     
-    let kv_dir = utils::paths::get_kv_dir(Some(app_handle), Some(&task.r#ref));
-    if kv_dir.exists() { println!("[PROCESS] Found existing KV directory for address: {}", task.r#ref); }
-
-    let large_model_path_hint = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
-        .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
-    if let Some(p) = large_model_path_hint {
-        let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
-    }
-
-    log_task_progress(app_handle, &task.id, &json!({ 
-        "category": "Processing", "summary": "Starting extraction...", "spinner": "⠋" 
-    }));
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Processing", "summary": "Starting high-speed extraction...", "spinner": "⠋" }));
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -252,50 +219,9 @@ async fn process_task(
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
     let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
-    if url.is_empty() && image_path.is_empty() { return Ok(()); }
-
-    // 2. Fetch & Convert to PUG
-    let light_pug = {
-        let light_pug_path = data_manager.get_path("light_pug");
-        if light_pug_path.exists() {
-            data_manager.load(&light_pug_path)?
-        } else {
-            let raw_html_path = data_manager.get_path("raw_html");
-            let raw_content = if raw_html_path.exists() {
-                data_manager.load(&raw_html_path)?
-            } else if let Some(h) = task_data.get("html").and_then(|s| s.as_str()) {
-                 data_manager.offload(h, "raw_html")?;
-                 h.to_string()
-            } else {
-                 let res = reqwest::get(&url).await?;
-                 let bytes = res.bytes().await?;
-                 let content = String::from_utf8_lossy(&bytes).to_string();
-                 data_manager.offload(&content, "raw_html")?;
-                 content
-            };
-            
-            let clean = parsing::pre_clean_html(&raw_content);
-            let p = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
-            data_manager.offload(&p, "light_pug")?;
-            p
-        }
-    };
-
-    // [LOCK] Acquire Model Access
     let model = {
         let mut model_lock = model_mutex.lock().await;
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        if let Some(m) = model_lock.as_ref() {
-            let wants_cpu = effective_device_pref.as_deref() == Some("cpu");
-            if m.is_cpu_mode != wants_cpu {
-                m.unload_generator().await;
-                *model_lock = None;
-            }
-        }
-
         if model_lock.is_none() {
-            println!("[PIPELINE] Initializing 2026-Ready High-Speed Inference Engine...");
             match LogisModel::new(effective_device_pref.as_deref()).await {
                 Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
@@ -304,147 +230,274 @@ async fn process_task(
         model_lock.as_ref().unwrap().clone()
     };
 
-    // [PIPELINE-FORK] Separate Image and Text preprocessing flows
     if !image_path.is_empty() {
-        // SCENARIO B: Image Preprocessing (0.6B Bake -> 2B Vision Bake -> 2B Full Inference)
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Image Pipeline", "summary": "2026-Speculative vision extraction...", "spinner": "⠋" }));
         let language = task_data.get("language").and_then(|s| s.as_str()).unwrap_or("korean").to_string();
-        model.extract_from_image(task.id.clone(), task.r#ref.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await?;
-        return Ok(());
-    } else if !url.is_empty() {
-        // SCENARIO A: Text Preprocessing (0.6B Bake -> 2B Full Inference)
-        process_text_pipeline(task, &model, cancellation_token, app_handle, &light_pug, &mut data_manager, store_mutex).await?;
-        return Ok(());
+        return model.extract_from_image(task.id.clone(), task.r#ref.clone(), image_path, language, app_handle, Some(cancellation_token.clone()), store_mutex).await;
     }
 
-    Ok(())
-}
+    if url.is_empty() { return Ok(()); }
 
-async fn process_text_pipeline(
-    task: Task,
-    model: &LogisModel,
-    cancellation_token: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
-    light_pug: &str,
-    data_manager: &mut TaskDataManager,
-    store_mutex: &Arc<Mutex<Option<VectorStore>>>,
-) -> Result<()> {
-    let address_hash = &task.r#ref; // Use the URL hash from LanceDB
+    let raw_html = if let Some(h) = task_data.get("html").and_then(|s| s.as_str()) {
+        h.to_string()
+    } else {
+        reqwest::get(&url).await?.text().await?
+    };
     
-    // [MODULAR-PIPELINE] Step 0: One-time PUG Baking (Branching by address_hash)
-    log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Baking PUG context (address-based)...", "spinner": "⠋" }));
-    model.bake_pug_context(address_hash, &task.id, light_pug, Some(cancellation_token.clone())).await?;
+    let clean = parsing::pre_clean_html(&raw_html);
+    let light_pug = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
+    data_manager.offload(&light_pug, "light_pug")?;
+    
+    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let _ = std::fs::write(pug_logs_dir.join(format!("light_{}_{}.pug", task.id, ts_nano)), &light_pug);
 
-    // --- PIPELINE STEP A: CLASSIFICATION ---
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
+    model.bake_pug_context(&task.r#ref, &task.id, &light_pug, Some(cancellation_token.clone())).await?;
+
     let mut page_type = String::new();
     let mut selector_info = json!({});
-    
+    let mut is_detail = false;
+
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
-
         let type_prompt = parsing::page_type_prompt();
-        // Reuse pre-baked PUG from address folder
-        let res = model.run_modular_inference(address_hash, &task.id, "class", &type_prompt, "Classify this page.", Some(cancellation_token.clone())).await?;
-        data_manager.offload(&res, "step_a_res")?;
-        
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋" }));
+        let res = model.run_modular_inference(&task.r#ref, &task.id, "class", &type_prompt, "Classify this page.", Some(cancellation_token.clone())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
-        println!("[Scheduler] Classified as: {}", page_type);
+        if page_type == "unknown" || page_type.is_empty() { return Ok(()); }
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": format!("Identified as {}", page_type), "spinner": "✅" }));
     }
-    
-    if page_type == "unknown" { return Ok(()); } 
-    
-    // --- PIPELINE STEP B: SELECTORS ---
+
+    model.deep_purge_resources(false).await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
-
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        // Reuse pre-baked PUG
-        let res = model.run_modular_inference(address_hash, &task.id, "sel", &selector_prompt, "Identify selectors.", Some(cancellation_token.clone())).await?;
-        data_manager.offload(&res, "step_b_res")?;
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Analyzing structural selectors...", "spinner": "⠋" }));
+        let res = model.run_modular_inference(&task.r#ref, &task.id, "sel", &selector_prompt, "Identify selectors.", Some(cancellation_token.clone())).await?;
         selector_info = parsing::parse_json_from_llm(&res);
+        is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Selectors identified.", "spinner": "✅", "data": selector_info }));
     }
 
-    let is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
+    {
+        let db_lock = store_mutex.lock().await;
+        if let Some(db) = db_lock.as_ref() {
+            let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
+            if let Ok(url_obj) = url::Url::parse(&url) {
+                let raw_path = url_obj.path();
+                let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+                let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+                let mut page_data = selector_info.clone();
+                if let Some(obj) = page_data.as_object_mut() {
+                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                    obj.insert("link".to_string(), json!(url_obj.path()));
+                    obj.insert("type".to_string(), json!(page_type));
+                }
+                let _ = db.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
+            }
+        }
+    }
+
+    model.deep_purge_resources(false).await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+
+    let mut all_extracted_items = Vec::new();
     let mut extracted_data = json!({});
 
-    if !is_detail {
-        let item_selector = selector_info.get("item").and_then(|s| s.as_str()).unwrap_or("");
-        let mut all_extracted_items = Vec::new();
-        {
-            let clean_html_path = data_manager.get_path("clean_html");
-            if !clean_html_path.exists() {
-                 let raw = data_manager.load(&data_manager.get_path("raw_html"))?;
-                 let c = parsing::pre_clean_html(&raw);
-                 data_manager.offload(&c, "clean_html")?;
-            }
-            let clean_content = data_manager.load(&clean_html_path)?;
-            let document = scraper::Html::parse_document(&clean_content);
-             if let Ok(sel) = scraper::Selector::parse(item_selector) {
-                for item in document.select(&sel) {
-                    let text = item.text().collect::<Vec<_>>().join(" ").trim().to_string();
-                    if !text.is_empty() { all_extracted_items.push(json!({ "text": text })); }
-                }
-            }
-        }
-        extracted_data = json!({ "items": all_extracted_items, "type": page_type, "detail": false });
-    } else {
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting details...", "spinner": "⠋" }));
-        
-        let node_selector = selector_info.get("node").and_then(|s| s.as_str()).unwrap_or("body");
-        let content_pug = {
-            let clean_html_path = data_manager.get_path("clean_html");
-            let clean_content = data_manager.load(&clean_html_path)?;
-            let document = scraper::Html::parse_document(&clean_content);
-            let mut pug_output = String::new();
-            if let Ok(selector) = scraper::Selector::parse(node_selector) {
-                if let Some(node) = document.select(&selector).next() {
-                    parsing::generate_pug_lines(*node, 0, &mut pug_output, &PugMode::FullContent);
-                }
-            }
-            parsing::sanitize_llm_input(&pug_output)
-        };
+        if !is_detail {
 
-        if !content_pug.trim().is_empty() {
-             let extraction_instruction = parsing::item2json(&page_type, &task.data_json, "english");
-             // Reuse pre-baked PUG
-             let res = model.run_modular_inference(address_hash, &task.id, "ext", &extraction_instruction, "Extract JSON data.", Some(cancellation_token.clone())).await?;
-             data_manager.offload(&res, "step_c_res")?;
-             extracted_data = parsing::parse_json_from_llm(&res);
-        }
-    }
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Direct DOM extraction starting...", "spinner": "⠋" }));
 
-    // --- PHASE 3: HANDOVER & EMBEDDING ---
-    model.unload_generator().await;
+            
+
+            let target_selector = selector_info.get("item").and_then(|s| s.as_str()).unwrap_or("body").to_string();
+
+            let field_selectors = selector_info.get("selectors").and_then(|v| v.as_object());
+
     
-    if let Some(obj) = extracted_data.as_object_mut() {
-        if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
+
+            // [FIX] Use a scoped block to ensure 'document' (!Send) is dropped before any .await
+
+            {
+
+                let document = scraper::Html::parse_document(&clean);
+
+                if let Ok(sel) = scraper::Selector::parse(&target_selector) {
+
+                    for item_node in document.select(&sel) {
+
+                        let mut item_json = json!({});
+
+                        let mut has_data = false;
+
+                        if let Some(subs) = field_selectors {
+
+                            for (field_name, sel_val) in subs {
+
+                                if let Ok(sub_sel) = scraper::Selector::parse(sel_val.as_str().unwrap_or("")) {
+
+                                    if let Some(found_el) = item_node.select(&sub_sel).next() {
+
+                                        let text = found_el.text().collect::<Vec<_>>().join("").trim().to_string();
+
+                                        if !text.is_empty() { item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text)); has_data = true; }
+
+                                    }
+
+                                }
+
+                            }
+
+                        } else {
+
+                            let text = item_node.text().collect::<Vec<_>>().join(" ").trim().to_string();
+
+                            if !text.is_empty() { item_json.as_object_mut().unwrap().insert("text".to_string(), json!(text)); has_data = true; }
+
+                        }
+
+                        if has_data {
+
+                            if let Some(link_el) = item_node.select(&scraper::Selector::parse("a[href]").unwrap()).next() {
+
+                                item_json.as_object_mut().unwrap().insert("link".to_string(), json!(link_el.value().attr("href").unwrap_or("")));
+
+                            }
+
+                            all_extracted_items.push(item_json);
+
+                        }
+
+                    }
+
+                }
+
+            } // 'document' dropped here
+
+    
+
+            if !all_extracted_items.is_empty() {
+
+    
+            log_task_progress(app_handle, &task.id, &json!({ "category": "Refinement", "summary": format!("Refining {} items with AI...", all_extracted_items.len()), "spinner": "⠋" }));
+            let mut refined_items = Vec::new();
+            for (batch_idx, batch) in all_extracted_items.chunks(10).enumerate() {
+                if cancellation_token.load(Ordering::Relaxed) { break; }
+                let batch_text: String = batch.iter().enumerate().map(|(i, it)| format!("Item {}:\n{}", i + 1, it.to_string())).collect::<Vec<_>>().join("\n\n");
+                let ins = parsing::list2json(&page_type, "english");
+                let res = model.run_modular_inference(&task.r#ref, &task.id, &format!("list_{}", batch_idx), &ins, &batch_text, Some(cancellation_token.clone())).await?;
+                let parsed = parsing::parse_json_from_llm(&res);
+                if let Some(arr) = parsed.as_array().or_else(|| parsed.get("items").and_then(|v| v.as_array())) {
+                    for (i, refined) in arr.iter().enumerate() { if i < batch.len() { let mut m = batch[i].clone(); merge_json_results(&mut m, refined); refined_items.push(m); } }
+                } else { refined_items.extend_from_slice(batch); }
+            }
+            all_extracted_items = refined_items;
+        }
+    } else {
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting structured details...", "spinner": "⠋" }));
+        let ins = parsing::item2json(&page_type, &url, "english");
+        let res = model.run_modular_inference(&task.r#ref, &task.id, "detail", &ins, "Extract everything.", Some(cancellation_token.clone())).await?;
+        extracted_data = parsing::parse_json_from_llm(&res);
+        all_extracted_items.push(extracted_data.clone());
     }
 
-    log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
+    model.unload_generator().await;
+    let store = { let g = store_mutex.lock().await; g.as_ref().ok_or_else(|| anyhow::anyhow!("DB Error"))?.clone() };
+    let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
 
-    let store = {
-        let store_guard = store_mutex.lock().await;
-        store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
-    };
+    // [NEW] Side-Effect Logic for Orders
+    if page_type == "order" && is_detail {
+        if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
+            let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            for good in goods_arr {
+                let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
+                if !g_no.is_empty() {
+                    let clean_g_no = crate::utils::hash::normalize_numeric_homoglyphs(g_no).replace("-", "").replace("_", "");
+                    let g_index = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("goods{}{}", team_id, clean_g_no)));
+                    let tracking_id = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.id, clean_g_no));
+                    let mut tracking_data = extracted_data.clone();
+                    if let Some(obj) = tracking_data.as_object_mut() {
+                        obj.insert("type".to_string(), json!("tracking"));
+                        obj.insert("goods".to_string(), json!(g_index));
+                        obj.insert("order".to_string(), json!(crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("order{}{}", team_id, task.r#ref)))));
+                    }
+                    let _ = store.upsert_item("tracking", &tracking_id, "tracking", tracking_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&crate::utils::hash::hash_id(&format!("tracking{}", cc_val))), Some(&crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref))), None).await;
+                }
+            }
+        }
+    }
 
-    let text_to_embed = parsing::json_to_natural_language(&extracted_data);
-    let item_digest = crate::utils::hash::digest(&text_to_embed); 
-    let vector = model.get_embedding(text_to_embed).await?;
+    if !is_detail {
+        for mut item in all_extracted_items {
+            if cancellation_token.load(Ordering::Relaxed) { break; }
+            let item_id;
+            let idx_val;
+            let link;
 
-    let generated_id = crate::utils::hash::hash_id(&format!("{}{}", task.to, task.id)); 
-    let _ = store.upsert_item(
-        &page_type, &generated_id, &page_type, extracted_data.clone(), Some(vector),
-        Some(&task.from), Some(&task.to), Some(&task.cc), None, None, Some(&item_digest)
-    ).await;
+            if let Some(obj) = item.as_object_mut() {
+                if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
+                let id_raw = obj.get("id").or_else(|| obj.get("index")).and_then(|v| v.as_str()).unwrap_or("");
+                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(id_raw).replace("-", "").replace("_", "");
+                idx_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
+                item_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, idx_val));
+                obj.insert("index".to_string(), json!(idx_val));
+                obj.insert("id".to_string(), json!(item_id));
+                link = obj.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            } else { continue; }
 
-    log_task_progress(app_handle, &task.id, &json!({
-        "category": "Done", "summary": "Extraction complete.", "spinner": "✅",
-        "data": extracted_data
-    }));
+            let mut final_item = item.clone();
+            if let Some((queries, _merge_info)) = logic::relay(&page_type, &item) {
+                for q in queries { 
+                    if let Ok(Some((_ex_id, ex_data))) = store.find_item_by_property(&q.table, &q.column, &q.value).await { 
+                        logic::merge_node(&mut final_item, &ex_data); 
+                        break; 
+                    } 
+                }
+            }
 
+            let text_to_embed = parsing::json_to_natural_language(&final_item);
+            let item_digest = crate::utils::hash::digest(&text_to_embed);
+            let vector = model.get_embedding(text_to_embed).await?;
+            
+            // [STRICT PARITY] Re-generate BCC and REF exactly as server does
+            let cc_for_hash = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_hash));
+            // For list items, ref_val must include the hashed link
+            let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, link));
+
+            let _ = store.upsert_item(&page_type, &item_id, &page_type, final_item.clone(), Some(vector.clone()), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
+            let _ = store.upsert_item("items", &item_id, &page_type, final_item, Some(vector), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
+        }
+    } else {
+        // [RESTORED] Direct Item Persistence for Detail Pages (Proxy Parity)
+        let target_id = task.r#ref.clone();
+        let mut final_data = extracted_data.clone();
+        
+        let mut text_to_embed = parsing::json_to_natural_language(&final_data);
+        let item_digest = crate::utils::hash::digest(&text_to_embed);
+        
+        // Skip embedding if unchanged
+        let mut existing_vector = None;
+        if let Ok(Some(ex)) = store.get_item_by_id(&page_type, &target_id).await {
+            if ex.digest == item_digest { 
+                println!("[Scheduler] Content unchanged for {}. Reusing vector.", target_id);
+                existing_vector = Some(ex.vector); 
+            }
+        }
+
+        let vector = if let Some(v) = existing_vector { v } else { model.get_embedding(text_to_embed).await? };
+        let cc_for_hash = task.cc.to_uppercase();
+        let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_hash));
+        // [FIX] For detail pages, ref_val IS the task.r#ref (URL hash)
+        let ref_val = task.r#ref.clone();
+
+        let _ = store.upsert_item(&page_type, &target_id, &page_type, final_data.clone(), Some(vector.clone()), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
+        let _ = store.upsert_item("items", &target_id, &page_type, final_data, Some(vector), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
+    }
+    log_task_progress(app_handle, &task.id, &json!({ "category": "Done", "summary": "Extraction Complete", "spinner": "✅" }));
     Ok(())
 }
 
@@ -452,20 +505,19 @@ fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) 
     let _ = fs::remove_dir_all(utils::paths::get_task_specific_dir(app_handle, task_id));
 }
 
+// [RESTORED] OS Page Cache Warm-up for high-speed model switching
 pub fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     use std::io::Read;
     println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let p = entry.path();
-                    if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
-                        if let Ok(mut file) = std::fs::File::open(p) {
-                            let mut buffer = [0u8; 1024 * 1024]; 
-                            while let Ok(n) = file.read(&mut buffer) {
-                                if n == 0 { break; }
-                            }
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
+                    if let Ok(mut file) = std::fs::File::open(&p) {
+                        let mut buffer = [0u8; 1024 * 1024]; 
+                        while let Ok(n) = file.read(&mut buffer) {
+                            if n == 0 { break; }
                         }
                     }
                 }
@@ -474,11 +526,6 @@ pub fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     }
     println!("[PRE-FETCH] Warm-up complete.");
     Ok(())
-}
-
-fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
-    println!("[Cleanup] Clearing all temporary data directories...");
-    utils::paths::cleanup_temp_dirs(app_handle);
 }
 
 async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>) -> Result<()> {
@@ -526,16 +573,11 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
         let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
         let meets_ram = current_ram >= target_ram_bytes;
         
-        if meets_vram && meets_ram {
-            break; 
-        }
+        if meets_vram && meets_ram { break; }
 
         let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
-        if delta < 5_000_000 { 
-            stable_ticks += 1;
-        } else {
-            stable_ticks = 0;
-        }
+        if delta < 5_000_000 { stable_ticks += 1; } 
+        else { stable_ticks = 0; }
 
         if stable_ticks >= 6 && current_vram > 1_200_000_000 {
             println!("[RESOURCE-WATCH] Memory stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
@@ -557,65 +599,4 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Ok(())
-}
-
-fn chunk_text(text: &str, target_size: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let bytes = text.as_bytes();
-
-    while start < text.len() {
-        let mut end = (start + target_size).min(text.len());
-        if end < text.len() {
-            let mut temp_end = end;
-            while temp_end > start && bytes[temp_end] != b'\n' {
-                temp_end -= 1;
-            }
-            if temp_end > start {
-                end = temp_end + 1; 
-            } else {
-                while end < text.len() && !text.is_char_boundary(end) {
-                    end += 1;
-                }
-            }
-        } else {
-            end = text.len();
-        }
-        let slice = &text[start..end];
-        if !slice.trim().is_empty() {
-            chunks.push(slice.to_string());
-        }
-        start = end;
-    }
-    chunks
-}
-
-fn merge_json_results(target: &mut Value, source: &Value) {
-    if let (Some(target_obj), Some(source_obj)) = (target.as_object_mut(), source.as_object()) {
-        for (k, v) in source_obj {
-            if v.is_null() { continue; }
-            if let Some(s) = v.as_str() { if s.is_empty() { continue; } }
-            if let Some(a) = v.as_array() { if a.is_empty() { continue; } }
-            
-            let should_update = match target_obj.get(k) {
-                None => true,
-                Some(tv) => {
-                    tv.is_null() || 
-                    (tv.is_string() && tv.as_str() == Some("")) ||
-                    (tv.is_array() && tv.as_array().unwrap().is_empty())
-                }
-            };
-
-            if should_update {
-                target_obj.insert(k.clone(), v.clone());
-            } else if let Some(target_inner) = target_obj.get_mut(k) {
-                if target_inner.is_object() && v.is_object() {
-                    merge_json_results(target_inner, v);
-                }
-                else if let (Some(ta), Some(sa)) = (target_inner.as_array_mut(), v.as_array()) {
-                    ta.extend(sa.clone());
-                }
-            }
-        }
-    }
 }
