@@ -176,26 +176,56 @@ impl Qwen3VLGenerateModel {
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>) -> Result<String> {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
-        let mut all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
+        let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
         let mut seqlen_offset = self.get_kv_len();
         let mut generated_text = String::new();
         let max_new_tokens = mes.max_tokens.unwrap_or(1024) as usize;
+
+        // [SKIP-PREFILL] Determine tokens to process in the first step
+        let mut current_ids = if seqlen_offset > 0 {
+            if seqlen_offset < all_ids.len() {
+                println!("[SKIP-PREFILL] Resuming from token {}/{}", seqlen_offset, all_ids.len());
+                all_ids[seqlen_offset..].to_vec()
+            } else {
+                // Already processed everything in prefill/bake, start with a dummy or empty
+                vec![] 
+            }
+        } else {
+            all_ids.clone()
+        };
 
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
             }
 
-            let input_ids = if i == 0 { all_ids.clone() } else { vec![*all_ids.last().unwrap()] };
-            let (pixels, grid) = if i == 0 && seqlen_offset == 0 { (input.pixel_values.as_deref(), input.image_grid_thw.as_ref()) } else { (None, None) };
+            // At i=0, we use our calculated current_ids. 
+            // If current_ids is empty (all baked), we might need to sample the next token immediately.
+            let input_ids = if i == 0 { 
+                if current_ids.is_empty() {
+                    // This case happens if the entire prompt was already baked into KV.
+                    // We need at least the last token to trigger next token generation.
+                    vec![*all_ids.last().unwrap()]
+                } else {
+                    current_ids.clone()
+                }
+            } else { 
+                vec![*current_ids.last().unwrap()] 
+            };
+
+            let (pixels, grid) = if i == 0 && seqlen_offset == 0 { 
+                (input.pixel_values.as_deref(), input.image_grid_thw.as_ref()) 
+            } else { 
+                (None, None) 
+            };
 
             let logits = self.qwen3_vl.forward(&input_ids, pixels, grid, seqlen_offset);
             let next_id = self.sample_greedy(&logits);
             
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             
-            all_ids.push(next_id);
+            current_ids.push(next_id);
             let new_word = self.tokenizer.token_decode(vec![next_id])?;
             print!("{}", new_word); 
             use std::io::Write;
@@ -332,6 +362,8 @@ impl Qwen3VLGenerateModel {
         }
         Ok(())
     }
+
+    pub fn save_raw_kv_to_disk(&self, path: &Path, k: &[u32], v: &[f16]) -> Result<()> {
         let mut tensors = std::collections::HashMap::new();
         
         let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };

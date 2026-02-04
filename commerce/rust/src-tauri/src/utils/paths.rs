@@ -56,7 +56,7 @@ pub fn get_stop_signal_file() -> PathBuf {
 
 /// Initialize all necessary directories
 pub fn init_directories(app: Option<&AppHandle>) {
-    let _ = get_kv_dir(app);
+    let _ = get_kv_dir(app, None);
     let _ = get_task_data_dir(app);
     let _ = get_logs_dir(app);
 }

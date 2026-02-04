@@ -357,7 +357,7 @@ async fn process_text_pipeline(
     
     // --- PIPELINE STEP B: SELECTORS ---
     {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::any_how!("Task cancelled")); }
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type);

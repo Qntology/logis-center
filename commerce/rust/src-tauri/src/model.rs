@@ -102,13 +102,20 @@ impl LogisModel {
     }
 
     /// [CLEANUP] Adaptive resource management based on system stress
-    pub async fn deep_purge_resources(&self) {
-        // 1. Clear Active Slots
+    pub async fn deep_purge_resources(&self, force_all: bool) {
+        // 1. Clear Active Slot
         if let Ok(mut gen) = self.generator.try_lock() { *gen = None; }
-        if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
-        if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
         
-        // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
+        // 2. Clear Hibernation Slots ONLY if forced or in GPU mode (to be safe)
+        if force_all || !self.is_cpu_mode {
+            if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
+            if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
+            
+            let mut size = self.current_size.lock().await;
+            *size = None;
+        }
+        
+        // 3. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::*;
@@ -118,7 +125,7 @@ impl LogisModel {
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
         
-        println!("[MEMORY] Deep Purge Complete. VRAM/RAM released to OS.");
+        println!("[MEMORY] Purge Complete (Force: {}). OS Working Set flushed.", force_all);
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
@@ -255,9 +262,9 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, address_hash: Option<&str>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?}...", target_size);
-        self.deep_purge_resources().await;
+        // 1. [CLEANUP] 리소스 정리 (CPU 모드에서는 히버네이션 유지)
+        println!("[RELAY] Preparing Transition to {:?}...", target_size);
+        self.deep_purge_resources(false).await;
         
         if !self.is_cpu_mode {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -350,7 +357,7 @@ impl LogisModel {
     }
 
     // --- [SCENARIO B] Image Preprocessing (0.6B 1L Bake -> 2B 1L Vision Bake -> 2B Full Inf) ---
-    pub async fn bake_image_kv(&self, task_id: &str, region: &str, language: &str, page_type: &str, address: &str, address_hash: Option<&str>, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn bake_image_kv(&self, task_id: &str, region: &str, language: &str, page_type: &str, address: &str, address_hash: Option<&str>, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>, app_handle: &tauri::AppHandle) -> anyhow::Result<()> {
         let sys_session = format!("{}_sys", task_id);
         let img_session = format!("{}_img", task_id);
         let system_prompt = Self::get_image_extraction_prompt(region, language, page_type, address);
@@ -380,7 +387,7 @@ impl LogisModel {
             let _ = self.chat_with_image_spinner(
                 "[IMAGE-BAKE] Vision feature extraction.".to_string(), 
                 Some(image), 
-                &unsafe { std::mem::zeroed() }, 
+                app_handle, 
                 "", 
                 json!({}), 
                 1, 
@@ -412,7 +419,7 @@ impl LogisModel {
             let dynamic_image = image::DynamicImage::ImageRgb8(img.to_rgb8());
             
             // 1 & 2. Bake KV (0.6B 1L Sys -> 2B 1L Img)
-            self.bake_image_kv(&task_id, "kr", &language, "tracking", "", Some(&address_hash), dynamic_image, cancel_token.clone()).await?;
+            self.bake_image_kv(&task_id, "kr", &language, "tracking", "", Some(&address_hash), dynamic_image, cancel_token.clone(), app_handle).await?;
 
             // 3. Full Inference (2B Full with Injected KV)
             crate::scheduler::log_task_progress(app_handle, &task_id, &json!({
@@ -511,9 +518,48 @@ impl LogisModel {
         }).await?
     }
 
+    /// [STABILITY] Check if the system has enough overhead to keep models in RAM
+    async fn is_system_under_pressure(&self) -> bool {
+        // 1. Check System RAM (Threshold: 4GB)
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        
+        if free_ram_gb < 4.0 {
+            println!("[STABILITY-WATCH] High RAM Pressure detected ({:.2} GB free).", free_ram_gb);
+            return true;
+        }
+
+        // 2. Check GPU VRAM if applicable (Threshold: 2GB)
+        if !self.is_cpu_mode {
+            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                    if let Ok(mem) = dev.memory_info() {
+                        let free_vram_gb = mem.free as f64 / 1024.0 / 1024.0 / 1024.0;
+                        if free_vram_gb < 2.0 {
+                            println!("[STABILITY-WATCH] High VRAM Pressure detected ({:.2} GB free).", free_vram_gb);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     pub async fn secure_vram_relay_ext(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, baking_only: bool, force_text_only: bool, address_hash: Option<&str>) -> anyhow::Result<()> {
         let start_time = Instant::now();
-        self.deep_purge_resources().await;
+        
+        // [DYNAMIC-PURGE] Check system status before deciding how hard to purge
+        let pressure = self.is_system_under_pressure().await;
+        let force_purge = pressure || !self.is_cpu_mode || baking_only;
+        
+        if pressure {
+            println!("[RELAY] System under pressure. Performing Aggressive Purge to ensure OOM safety.");
+        }
+        
+        self.deep_purge_resources(force_purge).await;
         
         if !self.is_cpu_mode {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -526,7 +572,8 @@ impl LogisModel {
             self.load_kv_snapshot(tid, address_hash).await?;
         }
 
-        println!("[RELAY] Transition to {:?} (Baking: {}, Text-Only: {}) complete in {:.2}s", target_size, baking_only, force_text_only, start_time.elapsed().as_secs_f32());
+        println!("[RELAY] Transition to {:?} (Purge: {}, Pressure: {}) complete in {:.2}s", 
+            target_size, force_purge, pressure, start_time.elapsed().as_secs_f32());
         Ok(())
     }
 
@@ -546,7 +593,21 @@ impl LogisModel {
 
         println!("[MODEL] Activating engine -> Size: {:?}, Mode: {}, Vision: {}", size, if baking_only { "BAKING (Layer 0)" } else { "INFERENCE (Full)" }, !force_text_only);
 
-        // 2. [LOAD] Load from disk
+        // 1. [HIBERNATION-CHECK] Check if we can swap from hibernation slots
+        let swapped = if !baking_only { // Baking models are specialized (Layer 0), usually not worth hibernating
+            match size {
+                ModelSize::Small => if let Some(m) = small_slot.take() { *gen_guard = Some(m); true } else { false },
+                ModelSize::Large => if let Some(m) = large_slot.take() { *gen_guard = Some(m); true } else { false },
+            }
+        } else { false };
+
+        if swapped {
+            println!("[HIBERNATION] Model restored from RAM slot (Skip Disk I/O)");
+            *current_size_guard = Some(size);
+            return Ok(());
+        }
+
+        // 2. [LOAD] Fresh loading from disk if not in hibernation
         println!("[LOAD] Fresh loading {:?} model from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
@@ -556,7 +617,7 @@ impl LogisModel {
         let path_clone = path.to_string();
         let shared_path_clone = shared_path.map(|s| s.to_string());
 
-        let mut gen = tokio::task::spawn_blocking(move || {
+        let gen = tokio::task::spawn_blocking(move || {
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path_clone.as_deref(), 
@@ -573,6 +634,7 @@ impl LogisModel {
             println!("[MODEL] Staying on CPU (Extreme Optimized Bit-serial Path)...");
         }
 
+        // Save old model to hibernation if applicable
         if let Some(old_m) = gen_guard.take() {
             if let Some(old_size) = *current_size_guard {
                 match old_size {
