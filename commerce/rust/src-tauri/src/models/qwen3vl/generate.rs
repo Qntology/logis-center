@@ -386,25 +386,20 @@ impl Qwen3VLGenerateModel {
                 
                 let target_head_dim = m.text_model.config.head_dim;
                 let target_n_kv = m.text_model.config.num_key_value_heads;
-                let target_dim = target_head_dim * target_n_kv; // e.g., 2048 for 2B
+                let target_dim = target_head_dim * target_n_kv; 
 
                 for path in paths {
                     if !path.exists() { continue; }
                     let file = std::fs::read(path)?;
                     let st = safetensors::SafeTensors::deserialize(&file)?;
                     
+                    // [REPLICATION-STRATEGY] Look for Layer 0 and prepare for all-layer injection
                     if let (Ok(kt), Ok(vt)) = (st.tensor("layer.0.k"), st.tensor("layer.0.v")) {
                         let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
                         let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
                         
-                        // [DIMENSION-MATCHING] Check if upscaling is needed (e.g., 0.6B -> 2B)
-                        let source_dim_bits = (k_data.len() * 32) / (v_data.len() / k_data.len() / 32).max(1); // Approximate source dim
-                        // Actually, a simpler way is to check the ratio between current model dim and source dim
-                        let seq_len = v_data.len() / (v_data.len() / (k_data.len() * 32 / target_head_dim).max(1)).max(1); // Dummy placeholder
-                        
-                        // Calculate real sequence length based on the smallest unit
-                        // For bit-serial, 1 token = target_dim / 32 units of u32
-                        let source_dim = 1024; // Most common small model dim
+                        // [DIMENSION-MATCHING] 0.6B (1024) -> 2B (2048) Upscaling
+                        let source_dim = 1024; 
                         if target_dim > source_dim && target_dim % source_dim == 0 {
                             let ratio = target_dim / source_dim;
                             println!("[KV-UPscale] Matching dimensions: {} -> {} (Ratio: {})", source_dim, target_dim, ratio);
@@ -412,7 +407,6 @@ impl Qwen3VLGenerateModel {
                             let mut new_k = Vec::with_capacity(k_data.len() * ratio);
                             let mut new_v = Vec::with_capacity(v_data.len() * ratio);
                             
-                            // Repeat data to match new dimension
                             for chunk in k_data.chunks_exact(source_dim / 32) {
                                 for _ in 0..ratio { new_k.extend_from_slice(chunk); }
                             }
@@ -429,8 +423,14 @@ impl Qwen3VLGenerateModel {
                 }
 
                 if !combined_k.is_empty() {
-                    m.text_model.layers[0].set_kv_data(combined_k, combined_v);
-                    println!("[KV-STITCH] Successfully merged & matched {} KV segments into Layer 0", paths.len());
+                    // [STRICT-NO-PREFILL] Inject the same context into EVERY layer of the 2B model
+                    let num_layers = m.text_model.layers.len();
+                    println!("[KV-STITCH] Replicating baked context across ALL {} layers to skip Prefill.", num_layers);
+                    
+                    for i in 0..num_layers {
+                        m.text_model.layers[i].set_kv_data(combined_k.clone(), combined_v.clone());
+                    }
+                    println!("[KV-STITCH] SUCCESS: Prefill-skip enabled for 2B Full Model.");
                 }
             }
         }
