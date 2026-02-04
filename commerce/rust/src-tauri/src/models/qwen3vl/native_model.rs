@@ -770,6 +770,12 @@ impl NativeQwen3VLModel {
     pub fn forward(&self, i_ids: &[u32], _p_v: Option<&[f16]>, _g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
         let x = self.text_model.forward(i_ids, s_o); self.lm_head.forward(&x)
     }
+    
+    /// [ACCELERATION] Update KV Cache without computing logits.
+    /// Used during prefill/relay phase to eliminate overhead.
+    pub fn forward_kv_only(&self, i_ids: &[u32], s_o: usize) {
+        let _ = self.text_model.forward(i_ids, s_o);
+    }
         pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
         pub fn force_free_kv_cache(&self) { self.text_model.force_free_kv_cache(); }
         pub fn move_to_gpu(&mut self, device_id: i32) {

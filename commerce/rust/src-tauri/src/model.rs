@@ -319,20 +319,16 @@ impl LogisModel {
     }
 
     /// Step 2: Bake a specific prompt and run inference by stitching with PUG base
-    pub async fn run_modular_inference(&self, address_hash: &str, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+    pub async fn run_modular_inference(&self, address_hash: &str, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let _prompt_session = format!("{}_prompt_{}", task_id, prompt_name);
-        let _kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
         
-        println!("[MODULAR-INF] Running inference for step: {} (Address: {})", prompt_name, address_hash);
+        println!("[MODULAR-INF] Step 1: Baking specific system prompt for {}...", prompt_name);
 
-        // 1. Bake the specific system prompt (Quick 1-layer bake)
-        // [FIX] Wrap in ChatML template so the model knows it's a system instruction
-        let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
-
+        // 1. Bake the specific system prompt (Raw text)
         self.ensure_generator_ext(ModelSize::Small, true, true).await?;
         {
             let gen_clone = self.generator.clone();
-            let sp = formatted_prompt;
+            let sp = system_prompt.to_string(); // Raw
             let ah = address_hash.to_string();
             let tid = task_id.to_string();
             let p_name = prompt_name.to_string();
@@ -349,17 +345,33 @@ impl LogisModel {
         self.unload_generator().await;
 
         // 2. Load 2B Full Model and Stitch [PUG + PROMPT]
-        // [RESTORE] Use full layers for inference to ensure high quality and complete output
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true, Some(address_hash)).await?;
-        
-        // Load both PUG base and the specific prompt in ONE call to prevent overwriting
         self.load_stitched_kv(address_hash, task_id, &["pug_base", &format!("prompt_{}", prompt_name)]).await?;
 
-        // 3. Final Chat
-        // [FIX] Since system prompt is already baked into KV, we pass empty string to 'system'
-        // and ensure the prompt is just the user block to avoid duplication.
-        println!("[MODULAR-INF] Finalizing with user input...");
-        self.chat("", user_input, cancel_token, Some(format!("{}_final", prompt_name))).await
+        // 3. Final Raw Chat (Template Bypass)
+        println!("[MODULAR-INF] Finalizing with raw token alignment...");
+        
+        let gen_arc = self.generator.clone();
+        // [STRICT-ALIGNMENT] Concatenate without extra padding to match baked tokens exactly
+        let full_raw_prompt = format!("{}{}\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", pug_content, system_prompt, user_input);
+        let p_name_clone = prompt_name.to_string();
+        
+        tokio::task::spawn_blocking(move || {
+            let mut gen_guard = gen_arc.blocking_lock();
+            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator unloaded"))?;
+            
+            // [BYPASS] Create params with a single raw user message to avoid template interference
+            let params = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::String(full_raw_prompt),
+                    name: None,
+                })],
+                max_tokens: Some(4096),
+                ..Default::default()
+            };
+            
+            gen.generate(params, cancel_token, Some(format!("{}_final", p_name_clone)))
+        }).await?
     }
 
     // --- [SCENARIO B] Image Preprocessing (0.6B 1L Bake -> 2B 1L Vision Bake -> 2B Full Inf) ---

@@ -74,48 +74,16 @@ pub fn pre_clean_html(html: &str) -> String {
 
 
 pub fn convert_doc_to_clean_pug(document: &Html, mode: PugMode) -> String {
-
     let mut pug_output = String::new();
-
-    pug_output.reserve(1024 * 50);
-
+    pug_output.reserve(1024 * 60);
     
-
-    // Discovery 모드(StructureOnly)일 때는 body 내부만 집중
-
-    let mut found_body = false;
-
+    // [FIX] Iterate over children of the root (Document) to reach Element nodes.
     for child in document.tree.root().children() {
-
-        if let Some(element) = child.value().as_element() {
-
-            if element.name() == "body" {
-
-                generate_pug_lines(child, 0, &mut pug_output, &mode);
-
-                found_body = true;
-
-                break;
-
-            }
-
-        }
-
+        generate_pug_lines(child, 0, &mut pug_output, &mode);
     }
 
-        if !found_body {
-
-            for child in document.tree.root().children() {
-
-                generate_pug_lines(child, 0, &mut pug_output, &mode);
-
-            }
-
-        }
-
-        sanitize_llm_input(&pug_output)
-
-    }
+    sanitize_llm_input(&pug_output)
+}
 
     
 
