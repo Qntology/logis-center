@@ -207,8 +207,8 @@ impl Qwen3VLGenerateModel {
         let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
         // [2025-H2-RESEARCH] Last-Block Recalibration (LBR)
-        // Stabilizes 0.6B -> 2B relay by re-computing the final 64 tokens using the Large model.
-        let recalibration_len = 64; 
+        // Stabilizes 0.6B -> 2B relay by re-computing the final 32 tokens using the Large model.
+        let recalibration_len = 32; 
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
@@ -221,8 +221,8 @@ impl Qwen3VLGenerateModel {
             if all_ids.len() >= seqlen_offset {
                 // CASE A: Standard Full-Text Match with LBR
                 local_pos = seqlen_offset.saturating_sub(recalibration_len);
-                current_kv_offset = local_pos; // Overwrite last 64 stale tokens with Large-model precision
-                println!("[ZERO-PREFILL-LBR] Recalibrating last {} tokens for transition stability.", seqlen_offset - local_pos);
+                current_kv_offset = local_pos; // Overwrite last 32 stale tokens with Large-model precision
+                println!("[ZERO-PREFILL-LBR] Recalibrating last {} tokens for transition stability (Offset: {}).", seqlen_offset - local_pos, local_pos);
             } else {
                 // CASE B: Modular Extension
                 println!("[ZERO-PREFILL-MODULAR] Modular Mode. Cache ({}) > Prompt ({}).", seqlen_offset, all_ids.len());

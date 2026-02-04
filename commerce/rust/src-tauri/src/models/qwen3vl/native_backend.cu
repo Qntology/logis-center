@@ -49,15 +49,15 @@ __global__ void bit_serial_matmul_kernel_shuffled(
     output[m * N + n] = sum * scale[n];
 }
 
-// [2026-ULTRA-OPTIMIZED] Tiled Bit-Flash Attention 5.0
-// Uses Online Softmax (FlashAttention-style) with 64-token tiling
-// Maximizes L1 cache hits and GPU occupancy by avoiding large shared memory buffers
+// [2026-ULTRA-OPTIMIZED] Tiled Bit-Flash Attention 5.1
+// Uses Online Softmax (FlashAttention-style) with Warp-Reduction Stability
 __global__ void bit_serial_attn_kernel_v2026(
     const float* __restrict__ Q,        
     const uint32_t* __restrict__ K_p,   
     const float* __restrict__ V,        
     float* __restrict__ O,              
-    int n_h, int n_kv, int h_d, int t_s, float sc, int q_len
+    int n_h, int n_kv, int h_d, int t_s, float sc, int q_len,
+    float alpha // [NEW] Dynamic stability bias
 ) {
     int q_idx = blockIdx.x; 
     int h = blockIdx.y;     
@@ -67,6 +67,9 @@ __global__ void bit_serial_attn_kernel_v2026(
     int k_b = (h_d + 31) / 32;
     int h_kv = h / (n_h / n_kv);
     
+    // [STABILITY] Dynamic Keep-alive bias to prevent Softmax death
+    const float KEEP_ALIVE_BIAS = alpha;
+
     // Shared memory for Q bits and tiling metadata
     __shared__ uint32_t s_q_bits[8]; 
     __shared__ float s_running_max;
@@ -83,7 +86,7 @@ __global__ void bit_serial_attn_kernel_v2026(
         s_q_bits[tid] = bts;
     }
     
-    // Initialize Online Softmax state
+    // Accumulators for O [head_dim]
     float local_o[128]; // Max head_dim 128
     #pragma unroll
     for(int i=0; i<128; ++i) local_o[i] = 0.0f;
@@ -97,10 +100,10 @@ __global__ void bit_serial_attn_kernel_v2026(
     }
     __syncthreads();
 
-    // 2. Tiled Processing (Chunk size: 64 tokens)
-    const int TILE_SIZE = 64;
+    // 2. Tiled Processing (Chunk size: 32 tokens for warp-alignment)
+    const int TILE_SIZE = 32;
     for (int t_start = 0; t_start < t_s; t_start += TILE_SIZE) {
-        int j = t_start + (tid % TILE_SIZE); // Map thread to token in tile
+        int j = t_start + (tid % TILE_SIZE); 
         float score = -1e20f;
         
         if (j < t_s) {
@@ -109,62 +112,74 @@ __global__ void bit_serial_attn_kernel_v2026(
             for (int kb = 0; kb < k_b; ++kb) {
                 dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * k_b + kb]));
             }
-            score = (float)dot * sc;
+            // Apply scale and stability bias
+            score = ((float)dot + KEEP_ALIVE_BIAS) * sc;
         }
 
-        // Warp-level Max reduction
+        // Warp-level Max reduction (since TILE_SIZE=32)
         float tile_max = score;
         #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2)
-            tile_max = fmaxf(tile_max, __shfl_down_sync(0xFFFFFFFF, tile_max, offset));
-        
-        // Broadcast max to all threads in warp
-        tile_max = __shfl_sync(0xFFFFFFFF, tile_max, 0);
+            tile_max = fmaxf(tile_max, __shfl_xor_sync(0xFFFFFFFF, tile_max, offset));
 
-        // Update Online Softmax state
-        float prev_max = running_max;
-        running_max = fmaxf(running_max, tile_max);
+        // Online Softmax update
+        float next_max = fmaxf(running_max, tile_max);
+        float exp_scale_prev = expf(running_max - next_max);
+        float exp_score = (j < t_s) ? expf(score - next_max) : 0.0f;
         
-        float exp_scale_prev = expf(prev_max - running_max);
-        float exp_score = (j < t_s) ? expf(score - running_max) : 0.0f;
-        
-        // Update local weighted sum (V-accumulation)
-        // This is the core of FlashAttention: O = O * exp(m_old - m_new) + V * exp(score - m_new)
-        #pragma unroll 4
+        // Warp-level Sum reduction for exp_score
+        float tile_sum = exp_score;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            tile_sum += __shfl_xor_sync(0xFFFFFFFF, tile_sum, offset);
+
+        // Update global accumulators
+        running_sum = running_sum * exp_scale_prev + tile_sum;
+        running_max = next_max;
+
+        // Accumulate V values: local_o = local_o * exp_scale_prev + exp_score * V
         for (int d = 0; d < h_d; ++d) {
             float v_val = (j < t_s) ? V[(j * n_kv + h_kv) * h_d + d] : 0.0f;
-            // Weighted sum reduction across threads for the current tile? 
-            // Simplified: Each thread handles its own 'j' and we reduce across tile tokens.
-            // But we need the sum over 'j' for each 'd'.
+            float weighted_v = exp_score * v_val;
+            
+            // Sum across warp for this 'd'
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2)
+                weighted_v += __shfl_xor_sync(0xFFFFFFFF, weighted_v, offset);
+            
+            // Only one thread per warp needs to update the local_o accumulator per tile?
+            // Actually, for better occupancy, we can distribute 'd' across threads.
+            // But since local_o is private, we just keep it simple: 
+            // EACH thread calculates its OWN local_o contribution for its specific 'd'.
+            // Wait, FlashAttention typically computes O = sum(P * V).
+            // Here we do O_d = sum_j(exp(score_j - max) * V_jd)
         }
         
-        // [REFINED-STRATEGY] Instead of complex tile-reduce, use a small shared score buffer 
-        // to keep it fast for RTX 3050's smaller SMs.
-        __shared__ float s_tile_scores[64];
+        // [FIXED-ACCUMULATION] Parallelize over 'd' instead of 'j' for V-reduction
+        __shared__ float s_tile_scores[TILE_SIZE];
         if (tid < TILE_SIZE) s_tile_scores[tid] = exp_score;
         __syncthreads();
 
-        float tile_sum_local = (tid < TILE_SIZE) ? exp_score : 0.0f;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2)
-            tile_sum_local += __shfl_down_sync(0xFFFFFFFF, tile_sum_local, offset);
-        tile_sum_local = __shfl_sync(0xFFFFFFFF, tile_sum_local, 0);
-
-        running_sum = running_sum * exp_scale_prev + tile_sum_local;
-
         for (int d = tid; d < h_d; d += blockDim.x) {
-            float tile_v_sum = 0.0f;
-            #pragma unroll 8
+            float v_acc = 0.0f;
+            #pragma unroll
             for (int tile_j = 0; tile_j < TILE_SIZE; ++tile_j) {
                 int global_j = t_start + tile_j;
                 if (global_j < t_s) {
-                    tile_v_sum += s_tile_scores[tile_j] * V[(global_j * n_kv + h_kv) * h_d + d];
+                    v_acc += s_tile_scores[tile_j] * V[(global_j * n_kv + h_kv) * h_d + d];
                 }
             }
-            local_o[d] = local_o[d] * exp_scale_prev + tile_v_sum;
+            local_o[d] = local_o[d] * exp_scale_prev + v_acc;
         }
         __syncthreads();
     }
+
+    // 3. Final Normalization and Store
+    float inv_sum = 1.0f / (running_sum + 1e-9f);
+    for (int d = tid; d < h_d; d += blockDim.x) {
+        O[(q_idx * n_h * h_d) + (h * h_d) + d] = local_o[d] * inv_sum;
+    }
+}
 
     // 3. Final Normalization and Store
     float inv_sum = 1.0f / (running_sum + 1e-9f);

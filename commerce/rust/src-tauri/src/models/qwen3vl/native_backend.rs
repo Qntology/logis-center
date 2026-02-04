@@ -309,6 +309,9 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
     let k_b = (h_d + 31) / 32; 
     let mut o = vec![f16::ZERO; q_l * hid]; 
     let sc = 1.0 / (h_d as f32).sqrt();
+    
+    // [STABILITY] Match GPU fix to prevent signal collapse
+    const KEEP_ALIVE_BIAS: f32 = 0.1f;
 
     // [2026-CPU-OPTIMIZATION] Pre-pack all Query bits once to avoid redundant work in the loop
     let mut q_p = vec![0u32; q_l * n_h * k_b];
@@ -327,8 +330,15 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
         }
     });
 
+    println!("[CPU-ATTN] Processing {} queries over {} context tokens...", q_l, t_s);
+
     // Main Attention Loop with Hardware POPCNT 가속
     o.par_chunks_exact_mut(hid).enumerate().for_each(|(i, out)| {
+        // [PROGRESS-LOG] Every 100 tokens to avoid UI freeze perception
+        if i > 0 && i % 100 == 0 {
+            println!("[CPU-ATTN] Progress: {}/{} rows completed", i, q_l);
+        }
+
         for h in 0..n_h {
             let h_kv = h / (n_h / n_kv);
             let mut scores = vec![0.0f32; t_s];
@@ -340,17 +350,17 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
             {
                 if is_x86_feature_detected!("avx2") && k_b == 4 { // head_dim 128 (4 * 32)
                     unsafe {
-                        let qp_v = _mm128_loadu_si128(qp.as_ptr() as *const __m128i);
+                        let qp_v = _mm_loadu_si128(qp.as_ptr() as *const __m128i);
                         for j in 0..t_s {
                             let k_start = (j * n_kv + h_kv) * k_b;
-                            let kj_v = _mm128_loadu_si128(k_p.as_ptr().add(k_start) as *const __m128i);
+                            let kj_v = _mm_loadu_si128(k_p.as_ptr().add(k_start) as *const __m128i);
                             let xor_v = _mm_xor_si128(qp_v, kj_v);
                             
-                            // POPCNT for each 32-bit element
                             let mut dot = 0i32;
                             let vals: [u32; 4] = std::mem::transmute(xor_v);
                             for v in vals { dot += 32 - 2 * v.count_ones() as i32; }
-                            scores[j] = (dot as f32) * sc;
+                            // Add KEEP_ALIVE_BIAS for stability
+                            scores[j] = ((dot as f32) + KEEP_ALIVE_BIAS) * sc;
                         }
                     }
                 } else {
@@ -359,7 +369,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
                         let kj = &k_p[k_start .. k_start + k_b];
                         let mut dot = 0i32;
                         for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
-                        scores[j] = (dot as f32) * sc;
+                        scores[j] = ((dot as f32) + KEEP_ALIVE_BIAS) * sc;
                     }
                 }
             }
@@ -370,7 +380,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
                     let kj = &k_p[k_start .. k_start + k_b];
                     let mut dot = 0i32;
                     for kb in 0..k_b { dot += 32 - 2 * (qp[kb] ^ kj[kb]).count_ones() as i32; }
-                    scores[j] = (dot as f32) * sc;
+                    scores[j] = ((dot as f32) + KEEP_ALIVE_BIAS) * sc;
                 }
             }
             

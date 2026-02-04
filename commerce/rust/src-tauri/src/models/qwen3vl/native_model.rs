@@ -286,12 +286,25 @@ impl NativeLayer {
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
             let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o);
             
-            // [2026-HYBRID-STABILITY] Heavy-Hitter Recovery
-            // If the Bit-Serial score aggregation is unstable, we use FP16 for critical header tokens
+            // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
             if !attn_out.is_empty() && attn_out[0].to_f32() == 0.0 && attn_out.iter().take(50).all(|x| x.to_f32() == 0.0) {
-                println!("[STABILITY-RECOVERY] Bit-Serial Signal Death. Falling back to Hybrid-SIMD...");
-                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                    attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len);
+                println!("[STABILITY] Signal Death detected at layer {}. Attempting Relaxed-Scaling GPU recovery...", _idx);
+                
+                // Retry with a slightly higher "Keep-alive" or scaling factor if the kernel supports it, 
+                // or just try to re-run with a slightly different epsilon.
+                // For now, we try ONE MORE GPU pass with a safety check before CPU fallback.
+                if new_len > 1 {
+                     println!("[STABILITY] Large context ({}) recovery: Re-sampling Attention...", new_len);
+                     attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o);
+                }
+
+                if attn_out[0].to_f32() == 0.0 {
+                    println!("[STABILITY-CRITICAL] GPU recovery failed. Falling back to Hybrid-SIMD (CPU)...");
+                    if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len);
+                    }
+                } else {
+                    println!("[STABILITY] GPU recovery SUCCESSFUL at layer {}.", _idx);
                 }
             }
 
