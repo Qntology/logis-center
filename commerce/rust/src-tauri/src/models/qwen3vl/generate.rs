@@ -393,27 +393,42 @@ impl Qwen3VLGenerateModel {
 
                 for path in paths {
                     if !path.exists() { continue; }
+                    println!("[KV-STITCH] Loading component: {:?}", path.file_name());
                     let file = std::fs::read(path)?;
                     let st = safetensors::SafeTensors::deserialize(&file)?;
                     
-                    // [REPLICATION-STRATEGY] Look for Layer 0 and prepare for all-layer injection
                     if let (Ok(kt), Ok(vt)) = (st.tensor("layer.0.k"), st.tensor("layer.0.v")) {
                         let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
                         let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
                         
-                        // [DIMENSION-MATCHING] 0.6B (1024) -> 2B (2048) Upscaling
-                        let source_dim = 1024; 
-                        if target_dim > source_dim && target_dim % source_dim == 0 {
-                            let ratio = target_dim / source_dim;
-                            println!("[KV-UPscale] Matching dimensions: {} -> {} (Ratio: {})", source_dim, target_dim, ratio);
+                        // [DYNAMIC-DIMENSION-MATCHING] Calculate source dim from shape
+                        // kt.shape() is [total_units], where each unit is 32 bits of one token's KV dim.
+                        // vt.shape() is [total_elements], where each element is 16 bits of one token's KV dim.
+                        // tokens = vt.shape[0] / source_kv_dim.
+                        // So, source_kv_dim = vt.shape[0] / (kt.shape[0] * 32 / source_kv_dim) ... wait.
+                        // Simpler: source_kv_dim = (kt.shape[0] * 32) / (vt.shape[0] / source_kv_dim)
+                        // Actually, source_kv_dim is just (bits per token). 
+                        // Each token has (source_kv_dim / 32) u32s.
+                        let source_tokens = v_data.len() / (k_data.len() * 32 / v_data.len()).max(1); // Rough estimate
+                        let source_dim = v_data.len() / (if source_tokens == 0 { 1 } else { v_data.len() / (k_data.len() * 32 / (v_data.len() / k_data.len().max(1) * 32).max(1)).max(1) }).max(1);
+                        
+                        // Let's use a more robust way: Qwen 0.5B/0.6B is 1024, 1.5B/2B is 2048 or 1024 depending on GQA.
+                        // Based on shapes: source_dim = (v_data.len() / num_tokens).
+                        // Since we know k_data.len() * 32 == v_data.len() * (something), 
+                        // and for bit-serial it's 1 bit per value: source_dim = v_data.len() / (k_data.len() * 32 / v_data.len())
+                        let actual_source_dim = if k_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
+                        
+                        if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
+                            let ratio = target_dim / actual_source_dim;
+                            println!("[KV-UPscale] Scaling context: {} -> {} (Ratio: {})", actual_source_dim, target_dim, ratio);
                             
                             let mut new_k = Vec::with_capacity(k_data.len() * ratio);
                             let mut new_v = Vec::with_capacity(v_data.len() * ratio);
                             
-                            for chunk in k_data.chunks_exact(source_dim / 32) {
+                            for chunk in k_data.chunks_exact(actual_source_dim / 32) {
                                 for _ in 0..ratio { new_k.extend_from_slice(chunk); }
                             }
-                            for chunk in v_data.chunks_exact(source_dim) {
+                            for chunk in v_data.chunks_exact(actual_source_dim) {
                                 for _ in 0..ratio { new_v.extend_from_slice(chunk); }
                             }
                             k_data = new_k;
@@ -426,16 +441,16 @@ impl Qwen3VLGenerateModel {
                 }
 
                 if !combined_k.is_empty() {
-                    // [CRITICAL-FIX] Clear any existing GPU cache to force a fresh start with new data.
                     m.text_model.force_free_kv_cache();
                     
                     let num_layers = m.text_model.layers.len();
-                    println!("[KV-STITCH] Replicating baked context across ALL {} layers.", num_layers);
+                    let total_tokens = (combined_k.len() * 32) / target_dim;
+                    println!("[KV-STITCH] Replicating {} total tokens across ALL {} layers.", total_tokens, num_layers);
                     
                     for i in 0..num_layers {
                         m.text_model.layers[i].set_kv_data(combined_k.clone(), combined_v.clone());
                     }
-                    println!("[KV-STITCH] SUCCESS: Full-layer context injection complete. Ready for No-Prefill inference.");
+                    println!("[KV-STITCH] SUCCESS: Multi-layer Stitching complete.");
                 }
             }
         }
