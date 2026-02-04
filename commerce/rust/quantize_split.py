@@ -64,8 +64,15 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
 
     final_dict = {}
     for name, param in tensors.items():
+        # [NAMING-UNITY] 0.6B 모델의 이름을 2B 모델과 일치하도록 변환
+        # model.layers.0 -> model.language_model.layers.0
+        new_name = name
+        if "layers." in name and "language_model" not in name:
+            new_name = name.replace("model.layers", "model.language_model.layers")
+            print(f"  -> Renaming: {name} to {new_name}")
+
         # 레이어 인덱스 추출
-        idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', name)
+        idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', new_name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
         
         # Baking 전용: 레이어 제한 (Layer 0만 포함)
