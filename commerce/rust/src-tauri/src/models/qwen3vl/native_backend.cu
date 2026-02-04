@@ -248,13 +248,13 @@ __global__ void bit_serial_attn_kernel_tile_fused(
 }
 
 extern "C" {
-    void bit_serial_attn_cuda_direct(const float* d_q, const uint32_t* d_k, const float* d_v, float* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len) {
+    void bit_serial_attn_cuda_direct(const float* d_q, const uint32_t* d_k, const float* d_v, float* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha) {
         cudaSetDevice(dev);
         dim3 block(256); // 4 warps
         dim3 grid(q_len, n_h);
         // Tiled kernel handles synchronization internally. Small shared memory for Q-bits and tiling.
         size_t smem = 1024; 
-        bit_serial_attn_kernel_v2026<<<grid, block, smem>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len);
+        bit_serial_attn_kernel_v2026<<<grid, block, smem>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha);
     }
 
     void bit_serial_attn_cuda_fused(const float* d_q, const uint32_t** d_k_table, const float** d_v_table, const int* d_lens, int n_segs, float* d_o, int n_h, int h_d, float scale, int dev, int q_len) {

@@ -284,18 +284,15 @@ impl NativeLayer {
 
             // [OPTIMIZATION] Reuse scratch buffers for Attention
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
-            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o);
+            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.1f);
             
             // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
             if !attn_out.is_empty() && attn_out[0].to_f32() == 0.0 && attn_out.iter().take(50).all(|x| x.to_f32() == 0.0) {
-                println!("[STABILITY] Signal Death detected at layer {}. Attempting Relaxed-Scaling GPU recovery...", _idx);
+                println!("[STABILITY] Signal Death detected at layer {}. Attempting Relaxed-Scaling (Alpha: 0.5) GPU recovery...", _idx);
                 
-                // Retry with a slightly higher "Keep-alive" or scaling factor if the kernel supports it, 
-                // or just try to re-run with a slightly different epsilon.
-                // For now, we try ONE MORE GPU pass with a safety check before CPU fallback.
+                // [2026-FIX] Apply much stronger bias during recovery to force signal survival
                 if new_len > 1 {
-                     println!("[STABILITY] Large context ({}) recovery: Re-sampling Attention...", new_len);
-                     attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o);
+                     attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, 0.5f);
                 }
 
                 if attn_out[0].to_f32() == 0.0 {

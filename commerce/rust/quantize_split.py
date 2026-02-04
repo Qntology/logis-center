@@ -64,12 +64,19 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
 
     final_dict = {}
     for name, param in tensors.items():
-        # [NAMING-UNITY] 0.6B 모델의 이름을 2B 모델과 일치하도록 변환
-        # model.layers.0 -> model.language_model.layers.0
+        # [NAMING-UNITY] 0.6B 모델의 이름을 2B 모델과 일치하도록 완벽 변환
         new_name = name
         if "layers." in name and "language_model" not in name:
             new_name = name.replace("model.layers", "model.language_model.layers")
-            print(f"  -> Renaming: {name} to {new_name}")
+        elif "model.embed_tokens" in name and "language_model" not in name:
+            new_name = name.replace("model.embed_tokens", "model.language_model.embed_tokens")
+        elif "model.norm" in name and "language_model" not in name:
+            new_name = name.replace("model.norm", "model.language_model.norm")
+        elif name.startswith("lm_head"):
+            new_name = "model.language_model.lm_head" + name[7:]
+            
+        if new_name != name:
+            print(f"  -> Unified Name: {name} to {new_name}")
 
         # 레이어 인덱스 추출
         idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', new_name)
