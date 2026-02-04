@@ -5,106 +5,110 @@ import os
 import re
 import gguf
 
-def quantize_tensor_bit_serial(param):
+def quantize_tensor_bit_serial_shuffled(param):
+    """
+    [OPTIMIZED] 1-bit Quantization with Layout Shuffling
+    Rearranges weights into [N/8, K/32, 8] for direct AVX2 register loading.
+    """
     BLOCK_SIZE = 32
-    original_shape = list(param.shape)
-    flat_w = param.view(-1).to(torch.float32)
-    pad_len = (BLOCK_SIZE - (flat_w.numel() % BLOCK_SIZE)) % BLOCK_SIZE
-    if pad_len > 0: flat_w = torch.cat([flat_w, torch.zeros(pad_len)])
-    num_blocks = flat_w.numel() // BLOCK_SIZE
-    blocks = flat_w.view(num_blocks, BLOCK_SIZE)
-    scales = torch.mean(torch.abs(blocks), dim=1).to(torch.float16)
-    binary = (blocks >= 0).to(torch.uint8)
-    packed_uint32 = torch.zeros(num_blocks, dtype=torch.int32)
-    for i in range(32):
-        packed_uint32 |= (binary[:, i].to(torch.int32) << i)
-    return packed_uint32, scales, torch.tensor(original_shape, dtype=torch.int32)
-
-def process_text_layer0(input_path, output_dir):
-    """
-    Generate a Baking-Only model with ONLY Layer 0.
-    No lm_head, no other layers.
-    """
-    print(f"\n[TEXT-L0] Extracting Layer 0 for Baking: {input_path}")
-    tensors = load_file(input_path)
-    layer0_dict = {}
+    N, K = param.shape[0], param.shape[1]
     
+    # 1. Padding K to multiple of 32
+    pad_k = (BLOCK_SIZE - (K % BLOCK_SIZE)) % BLOCK_SIZE
+    if pad_k > 0:
+        param = torch.nn.functional.pad(param, (0, pad_k))
+    K_padded = K + pad_k
+    K_blocks = K_padded // BLOCK_SIZE
+
+    # 2. Basic Bit-packing [N, K_blocks]
+    flat_w = param.view(N, K_blocks, BLOCK_SIZE)
+    # Scales are also stored per block
+    scales = torch.mean(torch.abs(flat_w), dim=2).to(torch.float16)
+    binary = (flat_w >= 0).to(torch.int32)
+    
+    packed_rows = torch.zeros((N, K_blocks), dtype=torch.int32)
+    for i in range(BLOCK_SIZE):
+        packed_rows |= (binary[:, :, i] << i)
+
+    # 3. [LAYOUT SHUFFLING] Group 8 output channels together
+    pad_n = (8 - (N % 8)) % 8
+    if pad_n > 0:
+        packed_rows = torch.nn.functional.pad(packed_rows, (0, 0, 0, pad_n))
+        scales = torch.nn.functional.pad(scales, (0, 0, 0, pad_n))
+    
+    N_padded = N + pad_n
+    # Change layout to [N/8, K_blocks, 8]
+    shuffled_w = packed_rows.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
+    shuffled_s = scales.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
+
+    return shuffled_w.view(-1), shuffled_s.view(-1), torch.tensor([N, K], dtype=torch.int32)
+
+def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=None):
+    mode_name = "LAYER0" if layer_limit == 1 else "ALL"
+    suffix = f"BITSERIAL_{mode_name}.safetensors"
+    prefix = "mmproj-" if is_vision else "model-"
+    out_path = os.path.join(output_dir, f"{prefix}{suffix}")
+
+    print(f"\n[PROCESS-{mode_name}] Layout: Shuffled (Format 1) | Path: {input_path}")
+    
+    tensors = {}
+    if input_path.endswith(".gguf"):
+        reader = gguf.GGUFReader(input_path)
+        for t in reader.tensors:
+            name = t.name.replace("v.", "visual.") if t.name.startswith("v.") else t.name
+            if not name.startswith("visual.") and ("blk" in name or "mm" in name or "patch" in name):
+                name = f"visual.{name}"
+            tensors[name] = torch.from_numpy(t.data).to(torch.float32)
+    else:
+        tensors = load_file(input_path)
+
+    final_dict = {}
     for name, param in tensors.items():
-        idx_match = re.search(r'(layers)\.(\d+)\.', name)
+        # 레이어 인덱스 추출
+        idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
         
-        # Baking-Only: Remove lm_head and layers > 0
-        if "lm_head" in name or "output.weight" in name: continue
-        if layer_idx > 0: continue
+        # Baking 전용: 레이어 제한 (Layer 0만 포함)
+        if layer_limit is not None and layer_idx >= layer_limit: continue
         
-        is_weight = "weight" in name and len(param.shape) >= 2
-        should_quantize = is_weight and "embed" not in name and "norm" not in name
+        # 비전/텍스트 분리
+        if is_vision != ("visual" in name): continue
+
+        is_weight = "weight" in name and len(param.shape) == 2
+        # 양자화 대상 제외 (임베딩, 노름 등)
+        should_quantize = is_weight and "norm" not in name and "ln" not in name and "embed" not in name and "patch" not in name
 
         if should_quantize:
-            packed, scales, shape = quantize_tensor_bit_serial(param)
-            layer0_dict.update({
+            packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
+            final_dict.update({
                 f"{name}.packed": packed,
                 f"{name}.scales": scales,
                 f"{name}.shape": shape,
-                f"{name}.format": torch.tensor([0], dtype=torch.int8)
+                f"{name}.format": torch.tensor([1], dtype=torch.int8) # Format 1 = Shuffled
             })
         else:
-            layer0_dict[name] = param.to(torch.float16)
+            final_dict[name] = param.to(torch.float16)
 
-    out_path = os.path.join(output_dir, f"{os.path.basename(input_path).replace('.safetensors', '')}-BITSERIAL_LAYER0.safetensors")
-    save_file(layer0_dict, out_path)
-    print(f" -> Saved: {out_path} ({len(layer0_dict)} tensors)")
-
-def process_vision_layer0(input_path, output_dir):
-    """
-    Generate a Baking-Only Vision model with ONLY Block 0.
-    """
-    print(f"\n[VISION-L0] Extracting Vision Block 0 for Baking: {input_path}")
-    reader = gguf.GGUFReader(input_path)
-    layer0_dict = {}
-    
-    for tensor in reader.tensors:
-        name = tensor.name
-        data = torch.from_numpy(tensor.data).to(torch.float32)
-        
-        new_name = name.replace("v.", "visual.") if name.startswith("v.") else name
-        if not new_name.startswith("visual.") and ("blk" in new_name or "mm" in new_name or "patch" in new_name):
-             new_name = f"visual.{new_name}"
-        
-        idx_match = re.search(r'(blk|blocks)\.(\d+)\.', new_name)
-        layer_idx = int(idx_match.group(2)) if idx_match else -1
-        
-        # Baking-Only: Remove vision blocks > 0
-        if layer_idx > 0: continue 
-
-        is_weight = "weight" in new_name and len(data.shape) >= 2
-        should_quantize = is_weight and "norm" not in new_name and "ln" not in new_name and "embed" not in new_name and "patch" not in new_name
-        
-        if should_quantize:
-            packed, scales, shape = quantize_tensor_bit_serial(data)
-            layer0_dict.update({
-                f"{new_name}.packed": packed,
-                f"{new_name}.scales": scales,
-                f"{new_name}.shape": shape,
-                f"{new_name}.format": torch.tensor([0], dtype=torch.int8)
-            })
-        else:
-            layer0_dict[new_name] = data.to(torch.float16)
-            
-    out_path = os.path.join(output_dir, "mmproj-BITSERIAL_LAYER0.safetensors")
-    save_file(layer0_dict, out_path)
-    print(f" -> Saved: {out_path} ({len(layer0_dict)} tensors)")
+    save_file(final_dict, out_path)
+    print(f" -> Saved to {out_path} ({len(final_dict)} tensors)")
 
 if __name__ == "__main__":
     BASE_DIR = "src-tauri/models"
     
-    # 1. Text Layer 0 Extraction
-    for m_dir in ["Qwen3-VL-2B-Instruct-gguf", "Qwen3-0.6B-Instruct-gguf"]:
-        src = os.path.join(BASE_DIR, m_dir, "model.safetensors")
-        if os.path.exists(src):
-            process_text_layer0(src, os.path.dirname(src))
-
-    # 2. Vision Layer 0 Extraction
-    v_src = os.path.join(BASE_DIR, "Qwen3-VL-2B-Instruct-gguf/mmproj-Qwen3VL-2B-Instruct-F16.gguf")
-    if os.path.exists(v_src):
-        process_vision_layer0(v_src, os.path.dirname(v_src))
+    # 텍스트 및 비전 모델 리스트
+    tasks = [
+        # (디렉토리, 소스파일, 비전여부, 레이어제한)
+        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, None),
+        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, 1),
+        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, None),
+        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, 1),
+        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, None),
+        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, 1),
+    ]
+    
+    for m_dir, src_file, is_v, limit in tasks:
+        p_src = os.path.join(BASE_DIR, m_dir, src_file)
+        if os.path.exists(p_src):
+            process_model_shuffled(p_src, os.path.join(BASE_DIR, m_dir), is_v, limit)
+        else:
+            print(f"[SKIP] Source not found: {p_src}")
