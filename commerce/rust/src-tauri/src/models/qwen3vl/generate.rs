@@ -181,40 +181,58 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
         let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
+        // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
+        // [FIX] Distinguish between Resume (same prompt) and Relay (new suffix prompt)
+        let mut local_pos = if seqlen_offset > 0 && seqlen_offset < all_ids.len() {
+             // Case A: Resuming within the same long prompt
+             println!("[SKIP-PREFILL] Context matching. Resuming from token {}/{}", seqlen_offset, all_ids.len());
+             seqlen_offset
+        } else if seqlen_offset > 0 {
+             // Case B: Relay mode. Current prompt is a new instruction to be added AFTER baked KV.
+             println!("[SKIP-PREFILL] Relay mode. Appending new prompt ({} tokens) at offset {}", all_ids.len(), seqlen_offset);
+             0 
+        } else {
+             0
+        };
+
+        let prefill_chunk_size = 512;
+        while local_pos < all_ids.len() {
+            let remaining = all_ids.len() - local_pos;
+            if remaining <= 1 { break; } // Keep the last token for generation trigger
+            
+            let chunk_size = remaining.min(prefill_chunk_size);
+            let end = (local_pos + chunk_size).min(all_ids.len() - 1);
+            let chunk = &all_ids[local_pos..end];
+            
+            if let Some(flag) = &cancel_flag {
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
+            }
+
+            self.qwen3_vl.forward(chunk, None, None, seqlen_offset);
+            
+            let processed = chunk.len();
+            local_pos += processed;
+            seqlen_offset += processed;
+        }
+
         let mut generated_text = String::new();
         let max_new_tokens = mes.max_tokens.unwrap_or(1024) as usize;
-
-        // [SKIP-PREFILL] Determine tokens to process in the first step
-        let mut current_ids = if seqlen_offset > 0 {
-            if seqlen_offset < all_ids.len() {
-                println!("[SKIP-PREFILL] Context already in KV. Resuming from token {}/{}", seqlen_offset, all_ids.len());
-                all_ids[seqlen_offset..].to_vec()
-            } else {
-                println!("[SKIP-PREFILL] Entire prompt already baked. Starting with last token.");
-                vec![] 
-            }
-        } else {
-            println!("[SKIP-PREFILL] WARNING: Offset is 0. Performing full prefill.");
-            all_ids.clone()
-        };
+        let mut current_all_ids = all_ids.clone();
 
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
             }
 
-            // At i=0, we use our calculated current_ids. 
-            // If current_ids is empty (all baked), we might need to sample the next token immediately.
+            // The very first token of the loop handles the "last token" of the prompt
             let input_ids = if i == 0 { 
-                if current_ids.is_empty() {
-                    // This case happens if the entire prompt was already baked into KV.
-                    // We need at least the last token to trigger next token generation.
-                    vec![*all_ids.last().unwrap()]
+                if local_pos < current_all_ids.len() {
+                    current_all_ids[local_pos..].to_vec()
                 } else {
-                    current_ids.clone()
+                    vec![*current_all_ids.last().unwrap()]
                 }
             } else { 
-                vec![*current_ids.last().unwrap()] 
+                vec![*current_all_ids.last().unwrap()] 
             };
 
             let (pixels, grid) = if i == 0 && seqlen_offset == 0 { 
@@ -228,7 +246,7 @@ impl Qwen3VLGenerateModel {
             
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             
-            current_ids.push(next_id);
+            current_all_ids.push(next_id);
             let new_word = self.tokenizer.token_decode(vec![next_id])?;
             print!("{}", new_word); 
             use std::io::Write;

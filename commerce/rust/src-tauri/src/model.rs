@@ -320,16 +320,19 @@ impl LogisModel {
 
     /// Step 2: Bake a specific prompt and run inference by stitching with PUG base
     pub async fn run_modular_inference(&self, address_hash: &str, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let prompt_session = format!("{}_prompt_{}", task_id, prompt_name);
-        let kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
+        let _prompt_session = format!("{}_prompt_{}", task_id, prompt_name);
+        let _kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
         
         println!("[MODULAR-INF] Running inference for step: {} (Address: {})", prompt_name, address_hash);
 
         // 1. Bake the specific system prompt (Quick 1-layer bake)
+        // [FIX] Wrap in ChatML template so the model knows it's a system instruction
+        let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
+
         self.ensure_generator_ext(ModelSize::Small, true, true).await?;
         {
             let gen_clone = self.generator.clone();
-            let sp = system_prompt.to_string();
+            let sp = formatted_prompt;
             let ah = address_hash.to_string();
             let tid = task_id.to_string();
             let p_name = prompt_name.to_string();
