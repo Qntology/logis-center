@@ -325,6 +325,7 @@ async fn process_task(
             let mut gen_guard = gen_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
                 gen.load_kv_stitched(&[pug_base_path])?;
+                println!("[PROCESS] KV Cache Stitched. Offset: {} tokens.", gen.get_kv_len());
             }
             Ok::<(), anyhow::Error>(())
         }).await??;
@@ -335,24 +336,24 @@ async fn process_task(
     let mut is_detail = false;
     let mut all_extracted_items = Vec::new();
 
-    // PHASE 1 & 2: Integrated Analysis (Type + Selectors)
+    // [PHASE 1 & 2] Integrated Analysis (Using nobridge to ensure alignment)
     {
         log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Identifying page structure...", "spinner": "⠋" }));
         
         let type_prompt = parsing::page_type_prompt();
-        let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
-
-        let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("integrated_type".to_string())).await?;
+        // [STRICT-ALIGNMENT] nobridge 세션 태그를 사용하여 베이킹된 문맥을 훼손하지 않고 질의
+        let res = model.chat("", &type_prompt, Some(cancellation_token.clone()), Some("integrated_type_nobridge".to_string())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
-        if page_type == "unknown" || page_type.is_empty() { return Ok(()); }
+        if page_type == "unknown" || page_type.is_empty() { 
+            println!("[PROCESS] Page type identification failed. LLM Response: {}", res);
+            return Ok(()); 
+        }
 
         // Immediately follow up with selector detection in the same session
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        let sel_query = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
-        
-        let res_sel = model.chat("", &sel_query, Some(cancellation_token.clone()), Some("integrated_selectors_nobridge".to_string())).await?;
+        let res_sel = model.chat("", &selector_prompt, Some(cancellation_token.clone()), Some("integrated_selectors_nobridge".to_string())).await?;
         selector_info = parsing::parse_json_from_llm(&res_sel);
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
 

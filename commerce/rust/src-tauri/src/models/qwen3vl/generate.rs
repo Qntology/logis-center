@@ -405,25 +405,17 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn save_raw_kv_to_disk(&self, path: &Path, k: &[u32], v: &[f16]) -> Result<()> {
-        let mut tensors = std::collections::HashMap::new();
+        let mut k_bytes = Vec::with_capacity(k.len() * 4);
+        for &val in k { k_bytes.extend_from_slice(&val.to_ne_bytes()); }
         
-        // [DIST-AUDIT] Calculate stats for V-cache (Values are more sensitive to distribution)
-        let v_f32: Vec<f32> = v.iter().map(|&x| x.to_f32()).collect();
-        let sum: f32 = v_f32.iter().sum();
-        let mean = sum / v_f32.len() as f32;
-        let max_abs = v_f32.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-        println!("[DIST-AUDIT-BAKE] V-Cache Stats -> Mean: {:.6}, MaxAbs: {:.6}, Count: {}", mean, max_abs, v.len());
-        if max_abs == 0.0 {
-            println!("[BAKE-CRITICAL] V-CACHE IS COMPLETELY DEAD (ALL ZEROS). Check v_proj output.");
-        }
+        let mut v_bytes = Vec::with_capacity(v.len() * 2);
+        for &val in v { v_bytes.extend_from_slice(&val.to_ne_bytes()); }
 
-        let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
-        tensors.insert("layer.0.k".to_string(), safetensors::tensor::TensorView::new(safetensors::Dtype::U32, vec![k.len()], k_u8)?);
-        
-        let v_u8 = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
-        tensors.insert("layer.0.v".to_string(), safetensors::tensor::TensorView::new(safetensors::Dtype::F16, vec![v.len()], v_u8)?);
+        let mut views = std::collections::HashMap::new();
+        views.insert("layer.0.k".to_string(), safetensors::tensor::TensorView::new(safetensors::Dtype::U32, vec![k.len()], &k_bytes)?);
+        views.insert("layer.0.v".to_string(), safetensors::tensor::TensorView::new(safetensors::Dtype::F16, vec![v.len()], &v_bytes)?);
 
-        safetensors::tensor::serialize_to_file(tensors, &None, path)?;
+        safetensors::tensor::serialize_to_file(views, &None, path)?;
         Ok(())
     }
 
@@ -437,32 +429,34 @@ impl Qwen3VLGenerateModel {
             return Ok(()); 
         }
 
-        let abs_path = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))
-            .map(|p| p.join(path.file_name().unwrap()))
-            .unwrap_or(path.to_path_buf());
-            
-        println!("[KV-DISK] Attempting to save {} layers to {:?}", kvs.len(), abs_path);
-
-        // Ensure parent directory exists
+        // Parent directory check
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                println!("[KV-DISK] Creating missing directory: {:?}", parent);
-                std::fs::create_dir_all(parent)?;
-            }
+            if !parent.exists() { std::fs::create_dir_all(parent)?; }
         }
 
         let mut tensors = std::collections::HashMap::new();
+        // [FIX] Windows Os Error 1784 대응: raw_parts 대신 안전한 바이트 복사 사용
+
         for (i, (k, v)) in kvs.into_iter().enumerate() {
-            let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
-            tensors.insert(format!("layer.{}.k", i), safetensors::tensor::TensorView::new(safetensors::Dtype::U32, vec![k.len()], k_u8)?);
-            let v_u8 = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
-            tensors.insert(format!("layer.{}.v", i), safetensors::tensor::TensorView::new(safetensors::Dtype::F16, vec![v.len()], v_u8)?);
+            // K (u32) to bytes
+            let mut k_bytes = Vec::with_capacity(k.len() * 4);
+            for &val in &k { k_bytes.extend_from_slice(&val.to_ne_bytes()); }
+            tensors.insert(format!("layer.{}.k", i), (safetensors::Dtype::U32, vec![k.len()], k_bytes));
+            
+            // V (f16) to bytes
+            let mut v_bytes = Vec::with_capacity(v.len() * 2);
+            for &val in &v { v_bytes.extend_from_slice(&val.to_ne_bytes()); }
+            tensors.insert(format!("layer.{}.v", i), (safetensors::Dtype::F16, vec![v.len()], v_bytes));
         }
 
-        match safetensors::tensor::serialize_to_file(tensors, &None, path) {
-            Ok(_) => println!("[KV-DISK] SUCCESS: Saved KV Cache to {:?}", abs_path),
-            Err(e) => println!("[KV-DISK] ERROR: Failed to save safetensors: {}", e),
+        // Safetensors 저장을 위한 View 생성
+        let mut views = std::collections::HashMap::new();
+        for (name, (dtype, shape, ref data)) in &tensors {
+            views.insert(name.clone(), safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)?);
         }
+
+        safetensors::tensor::serialize_to_file(views, &None, path)?;
+        println!("[KV-DISK] SUCCESS: Saved KV Cache to {:?}", path);
         Ok(())
     }
 

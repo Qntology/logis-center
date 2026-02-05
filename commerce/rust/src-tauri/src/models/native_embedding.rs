@@ -94,13 +94,24 @@ impl NativeEmbeddingModel {
         let table = self.embed_tokens.get_slice::<f16>();
         let mut x = native_embedding_lookup_f16(token_ids, &table, self.hidden_size);
         let mut ws_guard = self.workspace.lock().unwrap();
+        // Initialize hidden_a with lookup results
+        ws_guard.hidden_a[..x.len()].copy_from_slice(&x);
+        let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws_guard.hidden_a.as_ptr(), x.len()) };
 
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, &cfg, 0, i, &[], &[], false, None, Some(&mut *ws_guard));
+            let use_b = i % 2 == 0;
+            let out_slice = layer.forward(cur_x, &cfg, 0, i, &[], &[], false, None, &mut *ws_guard, use_b);
+            
+            // Detach slice from mutable borrow
+            unsafe {
+                let ptr = out_slice.as_ptr();
+                let len = out_slice.len();
+                cur_x = std::slice::from_raw_parts(ptr, len);
+            }
         }
 
         let norm_w = self.norm.get_slice::<f16>();
-        let x_norm = native_rms_norm_f16(&x, &norm_w, 1e-6, self.hidden_size);
+        let x_norm = native_rms_norm_f16(cur_x, norm_w.as_ref(), 1e-6, self.hidden_size);
         
         let mut pooled = vec![0.0f32; self.hidden_size];
         for i in 0..token_ids.len() {
