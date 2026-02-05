@@ -313,6 +313,9 @@ impl NativeLayer {
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
+            // [OPTIMIZATION] Reuse scratch buffers for Attention
+            let (d_q, d_o) = self.ensure_attn_scratch(q.len());
+
             // [STABILITY-ORGANIC-RECOVERY] Multi-stage GPU persistence loop
             // Instead of giving up, 0.6B model fights to stay on GPU via incremental alpha hunting.
             let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
