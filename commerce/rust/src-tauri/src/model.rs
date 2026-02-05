@@ -318,43 +318,43 @@ impl LogisModel {
     }
 
     /// Step 2: Bake a specific prompt and run inference by stitching with PUG base
-    pub async fn run_modular_inference(&self, address_hash: &str, task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
-        let _prompt_session = format!("{}_prompt_{}", task_id, prompt_name);
-        
-        println!("[MODULAR-INF] Running inference for step: {} (Address: {})", prompt_name, address_hash);
+    pub async fn run_modular_inference(&self, address_hash: &str, _task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
+        let prompt_session = format!("shared_prompt_{}", prompt_name);
+        println!("[MODULAR-INF] Running cached inference for step: {} (Address: {})", prompt_name, address_hash);
 
-        // 0. Get path for shared site base
-        let pug_base_path = crate::utils::paths::get_kv_dir(None, Some(address_hash)).join("shared_pug_base.safetensors");
+        let kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
+        let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
+        let prompt_path = kv_dir.join(format!("{}.safetensors", prompt_session));
 
-        // 1. Bake the specific system prompt (Quick 1-layer bake)
-        let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
-
-        self.ensure_generator_ext(ModelSize::Small, true, true).await?;
-        {
-            let gen_clone = self.generator.clone();
-            let sp = formatted_prompt;
-            let ah = address_hash.to_string();
-            let tid = task_id.to_string();
-            let p_name = prompt_name.to_string();
-            let token_clone = cancel_token.clone();
-            let p_path = pug_base_path.clone();
-            
-            tokio::task::spawn_blocking(move || {
-                let mut gen_guard = gen_clone.blocking_lock();
-                if let Some(gen) = gen_guard.as_mut() {
-                    let offset = if p_path.exists() { gen.get_kv_file_token_count(&p_path).unwrap_or(0) } else { 0 };
-                    let path = crate::utils::paths::get_kv_dir(None, Some(&ah)).join(format!("{}_prompt_{}.safetensors", tid, p_name));
-                    gen.bake_text_in_parts_to_path(sp, &path, "baked", offset, token_clone)?;
-                    Ok::<(), anyhow::Error>(())
-                } else { Ok(()) }
-            }).await??;
+        // 1. Bake the specific system prompt ONLY if missing
+        if !prompt_path.exists() {
+            println!("[MODULAR-INF] Prompt cache missing. Baking: {}", prompt_name);
+            let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
+            self.ensure_generator_ext(ModelSize::Small, true, true).await?;
+            {
+                let gen_clone = self.generator.clone();
+                let sp = formatted_prompt;
+                let p_path = prompt_path.clone();
+                let b_path = pug_base_path.clone();
+                let token_clone = cancel_token.clone();
+                
+                tokio::task::spawn_blocking(move || {
+                    let mut gen_guard = gen_clone.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        let offset = if b_path.exists() { gen.get_kv_file_token_count(&b_path).unwrap_or(0) } else { 0 };
+                        gen.bake_text_in_parts_to_path(sp, &p_path, "baked", offset, token_clone)?;
+                        Ok::<(), anyhow::Error>(())
+                    } else { Ok(()) }
+                }).await??;
+            }
+            self.unload_generator().await;
+        } else {
+            println!("[MODULAR-INF] Found cached prompt for {}, skipping baking.", prompt_name);
         }
-        self.unload_generator().await;
 
-        // 2. Load 2B Full Model and Stitch [Permanent Site Base + Current Task Prompt]
+        // 2. Load 2B Full Model and Stitch
         self.secure_vram_relay_ext(ModelSize::Large, None, cancel_token.clone(), false, true, Some(address_hash)).await?;
         
-        let prompt_path = crate::utils::paths::get_kv_dir(None, Some(address_hash)).join(format!("{}_prompt_{}.safetensors", task_id, prompt_name));
         let mut components = Vec::new();
         if pug_base_path.exists() { components.push(pug_base_path); }
         if prompt_path.exists() { components.push(prompt_path); }
@@ -364,15 +364,15 @@ impl LogisModel {
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_arc.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    println!("[SSD-BRIDGE] Stitching permanent base with current prompt ({} files)", components.len());
+                    println!("[SSD-BRIDGE] Stitching permanent base with permanent prompt ({} files)", components.len());
                     gen.load_kv_stitched(&components)?;
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
         }
 
-        // 3. Final Chat
-        self.chat("", user_input, cancel_token, Some(format!("{}_final", prompt_name))).await
+        // 3. Final Chat (Bypass additional bridging)
+        self.chat("", user_input, cancel_token, Some(format!("{}_final_nobridge", prompt_name))).await
     }
 
     // --- [SCENARIO B] Image Preprocessing (0.6B 1L Bake -> 2B 1L Vision Bake -> 2B Full Inf) ---

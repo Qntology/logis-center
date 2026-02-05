@@ -201,6 +201,7 @@ impl Qwen3VLGenerateModel {
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, phase_tag: Option<&str>) -> Result<String> {
         let seqlen_offset = self.get_kv_len();
         let tag = phase_tag.unwrap_or("GENERATE");
+        let no_bridge = tag.contains("nobridge");
         println!("[{}] Initial KV Offset: {}", tag, seqlen_offset);
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
@@ -211,7 +212,7 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
-        if seqlen_offset > 0 {
+        if seqlen_offset > 0 && !no_bridge {
             // [STITCHING] Align 0.6B cache with 2B activations using a 32-token overlap
             let bridge_len = all_ids.len().min(recalibration_len);
             current_kv_offset = seqlen_offset.saturating_sub(bridge_len);
@@ -240,16 +241,18 @@ impl Qwen3VLGenerateModel {
         }
 
         // [LBR-STABILITY] Recalibrate the last tokens to bridge 0.6B -> 2B drift
-        let recalib_len = current_kv_offset.min(32);
-        let safe_offset = current_kv_offset - recalib_len;
-        
-        if recalib_len > 0 {
-            // [FIX] Ensure we don't slice past all_ids length
-            let actual_slice_len = all_ids.len().min(recalib_len);
-            if actual_slice_len > 0 {
-                println!("[LBR] Synchronizing last {} tokens for context alignment...", actual_slice_len);
-                let recalib_chunk = &all_ids[..actual_slice_len]; 
-                self.qwen3_vl.forward(recalib_chunk, None, None, safe_offset);
+        if !no_bridge {
+            let recalib_len = current_kv_offset.min(32);
+            let safe_offset = current_kv_offset - recalib_len;
+            
+            if recalib_len > 0 {
+                // [FIX] Ensure we don't slice past all_ids length
+                let actual_slice_len = all_ids.len().min(recalib_len);
+                if actual_slice_len > 0 {
+                    println!("[LBR] Synchronizing last {} tokens for context alignment...", actual_slice_len);
+                    let recalib_chunk = &all_ids[..actual_slice_len]; 
+                    self.qwen3_vl.forward(recalib_chunk, None, None, safe_offset);
+                }
             }
         }
 
