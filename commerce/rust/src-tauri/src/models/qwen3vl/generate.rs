@@ -383,11 +383,8 @@ impl Qwen3VLGenerateModel {
             current_offset += chunk.len();
         }
 
-        let ModelVariant::Native(m) = &self.qwen3_vl;
-        if let Some((k, v)) = m.text_model.layers[0].get_kv_data(m.text_model.config.head_dim, m.text_model.config.num_key_value_heads) {
-            self.save_raw_kv_to_disk(final_path, &k, &v)?;
-            println!("[BAKE-PATH] SUCCESS: Saved context ({} tokens) to {:?}", k.len() * 32 / (m.text_model.config.num_key_value_heads * m.text_model.config.head_dim), final_path);
-        }
+        // [FIX] Save ALL layers, not just layer 0
+        self.save_kv_to_disk(final_path)?;
         
         self.clear_kv_cache();
         Ok(())
@@ -476,12 +473,13 @@ impl Qwen3VLGenerateModel {
     pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<()> {
         match &self.qwen3_vl {
             ModelVariant::Native(m) => {
-                let mut combined_k = Vec::new();
-                let mut combined_v = Vec::new();
-                
                 let target_head_dim = m.text_model.config.head_dim;
                 let target_n_kv = m.text_model.config.num_key_value_heads;
                 let target_dim = target_head_dim * target_n_kv; 
+                let num_target_layers = m.text_model.layers.len();
+
+                // Clear existing cache before starting
+                m.text_model.force_free_kv_cache();
 
                 for path in paths {
                     if !path.exists() { continue; }
@@ -489,72 +487,73 @@ impl Qwen3VLGenerateModel {
                     let file = std::fs::read(path)?;
                     let st = safetensors::SafeTensors::deserialize(&file)?;
                     
-                    if let (Ok(kt), Ok(vt)) = (st.tensor("layer.0.k"), st.tensor("layer.0.v")) {
-                        let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
-                        let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
-                        
-                        // [DYNAMIC-DIMENSION-MATCHING] Robust mapping for Qwen family.
-                        // 0.6B models usually have 8 KV heads * 128 head_dim = 1024.
-                        // 2B models vary (e.g., 1536 or 2048).
-                        let actual_source_dim = if k_data.len() > 0 && v_data.len() > 0 {
-                            (v_data.len() * 32) / k_data.len()
-                        } else { 1024 };
-                        
-                        if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
-                            let ratio = target_dim / actual_source_dim;
-                            println!("[KV-UPSCALE] 2025-H2 Drift Compensation: Bridging 1-bit Small -> Large");
-                            
-                            let mut new_k = Vec::with_capacity(k_data.len() * ratio);
-                            let mut new_v = Vec::with_capacity(v_data.len() * ratio);
-                            
-                            // [2025-H2-RESEARCH] Drift Compensation Factor
-                            // Shift the 1-bit signal mean to match Large model's activation center
-                            let semantic_multiplier = f16::from_f32(1.12);
-                            let drift_bias = f16::from_f32(0.005); 
+                    // [2026-MULTI-LAYER-STITCH] 1:1 Parity Mapping (28 Layers for both Small & Large)
+                    let mut file_layers = 0;
+                    while st.tensor(&format!("layer.{}.k", file_layers)).is_ok() { file_layers += 1; }
+                    
+                    if file_layers == 0 {
+                        if let (Ok(kt), Ok(vt)) = (st.tensor("layer.0.k"), st.tensor("layer.0.v")) {
+                            println!("[KV-STITCH] Legacy single-layer fallback.");
+                            let k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                            let v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
+                            m.text_model.batch_upload_stitched_cache(k_data, v_data);
+                        }
+                        continue;
+                    }
 
-                            let k_units_per_token = actual_source_dim / 32;
-                            for chunk in k_data.chunks_exact(k_units_per_token) {
-                                for _ in 0..ratio { new_k.extend_from_slice(chunk); }
-                            }
-                            for chunk in v_data.chunks_exact(actual_source_dim) {
-                                for _ in 0..ratio { 
-                                    let mut v_scaled = chunk.to_vec();
-                                    for val in v_scaled.iter_mut() { 
-                                        // Apply both Scale and Drift Bias for 1-bit stability
-                                        *val = (*val * semantic_multiplier) + drift_bias; 
-                                    }
-                                    new_v.extend_from_slice(&v_scaled); 
-                                }
-                            }
-                            k_data = new_k;
-                            v_data = new_v;
+                    println!("[KV-STITCH] Found {} layers in file. Target: {} layers.", file_layers, num_target_layers);
+
+                    for l_idx in 0..num_target_layers {
+                        // [REPLICATION-LOGIC] If file has only 1 layer, use it for all target layers.
+                        // Otherwise, do 1:1 mapping.
+                        let src_idx = if file_layers == 1 { 0 } else { l_idx };
+                        
+                        if src_idx >= file_layers {
+                            continue; 
                         }
                         
-                        combined_k.extend(k_data);
-                        combined_v.extend(v_data);
+                        let k_key = format!("layer.{}.k", src_idx);
+                        let v_key = format!("layer.{}.v", src_idx);
+                        
+                        if let (Ok(kt), Ok(vt)) = (st.tensor(&k_key), st.tensor(&v_key)) {
+                            let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                            let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
+                            
+                            let actual_source_dim = if k_data.len() > 0 && v_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
+                            
+                            if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
+                                let ratio = target_dim / actual_source_dim;
+                                let mut new_k = Vec::with_capacity(k_data.len() * ratio);
+                                let mut new_v = Vec::with_capacity(v_data.len() * ratio);
+                                let semantic_multiplier = f16::from_f32(1.12);
+                                let drift_bias = f16::from_f32(0.005); 
+                                let k_units_per_token = actual_source_dim / 32;
+                                for chunk in k_data.chunks_exact(k_units_per_token) { for _ in 0..ratio { new_k.extend_from_slice(chunk); } }
+                                for chunk in v_data.chunks_exact(actual_source_dim) {
+                                    for _ in 0..ratio { 
+                                        let mut v_scaled = chunk.to_vec();
+                                        for val in v_scaled.iter_mut() { *val = (*val * semantic_multiplier) + drift_bias; }
+                                        new_v.extend_from_slice(&v_scaled); 
+                                    }
+                                }
+                                k_data = new_k; v_data = new_v;
+                            }
+                            
+                            // Append to target layer's cache (allowing multiple components to stack)
+                            let mut cache_k = m.text_model.layers[l_idx].kv_cache.lock().unwrap();
+                            if cache_k.is_none() { *cache_k = Some((Vec::new(), Vec::new())); }
+                            if let Some((ref mut pk, ref mut pv)) = *cache_k {
+                                pk.extend(k_data); pv.extend(v_data);
+                            }
+                        }
                     }
                 }
 
-                if !combined_k.is_empty() {
-                    // [CRITICAL-FIX] Clear any existing GPU cache to force a fresh start with new data.
-                    m.text_model.force_free_kv_cache();
-                    
-                    let total_tokens = (combined_k.len() * 32) / target_dim;
-                    
-                    // [DIST-AUDIT] Restored Stats check
-                    let v_f32: Vec<f32> = combined_v.iter().map(|&x| x.to_f32()).collect();
-                    let sum: f32 = v_f32.iter().sum();
-                    let mean = sum / v_f32.len() as f32;
-                    let max_abs = v_f32.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                    println!("[DIST-AUDIT-LOAD] Restored V-Cache Stats -> Mean: {:.6}, MaxAbs: {:.6}", mean, max_abs);
-
-                    println!("[KV-STITCH-VERIFY] Load Complete: {} tokens (Dim: {})", total_tokens, target_dim);
-                    
-                    if total_tokens > 0 {
-                        m.text_model.batch_upload_stitched_cache(combined_k, combined_v);
-                    }
-                }
-            }
+                // Final Step: Sync Layer 0's cache to GPU if applicable (other layers will DtoD during forward)
+                // Or simply let the first forward pass handle the HtoD.
+                println!("[KV-STITCH-VERIFY] Load Complete across all layers.");
+            },
+            _ => return Err(anyhow!("GGUF not supported for stitching")),
         }
         Ok(())
     }
