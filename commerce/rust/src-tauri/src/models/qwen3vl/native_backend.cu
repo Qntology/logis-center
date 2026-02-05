@@ -297,7 +297,15 @@ extern "C" {
 
 
 
+    
+
+
+
         void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
+
+
+
+    
 
 
 
@@ -305,7 +313,15 @@ extern "C" {
 
 
 
+    
+
+
+
             dim3 grid((n + 15) / 16, (m + 15) / 16);
+
+
+
+    
 
 
 
@@ -313,11 +329,395 @@ extern "C" {
 
 
 
+    
+
+
+
         }
 
 
 
+    
+
+
+
+    
+
+
+
+    
+
+
+
+            void rms_norm_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+                // [FIX] Call the standalone kernel instead of using an invalid inline lambda
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+                rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+            }
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+        }
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+        
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+    // Actual Kernels for activation and norm
+
+
+
+    
+
+
+
+    __global__ void rms_norm_kernel_f16(const half* i, const half* w, half* o, int h, float e) {
+
+
+
+    
+
+
+
+        int row = blockIdx.x;
+
+
+
+    
+
+
+
+        int tid = threadIdx.x;
+
+
+
+    
+
+
+
+        extern __shared__ float s_part_sum[];
+
+
+
+    
+
+
+
+        float sum = 0.0f;
+
+
+
+    
+
+
+
+        for (int j = tid; j < h; j += blockDim.x) { float val = __half2float(i[row * h + j]); sum += val * val; }
+
+
+
+    
+
+
+
+        s_part_sum[tid] = sum;
+
+
+
+    
+
+
+
+        __syncthreads();
+
+
+
+    
+
+
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+
+
+
+    
+
+
+
+            if (tid < stride) s_part_sum[tid] += s_part_sum[tid + stride];
+
+
+
+    
+
+
+
+            __syncthreads();
+
+
+
+    
+
+
+
+        }
+
+
+
+    
+
+
+
+        float inv_rms = rsqrtf(s_part_sum[0] / h + e);
+
+
+
+    
+
+
+
+        for (int j = tid; j < h; j += blockDim.x) o[row * h + j] = __float2half(__half2float(i[row * h + j]) * inv_rms * __half2float(w[j]));
+
+
+
+    
+
+
+
     }
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+    __global__ void silu_mul_kernel_f16(half* gate, const half* up, int size) {
+
+
+
+    
+
+
+
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+
+
+    
+
+
+
+        if (idx < size) {
+
+
+
+    
+
+
+
+            float g = __half2float(gate[idx]);
+
+
+
+    
+
+
+
+            float u = __half2float(up[idx]);
+
+
+
+    
+
+
+
+            gate[idx] = __float2half((g / (1.0f + expf(-g))) * u);
+
+
+
+    
+
+
+
+        }
+
+
+
+    
+
+
+
+    }
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+    extern "C" {
+
+
+
+    
+
+
+
+        void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
+
+
+
+    
+
+
+
+            rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
+
+
+
+    
+
+
+
+        }
+
+
+
+    
+
+
+
+        void cuda_silu_mul_f16(half* d_gate, const half* d_up, int size) {
+
+
+
+    
+
+
+
+            silu_mul_kernel_f16<<<(size + 255) / 256, 256>>>(d_gate, d_up, size);
+
+
+
+    
+
+
+
+        }
+
+
+
+    
+
+
+
+    }
+
+
+
+    
+
+
+
+    
 
 
 

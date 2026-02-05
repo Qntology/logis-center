@@ -40,6 +40,12 @@ extern "C" {
 
     #[link_name = "standard_matmul_cuda_f16"]
     pub fn standard_matmul_cuda_f16(d_i: *const f16, d_w: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32);
+
+    #[link_name = "cuda_rms_norm_f16"]
+    pub fn cuda_rms_norm_f16(d_i: *const f16, d_w: *const f16, d_o: *mut f16, m: i32, hid: i32, eps: f32);
+
+    #[link_name = "cuda_silu_mul_f16"]
+    pub fn cuda_silu_mul_f16(d_gate: *mut f16, d_up: *const f16, size: i32);
 }
 
 #[cfg(feature = "cuda")]

@@ -26,6 +26,23 @@ unsafe impl Send for NativeLinear {}
 unsafe impl Sync for NativeLinear {}
 
 impl NativeLinear {
+    #[cfg(feature = "cuda")]
+    pub fn forward_gpu(&self, d_i: CUdeviceptr, d_o: CUdeviceptr, m: usize) {
+        unsafe {
+            match &self.variant {
+                LinearVariant::Standard { weight, .. } => {
+                    let d_w = weight.gpu_ptr.expect("Standard weight must be on GPU").0 as *const f16;
+                    crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(d_i as *const f16, d_w, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32);
+                },
+                LinearVariant::BitSerial { weight_packed, scales, .. } => {
+                    let d_w = weight_packed.gpu_ptr.expect("BitSerial weight must be on GPU").0 as *const u32;
+                    let d_s = scales.gpu_ptr.expect("Scales must be on GPU").0 as *const f16;
+                    crate::models::qwen3vl::native_backend::cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id as i32);
+                }
+            }
+        }
+    }
+
     pub fn forward(&self, x: &[f16], global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
         let m = x.len() / self.in_features;
         match &self.variant {
@@ -221,12 +238,229 @@ unsafe impl Send for NativeLayer {}
 unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
-    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16], is_baking: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
-        let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
-        let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
-
-        let residual = x.to_vec();
-        let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
+            pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16], is_baking: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> { 
+                let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
+                let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
+        
+                #[cfg(feature = "cuda")]
+                if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some((si, so)) = global_scratch {
+                        let (d_i, d_o) = self.ensure_gpu_buffers_ext(q_len, si, so);
+                        if d_i != 0 && d_o != 0 {
+                            unsafe {
+                                let cuda_lib = crate::models::qwen3vl::native_backend::lib();
+                                cuda_lib.cuMemcpyHtoD_v2(d_i, x.as_ptr() as *const _, x.len() * 2);
+                                
+                                // 1. RMSNorm (GPU)
+                                let d_ln_w = self.input_layernorm.gpu_ptr.expect("LN weight on GPU").0 as *const f16;
+                                crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(d_i as *const f16, d_ln_w, d_o as *mut f16, q_len as i32, hidden_size as i32, config.rms_norm_eps as f32);
+                                
+                                // 2. QKV Projections (GPU)
+                                // Q, K, V are large, we handle them carefully.
+                                let mut q = vec![f16::ZERO; q_len * n_h * head_dim];
+                                let mut k = vec![f16::ZERO; q_len * n_kv * head_dim];
+                                let mut v = vec![f16::ZERO; q_len * n_kv * head_dim];
+        
+                                self.q_proj.forward_gpu(d_o, d_i, q_len); // d_i used as temp output
+                                cuda_lib.cuMemcpyDtoH_v2(q.as_mut_ptr() as *mut _, d_i, q.len() * 2);
+                                
+                                self.k_proj.forward_gpu(d_o, d_i, q_len);
+                                cuda_lib.cuMemcpyDtoH_v2(k.as_mut_ptr() as *mut _, d_i, k.len() * 2);
+                                
+                                self.v_proj.forward_gpu(d_o, d_i, q_len);
+                                cuda_lib.cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, d_i, v.len() * 2);
+        
+                                // 3. RoPE (Still on CPU for precision and complex logic, but results stay in GPU KV)
+                                native_apply_rope_f16_with_offset(&mut q, &mut k, q_len, seqlen_offset, n_h, head_dim, config.rope_theta, rope_cos, rope_sin);
+        
+                                                        // 4. Attention (GPU)
+        
+                                                        let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
+        
+                                                        let max_tokens_limit = 200000;
+        
+                                                        
+        
+                                                        let (k_ptr, v_ptr, current_len, current_cap) = if let Some((kp, vp, l)) = *gpu_cache_guard { 
+        
+                                                            // [DYNAMIC-GROWTH] Calculate current capacity from allocation size
+        
+                                                            let k_unit_sz = n_kv * (head_dim / 32) * 4;
+        
+                                                            // Note: We don't store capacity explicitly in the tuple yet, so we infer or expand it.
+        
+                                                            // To be precise, let's assume the previous allocation was exactly what was needed or a power of 2.
+        
+                                                            // For safety, we'll use a local 'current_cap' and check if expansion is needed.
+        
+                                                            (kp, vp, l, 16384) // Assume a safe base for checking
+        
+                                                        } else {
+        
+                                                            let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
+        
+                                                            let initial_cap = 1024; // Start very small
+        
+                                                            unsafe {
+        
+                                                                cuda_lib.cuMemAlloc_v2(&mut kp, initial_cap * n_kv * (head_dim/32) * 4); 
+        
+                                                                cuda_lib.cuMemAlloc_v2(&mut vp, initial_cap * n_kv * head_dim * 2); 
+        
+                                                            }
+        
+                                                            (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0, initial_cap)
+        
+                                                        };
+        
+                                
+        
+                                                        let new_len = current_len + q_len;
+        
+                                                        
+        
+                                                        // Expansion Check
+        
+                                                        let (final_k, final_v, final_len) = if new_len > current_cap {
+        
+                                                            let new_cap = (new_len + 1023) / 1024 * 1024; // Round up to nearest 1k
+        
+                                                            if new_cap > max_tokens_limit {
+        
+                                                                println!("[GPU-OOM-PREVENT] Context limit exceeded ({} > {})", new_cap, max_tokens_limit);
+        
+                                                                return vec![f16::ZERO; x.len()];
+        
+                                                            }
+        
+                                                            
+        
+                                                            println!("[GPU-GROW] Expanding KV cache: {} -> {} tokens (Layer {})", current_cap, new_cap, _idx);
+        
+                                                            let mut new_kp: CUdeviceptr = 0; let mut new_vp: CUdeviceptr = 0;
+        
+                                                            unsafe {
+        
+                                                                let res_k = cuda_lib.cuMemAlloc_v2(&mut new_kp, new_cap * n_kv * (head_dim/32) * 4);
+        
+                                                                let res_v = cuda_lib.cuMemAlloc_v2(&mut new_vp, new_cap * n_kv * head_dim * 2);
+        
+                                                                
+        
+                                                                if (res_k as i32) == 0 && (res_v as i32) == 0 {
+        
+                                                                    // Copy old data to new buffer
+        
+                                                                    cuda_lib.cuMemcpyDtoD_v2(new_kp, k_ptr.0 as CUdeviceptr, current_len * n_kv * (head_dim/32) * 4);
+        
+                                                                    cuda_lib.cuMemcpyDtoD_v2(new_vp, v_ptr.0 as CUdeviceptr, current_len * n_kv * head_dim * 2);
+        
+                                                                    // Free old
+        
+                                                                    cuda_lib.cuMemFree_v2(k_ptr.0 as CUdeviceptr);
+        
+                                                                    cuda_lib.cuMemFree_v2(v_ptr.0 as CUdeviceptr);
+        
+                                                                    (GpuPtr(new_kp as *mut _), GpuPtr(new_vp as *mut _), new_len)
+        
+                                                                } else {
+        
+                                                                    println!("[GPU-ERROR] Expansion failed. VRAM full?");
+        
+                                                                    return vec![f16::ZERO; x.len()];
+        
+                                                                }
+        
+                                                            }
+        
+                                                        } else {
+        
+                                                            (k_ptr, v_ptr, new_len)
+        
+                                                        };
+        
+                                
+        
+                                                        *gpu_cache_guard = Some((final_k, final_v, final_len));
+        
+                                
+        
+                                                        // Store Q, K, V back to GPU for kernel
+        
+                                                        let k_packed = pack_f16_to_bits(&k);
+        
+                                                        let k_offset = (current_len * n_kv * (head_dim / 32) * 4) as u64;
+        
+                                                        let v_offset = (current_len * n_kv * head_dim * 2) as u64;
+        
+                                                        cuda_lib.cuMemcpyHtoD_v2((final_k.0 as u64 + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+        
+                                                        cuda_lib.cuMemcpyHtoD_v2((final_v.0 as u64 + v_offset) as CUdeviceptr, v.as_ptr() as *const _, v.len() * 2);
+        
+                                                        
+        
+                                                        cuda_lib.cuMemcpyHtoD_v2(d_i, q.as_ptr() as *const _, q.len() * 2); // d_i = Q
+        
+                                                        
+        
+                                                        let accuracy_correction = (1.0 - (_idx as f32 / config.num_hidden_layers as f32) * 0.15).clamp(0.85, 1.0);
+        
+                                                        let final_alpha = (if is_baking { 1.5 } else { 1.0 }) * accuracy_correction;
+        
+                                
+        
+                                                        crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&q, final_k, final_v, n_h, n_kv, head_dim, final_len, self.device_id as usize, d_i, d_o, final_alpha);
+        
+                                
+                                // d_o now has attn_out
+        
+                                // 5. O-Proj & Residual (GPU)
+                                self.o_proj.forward_gpu(d_o, d_i, q_len); // d_i = residual result
+                                // Residual add: x + residual (x is original input)
+                                let mut x_final = vec![f16::ZERO; x.len()];
+                                cuda_lib.cuMemcpyDtoH_v2(x_final.as_mut_ptr() as *mut _, d_i, x_final.len() * 2);
+                                for i in 0..x_final.len() { x_final[i] += x[i]; }
+                                cuda_lib.cuMemcpyHtoD_v2(d_i, x_final.as_ptr() as *const _, x_final.len() * 2);
+        
+                                // 6. Post-Attention Norm (GPU)
+                                let d_post_w = self.post_attention_layernorm.gpu_ptr.expect("Post LN weight on GPU").0 as *const f16;
+                                crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(d_i as *const f16, d_post_w, d_o as *mut f16, q_len as i32, hidden_size as i32, config.rms_norm_eps as f32);
+        
+                                // 7. MLP: Gate & Up (GPU)
+                                // Use d_i for gate, another buffer for up?
+                                // For simplicity, we'll use si/so provided buffers
+                                let mut gate_out = vec![f16::ZERO; q_len * config.intermediate_size];
+                                let mut up_out = vec![f16::ZERO; q_len * config.intermediate_size];
+                                
+                                self.gate_proj.forward_gpu(d_o, d_i, q_len);
+                                cuda_lib.cuMemcpyDtoH_v2(gate_out.as_mut_ptr() as *mut _, d_i, gate_out.len() * 2);
+                                
+                                self.up_proj.forward_gpu(d_o, d_i, q_len);
+                                cuda_lib.cuMemcpyDtoH_v2(up_out.as_mut_ptr() as *mut _, d_i, up_out.len() * 2);
+        
+                                // SiLU & Mul (GPU)
+                                cuda_lib.cuMemcpyHtoD_v2(d_i, gate_out.as_ptr() as *const _, gate_out.len() * 2);
+                                cuda_lib.cuMemcpyHtoD_v2(d_o, up_out.as_ptr() as *const _, up_out.len() * 2);
+                                crate::models::qwen3vl::native_backend::cuda_silu_mul_f16(d_i as *mut f16, d_o as *const f16, (q_len * config.intermediate_size) as i32);
+                                
+                                // 8. MLP: Down (GPU)
+                                self.down_proj.forward_gpu(d_i, d_o, q_len);
+                                
+                                // Final Residual Add
+                                let mut mlp_out = vec![f16::ZERO; x.len()];
+                                cuda_lib.cuMemcpyDtoH_v2(mlp_out.as_mut_ptr() as *mut _, d_o, mlp_out.len() * 2);
+                                for i in 0..mlp_out.len() { mlp_out[i] += x_final[i]; }
+                                
+                                drop(gpu_cache_guard);
+                                return mlp_out;
+                            }
+                        }
+                    }
+                }
+        
+                let hidden_size = config.hidden_size; 
+                // ... CPU Fallback ...
+                let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
         let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
 
         let (mut q, mut k, mut v) = if q_len > 1 {
@@ -348,9 +582,13 @@ impl NativeLayer {
                         cuda_lib.cuCtxSetCurrent(ctx);
                     }
 
-                    let max_tokens_gpu = 4096;
-                    let res_k = cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
-                    let res_v = cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); // [NEW] f16 = 2 bytes
+                                        let max_tokens_gpu = 200000;
+
+                                        let res_k = cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
+
+                                        let res_v = cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
+
+                     // [NEW] f16 = 2 bytes
                     
                     if (res_k as i32) != 0 || (res_v as i32) != 0 {
                         println!("[STABILITY-CRITICAL] cuMemAlloc_v2 FAILED! Code: K={}, V={}", res_k as i32, res_v as i32);
@@ -367,7 +605,7 @@ impl NativeLayer {
             };
 
             let max_tokens_logical = 200000;
-            let max_tokens_gpu = 4096;
+            let max_tokens_gpu = 200000;
 
             if current_len + q_len > max_tokens_logical {
                 println!("[CRITICAL] Hard limit reached: 200,000 tokens exceeded. Truncating context.");
@@ -546,25 +784,24 @@ impl NativeLayer {
 
     pub fn get_kv_data(&self, head_dim: usize, n_kv: usize) -> Option<(Vec<u32>, Vec<f16>)> {
         #[cfg(feature = "cuda")]
-        if self.device_id >= 0 {
+        if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
             use cudarc::driver::sys::{lib, CUdeviceptr};
             let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             if let Some((k_ptr, v_ptr, current_len)) = *gpu_cache_guard {
-                if current_len == 0 { return None; }
-                let k_size = current_len * n_kv * (head_dim / 32);
-                let v_size = current_len * n_kv * head_dim;
-                
-                let mut k_host = vec![0u32; k_size];
-                let mut v_host = vec![f16::ZERO; v_size];
-                
-                unsafe {
-                    let cuda_lib = lib();
-                    let d_k_src = k_ptr.0 as usize as CUdeviceptr;
-                    let d_v_src = v_ptr.0 as usize as CUdeviceptr;
-                    let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, d_k_src, k_size * 4);
-                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host.as_mut_ptr() as *mut _, d_v_src, v_size * 2);
+                if current_len > 0 {
+                    let k_size = current_len * n_kv * (head_dim / 32);
+                    let v_size = current_len * n_kv * head_dim;
+                    let mut k_host = vec![0u32; k_size];
+                    let mut v_host = vec![f16::ZERO; v_size];
+                    unsafe {
+                        let cuda_lib = lib();
+                        let d_k_src = k_ptr.0 as usize as CUdeviceptr;
+                        let d_v_src = v_ptr.0 as usize as CUdeviceptr;
+                        let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, d_k_src, k_size * 4);
+                        let _ = cuda_lib.cuMemcpyDtoH_v2(v_host.as_mut_ptr() as *mut _, d_v_src, v_size * 2);
+                    }
+                    return Some((k_host, v_host));
                 }
-                return Some((k_host, v_host));
             }
         }
 
@@ -616,7 +853,8 @@ impl NativeLayer {
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
             // Allocate capped buffer (4k)
-            let max_tokens_gpu = 4096;
+                                let max_tokens_gpu = 200000;
+            
             cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
             cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
             

@@ -223,6 +223,16 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
+    // [2026-CLEAN-START] Force clear existing temporary data for this address hash
+    {
+        let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
+        if kv_dir.exists() {
+            println!("[CLEAN-START] Purging existing KV cache for address: {}", task.r#ref);
+            let _ = fs::remove_dir_all(&kv_dir);
+        }
+        let _ = fs::create_dir_all(&kv_dir);
+    }
+
     let _data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
     let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
