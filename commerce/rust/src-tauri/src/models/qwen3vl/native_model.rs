@@ -208,6 +208,7 @@ pub struct NativeLayer {
     pub gpu_kv_cache: std::sync::Mutex<Option<(GpuPtr, GpuPtr, usize)>>, 
     pub attn_scratch_q: std::sync::Mutex<Option<(GpuPtr, usize)>>,
     pub attn_scratch_o: std::sync::Mutex<Option<(GpuPtr, usize)>>,
+    pub gpu_broken: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for NativeLayer {}
@@ -328,7 +329,7 @@ impl NativeLayer {
         native_apply_rope_f16_with_offset(&mut q, &mut k, q_len, seqlen_offset, n_h, head_dim, config.rope_theta, rope_cos, rope_sin);
 
         #[cfg(feature = "cuda")]
-        if self.device_id >= 0 {
+        if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
             use cudarc::driver::sys::*;
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
@@ -419,30 +420,15 @@ impl NativeLayer {
             };
 
             if is_dead(&attn_out) {
-                let mut current_alpha = final_alpha;
-                let mut success = false;
+                // [STABILITY-DECISION] 레이어 0에서 신호가 죽었다면 더 이상 리트라이하지 않고 즉시 CPU 폴백
+                println!("[STABILITY] GPU output dead at Layer {}. PERMANENTLY falling back to CPU for this session.", _idx);
+                self.gpu_broken.store(true, std::sync::atomic::Ordering::Relaxed);
                 
-                // [2025-H2-RESEARCH] 3-Stage GPU Probing: Much faster than CPU fallback
-                for stage in 1..=3 {
-                    current_alpha += 0.5; // Stronger increments for GPU survival
-                    println!("[STABILITY-RECOVERY] GPU Stage {} (Baking: {}) -> Hunting with alpha {:.2}...", stage, is_baking, current_alpha);
-                    
-                    let retry = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, current_alpha);
-                    if !is_dead(&retry) {
-                        println!("[STABILITY] GPU Signal RECOVERED at Stage {}! Alpha: {:.2}", stage, current_alpha);
-                        attn_out = retry;
-                        success = true;
-                        break;
-                    }
-                }
-
-                if !success {
-                    let final_cpu_alpha = current_alpha + 0.3;
-                    println!("[STABILITY-CRITICAL] All GPU stages failed. Final fallback to CPU with alpha {:.2}...", final_cpu_alpha);
-                    drop(gpu_cache_guard);
-                    if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, final_cpu_alpha);
-                    }
+                drop(gpu_cache_guard);
+                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                    attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, final_alpha + 0.5);
+                    // Apply gain again to CPU output
+                    for val in attn_out.iter_mut() { *val = f16::from_f32(val.to_f32() * semantic_gain); }
                 }
             }
 
@@ -1034,6 +1020,7 @@ impl NativeQwen3VLModel {
                 down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size, layer_idx)?,
                 device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
                 attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
+                gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
         }
         
@@ -1142,6 +1129,7 @@ impl NativeQwen3VLModel {
                     down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_cfg.hidden_size)?,
                     device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
                     attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
+                    gpu_broken: std::sync::atomic::AtomicBool::new(false),
                 });
             }
             let merger = NativeLayer {
@@ -1157,6 +1145,7 @@ impl NativeQwen3VLModel {
                 down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
                 device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
                 attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
+                gpu_broken: std::sync::atomic::AtomicBool::new(false),
             };
             Some(NativeVisionModel { patch_embed, blocks, merger })
         } else { None };

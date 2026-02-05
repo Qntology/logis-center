@@ -62,6 +62,7 @@ impl NativeEmbeddingModel {
                 attn_scratch_q: std::sync::Mutex::new(None),
                 attn_scratch_o: std::sync::Mutex::new(None),
                 device_id: -1,
+                gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
         }
 
