@@ -162,6 +162,9 @@ pub fn pack_f16_to_bits(src: &[f16]) -> Vec<u32> {
 
 #[cfg(feature = "cuda")]
 pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32) -> Vec<f16> {
+    if d_q == 0 || d_o == 0 || k_p.0.is_null() || v_p.0.is_null() {
+        return vec![f16::ZERO; q.len()];
+    }
     unsafe {
         let cuda_lib = lib();
         
@@ -224,6 +227,9 @@ pub fn bit_serial_matmul_gpu_buffered(
     m: usize, n: usize, k: usize, dev: usize,
     d_i: CUdeviceptr, d_o: CUdeviceptr
 ) -> Vec<f16> {
+    if d_i == 0 || d_o == 0 {
+        return vec![f16::ZERO; m * n];
+    }
     unsafe {
         let cuda_lib = lib();
         

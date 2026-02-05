@@ -421,9 +421,15 @@ impl NativeLayer {
             };
 
             if is_dead(&attn_out) {
-                println!("[STABILITY] GPU output dead at Layer {}. PERMANENTLY falling back to CPU for this session.", _idx);
+                println!("[STABILITY] GPU output dead at Layer {}. Syncing cache and falling back to CPU.", _idx);
                 self.gpu_broken.store(true, std::sync::atomic::Ordering::Relaxed);
-                // Just drop the lock and let the CPU block at the bottom handle it
+                
+                // [SYNC] GPU에 있던 기존 데이터를 CPU 캐시로 가져와서 동기화
+                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                    let mut cache = self.kv_cache.lock().unwrap();
+                    *cache = Some((k_host, v_host));
+                }
+                
                 drop(gpu_cache_guard);
             } else {
                 let mut x_at = self.o_proj.forward(&attn_out);
