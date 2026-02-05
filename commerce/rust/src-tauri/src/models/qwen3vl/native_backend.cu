@@ -293,158 +293,6 @@ extern "C" {
 
 
 
-    extern "C" {
-
-
-
-    
-
-
-
-        void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
-
-
-
-    
-
-
-
-            dim3 block(16, 16);
-
-
-
-    
-
-
-
-            dim3 grid((n + 15) / 16, (m + 15) / 16);
-
-
-
-    
-
-
-
-            standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-            void rms_norm_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-                // [FIX] Call the standalone kernel instead of using an invalid inline lambda
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-                rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-            }
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-        
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
     // Actual Kernels for activation and norm
 
 
@@ -661,6 +509,110 @@ extern "C" {
 
 
 
+        void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
+
+
+
+    
+
+
+
+            dim3 block(16, 16);
+
+
+
+    
+
+
+
+            dim3 grid((n + 15) / 16, (m + 15) / 16);
+
+
+
+    
+
+
+
+            standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
+
+
+
+    
+
+
+
+        }
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+        void rms_norm_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
+
+
+
+    
+
+
+
+            // [FIX] Call the standalone kernel instead of using an invalid inline lambda
+
+
+
+    
+
+
+
+            rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
+
+
+
+    
+
+
+
+        }
+
+
+
+    
+
+
+
+    }
+
+
+
+    
+
+
+
+    
+
+
+
+    
+
+
+
+    extern "C" {
+
+
+
+    
+
+
+
         void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
 
 
@@ -710,6 +662,14 @@ extern "C" {
 
 
     }
+
+
+
+    
+
+
+
+    
 
 
 

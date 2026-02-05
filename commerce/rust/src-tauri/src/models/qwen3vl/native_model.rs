@@ -238,14 +238,16 @@ unsafe impl Send for NativeLayer {}
 unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
-            pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16], is_baking: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> { 
-                let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
-                let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
-        
-                #[cfg(feature = "cuda")]
-                if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some((si, so)) = global_scratch {
-                        let (d_i, d_o) = self.ensure_gpu_buffers_ext(q_len, si, so);
+                pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16], is_baking: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> { 
+                    let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
+                    let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
+                    let residual = x.to_vec();
+            
+                    #[cfg(feature = "cuda")]
+                    if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some((si, so)) = global_scratch {
+                            let (d_i, d_o) = self.q_proj.ensure_gpu_buffers_ext(q_len, si, so);
+            
                         if d_i != 0 && d_o != 0 {
                             unsafe {
                                 let cuda_lib = crate::models::qwen3vl::native_backend::lib();
