@@ -831,6 +831,16 @@ impl NativeQwen3VLModel {
             if current_st.tensor(&p_n).is_ok() {
                 let vp = current_st.tensor(&p_n)?; 
                 let vs = current_st.tensor(&s_n)?;
+                
+                // [STABILITY-DIAG] 로딩 시점에 텐서 유효성 샘플링
+                let scale_sample = vs.data();
+                if scale_sample.len() >= 2 {
+                    let first_val = u16::from_le_bytes([scale_sample[0], scale_sample[1]]);
+                    if first_val == 0 && scale_sample.iter().take(100).all(|&b| b == 0) {
+                        println!("[LOAD-CRITICAL] Tensor {} has ALL ZERO scales! Inference will fail.", key);
+                    }
+                }
+
                 let op = unsafe { vp.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                 let os = unsafe { vs.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                 
