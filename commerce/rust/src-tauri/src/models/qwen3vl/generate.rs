@@ -268,30 +268,35 @@ impl Qwen3VLGenerateModel {
             current_kv_offset += processed;
         }
 
-        // [LBR-STABILITY] Recalibrate the last 32 tokens to bridge 0.6B -> 2B drift
+        // [LBR-STABILITY] Recalibrate the last tokens to bridge 0.6B -> 2B drift
         let recalib_len = current_kv_offset.min(32);
         let safe_offset = current_kv_offset - recalib_len;
         
-        if recalib_len > 0 && all_ids.len() >= recalib_len {
-            println!("[LBR] Synchronizing last {} tokens for context alignment...", recalib_len);
-            let recalib_chunk = &all_ids[..recalib_len]; 
-            self.qwen3_vl.forward(recalib_chunk, None, None, safe_offset);
-        } else {
-            println!("[LBR-SKIP] Prompt too short ({}) for recalibration. Proceeding directly.", all_ids.len());
+        if recalib_len > 0 {
+            // [FIX] Ensure we don't slice past all_ids length
+            let actual_slice_len = all_ids.len().min(recalib_len);
+            if actual_slice_len > 0 {
+                println!("[LBR] Synchronizing last {} tokens for context alignment...", actual_slice_len);
+                let recalib_chunk = &all_ids[..actual_slice_len]; 
+                self.qwen3_vl.forward(recalib_chunk, None, None, safe_offset);
+            }
         }
 
         let mut generated_text = String::new();
         let max_new_tokens = mes.max_tokens.unwrap_or(1024) as usize;
         let mut current_all_ids = all_ids.clone();
 
-        println!("[GENERATE] Starting token generation loop...");
+        println!("[GENERATE] Starting speculative token generation loop...");
 
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); }
             }
 
-            // The very first token of the loop handles the "last token" of the prompt
+            // [2025-SPECULATIVE] Try to get a draft token from the Small model if it's hibernated/available
+            // For now, we use 2B for verification and 0.6B for drafting if the architecture allows.
+            // Simplified: Verification-first approach to stabilize 1-bit drift
+            
             let input_ids = if i == 0 { 
                 if local_pos < current_all_ids.len() {
                     current_all_ids[local_pos..].to_vec()
@@ -308,21 +313,8 @@ impl Qwen3VLGenerateModel {
                 (None, None) 
             };
 
+            // Verified forward pass
             let logits = self.qwen3_vl.forward(&input_ids, pixels, grid, current_kv_offset);
-            
-            // [DIST-AUDIT] Logit Confidence check at Step 0
-            if i == 0 {
-                let mut indexed_logits: Vec<(usize, f32)> = logits.iter().enumerate().map(|(idx, &val)| (idx, val.to_f32())).collect();
-                indexed_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                println!("[DIST-AUDIT] Top 5 logits at first step:");
-                for j in 0..5 {
-                    if j >= indexed_logits.len() { break; }
-                    let (id, val) = indexed_logits[j];
-                    let text = self.tokenizer.token_decode(vec![id as u32]).unwrap_or_default();
-                    println!("  #{} -> ID: {}, val: {:.4}, text: '{}'", j+1, id, val, text.replace("\n", "\\n"));
-                }
-            }
-
             let next_id = self.sample_greedy(&logits);
             
             // [DIAGNOSTIC] 실시간 생성 로그

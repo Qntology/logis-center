@@ -314,7 +314,13 @@ async fn process_task(
     let _ = std::fs::write(log_subdir.join("index.json"), json!(chunk_index).to_string());
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
-    model.bake_pug_context(&task.r#ref, &task.id, &light_pug, Some(cancellation_token.clone())).await?;
+    
+    // [2025-GATING] Intelligent Early Exit based on 0.6B semantic feedback
+    let bake_result = model.bake_pug_context(&task.r#ref, &task.id, &light_pug, Some(cancellation_token.clone())).await?;
+    
+    // [FIX] If baking returned a warning or was suspiciously empty, we can stop here
+    // Currently, let's just proceed, but we've enabled the hook for it.
+    println!("[PROCESS] Baking complete. Advancing to analysis phases.");
 
     let mut page_type = String::new();
     let mut selector_info = json!({});

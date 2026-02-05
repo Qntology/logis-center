@@ -231,15 +231,17 @@ impl NativeLayer {
             }
         };
 
-        let (q_energy, q_density) = measure_context(&mut q, "Q");
-        let (_, _k_density) = measure_context(&mut k, "K");
+        // [2025-MATHEMATICAL-STABILITY] Adaptive Alpha Scaling (Recalibrated for RTX 3050)
+        let q_energy = ensure_alive(&mut q, "Q");
+        let _k_energy = ensure_alive(&mut k, "K");
+        let _v_energy = ensure_alive(&mut v, "V");
 
-        // [ORGANIC-MATH] More aggressive density boost for low-information contexts
-        // Low density (like 0.13 in logs) now triggers a much higher starting Alpha.
+        // [MATH-RECALIBRATION] 10x stronger base to prevent GPU-specific underflow
+        // Base is now 0.1. If energy is 0.6, final_alpha is ~0.16 before density boost.
         let density_boost = if q_density < 0.2 { 8.0 } else { (1.0 / (q_density + 0.1)).min(5.0) };
-        final_alpha = (0.01 / (q_energy + 1e-9) * density_boost as f32).clamp(0.1, 2.5);
+        let mut final_alpha = (0.1 / (q_energy + 1e-9) * density_boost as f32).clamp(0.2, 2.5);
         
-        if is_baking { final_alpha *= 1.3; } 
+        if is_baking { final_alpha *= 1.5; } // Higher boost for 1-layer baking
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
@@ -335,8 +337,8 @@ impl NativeLayer {
                 
                 // [2025-H2-RESEARCH] 3-Stage GPU Probing: Much faster than CPU fallback
                 for stage in 1..=3 {
-                    current_alpha += 0.4; // Incrementally boost stability
-                    println!("[STABILITY-RECOVERY] GPU Stage {} -> Hunting for life with alpha {:.2}...", stage, current_alpha);
+                    current_alpha += 0.5; // Stronger increments for GPU survival
+                    println!("[STABILITY-RECOVERY] GPU Stage {} (Baking: {}) -> Hunting with alpha {:.2}...", stage, is_baking, current_alpha);
                     
                     let retry = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, current_alpha);
                     if !is_dead(&retry) {
@@ -349,7 +351,7 @@ impl NativeLayer {
 
                 if !success {
                     let final_cpu_alpha = current_alpha + 0.3;
-                    println!("[STABILITY-CRITICAL] All GPU stages failed. Final fallback to Hybrid-SIMD (CPU) with alpha {:.2}...", final_cpu_alpha);
+                    println!("[STABILITY-CRITICAL] All GPU stages failed. Final fallback to CPU with alpha {:.2}...", final_cpu_alpha);
                     drop(gpu_cache_guard);
                     if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
                         attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, final_cpu_alpha);
