@@ -62,6 +62,7 @@ impl LogisModel {
         
         let mut size = self.current_size.lock().await;
         *size = None;
+
         println!("[MODEL] All generators (Active & Hibernated) destroyed.");
     }
 

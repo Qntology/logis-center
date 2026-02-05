@@ -27,11 +27,22 @@ __global__ void bit_serial_matmul_kernel_shuffled(
             int k_idx = kb * 32 + b;
             if (k_idx < K && input[m * K + k_idx] >= 0.0f) input_bits |= (1u << b);
         }
-        uint32_t weight_bits = weight[n_group * k_blocks * 8 + kb * 8 + n_sub];
+        
+        uint32_t weight_bits = 0;
+        float s_val = 0.0f;
+        if (n < N) {
+            int idx = n_group * k_blocks * 8 + kb * 8 + n_sub;
+            weight_bits = weight[idx];
+            s_val = scale[idx]; 
+        }
+        
         uint32_t diff = __popc(input_bits ^ weight_bits);
-        sum += (float)(32 - 2 * (int)diff);
+        sum += (float)(32 - 2 * (int)diff) * s_val;
     }
-    output[m * N + n] = sum * scale[n];
+    
+    if (m < M && n < N) {
+        output[m * N + n] = sum;
+    }
 }
 
 // [2026-ULTRA-OPTIMIZED] Tiled Bit-Flash Attention 5.5

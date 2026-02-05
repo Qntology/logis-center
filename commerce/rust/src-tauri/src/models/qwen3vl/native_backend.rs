@@ -7,7 +7,7 @@ use half::f16;
 use std::arch::x86_64::*;
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::sys::*;
+pub use cudarc::driver::sys::{lib, CUdeviceptr, CUcontext, CUdevice, CUresult};
 
 #[cfg(feature = "cuda")]
 extern "C" {
@@ -65,6 +65,39 @@ impl NativeTensor {
     }
 
     #[cfg(feature = "cuda")]
+    pub fn move_to_gpu_forced_f32(&mut self, device_id: i32) {
+        if self.gpu_ptr.is_some() { return; }
+        unsafe {
+            let mut ptr: CUdeviceptr = 0;
+            let lib = lib();
+            
+            // Ensure context
+            let mut ctx = std::ptr::null_mut() as CUcontext;
+            lib.cuCtxGetCurrent(&mut ctx);
+            if ctx == std::ptr::null_mut() {
+                let mut dev = 0 as CUdevice;
+                lib.cuDeviceGet(&mut dev, device_id);
+                lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                lib.cuCtxSetCurrent(ctx);
+            }
+
+            let data_f16 = self.get_slice::<f16>();
+            let data_f32: Vec<f32> = data_f16.iter().map(|v| v.to_f32()).collect();
+            let size_bytes = data_f32.len() * 4;
+            
+            let res = lib.cuMemAlloc_v2(&mut ptr, size_bytes);
+            if (res as i32) == 0 && ptr != 0 {
+                lib.cuMemcpyHtoD_v2(ptr, data_f32.as_ptr() as *const _, size_bytes);
+                self.gpu_ptr = Some(GpuPtr(ptr as *mut _));
+                self.device_id = device_id;
+                println!("[GPU-PIN] Forced F16->F32 conversion successful ({} elements)", data_f32.len());
+            } else {
+                println!("[GPU-ERROR] Forced conversion allocation failed: {}", res as i32);
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn move_to_gpu(&mut self, device_id: i32) {
         if self.gpu_ptr.is_some() { return; }
         
@@ -87,14 +120,18 @@ impl NativeTensor {
             let mut size_bytes = 0;
 
             // [OPTIMIZATION] If dtype is F16 but we need F32 on GPU (for scales), convert during transfer
-            if self.dtype == NativeDType::F16 && self.shape.last() == Some(&1) {
+            // We detect Bit-serial scales by checking if shape has 3 dimensions and ends with 8 (Shuffled Layout)
+            let is_bitserial_scale = self.dtype == NativeDType::F16 && self.shape.len() == 3 && self.shape.last() == Some(&8);
+            let is_standard_scale = self.dtype == NativeDType::F16 && self.shape.last() == Some(&1);
+
+            if is_bitserial_scale || is_standard_scale {
                 let data_f16 = self.get_slice::<f16>();
                 let data_f32: Vec<f32> = data_f16.iter().map(|v| v.to_f32()).collect();
                 size_bytes = data_f32.len() * 4;
                 res_alloc = lib.cuMemAlloc_v2(&mut ptr, size_bytes);
                 if (res_alloc as i32) == 0 {
                     lib.cuMemcpyHtoD_v2(ptr, data_f32.as_ptr() as *const _, size_bytes);
-                    println!("[GPU-PIN] Transferred & Converted F16->F32 scale tensor to GPU");
+                    println!("[GPU-PIN] Transferred & Converted Bit-serial scale tensor to GPU ({} elements)", data_f32.len());
                 }
             } else {
                 size_bytes = size_raw * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };

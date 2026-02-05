@@ -144,11 +144,18 @@ impl NativeLinear {
 
     pub fn move_to_gpu(&mut self, device_id: i32) {
         self.device_id = device_id;
-        if let LinearVariant::BitSerial { weight_packed, scales, .. } = &mut self.variant {
-            #[cfg(feature = "cuda")] 
-            {
-                weight_packed.move_to_gpu(device_id);
-                scales.move_to_gpu(device_id);
+        match &mut self.variant {
+            LinearVariant::Standard { weight, bias } => {
+                weight.move_to_gpu(device_id);
+                if let Some(b) = bias { b.move_to_gpu(device_id); }
+            },
+            LinearVariant::BitSerial { weight_packed, scales, bias } => {
+                #[cfg(feature = "cuda")] 
+                {
+                    weight_packed.move_to_gpu(device_id);
+                    scales.move_to_gpu_forced_f32(device_id);
+                    if let Some(b) = bias { b.move_to_gpu(device_id); }
+                }
             }
         }
     }
