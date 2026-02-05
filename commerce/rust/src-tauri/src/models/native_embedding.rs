@@ -94,7 +94,7 @@ impl NativeEmbeddingModel {
         let mut x = native_embedding_lookup_f16(token_ids, &table, self.hidden_size);
 
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, &cfg, 0, i, &[], &[]);
+            x = layer.forward(&x, &cfg, 0, i, &[], &[], false);
         }
 
         let norm_w = self.norm.get_slice::<f16>();

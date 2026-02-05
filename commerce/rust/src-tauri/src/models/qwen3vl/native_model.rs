@@ -186,7 +186,7 @@ unsafe impl Send for NativeLayer {}
 unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
-    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16]) -> Vec<f16> {
+    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16], is_baking: bool) -> Vec<f16> {
         let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
         let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
 
@@ -195,7 +195,7 @@ impl NativeLayer {
         let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
         
         // [RAYON-STRATEGY] Only use parallel join if processing multiple tokens (prefill)
-        let (mut q, mut k, v) = if q_len > 1 {
+        let (mut q, mut k, mut v) = if q_len > 1 {
             let (q_p, (k_p, v_p)) = rayon::join(
                 || self.q_proj.forward(&x_norm),
                 || rayon::join(|| self.k_proj.forward(&x_norm), || self.v_proj.forward(&x_norm))
@@ -205,11 +205,14 @@ impl NativeLayer {
             (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
         };
 
-        // [STABILITY-AUDIT] Log distribution before Norm
-        if _idx == 0 && !q.is_empty() {
-            let q_max = q.iter().fold(0.0f32, |a, &b| a.max(b.to_f32().abs()));
-            if q_max == 0.0 { println!("[STABILITY-CRITICAL] Q-proj returned ALL ZEROS at layer {}!", _idx); }
-        }
+        // [STABILITY-AUDIT] Jumpstart zero signals if necessary
+        let ensure_alive = |data: &mut Vec<f16>, name: &str| {
+            if !data.is_empty() && data.iter().take(100).all(|x| x.to_f32().abs() < 1e-12) {
+                println!("[STABILITY-WARN] {} projection was DEAD (all zeros). Jumpstarting...", name);
+                for i in 0..data.len().min(100) { data[i] = f16::from_f32(1e-6); }
+            }
+        };
+        ensure_alive(&mut q, "Q"); ensure_alive(&mut k, "K"); ensure_alive(&mut v, "V");
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
@@ -283,9 +286,8 @@ impl NativeLayer {
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
-            // [STABILITY] Dynamic alpha: Baking needs more bias than inference
-            let is_baking = config.num_hidden_layers <= 1;
-            let alpha = if is_baking { 0.3f32 } else { 0.1f32 }; // Higher floor for 1-layer baking
+            // [STABILITY] Strong alpha: Baking needs significant bias to survive 1-bit quantization collapse
+            let alpha = if is_baking { 0.8f32 } else { 0.1f32 }; 
 
             // [OPTIMIZATION] Reuse scratch buffers for Attention
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
@@ -293,19 +295,20 @@ impl NativeLayer {
             
             // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
             if !attn_out.is_empty() && (attn_out[0].to_f32().abs() < 1e-9) && attn_out.iter().take(20).all(|x| x.to_f32().abs() < 1e-9) {
-                println!("[STABILITY] Signal Death at layer {} (Baking: {}). Attempting GPU recovery with alpha {}...", _idx, is_baking, alpha + 0.4);
+                let retry_alpha = if is_baking { 1.2f32 } else { alpha + 0.4 };
+                println!("[STABILITY] Signal Death at layer {} (Baking: {}). Attempting GPU recovery with aggressive alpha {}...", _idx, is_baking, retry_alpha);
                 
-                attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, alpha + 0.4);
+                attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, retry_alpha);
 
                 if attn_out[0].to_f32().abs() < 1e-9 {
-                    println!("[STABILITY-CRITICAL] GPU recovery failed. Falling back to Hybrid-SIMD (CPU)...");
-                    // [FIX] DROP LOCK before calling get_kv_data to prevent Deadlock
+                    let cpu_alpha = if is_baking { 1.5f32 } else { retry_alpha + 0.2 };
+                    println!("[STABILITY-CRITICAL] GPU recovery failed. Falling back to Hybrid-SIMD (CPU) with alpha {}...", cpu_alpha);
                     drop(gpu_cache_guard);
                     if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, alpha + 0.5);
+                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, cpu_alpha);
                     }
                 } else {
-                    println!("[STABILITY] GPU recovery SUCCESSFUL at layer {}.", _idx);
+                    println!("[STABILITY] GPU recovery SUCCESSFUL at layer {} with alpha {}.", _idx, retry_alpha);
                 }
             }
 
@@ -549,6 +552,8 @@ unsafe impl Sync for NativeQwen3TextModel {}
 impl NativeQwen3TextModel {
     pub fn forward(&self, input_ids: &[u32], pixel_values: Option<&[f16]>, grid_thw: Option<&[u32; 3]>, seqlen_offset: usize) -> Vec<f16> {
         let hid = self.config.hidden_size;
+        let is_baking = self.layers.len() <= 1; // [CRITICAL] 1 layer = Small baking model
+        
         let mut cur_x = match &self.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => {
                 let w_cow = weight.get_slice::<f16>();
@@ -560,25 +565,8 @@ impl NativeQwen3TextModel {
             }
         };
 
-        // [STABILITY-AUDIT] Check embedding output
-        if !cur_x.is_empty() {
-            let first_val = cur_x[0].to_f32();
-            if first_val == 0.0 && cur_x.iter().take(100).all(|x| x.to_f32() == 0.0) {
-                println!("[STABILITY-WARN] Embedding returned ALL ZEROS for {} tokens!", input_ids.len());
-            }
-        }
-
         for (i, layer) in self.layers.iter().enumerate() { 
-            let prev_val = cur_x[0].to_f32();
-            cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i, &self.rope_cos, &self.rope_sin); 
-            
-            // [STABILITY-AUDIT] Check layer output
-            if i == 0 && !cur_x.is_empty() {
-                let current_val = cur_x[0].to_f32();
-                if current_val == 0.0 && prev_val != 0.0 {
-                    println!("[STABILITY-CRITICAL] Layer 0 killed the signal (became ALL ZEROS)!");
-                }
-            }
+            cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i, &self.rope_cos, &self.rope_sin, is_baking); 
         }
         let norm_cow = self.norm.get_slice::<f16>();
         native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid)
@@ -693,7 +681,7 @@ impl NativeVisionModel {
                 max_position_embeddings: 4096,
                 dtype: None,
                 rope_scaling: None,
-            }, 0, 0, rope_cos, rope_sin);
+            }, 0, 0, rope_cos, rope_sin, false);
         }
         
         // 3. Patch Merger
@@ -710,7 +698,7 @@ impl NativeVisionModel {
             max_position_embeddings: 4096,
             dtype: None,
             rope_scaling: None,
-        }, 0, 0, rope_cos, rope_sin)
+        }, 0, 0, rope_cos, rope_sin, false)
     }
 }
 
@@ -1020,8 +1008,9 @@ impl NativeQwen3VLModel {
         }
 
         let mut cur_x = embeds;
+        let is_baking = self.text_model.layers.len() <= 1;
         for (i, layer) in self.text_model.layers.iter().enumerate() { 
-            cur_x = layer.forward(&cur_x, &self.text_model.config, s_o, i, &self.text_model.rope_cos, &self.text_model.rope_sin); 
+            cur_x = layer.forward(&cur_x, &self.text_model.config, s_o, i, &self.text_model.rope_cos, &self.text_model.rope_sin, is_baking); 
         }
         
         let norm_cow = self.text_model.norm.get_slice::<f16>();

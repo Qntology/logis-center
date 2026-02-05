@@ -21,7 +21,8 @@ pub fn get_optimal_device_config() -> DeviceConfig {
     if let Ok(nvml) = Nvml::init() {
         if let Ok(count) = nvml.device_count() {
             let mut best_id = 0;
-            let mut max_free = 0;
+            let mut max_total = 0;
+            let mut best_free = 0;
             let mut found_gpu = false;
             
             for i in 0..count {
@@ -32,9 +33,10 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                         let free_gib = mem.free as f64 / 1073741824.0;
                         println!("[DEVICE-CHECK] GPU-{}: {} (Total: {:.2} GiB, Free: {:.2} GiB)", i, name, total_gib, free_gib);
                         
-                        // [CRITICAL-FIX] Choose based on CURRENT AVAILABLE (Free) VRAM
-                        if mem.free > max_free {
-                            max_free = mem.free;
+                        // [CRITICAL-FIX] Prioritize the card with HIGHEST TOTAL VRAM (performance card)
+                        if mem.total > max_total {
+                            max_total = mem.total;
+                            best_free = mem.free;
                             best_id = i;
                             found_gpu = true;
                         }
@@ -42,11 +44,11 @@ pub fn get_optimal_device_config() -> DeviceConfig {
                 }
             }
             
-            if found_gpu && max_free > 500 * 1024 * 1024 { // At least 500MB free
+            if found_gpu && best_free > 500 * 1024 * 1024 { // Ensure the best card has enough free space
                 if let Ok(device) = nvml.device_by_index(best_id as u32) {
                     let name = device.name().unwrap_or_default();
-                    println!("[DEVICE-SELECT] Choosing GPU-{} ({}) with the most free VRAM: {:.2} GiB.", 
-                        best_id, name, max_free as f64 / 1073741824.0);
+                    println!("[DEVICE-SELECT] Choosing best-performance GPU-{} ({}) with {:.2} GiB free.", 
+                        best_id, name, best_free as f64 / 1073741824.0);
                     return DeviceConfig {
                         is_cpu: false,
                         classify_chunk_size: 12_000, 
