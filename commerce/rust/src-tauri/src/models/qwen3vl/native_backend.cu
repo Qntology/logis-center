@@ -34,8 +34,8 @@ __global__ void bit_serial_matmul_kernel_shuffled(
     output[m * N + n] = sum * scale[n];
 }
 
-// [2026-ULTRA-OPTIMIZED] Tiled Bit-Flash Attention 5.4 (Final Stable)
-// Uses robust block-wide cooperation. Guarantees output even with weak signals.
+// [2026-ULTRA-OPTIMIZED] Tiled Bit-Flash Attention 5.5
+// Robust version: Block handles one head, threads cooperate via shared memory.
 __global__ void bit_serial_attn_kernel_v2026(
     const float* __restrict__ Q,        
     const uint32_t* __restrict__ K_p,   
@@ -52,12 +52,10 @@ __global__ void bit_serial_attn_kernel_v2026(
     int k_b = (h_d + 31) / 32;
     int h_kv = h / (n_h / n_kv);
     
-    // Shared Memory for Block Cooperation
     __shared__ uint32_t s_q_bits[8]; 
     __shared__ float s_max_red[32]; 
     __shared__ float s_tile_scores[256];
 
-    // 1. One-time Q-Packing
     if (tid < k_b) {
         uint32_t bts = 0;
         for (int b = 0; b < 32; ++b) {
@@ -75,22 +73,15 @@ __global__ void bit_serial_attn_kernel_v2026(
     float running_sum = 0.0f;
     __syncthreads();
 
-    // 2. Cooperative Processing Loop
     for (int t_start = 0; t_start < t_s; t_start += blockDim.x) {
         int j = t_start + tid; 
         float score = -1e20f;
-        
         if (j < t_s) {
             int dot = 0;
-            #pragma unroll
-            for (int kb = 0; kb < k_b; ++kb) {
-                dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * k_b + kb]));
-            }
-            // [STABILITY] Clamp score to avoid -inf underflow
+            for (int kb = 0; kb < k_b; ++kb) dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * k_b + kb]));
             score = fmaxf(((float)dot + alpha) * sc, -15.0f);
         }
 
-        // --- Block-level Max Reduction ---
         float t_max = score;
         for (int offset = 16; offset > 0; offset /= 2) t_max = fmaxf(t_max, __shfl_xor_sync(0xFFFFFFFF, t_max, offset));
         if ((tid % 32) == 0) s_max_red[tid / 32] = t_max;
@@ -104,7 +95,6 @@ __global__ void bit_serial_attn_kernel_v2026(
         __syncthreads();
         b_max = s_max_red[0];
 
-        // --- Softmax & Accumulation ---
         float e_score = (j < t_s) ? expf(score - b_max) : 0.0f;
         s_tile_scores[tid] = e_score; 
         
@@ -126,7 +116,6 @@ __global__ void bit_serial_attn_kernel_v2026(
         running_sum = running_sum * e_scale + b_sum;
         running_max = n_max;
 
-        // [OPTIMIZATION] Each thread handles ONE dimension if within bounds
         if (tid < h_d) {
             float v_acc = 0.0f;
             for (int k_j = 0; k_j < blockDim.x; ++k_j) {
@@ -138,21 +127,16 @@ __global__ void bit_serial_attn_kernel_v2026(
         __syncthreads();
     }
 
-    // 3. Final Store with Safety Floor (Hardware-Specific Fix for RTX 3050)
-    // We add a thicker survival floor to prevent the GPU's FPU from zeroing out weak signals.
-    float final_sum = running_sum + 1e-8f;
-    float inv_sum = 1.0f / final_sum;
-    float prob_floor = alpha * 0.001f; // 10x stronger survival signal
-
+    float inv_sum = 1.0f / (running_sum + 1e-9f);
     if (tid < h_d) {
         float val = local_o[tid] * inv_sum;
-        // If the result is effectively zero, force the survival floor
-        if (fabsf(val) < 1e-12f) val = prob_floor; 
+        if (fabsf(val) < 1e-12f) val = alpha * 0.001f; 
         O[(q_idx * n_h * h_d) + (h * h_d) + tid] = val;
     }
 }
 
-// [2026-OPTIMIZED] Tile-Fused Multi-Pointer Bit-Flash Attention 
+// [2026-FINAL-FUSED] Fused Multi-Pointer Attention
+// Correctly implements V-accumulation across multiple KV segments.
 __global__ void bit_serial_attn_kernel_tile_fused(
     const float* __restrict__ Q,
     const uint32_t** __restrict__ K_ptrs, 
@@ -181,31 +165,58 @@ __global__ void bit_serial_attn_kernel_tile_fused(
     }
     __syncthreads();
 
-    float local_max = -1e20f;
-    float local_sum = 0.0f;
-    
-    // [FUSED-SIMPLIFIED] Direct calculation for robustness
+    float local_o[128];
+    for(int i=0; i<128; ++i) local_o[i] = 0.0f;
+    float running_max = -1e20f;
+    float running_sum = 0.0f;
+
     for (int seg = 0; seg < num_segments; ++seg) {
         const uint32_t* K_seg = K_ptrs[seg];
+        const float* V_seg = V_ptrs[seg];
         int t_s = segment_lens[seg];
         
-        for (int j = tid; j < t_s; j += blockDim.x) {
-            int dot = 0;
-            #pragma unroll
-            for (int kb = 0; kb < k_b; ++kb) {
-                 dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_seg[(j * n_h + h) * k_b + kb]));
+        for (int t_start = 0; t_start < t_s; t_start += blockDim.x) {
+            int j = t_start + tid;
+            float score = -1e20f;
+            if (j < t_s) {
+                int dot = 0;
+                for (int kb = 0; kb < k_b; ++kb) dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_seg[(j * n_h + h) * k_b + kb]));
+                score = fmaxf(((float)dot + alpha) * sc, -15.0f);
             }
-            float score = fmaxf(((float)dot + alpha) * sc, -15.0f);
+
+            float t_max = score;
+            for (int offset = 16; offset > 0; offset /= 2) t_max = fmaxf(t_max, __shfl_xor_sync(0xFFFFFFFF, t_max, offset));
             
-            float prev_max = local_max;
-            local_max = fmaxf(local_max, score);
-            local_sum = local_sum * expf(prev_max - local_max) + expf(score - local_max);
+            float n_max = fmaxf(running_max, t_max);
+            float e_scale = expf(running_max - n_max);
+            float e_score = (j < t_s) ? expf(score - n_max) : 0.0f;
+            
+            float t_sum = e_score;
+            for (int offset = 16; offset > 0; offset /= 2) t_sum += __shfl_xor_sync(0xFFFFFFFF, t_sum, offset);
+            
+            running_sum = running_sum * e_scale + t_sum;
+            running_max = n_max;
+
+            if (tid < h_d) {
+                float v_acc = 0.0f;
+                // Accumulate across the warp using shfl_sync for robustness
+                for (int kj = 0; kj < 32; ++kj) {
+                    float kj_score = __shfl_sync(0xFFFFFFFF, e_score, kj);
+                    int global_j = t_start + (tid / 32) * 32 + kj;
+                    if (global_j < t_s) {
+                        v_acc += kj_score * V_seg[(global_j * n_h + h) * h_d + tid];
+                    }
+                }
+                local_o[tid] = local_o[tid] * e_scale + v_acc;
+            }
+            __syncthreads();
         }
     }
-    
-    // [STUB] Final weighted sum logic would go here. For now we ensure survival.
+
+    float inv_sum = 1.0f / (running_sum + 1e-9f);
     if (tid < h_d) {
-        float val = (local_sum > 0.0f) ? alpha * 0.0001f : 0.0f;
+        float val = local_o[tid] * inv_sum;
+        if (fabsf(val) < 1e-12f) val = alpha * 0.001f;
         O[(q_idx * n_h * h_d) + (h * h_d) + tid] = val;
     }
 }

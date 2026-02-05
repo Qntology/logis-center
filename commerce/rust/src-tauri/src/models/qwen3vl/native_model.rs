@@ -305,10 +305,15 @@ impl NativeLayer {
             };
             unsafe {
                 let cuda_lib = lib();
-                let k_offset = current_len * n_kv * (head_dim/32) * 4;
-                let v_offset = current_len * n_kv * head_dim * 4;
-                let _ = cuda_lib.cuMemcpyHtoD_v2((k_ptr.0 as usize + k_offset) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
-                let _ = cuda_lib.cuMemcpyHtoD_v2((v_ptr.0 as usize + v_offset) as CUdeviceptr, v_f32.as_ptr() as *const _, v_f32.len() * 4);
+                // [FIX] Use correct pointer arithmetic for CUdeviceptr offsets
+                let k_offset_bytes = current_len * n_kv * (head_dim / 32) * 4;
+                let v_offset_bytes = current_len * n_kv * head_dim * 4;
+                
+                let d_k_target = (k_ptr.0 as usize + k_offset_bytes) as CUdeviceptr;
+                let d_v_target = (v_ptr.0 as usize + v_offset_bytes) as CUdeviceptr;
+                
+                let _ = cuda_lib.cuMemcpyHtoD_v2(d_k_target, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+                let _ = cuda_lib.cuMemcpyHtoD_v2(d_v_target, v_f32.as_ptr() as *const _, v_f32.len() * 4);
             }
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
@@ -496,11 +501,11 @@ impl NativeLayer {
                 
                 unsafe {
                     let cuda_lib = lib();
-                    // [FIX] Correctly cast GpuPtr to CUdeviceptr without redundant usize/u64 wrapping
-                    let d_k = k_ptr.0 as CUdeviceptr;
-                    let d_v = v_ptr.0 as CUdeviceptr;
-                    let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, d_k, k_size * 4);
-                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host_f32.as_mut_ptr() as *mut _, d_v, v_size * 4);
+                    // [FIX] Correctly cast GpuPtr to CUdeviceptr for reliable reading
+                    let d_k_src = k_ptr.0 as usize as CUdeviceptr;
+                    let d_v_src = v_ptr.0 as usize as CUdeviceptr;
+                    let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, d_k_src, k_size * 4);
+                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host_f32.as_mut_ptr() as *mut _, d_v_src, v_size * 4);
                 }
                 
                 let v_host: Vec<f16> = v_host_f32.into_iter().map(|v| {
