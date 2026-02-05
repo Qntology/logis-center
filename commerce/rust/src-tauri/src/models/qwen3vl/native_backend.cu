@@ -221,10 +221,104 @@ extern "C" {
 
 
 
-    void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev) {
+        void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev) {
 
-        bit_serial_matmul_kernel_f16<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
+
+
+            bit_serial_matmul_kernel_f16<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
+
+
+
+        }
+
+
 
     }
 
-}
+
+
+    
+
+
+
+    // [STANDARD-F16-MATMUL] For non-quantized layers like lm_head or standard projections
+
+
+
+    __global__ void standard_matmul_kernel_f16(const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C, int M, int N, int K) {
+
+
+
+        int m = blockIdx.y * blockDim.y + threadIdx.y;
+
+
+
+        int n = blockIdx.x * blockDim.x + threadIdx.x;
+
+
+
+        if (m < M && n < N) {
+
+
+
+            float acc = 0.0f;
+
+
+
+            for (int k = 0; k < K; ++k) {
+
+
+
+                acc += __half2float(A[m * K + k]) * __half2float(B[n * K + k]); // Assumes B is [N, K] and transposed or handled accordingly
+
+
+
+            }
+
+
+
+            C[m * N + n] = __float2half(acc);
+
+
+
+        }
+
+
+
+    }
+
+
+
+    
+
+
+
+    extern "C" {
+
+
+
+        void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
+
+
+
+            dim3 block(16, 16);
+
+
+
+            dim3 grid((n + 15) / 16, (m + 15) / 16);
+
+
+
+            standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
+
+
+
+        }
+
+
+
+    }
+
+
+
+    

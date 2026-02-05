@@ -30,6 +30,29 @@ impl NativeLinear {
         let m = x.len() / self.in_features;
         match &self.variant {
             LinearVariant::Standard { weight, bias } => {
+                #[cfg(feature = "cuda")]
+                if self.device_id >= 0 {
+                    if let Some(w_gpu) = weight.gpu_ptr {
+                        let (d_i, d_o) = if let Some((si, so)) = global_scratch {
+                            self.ensure_gpu_buffers_ext(m, si, so)
+                        } else { (0 as CUdeviceptr, 0 as CUdeviceptr) };
+
+                        if d_i != 0 && d_o != 0 {
+                            unsafe {
+                                let cuda_lib = crate::models::qwen3vl::native_backend::lib();
+                                cuda_lib.cuMemcpyHtoD_v2(d_i, x.as_ptr() as *const _, x.len() * 2);
+                                crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(d_i as *const f16, w_gpu.0 as *const f16, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32);
+                                let mut res = vec![f16::ZERO; m * self.out_features];
+                                cuda_lib.cuMemcpyDtoH_v2(res.as_mut_ptr() as *mut _, d_o, res.len() * 2);
+                                if let Some(b) = bias {
+                                    let b_ref = b.get_slice::<f16>();
+                                    for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } }
+                                }
+                                return res;
+                            }
+                        }
+                    }
+                }
                 let w_cow = weight.get_slice::<f16>(); 
                 let b_cow = bias.as_ref().map(|t| t.get_slice::<f16>());
                 native_linear_f16(x, w_cow.as_ref(), b_cow.as_ref().map(|b| b.as_ref()), m, self.out_features, self.in_features)
@@ -444,10 +467,9 @@ impl NativeLayer {
                     let mut x_at = self.o_proj.forward(&attn_out, global_scratch);
                     for i in 0..x_at.len() { x_at[i] += residual[i]; }
                     let r_mlp = x_at.clone();
-                    let x_n_m = unsafe {
-                        let post_ln_weight_ref = self.post_attention_layernorm.get_raw_slice::<f16>();
-                        native_rms_norm_f16(&x_at, post_ln_weight_ref, config.rms_norm_eps as f32, hidden_size)
-                    };
+                    let post_ln_weight_ref = self.post_attention_layernorm.get_slice::<f16>();
+                    let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_ref.as_ref(), config.rms_norm_eps as f32, hidden_size);
+                    
                     let (mut gate, up) = if q_len > 1 {
                         rayon::join(|| self.gate_proj.forward(&x_n_m, global_scratch), || self.up_proj.forward(&x_n_m, global_scratch))
                     } else {
@@ -456,7 +478,9 @@ impl NativeLayer {
                     
                     native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
                     let mut x_m = self.down_proj.forward(&gate, global_scratch); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
-                    return x_m;
+                    
+                    drop(gpu_cache_guard);
+                    return x_m; // <--- NO FALLTHROUGH TO CPU
                 }
             }
         }
