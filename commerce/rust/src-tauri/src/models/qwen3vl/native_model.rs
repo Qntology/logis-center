@@ -833,7 +833,9 @@ impl NativeQwen3VLModel {
         let kv_out = t_c.num_key_value_heads * t_c.head_dim;
 
         for i in 0..l_to_l {
-            let p = format!("model.layers.{}", i);
+            // [STRICT-PARITY] Use unified naming convention enforced by quantization script
+            let p = format!("model.language_model.layers.{}", i);
+
             layers.push(NativeLayer {
                 input_layernorm: get_t(&format!("{}.input_layernorm.weight", p))?,
                 post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p))?,
@@ -850,7 +852,8 @@ impl NativeQwen3VLModel {
                 attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
             });
         }
-        let norm = get_t("model.norm.weight")?;
+        
+        let norm = get_t("model.language_model.norm.weight")?;
         
         // [SMART-HEAD-LOADER] 가중치 공유(tied weights) 대응 강화
         let head_res = get_l("lm_head.weight", t_c.hidden_size, 151936)

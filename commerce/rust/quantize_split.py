@@ -95,13 +95,13 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
         if should_quantize:
             packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
             final_dict.update({
-                f"{name}.packed": packed,
-                f"{name}.scales": scales,
-                f"{name}.shape": shape,
-                f"{name}.format": torch.tensor([1], dtype=torch.int8) # Format 1 = Shuffled
+                f"{new_name}.packed": packed,
+                f"{new_name}.scales": scales,
+                f"{new_name}.shape": shape,
+                f"{new_name}.format": torch.tensor([1], dtype=torch.int8) # Format 1 = Shuffled
             })
         else:
-            final_dict[name] = param.to(torch.float16)
+            final_dict[new_name] = param.to(torch.float16)
 
     save_file(final_dict, out_path)
     print(f" -> Saved to {out_path} ({len(final_dict)} tensors)")

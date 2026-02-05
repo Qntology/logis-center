@@ -177,16 +177,26 @@ __global__ void bit_serial_attn_kernel_v2026(
     }
 
     // 3. Final Normalization and Store
-    float inv_sum = 1.0f / (running_sum + 1e-9f);
+    float final_sum = running_sum + 1e-9f;
+    float inv_sum = 1.0f / final_sum;
+    float prob_floor = alpha * 0.0001f; 
+
     for (int d = tid; d < h_d; d += blockDim.x) {
-        O[(q_idx * n_h * h_d) + (h * h_d) + d] = local_o[d] * inv_sum;
+        float val = local_o[d] * inv_sum;
+        if (fabsf(val) < 1e-10f) val = prob_floor; 
+        O[(q_idx * n_h * h_d) + (h * h_d) + d] = val;
     }
 }
 
     // 3. Final Normalization and Store
-    float inv_sum = 1.0f / (running_sum + 1e-9f);
+    float final_sum = running_sum + 1e-9f;
+    float inv_sum = 1.0f / final_sum;
+    float prob_floor = alpha * 0.0001f; 
+
     for (int d = tid; d < h_d; d += blockDim.x) {
-        O[(q_idx * n_h * h_d) + (h * h_d) + d] = local_o[d] * inv_sum;
+        float val = local_o[d] * inv_sum;
+        if (fabsf(val) < 1e-10f) val = prob_floor; 
+        O[(q_idx * n_h * h_d) + (h * h_d) + d] = val;
     }
 }
 
