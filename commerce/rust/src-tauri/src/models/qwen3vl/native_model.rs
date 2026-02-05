@@ -199,22 +199,37 @@ impl NativeLayer {
         let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
         let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
 
-        let residual = x.to_vec();
-        let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
-        let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
+                let residual = x.to_vec();
+
+                let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
+
+                let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
+
+                
+
+                        // [STABILITY-FIX] 순차적으로 실행하여 CUDA 컨텍스트 혼선 방지
+
+                
+
+                        let mut q = self.q_proj.forward(&x_norm);
+
+                
+
+                        let mut k = self.k_proj.forward(&x_norm);
+
+                
+
+                        let mut v = self.v_proj.forward(&x_norm);
+
+                
+
+                
+
         
-        // [RAYON-STRATEGY] Only use parallel join if processing multiple tokens (prefill)
-                            let (mut q, mut k, mut v) = if q_len > 1 {
-                                let (q_p, (k_p, v_p)) = rayon::join(
-                                    || self.q_proj.forward(&x_norm),
-                                    || rayon::join(|| self.k_proj.forward(&x_norm), || self.v_proj.forward(&x_norm))
-                                );
-                                (q_p, k_p, v_p)
-                            } else {
-                                (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
-                            };
-                    
-                            if _idx == 0 && q_len > 0 {
+
+                if _idx == 0 && q_len > 0 {
+
+        
                                 let v_max = v.iter().take(100).fold(0.0f32, |a, &b| a.max(b.to_f32().abs()));
                                 if v_max == 0.0 {
                                     println!("[STABILITY-CRITICAL] Layer 0 V-PROJ produced ALL ZEROS at forward!");

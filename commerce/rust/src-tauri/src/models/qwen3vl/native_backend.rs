@@ -68,29 +68,32 @@ impl NativeTensor {
     pub fn move_to_gpu_forced_f32(&mut self, device_id: i32) {
         if self.gpu_ptr.is_some() { return; }
         unsafe {
-            let mut ptr: CUdeviceptr = 0;
-            let lib = lib();
-            
-            // Ensure context
+            let cuda_lib = lib();
             let mut ctx = std::ptr::null_mut() as CUcontext;
-            lib.cuCtxGetCurrent(&mut ctx);
+            cuda_lib.cuCtxGetCurrent(&mut ctx);
             if ctx == std::ptr::null_mut() {
                 let mut dev = 0 as CUdevice;
-                lib.cuDeviceGet(&mut dev, device_id);
-                lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
-                lib.cuCtxSetCurrent(ctx);
+                cuda_lib.cuDeviceGet(&mut dev, device_id);
+                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                cuda_lib.cuCtxSetCurrent(ctx);
             }
 
             let data_f16 = self.get_slice::<f16>();
             let data_f32: Vec<f32> = data_f16.iter().map(|v| v.to_f32()).collect();
             let size_bytes = data_f32.len() * 4;
             
-            let res = lib.cuMemAlloc_v2(&mut ptr, size_bytes);
+            let mut ptr: CUdeviceptr = 0;
+            let res = cuda_lib.cuMemAlloc_v2(&mut ptr, size_bytes);
             if (res as i32) == 0 && ptr != 0 {
-                lib.cuMemcpyHtoD_v2(ptr, data_f32.as_ptr() as *const _, size_bytes);
-                self.gpu_ptr = Some(GpuPtr(ptr as *mut _));
-                self.device_id = device_id;
-                println!("[GPU-PIN] Forced F16->F32 conversion successful ({} elements)", data_f32.len());
+                let res_cp = cuda_lib.cuMemcpyHtoD_v2(ptr, data_f32.as_ptr() as *const _, size_bytes);
+                if (res_cp as i32) == 0 {
+                    self.gpu_ptr = Some(GpuPtr(ptr as *mut _));
+                    self.device_id = device_id;
+                    println!("[GPU-PIN] Forced F16->F32 conversion successful ({} elements)", data_f32.len());
+                } else {
+                    cuda_lib.cuMemFree_v2(ptr);
+                    println!("[GPU-ERROR] Memcpy failed during forced conversion: {}", res_cp as i32);
+                }
             } else {
                 println!("[GPU-ERROR] Forced conversion allocation failed: {}", res as i32);
             }
@@ -103,47 +106,29 @@ impl NativeTensor {
         
         let size_raw = self.shape.iter().product::<usize>();
         unsafe {
-            let mut ptr: CUdeviceptr = 0;
-            let lib = lib();
-            
-            // [STABILITY] Ensure valid context before transfer
+            let cuda_lib = lib();
             let mut ctx = std::ptr::null_mut() as CUcontext;
-            lib.cuCtxGetCurrent(&mut ctx);
+            cuda_lib.cuCtxGetCurrent(&mut ctx);
             if ctx == std::ptr::null_mut() {
                 let mut dev = 0 as CUdevice;
-                lib.cuDeviceGet(&mut dev, device_id);
-                lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
-                lib.cuCtxSetCurrent(ctx);
+                cuda_lib.cuDeviceGet(&mut dev, device_id);
+                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                cuda_lib.cuCtxSetCurrent(ctx);
             }
 
-            let res_alloc: CUresult;
-            let mut size_bytes = 0;
-
-            // [OPTIMIZATION] If dtype is F16 but we need F32 on GPU (for scales), convert during transfer
-            // We detect Bit-serial scales by checking if shape has 3 dimensions and ends with 8 (Shuffled Layout)
-            let is_bitserial_scale = self.dtype == NativeDType::F16 && self.shape.len() == 3 && self.shape.last() == Some(&8);
-            let is_standard_scale = self.dtype == NativeDType::F16 && self.shape.last() == Some(&1);
-
-            if is_bitserial_scale || is_standard_scale {
-                let data_f16 = self.get_slice::<f16>();
-                let data_f32: Vec<f32> = data_f16.iter().map(|v| v.to_f32()).collect();
-                size_bytes = data_f32.len() * 4;
-                res_alloc = lib.cuMemAlloc_v2(&mut ptr, size_bytes);
-                if (res_alloc as i32) == 0 {
-                    lib.cuMemcpyHtoD_v2(ptr, data_f32.as_ptr() as *const _, size_bytes);
-                    println!("[GPU-PIN] Transferred & Converted Bit-serial scale tensor to GPU ({} elements)", data_f32.len());
-                }
-            } else {
-                size_bytes = size_raw * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
-                res_alloc = lib.cuMemAlloc_v2(&mut ptr, size_bytes);
-                if (res_alloc as i32) == 0 {
-                    lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size_bytes);
-                }
-            }
+            let mut ptr: CUdeviceptr = 0;
+            let size_bytes = size_raw * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
             
+            let res_alloc = cuda_lib.cuMemAlloc_v2(&mut ptr, size_bytes);
             if (res_alloc as i32) == 0 && ptr != 0 {
-                self.gpu_ptr = Some(GpuPtr(ptr as *mut _)); 
-                self.device_id = device_id;
+                let res_cp = cuda_lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size_bytes);
+                if (res_cp as i32) == 0 {
+                    self.gpu_ptr = Some(GpuPtr(ptr as *mut _)); 
+                    self.device_id = device_id;
+                } else {
+                    cuda_lib.cuMemFree_v2(ptr);
+                    println!("[GPU-ERROR] Memcpy failed: {}", res_cp as i32);
+                }
             } else {
                 println!("[GPU-ERROR] Failed to move tensor to GPU! Code: {}", res_alloc as i32);
             }
@@ -165,7 +150,18 @@ pub fn pack_f16_to_bits(src: &[f16]) -> Vec<u32> {
 #[cfg(feature = "cuda")]
 pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32) -> Vec<f16> {
     unsafe {
-        let lib = lib();
+        let cuda_lib = lib();
+        
+        // [STABILITY] Ensure valid context for current thread
+        let mut ctx = std::ptr::null_mut() as CUcontext;
+        cuda_lib.cuCtxGetCurrent(&mut ctx);
+        if ctx == std::ptr::null_mut() {
+            let mut device = 0 as CUdevice;
+            cuda_lib.cuDeviceGet(&mut device, dev as i32);
+            cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, device);
+            cuda_lib.cuCtxSetCurrent(ctx);
+        }
+
         let q_len = q.len() / (n_h * h_d);
         
         // Parallel conversion f16 -> f32
@@ -175,12 +171,12 @@ pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, 
             q.iter().map(|v| v.to_f32()).collect()
         };
         
-        lib.cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
+        lib().cuMemcpyHtoD_v2(d_q, q_f32.as_ptr() as *const _, q.len() * 4);
         
         bit_serial_attn_cuda_direct(d_q as *const f32, k_p.0 as *const u32, v_p.0 as *const f32, d_o as *mut f32, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, q_len as i32, alpha);
         
         let mut o_f = vec![0.0f32; q.len()]; 
-        lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);
+        lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 4);
         
         // Parallel conversion f32 -> f16
         if q.len() > 1024 {
@@ -194,17 +190,17 @@ pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, 
 #[cfg(feature = "cuda")]
 pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, alpha: f32) -> Vec<f16> {
     unsafe {
-        let lib = lib();
+        let cuda_lib = lib();
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         let q_len = q.len() / (n_h * h_d);
         
-        lib.cuMemAlloc_v2(&mut d_q, q.len() * 4); 
-        lib.cuMemAlloc_v2(&mut d_o, q.len() * 4);
+        lib().cuMemAlloc_v2(&mut d_q, q.len() * 4); 
+        lib().cuMemAlloc_v2(&mut d_o, q.len() * 4);
         
         let res = native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha);
         
-        lib.cuMemFree_v2(d_q); 
-        lib.cuMemFree_v2(d_o);
+        lib().cuMemFree_v2(d_q); 
+        lib().cuMemFree_v2(d_o);
         res
     }
 }
@@ -216,8 +212,18 @@ pub fn bit_serial_matmul_gpu_buffered(
     d_i: CUdeviceptr, d_o: CUdeviceptr
 ) -> Vec<f16> {
     unsafe {
-        let lib = lib();
+        let cuda_lib = lib();
         
+        // [STABILITY] Ensure valid context for current thread
+        let mut ctx = std::ptr::null_mut() as CUcontext;
+        cuda_lib.cuCtxGetCurrent(&mut ctx);
+        if ctx == std::ptr::null_mut() {
+            let mut device = 0 as CUdevice;
+            cuda_lib.cuDeviceGet(&mut device, dev as i32);
+            cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, device);
+            cuda_lib.cuCtxSetCurrent(ctx);
+        }
+
         // [OPTIMIZED-CONVERSION] 
         let i_f32: Vec<f32> = if m * k > 1024 {
             i.par_iter().map(|v: &f16| v.to_f32()).collect()
@@ -225,7 +231,17 @@ pub fn bit_serial_matmul_gpu_buffered(
             i.iter().map(|v: &f16| v.to_f32()).collect()
         };
         
-        lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
+        let res_cp = cuda_lib.cuMemcpyHtoD_v2(d_i, i_f32.as_ptr() as *const _, m * k * 4);
+        if (res_cp as i32) != 0 {
+            println!("[GPU-ERROR] Input transfer failed in matmul: {}", res_cp as i32);
+            // Fallback to CPU calculation if possible
+            unsafe {
+                let wp_ref = w.get_raw_slice::<u32>(); 
+                let s_ref = s.get_raw_slice::<f16>();
+                let out = crate::models::qwen3vl::native_backend::bit_serial_matmul_f32_shuffled(i, wp_ref, s_ref, m, n, k);
+                return out.into_iter().map(f16::from_f32).collect();
+            }
+        }
         
         let d_w = w.gpu_ptr.expect("Weight must be on GPU").0 as *const u32;
         let d_s = s.gpu_ptr.expect("Scale must be on GPU").0 as *const f32;
@@ -233,7 +249,7 @@ pub fn bit_serial_matmul_gpu_buffered(
         bit_serial_matmul_cuda_direct(d_i as *const f32, d_w, d_s, d_o as *mut f32, m as i32, n as i32, k as i32, dev as i32);
         
         let mut o_f = vec![0.0f32; m * n]; 
-        lib.cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
+        lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 4);
         
         if m * n > 1024 {
             o_f.into_par_iter().map(f16::from_f32).collect()
