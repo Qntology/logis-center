@@ -39,7 +39,9 @@ impl NativeLinear {
                 #[cfg(feature = "cuda")]
                 {
                     if self.device_id >= 0 {
-                        if weight_packed.gpu_ptr.is_some() {
+                        // [STABILITY] Check if GPU pointers are valid and NOT NULL
+                        let wp_ptr = weight_packed.gpu_ptr.map(|p| p.0 as usize).unwrap_or(0);
+                        if wp_ptr != 0 {
                             let (d_i, d_o) = self.ensure_gpu_buffers(m);
                             let mut res = bit_serial_matmul_gpu_buffered(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o);
                             
@@ -292,8 +294,30 @@ impl NativeLayer {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 let max_tokens = 16384; 
                 unsafe { 
-                    lib().cuMemAlloc_v2(&mut kp, max_tokens * n_kv * (head_dim/32) * 4); 
-                    lib().cuMemAlloc_v2(&mut vp, max_tokens * n_kv * head_dim * 4); 
+                    let cuda_lib = lib();
+                    // [STABILITY] Ensure we are on the correct device context before allocation
+                    let mut ctx = std::ptr::null_mut() as CUcontext;
+                    cuda_lib.cuCtxGetCurrent(&mut ctx);
+                    if ctx == std::ptr::null_mut() {
+                        let mut dev = 0 as CUdevice;
+                        cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                        cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                        cuda_lib.cuCtxSetCurrent(ctx);
+                    }
+
+                    let res_k = cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens * n_kv * (head_dim/32) * 4); 
+                    let res_v = cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens * n_kv * head_dim * 4); 
+                    
+                    if (res_k as i32) != 0 || (res_v as i32) != 0 {
+                        println!("[STABILITY-CRITICAL] cuMemAlloc_v2 FAILED! Code: K={}, V={}", res_k as i32, res_v as i32);
+                        // If allocation fails, we must NOT return 0 pointers as valid GpuPtr
+                        drop(gpu_cache_guard);
+                        if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                            let cpu_attn = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, q_len, 0.1f32);
+                            return cpu_attn;
+                        }
+                        return vec![f16::ZERO; q.len()];
+                    }
                 }
                 
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
@@ -783,6 +807,19 @@ impl NativeVisionModel {
 
 impl NativeQwen3VLModel {
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let cuda_lib = lib();
+            let res_init = cuda_lib.cuInit(0);
+            if (res_init as i32) != 0 {
+                println!("[CUDA-INIT] cuInit FAILED with code: {}", res_init as i32);
+            } else {
+                let mut count = 0;
+                cuda_lib.cuDeviceGetCount(&mut count);
+                println!("[CUDA-INIT] cuInit Success. Total CUDA devices visible: {}", count);
+            }
+        }
+
         let st = SafeTensors::deserialize(&m_mmap)?; 
         let st_sec = s_mmap.as_ref().map(|m| SafeTensors::deserialize(m)).transpose()?;
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;

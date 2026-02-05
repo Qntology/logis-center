@@ -29,25 +29,26 @@ pub fn get_optimal_device_config() -> DeviceConfig {
     // 2. Intelligent Auto-Selection
     if let Ok(nvml) = Nvml::init() {
         if let Ok(count) = nvml.device_count() {
+            println!("[DEVICE-SELECT] Total GPUs detected by NVML: {}", count);
             let mut candidates = Vec::new();
             for i in 0..count {
                 if let Ok(device) = nvml.device_by_index(i) {
                     if let Ok(mem) = device.memory_info() {
-                        candidates.push((i, mem.total, mem.free, device.name().unwrap_or_default()));
+                        let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+                        println!("[DEVICE-SELECT] Candidate GPU-{}: {} | Free: {:.2} GiB / Total: {:.2} GiB", 
+                            i, name, mem.free as f64 / 1073741824.0, mem.total as f64 / 1073741824.0);
+                        candidates.push((i, mem.total, mem.free, name));
                     }
                 }
             }
             
-            // Sort by Total VRAM Descending
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+            // Sort by FREE VRAM Descending (Priority to the card with more room)
+            candidates.sort_by(|a, b| b.2.cmp(&a.2));
 
             if let Some(best) = candidates.first() {
                 if best.1 > 1024 * 1024 * 1024 { // If it's a dedicated card (>1GB)
-                    // [HYBRID-LAPTOP-FIX] In many laptops, NVML GPU-0 is actually CUDA Device 1
-                    // If multiple GPUs exist, and we're picking the powerful one, 
-                    // we log a warning and use the best candidate's ID.
-                    println!("[DEVICE-SELECT] Automatic: Picking {} (Total: {:.2} GiB) at index {}.", 
-                        best.3, best.1 as f64 / 1073741824.0, best.0);
+                    println!("[DEVICE-SELECT] Automatic: Picking {} (Free: {:.2} GiB, Total: {:.2} GiB) at index {}.", 
+                        best.3, best.2 as f64 / 1073741824.0, best.1 as f64 / 1073741824.0, best.0);
                     
                     return DeviceConfig {
                         is_cpu: false,
