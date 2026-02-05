@@ -205,14 +205,35 @@ impl NativeLayer {
             (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
         };
 
-        // [STABILITY-AUDIT] Jumpstart zero signals if necessary
-        let ensure_alive = |data: &mut Vec<f16>, name: &str| {
-            if !data.is_empty() && data.iter().take(100).all(|x| x.to_f32().abs() < 1e-12) {
-                println!("[STABILITY-WARN] {} projection was DEAD (all zeros). Jumpstarting...", name);
+        // [2025-MATHEMATICAL-STABILITY] Adaptive Alpha Scaling
+        // Instead of hard-coded values, we scale alpha based on the signal's energy (MeanAbs).
+        let mut final_alpha = 0.1f32;
+        
+        let ensure_alive = |data: &mut Vec<f16>, name: &str| -> f32 {
+            if data.is_empty() { return 0.0; }
+            let mean_abs = data.iter().take(500).map(|x| x.to_f32().abs()).sum::<f32>() / 500.0;
+            
+            if _idx == 0 {
+                println!("[DIAGNOSTIC] Layer 0 {} MeanAbs: {:.2e}", name, mean_abs);
+            }
+
+            if mean_abs < 1e-12 {
+                println!("[STABILITY-WARN] {} projection is DEAD. Jumpstarting...", name);
                 for i in 0..data.len().min(100) { data[i] = f16::from_f32(1e-6); }
+                1e-6
+            } else {
+                mean_abs
             }
         };
-        ensure_alive(&mut q, "Q"); ensure_alive(&mut k, "K"); ensure_alive(&mut v, "V");
+
+        let q_energy = ensure_alive(&mut q, "Q");
+        let _k_energy = ensure_alive(&mut k, "K");
+        let _v_energy = ensure_alive(&mut v, "V");
+
+        // [MATH] Calculate dynamic alpha based on Q energy
+        // If energy is 0.1, alpha stays 0.1. If energy is 0.01, alpha becomes 1.0.
+        final_alpha = (0.01 / (q_energy + 1e-9)).clamp(0.1, 2.0);
+        if is_baking { final_alpha *= 1.5; } // Extra boost for baking
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
@@ -286,29 +307,26 @@ impl NativeLayer {
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
-            // [STABILITY] Strong alpha: Baking needs significant bias to survive 1-bit quantization collapse
-            let alpha = if is_baking { 0.8f32 } else { 0.1f32 }; 
-
             // [OPTIMIZATION] Reuse scratch buffers for Attention
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
-            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, alpha);
+            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
             
             // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
             if !attn_out.is_empty() && (attn_out[0].to_f32().abs() < 1e-9) && attn_out.iter().take(20).all(|x| x.to_f32().abs() < 1e-9) {
-                let retry_alpha = if is_baking { 1.2f32 } else { alpha + 0.4 };
-                println!("[STABILITY] Signal Death at layer {} (Baking: {}). Attempting GPU recovery with aggressive alpha {}...", _idx, is_baking, retry_alpha);
+                let retry_alpha = (final_alpha + 0.5).min(2.5);
+                println!("[STABILITY] Signal Death at layer {} (Energy: {:.2e}). GPU recovery with alpha {}...", _idx, q_energy, retry_alpha);
                 
                 attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, retry_alpha);
 
                 if attn_out[0].to_f32().abs() < 1e-9 {
-                    let cpu_alpha = if is_baking { 1.5f32 } else { retry_alpha + 0.2 };
-                    println!("[STABILITY-CRITICAL] GPU recovery failed. Falling back to Hybrid-SIMD (CPU) with alpha {}...", cpu_alpha);
+                    let cpu_alpha = retry_alpha + 0.2;
+                    println!("[STABILITY-CRITICAL] GPU failed. Fallback to CPU (Alpha: {})...", cpu_alpha);
                     drop(gpu_cache_guard);
                     if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
                         attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, cpu_alpha);
                     }
                 } else {
-                    println!("[STABILITY] GPU recovery SUCCESSFUL at layer {} with alpha {}.", _idx, retry_alpha);
+                    println!("[STABILITY] GPU recovery SUCCESSFUL at layer {}.", _idx);
                 }
             }
 
@@ -444,7 +462,7 @@ impl NativeLayer {
     pub fn get_kv_data(&self, head_dim: usize, n_kv: usize) -> Option<(Vec<u32>, Vec<f16>)> {
         #[cfg(feature = "cuda")]
         if self.device_id >= 0 {
-            use cudarc::driver::sys::lib;
+            use cudarc::driver::sys::{lib, CUdeviceptr};
             let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             if let Some((k_ptr, v_ptr, current_len)) = *gpu_cache_guard {
                 if current_len == 0 { return None; }
@@ -456,11 +474,16 @@ impl NativeLayer {
                 
                 unsafe {
                     let cuda_lib = lib();
-                    let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, k_ptr.0 as usize as u64, k_size * 4);
-                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host_f32.as_mut_ptr() as *mut _, v_ptr.0 as usize as u64, v_size * 4);
+                    // [FIX] Correctly cast GpuPtr to CUdeviceptr without redundant usize/u64 wrapping
+                    let d_k = k_ptr.0 as CUdeviceptr;
+                    let d_v = v_ptr.0 as CUdeviceptr;
+                    let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, d_k, k_size * 4);
+                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host_f32.as_mut_ptr() as *mut _, d_v, v_size * 4);
                 }
                 
-                let v_host: Vec<f16> = v_host_f32.into_iter().map(f16::from_f32).collect();
+                let v_host: Vec<f16> = v_host_f32.into_iter().map(|v| {
+                    if v.is_nan() { f16::ZERO } else { f16::from_f32(v) }
+                }).collect();
                 return Some((k_host, v_host));
             }
         }

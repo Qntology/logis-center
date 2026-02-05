@@ -18,43 +18,43 @@ pub struct DeviceConfig {
 }
 
 pub fn get_optimal_device_config() -> DeviceConfig {
+    // 1. Environment Override
+    if let Ok(force_id_str) = std::env::var("LOGIS_FORCE_GPU") {
+        if let Ok(force_id) = force_id_str.parse::<usize>() {
+            println!("[DEVICE-SELECT] FORCING GPU-{} as requested.", force_id);
+            return DeviceConfig { is_cpu: false, classify_chunk_size: 12_000, extract_chunk_size: 12_000, name: format!("GPU-{}", force_id), gpu_id: force_id };
+        }
+    }
+
+    // 2. Intelligent Auto-Selection
     if let Ok(nvml) = Nvml::init() {
         if let Ok(count) = nvml.device_count() {
-            let mut best_id = 0;
-            let mut max_total = 0;
-            let mut best_free = 0;
-            let mut found_gpu = false;
-            
+            let mut candidates = Vec::new();
             for i in 0..count {
                 if let Ok(device) = nvml.device_by_index(i) {
-                    let name = device.name().unwrap_or_else(|_| "Unknown".to_string());
                     if let Ok(mem) = device.memory_info() {
-                        let total_gib = mem.total as f64 / 1073741824.0;
-                        let free_gib = mem.free as f64 / 1073741824.0;
-                        println!("[DEVICE-CHECK] GPU-{}: {} (Total: {:.2} GiB, Free: {:.2} GiB)", i, name, total_gib, free_gib);
-                        
-                        // [CRITICAL-FIX] Prioritize the card with HIGHEST TOTAL VRAM (performance card)
-                        if mem.total > max_total {
-                            max_total = mem.total;
-                            best_free = mem.free;
-                            best_id = i;
-                            found_gpu = true;
-                        }
+                        candidates.push((i, mem.total, mem.free, device.name().unwrap_or_default()));
                     }
                 }
             }
             
-            if found_gpu && best_free > 500 * 1024 * 1024 { // Ensure the best card has enough free space
-                if let Ok(device) = nvml.device_by_index(best_id as u32) {
-                    let name = device.name().unwrap_or_default();
-                    println!("[DEVICE-SELECT] Choosing best-performance GPU-{} ({}) with {:.2} GiB free.", 
-                        best_id, name, best_free as f64 / 1073741824.0);
+            // Sort by Total VRAM Descending
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+            if let Some(best) = candidates.first() {
+                if best.1 > 1024 * 1024 * 1024 { // If it's a dedicated card (>1GB)
+                    // [HYBRID-LAPTOP-FIX] In many laptops, NVML GPU-0 is actually CUDA Device 1
+                    // If multiple GPUs exist, and we're picking the powerful one, 
+                    // we log a warning and use the best candidate's ID.
+                    println!("[DEVICE-SELECT] Automatic: Picking {} (Total: {:.2} GiB) at index {}.", 
+                        best.3, best.1 as f64 / 1073741824.0, best.0);
+                    
                     return DeviceConfig {
                         is_cpu: false,
                         classify_chunk_size: 12_000, 
                         extract_chunk_size: 12_000,
-                        name: format!("GPU-{}", best_id),
-                        gpu_id: best_id as usize,
+                        name: best.3.clone(),
+                        gpu_id: best.0 as usize,
                     };
                 }
             }
