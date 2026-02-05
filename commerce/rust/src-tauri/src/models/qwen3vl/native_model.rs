@@ -243,6 +243,14 @@ impl NativeLayer {
         let density_boost = if q_density < 0.2f32 { 8.0f32 } else { (1.0f32 / (q_density + 0.1f32)).min(5.0f32) };
         let mut final_alpha = (0.1f32 / (q_energy + 1e-9f32) * density_boost).clamp(0.2f32, 2.5f32);
         
+        // [2025-COGNITIVE-REFLECT] Dynamic Semantic Gain based on Layer 0 Diagnostic
+        let semantic_gain = (q_density * 2.0 + 0.8).clamp(0.9, 1.2);
+        
+        if _idx == 0 && q_len > 0 {
+            println!("[COGNITIVE] Layer 0 {} -> Alpha: {:.4}, Semantic Gain: {:.4} (Density: {:.4})", 
+                if is_baking { "BAKING" } else { "INF" }, final_alpha, semantic_gain, q_density);
+        }
+
         if is_baking { final_alpha *= 1.5f32; } 
 
         if let Some(ref qw) = self.q_norm { 
@@ -325,9 +333,13 @@ impl NativeLayer {
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
 
             // [STABILITY-ORGANIC-RECOVERY] Multi-stage GPU persistence loop
-            // Instead of giving up, 0.6B model fights to stay on GPU via incremental alpha hunting.
             let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
             
+            // Apply gain to the signal before it leaves the attention block
+            for val in attn_out.iter_mut() {
+                *val = f16::from_f32(val.to_f32() * semantic_gain);
+            }
+
             let is_dead = |data: &[f16]| -> bool {
                 !data.is_empty() && (data[0].to_f32().abs() < 1e-9) && data.iter().take(20).all(|x| x.to_f32().abs() < 1e-9)
             };
@@ -387,7 +399,12 @@ impl NativeLayer {
         let t_s = v_f_f.len() / (n_kv * head_dim);
         *cache_guard = Some((k_p_f.clone(), v_f_f.clone())); drop(cache_guard);
 
-        let attn_out = native_bit_serial_attn_f16(&q, &k_p_f, &v_f_f, hidden_size, n_h, n_kv, q_len, t_s, 0.1f32);
+        let mut attn_out = native_bit_serial_attn_f16(&q, &k_p_f, &v_f_f, hidden_size, n_h, n_kv, q_len, t_s, 0.1f32);
+        
+        // [2025-COGNITIVE-REFLECT] Apply semantic gain on CPU path
+        for val in attn_out.iter_mut() {
+            *val = f16::from_f32(val.to_f32() * semantic_gain);
+        }
         let mut x_at = self.o_proj.forward(&attn_out);
         for i in 0..x_at.len() { x_at[i] += residual[i]; }
         let r_mlp = x_at.clone();
