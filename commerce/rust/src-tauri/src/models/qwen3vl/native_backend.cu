@@ -2,8 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// [ULTRA-ROBUST] Tiled Shared Memory Bit-serial Matmul
-// Uses shared memory to prevent illegal address access and bank conflicts.
+// [ULTRA-ROBUST-TILED] Shared Memory Bit-serial Matmul
 __global__ void bit_serial_matmul_kernel_shuffled(
     const float* __restrict__ input,    
     const uint32_t* __restrict__ weight, 
@@ -11,16 +10,13 @@ __global__ void bit_serial_matmul_kernel_shuffled(
     float* __restrict__ output,          
     int M, int N, int K
 ) {
-    // Tile dimensions
-    const int TILE_SIZE = 32;
-    __shared__ uint32_t s_input_bits[TILE_SIZE]; 
-    __shared__ uint32_t s_weight_bits[TILE_SIZE * 8]; 
-    __shared__ float s_scales[TILE_SIZE * 8];
+    const int TILE_M = 32;
+    __shared__ uint32_t s_input_bits[TILE_M]; 
 
-    int m_base = blockIdx.y * TILE_SIZE;
+    int m_base = blockIdx.y * TILE_M;
     int n_group = blockIdx.x;
-    int n_sub = threadIdx.x; // 0..7
-    int m_sub = threadIdx.y; // 0..31
+    int n_sub = threadIdx.x; 
+    int m_sub = threadIdx.y; 
     
     int m = m_base + m_sub;
     int n = n_group * 8 + n_sub;
@@ -28,34 +24,25 @@ __global__ void bit_serial_matmul_kernel_shuffled(
 
     float acc = 0.0f;
 
-    // Iterate over K in tiles
-    for (int kb_offset = 0; kb_offset < k_blocks; kb_offset += 1) {
-        // 1. Collaborative load Input bits into shared memory
-        if (m < M && kb_offset < k_blocks) {
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        if (n_sub == 0) {
             uint32_t bts = 0;
-            for (int b = 0; b < 32; ++b) {
-                int k_idx = kb_offset * 32 + b;
-                if (k_idx < K && input[m * K + k_idx] >= 0.0f) bts |= (1u << b);
+            if (m < M) {
+                #pragma unroll
+                for (int b = 0; b < 32; ++b) {
+                    int k_idx = kb * 32 + b;
+                    if (k_idx < K && input[m * K + k_idx] >= 0.0f) bts |= (1u << b);
+                }
             }
             s_input_bits[m_sub] = bts;
-        } else {
-            s_input_bits[m_sub] = 0;
-        }
-
-        // 2. Collaborative load Weight and Scale
-        if (n < N && kb_offset < k_blocks) {
-            int w_idx = n_group * k_blocks * 8 + kb_offset * 8 + n_sub;
-            s_weight_bits[m_sub * 8 + n_sub] = weight[w_idx]; // Just a placeholder for indexing
-            // In bitserial shuffled, scale[idx] corresponds to weight[idx]
-            s_scales[n_sub] = scale[w_idx]; 
         }
         __syncthreads();
 
-        // 3. Compute
         if (m < M && n < N) {
-            uint32_t w_val = weight[n_group * k_blocks * 8 + kb_offset * 8 + n_sub];
-            uint32_t diff = __popc(s_input_bits[m_sub] ^ w_val);
-            acc += (float)(32 - 2 * (int)diff) * scale[n_group * k_blocks * 8 + kb_offset * 8 + n_sub];
+            int idx = n_group * k_blocks * 8 + kb * 8 + n_sub;
+            uint32_t w_val = weight[idx];
+            float s_val = scale[idx];
+            acc += (float)(32 - 2 * (int)__popc(s_input_bits[m_sub] ^ w_val)) * s_val;
         }
         __syncthreads();
     }
@@ -65,8 +52,8 @@ __global__ void bit_serial_matmul_kernel_shuffled(
     }
 }
 
-// [2026-ULTRA-OPTIMIZED] Tiled Bit-Flash Attention 5.5
-// Robust version: Block handles one head, threads cooperate via shared memory.
+// [ULTRA-SAFE] Bit-serial Attention Kernel
+// Hardened indexing and shared memory protection for Large models (2B+)
 __global__ void bit_serial_attn_kernel_v2026(
     const float* __restrict__ Q,        
     const uint32_t* __restrict__ K_p,   
@@ -77,46 +64,59 @@ __global__ void bit_serial_attn_kernel_v2026(
 ) {
     int q_idx = blockIdx.x; 
     int h = blockIdx.y;     
-    int tid = threadIdx.x;
+    int tid = threadIdx.x; // Block size 256
+    
     if (q_idx >= q_len || h >= n_h) return;
 
     int k_b = (h_d + 31) / 32;
     int h_kv = h / (n_h / n_kv);
     
-    __shared__ uint32_t s_q_bits[8]; 
+    __shared__ uint32_t s_q_bits[16]; // Supports up to h_d=512
     __shared__ float s_max_red[32]; 
     __shared__ float s_tile_scores[256];
 
+    // 1. Collaborative load Query bits
     if (tid < k_b) {
         uint32_t bts = 0;
         for (int b = 0; b < 32; ++b) {
             int d_idx = tid * 32 + b;
-            if (d_idx < h_d && Q[(q_idx * n_h * h_d) + (h * h_d) + d_idx] >= 0.0f) bts |= (1u << b);
+            if (d_idx < h_d) {
+                float val = Q[(q_idx * n_h * h_d) + (h * h_d) + d_idx];
+                if (val >= 0.0f) bts |= (1u << b);
+            }
         }
         s_q_bits[tid] = bts;
     }
+    __syncthreads();
     
-    float local_o[128]; 
-    #pragma unroll
-    for(int i=0; i<128; ++i) local_o[i] = 0.0f;
+    float local_o[256]; // Supports h_d up to 256
+    for(int i=0; i<256; ++i) local_o[i] = 0.0f;
     
     float running_max = -1e20f;
     float running_sum = 0.0f;
-    __syncthreads();
 
+    // 2. Iterate over sequence length (t_s)
     for (int t_start = 0; t_start < t_s; t_start += blockDim.x) {
         int j = t_start + tid; 
         float score = -1e20f;
+        
         if (j < t_s) {
             int dot = 0;
-            for (int kb = 0; kb < k_b; ++kb) dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * k_b + kb]));
-            score = fmaxf(((float)dot + alpha) * sc, -15.0f);
+            // Boundary-safe Key bit-serial dot product
+            for (int kb = 0; kb < k_b; ++kb) {
+                int k_idx = (j * n_kv + h_kv) * k_b + kb;
+                dot += (32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[k_idx]));
+            }
+            score = ((float)dot + alpha) * sc;
+            if (score < -15.0f) score = -15.0f;
         }
 
+        // Parallel Max reduction within block
         float t_max = score;
         for (int offset = 16; offset > 0; offset /= 2) t_max = fmaxf(t_max, __shfl_xor_sync(0xFFFFFFFF, t_max, offset));
         if ((tid % 32) == 0) s_max_red[tid / 32] = t_max;
         __syncthreads();
+        
         float b_max = -1e20f;
         if (tid < 32) {
             b_max = (tid < (blockDim.x / 32)) ? s_max_red[tid] : -1e20f;
@@ -128,11 +128,14 @@ __global__ void bit_serial_attn_kernel_v2026(
 
         float e_score = (j < t_s) ? expf(score - b_max) : 0.0f;
         s_tile_scores[tid] = e_score; 
+        __syncthreads();
         
+        // Parallel Sum reduction
         float t_sum = e_score;
         for (int offset = 16; offset > 0; offset /= 2) t_sum += __shfl_xor_sync(0xFFFFFFFF, t_sum, offset);
         if ((tid % 32) == 0) s_max_red[tid / 32] = t_sum;
         __syncthreads();
+        
         float b_sum = 0.0f;
         if (tid < 32) {
             b_sum = (tid < (blockDim.x / 32)) ? s_max_red[tid] : 0.0f;
@@ -142,6 +145,7 @@ __global__ void bit_serial_attn_kernel_v2026(
         __syncthreads();
         b_sum = s_max_red[0];
 
+        // Softmax normalization and V-accumulation
         float n_max = fmaxf(running_max, b_max);
         float e_scale = expf(running_max - n_max);
         running_sum = running_sum * e_scale + b_sum;
@@ -151,104 +155,20 @@ __global__ void bit_serial_attn_kernel_v2026(
             float v_acc = 0.0f;
             for (int k_j = 0; k_j < blockDim.x; ++k_j) {
                 int g_j = t_start + k_j;
-                if (g_j < t_s) v_acc += s_tile_scores[k_j] * V[(g_j * n_kv + h_kv) * h_d + tid];
+                if (g_j < t_s) {
+                    int v_idx = (g_j * n_kv + h_kv) * h_d + tid;
+                    v_acc += s_tile_scores[k_j] * V[v_idx];
+                }
             }
             local_o[tid] = local_o[tid] * e_scale + v_acc;
         }
         __syncthreads();
     }
 
-    float inv_sum = 1.0f / (running_sum + 1e-9f);
+    // Write final output O
     if (tid < h_d) {
-        float val = local_o[tid] * inv_sum;
-        if (fabsf(val) < 1e-12f) val = alpha * 0.001f; 
-        O[(q_idx * n_h * h_d) + (h * h_d) + tid] = val;
-    }
-}
-
-// [2026-FINAL-FUSED] Fused Multi-Pointer Attention
-// Correctly implements V-accumulation across multiple KV segments.
-__global__ void bit_serial_attn_kernel_tile_fused(
-    const float* __restrict__ Q,
-    const uint32_t** __restrict__ K_ptrs, 
-    const float** __restrict__ V_ptrs,     
-    const int* __restrict__ segment_lens,  
-    int num_segments,
-    float* __restrict__ O,
-    int n_h, int h_d, float sc, int q_len,
-    float alpha
-) {
-    int q_idx = blockIdx.x; 
-    int h = blockIdx.y;     
-    int tid = threadIdx.x;
-    if (q_idx >= q_len || h >= n_h) return;
-
-    __shared__ uint32_t s_q_bits[8]; 
-    int k_b = (h_d + 31) / 32;
-
-    if (tid < k_b) {
-        uint32_t bts = 0;
-        for (int b = 0; b < 32; ++b) {
-            int d_idx = tid * 32 + b;
-            if (d_idx < h_d && Q[(q_idx * n_h * h_d) + (h * h_d) + d_idx] >= 0.0f) bts |= (1u << b);
-        }
-        s_q_bits[tid] = bts;
-    }
-    __syncthreads();
-
-    float local_o[128];
-    for(int i=0; i<128; ++i) local_o[i] = 0.0f;
-    float running_max = -1e20f;
-    float running_sum = 0.0f;
-
-    for (int seg = 0; seg < num_segments; ++seg) {
-        const uint32_t* K_seg = K_ptrs[seg];
-        const float* V_seg = V_ptrs[seg];
-        int t_s = segment_lens[seg];
-        
-        for (int t_start = 0; t_start < t_s; t_start += blockDim.x) {
-            int j = t_start + tid;
-            float score = -1e20f;
-            if (j < t_s) {
-                int dot = 0;
-                for (int kb = 0; kb < k_b; ++kb) dot += (32 - 2 * __popc(s_q_bits[kb] ^ K_seg[(j * n_h + h) * k_b + kb]));
-                score = fmaxf(((float)dot + alpha) * sc, -15.0f);
-            }
-
-            float t_max = score;
-            for (int offset = 16; offset > 0; offset /= 2) t_max = fmaxf(t_max, __shfl_xor_sync(0xFFFFFFFF, t_max, offset));
-            
-            float n_max = fmaxf(running_max, t_max);
-            float e_scale = expf(running_max - n_max);
-            float e_score = (j < t_s) ? expf(score - n_max) : 0.0f;
-            
-            float t_sum = e_score;
-            for (int offset = 16; offset > 0; offset /= 2) t_sum += __shfl_xor_sync(0xFFFFFFFF, t_sum, offset);
-            
-            running_sum = running_sum * e_scale + t_sum;
-            running_max = n_max;
-
-            if (tid < h_d) {
-                float v_acc = 0.0f;
-                // Accumulate across the warp using shfl_sync for robustness
-                for (int kj = 0; kj < 32; ++kj) {
-                    float kj_score = __shfl_sync(0xFFFFFFFF, e_score, kj);
-                    int global_j = t_start + (tid / 32) * 32 + kj;
-                    if (global_j < t_s) {
-                        v_acc += kj_score * V_seg[(global_j * n_h + h) * h_d + tid];
-                    }
-                }
-                local_o[tid] = local_o[tid] * e_scale + v_acc;
-            }
-            __syncthreads();
-        }
-    }
-
-    float inv_sum = 1.0f / (running_sum + 1e-9f);
-    if (tid < h_d) {
-        float val = local_o[tid] * inv_sum;
-        if (fabsf(val) < 1e-12f) val = alpha * 0.001f;
-        O[(q_idx * n_h * h_d) + (h * h_d) + tid] = val;
+        float inv_sum = 1.0f / (running_sum + 1e-9f);
+        O[(q_idx * n_h * h_d) + (h * h_d) + tid] = local_o[tid] * inv_sum;
     }
 }
 
@@ -258,13 +178,6 @@ extern "C" {
         dim3 block(256); 
         dim3 grid(q_len, n_h);
         bit_serial_attn_kernel_v2026<<<grid, block>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha);
-    }
-
-    void bit_serial_attn_cuda_fused(const float* d_q, const uint32_t** d_k_table, const float** d_v_table, const int* d_lens, int n_segs, float* d_o, int n_h, int h_d, float scale, int dev, int q_len, float alpha) {
-        cudaSetDevice(dev);
-        dim3 block(256);
-        dim3 grid(q_len, n_h);
-        bit_serial_attn_kernel_tile_fused<<<grid, block>>>(d_q, d_k_table, d_v_table, d_lens, n_segs, d_o, n_h, h_d, scale, q_len, alpha);
     }
 
     void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {

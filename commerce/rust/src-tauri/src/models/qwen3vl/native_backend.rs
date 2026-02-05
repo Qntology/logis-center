@@ -9,6 +9,19 @@ use std::arch::x86_64::*;
 #[cfg(feature = "cuda")]
 pub use cudarc::driver::sys::{lib, CUdeviceptr, CUcontext, CUdevice, CUresult};
 
+pub static GPU_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_gpu_panicked() -> bool {
+    GPU_PANIC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn trigger_gpu_panic() {
+    if !is_gpu_panicked() {
+        println!("[GPU-PANIC] Critical error detected. Disabling GPU for all future operations.");
+        GPU_PANIC.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(feature = "cuda")]
 extern "C" {
     fn bit_serial_matmul_cuda_direct(d_i: *const f32, d_w: *const u32, d_s: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, dev: i32);
