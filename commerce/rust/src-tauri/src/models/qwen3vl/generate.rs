@@ -541,9 +541,14 @@ impl Qwen3VLGenerateModel {
                             
                             // Append to target layer's cache (allowing multiple components to stack)
                             let mut cache_k = m.text_model.layers[l_idx].kv_cache.lock().unwrap();
-                            if cache_k.is_none() { *cache_k = Some((Vec::new(), Vec::new())); }
-                            if let Some((ref mut pk, ref mut pv)) = *cache_k {
-                                pk.extend(k_data); pv.extend(v_data);
+                            cache_k.k.extend(k_data); 
+                            cache_k.v.extend(v_data);
+                            
+                            // Re-calculate current length and capacity after manual extension
+                            let k_unit = target_dim / 32;
+                            if k_unit > 0 {
+                                cache_k.current_len = cache_k.k.len() / k_unit;
+                                cache_k.capacity = cache_k.current_len;
                             }
                         }
                     }

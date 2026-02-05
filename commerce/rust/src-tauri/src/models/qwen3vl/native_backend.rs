@@ -329,8 +329,49 @@ pub fn bit_serial_matmul_f32_shuffled(i: &[f16], w: &[u32], s: &[f16], m: usize,
     o
 }
 
-pub fn bit_serial_matmul_f32_extreme(i: &[f16], w: &[u32], s: &[f16], m: usize, n: usize, k: usize) -> Vec<f32> {
-    bit_serial_matmul_f32_shuffled(i, w, s, m, n, k)
+#[cfg(feature = "cuda")]
+pub fn bit_serial_matmul_gpu_buffered_into(
+    i: &[f16], w: &NativeTensor, s: &NativeTensor, 
+    out: &mut [f16],
+    m: usize, n: usize, k: usize, dev: usize,
+    d_i: CUdeviceptr, d_o: CUdeviceptr
+) {
+    if d_i == 0 || d_o == 0 { return; }
+    unsafe {
+        let _ = lib().cuMemcpyHtoD_v2(d_i, i.as_ptr() as *const _, m * k * 2);
+        let d_w = w.gpu_ptr.expect("Weight must be on GPU").0 as *const u32;
+        let d_s = s.gpu_ptr.expect("Scale must be on GPU").0 as *const f16;
+        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32);
+        lib().cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, m * n * 2);
+    }
+}
+
+pub fn bit_serial_matmul_f32_extreme_into(i: &[f16], w: &[u32], s: &[f16], out: &mut [f16], m: usize, n: usize, k: usize) {
+    let res = bit_serial_matmul_f32_shuffled(i, w, s, m, n, k);
+    for j in 0..res.len() { out[j] = f16::from_f32(res[j]); }
+}
+
+pub fn native_rms_norm_f16_into(x: &[f16], w: &[f16], eps: f32, hid: usize, out: &mut [f16]) {
+    out.par_chunks_mut(hid).enumerate().for_each(|(i, row)| {
+        let start = i * hid;
+        let mut v = 0.0f32;
+        for j in 0..hid { let val = x[start + j].to_f32(); v += val * val; }
+        let inv = 1.0 / (v / hid as f32 + eps).sqrt();
+        for j in 0..hid { row[j] = f16::from_f32(x[start + j].to_f32() * inv * w[j].to_f32()); }
+    });
+}
+
+pub fn native_linear_f16_into(x: &[f16], w: &[f16], b: Option<&[f16]>, out: &mut [f16], m: usize, out_f: usize, in_f: usize) {
+    out.par_chunks_mut(out_f).enumerate().for_each(|(i, row)| {
+        let x_row = &x[i * in_f..(i + 1) * in_f];
+        for j in 0..out_f {
+            let mut acc = 0.0f32;
+            let w_row = &w[j * in_f..(j + 1) * in_f];
+            for k in 0..in_f { acc += x_row[k].to_f32() * w_row[k].to_f32(); }
+            if let Some(bias) = b { acc += bias[j].to_f32(); }
+            row[j] = f16::from_f32(acc);
+        }
+    });
 }
 
 pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usize, n_h: usize, n_kv: usize, q_l: usize, t_s: usize, alpha: f32) -> Vec<f16> {

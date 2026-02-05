@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use memmap2::Mmap;
 use crate::models::qwen3vl::native_backend::*;
-use crate::models::qwen3vl::native_model::{NativeLayer, NativeLinear, LinearVariant};
+use crate::models::qwen3vl::native_model::{NativeLayer, NativeLinear, LinearVariant, DynamicKVCache, ForwardWorkspace};
 use crate::models::qwen3vl::config::Qwen3VLTextConfig;
 use anyhow::{Result, anyhow};
 use half::f16;
@@ -14,6 +14,7 @@ pub struct NativeEmbeddingModel {
     pub layers: Vec<NativeLayer>,
     pub norm: NativeTensor,
     pub hidden_size: usize,
+    pub workspace: std::sync::Mutex<ForwardWorkspace>,
 }
 
 impl NativeEmbeddingModel {
@@ -57,7 +58,7 @@ impl NativeEmbeddingModel {
                 gate_proj: NativeLinear { in_features: hidden_size, out_features: 1152, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.gate_proj.weight", p))?, bias: None }, device_id: -1 },
                 up_proj: NativeLinear { in_features: hidden_size, out_features: 1152, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.up_proj.weight", p))?, bias: None }, device_id: -1 },
                 down_proj: NativeLinear { in_features: 1152, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.down_proj.weight", p))?, bias: None }, device_id: -1 },
-                kv_cache: std::sync::Mutex::new(None),
+                kv_cache: std::sync::Mutex::new(DynamicKVCache::new()),
                 gpu_kv_cache: std::sync::Mutex::new(None),
                 device_id: -1,
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
@@ -65,8 +66,9 @@ impl NativeEmbeddingModel {
         }
 
         let norm = get_t("model.norm.weight")?;
+        let workspace = std::sync::Mutex::new(ForwardWorkspace::new());
 
-        Ok(Self { tokenizer, embed_tokens, layers, norm, hidden_size })
+        Ok(Self { tokenizer, embed_tokens, layers, norm, hidden_size, workspace })
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -91,9 +93,10 @@ impl NativeEmbeddingModel {
 
         let table = self.embed_tokens.get_slice::<f16>();
         let mut x = native_embedding_lookup_f16(token_ids, &table, self.hidden_size);
+        let mut ws_guard = self.workspace.lock().unwrap();
 
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, &cfg, 0, i, &[], &[], false, None);
+            x = layer.forward(&x, &cfg, 0, i, &[], &[], false, None, Some(&mut *ws_guard));
         }
 
         let norm_w = self.norm.get_slice::<f16>();
