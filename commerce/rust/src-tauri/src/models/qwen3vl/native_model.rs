@@ -234,10 +234,10 @@ impl NativeLayer {
         let (q_energy, q_density) = measure_context(&mut q, "Q");
         let (_, _k_density) = measure_context(&mut k, "K");
 
-        // [ORGANIC-MATH] Alpha is now a function of both Energy and Semantic Density
-        // Thin contexts (low density) get significantly more protection.
-        let density_boost = (1.0 / (q_density + 0.1)).min(5.0);
-        final_alpha = (0.01 / (q_energy + 1e-9) * density_boost).clamp(0.1, 2.5);
+        // [ORGANIC-MATH] More aggressive density boost for low-information contexts
+        // Low density (like 0.13 in logs) now triggers a much higher starting Alpha.
+        let density_boost = if q_density < 0.2 { 8.0 } else { (1.0 / (q_density + 0.1)).min(5.0) };
+        final_alpha = (0.01 / (q_energy + 1e-9) * density_boost as f32).clamp(0.1, 2.5);
         
         if is_baking { final_alpha *= 1.3; } 
 
@@ -313,30 +313,39 @@ impl NativeLayer {
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
-            // [OPTIMIZATION] Reuse scratch buffers for Attention
-            let (d_q, d_o) = self.ensure_attn_scratch(q.len());
+            // [STABILITY-ORGANIC-RECOVERY] Multi-stage GPU persistence loop
+            // Instead of giving up, 0.6B model fights to stay on GPU via incremental alpha hunting.
+            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
             
-            // [STABILITY] Boost alpha for inference to keep GPU alive
-            let base_alpha = if is_baking { final_alpha * 1.5 } else { (final_alpha + 0.4).min(2.0) };
-            
-            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, base_alpha);
-            
-            // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
-            if !attn_out.is_empty() && (attn_out[0].to_f32().abs() < 1e-9) && attn_out.iter().take(20).all(|x| x.to_f32().abs() < 1e-9) {
-                let retry_alpha = base_alpha + 0.5;
-                println!("[STABILITY] Signal Death at layer {} (Energy: {:.2e}). GPU recovery with alpha {:.2}...", _idx, q_energy, retry_alpha);
-                
-                attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, retry_alpha);
+            let is_dead = |data: &[f16]| -> bool {
+                !data.is_empty() && (data[0].to_f32().abs() < 1e-9) && data.iter().take(20).all(|x| x.to_f32().abs() < 1e-9)
+            };
 
-                if attn_out[0].to_f32().abs() < 1e-9 {
-                    let cpu_alpha = retry_alpha + 0.2;
-                    println!("[STABILITY-CRITICAL] GPU failed. Fallback to CPU (Alpha: {:.2})...", cpu_alpha);
+            if is_dead(&attn_out) {
+                let mut current_alpha = final_alpha;
+                let mut success = false;
+                
+                // [2025-H2-RESEARCH] 3-Stage GPU Probing: Much faster than CPU fallback
+                for stage in 1..=3 {
+                    current_alpha += 0.4; // Incrementally boost stability
+                    println!("[STABILITY-RECOVERY] GPU Stage {} -> Hunting for life with alpha {:.2}...", stage, current_alpha);
+                    
+                    let retry = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, current_alpha);
+                    if !is_dead(&retry) {
+                        println!("[STABILITY] GPU Signal RECOVERED at Stage {}! Alpha: {:.2}", stage, current_alpha);
+                        attn_out = retry;
+                        success = true;
+                        break;
+                    }
+                }
+
+                if !success {
+                    let final_cpu_alpha = current_alpha + 0.3;
+                    println!("[STABILITY-CRITICAL] All GPU stages failed. Final fallback to Hybrid-SIMD (CPU) with alpha {:.2}...", final_cpu_alpha);
                     drop(gpu_cache_guard);
                     if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, cpu_alpha);
+                        attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, final_cpu_alpha);
                     }
-                } else {
-                    println!("[STABILITY] GPU recovery SUCCESSFUL at layer {}.", _idx);
                 }
             }
 

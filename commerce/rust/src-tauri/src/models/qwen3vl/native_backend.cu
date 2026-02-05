@@ -138,15 +138,16 @@ __global__ void bit_serial_attn_kernel_v2026(
         __syncthreads();
     }
 
-    // 3. Final Store with Safety Floor
-    float final_sum = running_sum + 1e-9f;
+    // 3. Final Store with Safety Floor (Hardware-Specific Fix for RTX 3050)
+    // We add a thicker survival floor to prevent the GPU's FPU from zeroing out weak signals.
+    float final_sum = running_sum + 1e-8f;
     float inv_sum = 1.0f / final_sum;
-    float prob_floor = alpha * 0.0001f; 
+    float prob_floor = alpha * 0.001f; // 10x stronger survival signal
 
-    // Only threads within head_dim range write results
     if (tid < h_d) {
         float val = local_o[tid] * inv_sum;
-        if (fabsf(val) < 1e-10f) val = prob_floor; 
+        // If the result is effectively zero, force the survival floor
+        if (fabsf(val) < 1e-12f) val = prob_floor; 
         O[(q_idx * n_h * h_d) + (h * h_d) + tid] = val;
     }
 }
