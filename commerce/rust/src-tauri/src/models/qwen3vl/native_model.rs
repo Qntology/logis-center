@@ -1128,15 +1128,16 @@ impl NativeQwen3VLModel {
     }
     pub fn forward(&self, i_ids: &[u32], p_v: Option<&[f16]>, g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
         #[cfg(feature = "cuda")]
-        if self.device_id >= 0 {
+        if !self.text_model.layers.is_empty() && self.text_model.layers[0].device_id >= 0 {
             use cudarc::driver::sys::*;
             unsafe {
+                let dev_id = self.text_model.layers[0].device_id;
                 let cuda_lib = crate::models::qwen3vl::native_backend::lib();
                 let mut ctx = std::ptr::null_mut() as CUcontext;
                 cuda_lib.cuCtxGetCurrent(&mut ctx);
                 if ctx == std::ptr::null_mut() {
                     let mut dev = 0 as CUdevice;
-                    cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                    cuda_lib.cuDeviceGet(&mut dev, dev_id);
                     cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
                     cuda_lib.cuCtxSetCurrent(ctx);
                 }

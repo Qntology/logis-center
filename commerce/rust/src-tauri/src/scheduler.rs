@@ -9,11 +9,9 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::{LogisModel, ModelSize};
-use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
-use crate::openai_types::ChatCompletionParameters;
 use serde_json::{Value, json};
 use anyhow::Result;
-use tauri::{Manager, Emitter};
+use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
@@ -63,11 +61,6 @@ impl TaskDataManager {
 
     pub fn load(&self, path: &std::path::Path) -> Result<String> {
         Ok(fs::read_to_string(path)?)
-    }
-
-    pub fn get_path(&self, suffix: &str) -> PathBuf {
-        let dir = utils::paths::get_task_specific_dir(self.app_handle.as_ref(), &self.task_id);
-        dir.join(format!("{}.txt", suffix))
     }
 }
 
@@ -230,7 +223,7 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
+    let _data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
     let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
     let effective_device_pref = device_preference.or_else(|| {
@@ -252,7 +245,7 @@ async fn process_task(
             if m.is_cpu_mode != wants_cpu {
                 m.unload_generator().await;
                 *model_lock = None;
-                let _ = wait_for_resources_settled(1000, 500, Some(cancellation_token)).await;
+                let _ = wait_for_resources_settled(1000, 500, cancellation_token).await;
             }
         }
 
@@ -339,7 +332,7 @@ async fn process_task(
         let type_prompt = parsing::page_type_prompt();
         let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
 
-        let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("integrated_type")).await?;
+        let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("integrated_type".to_string())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
@@ -349,12 +342,14 @@ async fn process_task(
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
         let sel_query = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
         
-        let res_sel = model.chat("", &sel_query, Some(cancellation_token.clone()), Some("integrated_selectors_nobridge")).await?;
+        let res_sel = model.chat("", &sel_query, Some(cancellation_token.clone()), Some("integrated_selectors_nobridge".to_string())).await?;
         selector_info = parsing::parse_json_from_llm(&res_sel);
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
 
         log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": format!("Identified {} (Detail: {})", page_type, is_detail), "spinner": "✅" }));
     }
+
+    let store = { let g = store_mutex.lock().await; g.as_ref().ok_or_else(|| anyhow::anyhow!("DB Error"))?.clone() };
 
     // PHASE 3: Hybrid DOM Extraction (Rust Scraper)
     if !is_detail {
@@ -365,7 +360,8 @@ async fn process_task(
             let document = scraper::Html::parse_document(&clean);
             let field_selectors = selector_info.get("selectors").and_then(|v| v.as_object());
             
-            if let Ok(sel) = scraper::Selector::parse(&target_selector) {
+            let sel_res = scraper::Selector::parse(&target_selector);
+            if let Ok(sel) = sel_res {
                 for item_node in document.select(&sel) {
                     let mut item_json = json!({});
                     let mut has_data = false;
@@ -439,14 +435,14 @@ async fn process_task(
     if is_detail {
         log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Scanning target detail content...", "spinner": "⠋" }));
         
-        // [METICULOUS] Targeted Detail Scan: instead of full HTML, scan specific selector
         let target_selector = selector_info.get("node").or(selector_info.get("item")).and_then(|v| v.as_str()).unwrap_or("body");
         let content_pug = {
             let document = scraper::Html::parse_document(&clean);
             let mut pug_output = String::new();
             if let Ok(selector) = scraper::Selector::parse(target_selector) {
                 if let Some(element_ref) = document.select(&selector).next() {
-                    parsing::generate_pug_lines(element_ref.id(), 0, &mut pug_output, &PugMode::FullContent);
+                    let node_ref = element_ref.id();
+                    parsing::generate_pug_lines(document.tree.get(node_ref).unwrap(), 0, &mut pug_output, &PugMode::FullContent);
                 }
             }
             if pug_output.is_empty() { light_pug.clone() } else { pug_output }
@@ -454,7 +450,7 @@ async fn process_task(
 
         let ins = parsing::item2json(&page_type, &url, "english");
         let query_text = format!("[TARGET CONTENT]\n{}\n\nTASK: {}\n\nACTION: SAVE", content_pug, ins);
-        let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("detail_extraction_nobridge")).await?;
+        let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("detail_extraction_nobridge".to_string())).await?;
         extracted_data = parsing::parse_json_from_llm(&res);
         all_extracted_items = vec![extracted_data.clone()];
     } else if !all_extracted_items.is_empty() {
@@ -479,7 +475,7 @@ async fn process_task(
             let action_flag = if end_item == all_extracted_items.len() { "ACTION: SAVE" } else { "ACTION: INGEST" };
             let query_text = format!("{}\n\n{}\n\n{}", batch_text, ins, action_flag);
             
-            let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some(&format!("batch_refinement_{}", batch_idx))).await?;
+            let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some(format!("batch_refinement_{}", batch_idx))).await?;
             let parsed = parsing::parse_json_from_llm(&res);
             
             if let Some(arr) = parsed.as_array().or_else(|| parsed.get("items").and_then(|v| v.as_array())) {
@@ -491,7 +487,6 @@ async fn process_task(
                     }
                 }
             } else {
-                // Fallback: If AI fails to return JSON array, keep raw data for this batch
                 refined_items.extend_from_slice(batch);
             }
 
@@ -505,10 +500,8 @@ async fn process_task(
 
     // --- PHASE 4: PERSISTENCE & SYNC ---
     model.unload_generator().await;
-    let store = { let g = store_mutex.lock().await; g.as_ref().ok_or_else(|| anyhow::anyhow!("DB Error"))?.clone() };
     let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
 
-    // [INTEGRATED-NORMALIZATION] Deeply flatten nested structures for the root extracted_data
     let mut normalized_root = json!({});
     if let Some(obj) = extracted_data.as_object() {
         for (k, v) in obj {
@@ -546,8 +539,6 @@ async fn process_task(
         if cancellation_token.load(Ordering::Relaxed) { break; }
         
         let mut item = item_orig.clone();
-        
-        // [INTEGRATED-NORMALIZATION] Apply same deep flattening to each item in the list
         let mut normalized_item = json!({});
         if let Some(obj) = item.as_object() {
             for (k, v) in obj {
@@ -587,20 +578,14 @@ async fn process_task(
         let text_to_embed = parsing::json_to_natural_language(&final_item);
         let item_digest = crate::utils::hash::digest(&text_to_embed);
         
-        // [INTEGRATED-OPTIMIZATION] Skip high-cost embedding if content hasn't changed
         let mut existing_vector = None;
-        if let Ok(Some(existing)) = store.get_item_by_id(&page_type, &item_id).await {
-            if existing.digest == item_digest {
-                println!("[PROCESS] Digest match for {}. Skipping embedding.", item_id);
-                existing_vector = Some(existing.vector);
+        if let Ok(Some(existing_item)) = store.get_item_by_id("items", &item_id).await {
+            if existing_item.digest == item_digest {
+                existing_vector = Some(existing_item.vector);
             }
         }
 
-        let vector = if let Some(v) = existing_vector {
-            v
-        } else {
-            model.get_embedding(text_to_embed).await?
-        };
+        let vector = if let Some(v) = existing_vector { v } else { model.get_embedding(text_to_embed).await? };
 
         let cc_for_hash = task.cc.clone(); 
         let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_hash));
