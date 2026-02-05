@@ -309,18 +309,22 @@ impl NativeLayer {
 
             // [OPTIMIZATION] Reuse scratch buffers for Attention
             let (d_q, d_o) = self.ensure_attn_scratch(q.len());
-            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
+            
+            // [STABILITY] Boost alpha for inference to keep GPU alive
+            let base_alpha = if is_baking { final_alpha * 1.5 } else { (final_alpha + 0.4).min(2.0) };
+            
+            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, base_alpha);
             
             // [2026-STABILITY-ENHANCED] Adaptive Recovery Protocol
             if !attn_out.is_empty() && (attn_out[0].to_f32().abs() < 1e-9) && attn_out.iter().take(20).all(|x| x.to_f32().abs() < 1e-9) {
-                let retry_alpha = (final_alpha + 0.5).min(2.5);
-                println!("[STABILITY] Signal Death at layer {} (Energy: {:.2e}). GPU recovery with alpha {}...", _idx, q_energy, retry_alpha);
+                let retry_alpha = base_alpha + 0.5;
+                println!("[STABILITY] Signal Death at layer {} (Energy: {:.2e}). GPU recovery with alpha {:.2}...", _idx, q_energy, retry_alpha);
                 
                 attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, retry_alpha);
 
                 if attn_out[0].to_f32().abs() < 1e-9 {
                     let cpu_alpha = retry_alpha + 0.2;
-                    println!("[STABILITY-CRITICAL] GPU failed. Fallback to CPU (Alpha: {})...", cpu_alpha);
+                    println!("[STABILITY-CRITICAL] GPU failed. Fallback to CPU (Alpha: {:.2})...", cpu_alpha);
                     drop(gpu_cache_guard);
                     if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
                         attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, cpu_alpha);

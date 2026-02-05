@@ -272,12 +272,12 @@ impl Qwen3VLGenerateModel {
         let recalib_len = current_kv_offset.min(32);
         let safe_offset = current_kv_offset - recalib_len;
         
-        if recalib_len > 0 {
+        if recalib_len > 0 && all_ids.len() >= recalib_len {
             println!("[LBR] Synchronizing last {} tokens for context alignment...", recalib_len);
-            let recalib_chunk = &all_ids[..recalib_len]; // Simplified for this implementation
-            // Actually, we should pull original IDs from the cache if possible, but 
-            // for now, we use the start of the current prompt as a bridge.
+            let recalib_chunk = &all_ids[..recalib_len]; 
             self.qwen3_vl.forward(recalib_chunk, None, None, safe_offset);
+        } else {
+            println!("[LBR-SKIP] Prompt too short ({}) for recalibration. Proceeding directly.", all_ids.len());
         }
 
         let mut generated_text = String::new();
