@@ -198,54 +198,25 @@ impl Qwen3VLGenerateModel {
         })
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, _session_id: Option<String>) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, phase_tag: Option<&str>) -> Result<String> {
         let seqlen_offset = self.get_kv_len();
-        println!("[GENERATE] Initial KV Offset: {}", seqlen_offset);
+        let tag = phase_tag.unwrap_or("GENERATE");
+        println!("[{}] Initial KV Offset: {}", tag, seqlen_offset);
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
         let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
-        // [2025-H2-RESEARCH] Last-Block Recalibration (LBR)
-        // Stabilizes 0.6B -> 2B relay by re-computing the final 32 tokens using the Large model.
         let recalibration_len = 32; 
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
         if seqlen_offset > 0 {
-            // [DIAGNOSTIC] Print first 20 tokens of the new prompt
-            let head_len = all_ids.len().min(20);
-            let head_text = self.tokenizer.token_decode(all_ids[..head_len].to_vec()).unwrap_or_default();
-            println!("[ZERO-PREFILL-DIAG] New Prompt (Head): '{}'", head_text.replace("\n", "\\n"));
-
-            if all_ids.len() >= seqlen_offset {
-                // CASE A: Standard Full-Text Match with LBR
-                local_pos = seqlen_offset.saturating_sub(recalibration_len);
-                current_kv_offset = local_pos; // Overwrite last 32 stale tokens with Large-model precision
-                println!("[ZERO-PREFILL-LBR] Recalibrating last {} tokens for transition stability (Offset: {}).", seqlen_offset - local_pos, local_pos);
-            } else {
-                // CASE B: Modular Extension
-                println!("[ZERO-PREFILL-MODULAR] Modular Mode. Cache ({}) > Prompt ({}).", seqlen_offset, all_ids.len());
-                
-                let mut found_split = 0;
-                for i in 0..all_ids.len().min(20) {
-                    if all_ids[i] == 151645 { // <|im_end|>
-                        found_split = i + 1;
-                        if found_split < all_ids.len() && all_ids[found_split] == 198 { // \n
-                            found_split += 1;
-                        }
-                        break;
-                    }
-                }
-
-                if found_split > 0 {
-                    // Even in modular mode, we recalibrate if the prompt allows
-                    local_pos = found_split;
-                    println!("[ZERO-PREFILL-MODULAR] Skipping header ({} tokens).", found_split);
-                } else {
-                    local_pos = 0;
-                }
-            }
+            // [STITCHING] Align 0.6B cache with 2B activations using a 32-token overlap
+            let bridge_len = all_ids.len().min(recalibration_len);
+            current_kv_offset = seqlen_offset.saturating_sub(bridge_len);
+            local_pos = 0;
+            println!("[{}-STITCH] Bridging {} tokens at offset {} to sync 0.6B context.", tag, bridge_len, current_kv_offset);
         }
 
         let prefill_chunk_size = 512;
@@ -436,7 +407,10 @@ impl Qwen3VLGenerateModel {
         let sum: f32 = v_f32.iter().sum();
         let mean = sum / v_f32.len() as f32;
         let max_abs = v_f32.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-        println!("[DIST-AUDIT-BAKE] V-Cache Stats -> Mean: {:.6}, MaxAbs: {:.6}", mean, max_abs);
+        println!("[DIST-AUDIT-BAKE] V-Cache Stats -> Mean: {:.6}, MaxAbs: {:.6}, Count: {}", mean, max_abs, v.len());
+        if max_abs == 0.0 {
+            println!("[BAKE-CRITICAL] V-CACHE IS COMPLETELY DEAD (ALL ZEROS). Check v_proj output.");
+        }
 
         let k_u8 = unsafe { std::slice::from_raw_parts(k.as_ptr() as *const u8, k.len() * 4) };
         tensors.insert("layer.0.k".to_string(), safetensors::tensor::TensorView::new(safetensors::Dtype::U32, vec![k.len()], k_u8)?);

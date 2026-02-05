@@ -48,7 +48,7 @@ impl NativeLinear {
                                 unsafe {
                                     let wp_ref = weight_packed.get_raw_slice::<u32>(); 
                                     let s_ref = scales.get_raw_slice::<f16>();
-                                    let mut out = bit_serial_matmul_f32_extreme(x, wp_ref, s_ref, m, self.out_features, self.in_features);
+                                    let out = bit_serial_matmul_f32_extreme(x, wp_ref, s_ref, m, self.out_features, self.in_features);
                                     res = out.into_iter().map(f16::from_f32).collect();
                                 }
                             }
@@ -195,21 +195,25 @@ impl NativeLayer {
         let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
         
         // [RAYON-STRATEGY] Only use parallel join if processing multiple tokens (prefill)
-        let (mut q, mut k, mut v) = if q_len > 1 {
-            let (q_p, (k_p, v_p)) = rayon::join(
-                || self.q_proj.forward(&x_norm),
-                || rayon::join(|| self.k_proj.forward(&x_norm), || self.v_proj.forward(&x_norm))
-            );
-            (q_p, k_p, v_p)
-        } else {
-            (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
-        };
-
-        // [2025-COGNITIVE-STABILITY] Embedding-Guided Adaptive Scaling
+                            let (mut q, mut k, mut v) = if q_len > 1 {
+                                let (q_p, (k_p, v_p)) = rayon::join(
+                                    || self.q_proj.forward(&x_norm),
+                                    || rayon::join(|| self.k_proj.forward(&x_norm), || self.v_proj.forward(&x_norm))
+                                );
+                                (q_p, k_p, v_p)
+                            } else {
+                                (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
+                            };
+                    
+                            if _idx == 0 && q_len > 0 {
+                                let v_max = v.iter().take(100).fold(0.0f32, |a, &b| a.max(b.to_f32().abs()));
+                                if v_max == 0.0 {
+                                    println!("[STABILITY-CRITICAL] Layer 0 V-PROJ produced ALL ZEROS at forward!");
+                                }
+                            }        // [2025-COGNITIVE-STABILITY] Embedding-Guided Adaptive Scaling
         // Treat Layer 0 as an embedding engine to measure semantic density.
-        let mut final_alpha = 0.1f32;
         
-        let mut measure_context = |data: &mut Vec<f16>, name: &str| -> (f32, f32) {
+        let measure_context = |data: &mut Vec<f16>, name: &str| -> (f32, f32) {
             if data.is_empty() { return (0.0, 1.0); }
             let samples = data.iter().take(500).map(|x| x.to_f32().abs()).collect::<Vec<_>>();
             let mean_abs = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -231,17 +235,15 @@ impl NativeLayer {
             }
         };
 
-        // [2025-MATHEMATICAL-STABILITY] Adaptive Alpha Scaling (Recalibrated for RTX 3050)
-        let q_energy = ensure_alive(&mut q, "Q");
-        let _k_energy = ensure_alive(&mut k, "K");
-        let _v_energy = ensure_alive(&mut v, "V");
+        let (q_energy, q_density) = measure_context(&mut q, "Q");
+        let (_k_energy, _k_density) = measure_context(&mut k, "K");
+        let (_v_energy, _v_density) = measure_context(&mut v, "V");
 
         // [MATH-RECALIBRATION] 10x stronger base to prevent GPU-specific underflow
-        // Base is now 0.1. If energy is 0.6, final_alpha is ~0.16 before density boost.
-        let density_boost = if q_density < 0.2 { 8.0 } else { (1.0 / (q_density + 0.1)).min(5.0) };
-        let mut final_alpha = (0.1 / (q_energy + 1e-9) * density_boost as f32).clamp(0.2, 2.5);
+        let density_boost = if q_density < 0.2f32 { 8.0f32 } else { (1.0f32 / (q_density + 0.1f32)).min(5.0f32) };
+        let mut final_alpha = (0.1f32 / (q_energy + 1e-9f32) * density_boost).clamp(0.2f32, 2.5f32);
         
-        if is_baking { final_alpha *= 1.5; } // Higher boost for 1-layer baking
+        if is_baking { final_alpha *= 1.5f32; } 
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
@@ -278,11 +280,10 @@ impl NativeLayer {
         if self.device_id >= 0 {
             use cudarc::driver::sys::*;
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
-            let (k_ptr, v_ptr, mut current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
+            let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
                 let max_tokens = 16384; 
                 unsafe { 
-                    let cuda_lib = lib();
                     lib().cuMemAlloc_v2(&mut kp, max_tokens * n_kv * (head_dim/32) * 4); 
                     lib().cuMemAlloc_v2(&mut vp, max_tokens * n_kv * head_dim * 4); 
                 }

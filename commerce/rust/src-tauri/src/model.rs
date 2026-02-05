@@ -1,6 +1,6 @@
 use crate::utils;
 use anyhow::anyhow;
-use crate::models::qwen3vl::generate::{Qwen3VLGenerateModel, ModelVariant};
+use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
 use crate::models::native_embedding::NativeEmbeddingModel;
 use crate::openai_types::{
     ChatCompletionParameters,
@@ -832,7 +832,7 @@ Return valid JSON only. No explanation.
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id.as_deref()).map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }).await?
@@ -911,7 +911,7 @@ Return valid JSON only. No explanation.
         let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id.as_deref()).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         task.await.map_err(|e| anyhow!("Task join error: {}", e))?
@@ -969,7 +969,7 @@ Return valid JSON only. No explanation.
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id.as_deref()).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         task.await.map_err(|e| anyhow!("Task join error: {}", e))?
@@ -1014,7 +1014,7 @@ Return valid JSON only. No explanation.
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id.as_deref()).map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -1076,7 +1076,7 @@ Return valid JSON only. No explanation.
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id.as_deref()).map_err(|e| anyhow!("Inference failed: {}", e))
         });
         
         task.await.map_err(|e| anyhow!("Task join error: {}", e))?
