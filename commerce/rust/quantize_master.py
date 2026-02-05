@@ -64,25 +64,36 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
 
     final_dict = {}
     for name, param in tensors.items():
-        idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', name)
+        # [NAMING-UNITY] 0.6B 모델의 이름을 2B 모델과 일치하도록 완벽 변환 (model.language_model. 추가)
+        new_name = name
+        if "layers." in name and "language_model" not in name:
+            new_name = name.replace("model.layers", "model.language_model.layers")
+        elif "model.embed_tokens" in name and "language_model" not in name:
+            new_name = name.replace("model.embed_tokens", "model.language_model.embed_tokens")
+        elif "model.norm" in name and "language_model" not in name:
+            new_name = name.replace("model.norm", "model.language_model.norm")
+        elif name.startswith("lm_head"):
+            new_name = "model.language_model.lm_head" + name[7:]
+
+        idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', new_name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
         if layer_limit is not None and layer_idx >= layer_limit: continue
         if is_vision != ("visual" in name): continue
 
         is_weight = "weight" in name and len(param.shape) == 2
-        # [CRITICAL] Skip layers that require high precision or are used for lookups
+        # [CRITICAL] Skip layers that require high precision
         should_quantize = is_weight and "norm" not in name and "ln" not in name and "embed" not in name and "patch" not in name
 
         if should_quantize:
             packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
             final_dict.update({
-                f"{name}.packed": packed,
-                f"{name}.scales": scales,
-                f"{name}.shape": shape,
-                f"{name}.format": torch.tensor([1], dtype=torch.int8) # Format 1 = Shuffled
+                f"{new_name}.packed": packed,
+                f"{new_name}.scales": scales,
+                f"{new_name}.shape": shape,
+                f"{new_name}.format": torch.tensor([1], dtype=torch.int8) 
             })
         else:
-            final_dict[name] = param.to(torch.float16)
+            final_dict[new_name] = param.to(torch.float16)
 
     save_file(final_dict, out_path)
     print(f" -> DONE. Shuffled model saved to {out_path}")
