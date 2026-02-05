@@ -350,7 +350,7 @@ impl NativeLayer {
 
                     let max_tokens_gpu = 4096;
                     let res_k = cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
-                    let res_v = cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 4); 
+                    let res_v = cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); // [NEW] f16 = 2 bytes
                     
                     if (res_k as i32) != 0 || (res_v as i32) != 0 {
                         println!("[STABILITY-CRITICAL] cuMemAlloc_v2 FAILED! Code: K={}, V={}", res_k as i32, res_v as i32);
@@ -388,16 +388,15 @@ impl NativeLayer {
                 // The main CPU logic at the bottom of the function will handle it now
             } else {
                 let k_packed = pack_f16_to_bits(&k);
-                let v_f32: Vec<f32> = v.iter().map(|val: &f16| val.to_f32()).collect();
                 
                 if _idx == 0 && q_len > 0 {
-                    let v_f32_max = v_f32.iter().take(100).fold(0.0f32, |a, &b| a.max(b.abs()));
-                    println!("[GPU-DEBUG] Transferring Chunk to GPU. Len: {}, V-sample-max: {:.6}, Current-Offset: {}", q_len, v_f32_max, current_len);
+                    let v_max = v.iter().take(100).fold(0.0f32, |a, &b| a.max(b.to_f32().abs()));
+                    println!("[GPU-DEBUG] Transferring Chunk to GPU. Len: {}, V-sample-max: {:.6}, Current-Offset: {}", q_len, v_max, current_len);
                 }
 
             unsafe {
                 let cuda_lib = lib();
-                // [STABILITY-FIX] Ensure context is current for THIS thread before copying
+                // [STABILITY-FIX] Ensure context is current
                 let mut ctx = std::ptr::null_mut() as CUcontext;
                 cuda_lib.cuCtxGetCurrent(&mut ctx);
                 if ctx == std::ptr::null_mut() && self.device_id >= 0 {
@@ -408,23 +407,14 @@ impl NativeLayer {
                 }
 
                 let k_offset_bytes = (current_len as u64) * (n_kv as u64) * ((head_dim / 32) as u64) * 4;
-                let v_offset_bytes = (current_len as u64) * (n_kv as u64) * (head_dim as u64) * 4;
+                let v_offset_bytes = (current_len as u64) * (n_kv as u64) * (head_dim as u64) * 2; // [NEW] f16 = 2 bytes
                 
                 let d_k_target = (k_ptr.0 as u64 + k_offset_bytes) as CUdeviceptr;
                 let d_v_target = (v_ptr.0 as u64 + v_offset_bytes) as CUdeviceptr;
-                
-                if k_ptr.0.is_null() || v_ptr.0.is_null() {
-                    println!("[STABILITY-CRITICAL] Base pointers are NULL during forward! Re-allocating...");
-                    // [RECOVERY] If base pointers are null, trigger a local allocation or fallback
-                }
 
-                let res_k = cuda_lib.cuMemcpyHtoD_v2(d_k_target, k_packed.as_ptr() as *const _, k_packed.len() * 4);
-                let res_v = cuda_lib.cuMemcpyHtoD_v2(d_v_target, v_f32.as_ptr() as *const _, v_f32.len() * 4);
-                    
-                    if (res_k as i32) != 0 || (res_v as i32) != 0 {
-                        println!("[STABILITY-CRITICAL] cuMemcpyHtoD_v2 FAILED! K_err={}, V_err={}", res_k as i32, res_v as i32);
-                    }
-                }
+                let _ = cuda_lib.cuMemcpyHtoD_v2(d_k_target, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+                let _ = cuda_lib.cuMemcpyHtoD_v2(d_v_target, v.as_ptr() as *const _, v.len() * 2); // [NEW] Copy f16 directly
+            }
                 let new_len = current_len + q_len;
                 *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
@@ -565,20 +555,15 @@ impl NativeLayer {
                 let v_size = current_len * n_kv * head_dim;
                 
                 let mut k_host = vec![0u32; k_size];
-                let mut v_host_f32 = vec![0.0f32; v_size];
+                let mut v_host = vec![f16::ZERO; v_size];
                 
                 unsafe {
                     let cuda_lib = lib();
-                    // [FIX] Correctly cast GpuPtr to CUdeviceptr for reliable reading
                     let d_k_src = k_ptr.0 as usize as CUdeviceptr;
                     let d_v_src = v_ptr.0 as usize as CUdeviceptr;
                     let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, d_k_src, k_size * 4);
-                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host_f32.as_mut_ptr() as *mut _, d_v_src, v_size * 4);
+                    let _ = cuda_lib.cuMemcpyDtoH_v2(v_host.as_mut_ptr() as *mut _, d_v_src, v_size * 2);
                 }
-                
-                let v_host: Vec<f16> = v_host_f32.into_iter().map(|v| {
-                    if v.is_nan() { f16::ZERO } else { f16::from_f32(v) }
-                }).collect();
                 return Some((k_host, v_host));
             }
         }
