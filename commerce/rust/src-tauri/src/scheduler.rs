@@ -336,27 +336,29 @@ async fn process_task(
     let mut is_detail = false;
     let mut all_extracted_items = Vec::new();
 
-    // [PHASE 1 & 2] Integrated Analysis (Using nobridge to ensure alignment)
+    // [PHASE 1 & 2] Integrated Analysis (Using Backup Mechanism: Integrated Prefill)
     {
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Identifying page structure...", "spinner": "⠋" }));
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Syncing context and identifying structure...", "spinner": "⠋" }));
         
         let type_prompt = parsing::page_type_prompt();
-        // [STRICT-ALIGNMENT] nobridge 세션 태그를 사용하여 베이킹된 문맥을 훼손하지 않고 질의
-        let res = model.chat("", &type_prompt, Some(cancellation_token.clone()), Some("integrated_type_nobridge".to_string())).await?;
+        // [STRICT-PARITY] 백업 버전처럼 베이킹된 문맥 뒤에 질문을 'nobridge' 모드로 즉시 주입
+        // 이 방식은 모델이 PUG 문맥 전체를 완벽히 이해한 상태에서 응답을 시작하게 합니다.
+        let res = model.chat("", &type_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
+        
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
         if page_type == "unknown" || page_type.is_empty() { 
-            println!("[PROCESS] Page type identification failed. LLM Response: {}", res);
+            println!("[PROCESS] identification failure. Response was: {}", res);
             return Ok(()); 
         }
 
-        // Immediately follow up with selector detection in the same session
+        // [BACKUP-MECHANISM] Selector 추출도 동일 세션(Context 유지)에서 연속 진행
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        let res_sel = model.chat("", &selector_prompt, Some(cancellation_token.clone()), Some("integrated_selectors_nobridge".to_string())).await?;
+        let res_sel = model.chat("", &selector_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         selector_info = parsing::parse_json_from_llm(&res_sel);
+        
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
-
         log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": format!("Identified {} (Detail: {})", page_type, is_detail), "spinner": "✅" }));
     }
 

@@ -201,34 +201,44 @@ impl Qwen3VLGenerateModel {
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, phase_tag: Option<&str>) -> Result<String> {
         let seqlen_offset = self.get_kv_len();
         let tag = phase_tag.unwrap_or("GENERATE");
-        // [FIX] Support various naming conventions for nobridge tag
-        let no_bridge = tag.to_lowercase().contains("nobridge");
+        
+        // [INTEGRATED-MECHANISM] 시스템 프롬프트가 비어있거나 nobridge 태그가 있으면 통합 모드로 작동
+        let is_system_empty = mes.messages.first().map_or(true, |m| match m {
+            crate::openai_types::ChatCompletionRequestMessage::System(s) => s.content.is_empty(),
+            _ => false,
+        });
+        let no_bridge = tag.to_lowercase().contains("nobridge") || (seqlen_offset > 0 && is_system_empty);
+        
         println!("[{}] Initial KV Offset: {}, No-Bridge: {}", tag, seqlen_offset, no_bridge);
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
         let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
         
-        let recalibration_len = 32; 
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
-        // [ZERO-PREFILL] If KV cache is already exactly matching the prompt length (minus trigger), skip prefill.
-        if seqlen_offset > 0 && seqlen_offset == all_ids.len().saturating_sub(1) {
-            println!("[{}-ZERO-PREFILL] KV cache exactly matches prompt ({} tokens). Skipping prefill.", tag, seqlen_offset);
-            local_pos = seqlen_offset;
+        if no_bridge && seqlen_offset > 0 {
+            // [BACKUP-PARITY] 베이킹된 문맥이 이미 있으므로, 전체 프롬프트 중 
+            // 베이킹된 부분(HTML)을 건너뛰고 순수 질문 토큰만 찾아서 주입해야 함.
+            // 보통 <|im_start|>user\n 문구 뒤부터가 실제 질문임.
+            let user_trigger = self.tokenizer.text_encode_vec("<|im_start|>user\n".to_string(), false)?;
+            if let Some(pos) = all_ids.windows(user_trigger.len()).position(|window| window == user_trigger) {
+                local_pos = pos;
+                println!("[{}-INTEGRATED] Fast-forwarding to user query at pos {}.", tag, local_pos);
+            }
         } else if seqlen_offset > 0 && !no_bridge {
-            // [STITCHING] Align 0.6B cache with 2B activations using a 32-token overlap
+            let recalibration_len = 32;
             let bridge_len = all_ids.len().min(recalibration_len);
             current_kv_offset = seqlen_offset.saturating_sub(bridge_len);
             local_pos = 0;
-            println!("[{}-STITCH] Bridging {} tokens at offset {} to sync 0.6B context.", tag, bridge_len, current_kv_offset);
+            println!("[{}-STITCH] Bridging {} tokens at offset {} to sync context.", tag, bridge_len, current_kv_offset);
         }
 
         let prefill_chunk_size = 512;
         while local_pos < all_ids.len() {
             let remaining = all_ids.len() - local_pos;
-            if remaining <= 1 { break; } // Keep the last token for generation trigger
+            if remaining <= 1 { break; } 
             
             let chunk_size = remaining.min(prefill_chunk_size);
             let end = (local_pos + chunk_size).min(all_ids.len() - 1);
@@ -240,9 +250,8 @@ impl Qwen3VLGenerateModel {
 
             self.qwen3_vl.forward(chunk, input.pixel_values.as_deref(), input.image_grid_thw.as_ref(), current_kv_offset);
             
-            let processed = chunk.len();
-            local_pos += processed;
-            current_kv_offset += processed;
+            local_pos += chunk.len();
+            current_kv_offset += chunk.len();
         }
 
         // [LBR-STABILITY] Recalibrate the last tokens to bridge 0.6B -> 2B drift

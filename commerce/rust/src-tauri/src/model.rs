@@ -807,18 +807,27 @@ Return valid JSON only. No explanation.
         }
         
         let self_clone = self.generator.clone();
-        let system_text = system.to_string();
+        let sid_clone = session_id.clone();
+        
+        // [INTEGRATED-PREFILL] nobridge 모드일 때는 시스템 프롬프트를 비워 
+        // generate.rs가 기존 KV 캐시(베이킹된 HTML)를 훼손하지 않게 함.
+        let final_system = if sid_clone.as_ref().map_or(false, |s| s.contains("nobridge")) {
+            "".to_string()
+        } else {
+            system.to_string()
+        };
+        
         let user_text = user_input.to_string();
         let max_tok = self.max_tokens_limit;
         
-        println!("[MODEL-CHAT] Sending Chat Request...");
+        println!("[MODEL-CHAT] Sending Chat Request (nobridge: {})...", final_system.is_empty());
         
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                content: system_text,
+                content: final_system,
                 name: None,
             });
 
@@ -842,8 +851,8 @@ Return valid JSON only. No explanation.
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id.as_deref()).map_err(|e| anyhow!("Inference failed: {}", e))?;
-            println!("[MODEL-CHAT] Raw Response: {}", response);
+            let response = gen.generate(params, cancel_token, sid_clone.as_deref()).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            println!("[MODEL-CHAT] Raw Response Length: {}", response.len());
             Ok(response)
         }).await?
     }
