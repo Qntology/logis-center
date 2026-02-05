@@ -384,21 +384,22 @@ impl NativeLayer {
 
             unsafe {
                 let cuda_lib = lib();
-                let k_offset_bytes = current_len * n_kv * (head_dim / 32) * 4;
-                let v_offset_bytes = current_len * n_kv * head_dim * 4;
+                let k_offset_bytes = (current_len as u64) * (n_kv as u64) * ((head_dim / 32) as u64) * 4;
+                let v_offset_bytes = (current_len as u64) * (n_kv as u64) * (head_dim as u64) * 4;
                 
-                let d_k_target = (k_ptr.0 as usize + k_offset_bytes) as CUdeviceptr;
-                let d_v_target = (v_ptr.0 as usize + v_offset_bytes) as CUdeviceptr;
+                let d_k_target = (k_ptr.0 as u64 + k_offset_bytes) as CUdeviceptr;
+                let d_v_target = (v_ptr.0 as u64 + v_offset_bytes) as CUdeviceptr;
                 
                 if d_k_target == 0 || d_v_target == 0 {
-                    println!("[STABILITY-CRITICAL] CUDA Target Pointers are NULL! Allocation might have failed.");
+                    println!("[STABILITY-CRITICAL] CUDA Target Pointers are NULL! Base: K=0x{:X}, V=0x{:X}", k_ptr.0 as u64, v_ptr.0 as u64);
                 }
 
                 let res_k = cuda_lib.cuMemcpyHtoD_v2(d_k_target, k_packed.as_ptr() as *const _, k_packed.len() * 4);
                 let res_v = cuda_lib.cuMemcpyHtoD_v2(d_v_target, v_f32.as_ptr() as *const _, v_f32.len() * 4);
                 
                 if (res_k as i32) != 0 || (res_v as i32) != 0 {
-                    println!("[STABILITY-CRITICAL] cuMemcpyHtoD_v2 FAILED with codes: K={}, V={}", res_k as i32, res_v as i32);
+                    println!("[STABILITY-CRITICAL] cuMemcpyHtoD_v2 FAILED! K_ptr=0x{:X}, V_ptr=0x{:X}, K_err={}, V_err={}", 
+                        d_k_target as u64, d_v_target as u64, res_k as i32, res_v as i32);
                 }
             }
             let new_len = current_len + q_len;
@@ -420,60 +421,61 @@ impl NativeLayer {
             };
 
             if is_dead(&attn_out) {
-                // [STABILITY-DECISION] 레이어 0에서 신호가 죽었다면 더 이상 리트라이하지 않고 즉시 CPU 폴백
                 println!("[STABILITY] GPU output dead at Layer {}. PERMANENTLY falling back to CPU for this session.", _idx);
                 self.gpu_broken.store(true, std::sync::atomic::Ordering::Relaxed);
-                
+                // Just drop the lock and let the CPU block at the bottom handle it
                 drop(gpu_cache_guard);
-                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                    attn_out = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, new_len, final_alpha + 0.5);
-                    // Apply gain again to CPU output
-                    for val in attn_out.iter_mut() { *val = f16::from_f32(val.to_f32() * semantic_gain); }
-                }
+            } else {
+                let mut x_at = self.o_proj.forward(&attn_out);
+                for i in 0..x_at.len() { x_at[i] += residual[i]; }
+                let r_mlp = x_at.clone();
+                
+                let x_n_m = unsafe {
+                    let post_ln_weight_ref = self.post_attention_layernorm.get_raw_slice::<f16>();
+                    native_rms_norm_f16(&x_at, post_ln_weight_ref, config.rms_norm_eps as f32, hidden_size)
+                };
+                
+                let (mut gate, up) = if q_len > 1 {
+                    rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
+                } else {
+                    (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
+                };
+                
+                native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
+                let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
+                return x_m;
+            }
+        }
+
+        let mut cache_guard = self.kv_cache.lock().unwrap();
+        if cache_guard.is_none() {
+            *cache_guard = Some((Vec::new(), Vec::new()));
+        }
+        
+        if let Some((ref mut pk, ref mut pv)) = *cache_guard {
+            pk.extend_from_slice(&pack_f16_to_bits(&k));
+            pv.extend_from_slice(&v);
+            
+            let t_s = pv.len() / (n_kv * head_dim);
+            let mut attn_out = native_bit_serial_attn_f16(&q, pk, pv, hidden_size, n_h, n_kv, q_len, t_s, final_alpha);
+            
+            // [2025-COGNITIVE-REFLECT] Apply semantic gain
+            for val in attn_out.iter_mut() {
+                *val = f16::from_f32(val.to_f32() * semantic_gain);
             }
 
             let mut x_at = self.o_proj.forward(&attn_out);
             for i in 0..x_at.len() { x_at[i] += residual[i]; }
             let r_mlp = x_at.clone();
-            
-            let x_n_m = unsafe {
-                let post_ln_weight_ref = self.post_attention_layernorm.get_raw_slice::<f16>();
-                native_rms_norm_f16(&x_at, post_ln_weight_ref, config.rms_norm_eps as f32, hidden_size)
-            };
-            
-            let (mut gate, up) = if q_len > 1 {
-                rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
-            } else {
-                (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
-            };
-            
+            let post_ln_weight_cow = self.post_attention_layernorm.get_slice::<f16>();
+            let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
+            let mut gate = self.gate_proj.forward(&x_n_m); let up = self.up_proj.forward(&x_n_m);
             native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
             let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
             return x_m;
         }
-
-        let mut cache_guard = self.kv_cache.lock().unwrap();
-        let (k_p_f, v_f_f): (Vec<u32>, Vec<f16>) = if let Some((pk, pv)) = cache_guard.take() {
-            let mut nk = pk; let mut nv = pv; nk.extend_from_slice(&pack_f16_to_bits(&k)); nv.extend_from_slice(&v); (nk, nv)
-        } else { (pack_f16_to_bits(&k), v) };
-        let t_s = v_f_f.len() / (n_kv * head_dim);
-        *cache_guard = Some((k_p_f.clone(), v_f_f.clone())); drop(cache_guard);
-
-        let mut attn_out = native_bit_serial_attn_f16(&q, &k_p_f, &v_f_f, hidden_size, n_h, n_kv, q_len, t_s, 0.1f32);
         
-        // [2025-COGNITIVE-REFLECT] Apply semantic gain on CPU path
-        for val in attn_out.iter_mut() {
-            *val = f16::from_f32(val.to_f32() * semantic_gain);
-        }
-        let mut x_at = self.o_proj.forward(&attn_out);
-        for i in 0..x_at.len() { x_at[i] += residual[i]; }
-        let r_mlp = x_at.clone();
-        let post_ln_weight_cow = self.post_attention_layernorm.get_slice::<f16>();
-        let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
-        let mut gate = self.gate_proj.forward(&x_n_m); let up = self.up_proj.forward(&x_n_m);
-        native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
-        let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
-        x_m
+        vec![f16::ZERO; x.len()]
     }
 
     #[cfg(feature = "cuda")]
