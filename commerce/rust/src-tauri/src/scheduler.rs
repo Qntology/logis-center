@@ -1,6 +1,9 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration};
+use dashmap::DashMap;
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 use crate::store::{VectorStore, Task};
 use crate::logic;
 use crate::utils;
@@ -10,11 +13,26 @@ use crate::models::qwen3vl::generate::Qwen3VLGenerateModel;
 use crate::openai_types::ChatCompletionParameters;
 use serde_json::{Value, json};
 use anyhow::Result;
-use tauri::{AppHandle, Manager, Emitter};
+use tauri::{Manager, Emitter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
-use tokio::sync::Notify;
+
+// --- [2026-REGISTRY] In-Flight Task Deduplication ---
+type SharedBakeResult = Shared<BoxFuture<'static, Arc<Result<()>>>>;
+type SharedInfResult = Shared<BoxFuture<'static, Arc<Result<String>>>>;
+
+pub struct InFlightRegistry {
+    pub baking: DashMap<String, SharedBakeResult>,
+    pub inference: DashMap<String, SharedInfResult>,
+}
+
+lazy_static::lazy_static! {
+    pub static ref REGISTRY: InFlightRegistry = InFlightRegistry {
+        baking: DashMap::new(),
+        inference: DashMap::new(),
+    };
+}
 
 // --- [MEMORY OPTIMIZATION] Task Data Manager (RAII) ---
 pub struct TaskDataManager {
@@ -315,11 +333,30 @@ async fn process_task(
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     
-    // [2025-GATING] Intelligent Early Exit based on 0.6B semantic feedback
-    let bake_result = model.bake_pug_context(&task.r#ref, &task.id, &light_pug, Some(cancellation_token.clone())).await?;
+    // [2026-PHYSICAL-DEDUPLICATION] Check registry before baking
+    let bake_key = format!("bake_{}", task.r#ref);
+    let bake_future = if let Some(existing) = REGISTRY.baking.get(&bake_key) {
+        println!("[REGISTRY] Joining in-flight baking for address: {}", task.r#ref);
+        existing.clone()
+    } else {
+        println!("[REGISTRY] Starting new baking for address: {}", task.r#ref);
+        let model_arc = model.clone();
+        let ref_id = task.r#ref.clone();
+        let task_id = task.id.clone();
+        let pug = light_pug.clone();
+        let cancel = cancellation_token.clone();
+        
+        let new_bake = async move {
+            Arc::new(model_arc.bake_pug_context(&ref_id, &task_id, &pug, Some(cancel)).await)
+        }.boxed().shared();
+        
+        REGISTRY.baking.insert(bake_key.clone(), new_bake.clone());
+        new_bake
+    };
+
+    let _bake_result = (*bake_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
+    REGISTRY.baking.remove(&bake_key);
     
-    // [FIX] If baking returned a warning or was suspiciously empty, we can stop here
-    // Currently, let's just proceed, but we've enabled the hook for it.
     println!("[PROCESS] Baking complete. Advancing to analysis phases.");
 
     let mut page_type = String::new();
@@ -335,7 +372,26 @@ async fn process_task(
         
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋" }));
 
-        let res = model.run_modular_inference(&task.r#ref, &task.id, "class", &query_text, "Classify this page.", Some(cancellation_token.clone())).await?;
+        // [2026-PHYSICAL-DEDUPLICATION] Registry-wrapped inference
+        let inf_key = format!("inf_class_{}", task.r#ref);
+        let inf_future = if let Some(existing) = REGISTRY.inference.get(&inf_key) {
+            println!("[REGISTRY] Joining in-flight classification for address: {}", task.r#ref);
+            existing.clone()
+        } else {
+            let model_arc = model.clone();
+            let ref_id = task.r#ref.clone();
+            let task_id = task.id.clone();
+            let prompt = query_text.clone();
+            let cancel = cancellation_token.clone();
+            let new_inf = async move {
+                Arc::new(model_arc.run_modular_inference(&ref_id, &task_id, "class", &prompt, "Classify this page.", Some(cancel)).await)
+            }.boxed().shared();
+            REGISTRY.inference.insert(inf_key.clone(), new_inf.clone());
+            new_inf
+        };
+
+        let res = (*inf_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?.clone();
+        REGISTRY.inference.remove(&inf_key);
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
@@ -368,7 +424,26 @@ async fn process_task(
 
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Analyzing structural selectors...", "spinner": "⠋" }));
 
-        let res = model.run_modular_inference(&task.r#ref, &task.id, "sel", &query_text, "Identify selectors.", Some(cancellation_token.clone())).await?;
+        // [2026-PHYSICAL-DEDUPLICATION] Registry-wrapped inference
+        let inf_key = format!("inf_sel_{}", task.r#ref);
+        let inf_future = if let Some(existing) = REGISTRY.inference.get(&inf_key) {
+            println!("[REGISTRY] Joining in-flight selector identification for address: {}", task.r#ref);
+            existing.clone()
+        } else {
+            let model_arc = model.clone();
+            let ref_id = task.r#ref.clone();
+            let task_id = task.id.clone();
+            let prompt = query_text.clone();
+            let cancel = cancellation_token.clone();
+            let new_inf = async move {
+                Arc::new(model_arc.run_modular_inference(&ref_id, &task_id, "sel", &prompt, "Identify selectors.", Some(cancel)).await)
+            }.boxed().shared();
+            REGISTRY.inference.insert(inf_key.clone(), new_inf.clone());
+            new_inf
+        };
+
+        let res = (*inf_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?.clone();
+        REGISTRY.inference.remove(&inf_key);
         selector_info = parsing::parse_json_from_llm(&res);
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
 

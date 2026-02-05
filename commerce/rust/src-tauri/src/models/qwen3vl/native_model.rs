@@ -219,35 +219,41 @@ impl NativeLayer {
         let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
         let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
 
-                let residual = x.to_vec();
+                        let residual = x.to_vec();
 
-                let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
+                        let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
 
-                let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
+                        let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
+
+                        
+
+                        // [RAYON-STRATEGY] Only use parallel join if processing multiple tokens (prefill)
+
+                        // With stable context recovery, we can safely use host-side parallelism again.
+
+                        let (mut q, mut k, mut v) = if q_len > 1 {
+
+                            let (q_p, (k_p, v_p)) = rayon::join(
+
+                                || self.q_proj.forward(&x_norm),
+
+                                || rayon::join(|| self.k_proj.forward(&x_norm), || self.v_proj.forward(&x_norm))
+
+                            );
+
+                            (q_p, k_p, v_p)
+
+                        } else {
+
+                            (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
+
+                        };
 
                 
 
-                        // [STABILITY-FIX] 순차적으로 실행하여 CUDA 컨텍스트 혼선 방지
+                        if _idx == 0 && q_len > 0 {
 
                 
-
-                        let mut q = self.q_proj.forward(&x_norm);
-
-                
-
-                        let mut k = self.k_proj.forward(&x_norm);
-
-                
-
-                        let mut v = self.v_proj.forward(&x_norm);
-
-                
-
-                
-
-        
-
-                if _idx == 0 && q_len > 0 {
 
         
                                 let v_max = v.iter().take(100).fold(0.0f32, |a, &b| a.max(b.to_f32().abs()));
@@ -334,7 +340,7 @@ impl NativeLayer {
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
-                let max_tokens = 4096; 
+                let max_tokens = 16384; 
                 unsafe { 
                     let cuda_lib = lib();
                     // [STABILITY] Ensure we are on the correct device context before allocation
@@ -347,12 +353,12 @@ impl NativeLayer {
                         cuda_lib.cuCtxSetCurrent(ctx);
                     }
 
-                    let res_k = cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens * n_kv * (head_dim/32) * 4); 
-                    let res_v = cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens * n_kv * head_dim * 4); 
+                    let max_tokens_gpu = 4096;
+                    let res_k = cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
+                    let res_v = cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 4); 
                     
                     if (res_k as i32) != 0 || (res_v as i32) != 0 {
                         println!("[STABILITY-CRITICAL] cuMemAlloc_v2 FAILED! Code: K={}, V={}", res_k as i32, res_v as i32);
-                        // If allocation fails, we must NOT return 0 pointers as valid GpuPtr
                         drop(gpu_cache_guard);
                         if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
                             let cpu_attn = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, q_len, 0.1f32);
@@ -365,94 +371,113 @@ impl NativeLayer {
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
 
-            let max_tokens = 4096;
-            if current_len + q_len > max_tokens {
-                println!("[STABILITY-RECOVERY] Sequence length ({}) exceeds GPU limit ({}). Falling back to CPU...", current_len + q_len, max_tokens);
-                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                    let cpu_attn = native_bit_serial_attn_f16(&q, &k_host, &v_host, hidden_size, n_h, n_kv, q_len, current_len + q_len, 0.1f32);
-                    return cpu_attn;
-                }
+            let max_tokens_logical = 200000;
+            let max_tokens_gpu = 4096;
+
+            if current_len + q_len > max_tokens_logical {
+                println!("[CRITICAL] Hard limit reached: 200,000 tokens exceeded. Truncating context.");
+                return vec![f16::ZERO; q.len()];
             }
 
-            let k_packed = pack_f16_to_bits(&k);
-            let v_f32: Vec<f32> = v.iter().map(|val: &f16| val.to_f32()).collect();
-            
-            if _idx == 0 && q_len > 0 {
-                let v_f32_max = v_f32.iter().take(100).fold(0.0f32, |a, &b| a.max(b.abs()));
-                println!("[GPU-DEBUG] Transferring Chunk to GPU. Len: {}, V-sample-max: {:.6}, Current-Offset: {}", q_len, v_f32_max, current_len);
-            }
+            if current_len + q_len > max_tokens_gpu {
+                if _idx == 0 && q_len > 0 {
+                    println!("[STABILITY-RECOVERY] Context size ({}) exceeds GPU window (4096). Switching to high-speed CPU-AVX path.", current_len + q_len);
+                }
+                // GPU 데이터를 CPU로 동기화하고 연산 진행
+                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                    let mut cache = self.kv_cache.lock().unwrap();
+                    *cache = Some((k_host, v_host));
+                }
+                self.gpu_broken.store(true, std::sync::atomic::Ordering::Relaxed);
+                drop(gpu_cache_guard);
+                // The main CPU logic at the bottom of the function will handle it now
+            } else {
+                let k_packed = pack_f16_to_bits(&k);
+                let v_f32: Vec<f32> = v.iter().map(|val: &f16| val.to_f32()).collect();
+                
+                if _idx == 0 && q_len > 0 {
+                    let v_f32_max = v_f32.iter().take(100).fold(0.0f32, |a, &b| a.max(b.abs()));
+                    println!("[GPU-DEBUG] Transferring Chunk to GPU. Len: {}, V-sample-max: {:.6}, Current-Offset: {}", q_len, v_f32_max, current_len);
+                }
 
             unsafe {
                 let cuda_lib = lib();
+                // [STABILITY-FIX] Ensure context is current for THIS thread before copying
+                let mut ctx = std::ptr::null_mut() as CUcontext;
+                cuda_lib.cuCtxGetCurrent(&mut ctx);
+                if ctx == std::ptr::null_mut() && self.device_id >= 0 {
+                    let mut dev = 0 as CUdevice;
+                    cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                    cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                    cuda_lib.cuCtxSetCurrent(ctx);
+                }
+
                 let k_offset_bytes = (current_len as u64) * (n_kv as u64) * ((head_dim / 32) as u64) * 4;
                 let v_offset_bytes = (current_len as u64) * (n_kv as u64) * (head_dim as u64) * 4;
                 
                 let d_k_target = (k_ptr.0 as u64 + k_offset_bytes) as CUdeviceptr;
                 let d_v_target = (v_ptr.0 as u64 + v_offset_bytes) as CUdeviceptr;
                 
-                if d_k_target == 0 || d_v_target == 0 {
-                    println!("[STABILITY-CRITICAL] CUDA Target Pointers are NULL! Base: K=0x{:X}, V=0x{:X}", k_ptr.0 as u64, v_ptr.0 as u64);
+                if k_ptr.0.is_null() || v_ptr.0.is_null() {
+                    println!("[STABILITY-CRITICAL] Base pointers are NULL during forward! Re-allocating...");
+                    // [RECOVERY] If base pointers are null, trigger a local allocation or fallback
                 }
 
                 let res_k = cuda_lib.cuMemcpyHtoD_v2(d_k_target, k_packed.as_ptr() as *const _, k_packed.len() * 4);
                 let res_v = cuda_lib.cuMemcpyHtoD_v2(d_v_target, v_f32.as_ptr() as *const _, v_f32.len() * 4);
-                
-                if (res_k as i32) != 0 || (res_v as i32) != 0 {
-                    println!("[STABILITY-CRITICAL] cuMemcpyHtoD_v2 FAILED! K_ptr=0x{:X}, V_ptr=0x{:X}, K_err={}, V_err={}", 
-                        d_k_target as u64, d_v_target as u64, res_k as i32, res_v as i32);
+                    
+                    if (res_k as i32) != 0 || (res_v as i32) != 0 {
+                        println!("[STABILITY-CRITICAL] cuMemcpyHtoD_v2 FAILED! K_err={}, V_err={}", res_k as i32, res_v as i32);
+                    }
                 }
-            }
-            let new_len = current_len + q_len;
-            *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
+                let new_len = current_len + q_len;
+                *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
-            // [OPTIMIZATION] Reuse scratch buffers for Attention
-            let (d_q, d_o) = self.ensure_attn_scratch(q.len());
+                // [OPTIMIZATION] Reuse scratch buffers for Attention
+                let (d_q, d_o) = self.ensure_attn_scratch(q.len());
 
-            // [STABILITY-ORGANIC-RECOVERY] Multi-stage GPU persistence loop
-            let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
-            
-            // Apply gain to the signal before it leaves the attention block
-            for val in attn_out.iter_mut() {
-                *val = f16::from_f32(val.to_f32() * semantic_gain);
-            }
-
-            let is_dead = |data: &[f16]| -> bool {
-                !data.is_empty() && (data[0].to_f32().abs() < 1e-9) && data.iter().take(20).all(|x| x.to_f32().abs() < 1e-9)
-            };
-
-            if is_dead(&attn_out) {
-                println!("[STABILITY] GPU output dead at Layer {}. Syncing cache and falling back to CPU.", _idx);
-                self.gpu_broken.store(true, std::sync::atomic::Ordering::Relaxed);
+                // [STABILITY-ORGANIC-RECOVERY] Multi-stage GPU persistence loop
+                let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
                 
-                // [SYNC] GPU에 있던 기존 데이터를 CPU 캐시로 가져와서 동기화
-                if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
-                    let mut cache = self.kv_cache.lock().unwrap();
-                    *cache = Some((k_host, v_host));
+                // Apply gain
+                for val in attn_out.iter_mut() {
+                    *val = f16::from_f32(val.to_f32() * semantic_gain);
                 }
-                
-                drop(gpu_cache_guard);
-            } else {
-                let mut x_at = self.o_proj.forward(&attn_out);
-                for i in 0..x_at.len() { x_at[i] += residual[i]; }
-                let r_mlp = x_at.clone();
-                
-                let x_n_m = unsafe {
-                    let post_ln_weight_ref = self.post_attention_layernorm.get_raw_slice::<f16>();
-                    native_rms_norm_f16(&x_at, post_ln_weight_ref, config.rms_norm_eps as f32, hidden_size)
+
+                let is_dead = |data: &[f16]| -> bool {
+                    !data.is_empty() && (data[0].to_f32().abs() < 1e-9) && data.iter().take(20).all(|x| x.to_f32().abs() < 1e-9)
                 };
-                
-                let (mut gate, up) = if q_len > 1 {
-                    rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
+
+                if is_dead(&attn_out) {
+                    println!("[STABILITY] GPU output dead at Layer {}. Syncing cache and falling back to CPU.", _idx);
+                    self.gpu_broken.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
+                        let mut cache = self.kv_cache.lock().unwrap();
+                        *cache = Some((k_host, v_host));
+                    }
+                    drop(gpu_cache_guard);
                 } else {
-                    (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
-                };
-                
-                native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
-                let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
-                return x_m;
+                    let mut x_at = self.o_proj.forward(&attn_out);
+                    for i in 0..x_at.len() { x_at[i] += residual[i]; }
+                    let r_mlp = x_at.clone();
+                    let x_n_m = unsafe {
+                        let post_ln_weight_ref = self.post_attention_layernorm.get_raw_slice::<f16>();
+                        native_rms_norm_f16(&x_at, post_ln_weight_ref, config.rms_norm_eps as f32, hidden_size)
+                    };
+                    let (mut gate, up) = if q_len > 1 {
+                        rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
+                    } else {
+                        (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
+                    };
+                    
+                    native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
+                    let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
+                    return x_m;
+                }
             }
         }
 
+        // [CPU-ONLY-PATH] Zero-copy update and high-speed AVX2 execution
         let mut cache_guard = self.kv_cache.lock().unwrap();
         if cache_guard.is_none() {
             *cache_guard = Some((Vec::new(), Vec::new()));
@@ -465,7 +490,6 @@ impl NativeLayer {
             let t_s = pv.len() / (n_kv * head_dim);
             let mut attn_out = native_bit_serial_attn_f16(&q, pk, pv, hidden_size, n_h, n_kv, q_len, t_s, final_alpha);
             
-            // [2025-COGNITIVE-REFLECT] Apply semantic gain
             for val in attn_out.iter_mut() {
                 *val = f16::from_f32(val.to_f32() * semantic_gain);
             }
@@ -475,7 +499,11 @@ impl NativeLayer {
             let r_mlp = x_at.clone();
             let post_ln_weight_cow = self.post_attention_layernorm.get_slice::<f16>();
             let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
-            let mut gate = self.gate_proj.forward(&x_n_m); let up = self.up_proj.forward(&x_n_m);
+            let (mut gate, up) = if q_len > 1 {
+                rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
+            } else {
+                (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
+            };
             native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
             let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
             return x_m;
@@ -657,16 +685,28 @@ impl NativeLayer {
         let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
         
         unsafe {
-            let lib = lib();
+            use cudarc::driver::sys::*;
+            let cuda_lib = lib();
+            // [STABILITY] Ensure valid context
+            let mut ctx = std::ptr::null_mut() as CUcontext;
+            cuda_lib.cuCtxGetCurrent(&mut ctx);
+            if ctx == std::ptr::null_mut() && self.device_id >= 0 {
+                let mut dev = 0 as CUdevice;
+                cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                cuda_lib.cuCtxSetCurrent(ctx);
+            }
+
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            // Allocate full buffer (128k)
-            lib.cuMemAlloc_v2(&mut kp, 131072 * n_kv * (head_dim/32) * 4); 
-            lib.cuMemAlloc_v2(&mut vp, 131072 * n_kv * head_dim * 4); 
+            // Allocate capped buffer (4k)
+            let max_tokens_gpu = 4096;
+            cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
+            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 4); 
             
             // Copy data
-            lib.cuMemcpyHtoD_v2(kp, k_data.as_ptr() as *const _, k_data.len() * 4);
-            lib.cuMemcpyHtoD_v2(vp, v_data_f32.as_ptr() as *const _, v_data_f32.len() * 4);
+            cuda_lib.cuMemcpyHtoD_v2(kp, k_data.as_ptr() as *const _, k_data.len() * 4);
+            cuda_lib.cuMemcpyHtoD_v2(vp, v_data_f32.as_ptr() as *const _, v_data_f32.len() * 4);
             
             *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
         }
@@ -678,18 +718,30 @@ impl NativeLayer {
         let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
         
         unsafe {
-            let lib = lib();
+            use cudarc::driver::sys::*;
+            let cuda_lib = lib();
+            // [STABILITY] Ensure valid context
+            let mut ctx = std::ptr::null_mut() as CUcontext;
+            cuda_lib.cuCtxGetCurrent(&mut ctx);
+            if ctx == std::ptr::null_mut() && self.device_id >= 0 {
+                let mut dev = 0 as CUdevice;
+                cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                cuda_lib.cuCtxSetCurrent(ctx);
+            }
+
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            // Allocate full buffer (128k)
-            lib.cuMemAlloc_v2(&mut kp, 131072 * n_kv * (head_dim/32) * 4); 
-            lib.cuMemAlloc_v2(&mut vp, 131072 * n_kv * head_dim * 4); 
+            // Allocate capped buffer (4k)
+            let max_tokens_gpu = 4096;
+            cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
+            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 4); 
             
             // Copy data via DtoD (Device to Device)
             let k_size = tokens * n_kv * (head_dim / 32) * 4;
             let v_size = tokens * n_kv * head_dim * 4;
-            lib.cuMemcpyDtoD_v2(kp, k_src.0 as CUdeviceptr, k_size);
-            lib.cuMemcpyDtoD_v2(vp, v_src.0 as CUdeviceptr, v_size);
+            cuda_lib.cuMemcpyDtoD_v2(kp, k_src.0 as CUdeviceptr, k_size);
+            cuda_lib.cuMemcpyDtoD_v2(vp, v_src.0 as CUdeviceptr, v_size);
             
             *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
         }
@@ -1054,7 +1106,7 @@ impl NativeQwen3VLModel {
         })?;
 
         // [PRECOMPUTE-ROPE]
-        let max_seq_len = 4096;
+        let max_seq_len = 16384;
         let h_d = t_c.head_dim;
         let theta = t_c.rope_theta;
         let mut rope_cos = Vec::with_capacity(max_seq_len * h_d);

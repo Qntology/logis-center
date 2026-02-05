@@ -201,8 +201,9 @@ impl Qwen3VLGenerateModel {
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, phase_tag: Option<&str>) -> Result<String> {
         let seqlen_offset = self.get_kv_len();
         let tag = phase_tag.unwrap_or("GENERATE");
-        let no_bridge = tag.contains("nobridge");
-        println!("[{}] Initial KV Offset: {}", tag, seqlen_offset);
+        // [FIX] Support various naming conventions for nobridge tag
+        let no_bridge = tag.to_lowercase().contains("nobridge");
+        println!("[{}] Initial KV Offset: {}, No-Bridge: {}", tag, seqlen_offset, no_bridge);
 
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
