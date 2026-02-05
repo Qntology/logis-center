@@ -92,7 +92,20 @@ impl NativeLinear {
         use cudarc::driver::sys::*;
         let req_i = m * self.in_features * 4;
         let req_o = m * self.out_features * 4;
+        let cuda_lib = unsafe { crate::models::qwen3vl::native_backend::lib() };
         
+        // [STABILITY] Ensure valid context for this thread
+        unsafe {
+            let mut ctx = std::ptr::null_mut() as CUcontext;
+            cuda_lib.cuCtxGetCurrent(&mut ctx);
+            if ctx == std::ptr::null_mut() && self.device_id >= 0 {
+                let mut dev = 0 as CUdevice;
+                cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                cuda_lib.cuCtxSetCurrent(ctx);
+            }
+        }
+
         let mut si_guard = self.scratch_i.lock().unwrap();
         let d_i = if let Some((ptr, size)) = *si_guard {
             if size >= req_i { ptr.0 as CUdeviceptr }
@@ -100,19 +113,22 @@ impl NativeLinear {
                 println!("[GPU-SCRATCH] Growing input buffer to {} bytes", req_i);
                 unsafe {
                     let mut new_ptr: CUdeviceptr = 0;
-                    let lib = lib();
-                    let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let _ = lib.cuMemAlloc_v2(&mut new_ptr, req_i);
-                    *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
-                    new_ptr
+                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
+                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_i);
+                    if (res as i32) == 0 && new_ptr != 0 {
+                        *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
+                        new_ptr
+                    } else { 0 as CUdeviceptr }
                 }
             }
         } else {
             unsafe {
                 let mut new_ptr: CUdeviceptr = 0;
-                let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_i);
-                *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
-                new_ptr
+                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_i);
+                if (res as i32) == 0 && new_ptr != 0 {
+                    *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
+                    new_ptr
+                } else { 0 as CUdeviceptr }
             }
         };
 
@@ -123,19 +139,22 @@ impl NativeLinear {
                 println!("[GPU-SCRATCH] Growing output buffer to {} bytes", req_o);
                 unsafe {
                     let mut new_ptr: CUdeviceptr = 0;
-                    let lib = lib();
-                    let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let _ = lib.cuMemAlloc_v2(&mut new_ptr, req_o);
-                    *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
-                    new_ptr
+                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
+                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_o);
+                    if (res as i32) == 0 && new_ptr != 0 {
+                        *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
+                        new_ptr
+                    } else { 0 as CUdeviceptr }
                 }
             }
         } else {
             unsafe {
                 let mut new_ptr: CUdeviceptr = 0;
-                let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_o);
-                *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
-                new_ptr
+                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_o);
+                if (res as i32) == 0 && new_ptr != 0 {
+                    *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
+                    new_ptr
+                } else { 0 as CUdeviceptr }
             }
         };
 
@@ -475,6 +494,19 @@ impl NativeLayer {
     fn ensure_attn_scratch(&self, size: usize) -> (CUdeviceptr, CUdeviceptr) {
         use cudarc::driver::sys::*;
         let req_bytes = size * 4;
+        let cuda_lib = unsafe { crate::models::qwen3vl::native_backend::lib() };
+
+        // [STABILITY] Ensure valid context for this thread
+        unsafe {
+            let mut ctx = std::ptr::null_mut() as CUcontext;
+            cuda_lib.cuCtxGetCurrent(&mut ctx);
+            if ctx == std::ptr::null_mut() && self.device_id >= 0 {
+                let mut dev = 0 as CUdevice;
+                cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                cuda_lib.cuCtxSetCurrent(ctx);
+            }
+        }
         
         let mut sq_guard = self.attn_scratch_q.lock().unwrap();
         let d_q = if let Some((ptr, cur_s)) = *sq_guard {
@@ -482,18 +514,22 @@ impl NativeLayer {
             else {
                 unsafe {
                     let mut new_ptr: CUdeviceptr = 0;
-                    let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                    *sq_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                    new_ptr
+                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
+                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
+                    if (res as i32) == 0 && new_ptr != 0 {
+                        *sq_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
+                        new_ptr
+                    } else { 0 as CUdeviceptr }
                 }
             }
         } else {
             unsafe {
                 let mut new_ptr: CUdeviceptr = 0;
-                let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                *sq_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                new_ptr
+                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
+                if (res as i32) == 0 && new_ptr != 0 {
+                    *sq_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
+                    new_ptr
+                } else { 0 as CUdeviceptr }
             }
         };
 
@@ -503,18 +539,22 @@ impl NativeLayer {
             else {
                 unsafe {
                     let mut new_ptr: CUdeviceptr = 0;
-                    let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                    *so_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                    new_ptr
+                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
+                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
+                    if (res as i32) == 0 && new_ptr != 0 {
+                        *so_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
+                        new_ptr
+                    } else { 0 as CUdeviceptr }
                 }
             }
         } else {
             unsafe {
                 let mut new_ptr: CUdeviceptr = 0;
-                let _ = lib().cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                *so_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                new_ptr
+                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
+                if (res as i32) == 0 && new_ptr != 0 {
+                    *so_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
+                    new_ptr
+                } else { 0 as CUdeviceptr }
             }
         };
 
