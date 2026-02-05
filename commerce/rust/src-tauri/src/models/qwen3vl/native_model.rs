@@ -778,50 +778,36 @@ impl NativeQwen3VLModel {
         let st_sec = s_mmap.as_ref().map(|m| SafeTensors::deserialize(m)).transpose()?;
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         
-        let find_key_ext = |target: &str, primary: &SafeTensors, secondary: Option<&SafeTensors>| -> Option<(String, bool)> {
-            let variations = vec![
-                target.to_string(),
-                target.replace("model.", "model.language_model."),
-                target.replace("model.layers", "model.language_model.layers"),
-                target.replace("lm_head", "model.lm_head"),
-                target.replace("lm_head", "output"),
-                format!("model.language_model.{}", target.replace("model.", "")),
-                format!("model.{}", target),
-            ];
-            
+        let find_key_ext = |target: &str, primary: &SafeTensors, secondary: Option<&SafeTensors>, l_idx: i32| -> Option<(String, bool)> {
+            // After Python patch, names are unified to model.language_model...
             // 1. Try Primary
-            for v in variations.iter() {
-                if primary.tensor(v).is_ok() || primary.tensor(&format!("{}.packed", v)).is_ok() { return Some((v.clone(), true)); }
+            if primary.tensor(target).is_ok() || primary.tensor(&format!("{}.packed", target)).is_ok() {
+                return Some((target.to_string(), true));
             }
             
-            // 2. Try Secondary (if baking)
+            // 2. Try Secondary (2B)
             if let Some(sec) = secondary {
-                for v in variations.iter() {
-                    if sec.tensor(v).is_ok() || sec.tensor(&format!("{}.packed", v)).is_ok() { return Some((v.clone(), false)); }
+                if sec.tensor(target).is_ok() || sec.tensor(&format!("{}.packed", target)).is_ok() {
+                    return Some((target.to_string(), false));
                 }
             }
 
-            // 3. Exhaustive search in Primary
-            for name in primary.names() {
-                if name.contains(target) {
-                    return Some((name.replace(".packed", "").replace(".scales", "").replace(".shape", "").replace(".format", ""), true));
-                }
-            }
+            // Fallback: search for tied weights or variations if still missing
+            let variations = vec![
+                target.to_string(),
+                target.replace("lm_head", "model.lm_head"),
+                target.replace("lm_head", "output"),
+            ];
             
-            // 4. Exhaustive search in Secondary
-            if let Some(sec) = secondary {
-                for name in sec.names() {
-                    if name.contains(target) {
-                        return Some((name.replace(".packed", "").replace(".scales", "").replace(".shape", "").replace(".format", ""), false));
-                    }
-                }
+            for v in variations.iter() {
+                if primary.tensor(v).is_ok() || primary.tensor(&format!("{}.packed", v)).is_ok() { return Some((v.clone(), true)); }
             }
 
             None
         };
 
-        let get_l = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
-            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
+        let get_l = |base: &str, in_f: usize, out_f: usize, l_idx: i32| -> Result<NativeLinear> {
+            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref(), l_idx).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
 
@@ -834,11 +820,20 @@ impl NativeQwen3VLModel {
                 
                 // [STABILITY-DIAG] 로딩 시점에 텐서 유효성 샘플링
                 let scale_sample = vs.data();
-                if scale_sample.len() >= 2 {
-                    let first_val = u16::from_le_bytes([scale_sample[0], scale_sample[1]]);
-                    if first_val == 0 && scale_sample.iter().take(100).all(|&b| b == 0) {
+                if scale_sample.len() >= 4 {
+                    let s0 = f16::from_le_bytes([scale_sample[0], scale_sample[1]]).to_f32();
+                    let s1 = f16::from_le_bytes([scale_sample[2], scale_sample[3]]).to_f32();
+                    if s0 == 0.0 && scale_sample.iter().take(100).all(|&b| b == 0) {
                         println!("[LOAD-CRITICAL] Tensor {} has ALL ZERO scales! Inference will fail.", key);
+                    } else if l_idx == 0 && key.contains("v_proj") {
+                        println!("[LOAD-DEBUG] Layer 0 V-PROJ Scales sample: {:.6}, {:.6}", s0, s1);
                     }
+                }
+
+                let packed_sample = vp.data();
+                if l_idx == 0 && key.contains("v_proj") && packed_sample.len() >= 4 {
+                    let p0 = u32::from_le_bytes([packed_sample[0], packed_sample[1], packed_sample[2], packed_sample[3]]);
+                    println!("[LOAD-DEBUG] Layer 0 V-PROJ Packed sample: 0x{:08X}", p0);
                 }
 
                 let op = unsafe { vp.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
@@ -871,8 +866,8 @@ impl NativeQwen3VLModel {
             }
         };
 
-        let get_t = |name: &str| -> Result<NativeTensor> {
-            let (key, is_primary) = find_key_ext(name, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
+        let get_t = |name: &str, l_idx: i32| -> Result<NativeTensor> {
+            let (key, is_primary) = find_key_ext(name, &st, st_sec.as_ref(), l_idx).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
 
@@ -885,7 +880,7 @@ impl NativeQwen3VLModel {
 
         // [CRITICAL-FIX] 임베딩 로더: 임베딩은 항상 F16 룩업 테이블이어야 함
         let get_embed = |base: &str, vocab: usize, hid: usize| -> Result<NativeLinear> {
-            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("EmbedTensorNotFound: {}", base))?;
+            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref(), -1).ok_or_else(|| anyhow!("EmbedTensorNotFound: {}", base))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
 
@@ -899,7 +894,7 @@ impl NativeQwen3VLModel {
                     return Ok(NativeLinear { in_features: vocab, out_features: hid, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) });
                 }
             }
-            get_l(base, vocab, hid)
+            get_l(base, vocab, hid, -1)
         };
 
         let emb = get_embed("model.embed_tokens.weight", 151936, t_c.hidden_size)
@@ -915,33 +910,34 @@ impl NativeQwen3VLModel {
         for i in 0..l_to_l {
             // [STRICT-PARITY] Use unified naming convention enforced by quantization script
             let p = format!("model.language_model.layers.{}", i);
+            let layer_idx = i as i32;
 
             layers.push(NativeLayer {
-                input_layernorm: get_t(&format!("{}.input_layernorm.weight", p))?,
-                post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p))?,
-                q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p)).ok(),
-                k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p)).ok(),
-                q_proj: get_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out)?,
-                k_proj: get_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out)?,
-                v_proj: get_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out)?,
-                o_proj: get_l(&format!("{}.self_attn.o_proj.weight", p), q_out, t_c.hidden_size)?,
-                gate_proj: get_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
-                up_proj: get_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
-                down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
+                input_layernorm: get_t(&format!("{}.input_layernorm.weight", p), layer_idx)?,
+                post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p), layer_idx)?,
+                q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p), layer_idx).ok(),
+                k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p), layer_idx).ok(),
+                q_proj: get_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out, layer_idx)?,
+                k_proj: get_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out, layer_idx)?,
+                v_proj: get_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out, layer_idx)?,
+                o_proj: get_l(&format!("{}.self_attn.o_proj.weight", p), q_out, t_c.hidden_size, layer_idx)?,
+                gate_proj: get_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size, layer_idx)?,
+                up_proj: get_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size, layer_idx)?,
+                down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size, layer_idx)?,
                 device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
                 attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
             });
         }
         
-        let norm = get_t("model.language_model.norm.weight")?;
+        let norm = get_t("model.language_model.norm.weight", -1)?;
         
         // [SMART-HEAD-LOADER] 가중치 공유(tied weights) 대응 강화
-        let head_res = get_l("lm_head.weight", t_c.hidden_size, 151936)
-            .or_else(|_| get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936))
+        let head_res = get_l("lm_head.weight", t_c.hidden_size, 151936, -1)
+            .or_else(|_| get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936, -1))
             .or_else(|_| {
                 println!("[LOAD] lm_head not found, using tied weights from embed_tokens.");
-                get_l("model.embed_tokens.weight", 151936, t_c.hidden_size)
-                    .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))
+                get_l("model.embed_tokens.weight", 151936, t_c.hidden_size, -1)
+                    .or_else(|_| get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size, -1))
                     .map(|mut emb_l| {
                         emb_l.in_features = t_c.hidden_size;
                         emb_l.out_features = 151936;
