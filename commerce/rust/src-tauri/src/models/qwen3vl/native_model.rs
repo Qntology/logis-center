@@ -309,22 +309,31 @@ impl NativeLayer {
             }
 
             let k_packed = pack_f16_to_bits(&k);
-            let v_f32: Vec<f32> = if q_len > 1 {
-                v.par_iter().map(|val: &f16| val.to_f32()).collect()
-            } else {
-                v.iter().map(|val: &f16| val.to_f32()).collect()
-            };
+            let v_f32: Vec<f32> = v.iter().map(|val: &f16| val.to_f32()).collect();
+            
+            if _idx == 0 && q_len > 0 {
+                let v_f32_max = v_f32.iter().take(100).fold(0.0f32, |a, &b| a.max(b.abs()));
+                println!("[GPU-DEBUG] Transferring Chunk to GPU. Len: {}, V-sample-max: {:.6}, Current-Offset: {}", q_len, v_f32_max, current_len);
+            }
+
             unsafe {
                 let cuda_lib = lib();
-                // [FIX] Use correct pointer arithmetic for CUdeviceptr offsets
                 let k_offset_bytes = current_len * n_kv * (head_dim / 32) * 4;
                 let v_offset_bytes = current_len * n_kv * head_dim * 4;
                 
                 let d_k_target = (k_ptr.0 as usize + k_offset_bytes) as CUdeviceptr;
                 let d_v_target = (v_ptr.0 as usize + v_offset_bytes) as CUdeviceptr;
                 
-                let _ = cuda_lib.cuMemcpyHtoD_v2(d_k_target, k_packed.as_ptr() as *const _, k_packed.len() * 4);
-                let _ = cuda_lib.cuMemcpyHtoD_v2(d_v_target, v_f32.as_ptr() as *const _, v_f32.len() * 4);
+                if d_k_target == 0 || d_v_target == 0 {
+                    println!("[STABILITY-CRITICAL] CUDA Target Pointers are NULL! Allocation might have failed.");
+                }
+
+                let res_k = cuda_lib.cuMemcpyHtoD_v2(d_k_target, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+                let res_v = cuda_lib.cuMemcpyHtoD_v2(d_v_target, v_f32.as_ptr() as *const _, v_f32.len() * 4);
+                
+                if (res_k as i32) != 0 || (res_v as i32) != 0 {
+                    println!("[STABILITY-CRITICAL] cuMemcpyHtoD_v2 FAILED with codes: K={}, V={}", res_k as i32, res_v as i32);
+                }
             }
             let new_len = current_len + q_len;
             *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
