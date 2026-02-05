@@ -2,8 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// [HIGH-PERFORMANCE-TILED] Bit-serial Matmul
-// Re-implemented for maximum speed with shared memory caching.
+// [ULTRA-ROBUST-TILED-V2] Fixed Synchronization & Boundary Checks
 __global__ void bit_serial_matmul_kernel_shuffled(
     const float* __restrict__ input,    
     const uint32_t* __restrict__ weight, 
@@ -11,47 +10,54 @@ __global__ void bit_serial_matmul_kernel_shuffled(
     float* __restrict__ output,          
     int M, int N, int K
 ) {
-    // 32 threads in Y (M-direction), 8 threads in X (N-direction)
-    int m = blockIdx.y * 32 + threadIdx.y; 
-    int n_group = blockIdx.x; 
+    const int TILE_M = 32;
+    __shared__ uint32_t s_input_tile[TILE_M]; 
+
+    int m_base = blockIdx.y * TILE_M;
+    int n_group = blockIdx.x;
     int n_sub = threadIdx.x; 
-    int n = n_group * 8 + n_sub;
-
-    if (m >= M) return;
-
-    extern __shared__ uint32_t s_input_tile[]; // Size: blockDim.y (32)
+    int m_sub = threadIdx.y; 
     
+    int m = m_base + m_sub;
+    int n = n_group * 8 + n_sub;
     int k_blocks = (K + 31) / 32;
+
     float acc = 0.0f;
 
     for (int kb = 0; kb < k_blocks; ++kb) {
-        // 1. Collaborative load Input bits to Shared Memory
-        // Only the first thread of each output group (n_sub == 0) needs to load
+        // 1. Collaborative load Input bits
+        // EVERY thread in the block must reach __syncthreads()
+        uint32_t bts = 0;
         if (n_sub == 0) {
-            uint32_t bts = 0;
-            #pragma unroll
-            for (int b = 0; b < 32; ++b) {
-                int k_idx = kb * 32 + b;
-                if (k_idx < K && input[m * K + k_idx] >= 0.0f) bts |= (1u << b);
+            if (m < M) {
+                #pragma unroll
+                for (int b = 0; b < 32; ++b) {
+                    int k_idx = kb * 32 + b;
+                    if (k_idx < K && input[m * K + k_idx] >= 0.0f) bts |= (1u << b);
+                }
             }
-            s_input_tile[threadIdx.y] = bts;
+            s_input_tile[m_sub] = bts;
         }
+        
+        // ALL threads must wait here, even those with m >= M
         __syncthreads();
 
-        // 2. Compute using shared input and direct weight access
-        if (n < N) {
+        // 2. Compute
+        if (m < M && n < N) {
             int idx = n_group * k_blocks * 8 + kb * 8 + n_sub;
             uint32_t w_val = weight[idx];
             float s_val = scale[idx];
             
-            // Fast bit-count using hardware instruction
-            uint32_t diff = s_input_tile[threadIdx.y] ^ w_val;
+            uint32_t diff = s_input_tile[m_sub] ^ w_val;
             acc += (float)(32 - 2 * (int)__popc(diff)) * s_val;
         }
+        
+        // Ensure shared memory is ready for next K-tile
         __syncthreads();
     }
 
-    if (n < N) {
+    // 3. Final Store
+    if (m < M && n < N) {
         output[m * N + n] = acc;
     }
 }
@@ -125,9 +131,8 @@ extern "C" {
 
     void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {
         cudaSetDevice(dev);
-        dim3 block(8, 32); // 8 output channels, 32 tokens
+        dim3 block(8, 32); 
         dim3 grid((n + 7) / 8, (m + 31) / 32);
-        // Shared memory size: 32 * 4 bytes
-        bit_serial_matmul_kernel_shuffled<<<grid, block, 32 * 4>>>(d_i, d_w, d_s, d_o, m, n, k);
+        bit_serial_matmul_kernel_shuffled<<<grid, block>>>(d_i, d_w, d_s, d_o, m, n, k);
     }
 }
