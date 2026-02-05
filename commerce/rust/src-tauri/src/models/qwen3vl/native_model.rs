@@ -334,7 +334,7 @@ impl NativeLayer {
             let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             let (k_ptr, v_ptr, current_len) = if let Some((kp, vp, l)) = *gpu_cache_guard { (kp, vp, l) } else {
                 let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
-                let max_tokens = 16384; 
+                let max_tokens = 4096; 
                 unsafe { 
                     let cuda_lib = lib();
                     // [STABILITY] Ensure we are on the correct device context before allocation
@@ -365,7 +365,7 @@ impl NativeLayer {
                 (GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), 0)
             };
 
-            let max_tokens = 16384;
+            let max_tokens = 4096;
             if current_len + q_len > max_tokens {
                 println!("[STABILITY-RECOVERY] Sequence length ({}) exceeds GPU limit ({}). Falling back to CPU...", current_len + q_len, max_tokens);
                 if let Some((k_host, v_host)) = self.get_kv_data(head_dim, n_kv) {
@@ -1054,7 +1054,7 @@ impl NativeQwen3VLModel {
         })?;
 
         // [PRECOMPUTE-ROPE]
-        let max_seq_len = 16384;
+        let max_seq_len = 4096;
         let h_d = t_c.head_dim;
         let theta = t_c.rope_theta;
         let mut rope_cos = Vec::with_capacity(max_seq_len * h_d);
