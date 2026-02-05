@@ -205,35 +205,41 @@ impl NativeLayer {
             (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
         };
 
-        // [2025-MATHEMATICAL-STABILITY] Adaptive Alpha Scaling
-        // Instead of hard-coded values, we scale alpha based on the signal's energy (MeanAbs).
+        // [2025-COGNITIVE-STABILITY] Embedding-Guided Adaptive Scaling
+        // Treat Layer 0 as an embedding engine to measure semantic density.
         let mut final_alpha = 0.1f32;
         
-        let ensure_alive = |data: &mut Vec<f16>, name: &str| -> f32 {
-            if data.is_empty() { return 0.0; }
-            let mean_abs = data.iter().take(500).map(|x| x.to_f32().abs()).sum::<f32>() / 500.0;
+        let mut measure_context = |data: &mut Vec<f16>, name: &str| -> (f32, f32) {
+            if data.is_empty() { return (0.0, 1.0); }
+            let samples = data.iter().take(500).map(|x| x.to_f32().abs()).collect::<Vec<_>>();
+            let mean_abs = samples.iter().sum::<f32>() / samples.len() as f32;
+            let max_abs = samples.iter().fold(1e-9f32, |a, &b| a.max(b));
             
+            // Semantic Density: High ratio = rich context, Low ratio = sparse/risky context
+            let density = (mean_abs / max_abs).clamp(0.0, 1.0);
+
             if _idx == 0 {
-                println!("[DIAGNOSTIC] Layer 0 {} MeanAbs: {:.2e}", name, mean_abs);
+                println!("[SEMANTIC-DIAG] Layer 0 {} -> Energy: {:.2e}, Density: {:.4}", name, mean_abs, density);
             }
 
             if mean_abs < 1e-12 {
-                println!("[STABILITY-WARN] {} projection is DEAD. Jumpstarting...", name);
+                println!("[STABILITY-WARN] {} signal collapsed. Jumpstarting...", name);
                 for i in 0..data.len().min(100) { data[i] = f16::from_f32(1e-6); }
-                1e-6
+                (1e-6, 0.1)
             } else {
-                mean_abs
+                (mean_abs, density)
             }
         };
 
-        let q_energy = ensure_alive(&mut q, "Q");
-        let _k_energy = ensure_alive(&mut k, "K");
-        let _v_energy = ensure_alive(&mut v, "V");
+        let (q_energy, q_density) = measure_context(&mut q, "Q");
+        let (_, _k_density) = measure_context(&mut k, "K");
 
-        // [MATH] Calculate dynamic alpha based on Q energy
-        // If energy is 0.1, alpha stays 0.1. If energy is 0.01, alpha becomes 1.0.
-        final_alpha = (0.01 / (q_energy + 1e-9)).clamp(0.1, 2.0);
-        if is_baking { final_alpha *= 1.5; } // Extra boost for baking
+        // [ORGANIC-MATH] Alpha is now a function of both Energy and Semantic Density
+        // Thin contexts (low density) get significantly more protection.
+        let density_boost = (1.0 / (q_density + 0.1)).min(5.0);
+        final_alpha = (0.01 / (q_energy + 1e-9) * density_boost).clamp(0.1, 2.5);
+        
+        if is_baking { final_alpha *= 1.3; } 
 
         if let Some(ref qw) = self.q_norm { 
             let qw_cow = qw.get_slice::<f16>();
