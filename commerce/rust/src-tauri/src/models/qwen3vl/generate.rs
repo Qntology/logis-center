@@ -213,7 +213,11 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
-        if seqlen_offset > 0 && !no_bridge {
+        // [ZERO-PREFILL] If KV cache is already exactly matching the prompt length (minus trigger), skip prefill.
+        if seqlen_offset > 0 && seqlen_offset == all_ids.len().saturating_sub(1) {
+            println!("[{}-ZERO-PREFILL] KV cache exactly matches prompt ({} tokens). Skipping prefill.", tag, seqlen_offset);
+            local_pos = seqlen_offset;
+        } else if seqlen_offset > 0 && !no_bridge {
             // [STITCHING] Align 0.6B cache with 2B activations using a 32-token overlap
             let bridge_len = all_ids.len().min(recalibration_len);
             current_kv_offset = seqlen_offset.saturating_sub(bridge_len);

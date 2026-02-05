@@ -19,15 +19,14 @@ pub struct NativeLinear {
     pub out_features: usize, 
     pub variant: LinearVariant, 
     pub device_id: i32,
-    pub scratch_i: std::sync::Mutex<Option<(GpuPtr, usize)>>, // (Pointer, Current size in bytes)
-    pub scratch_o: std::sync::Mutex<Option<(GpuPtr, usize)>>,
+    // [REMOVED] Individual scratch buffers to save VRAM
 }
 
 unsafe impl Send for NativeLinear {}
 unsafe impl Sync for NativeLinear {}
 
 impl NativeLinear {
-    pub fn forward(&self, x: &[f16]) -> Vec<f16> {
+    pub fn forward(&self, x: &[f16], global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
         let m = x.len() / self.in_features;
         match &self.variant {
             LinearVariant::Standard { weight, bias } => {
@@ -39,29 +38,36 @@ impl NativeLinear {
                 #[cfg(feature = "cuda")]
                 {
                     if self.device_id >= 0 {
-                        // [STABILITY] Check if GPU pointers are valid and NOT NULL
                         let wp_ptr = weight_packed.gpu_ptr.map(|p| p.0 as usize).unwrap_or(0);
                         if wp_ptr != 0 {
-                            let (d_i, d_o) = self.ensure_gpu_buffers(m);
-                            let mut res = bit_serial_matmul_gpu_buffered(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o);
-                            
-                            // [STABILITY-FALLBACK] If GPU returned zeros, retry on CPU
-                            if !res.is_empty() && res[0].to_f32() == 0.0 && res.iter().take(50).all(|val| val.to_f32() == 0.0) {
-                                unsafe {
-                                    let wp_ref = weight_packed.get_raw_slice::<u32>(); 
-                                    let s_ref = scales.get_raw_slice::<f16>();
-                                    let out = bit_serial_matmul_f32_extreme(x, wp_ref, s_ref, m, self.out_features, self.in_features);
-                                    res = out.into_iter().map(f16::from_f32).collect();
-                                }
-                            }
+                            // [VRAM-SHARING] Use global scratch buffers if provided
+                            let (d_i, d_o) = if let Some((si, so)) = global_scratch {
+                                self.ensure_gpu_buffers_ext(m, si, so)
+                            } else {
+                                // Fallback (should not happen in optimized path)
+                                (0 as CUdeviceptr, 0 as CUdeviceptr)
+                            };
 
-                            if let Some(b) = bias { 
-                                unsafe {
-                                    let b_ref = b.get_raw_slice::<f16>();
-                                    for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } } 
+                            if d_i != 0 && d_o != 0 {
+                                let mut res = bit_serial_matmul_gpu_buffered(x, weight_packed, scales, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o);
+                                
+                                if !res.is_empty() && res[0].to_f32() == 0.0 && res.iter().take(50).all(|val| val.to_f32() == 0.0) {
+                                    unsafe {
+                                        let wp_ref = weight_packed.get_raw_slice::<u32>(); 
+                                        let s_ref = scales.get_raw_slice::<f16>();
+                                        let out = bit_serial_matmul_f32_extreme(x, wp_ref, s_ref, m, self.out_features, self.in_features);
+                                        res = out.into_iter().map(f16::from_f32).collect();
+                                    }
                                 }
+
+                                if let Some(b) = bias { 
+                                    unsafe {
+                                        let b_ref = b.get_raw_slice::<f16>();
+                                        for i in 0..m { for j in 0..self.out_features { res[i * self.out_features + j] += b_ref[j]; } } 
+                                    }
+                                }
+                                return res;
                             }
-                            return res;
                         }
                     }
                 }
@@ -88,13 +94,12 @@ impl NativeLinear {
     }
 
     #[cfg(feature = "cuda")]
-    fn ensure_gpu_buffers(&self, m: usize) -> (CUdeviceptr, CUdeviceptr) {
+    fn ensure_gpu_buffers_ext(&self, m: usize, scratch_i: &std::sync::Mutex<Option<(GpuPtr, usize)>>, scratch_o: &std::sync::Mutex<Option<(GpuPtr, usize)>>) -> (CUdeviceptr, CUdeviceptr) {
         use cudarc::driver::sys::*;
         let req_i = m * self.in_features * 4;
         let req_o = m * self.out_features * 4;
         let cuda_lib = unsafe { crate::models::qwen3vl::native_backend::lib() };
         
-        // [STABILITY] Ensure valid context for this thread
         unsafe {
             let mut ctx = std::ptr::null_mut() as CUcontext;
             cuda_lib.cuCtxGetCurrent(&mut ctx);
@@ -106,56 +111,46 @@ impl NativeLinear {
             }
         }
 
-        let mut si_guard = self.scratch_i.lock().unwrap();
+        let mut si_guard = scratch_i.lock().unwrap();
         let d_i = if let Some((ptr, size)) = *si_guard {
             if size >= req_i { ptr.0 as CUdeviceptr }
             else {
-                println!("[GPU-SCRATCH] Growing input buffer to {} bytes", req_i);
-                unsafe {
-                    let mut new_ptr: CUdeviceptr = 0;
-                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_i);
-                    if (res as i32) == 0 && new_ptr != 0 {
-                        *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
-                        new_ptr
-                    } else { 0 as CUdeviceptr }
-                }
-            }
-        } else {
-            unsafe {
                 let mut new_ptr: CUdeviceptr = 0;
-                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_i);
+                let _ = unsafe { cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr) };
+                let res = unsafe { cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_i) };
                 if (res as i32) == 0 && new_ptr != 0 {
                     *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
                     new_ptr
                 } else { 0 as CUdeviceptr }
             }
+        } else {
+            let mut new_ptr: CUdeviceptr = 0;
+            let res = unsafe { cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_i) };
+            if (res as i32) == 0 && new_ptr != 0 {
+                *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
+                new_ptr
+            } else { 0 as CUdeviceptr }
         };
 
-        let mut so_guard = self.scratch_o.lock().unwrap();
+        let mut so_guard = scratch_o.lock().unwrap();
         let d_o = if let Some((ptr, size)) = *so_guard {
             if size >= req_o { ptr.0 as CUdeviceptr }
             else {
-                println!("[GPU-SCRATCH] Growing output buffer to {} bytes", req_o);
-                unsafe {
-                    let mut new_ptr: CUdeviceptr = 0;
-                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_o);
-                    if (res as i32) == 0 && new_ptr != 0 {
-                        *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
-                        new_ptr
-                    } else { 0 as CUdeviceptr }
-                }
-            }
-        } else {
-            unsafe {
                 let mut new_ptr: CUdeviceptr = 0;
-                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_o);
+                let _ = unsafe { cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr) };
+                let res = unsafe { cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_o) };
                 if (res as i32) == 0 && new_ptr != 0 {
                     *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
                     new_ptr
                 } else { 0 as CUdeviceptr }
             }
+        } else {
+            let mut new_ptr: CUdeviceptr = 0;
+            let res = unsafe { cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_o) };
+            if (res as i32) == 0 && new_ptr != 0 {
+                *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
+                new_ptr
+            } else { 0 as CUdeviceptr }
         };
 
         (d_i, d_o)
@@ -172,21 +167,10 @@ impl NativeLinear {
                 #[cfg(feature = "cuda")] 
                 {
                     weight_packed.move_to_gpu(device_id);
-                    scales.move_to_gpu_forced_f32(device_id);
+                    scales.move_to_gpu_f16(device_id);
                     if let Some(b) = bias { b.move_to_gpu(device_id); }
                 }
             }
-        }
-    }
-
-    pub fn force_free_kv_cache(&self) {
-        // Linear doesn't have KV cache but has scratch buffers
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            let lib = lib();
-            if let Some((ptr, _)) = self.scratch_i.lock().unwrap().take() { let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr); }
-            if let Some((ptr, _)) = self.scratch_o.lock().unwrap().take() { let _ = lib.cuMemFree_v2(ptr.0 as CUdeviceptr); }
         }
     }
 }
@@ -206,8 +190,7 @@ pub struct NativeLayer {
     pub device_id: i32,
     pub kv_cache: std::sync::Mutex<Option<(Vec<u32>, Vec<f16>)>>, 
     pub gpu_kv_cache: std::sync::Mutex<Option<(GpuPtr, GpuPtr, usize)>>, 
-    pub attn_scratch_q: std::sync::Mutex<Option<(GpuPtr, usize)>>,
-    pub attn_scratch_o: std::sync::Mutex<Option<(GpuPtr, usize)>>,
+    // [REMOVED] Individual scratch buffers to save VRAM
     pub gpu_broken: std::sync::atomic::AtomicBool,
 }
 
@@ -215,39 +198,23 @@ unsafe impl Send for NativeLayer {}
 unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
-    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16], is_baking: bool) -> Vec<f16> {
+    pub fn forward(&self, x: &[f16], config: &Qwen3VLTextConfig, seqlen_offset: usize, _idx: usize, rope_cos: &[f16], rope_sin: &[f16], is_baking: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
         let hidden_size = config.hidden_size; let q_len = x.len() / hidden_size;
         let head_dim = config.head_dim; let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
 
-                        let residual = x.to_vec();
+        let residual = x.to_vec();
+        let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
+        let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
 
-                        let ln_weight_cow = self.input_layernorm.get_slice::<f16>();
-
-                        let x_norm = native_rms_norm_f16(x, ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
-
-                        
-
-                        // [RAYON-STRATEGY] Only use parallel join if processing multiple tokens (prefill)
-
-                        // With stable context recovery, we can safely use host-side parallelism again.
-
-                        let (mut q, mut k, mut v) = if q_len > 1 {
-
-                            let (q_p, (k_p, v_p)) = rayon::join(
-
-                                || self.q_proj.forward(&x_norm),
-
-                                || rayon::join(|| self.k_proj.forward(&x_norm), || self.v_proj.forward(&x_norm))
-
-                            );
-
-                            (q_p, k_p, v_p)
-
-                        } else {
-
-                            (self.q_proj.forward(&x_norm), self.k_proj.forward(&x_norm), self.v_proj.forward(&x_norm))
-
-                        };
+        let (mut q, mut k, mut v) = if q_len > 1 {
+            let (q_p, (k_p, v_p)) = rayon::join(
+                || self.q_proj.forward(&x_norm, global_scratch),
+                || rayon::join(|| self.k_proj.forward(&x_norm, global_scratch), || self.v_proj.forward(&x_norm, global_scratch))
+            );
+            (q_p, k_p, v_p)
+        } else {
+            (self.q_proj.forward(&x_norm, global_scratch), self.k_proj.forward(&x_norm, global_scratch), self.v_proj.forward(&x_norm, global_scratch))
+        };
 
                 
 
@@ -263,7 +230,7 @@ impl NativeLayer {
                             }        // [2025-COGNITIVE-STABILITY] Embedding-Guided Adaptive Scaling
         // Treat Layer 0 as an embedding engine to measure semantic density.
         
-        let measure_context = |data: &mut Vec<f16>, name: &str| -> (f32, f32) {
+        let measure_context = |data: &mut Vec<f16>, name: &str, idx: usize| -> (f32, f32) {
             if data.is_empty() { return (0.0, 1.0); }
             let samples = data.iter().take(500).map(|x| x.to_f32().abs()).collect::<Vec<_>>();
             let mean_abs = samples.iter().sum::<f32>() / samples.len() as f32;
@@ -272,7 +239,7 @@ impl NativeLayer {
             // Semantic Density: High ratio = rich context, Low ratio = sparse/risky context
             let density = (mean_abs / max_abs).clamp(0.0, 1.0);
 
-            if _idx == 0 {
+            if idx == 0 {
                 println!("[SEMANTIC-DIAG] Layer 0 {} -> Energy: {:.2e}, Density: {:.4}", name, mean_abs, density);
             }
 
@@ -285,16 +252,21 @@ impl NativeLayer {
             }
         };
 
-        let (q_energy, q_density) = measure_context(&mut q, "Q");
-        let (_k_energy, _k_density) = measure_context(&mut k, "K");
-        let (_v_energy, _v_density) = measure_context(&mut v, "V");
+        // [ACCURACY-CORRECTION] Attenuate memory intensity for higher layers
+        let layer_depth_ratio = _idx as f32 / config.num_hidden_layers as f32;
+        let accuracy_correction = (1.0 - layer_depth_ratio * 0.15).clamp(0.85, 1.0);
 
-        // [MATH-RECALIBRATION] 10x stronger base to prevent GPU-specific underflow
+        // [SPEED-OPTIMIZATION] Skip diagnostic sampling for internal layers during inference
+        let (q_energy, q_density) = if is_baking || _idx == 0 {
+            measure_context(&mut q, "Q", _idx)
+        } else {
+            (1.0f32, 0.5f32) // Default values for speed
+        };
+
         let density_boost = if q_density < 0.2f32 { 8.0f32 } else { (1.0f32 / (q_density + 0.1f32)).min(5.0f32) };
-        let mut final_alpha = (0.1f32 / (q_energy + 1e-9f32) * density_boost).clamp(0.2f32, 2.5f32);
+        let mut final_alpha = (0.1f32 / (q_energy + 1e-9f32) * density_boost * accuracy_correction).clamp(0.2f32, 2.5f32);
         
-        // [2025-COGNITIVE-REFLECT] Dynamic Semantic Gain based on Layer 0 Diagnostic
-        let semantic_gain = (q_density * 2.0 + 0.8).clamp(0.9, 1.2);
+        let semantic_gain = if is_baking || _idx == 0 { (q_density * 2.0 + 0.8).clamp(0.9, 1.2) } else { 1.0f32 };
         
         if _idx == 0 && q_len > 0 {
             println!("[COGNITIVE] Layer 0 {} -> Alpha: {:.4}, Semantic Gain: {:.4} (Density: {:.4})", 
@@ -433,11 +405,23 @@ impl NativeLayer {
                 let new_len = current_len + q_len;
                 *gpu_cache_guard = Some((k_ptr, v_ptr, new_len));
 
-                // [OPTIMIZATION] Reuse scratch buffers for Attention
-                let (d_q, d_o) = self.ensure_attn_scratch(q.len());
+                // [OPTIMIZATION] Reuse global scratch buffers for Attention to save VRAM
+                let (d_q, d_o) = if let Some((si, so)) = global_scratch {
+                    let mut si_g = si.lock().unwrap();
+                    let mut so_g = so.lock().unwrap();
+                    let q_bytes = q.len() * 4;
+                    // Use ensure_gpu_buffers_ext logic style or just get pointer
+                    let ptr_i = if let Some((p, s)) = *si_g { if s >= q_bytes { p.0 as CUdeviceptr } else { 0 as CUdeviceptr } } else { 0 as CUdeviceptr };
+                    let ptr_o = if let Some((p, s)) = *so_g { if s >= q_bytes { p.0 as CUdeviceptr } else { 0 as CUdeviceptr } } else { 0 as CUdeviceptr };
+                    (ptr_i, ptr_o)
+                } else { (0, 0) };
 
                 // [STABILITY-ORGANIC-RECOVERY] Multi-stage GPU persistence loop
-                let mut attn_out = native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha);
+                let mut attn_out = if d_q != 0 && d_o != 0 {
+                    native_bit_serial_attn_gpu_buffered(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, d_q, d_o, final_alpha)
+                } else {
+                    native_bit_serial_attn_gpu(&q, k_ptr, v_ptr, n_h, n_kv, head_dim, new_len, self.device_id as usize, final_alpha)
+                };
                 
                 // Apply gain
                 for val in attn_out.iter_mut() {
@@ -457,7 +441,7 @@ impl NativeLayer {
                     }
                     drop(gpu_cache_guard);
                 } else {
-                    let mut x_at = self.o_proj.forward(&attn_out);
+                    let mut x_at = self.o_proj.forward(&attn_out, global_scratch);
                     for i in 0..x_at.len() { x_at[i] += residual[i]; }
                     let r_mlp = x_at.clone();
                     let x_n_m = unsafe {
@@ -465,13 +449,13 @@ impl NativeLayer {
                         native_rms_norm_f16(&x_at, post_ln_weight_ref, config.rms_norm_eps as f32, hidden_size)
                     };
                     let (mut gate, up) = if q_len > 1 {
-                        rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
+                        rayon::join(|| self.gate_proj.forward(&x_n_m, global_scratch), || self.up_proj.forward(&x_n_m, global_scratch))
                     } else {
-                        (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
+                        (self.gate_proj.forward(&x_n_m, global_scratch), self.up_proj.forward(&x_n_m, global_scratch))
                     };
                     
                     native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
-                    let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
+                    let mut x_m = self.down_proj.forward(&gate, global_scratch); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
                     return x_m;
                 }
             }
@@ -494,93 +478,22 @@ impl NativeLayer {
                 *val = f16::from_f32(val.to_f32() * semantic_gain);
             }
 
-            let mut x_at = self.o_proj.forward(&attn_out);
+            let mut x_at = self.o_proj.forward(&attn_out, global_scratch);
             for i in 0..x_at.len() { x_at[i] += residual[i]; }
             let r_mlp = x_at.clone();
             let post_ln_weight_cow = self.post_attention_layernorm.get_slice::<f16>();
             let x_n_m = native_rms_norm_f16(&x_at, post_ln_weight_cow.as_ref(), config.rms_norm_eps as f32, hidden_size);
             let (mut gate, up) = if q_len > 1 {
-                rayon::join(|| self.gate_proj.forward(&x_n_m), || self.up_proj.forward(&x_n_m))
+                rayon::join(|| self.gate_proj.forward(&x_n_m, global_scratch), || self.up_proj.forward(&x_n_m, global_scratch))
             } else {
-                (self.gate_proj.forward(&x_n_m), self.up_proj.forward(&x_n_m))
+                (self.gate_proj.forward(&x_n_m, global_scratch), self.up_proj.forward(&x_n_m, global_scratch))
             };
             native_silu_f16(&mut gate); for i in 0..gate.len() { gate[i] *= up[i]; }
-            let mut x_m = self.down_proj.forward(&gate); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
+            let mut x_m = self.down_proj.forward(&gate, global_scratch); for i in 0..x_m.len() { x_m[i] += r_mlp[i]; }
             return x_m;
         }
         
         vec![f16::ZERO; x.len()]
-    }
-
-    #[cfg(feature = "cuda")]
-    fn ensure_attn_scratch(&self, size: usize) -> (CUdeviceptr, CUdeviceptr) {
-        use cudarc::driver::sys::*;
-        let req_bytes = size * 4;
-        let cuda_lib = unsafe { crate::models::qwen3vl::native_backend::lib() };
-
-        // [STABILITY] Ensure valid context for this thread
-        unsafe {
-            let mut ctx = std::ptr::null_mut() as CUcontext;
-            cuda_lib.cuCtxGetCurrent(&mut ctx);
-            if ctx == std::ptr::null_mut() && self.device_id >= 0 {
-                let mut dev = 0 as CUdevice;
-                cuda_lib.cuDeviceGet(&mut dev, self.device_id);
-                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
-                cuda_lib.cuCtxSetCurrent(ctx);
-            }
-        }
-        
-        let mut sq_guard = self.attn_scratch_q.lock().unwrap();
-        let d_q = if let Some((ptr, cur_s)) = *sq_guard {
-            if cur_s >= req_bytes { ptr.0 as CUdeviceptr }
-            else {
-                unsafe {
-                    let mut new_ptr: CUdeviceptr = 0;
-                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                    if (res as i32) == 0 && new_ptr != 0 {
-                        *sq_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                        new_ptr
-                    } else { 0 as CUdeviceptr }
-                }
-            }
-        } else {
-            unsafe {
-                let mut new_ptr: CUdeviceptr = 0;
-                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                if (res as i32) == 0 && new_ptr != 0 {
-                    *sq_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                    new_ptr
-                } else { 0 as CUdeviceptr }
-            }
-        };
-
-        let mut so_guard = self.attn_scratch_o.lock().unwrap();
-        let d_o = if let Some((ptr, cur_s)) = *so_guard {
-            if cur_s >= req_bytes { ptr.0 as CUdeviceptr }
-            else {
-                unsafe {
-                    let mut new_ptr: CUdeviceptr = 0;
-                    let _ = cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr);
-                    let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                    if (res as i32) == 0 && new_ptr != 0 {
-                        *so_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                        new_ptr
-                    } else { 0 as CUdeviceptr }
-                }
-            }
-        } else {
-            unsafe {
-                let mut new_ptr: CUdeviceptr = 0;
-                let res = cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_bytes);
-                if (res as i32) == 0 && new_ptr != 0 {
-                    *so_guard = Some((GpuPtr(new_ptr as *mut _), req_bytes));
-                    new_ptr
-                } else { 0 as CUdeviceptr }
-            }
-        };
-
-        (d_q, d_o)
     }
 
     pub fn move_to_gpu(&mut self, device_id: i32) {
@@ -614,12 +527,6 @@ impl NativeLayer {
                 let _ = lib().cuMemFree_v2(k.0 as CUdeviceptr);
                 let _ = lib().cuMemFree_v2(v.0 as CUdeviceptr);
             }
-        }
-        #[cfg(feature = "cuda")]
-        unsafe {
-            use cudarc::driver::sys::*;
-            if let Some((ptr, _)) = self.attn_scratch_q.lock().unwrap().take() { let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr); }
-            if let Some((ptr, _)) = self.attn_scratch_o.lock().unwrap().take() { let _ = lib().cuMemFree_v2(ptr.0 as CUdeviceptr); }
         }
     }
 
@@ -680,7 +587,7 @@ impl NativeLayer {
 
     /// [NEW] Direct GPU injection to prevent redundant CPU conversions
     #[cfg(feature = "cuda")]
-    pub fn inject_gpu_kv(&self, k_data: &[u32], v_data_f32: &[f32], n_kv: usize, head_dim: usize) {
+    pub fn inject_gpu_kv(&self, k_data: &[u32], v_data: &[f16], n_kv: usize, head_dim: usize) {
         let tokens = (k_data.len() * 32) / (n_kv * head_dim);
         let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
         
@@ -702,11 +609,11 @@ impl NativeLayer {
             // Allocate capped buffer (4k)
             let max_tokens_gpu = 4096;
             cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
-            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 4); 
+            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
             
-            // Copy data
+            // Copy data via F16 path
             cuda_lib.cuMemcpyHtoD_v2(kp, k_data.as_ptr() as *const _, k_data.len() * 4);
-            cuda_lib.cuMemcpyHtoD_v2(vp, v_data_f32.as_ptr() as *const _, v_data_f32.len() * 4);
+            cuda_lib.cuMemcpyHtoD_v2(vp, v_data.as_ptr() as *const _, v_data.len() * 2);
             
             *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
         }
@@ -735,11 +642,11 @@ impl NativeLayer {
             // Allocate capped buffer (4k)
             let max_tokens_gpu = 4096;
             cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
-            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 4); 
+            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
             
             // Copy data via DtoD (Device to Device)
             let k_size = tokens * n_kv * (head_dim / 32) * 4;
-            let v_size = tokens * n_kv * head_dim * 4;
+            let v_size = tokens * n_kv * head_dim * 2;
             cuda_lib.cuMemcpyDtoD_v2(kp, k_src.0 as CUdeviceptr, k_size);
             cuda_lib.cuMemcpyDtoD_v2(vp, v_src.0 as CUdeviceptr, v_size);
             
@@ -761,11 +668,10 @@ unsafe impl Send for NativeQwen3TextModel {}
 unsafe impl Sync for NativeQwen3TextModel {}
 
 impl NativeQwen3TextModel {
-    pub fn forward(&self, input_ids: &[u32], pixel_values: Option<&[f16]>, grid_thw: Option<&[u32; 3]>, seqlen_offset: usize) -> Vec<f16> {
+    pub fn forward(&self, input_ids: &[u32], pixel_values: Option<&[f16]>, grid_thw: Option<&[u32; 3]>, seqlen_offset: usize, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
         let hid = self.config.hidden_size;
-        let is_baking = self.layers.len() <= 1; // [CRITICAL] 1 layer = Small baking model
         
-        let mut cur_x = match &self.embed_tokens.variant {
+        let embeds = match &self.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => {
                 let w_cow = weight.get_slice::<f16>();
                 native_embedding_lookup_f16(input_ids, w_cow.as_ref(), hid)
@@ -776,8 +682,16 @@ impl NativeQwen3TextModel {
             }
         };
 
+        self.forward_ext(input_ids, embeds, seqlen_offset, global_scratch)
+    }
+
+    pub fn forward_ext(&self, _input_ids: &[u32], embeds: Vec<f16>, seqlen_offset: usize, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
+        let hid = self.config.hidden_size;
+        let is_baking = self.layers.len() <= 1;
+        let mut cur_x = embeds;
+
         for (i, layer) in self.layers.iter().enumerate() { 
-            cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i, &self.rope_cos, &self.rope_sin, is_baking); 
+            cur_x = layer.forward(&cur_x, &self.config, seqlen_offset, i, &self.rope_cos, &self.rope_sin, is_baking, global_scratch); 
         }
         let norm_cow = self.norm.get_slice::<f16>();
         native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid)
@@ -806,13 +720,10 @@ impl NativeQwen3TextModel {
         if self.layers[0].device_id >= 0 {
             println!("[GPU-BATCH-UPLOAD] Optimizing PCIe: HtoD once, then DtoD for {} layers...", self.layers.len());
             
-            // 1. Convert to f32 ONCE
-            let v_f32: Vec<f32> = v.par_iter().map(|val: &f16| val.to_f32()).collect();
+            // 1. Direct Inject to FIRST layer (HtoD via F16)
+            self.layers[0].inject_gpu_kv(&k, &v, n_kv, h_d);
             
-            // 2. Inject to FIRST layer (HtoD)
-            self.layers[0].inject_gpu_kv(&k, &v_f32, n_kv, h_d);
-            
-            // 3. Replicate from Layer 0 to all other layers (DtoD)
+            // 2. Replicate from Layer 0 to all other layers (DtoD)
             if let Some((k_src, v_src, tokens)) = *self.layers[0].gpu_kv_cache.lock().unwrap() {
                 for i in 1..self.layers.len() {
                     self.layers[i].inject_gpu_kv_direct(k_src, v_src, tokens, n_kv, h_d);
@@ -847,6 +758,9 @@ pub struct NativeQwen3VLModel {
     pub text_model: NativeQwen3TextModel, 
     pub lm_head: NativeLinear,
     pub visual: Option<NativeVisionModel>,
+    // [VRAM-SHARING] Global scratch buffers for all layers
+    pub global_scratch_i: std::sync::Mutex<Option<(GpuPtr, usize)>>,
+    pub global_scratch_o: std::sync::Mutex<Option<(GpuPtr, usize)>>,
 }
 
 pub struct NativeVisionModel {
@@ -865,14 +779,14 @@ impl NativeVisionModel {
         self.merger.move_to_gpu(device_id);
     }
 
-    pub fn forward(&self, pixel_values: &[f16], grid_thw: &[u32; 3], rope_cos: &[f16], rope_sin: &[f16]) -> Vec<f16> {
+    pub fn forward(&self, pixel_values: &[f16], grid_thw: &[u32; 3], rope_cos: &[f16], rope_sin: &[f16], global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
         // [VISION-TRANSFORMER-PIPELINE]
         // Hidden states: (patches, hidden_size)
         // grid_thw: [T, H, W]
         let patches = (grid_thw[1] * grid_thw[2]) as usize;
         
         // 1. Patch Embedding
-        let mut x = self.patch_embed.forward(pixel_values);
+        let mut x = self.patch_embed.forward(pixel_values, global_scratch);
         
         // 2. Transformer Blocks
         // Vision blocks usually don't use KV cache (full attention per image)
@@ -892,7 +806,7 @@ impl NativeVisionModel {
                 max_position_embeddings: 4096,
                 dtype: None,
                 rope_scaling: None,
-            }, 0, 0, rope_cos, rope_sin, false);
+            }, 0, 0, rope_cos, rope_sin, false, global_scratch);
         }
         
         // 3. Patch Merger
@@ -909,7 +823,7 @@ impl NativeVisionModel {
             max_position_embeddings: 4096,
             dtype: None,
             rope_scaling: None,
-        }, 0, 0, rope_cos, rope_sin, false)
+        }, 0, 0, rope_cos, rope_sin, false, global_scratch)
     }
 }
 
@@ -1001,8 +915,6 @@ impl NativeQwen3VLModel {
                         bias: None,
                     }, 
                     device_id: -1,
-                    scratch_i: std::sync::Mutex::new(None),
-                    scratch_o: std::sync::Mutex::new(None),
                 })
             } else {
                 let v = current_st.tensor(&key)?;
@@ -1014,8 +926,6 @@ impl NativeQwen3VLModel {
                         bias: None 
                     }, 
                     device_id: -1,
-                    scratch_i: std::sync::Mutex::new(None),
-                    scratch_o: std::sync::Mutex::new(None),
                 })
             }
         };
@@ -1045,7 +955,7 @@ impl NativeQwen3VLModel {
                 if current_st.tensor(&key).is_ok() {
                     let v = current_st.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                    return Ok(NativeLinear { in_features: vocab, out_features: hid, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) });
+                    return Ok(NativeLinear { in_features: vocab, out_features: hid, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 });
                 }
             }
             get_l(base, vocab, hid, -1)
@@ -1079,7 +989,6 @@ impl NativeQwen3VLModel {
                 up_proj: get_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size, layer_idx)?,
                 down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size, layer_idx)?,
                 device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
-                attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
         }
@@ -1158,11 +1067,11 @@ impl NativeQwen3VLModel {
                         weight_packed: NativeTensor::from_mmap(vm.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(vm.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                         bias: None,
-                    }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) })
+                    }, device_id: -1 })
                 } else {
                     let v = vst.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) })
+                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
                 }
             };
 
@@ -1188,7 +1097,6 @@ impl NativeQwen3VLModel {
                     up_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?, 
                     down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_cfg.hidden_size)?,
                     device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
-                    attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
                     gpu_broken: std::sync::atomic::AtomicBool::new(false),
                 });
             }
@@ -1204,15 +1112,37 @@ impl NativeQwen3VLModel {
                 up_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
                 down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
                 device_id: -1, kv_cache: std::sync::Mutex::new(None), gpu_kv_cache: std::sync::Mutex::new(None),
-                attn_scratch_q: std::sync::Mutex::new(None), attn_scratch_o: std::sync::Mutex::new(None),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
             };
             Some(NativeVisionModel { patch_embed, blocks, merger })
         } else { None };
             
-        Ok(Self { config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cos, rope_sin }, lm_head: head, visual })
+        Ok(Self { 
+            config: config.clone(), 
+            text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cos, rope_sin }, 
+            lm_head: head, 
+            visual,
+            global_scratch_i: std::sync::Mutex::new(None),
+            global_scratch_o: std::sync::Mutex::new(None),
+        })
     }
     pub fn forward(&self, i_ids: &[u32], p_v: Option<&[f16]>, g_t: Option<&[u32; 3]>, s_o: usize) -> Vec<f16> {
+        #[cfg(feature = "cuda")]
+        if self.device_id >= 0 {
+            use cudarc::driver::sys::*;
+            unsafe {
+                let cuda_lib = crate::models::qwen3vl::native_backend::lib();
+                let mut ctx = std::ptr::null_mut() as CUcontext;
+                cuda_lib.cuCtxGetCurrent(&mut ctx);
+                if ctx == std::ptr::null_mut() {
+                    let mut dev = 0 as CUdevice;
+                    cuda_lib.cuDeviceGet(&mut dev, self.device_id);
+                    cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                    cuda_lib.cuCtxSetCurrent(ctx);
+                }
+            }
+        }
+
         // [2026-SPECULATIVE-TREE] Support for validating multiple candidates in parallel
         let _batch_size = i_ids.len() / (if i_ids.len() > 1 { 1 } else { 1 }); // Adjust for Tree-Depth
         
@@ -1221,13 +1151,19 @@ impl NativeQwen3VLModel {
                 let w_cow = weight.get_slice::<f16>();
                 native_embedding_lookup_f16(i_ids, w_cow.as_ref(), self.text_model.config.hidden_size)
             },
-            _ => Vec::new(),
+            LinearVariant::BitSerial { weight_packed, .. } => {
+                let w_cow = weight_packed.get_slice::<f16>();
+                native_embedding_lookup_f16(i_ids, w_cow.as_ref(), self.text_model.config.hidden_size)
+            },
         };
+
+        // [VRAM-SHARING] Use global scratch buffers
+        let scratch = Some((&self.global_scratch_i, &self.global_scratch_o));
 
         // [VISION-FUSION] Skip during speculative tree validation to save cycles
         if let (Some(pv), Some(gt)) = (p_v, g_t) {
             if let Some(ref visual) = self.visual {
-                let vision_features = visual.forward(pv, gt, &self.text_model.rope_cos, &self.text_model.rope_sin);
+                let vision_features = visual.forward(pv, gt, &self.text_model.rope_cos, &self.text_model.rope_sin, scratch);
                 let img_token_id = 151655; // <|image_pad|>
                 let hid = self.text_model.config.hidden_size;
                 
@@ -1243,15 +1179,8 @@ impl NativeQwen3VLModel {
             }
         }
 
-        let mut cur_x = embeds;
-        let is_baking = self.text_model.layers.len() <= 1;
-        for (i, layer) in self.text_model.layers.iter().enumerate() { 
-            cur_x = layer.forward(&cur_x, &self.text_model.config, s_o, i, &self.text_model.rope_cos, &self.text_model.rope_sin, is_baking); 
-        }
-        
-        let norm_cow = self.text_model.norm.get_slice::<f16>();
-        let norm_x = native_rms_norm_f16(&cur_x, norm_cow.as_ref(), self.text_model.config.rms_norm_eps as f32, self.text_model.config.hidden_size);
-        self.lm_head.forward(&norm_x)
+        let norm_x = self.text_model.forward_ext(i_ids, embeds, s_o, scratch);
+        self.lm_head.forward(&norm_x, scratch)
     }
         pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
         pub fn force_free_kv_cache(&self) { self.text_model.force_free_kv_cache(); }

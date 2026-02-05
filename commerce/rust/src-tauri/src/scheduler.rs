@@ -231,7 +231,7 @@ async fn process_task(
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
-    let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
     let effective_device_pref = device_preference.or_else(|| {
         task_data.get("device_preference").and_then(|v| {
@@ -242,50 +242,23 @@ async fn process_task(
     let url = task_data.get("link").and_then(|s| s.as_str()).unwrap_or("").to_string();
     let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
 
-    // [RESTORED] Pre-fetch weights to OS Page Cache with settle delay
-    let large_model_dir = std::fs::canonicalize("src-tauri/models/Qwen3-VL-2B-Instruct-gguf")
-        .or_else(|_| std::fs::canonicalize("models/Qwen3-VL-2B-Instruct-gguf")).ok();
-    if let Some(ref p) = large_model_dir {
-        let path_clone = p.clone();
-        println!("[PROCESS] Warming up weight cache for large model...");
-        tokio::task::spawn_blocking(move || { let _ = pre_fetch_weights(&path_clone); });
-        // Give OS time to settle the cache after heavy read
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    // 2. Acquire Model with Stability Protocol
+    // 1. Prepare Model
     let model = {
         let mut model_lock = model_mutex.lock().await;
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-        // Ensure clean state if switching between CPU/GPU modes
         if let Some(m) = model_lock.as_ref() {
             let wants_cpu = effective_device_pref.as_deref() == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
-                println!("[PROCESS] Device mismatch detected. Purging current model...");
                 m.unload_generator().await;
                 *model_lock = None;
-                // Wait for VRAM/RAM to actually release
                 let _ = wait_for_resources_settled(1000, 500, Some(cancellation_token)).await;
             }
         }
 
         if model_lock.is_none() {
-            println!("[PROCESS] Initializing LogisModel Engine (Pref: {:?})...", effective_device_pref);
-            
-            // [RESTORED] Prevent UI hang during heavy MSVC/NVCC initialization
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::*;
-                let thread = GetCurrentThread();
-                SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
-            }
-
             match LogisModel::new(effective_device_pref.as_deref()).await {
-                Ok(m) => {
-                    println!("[PROCESS] Model Engine Ready.");
-                    *model_lock = Some(m);
-                },
+                Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
         }
@@ -308,28 +281,7 @@ async fn process_task(
     let clean = parsing::pre_clean_html(&raw_html);
     let light_pug = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
     
-    // [RESTORED] Always save log even if thin for transparency
-    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    let log_subdir = pug_logs_dir.join(format!("{}_{}", task.id, ts_nano));
-    let _ = fs::create_dir_all(&log_subdir);
-    let _ = std::fs::write(log_subdir.join("raw_thin.pug"), &light_pug);
-
-    // [RESTORED] Defensive Guard: Skip only if absolutely empty or meta-only
-    if light_pug.trim().len() < 10 {
-        println!("[PROCESS] Content too thin ({} chars): '{}', skipping AI analysis.", light_pug.len(), light_pug.trim());
-        return Ok(());
-    }
-
-    data_manager.offload(&light_pug, "light_pug")?;
-    
-    let pug_chunks = chunk_text(&light_pug, 3072);
-    let mut chunk_index = Vec::new();
-    for (i, chunk) in pug_chunks.iter().enumerate() {
-        let chunk_filename = format!("chunk_{}.pug", i);
-        let _ = std::fs::write(log_subdir.join(&chunk_filename), chunk);
-        chunk_index.push(json!({ "index": i, "file": chunk_filename, "size": chunk.len() }));
-    }
-    let _ = std::fs::write(log_subdir.join("index.json"), json!(chunk_index).to_string());
+    if light_pug.trim().len() < 10 { return Ok(()); }
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     
@@ -357,241 +309,206 @@ async fn process_task(
     let _bake_result = (*bake_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
     REGISTRY.baking.remove(&bake_key);
     
-    println!("[PROCESS] Baking complete. Advancing to analysis phases.");
+    println!("[PROCESS] Baking complete. Advancing to INTEGRATED analysis phase.");
+
+    // --- INTEGRATED INFERENCE PHASE ---
+    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
+    
+    {
+        let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
+        let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
+        let gen_arc = model.generator.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut gen_guard = gen_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                gen.load_kv_stitched(&[pug_base_path])?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await??;
+    }
 
     let mut page_type = String::new();
     let mut selector_info = json!({});
     let mut is_detail = false;
+    let mut all_extracted_items = Vec::new();
 
-    // --- PHASE 1: CLASSIFICATION ---
+    // PHASE 1 & 2: Integrated Analysis (Type + Selectors)
     {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[PROCESS] Phase 1: Classification (Incremental Query)");
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Identifying page structure...", "spinner": "⠋" }));
+        
         let type_prompt = parsing::page_type_prompt();
         let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", type_prompt);
-        
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Identifying page type...", "spinner": "⠋" }));
 
-        // [2026-PHYSICAL-DEDUPLICATION] Registry-wrapped inference
-        let inf_key = format!("inf_class_{}", task.r#ref);
-        let inf_future = if let Some(existing) = REGISTRY.inference.get(&inf_key) {
-            println!("[REGISTRY] Joining in-flight classification for address: {}", task.r#ref);
-            existing.clone()
-        } else {
-            let model_arc = model.clone();
-            let ref_id = task.r#ref.clone();
-            let task_id = task.id.clone();
-            let prompt = query_text.clone();
-            let cancel = cancellation_token.clone();
-            let new_inf = async move {
-                Arc::new(model_arc.run_modular_inference(&ref_id, &task_id, "class", &prompt, "Classify this page.", Some(cancel)).await)
-            }.boxed().shared();
-            REGISTRY.inference.insert(inf_key.clone(), new_inf.clone());
-            new_inf
-        };
-
-        let res = (*inf_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?.clone();
-        REGISTRY.inference.remove(&inf_key);
+        let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("integrated_type")).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
-        if page_type == "unknown" || page_type.is_empty() { 
-            println!("[PROCESS] Identification failed for task {}.", task.id);
-            return Ok(()); 
-        }
+        if page_type == "unknown" || page_type.is_empty() { return Ok(()); }
 
-        // [RESTORED] State Sync: Update DB with intermediate result & refresh timestamp
-        {
-            let store_guard = store_mutex.lock().await;
-            if let Some(db) = store_guard.as_ref() {
-                let _ = db.update_task_status(&task.id, 1).await; // Updates updated_at
-                let _ = db.update_message_status(&task.id, 1, Some(&format!("Page identified as: {}", page_type))).await;
-            }
-        }
-
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": format!("Identified as {}", page_type), "spinner": "✅" }));
-    }
-
-    model.deep_purge_resources(false).await;
-    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
-
-    // --- PHASE 2: SELECTOR IDENTIFICATION ---
-    {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        println!("[PROCESS] Phase 2: Selector ID (Incremental Query)");
+        // Immediately follow up with selector detection in the same session
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        let query_text = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
-
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Analyzing structural selectors...", "spinner": "⠋" }));
-
-        // [2026-PHYSICAL-DEDUPLICATION] Registry-wrapped inference
-        let inf_key = format!("inf_sel_{}", task.r#ref);
-        let inf_future = if let Some(existing) = REGISTRY.inference.get(&inf_key) {
-            println!("[REGISTRY] Joining in-flight selector identification for address: {}", task.r#ref);
-            existing.clone()
-        } else {
-            let model_arc = model.clone();
-            let ref_id = task.r#ref.clone();
-            let task_id = task.id.clone();
-            let prompt = query_text.clone();
-            let cancel = cancellation_token.clone();
-            let new_inf = async move {
-                Arc::new(model_arc.run_modular_inference(&ref_id, &task_id, "sel", &prompt, "Identify selectors.", Some(cancel)).await)
-            }.boxed().shared();
-            REGISTRY.inference.insert(inf_key.clone(), new_inf.clone());
-            new_inf
-        };
-
-        let res = (*inf_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?.clone();
-        REGISTRY.inference.remove(&inf_key);
-        selector_info = parsing::parse_json_from_llm(&res);
+        let sel_query = format!("\n\nTASK: {}\n\nACTION: JSON ONLY", selector_prompt);
+        
+        let res_sel = model.chat("", &sel_query, Some(cancellation_token.clone()), Some("integrated_selectors_nobridge")).await?;
+        selector_info = parsing::parse_json_from_llm(&res_sel);
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
 
-        // [RESTORED] Incremental State Sync
-        {
-            let store_guard = store_mutex.lock().await;
-            if let Some(db) = store_guard.as_ref() {
-                let _ = db.update_task_status(&task.id, 1).await;
-                let _ = db.update_message_status(&task.id, 1, Some("Structure analyzed. Extracting data...")).await;
-            }
-        }
-
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Selectors", "summary": "Selectors identified.", "spinner": "✅", "data": selector_info }));
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": format!("Identified {} (Detail: {})", page_type, is_detail), "spinner": "✅" }));
     }
 
-    {
-        let db_lock = store_mutex.lock().await;
-        if let Some(db) = db_lock.as_ref() {
-            let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
-            if let Ok(url_obj) = url::Url::parse(&url) {
-                let raw_path = url_obj.path();
-                let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
-                let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
-                let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
-                let mut page_data = selector_info.clone();
-                if let Some(obj) = page_data.as_object_mut() {
-                    obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
-                    obj.insert("link".to_string(), json!(url_obj.path()));
-                    obj.insert("type".to_string(), json!(page_type));
-                }
-                let _ = db.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
-            }
-        }
-    }
-
-    model.deep_purge_resources(false).await;
-    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
-
-    let mut all_extracted_items = Vec::new();
-    let mut extracted_data = json!({});
-
+    // PHASE 3: Hybrid DOM Extraction (Rust Scraper)
     if !is_detail {
         log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Direct DOM extraction starting...", "spinner": "⠋" }));
         let target_selector = selector_info.get("item").and_then(|s| s.as_str()).unwrap_or("body").to_string();
+        
         {
             let document = scraper::Html::parse_document(&clean);
             let field_selectors = selector_info.get("selectors").and_then(|v| v.as_object());
+            
             if let Ok(sel) = scraper::Selector::parse(&target_selector) {
                 for item_node in document.select(&sel) {
                     let mut item_json = json!({});
                     let mut has_data = false;
+                    
                     if let Some(subs) = field_selectors {
                         for (field_name, sel_val) in subs {
-                            if let Ok(sub_sel) = scraper::Selector::parse(sel_val.as_str().unwrap_or("")) {
+                            let sub_sel_str = sel_val.as_str().unwrap_or("");
+                            if let Ok(sub_sel) = scraper::Selector::parse(sub_sel_str) {
                                 if let Some(found_el) = item_node.select(&sub_sel).next() {
                                     let text = found_el.text().collect::<Vec<_>>().join("").trim().to_string();
-                                    if !text.is_empty() { item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text)); has_data = true; }
+                                    if !text.is_empty() { 
+                                        item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text)); 
+                                        has_data = true; 
+                                    }
+                                } else {
+                                    // [METICULOUS] Check next sibling if multi-row pattern detected
+                                    if let Some(next_sibling) = item_node.next_sibling() {
+                                        if let Some(sibling_el) = scraper::ElementRef::wrap(next_sibling) {
+                                            if sibling_el.select(&sub_sel).next().is_some() {
+                                                if let Some(found_el) = sibling_el.select(&sub_sel).next() {
+                                                    let text = found_el.text().collect::<Vec<_>>().join("").trim().to_string();
+                                                    item_json.as_object_mut().unwrap().insert(field_name.clone(), json!(text));
+                                                    has_data = true;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     } else {
                         let text = item_node.text().collect::<Vec<_>>().join(" ").trim().to_string();
-                        if !text.is_empty() { item_json.as_object_mut().unwrap().insert("text".to_string(), json!(text)); has_data = true; }
+                        if !text.is_empty() { 
+                            item_json.as_object_mut().unwrap().insert("text".to_string(), json!(text)); 
+                            has_data = true; 
+                        }
                     }
+
                     if has_data {
                         if let Some(link_el) = item_node.select(&scraper::Selector::parse("a[href]").unwrap()).next() {
                             item_json.as_object_mut().unwrap().insert("link".to_string(), json!(link_el.value().attr("href").unwrap_or("")));
                         }
                         all_extracted_items.push(item_json);
                     }
-                                }
-                            }
-                        }
-                
-                        // [RESTORED] Auto-Correction: If only 1 item found and no link, treat as detail
-                        if all_extracted_items.len() == 1 {
-                            let first = &all_extracted_items[0];
-                            let has_link = first.get("link").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty());
-                            if !has_link {
-                                println!("[PROCESS] Single item without link found. Auto-correcting to Detail mode.");
-                                is_detail = true; 
-                            }
-                        }
-                
-                        if !is_detail && !all_extracted_items.is_empty() {
-            log_task_progress(app_handle, &task.id, &json!({ "category": "Refinement", "summary": format!("AI Refinement loop for {} items...", all_extracted_items.len()), "spinner": "⠋" }));
-            let mut refined_items = Vec::new();
-            let batch_size = 10;
-            
-            for (batch_idx, batch) in all_extracted_items.chunks(batch_size).enumerate() {
-                if cancellation_token.load(Ordering::Relaxed) { break; }
-                let start_item = batch_idx * batch_size + 1;
-                let end_item = std::cmp::min(start_item + batch.len() - 1, all_extracted_items.len());
-                
-                let batch_text: String = batch.iter().enumerate().map(|(i, it)| format!("Item {}:\n{}", i + 1, it.to_string())).collect::<Vec<_>>().join("\n\n");
-                let ins = parsing::list2json(&page_type, "english");
-                
-                // [RESTORED] Explicit action flag for batch progression
-                let action_flag = if end_item == all_extracted_items.len() { "ACTION: SAVE" } else { "ACTION: INGEST" };
-                let query_text = format!("{}\n\n{}", batch_text, action_flag);
-
-                let res = model.run_modular_inference(&task.r#ref, &task.id, &format!("refine_{}", batch_idx), &ins, &query_text, Some(cancellation_token.clone())).await?;
-                let parsed = parsing::parse_json_from_llm(&res);
-                
-                if let Some(arr) = parsed.as_array().or_else(|| parsed.get("items").and_then(|v| v.as_array())) {
-                    for (i, refined) in arr.iter().enumerate() {
-                        if i < batch.len() {
-                            let mut merged = batch[i].clone();
-                            merge_json_results(&mut merged, refined);
-                            refined_items.push(merged);
-                        }
-                    }
-                } else {
-                    refined_items.extend_from_slice(batch);
                 }
-
-                // [RESTORED] Detailed Progress Tracking
-                log_task_progress(app_handle, &task.id, &json!({ 
-                    "category": "Refinement", 
-                    "summary": format!("Processed items {}-{} of {}...", start_item, end_item, all_extracted_items.len()) 
-                }));
             }
-            all_extracted_items = refined_items;
         }
     }
 
+    // [METICULOUS-PROXY-PARITY] Upsert page info with correct grouping (bcc)
+    {
+        let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
+        if let Ok(url_obj) = url::Url::parse(&url) {
+            let raw_path = url_obj.path();
+            let page_id = crate::utils::hash::hash_id(&format!("{}{}", task.cc, raw_path)); 
+            let cc_for_bcc = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
+            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_bcc));
+            
+            let mut page_data = selector_info.clone();
+            if let Some(obj) = page_data.as_object_mut() {
+                obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
+                obj.insert("link".to_string(), json!(url_obj.path()));
+                obj.insert("type".to_string(), json!(page_type));
+            }
+            let _ = store.upsert_item("pages", &page_id, "pages", page_data, None, Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(raw_path), None).await;
+        }
+    }
+
+    // PHASE 4: AI Refinement (Detail Target-Scan vs List Refine)
+    let mut extracted_data = json!({});
     if is_detail {
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Extracting structured details...", "spinner": "⠋" }));
-        let ins = parsing::item2json(&page_type, &url, "english");
-        let res = model.run_modular_inference(&task.r#ref, &task.id, "detail", &ins, "Extract everything.", Some(cancellation_token.clone())).await?;
-        extracted_data = parsing::parse_json_from_llm(&res);
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Scanning target detail content...", "spinner": "⠋" }));
         
-        // [VALIDATION] Self-Correction: If result is too thin, retry with force prompt
-        if extracted_data.as_object().map_or(true, |obj| obj.is_empty()) {
-            println!("[PROCESS] Result empty. Retrying with high-pressure prompt...");
-            let force_ins = format!("{}\nSTRICT: DO NOT RETURN EMPTY. FIND DATA.", ins);
-            let res = model.run_modular_inference(&task.r#ref, &task.id, "detail_retry", &force_ins, "Extract all info.", Some(cancellation_token.clone())).await?;
-            extracted_data = parsing::parse_json_from_llm(&res);
-        }
+        // [METICULOUS] Targeted Detail Scan: instead of full HTML, scan specific selector
+        let target_selector = selector_info.get("node").or(selector_info.get("item")).and_then(|v| v.as_str()).unwrap_or("body");
+        let content_pug = {
+            let document = scraper::Html::parse_document(&clean);
+            let mut pug_output = String::new();
+            if let Ok(selector) = scraper::Selector::parse(target_selector) {
+                if let Some(element_ref) = document.select(&selector).next() {
+                    parsing::generate_pug_lines(element_ref.id(), 0, &mut pug_output, &PugMode::FullContent);
+                }
+            }
+            if pug_output.is_empty() { light_pug.clone() } else { pug_output }
+        };
+
+        let ins = parsing::item2json(&page_type, &url, "english");
+        let query_text = format!("[TARGET CONTENT]\n{}\n\nTASK: {}\n\nACTION: SAVE", content_pug, ins);
+        let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("detail_extraction_nobridge")).await?;
+        extracted_data = parsing::parse_json_from_llm(&res);
         all_extracted_items = vec![extracted_data.clone()];
+    } else if !all_extracted_items.is_empty() {
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Refinement", "summary": format!("AI Refinement loop for {} items...", all_extracted_items.len()), "spinner": "⠋" }));
+        
+        let mut refined_items = Vec::new();
+        let batch_size = 10;
+        
+        for (batch_idx, batch) in all_extracted_items.chunks(batch_size).enumerate() {
+            if cancellation_token.load(Ordering::Relaxed) { break; }
+            
+            let start_item = batch_idx * batch_size + 1;
+            let end_item = std::cmp::min(start_item + batch.len() - 1, all_extracted_items.len());
+            
+            println!("[PROCESS] Refining batch {} (Items {}-{} of {})", batch_idx + 1, start_item, end_item, all_extracted_items.len());
+            
+            let batch_text: String = batch.iter().enumerate()
+                .map(|(i, it)| format!("Item {}:\n{}", i + 1, it.to_string()))
+                .collect::<Vec<_>>().join("\n\n");
+                
+            let ins = parsing::list2json(&page_type, "english");
+            let action_flag = if end_item == all_extracted_items.len() { "ACTION: SAVE" } else { "ACTION: INGEST" };
+            let query_text = format!("{}\n\n{}\n\n{}", batch_text, ins, action_flag);
+            
+            let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some(&format!("batch_refinement_{}", batch_idx))).await?;
+            let parsed = parsing::parse_json_from_llm(&res);
+            
+            if let Some(arr) = parsed.as_array().or_else(|| parsed.get("items").and_then(|v| v.as_array())) {
+                for (i, refined) in arr.iter().enumerate() {
+                    if i < batch.len() {
+                        let mut merged = batch[i].clone();
+                        merge_json_results(&mut merged, refined);
+                        refined_items.push(merged);
+                    }
+                }
+            } else {
+                // Fallback: If AI fails to return JSON array, keep raw data for this batch
+                refined_items.extend_from_slice(batch);
+            }
+
+            log_task_progress(app_handle, &task.id, &json!({ 
+                "category": "Refinement", 
+                "summary": format!("Processed items {}-{} of {}...", start_item, end_item, all_extracted_items.len()) 
+            }));
+        }
+        all_extracted_items = refined_items;
     }
 
-    // --- PHASE 4: PERSISTENCE, RELAY & SYNC ---
+    // --- PHASE 4: PERSISTENCE & SYNC ---
     model.unload_generator().await;
     let store = { let g = store_mutex.lock().await; g.as_ref().ok_or_else(|| anyhow::anyhow!("DB Error"))?.clone() };
     let team_id = if task.to.is_empty() { crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000") } else { task.to.clone() };
 
-    // [1. 정밀 데이터 정규화] Flatten nested { value: ... } structures
+    // [INTEGRATED-NORMALIZATION] Deeply flatten nested structures for the root extracted_data
     let mut normalized_root = json!({});
     if let Some(obj) = extracted_data.as_object() {
         for (k, v) in obj {
@@ -603,10 +520,10 @@ async fn process_task(
     }
     extracted_data = normalized_root;
 
-    // [2. 데이터베이스 릴레이 & 사이드 이펙트] Order -> Tracking auto-generation
+    // [INTEGRATED-RELAY] Database Side Effects: Order -> Tracking auto-generation
     if page_type == "order" && is_detail {
         if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
-            let cc_val = task.cc.to_uppercase(); // [4. 엄격한 Proxy ID] Uppercase CC for detail parity
+            let cc_val = task.cc.to_uppercase(); 
             for good in goods_arr {
                 let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
                 if !g_no.is_empty() {
@@ -625,105 +542,77 @@ async fn process_task(
         }
     }
 
-    if !is_detail {
-        for item_orig in &all_extracted_items {
-            if cancellation_token.load(Ordering::Relaxed) { break; }
-            let mut item = item_orig.clone();
-            
-            // Normalize each item in list
-            let mut normalized_item = json!({});
-            if let Some(obj) = item.as_object() {
-                for (k, v) in obj {
-                    let val = if let Some(inner) = v.as_object() {
-                        if let Some(vf) = inner.get("value") { vf.clone() } else { v.clone() }
-                    } else { v.clone() };
-                    normalized_item.as_object_mut().unwrap().insert(k.clone(), val);
-                }
-            }
-            item = normalized_item;
-
-            let item_id;
-            let idx_val;
-            let link;
-
-            if let Some(obj) = item.as_object_mut() {
-                if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
-                let id_raw = obj.get("id").or_else(|| obj.get("index")).and_then(|v| v.as_str()).unwrap_or("");
-                let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(id_raw).replace("-", "").replace("_", "");
-                idx_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
-                item_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, idx_val));
-                obj.insert("index".to_string(), json!(idx_val));
-                obj.insert("id".to_string(), json!(item_id));
-                link = obj.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            } else { continue; }
-
-            let mut final_item = item.clone();
-            if let Some((queries, _merge_info)) = logic::relay(&page_type, &item) {
-                for q in queries { 
-                    if let Ok(Some((_ex_id, ex_data))) = store.find_item_by_property(&q.table, &q.column, &q.value).await { 
-                        logic::merge_node(&mut final_item, &ex_data); 
-                        break; 
-                    } 
-                }
-            }
-
-            let mut text_to_embed = parsing::json_to_natural_language(&final_item);
-            let item_digest = crate::utils::hash::digest(&text_to_embed);
-            
-            if text_to_embed.chars().count() > 3000 { text_to_embed = text_to_embed.chars().take(3000).collect(); }
-
-            // [RESTORED] Cancellable Embedding
-            let vector = tokio::select! {
-                res = model.get_embedding(text_to_embed) => res?,
-                _ = async { loop { if cancellation_token.load(Ordering::Relaxed) { break; } tokio::time::sleep(std::time::Duration::from_millis(100)).await; } } => { return Err(anyhow::anyhow!("Task cancelled")); }
-            };
-
-            let cc_for_hash = task.cc.clone(); 
-            let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_hash));
-            let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, link));
-
-            let _ = store.upsert_item(&page_type, &item_id, &page_type, final_item.clone(), Some(vector.clone()), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
-            let _ = store.upsert_item("items", &item_id, &page_type, final_item, Some(vector), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
-        }
-    } else {
-        // [RESTORED] Direct Item Persistence for Detail Pages (Proxy Parity)
-        let mut target_id = task.r#ref.clone();
-        let mut final_data = extracted_data.clone();
+    for item_orig in &all_extracted_items {
+        if cancellation_token.load(Ordering::Relaxed) { break; }
         
-        // [2. 데이터베이스 릴레이 및 병합] Sync with existing data if detail matches
-        if let Some((queries, _)) = logic::relay(&page_type, &final_data) {
-            for q in queries {
-                if let Ok(Some((ex_id, ex_data))) = store.find_item_by_property(&q.table, &q.column, &q.value).await {
-                    println!("[STILL-CURRENT] Found existing {} for detail, merging...", page_type);
-                    logic::merge_node(&mut final_data, &ex_data);
-                    target_id = ex_id;
-                    break;
-                }
+        let mut item = item_orig.clone();
+        
+        // [INTEGRATED-NORMALIZATION] Apply same deep flattening to each item in the list
+        let mut normalized_item = json!({});
+        if let Some(obj) = item.as_object() {
+            for (k, v) in obj {
+                let val = if let Some(inner) = v.as_object() {
+                    if let Some(vf) = inner.get("value") { vf.clone() } else { v.clone() }
+                } else { v.clone() };
+                normalized_item.as_object_mut().unwrap().insert(k.clone(), val);
+            }
+        }
+        item = normalized_item;
+
+        let item_id;
+        let idx_val;
+        let link;
+
+        if let Some(obj) = item.as_object_mut() {
+            if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type)); }
+            let id_raw = obj.get("id").or_else(|| obj.get("index")).and_then(|v| v.as_str()).unwrap_or("");
+            let clean_no = crate::utils::hash::normalize_numeric_homoglyphs(id_raw).replace("-", "").replace("_", "");
+            idx_val = crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!("{}{}{}", page_type, team_id, clean_no)));
+            item_id = crate::utils::hash::hash_id(&format!("{}{}", team_id, idx_val));
+            obj.insert("index".to_string(), json!(idx_val));
+            obj.insert("id".to_string(), json!(item_id));
+            link = obj.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        } else { continue; }
+
+        let mut final_item = item.clone();
+        if let Some((queries, _)) = logic::relay(&page_type, &item) {
+            for q in queries { 
+                if let Ok(Some((_, ex_data))) = store.find_item_by_property(&q.table, &q.column, &q.value).await { 
+                    logic::merge_node(&mut final_item, &ex_data); 
+                    break; 
+                } 
             }
         }
 
-        let mut text_to_embed = parsing::json_to_natural_language(&final_data);
+        let text_to_embed = parsing::json_to_natural_language(&final_item);
         let item_digest = crate::utils::hash::digest(&text_to_embed);
+        
+        // [INTEGRATED-OPTIMIZATION] Skip high-cost embedding if content hasn't changed
         let mut existing_vector = None;
-        if let Ok(Some(ex)) = store.get_item_by_id(&page_type, &target_id).await { if ex.digest == item_digest { existing_vector = Some(ex.vector); } }
-        if text_to_embed.chars().count() > 3000 { text_to_embed = text_to_embed.chars().take(3000).collect(); }
-        let vector = if let Some(v) = existing_vector { v } else { 
-            tokio::select! {
-                res = model.get_embedding(text_to_embed) => res?,
-                _ = async { loop { if cancellation_token.load(Ordering::Relaxed) { break; } tokio::time::sleep(std::time::Duration::from_millis(100)).await; } } => { return Err(anyhow::anyhow!("Task cancelled")); }
+        if let Ok(Some(existing)) = store.get_item_by_id(&page_type, &item_id).await {
+            if existing.digest == item_digest {
+                println!("[PROCESS] Digest match for {}. Skipping embedding.", item_id);
+                existing_vector = Some(existing.vector);
             }
+        }
+
+        let vector = if let Some(v) = existing_vector {
+            v
+        } else {
+            model.get_embedding(text_to_embed).await?
         };
-        let cc_for_hash = task.cc.to_uppercase();
+
+        let cc_for_hash = task.cc.clone(); 
         let bcc = crate::utils::hash::hash_id(&format!("{}{}", page_type, cc_for_hash));
-        let ref_val = task.r#ref.clone();
-        let _ = store.upsert_item(&page_type, &target_id, &page_type, final_data.clone(), Some(vector.clone()), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
-        let _ = store.upsert_item("items", &target_id, &page_type, final_data, Some(vector), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
+        let ref_val = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, link));
+
+        let _ = store.upsert_item(&page_type, &item_id, &page_type, final_item.clone(), Some(vector.clone()), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
+        let _ = store.upsert_item("items", &item_id, &page_type, final_item, Some(vector), Some(&task.from), Some(&team_id), Some(&task.cc), Some(&bcc), Some(&ref_val), Some(&item_digest)).await;
     }
 
-    // [RESTORED] Final Status Reporting
-    let final_summary = if !is_detail { format!("Extraction Complete ({} items saved)", all_extracted_items.len()) } else { "Extraction Complete".to_string() };
-    { let status_code = logic::parse_status("complete"); let _ = store.update_message_status(&task.id, status_code, Some(&final_summary)).await; }
-    let payload = json!({ "task_id": task.id, "category": "Done", "summary": final_summary, "spinner": "✅", "data": if !is_detail { json!(null) } else { extracted_data } });
+    let final_summary = format!("Extraction Complete ({} items saved)", all_extracted_items.len());
+    let _ = store.update_message_status(&task.id, logic::parse_status("complete"), Some(&final_summary)).await;
+    let payload = json!({ "task_id": task.id, "category": "Done", "summary": final_summary, "spinner": "✅", "data": extracted_data });
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
@@ -755,23 +644,16 @@ pub fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
-    utils::paths::cleanup_temp_dirs(app_handle);
-}
-
-async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>) -> Result<()> {
+async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: &Arc<AtomicBool>) -> Result<()> {
     use nvml_wrapper::Nvml;
     use sysinfo::System;
     let mut sys = System::new_all();
     let nvml = Nvml::init().ok();
     let target_vram_bytes = target_vram_mb * 1024 * 1024;
     let target_ram_bytes = target_ram_mb * 1024 * 1024;
-    let mut last_vram = 0;
-    let mut stable_ticks = 0;
     let start_time = std::time::Instant::now();
-    println!("[RESOURCE-WATCH] Monitoring recovery (Target VRAM > {}MB)...", target_vram_mb);
     loop {
-        if let Some(token) = cancellation_token { if token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); } }
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         sys.refresh_memory(); 
         let current_ram = sys.available_memory();
         let mut current_vram = 0;
@@ -782,11 +664,7 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             }
         }
         if (!has_gpu || current_vram >= target_vram_bytes) && current_ram >= target_ram_bytes { break; }
-        let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
-        if delta < 5_000_000 { stable_ticks += 1; } else { stable_ticks = 0; }
-        if stable_ticks >= 6 && current_vram > 1_200_000_000 { break; }
         if start_time.elapsed().as_secs() > 20 { break; }
-        last_vram = current_vram;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Ok(())

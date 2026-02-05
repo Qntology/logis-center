@@ -50,17 +50,15 @@ impl NativeEmbeddingModel {
                 post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p))?,
                 q_norm: None,
                 k_norm: None,
-                q_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.q_proj.weight", p))?, bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) },
-                k_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.k_proj.weight", p))?, bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) },
-                v_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.v_proj.weight", p))?, bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) },
-                o_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.o_proj.weight", p))?, bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) },
-                gate_proj: NativeLinear { in_features: hidden_size, out_features: 1152, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.gate_proj.weight", p))?, bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) },
-                up_proj: NativeLinear { in_features: hidden_size, out_features: 1152, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.up_proj.weight", p))?, bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) },
-                down_proj: NativeLinear { in_features: 1152, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.down_proj.weight", p))?, bias: None }, device_id: -1, scratch_i: std::sync::Mutex::new(None), scratch_o: std::sync::Mutex::new(None) },
+                q_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.q_proj.weight", p))?, bias: None }, device_id: -1 },
+                k_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.k_proj.weight", p))?, bias: None }, device_id: -1 },
+                v_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.v_proj.weight", p))?, bias: None }, device_id: -1 },
+                o_proj: NativeLinear { in_features: hidden_size, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.self_attn.o_proj.weight", p))?, bias: None }, device_id: -1 },
+                gate_proj: NativeLinear { in_features: hidden_size, out_features: 1152, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.gate_proj.weight", p))?, bias: None }, device_id: -1 },
+                up_proj: NativeLinear { in_features: hidden_size, out_features: 1152, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.up_proj.weight", p))?, bias: None }, device_id: -1 },
+                down_proj: NativeLinear { in_features: 1152, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.down_proj.weight", p))?, bias: None }, device_id: -1 },
                 kv_cache: std::sync::Mutex::new(None),
                 gpu_kv_cache: std::sync::Mutex::new(None),
-                attn_scratch_q: std::sync::Mutex::new(None),
-                attn_scratch_o: std::sync::Mutex::new(None),
                 device_id: -1,
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
@@ -95,7 +93,7 @@ impl NativeEmbeddingModel {
         let mut x = native_embedding_lookup_f16(token_ids, &table, self.hidden_size);
 
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, &cfg, 0, i, &[], &[], false);
+            x = layer.forward(&x, &cfg, 0, i, &[], &[], false, None);
         }
 
         let norm_w = self.norm.get_slice::<f16>();
