@@ -228,7 +228,7 @@ impl LogisModel {
             if let Some(gen) = gen_guard.as_mut() {
                 let path = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref()).join(format!("{}.safetensors", task_id_str));
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
-                gen.save_kv_to_disk(&path, 0)?;
+                gen.save_kv_to_disk(&path, 0, &[])?;
                 Ok(path.to_string_lossy().to_string())
             } else {
                 Err(anyhow::anyhow!("No active generator to save snapshot from"))

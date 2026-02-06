@@ -33,6 +33,12 @@ impl ModelVariant {
             Self::Native(m) => m,
         }
     }
+
+    pub fn get_native_ref(&self) -> &Arc<NativeQwen3VLModel> {
+        match self {
+            Self::Native(m) => m,
+        }
+    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -239,21 +245,27 @@ impl Qwen3VLGenerateModel {
             current_kv_offset += chunk.len();
         }
 
-        // [LBR-STABILITY-MAX] Recalibrate the last block to bridge 0.6B -> 2B drift
-        // Using native 2B activations for the immediate context before generation.
-        if !no_bridge || seqlen_offset > 0 {
-            let recalib_len = current_kv_offset.min(32);
-            let safe_offset = current_kv_offset.saturating_sub(recalib_len);
+        // [LBR-STABILITY-FINAL] Recalibrate activations at the boundary of stitched files
+        // Uses the REAL tokens extracted from the baked component metadata.
+        if seqlen_offset > 0 {
+            let (recalib_chunk, safe_offset) = {
+                let rope_guard = self.qwen3_vl.get_native_ref().text_model.rope_cache.lock().unwrap();
+                let tokens = &rope_guard.tail_tokens;
+                if !tokens.is_empty() {
+                    let len = tokens.len().min(32);
+                    let start = tokens.len().saturating_sub(len);
+                    (tokens[start..].to_vec(), seqlen_offset.saturating_sub(len))
+                } else {
+                    // Fallback to old heuristic if metadata is missing
+                    let recalib_len = 32.min(seqlen_offset);
+                    let recalib_start = local_pos.saturating_sub(recalib_len);
+                    (all_ids[recalib_start..local_pos].to_vec(), seqlen_offset.saturating_sub(recalib_len))
+                }
+            };
             
-            if recalib_len > 0 {
-                // Determine the correct slice from all_ids to match the end of the context
-                let recalib_start = all_ids.len().saturating_sub(recalib_len + 1); // +1 to exclude current trigger
-                let recalib_end = all_ids.len().saturating_sub(1);
-                let recalib_chunk = &all_ids[recalib_start..recalib_end];
-                
-                println!("[LBR-MAX] Re-aligning {} tokens at offset {} with native 2B weights...", recalib_chunk.len(), safe_offset);
-                // Force update KV cache with 2B's native numerical characteristics
-                self.qwen3_vl.forward(recalib_chunk, None, None, safe_offset);
+            if !recalib_chunk.is_empty() {
+                println!("[LBR-BRIDGE] Syncing last {} tokens from file metadata at offset {}...", recalib_chunk.len(), safe_offset);
+                self.qwen3_vl.forward(&recalib_chunk, None, None, safe_offset);
             }
         }
 
@@ -346,7 +358,8 @@ impl Qwen3VLGenerateModel {
 
         // 3. Final Pull: Extract the COMPLETE KV state from ALL layers once, but only from initial_offset
         let final_path = crate::utils::paths::get_kv_dir(None, address_hash).join(format!("{}_{}.safetensors", task_id, suffix));
-        self.save_kv_to_disk(&final_path, initial_offset)?;
+        let tail_tokens = if all_ids.len() > 32 { &all_ids[all_ids.len()-32..] } else { &all_ids };
+        self.save_kv_to_disk(&final_path, initial_offset, tail_tokens)?;
         println!("[BAKE-STREAM] SUCCESS: Saved component context ({} tokens added) to {:?}", (all_ids.len()), final_path);
 
         self.clear_kv_cache(); 
@@ -374,8 +387,9 @@ impl Qwen3VLGenerateModel {
             current_offset += chunk.len();
         }
 
-        // [FIX] Save ONLY the newly baked tokens starting from initial_offset
-        self.save_kv_to_disk(final_path, initial_offset)?;
+        // [FIX] Extract the last 32 tokens as a bridge for 2B synchronization
+        let tail_tokens = if all_ids.len() > 32 { &all_ids[all_ids.len()-32..] } else { &all_ids };
+        self.save_kv_to_disk(final_path, initial_offset, tail_tokens)?;
         
         self.clear_kv_cache();
         Ok(())
@@ -410,7 +424,7 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
-    pub fn save_kv_to_disk(&self, path: &Path, start_token_idx: usize) -> Result<()> {
+    pub fn save_kv_to_disk(&self, path: &Path, start_token_idx: usize, tail_tokens: &[u32]) -> Result<()> {
         let kvs = match &self.qwen3_vl {
             ModelVariant::Native(m) => m.text_model.get_all_kv(start_token_idx),
         };
@@ -426,7 +440,13 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut tensors = std::collections::HashMap::new();
-        // [FIX] Windows Os Error 1784 대응: raw_parts 대신 안전한 바이트 복사 사용
+        
+        // [BRIDGE-METADATA] Save the last few tokens to allow LBR during stitching
+        if !tail_tokens.is_empty() {
+            let mut t_bytes = Vec::with_capacity(tail_tokens.len() * 4);
+            for &val in tail_tokens { t_bytes.extend_from_slice(&val.to_ne_bytes()); }
+            tensors.insert("metadata.tokens".to_string(), (safetensors::Dtype::U32, vec![tail_tokens.len()], t_bytes));
+        }
 
         for (i, (k, v)) in kvs.into_iter().enumerate() {
             // K (u32) to bytes
@@ -465,12 +485,24 @@ impl Qwen3VLGenerateModel {
 
                 // Clear existing cache before starting
                 m.text_model.force_free_kv_cache();
+                {
+                    let mut rope_guard = m.text_model.rope_cache.lock().unwrap();
+                    rope_guard.tail_tokens.clear();
+                }
 
                 for path in paths {
                     if !path.exists() { continue; }
                     println!("[KV-STITCH] Loading component: {:?}", path.file_name());
                     let file = std::fs::read(path)?;
                     let st = safetensors::SafeTensors::deserialize(&file)?;
+                    
+                    // [BRIDGE-LOAD] Extract tail tokens for synchronization
+                    if let Ok(tt) = st.tensor("metadata.tokens") {
+                        let tokens: Vec<u32> = tt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                        let mut rope_guard = m.text_model.rope_cache.lock().unwrap();
+                        rope_guard.tail_tokens = tokens;
+                        println!("[KV-STITCH] Found {} bridge tokens in {:?}", rope_guard.tail_tokens.len(), path.file_name());
+                    }
                     
                     // [2026-MULTI-LAYER-STITCH] 1:1 Parity Mapping (28 Layers for both Small & Large)
                     let mut file_layers = 0;

@@ -721,6 +721,7 @@ pub struct RopeCache {
     pub head_dim: usize,
     pub theta: f32,
     pub current_max_len: usize,
+    pub tail_tokens: Vec<u32>, // [BRIDGE] Last tokens from baked component
 }
 
 impl RopeCache {
@@ -731,6 +732,7 @@ impl RopeCache {
             head_dim,
             theta,
             current_max_len: 0,
+            tail_tokens: Vec::new(),
         };
         cache.ensure_length(initial_len);
         cache
