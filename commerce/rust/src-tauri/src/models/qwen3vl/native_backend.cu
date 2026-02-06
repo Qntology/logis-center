@@ -382,4 +382,23 @@ extern "C" {
     void cuda_apply_gain_f16(half* d_data, float gain, int elements) {
         apply_gain_kernel_f16<<<(elements + 255)/256, 256>>>(d_data, gain, elements);
     }
+
+    void cuda_element_mul_f16(half* d_dst, const half* d_src, int size) {
+        auto kernel = [] __device__ (half* dst, const half* src, int total) {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i < total) dst[i] = __float2half(__half2float(dst[i]) * __half2float(src[i]));
+        };
+        // [MOD] Define properly below
+    }
+}
+
+__global__ void element_mul_kernel_f16(half* dst, const half* src, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) dst[i] = __float2half(__half2float(dst[i]) * __half2float(src[i]));
+}
+
+extern "C" {
+    void cuda_element_mul_f16(half* d_dst, const half* d_src, int size) {
+        element_mul_kernel_f16<<<(size + 255)/256, 256>>>(d_dst, d_src, size);
+    }
 }
