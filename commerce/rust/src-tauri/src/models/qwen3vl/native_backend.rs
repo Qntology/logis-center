@@ -51,6 +51,14 @@ extern "C" {
 
     #[link_name = "cuda_pack_bits_f16"]
     pub fn cuda_pack_bits_f16(d_src: *const f16, d_dst: *mut u32, elements: i32);
+
+    #[link_name = "cuda_apply_gain_f16"]
+    pub fn cuda_apply_gain_f16(d_data: *mut f16, gain: f32, elements: i32);
+}
+
+#[cfg(feature = "cuda")]
+pub fn native_cuda_apply_gain(d_data: CUdeviceptr, gain: f32, elements: usize) {
+    unsafe { cuda_apply_gain_f16(d_data as *mut f16, gain, elements as i32); }
 }
 
 #[cfg(feature = "cuda")]

@@ -337,7 +337,48 @@ __global__ void apply_gain_kernel_f16(half* data, float gain, int total) {
     if (i < total) data[i] = __float2half(__half2float(data[i]) * gain);
 }
 
+// [GPU-RESIDUAL] Fast In-place Addition
+__global__ void add_inplace_kernel_f16(half* dst, const half* src, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) dst[i] = __float2half(__half2float(dst[i]) + __half2float(src[i]));
+}
+
+// [GPU-HYBRID-EXPAND] Fast repetition for 0.6B -> 2B transition
+__global__ void hybrid_repeat_kernel_f16(half* data, int src_size, int target_size, int q_len) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = q_len * target_size;
+    if (tid >= total_elements) return;
+
+    int t = tid / target_size;
+    int i = tid % target_size;
+    if (i >= src_size) {
+        data[tid] = data[t * target_size + (i % src_size)];
+    }
+}
+
+// [GPU-SILU] Fast element-wise SiLU
+__global__ void silu_inplace_kernel_f16(half* data, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float f = __half2float(data[i]);
+        data[i] = __float2half(f / (1.0f + expf(-f)));
+    }
+}
+
 extern "C" {
+    void cuda_add_inplace_f16(half* d_dst, const half* d_src, int size) {
+        add_inplace_kernel_f16<<<(size + 255)/256, 256>>>(d_dst, d_src, size);
+    }
+
+    void cuda_hybrid_repeat_f16(half* d_data, int src_size, int target_size, int q_len) {
+        int total = q_len * target_size;
+        hybrid_repeat_kernel_f16<<<(total + 255)/256, 256>>>(d_data, src_size, target_size, q_len);
+    }
+
+    void cuda_silu_inplace_f16(half* d_data, int size) {
+        silu_inplace_kernel_f16<<<(size + 255)/256, 256>>>(d_data, size);
+    }
+
     void cuda_apply_gain_f16(half* d_data, float gain, int elements) {
         apply_gain_kernel_f16<<<(elements + 255)/256, 256>>>(d_data, gain, elements);
     }
