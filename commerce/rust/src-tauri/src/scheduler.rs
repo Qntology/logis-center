@@ -223,14 +223,21 @@ async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // [2026-CLEAN-START] Force clear existing temporary data for this address hash
+    // [2026-CLEAN-START] Thread-safe directory management
     {
         let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
-        if kv_dir.exists() {
-            println!("[CLEAN-START] Purging existing KV cache for address: {}", task.r#ref);
-            let _ = fs::remove_dir_all(&kv_dir);
+        let bake_key = format!("bake_{}", task.r#ref);
+        
+        // Only clear the directory if this is a fresh start and NO ONE else is baking it
+        if !REGISTRY.baking.contains_key(&bake_key) {
+            if kv_dir.exists() {
+                println!("[CLEAN-START] Fresh start for address {}. Purging old cache.", task.r#ref);
+                let _ = fs::remove_dir_all(&kv_dir);
+            }
+            let _ = fs::create_dir_all(&kv_dir);
+        } else {
+            println!("[REGISTRY-SYNC] Join detected for {}. Skipping directory purge to protect active bake.", task.r#ref);
         }
-        let _ = fs::create_dir_all(&kv_dir);
     }
 
     let _data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
@@ -288,9 +295,9 @@ async fn process_task(
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     
-    // [2026-STRICT-COMPATIBILITY] Always use LARGE model for baking site context.
-    // Even in baking mode (Layer 0), the dimensions must match the final inference model.
-    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
+    // [2026-STRICT-2048-DIM] Use Large (2B) model for baking to match the 2048-dim requirement.
+    // We use baking_only: true to only load Layer 0, keeping it fast while maintaining dimensions.
+    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), true, true, Some(&task.r#ref)).await?;
     
     // [2026-PHYSICAL-DEDUPLICATION] Check registry before baking
     let bake_key = format!("bake_{}", task.r#ref);
@@ -306,7 +313,6 @@ async fn process_task(
         let cancel = cancellation_token.clone();
         
         let new_bake = async move {
-            // Internal call will use the Large model since we secured it above
             Arc::new(model_arc.bake_pug_context(&ref_id, &task_id, &pug, Some(cancel)).await)
         }.boxed().shared();
         
@@ -317,7 +323,7 @@ async fn process_task(
     let _bake_result = (*bake_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
     REGISTRY.baking.remove(&bake_key);
     
-    println!("[PROCESS] Baking complete with 2B dimensions. Advancing to INTEGRATED analysis phase.");
+    println!("[PROCESS] Baking complete with 2B (2048-dim) format. Advancing to analysis phase.");
 
     // --- INTEGRATED INFERENCE PHASE ---
     model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, false, Some(&task.r#ref)).await?;

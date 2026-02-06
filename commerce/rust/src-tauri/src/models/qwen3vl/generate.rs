@@ -427,7 +427,6 @@ impl Qwen3VLGenerateModel {
     /// [PARALLEL] Context-aware splitting for large documents - Encode once, Bake in parallel
     pub fn bake_text_in_parts(&mut self, text: String, task_id: &str, suffix: &str, address_hash: Option<&str>, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
         use rayon::prelude::*;
-        use std::sync::atomic::AtomicUsize;
 
         println!("[BAKE-STREAM-PARALLEL] Starting high-speed baking for {} (Offset: {})", task_id, initial_offset);
         
@@ -449,20 +448,17 @@ impl Qwen3VLGenerateModel {
 
         // 2. Parallel Processing
         let chunks: Vec<_> = all_ids.chunks(chunk_size).enumerate().collect();
-        let active_threads = Arc::new(AtomicUsize::new(0));
-        let max_parallel = 3;
 
         chunks.par_iter().for_each(|(chunk_idx, chunk)| {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return; } }
-            while active_threads.load(Ordering::SeqCst) >= max_parallel { std::thread::sleep(std::time::Duration::from_millis(50)); }
-            active_threads.fetch_add(1, Ordering::SeqCst);
-
             let current_chunk_offset = initial_offset + (chunk_idx * chunk_size);
             
             // Forward call will use a thread-local workspace internally
             self.qwen3_vl.forward(chunk, None, None, current_chunk_offset);
-
-            active_threads.fetch_sub(1, Ordering::SeqCst);
+            
+            if (chunk_idx + 1) % 5 == 0 || chunk_idx == &0 {
+                println!("[BAKE-PARALLEL] Progress: Chunk {}/{}", chunk_idx + 1, chunks.len());
+            }
         });
 
         // 3. Save
@@ -478,7 +474,6 @@ impl Qwen3VLGenerateModel {
     /// [PARALLEL] Context-aware splitting - Save to specific path with VRAM safety
     pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
         use rayon::prelude::*;
-        use std::sync::atomic::AtomicUsize;
 
         println!("[BAKE-PARALLEL] Starting high-speed parallel baking for {:?} (Offset: {})", final_path, initial_offset);
         
@@ -486,58 +481,50 @@ impl Qwen3VLGenerateModel {
         let total_tokens = all_ids.len();
         let chunk_size = self.max_chunk_size;
         
-        // 1. Pre-allocate everything once to avoid race conditions and reallocations
+        // 1. Pre-allocate everything once (Silent expansion)
         {
             let ModelVariant::Native(m) = &self.qwen3_vl;
             let needed_total = initial_offset + total_tokens;
             
-            // Expand RoPE cache
             let mut rope_guard = m.text_model.rope_cache.lock().unwrap();
             rope_guard.ensure_length(needed_total);
             
-            // Expand KV cache for all layers
             for layer in &m.text_model.layers {
                 let mut gpu_cache = layer.gpu_kv_cache.lock().unwrap();
                 gpu_cache.grow(needed_total, m.text_model.config.num_key_value_heads, m.text_model.config.head_dim, layer.device_id);
             }
         }
 
-        // 2. Prepare chunks
+        // 2. Process in parallel chunks
+        // We rely on Rayon's internal thread pool and the model's internal Mutexes 
+        // to naturally pipeline the execution across layers.
         let chunks: Vec<_> = all_ids.chunks(chunk_size).enumerate().collect();
-        let active_threads = Arc::new(AtomicUsize::new(0));
-        let max_parallel = 3; // Keep 3 parallel chunks to ensure ~20-30% VRAM margin on 4GB card
 
-        // 3. Process in parallel using Rayon
         chunks.par_iter().for_each(|(chunk_idx, chunk)| {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return; }
             }
 
-            // Simple VRAM throttling: wait if too many threads are active
-            while active_threads.load(Ordering::SeqCst) >= max_parallel {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            active_threads.fetch_add(1, Ordering::SeqCst);
-
             let current_chunk_offset = initial_offset + (chunk_idx * chunk_size);
-            println!("[BAKE-THREAD] Processing chunk {} (Tokens: {}, Offset: {})", chunk_idx + 1, chunk.len(), current_chunk_offset);
-
-            // Forward call will use a thread-local workspace internally
+            // No sleep, just push to the model. Internal Mutexes will handle serialization 
+            // at the layer level, effectively pipelining the GPU work.
             self.qwen3_vl.forward(chunk, None, None, current_chunk_offset);
-
-            active_threads.fetch_sub(1, Ordering::SeqCst);
+            
+            if (chunk_idx + 1) % 5 == 0 || chunk_idx == &0 {
+                println!("[BAKE-PARALLEL] Progress: Chunk {}/{}", chunk_idx + 1, chunks.len());
+            }
         });
 
         if let Some(flag) = &cancel_flag {
             if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
         }
 
-        // 4. Final Save: Extract the COMPLETE KV state
+        // 3. Final Save: Extract the COMPLETE KV state
         let tail_tokens = if all_ids.len() > 64 { &all_ids[all_ids.len()-64..] } else { &all_ids };
         self.save_kv_to_disk(final_path, initial_offset, tail_tokens)?;
         
         self.clear_kv_cache();
-        println!("[BAKE-PARALLEL] SUCCESS: Saved context to {:?}", final_path);
+        println!("[BAKE-PARALLEL] SUCCESS: Context saved to {:?}", final_path);
         Ok(())
     }
 
