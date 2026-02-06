@@ -40,8 +40,12 @@ __global__ void bit_serial_matmul_kernel_f16(
                     int k_base = kb * 32 + b;
                     if (k_base < src_k) {
                         float combined_signal = 0.0f;
+                        // [HYBRID-CYCLIC-REPETITION] Repeat input signal to match expanded target dimension
+                        // Instead of simple sum, we use the value at (k_base % src_k) 
+                        // but since we are within kb block, we just ensure k_base is safe.
                         for (int r = 0; r < repetition; ++r) {
-                            combined_signal += __half2float(input[m * K + k_base + (r * src_k)]);
+                            int target_k_idx = k_base + (r * src_k);
+                            combined_signal += __half2float(input[m * K + (target_k_idx % K)]);
                         }
                         // [STABILITY] Normalize folded signal energy
                         combined_signal *= r_scale;
@@ -104,8 +108,10 @@ __global__ void bit_serial_attn_kernel_f16(
             int d_base = tid * 32 + b;
             if (d_base < src_h_d) {
                 float combined_q = 0.0f;
+                // [HYBRID-CYCLIC-REPETITION] Cyclic read for Query signals
                 for (int r = 0; r < repetition; ++r) {
-                    combined_q += __half2float(Q[(q_idx * n_h * h_d) + (h * h_d) + d_base + (r * src_h_d)]);
+                    int target_d_idx = d_base + (r * src_h_d);
+                    combined_q += __half2float(Q[(q_idx * n_h * h_d) + (h * h_d) + (target_d_idx % h_d)]);
                 }
                 combined_q *= r_scale;
                 if (combined_q >= 0.0f) folded_bts |= (1u << b);

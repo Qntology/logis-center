@@ -20,6 +20,7 @@ pub struct ForwardWorkspace {
     pub hidden_b: Vec<f16>,
     pub intermediate_a: Vec<f16>,
     pub intermediate_b: Vec<f16>,
+    pub intermediate_c: Vec<f16>, // [NEW] Added for multi-stage MLP
     pub q: Vec<f16>,
     pub k: Vec<f16>,
     pub v: Vec<f16>,
@@ -29,7 +30,7 @@ impl ForwardWorkspace {
     pub fn new() -> Self {
         Self { 
             hidden_a: Vec::new(), hidden_b: Vec::new(), 
-            intermediate_a: Vec::new(), intermediate_b: Vec::new(),
+            intermediate_a: Vec::new(), intermediate_b: Vec::new(), intermediate_c: Vec::new(),
             q: Vec::new(), k: Vec::new(), v: Vec::new() 
         }
     }
@@ -40,14 +41,16 @@ impl ForwardWorkspace {
         let req_q = q_len * n_h * head_dim;
         let req_kv = q_len * n_kv * head_dim;
         
-        // [SAFE-GROWTH] Use resize to ensure both capacity and length are valid
-        if self.hidden_a.len() < req_hidden { self.hidden_a.resize(req_hidden, f16::ZERO); }
-        if self.hidden_b.len() < req_hidden { self.hidden_b.resize(req_hidden, f16::ZERO); }
-        if self.intermediate_a.len() < req_inter { self.intermediate_a.resize(req_inter, f16::ZERO); }
-        if self.intermediate_b.len() < req_inter { self.intermediate_b.resize(req_inter, f16::ZERO); }
-        if self.q.len() < req_q { self.q.resize(req_q, f16::ZERO); }
-        if self.k.len() < req_kv { self.k.resize(req_kv, f16::ZERO); }
-        if self.v.len() < req_kv { self.v.resize(req_kv, f16::ZERO); }
+        let eps_signal = f16::from_f32(1e-6);
+        // [STABILITY-FIX] Initialize with tiny epsilon instead of pure zero to jumpstart 1-bit activations
+        if self.hidden_a.len() < req_hidden { self.hidden_a.resize(req_hidden, eps_signal); }
+        if self.hidden_b.len() < req_hidden { self.hidden_b.resize(req_hidden, eps_signal); }
+        if self.intermediate_a.len() < req_inter { self.intermediate_a.resize(req_inter, eps_signal); }
+        if self.intermediate_b.len() < req_inter { self.intermediate_b.resize(req_inter, eps_signal); }
+        if self.intermediate_c.len() < req_inter { self.intermediate_c.resize(req_inter, eps_signal); }
+        if self.q.len() < req_q { self.q.resize(req_q, eps_signal); }
+        if self.k.len() < req_kv { self.k.resize(req_kv, eps_signal); }
+        if self.v.len() < req_kv { self.v.resize(req_kv, eps_signal); }
     }
 }
 
@@ -72,7 +75,7 @@ impl DynamicKVCache {
             let v_unit = n_kv * head_dim;
             
             self.k.resize(new_cap * k_unit, 0);
-            self.v.resize(new_cap * v_unit, f16::ZERO);
+            self.v.resize(new_cap * v_unit, f16::from_f32(1e-6));
             self.capacity = new_cap;
             println!("[CPU-GROW] KV Cache expanded to {} tokens.", new_cap);
         }
@@ -293,7 +296,8 @@ impl NativeLinear {
     }
 
     pub fn forward(&self, x: &[f16], global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
-        let mut out = vec![f16::ZERO; (x.len() / self.in_features) * self.out_features];
+        let eps_signal = f16::from_f32(1e-6);
+        let mut out = vec![eps_signal; (x.len() / self.in_features) * self.out_features];
         self.forward_into(x, &mut out, global_scratch);
         out
     }
@@ -540,10 +544,19 @@ impl NativeLayer {
                         let d_post_w = self.post_attention_layernorm.gpu_ptr.expect("Post LN on GPU").0 as *const f16;
                         crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(d_i as *const f16, d_post_w, d_o as *mut f16, q_len as i32, hidden_size as i32, config.rms_norm_eps as f32);
 
-                        self.gate_proj.forward_gpu(d_o, d_i, q_len); cuda_lib.cuMemcpyDtoH_v2(workspace.intermediate_a.as_mut_ptr() as *mut _, d_i, workspace.intermediate_a.len() * 2);
-                        self.up_proj.forward_gpu(d_o, d_i, q_len); cuda_lib.cuMemcpyDtoH_v2(workspace.intermediate_b.as_mut_ptr() as *mut _, d_i, workspace.intermediate_b.len() * 2);
-                        native_silu_f16(&mut workspace.intermediate_a); for i in 0..workspace.intermediate_a.len() { workspace.intermediate_a[i] *= workspace.intermediate_b[i]; }
-                        cuda_lib.cuMemcpyHtoD_v2(d_i, workspace.intermediate_a.as_ptr() as *const _, workspace.intermediate_a.len() * 2);
+                        self.gate_proj.forward_gpu(d_o, d_i, q_len); 
+                        let inter_size = q_len * config.intermediate_size;
+                        cuda_lib.cuMemcpyDtoH_v2(workspace.intermediate_a.as_mut_ptr() as *mut _, d_i, inter_size * 2);
+                        
+                        self.up_proj.forward_gpu(d_o, d_i, q_len); 
+                        cuda_lib.cuMemcpyDtoH_v2(workspace.intermediate_b.as_mut_ptr() as *mut _, d_i, inter_size * 2);
+                        
+                        native_silu_f16(&mut workspace.intermediate_a[..inter_size]); 
+                        for i in 0..inter_size { 
+                            workspace.intermediate_a[i] *= workspace.intermediate_b[i]; 
+                        }
+                        
+                        cuda_lib.cuMemcpyHtoD_v2(d_i, workspace.intermediate_a.as_ptr() as *const _, inter_size * 2);
                         self.down_proj.forward_gpu(d_i, d_o, q_len);
                         
                         let mlp_h = std::slice::from_raw_parts_mut(workspace.q.as_mut_ptr(), x.len());
@@ -590,11 +603,15 @@ impl NativeLayer {
         native_rms_norm_f16_into(out_slice, post_ln_w.as_ref(), config.rms_norm_eps as f32, hidden_size, &mut workspace.intermediate_a[..x.len()]);
         
         self.gate_proj.forward_into(&workspace.intermediate_a[..x.len()], &mut workspace.intermediate_b, global_scratch);
-        self.up_proj.forward_into(&workspace.intermediate_a[..x.len()], &mut workspace.q, global_scratch); 
-        native_silu_f16(&mut workspace.intermediate_b); for i in 0..workspace.intermediate_b.len() { workspace.intermediate_b[i] *= workspace.q[i]; }
+        self.up_proj.forward_into(&workspace.intermediate_a[..x.len()], &mut workspace.intermediate_c, global_scratch); 
+        
+        native_silu_f16(&mut workspace.intermediate_b[..q_len * config.intermediate_size]); 
+        for i in 0..q_len * config.intermediate_size { 
+            workspace.intermediate_b[i] *= workspace.intermediate_c[i]; 
+        }
         
         let mut mlp_out_h = vec![f16::ZERO; x.len()];
-        self.down_proj.forward_into(&workspace.intermediate_b, &mut mlp_out_h, global_scratch);
+        self.down_proj.forward_into(&workspace.intermediate_b[..q_len * config.intermediate_size], &mut mlp_out_h, global_scratch);
         for i in 0..x.len() { out_slice[i] += mlp_out_h[i]; }
         
         out_slice
@@ -929,7 +946,10 @@ impl NativeQwen3TextModel {
         }
         
         let norm_cow = self.norm.get_slice::<f16>();
-        native_rms_norm_f16(cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid)
+        let eps_signal = f16::from_f32(1e-6);
+        let mut cpu_norm = vec![eps_signal; x.len()];
+        native_rms_norm_f16_into(cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cpu_norm);
+        cpu_norm
     }
 
     pub fn move_to_gpu(&mut self, device_id: i32) {
