@@ -178,8 +178,12 @@ impl Qwen3VLGenerateModel {
         }
 
         if _text_device_id < 8 { 
+            println!("[DIAG] Attempting GPU offload to device index: {}", _text_device_id);
             if let Some(m) = Arc::get_mut(&mut qwen3_vl_native) {
+                println!("[DIAG] Arc::get_mut success. Calling move_to_gpu.");
                 m.move_to_gpu(_text_device_id as i32);
+            } else {
+                println!("[DIAG] Arc::get_mut FAILED. Another reference exists. GPU offload SKIPPED!");
             }
         }
 

@@ -1141,16 +1141,15 @@ impl NativeVisionModel {
 
 impl NativeQwen3VLModel {
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>) -> Result<Self> {
+        // [GPU-INITIALIZATION-FIX] Detect first available GPU
+        let mut active_gpu_id = -1;
         #[cfg(feature = "cuda")]
         unsafe {
-            let cuda_lib = lib();
-            let res_init = cuda_lib.cuInit(0);
-            if (res_init as i32) != 0 {
-                println!("[CUDA-INIT] cuInit FAILED with code: {}", res_init as i32);
-            } else {
-                let mut count = 0;
-                cuda_lib.cuDeviceGetCount(&mut count);
-                println!("[CUDA-INIT] cuInit Success. Total CUDA devices visible: {}", count);
+            let cuda_lib = crate::models::qwen3vl::native_backend::lib();
+            let mut count = 0;
+            if cuda_lib.cuInit(0) == 0 && cuda_lib.cuDeviceGetCount(&mut count) == 0 && count > 0 {
+                active_gpu_id = 0;
+                println!("[LOAD] GPU detected at index 0. Initializing layers with GPU acceleration enabled.");
             }
         }
 
@@ -1186,7 +1185,7 @@ impl NativeQwen3VLModel {
             None
         };
 
-        let get_l = |base: &str, in_f: usize, out_f: usize, _l_idx: i32| -> Result<NativeLinear> {
+        let mut get_l = |base: &str, in_f: usize, out_f: usize, _l_idx: i32| -> Result<NativeLinear> {
             let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref(), _l_idx).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
@@ -1208,7 +1207,7 @@ impl NativeQwen3VLModel {
                         scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                         bias: None,
                     }, 
-                    device_id: -1,
+                    device_id: active_gpu_id,
                 })
             } else {
                 let v = current_st.tensor(&key)?;
@@ -1241,10 +1240,10 @@ impl NativeQwen3VLModel {
                     Ok(NativeLinear { 
                         in_features: in_f, out_features: out_f, src_in, src_out,
                         variant: LinearVariant::Standard { 
-                            weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, 
+                            weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, 
                             bias: None 
                         }, 
-                        device_id: -1,
+                        device_id: active_gpu_id,
                     })
                 } else {
                     let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
@@ -1254,7 +1253,7 @@ impl NativeQwen3VLModel {
                             weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
                             bias: None 
                         }, 
-                        device_id: -1,
+                        device_id: active_gpu_id,
                     })
                 }
             }
@@ -1280,10 +1279,10 @@ impl NativeQwen3VLModel {
                 let boxed = new_data.into_boxed_slice();
                 let ptr = boxed.as_ptr() as *const u8;
                 std::mem::forget(boxed);
-                Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: -1 })
+                Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
             } else {
                 let off = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                Ok(NativeTensor::from_mmap(current_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+                Ok(NativeTensor { data_ptr: unsafe { current_mmap.as_ptr().add(off) }, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(current_mmap.clone()), device_id: active_gpu_id })
             }
         };
 
@@ -1326,10 +1325,10 @@ impl NativeQwen3VLModel {
                     in_features: vocab, out_features: target_hid, 
                     src_in: src_hid, src_out: target_hid,
                     variant: LinearVariant::Standard { 
-                        weight: NativeTensor { data_ptr: leaked_ptr, gpu_ptr: None, shape: vec![vocab, target_hid], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, 
+                        weight: NativeTensor { data_ptr: leaked_ptr, gpu_ptr: None, shape: vec![vocab, target_hid], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, 
                         bias: None 
                     }, 
-                    device_id: -1 
+                    device_id: active_gpu_id 
                 })
             } else {
                 get_l(base, vocab, target_hid, -1)
@@ -1385,11 +1384,11 @@ impl NativeQwen3VLModel {
                 Ok(NativeLinear { 
                     in_features: target_in, out_features: target_out, src_in, src_out,
                     variant: LinearVariant::BitSerial {
-                        weight_packed: NativeTensor { data_ptr: p_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::U32, _mmap: None, device_id: -1 },
-                        scales: NativeTensor { data_ptr: s_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::F16, _mmap: None, device_id: -1 },
+                        weight_packed: NativeTensor { data_ptr: p_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id },
+                        scales: NativeTensor { data_ptr: s_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id },
                         bias: None,
                     }, 
-                    device_id: -1,
+                    device_id: active_gpu_id,
                 })
             };
 
@@ -1409,10 +1408,10 @@ impl NativeQwen3VLModel {
                     let boxed = new_data.into_boxed_slice();
                     let ptr = boxed.as_ptr();
                     std::mem::forget(boxed);
-                    Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: -1 })
+                    Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
                 } else {
                     let off = unsafe { v.data().as_ptr().offset_from(sec_mmap.as_ptr()) } as usize;
-                    Ok(NativeTensor::from_mmap(sec_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+                    Ok(NativeTensor { data_ptr: unsafe { sec_mmap.as_ptr().add(off) }, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(sec_mmap.clone()), device_id: active_gpu_id })
                 }
             };
 
@@ -1429,7 +1428,7 @@ impl NativeQwen3VLModel {
                 gate_proj: get_sec_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 up_proj: get_sec_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 down_proj: get_sec_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
-                device_id: -1, is_support_layer: true,
+                device_id: active_gpu_id, is_support_layer: true,
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
@@ -1457,12 +1456,12 @@ impl NativeQwen3VLModel {
                             scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                             bias: None,
                         }, 
-                        device_id: -1,
+                        device_id: active_gpu_id,
                     })
                 } else {
                     let v = current_st.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: target_in, out_features: target_out, src_in: target_in, src_out: target_out, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                    Ok(NativeLinear { in_features: target_in, out_features: target_out, src_in: target_in, src_out: target_out, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: active_gpu_id })
                 }
             };
 
@@ -1481,7 +1480,7 @@ impl NativeQwen3VLModel {
                 gate_proj: get_hybrid_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 up_proj: get_hybrid_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 down_proj: get_hybrid_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
-                device_id: -1, 
+                device_id: active_gpu_id, 
                 is_support_layer: false,
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
@@ -1503,6 +1502,7 @@ impl NativeQwen3VLModel {
                         emb_l.out_features = 151936;
                         emb_l.src_in = t_c.hidden_size;
                         emb_l.src_out = 151936;
+                        emb_l.device_id = active_gpu_id; // [FIX] Ensure tied head has device_id
                         emb_l
                     })
             });
@@ -1549,16 +1549,14 @@ impl NativeQwen3VLModel {
                     let boxed = new_data.into_boxed_slice();
                     let ptr = boxed.as_ptr() as *const u8;
                     std::mem::forget(boxed);
-                    Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: -1 })
+                    Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
                 } else {
                     let off = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                    Ok(NativeTensor::from_mmap(vm.clone(), off, v.shape().to_vec(), NativeDType::F16))
+                    Ok(NativeTensor { data_ptr: unsafe { vm.as_ptr().add(off) }, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(vm.clone()), device_id: active_gpu_id })
                 }
             };
 
             let get_vl = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
-                // ... (implementation of get_vl already updated or handles it)
-                // Let's assume get_vl is already using the same expansion logic as get_l
                 let key = find_vkey(base).ok_or_else(|| anyhow!("VisionLinearTensorNotFound: {}", base))?;
                 let p_n = format!("{}.packed", key);
                 let s_n = format!("{}.scales", key);
@@ -1570,7 +1568,7 @@ impl NativeQwen3VLModel {
                         weight_packed: NativeTensor::from_mmap(vm.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(vm.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                         bias: None,
-                    }, device_id: -1 })
+                    }, device_id: active_gpu_id })
                 } else {
                     let v = vst.tensor(&key)?;
                     let src_shape = v.shape();
@@ -1594,10 +1592,10 @@ impl NativeQwen3VLModel {
                         let boxed = new_data.into_boxed_slice();
                         let ptr = boxed.as_ptr() as *const u8;
                         std::mem::forget(boxed);
-                        Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in, src_out, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, bias: None }, device_id: -1 })
+                        Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in, src_out, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
                     } else {
                         let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                        Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                        Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: active_gpu_id })
                     }
                 }
             };
