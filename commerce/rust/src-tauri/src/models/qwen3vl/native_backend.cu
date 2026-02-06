@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// [2026-HYBRID-MASTER] Optimized Folding Bit-serial Matmul for F16
+// [2026-HYBRID-MASTER] Optimized Folding Bit-serial Matmul for F16 with Dynamic Stabilization
 __global__ void bit_serial_matmul_kernel_f16(
     const half* __restrict__ input,    
     const uint32_t* __restrict__ weight, 
@@ -13,6 +13,7 @@ __global__ void bit_serial_matmul_kernel_f16(
 ) {
     const int TILE_M = 32;
     __shared__ uint32_t s_input_bits[TILE_M]; 
+    __shared__ float s_input_scales[TILE_M]; // [STABILITY] Dynamic Input Scale Pool
 
     int m_base = blockIdx.y * TILE_M;
     int n_group = blockIdx.x;
@@ -22,40 +23,47 @@ __global__ void bit_serial_matmul_kernel_f16(
     int m = m_base + m_sub;
     int n = n_group * 8 + n_sub;
     
-    // [HYBRID-FOLDING] 타겟 차원(K)이 원본(src_k)보다 크면 접어서 연산
     int src_k_blocks = (src_k + 31) / 32;
+    int K_blocks = (K + 31) / 32; // Actual physical stride in memory
     int repetition = (K > src_k) ? (K / src_k) : 1;
+    float r_scale = rsqrtf((float)repetition); // [STABILITY] Magnitude correction factor
 
     float acc = 0.0f;
 
     for (int kb = 0; kb < src_k_blocks; ++kb) {
         if (n_sub == 0) {
             uint32_t folded_bts = 0;
+            float block_sum_sq = 0.0f;
             if (m < M) {
                 #pragma unroll
                 for (int b = 0; b < 32; ++b) {
                     int k_base = kb * 32 + b;
                     if (k_base < src_k) {
                         float combined_signal = 0.0f;
-                        // 여러 파트(0~1023, 1024~2047 등)의 신호를 하나로 접음(Folding)
                         for (int r = 0; r < repetition; ++r) {
                             combined_signal += __half2float(input[m * K + k_base + (r * src_k)]);
                         }
+                        // [STABILITY] Normalize folded signal energy
+                        combined_signal *= r_scale;
                         if (combined_signal >= 0.0f) folded_bts |= (1u << b);
+                        block_sum_sq += combined_signal * combined_signal;
                     }
                 }
             }
             s_input_bits[m_sub] = folded_bts;
+            // [STABILITY] Per-block RMS for dynamic input scaling
+            s_input_scales[m_sub] = sqrtf(block_sum_sq / 32.0f + 1e-8f);
         }
         __syncthreads();
 
         if (m < M && n < N) {
-            // 가중치는 원본 src_k 분량만 읽으므로 메모리 효율 2배
-            int idx = n_group * src_k_blocks * 8 + kb * 8 + n_sub;
+            // [FIX] Use K_blocks for correct weight memory stride in expanded hybrid models
+            int idx = n_group * K_blocks * 8 + kb * 8 + n_sub;
             uint32_t w_val = weight[idx];
             float s_val = __half2float(scale[idx]);
             uint32_t diff = s_input_bits[m_sub] ^ w_val;
-            acc += (float)(32 - 2 * (int)__popc(diff)) * s_val;
+            // [HYBRID-PRECISION] Combine weight scale with dynamic input scale
+            acc += (float)(32 - 2 * (int)__popc(diff)) * s_val * s_input_scales[m_sub];
         }
         __syncthreads();
     }
@@ -65,7 +73,7 @@ __global__ void bit_serial_matmul_kernel_f16(
     }
 }
 
-// [FAST-ATTENTION-HYBRID] Folding-aware online softmax attention for F16
+// [FAST-ATTENTION-HYBRID] Folding-aware online softmax attention for F16 with Dynamic Stabilization
 __global__ void bit_serial_attn_kernel_f16(
     const half* __restrict__ Q,        
     const uint32_t* __restrict__ K_p,   
@@ -81,13 +89,17 @@ __global__ void bit_serial_attn_kernel_f16(
     if (q_idx >= q_len || h >= n_h) return;
 
     int src_k_b = (src_h_d + 31) / 32;
+    int h_d_blocks = (h_d + 31) / 32; // Actual physical stride in KV cache
     int h_kv = h / (n_h / n_kv);
     int repetition = (h_d > src_h_d) ? (h_d / src_h_d) : 1;
+    float r_scale = rsqrtf((float)repetition); // [STABILITY] Magnitude correction
     
     __shared__ uint32_t s_q_bits[16]; 
+    __shared__ float s_q_scales[16]; // [STABILITY] Dynamic Q-Scale Pool
     
     if (tid < src_k_b) {
         uint32_t folded_bts = 0;
+        float q_block_sum_sq = 0.0f;
         for (int b = 0; b < 32; ++b) {
             int d_base = tid * 32 + b;
             if (d_base < src_h_d) {
@@ -95,10 +107,13 @@ __global__ void bit_serial_attn_kernel_f16(
                 for (int r = 0; r < repetition; ++r) {
                     combined_q += __half2float(Q[(q_idx * n_h * h_d) + (h * h_d) + d_base + (r * src_h_d)]);
                 }
+                combined_q *= r_scale;
                 if (combined_q >= 0.0f) folded_bts |= (1u << b);
+                q_block_sum_sq += combined_q * combined_q;
             }
         }
         s_q_bits[tid] = folded_bts;
+        s_q_scales[tid] = sqrtf(q_block_sum_sq / 32.0f + 1e-8f);
     }
     __syncthreads();
     
@@ -107,11 +122,12 @@ __global__ void bit_serial_attn_kernel_f16(
     float local_o = 0.0f; 
 
     for (int j = 0; j < t_s; ++j) {
-        int dot = 0;
+        float dot = 0.0f;
         for (int kb = 0; kb < src_k_b; ++kb) {
-            dot += (32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * src_k_b + kb]));
+            // [FIX] Use h_d_blocks for correct KV memory stride
+            dot += (float)(32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * h_d_blocks + kb])) * s_q_scales[kb];
         }
-        float score = ((float)dot + alpha) * sc;
+        float score = (dot + alpha) * sc;
         if (score < -15.0f) score = -15.0f;
 
         float n_max = fmaxf(running_max, score);
@@ -119,17 +135,6 @@ __global__ void bit_serial_attn_kernel_f16(
         float e_score = expf(score - n_max);
         
         running_sum = running_sum * e_scale + e_score;
-        running_max = n_max;
-
-        if (tid < h_d) {
-            local_o = local_o * e_scale + e_score * __half2float(V[(j * n_kv + h_kv) * h_d + tid]);
-        }
-    }
-
-    if (tid < h_d) {
-        O[(q_idx * n_h * h_d) + (h * h_d) + tid] = __float2half(local_o / (running_sum + 1e-9f));
-    }
-}
         running_max = n_max;
 
         if (tid < h_d) {
@@ -220,508 +225,75 @@ __global__ void bit_serial_attn_kernel_v2026(
     if (tid < h_d) O[(q_idx * n_h * h_d) + (h * h_d) + tid] = local_o / (running_sum + 1e-9f);
 }
 
-// --- [CRITICAL] EXTERN C WRAPPERS ---
-
-extern "C" {
-
-    void bit_serial_attn_cuda_direct(const float* d_q, const uint32_t* d_k, const float* d_v, float* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha) {
-
-        bit_serial_attn_kernel_v2026<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha);
-
+// [STANDARD-F16-MATMUL] For non-quantized layers like lm_head or standard projections
+__global__ void standard_matmul_kernel_f16(const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C, int M, int N, int K) {
+    int m = blockIdx.y * blockDim.y + threadIdx.y;
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m < M && n < N) {
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            acc += __half2float(A[m * K + k]) * __half2float(B[n * K + k]); 
+        }
+        C[m * N + n] = __float2half(acc);
     }
-
-
-
-        void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha, int src_h_d) {
-
-
-
-            bit_serial_attn_kernel_f16<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha, src_h_d);
-
-
-
-        }
-
-
-
-    
-
-
-
-        void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {
-
-
-
-            bit_serial_matmul_kernel_shuffled<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
-
-
-
-        }
-
-
-
-    
-
-
-
-        void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k) {
-
-
-
-            bit_serial_matmul_kernel_f16<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
-
-
-
-        }
-
-
-
-    }
-
-
-
-    
-
-
-
-    // [STANDARD-F16-MATMUL] For non-quantized layers like lm_head or standard projections
-
-
-
-    __global__ void standard_matmul_kernel_f16(const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C, int M, int N, int K) {
-
-
-
-        int m = blockIdx.y * blockDim.y + threadIdx.y;
-
-
-
-        int n = blockIdx.x * blockDim.x + threadIdx.x;
-
-
-
-        if (m < M && n < N) {
-
-
-
-            float acc = 0.0f;
-
-
-
-            for (int k = 0; k < K; ++k) {
-
-
-
-                acc += __half2float(A[m * K + k]) * __half2float(B[n * K + k]); // Assumes B is [N, K] and transposed or handled accordingly
-
-
-
-            }
-
-
-
-            C[m * N + n] = __float2half(acc);
-
-
-
-        }
-
-
-
-    }
-
-
-
-    
-
-
-
-    // Actual Kernels for activation and norm
-
-
-
-    
-
-
-
-    __global__ void rms_norm_kernel_f16(const half* i, const half* w, half* o, int h, float e) {
-
-
-
-    
-
-
-
-        int row = blockIdx.x;
-
-
-
-    
-
-
-
-        int tid = threadIdx.x;
-
-
-
-    
-
-
-
-        extern __shared__ float s_part_sum[];
-
-
-
-    
-
-
-
-        float sum = 0.0f;
-
-
-
-    
-
-
-
-        for (int j = tid; j < h; j += blockDim.x) { float val = __half2float(i[row * h + j]); sum += val * val; }
-
-
-
-    
-
-
-
-        s_part_sum[tid] = sum;
-
-
-
-    
-
-
-
+}
+
+// [RMS-NORM-F16] High-speed RMS Normalization
+__global__ void rms_norm_kernel_f16(const half* i, const half* w, half* o, int h, float e) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    extern __shared__ float s_part_sum[];
+    float sum = 0.0f;
+    for (int j = tid; j < h; j += blockDim.x) { float val = __half2float(i[row * h + j]); sum += val * val; }
+    s_part_sum[tid] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_part_sum[tid] += s_part_sum[tid + stride];
         __syncthreads();
+    }
+    float inv_rms = rsqrtf(s_part_sum[0] / h + e);
+    for (int j = tid; j < h; j += blockDim.x) o[row * h + j] = __float2half(__half2float(i[row * h + j]) * inv_rms * __half2float(w[j]));
+}
 
+// [SILU-MUL-F16] High-speed Swiglu Activation
+__global__ void silu_mul_kernel_f16(half* gate, const half* up, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float g = __half2float(gate[idx]);
+        float u = __half2float(up[idx]);
+        gate[idx] = __float2half((g / (1.0f + expf(-g))) * u);
+    }
+}
 
-
-    
-
-
-
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-
-
-
-    
-
-
-
-            if (tid < stride) s_part_sum[tid] += s_part_sum[tid + stride];
-
-
-
-    
-
-
-
-            __syncthreads();
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
-        float inv_rms = rsqrtf(s_part_sum[0] / h + e);
-
-
-
-    
-
-
-
-        for (int j = tid; j < h; j += blockDim.x) o[row * h + j] = __float2half(__half2float(i[row * h + j]) * inv_rms * __half2float(w[j]));
-
-
-
-    
-
-
-
+// --- [CRITICAL] EXTERN C WRAPPERS ---
+extern "C" {
+    void bit_serial_attn_cuda_direct(const float* d_q, const uint32_t* d_k, const float* d_v, float* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha) {
+        bit_serial_attn_kernel_v2026<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha);
     }
 
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-    __global__ void silu_mul_kernel_f16(half* gate, const half* up, int size) {
-
-
-
-    
-
-
-
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-
-
-    
-
-
-
-        if (idx < size) {
-
-
-
-    
-
-
-
-            float g = __half2float(gate[idx]);
-
-
-
-    
-
-
-
-            float u = __half2float(up[idx]);
-
-
-
-    
-
-
-
-            gate[idx] = __float2half((g / (1.0f + expf(-g))) * u);
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
+    void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha, int src_h_d) {
+        bit_serial_attn_kernel_f16<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha, src_h_d);
     }
 
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-    extern "C" {
-
-
-
-    
-
-
-
-        void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
-
-
-
-    
-
-
-
-            dim3 block(16, 16);
-
-
-
-    
-
-
-
-            dim3 grid((n + 15) / 16, (m + 15) / 16);
-
-
-
-    
-
-
-
-            standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-        void rms_norm_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
-
-
-
-    
-
-
-
-            // [FIX] Call the standalone kernel instead of using an invalid inline lambda
-
-
-
-    
-
-
-
-            rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
+    void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {
+        bit_serial_matmul_kernel_shuffled<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
     }
 
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-    extern "C" {
-
-
-
-    
-
-
-
-        void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
-
-
-
-    
-
-
-
-            rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
-        void cuda_silu_mul_f16(half* d_gate, const half* d_up, int size) {
-
-
-
-    
-
-
-
-            silu_mul_kernel_f16<<<(size + 255) / 256, 256>>>(d_gate, d_up, size);
-
-
-
-    
-
-
-
-        }
-
-
-
-    
-
-
-
+    void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k) {
+        bit_serial_matmul_kernel_f16<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
     }
 
+    void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
+        dim3 block(16, 16);
+        dim3 grid((n + 15) / 16, (m + 15) / 16);
+        standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
+    }
 
+    void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
+        rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
+    }
 
-    
-
-
-
-    
-
-
-
-    
-
-
-
-    
-
-
-
-    
+    void cuda_silu_mul_f16(half* d_gate, const half* d_up, int size) {
+        silu_mul_kernel_f16<<<(size + 255) / 256, 256>>>(d_gate, d_up, size);
+    }
+}
