@@ -73,7 +73,7 @@ impl LogisModel {
                 &path, None, None, 
                 None, 9, // Device ID 9 = Force CPU
                 None, 9, None, Some(limit as usize),
-                false, true
+                true, true
             )
         }).await??;
 
@@ -697,10 +697,13 @@ impl LogisModel {
             return Ok(())
         }
 
-        println!("[MODEL] Activating engine -> Size: {:?}, Mode: {}, Vision: {}", size, if baking_only { "BAKING (Layer 0)" } else { "INFERENCE (Full)" }, !force_text_only);
+        // [MODIFICATION] Force 0.6B to use 1 layer (Layer 0) for all tasks (Inference/Baking)
+        let effective_baking_only = if size == ModelSize::Small { true } else { baking_only };
+
+        println!("[MODEL] Activating engine -> Size: {:?}, Mode: {}, Vision: {}", size, if effective_baking_only { "BAKING (Layer 0)" } else { "INFERENCE (Full)" }, !force_text_only);
 
         // 1. [HIBERNATION-CHECK] Check if we can swap from hibernation slots
-        let swapped = if !baking_only { // Baking models are specialized (Layer 0), usually not worth hibernating
+        let swapped = if !effective_baking_only { // Baking models are specialized (Layer 0), usually not worth hibernating
             match size {
                 ModelSize::Small => if let Some(m) = small_slot.take() { *gen_guard = Some(m); true } else { false },
                 ModelSize::Large => if let Some(m) = large_slot.take() { *gen_guard = Some(m); true } else { false },
@@ -729,7 +732,7 @@ impl LogisModel {
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
                 None, dev_id, None, dev_id, None, Some(limit as usize),
-                baking_only, force_text_only
+                effective_baking_only, force_text_only
             )
         }).await??;
 

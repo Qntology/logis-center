@@ -43,8 +43,8 @@ def quantize_tensor_bit_serial_shuffled(param):
 
     return shuffled_w.view(-1), shuffled_s.view(-1), torch.tensor([N, K], dtype=torch.int32)
 
-def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
-    mode_name = "LAYER0" if layer_limit == 1 else "ALL"
+def process_model(input_path, output_dir, is_vision=False, layer_limit=None, layer_start=0):
+    mode_name = "LAYER0" if layer_limit == 1 else ("L1_ALL" if layer_start > 0 else "ALL")
     suffix = f"BITSERIAL_{mode_name}.safetensors"
     prefix = "mmproj-" if is_vision else "model-"
     out_path = os.path.join(output_dir, f"{prefix}{suffix}")
@@ -64,7 +64,7 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
 
     final_dict = {}
     for name, param in tensors.items():
-        # [NAMING-UNITY] 0.6B 모델의 이름을 2B 모델과 일치하도록 완벽 변환 (model.language_model. 추가)
+        # [NAMING-UNITY] 0.6B 모델의 이름을 2B 모델과 일치하도록 완벽 변환
         new_name = name
         if "layers." in name and "language_model" not in name:
             new_name = name.replace("model.layers", "model.language_model.layers")
@@ -77,7 +77,18 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
 
         idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', new_name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
-        if layer_limit is not None and layer_idx >= layer_limit: continue
+        
+        # [OPTIMIZATION] 중복 저장 방지를 위한 칼같은 분할
+        if layer_limit is not None: # LAYER0 모드 (시작 조각)
+            if layer_idx >= layer_limit: continue
+            # 시작 조각에는 임베딩은 포함하고, 최종 출력층(Head/Norm)은 제외
+            if layer_idx == -1 and ("norm" in new_name or "lm_head" in new_name): continue
+        
+        if layer_start > 0: # L1_ALL 모드 (본체)
+            if 0 <= layer_idx < layer_start: continue
+            # 본체에는 임베딩은 제외하고, 최종 출력층(Head/Norm)은 포함
+            if layer_idx == -1 and "embed_tokens" in new_name: continue
+        
         if is_vision != ("visual" in name): continue
 
         is_weight = "weight" in name and len(param.shape) == 2
@@ -101,13 +112,15 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None):
 if __name__ == "__main__":
     MODELS_ROOT = "src-tauri/models"
     tasks = [
-        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, None),
-        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, 1),
-        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, None),
-        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, None),
-        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, 1),
+        # (디렉토리, 소스파일, 비전여부, layer_limit, layer_start)
+        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, None, 1),
+        ("Qwen3-VL-2B-Instruct-gguf", "model.safetensors", False, 1, 0),
+        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, None, 0),
+        ("Qwen3-VL-2B-Instruct-gguf", "mmproj-Qwen3VL-2B-Instruct-F16.gguf", True, 1, 0), # [NEW] 비전 0번 레이어 조각 추가
+        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, None, 1),
+        ("Qwen3-0.6B-Instruct-gguf", "model.safetensors", False, 1, 0),
     ]
-    for m_dir, src, is_v, limit in tasks:
+    for m_dir, src, is_v, limit, start in tasks:
         p_src = os.path.join(MODELS_ROOT, m_dir, src)
         if os.path.exists(p_src):
-            process_model(p_src, os.path.join(MODELS_ROOT, m_dir), is_v, limit)
+            process_model(p_src, os.path.join(MODELS_ROOT, m_dir), is_v, limit, start)

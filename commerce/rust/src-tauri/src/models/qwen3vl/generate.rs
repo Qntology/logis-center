@@ -119,7 +119,12 @@ impl Qwen3VLGenerateModel {
         vl_config.text_config = Some(correct_text_config);
         vl_config.hidden_size = Some(vl_config.text_config.as_ref().unwrap().hidden_size);
 
-        let main_filename = if baking_only { "model-BITSERIAL_LAYER0.safetensors" } else { "model-BITSERIAL_ALL.safetensors" };
+        // [HYBRID-INIT] 2B 모델 본체(L1_ALL)와 0.6B 모델 조각(LAYER0)을 함께 로드할 수 있도록 파일명 설정
+        let main_filename = if baking_only { 
+            "model-BITSERIAL_LAYER0.safetensors" 
+        } else { 
+            "model-BITSERIAL_L1_ALL.safetensors" 
+        };
         let main_path = path_obj.join(main_filename);
         let main_file = std::fs::File::open(main_path)?;
         let main_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&main_file)? });
@@ -134,7 +139,16 @@ impl Qwen3VLGenerateModel {
             } else { None }
         } else { None };
 
-        let secondary_mmap = if baking_only && tokenizer_path.is_some() {
+        let secondary_mmap = if !baking_only {
+            // Inference 모드일 때, Small 모델의 Layer 0를 서포트용으로 로드
+            let base_models_path = path_obj.parent().unwrap();
+            let small_path = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-BITSERIAL_LAYER0.safetensors");
+            if small_path.exists() {
+                println!("[HYBRID] Loading 0.6B Layer 0 support for 2B model...");
+                let small_file = std::fs::File::open(small_path)?;
+                Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&small_file)? }))
+            } else { None }
+        } else if baking_only && tokenizer_path.is_some() {
             let large_path = Path::new(tokenizer_path.unwrap()).join("model-BITSERIAL_ALL.safetensors");
             if large_path.exists() {
                 let large_file = std::fs::File::open(large_path)?;
@@ -624,8 +638,10 @@ impl Qwen3VLGenerateModel {
                 for t in 0..token_count {
                     for h in 0..num_kv_heads {
                         let src_start = (t * num_kv_heads + h) * src_head_dim_k;
-                        new_k.extend_from_slice(&k[src_start..src_start + src_head_dim_k]);
-                        new_k.extend(std::iter::repeat(0u32).take(dst_head_dim_k - src_head_dim_k));
+                        // [OPTIMIZATION] Zero Padding 대신 2번 반복(Repeat)하여 신호 강도 유지
+                        let chunk = &k[src_start..src_start + src_head_dim_k];
+                        new_k.extend_from_slice(chunk);
+                        new_k.extend_from_slice(chunk); // Repeat once more to reach dst_head_dim_k (4 u32s)
                     }
                 }
 
@@ -633,8 +649,10 @@ impl Qwen3VLGenerateModel {
                 for t in 0..token_count {
                     for h in 0..num_kv_heads {
                         let src_start = (t * num_kv_heads + h) * src_head_dim_v;
-                        new_v.extend_from_slice(&v[src_start..src_start + src_head_dim_v]);
-                        new_v.extend(std::iter::repeat(half::f16::ZERO).take(dst_head_dim_v - src_head_dim_v));
+                        // [OPTIMIZATION] Zero Padding 대신 2번 반복(Repeat)
+                        let chunk = &v[src_start..src_start + src_head_dim_v];
+                        new_v.extend_from_slice(chunk);
+                        new_v.extend_from_slice(chunk); // Repeat once more to reach dst_head_dim_v (128 f16s)
                     }
                 }
                 (new_k, new_v)
@@ -733,25 +751,16 @@ impl Qwen3VLGenerateModel {
                             
                             if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
                                 let ratio = target_dim / actual_source_dim;
-                                // [2026-H1-PRECISION] Layer-aware drift attenuation
-                                // Deeper layers (larger l_idx) need slightly less aggressive scaling
-                                let layer_factor = 1.0 - (l_idx as f32 / num_target_layers as f32) * 0.05;
-                                let semantic_multiplier = f16::from_f32(1.12 * layer_factor);
-                                let drift_bias = f16::from_f32(0.005 * layer_factor); 
-
+                                // [2026-REPETITION-STRATEGY] Zero padding 대신 데이터를 반복(Repeat)하여 에너지 유지
                                 let k_units_per_token = actual_source_dim / 32;
                                 let mut new_k = Vec::with_capacity(k_data.len() * ratio);
                                 let mut new_v = Vec::with_capacity(v_data.len() * ratio);
                                 
-                                for chunk in k_data.chunks_exact(k_units_per_token) { for _ in 0..ratio { new_k.extend_from_slice(chunk); } }
+                                for chunk in k_data.chunks_exact(k_units_per_token) { 
+                                    for _ in 0..ratio { new_k.extend_from_slice(chunk); } 
+                                }
                                 for chunk in v_data.chunks_exact(actual_source_dim) {
-                                    for _ in 0..ratio { 
-                                        let mut v_scaled = chunk.to_vec();
-                                        for val in v_scaled.iter_mut() { 
-                                            *val = (*val * semantic_multiplier) + drift_bias; 
-                                        }
-                                        new_v.extend_from_slice(&v_scaled); 
-                                    }
+                                    for _ in 0..ratio { new_v.extend_from_slice(chunk); }
                                 }
                                 k_data = new_k; v_data = new_v;
                             }

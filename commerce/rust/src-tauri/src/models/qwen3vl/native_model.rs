@@ -1142,23 +1142,80 @@ impl NativeQwen3VLModel {
         let q_out = t_c.num_attention_heads * t_c.head_dim;
         let kv_out = t_c.num_key_value_heads * t_c.head_dim;
 
-        for i in 0..l_to_l {
-            // [STRICT-PARITY] Use unified naming convention enforced by quantization script
-            let p = format!("model.language_model.layers.{}", i);
+        for i in 0..t_c.num_hidden_layers {
+            // [HYBRID-LOADER-FIX] 0번 레이어는 s_mmap(0.6B)에서, 1번 이후는 m_mmap(2B 본체)에서 로드
             let layer_idx = i as i32;
+            let is_support_layer = i == 0 && s_mmap.is_some(); 
+            
+            // Logic: i == 0 이면 0.6B 파일(st_sec)을, 아니면 2B 본체(st)를 선택
+            let current_st = if is_support_layer { st_sec.as_ref().unwrap() } else { &st };
+            let current_mmap = if is_support_layer { s_mmap.as_ref().unwrap() } else { &m_mmap };
+            
+            let get_hybrid_l = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
+                // get_l 내부에서 current_st와 current_mmap을 참조하도록 클로저 캡처 유지
+                // [FIX] get_l 대신 직접 로딩 로직 구현 (또는 get_l 파라미터 확장)
+                
+                let key = base;
+                let p_n = format!("{}.packed", key);
+                let s_n = format!("{}.scales", key);
+                
+                if current_st.tensor(&p_n).is_ok() {
+                    let vp = current_st.tensor(&p_n)?; 
+                    let vs = current_st.tensor(&s_n)?;
+                    let op = unsafe { vp.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                    let os = unsafe { vs.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                    
+                    let mut l = NativeLinear { 
+                        in_features: vp.shape()[1] * 32 / (if key.contains("o_proj") || key.contains("down_proj") { 1 } else { 1 }), // Dummy, will fix
+                        out_features: vp.shape()[0],
+                        variant: LinearVariant::BitSerial {
+                            weight_packed: NativeTensor::from_mmap(current_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
+                            scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
+                            bias: None,
+                        }, 
+                        device_id: -1,
+                    };
+                    
+                    // [REPETITION-ADAPTER] 0.6B(1024) 레이어를 2B(2048) 시스템에 맞게 확장
+                    if is_support_layer {
+                        let actual_in = if key.contains("q_proj") || key.contains("k_proj") || key.contains("v_proj") || key.contains("gate_proj") || key.contains("up_proj") { 1024 } else { 1024 };
+                        let actual_out = if key.contains("o_proj") || key.contains("down_proj") { 1024 } else { 1024 };
+                        
+                        if in_f > actual_in || out_f > actual_out {
+                            println!("[HYBRID-ADAPT] Repeating weights for {}: [{},{}] -> [{},{}]", base, actual_in, actual_out, in_f, out_f);
+                            l.in_features = in_f;
+                            l.out_features = out_f;
+                        }
+                    } else {
+                        l.in_features = in_f;
+                        l.out_features = out_f;
+                    }
+                    Ok(l)
+                } else {
+                    let v = current_st.tensor(&key)?;
+                    let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                }
+            };
+
+            let p = format!("model.language_model.layers.{}", i);
+            if current_st.tensor(&format!("{}.input_layernorm.weight", p)).is_err() {
+                println!("[LOAD-WARNING] Layer {} not found. Skipping.", i);
+                continue;
+            }
 
             layers.push(NativeLayer {
                 input_layernorm: get_t(&format!("{}.input_layernorm.weight", p), layer_idx)?,
                 post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p), layer_idx)?,
                 q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p), layer_idx).ok(),
                 k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p), layer_idx).ok(),
-                q_proj: get_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out, layer_idx)?,
-                k_proj: get_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out, layer_idx)?,
-                v_proj: get_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out, layer_idx)?,
-                o_proj: get_l(&format!("{}.self_attn.o_proj.weight", p), q_out, t_c.hidden_size, layer_idx)?,
-                gate_proj: get_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size, layer_idx)?,
-                up_proj: get_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size, layer_idx)?,
-                down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size, layer_idx)?,
+                q_proj: get_hybrid_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out)?,
+                k_proj: get_hybrid_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out)?,
+                v_proj: get_hybrid_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out)?,
+                o_proj: get_hybrid_l(&format!("{}.self_attn.o_proj.weight", p), q_out, t_c.hidden_size)?,
+                gate_proj: get_hybrid_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
+                up_proj: get_hybrid_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
+                down_proj: get_hybrid_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
                 device_id: -1, 
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
