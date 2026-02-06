@@ -352,46 +352,58 @@ pub fn bit_serial_matmul_f32_extreme_into(i: &[f16], w: &[u32], s: &[f16], out: 
 }
 
 pub fn native_rms_norm_f16_into(x: &[f16], w: &[f16], eps: f32, hid: usize, out: &mut [f16]) {
-    // [STABILITY-FIX] Use safe chunking to prevent out-of-bounds access
-    let x_chunks = x.chunks(hid);
-    out.par_chunks_mut(hid).zip(x_chunks).for_each(|(out_row, x_row)| {
-        let mut v = 0.0f32;
-        for &val in x_row {
-            let f = val.to_f32();
-            v += f * f;
-        }
-        let inv = 1.0 / (v / hid as f32 + eps).sqrt();
-        for (j, out_val) in out_row.iter_mut().enumerate() {
-            if j < w.len() && j < x_row.len() {
-                *out_val = f16::from_f32(x_row[j].to_f32() * inv * w[j].to_f32());
+    // [STABILITY-FIX] Use safe chunking. Iterate in parallel over 'out' chunks
+    out.par_chunks_mut(hid).enumerate().for_each(|(i, out_row)| {
+        let x_start = i * hid;
+        if x_start < x.len() {
+            let x_end = (x_start + hid).min(x.len());
+            let x_row = &x[x_start..x_end];
+            
+            let mut v = 0.0f32;
+            for &val in x_row {
+                let f = val.to_f32();
+                v += f * f;
+            }
+            let inv = 1.0 / (v / hid as f32 + eps).sqrt();
+            
+            for (j, out_val) in out_row.iter_mut().enumerate() {
+                if j < x_row.len() && j < w.len() {
+                    *out_val = f16::from_f32(x_row[j].to_f32() * inv * w[j].to_f32());
+                }
             }
         }
     });
 }
 
 pub fn native_linear_f16_into(x: &[f16], w: &[f16], b: Option<&[f16]>, out: &mut [f16], _m: usize, out_f: usize, in_f: usize) {
-    // [STABILITY-FIX] Use safe chunking for matrix multiply
-    let x_chunks = x.chunks(in_f);
-    out.par_chunks_mut(out_f).zip(x_chunks).for_each(|(out_row, x_row)| {
-        for j in 0..out_f {
-            let mut acc = 0.0f32;
-            let w_row_start = j * in_f;
-            if w_row_start + in_f <= w.len() {
-                let w_row = &w[w_row_start .. w_row_start + in_f];
-                // Dot product of x_row and w_row
-                for (k, &xv) in x_row.iter().enumerate() {
-                    if k < w_row.len() {
-                        acc += xv.to_f32() * w_row[k].to_f32();
+    // [STABILITY-FIX] Use safe chunking for matrix multiply. Iterate in parallel over 'out' chunks
+    out.par_chunks_mut(out_f).enumerate().for_each(|(i, out_row)| {
+        let x_start = i * in_f;
+        if x_start < x.len() {
+            let x_end = (x_start + in_f).min(x.len());
+            let x_row = &x[x_start..x_end];
+            
+            for j in 0..out_f {
+                let mut acc = 0.0f32;
+                let w_row_start = j * in_f;
+                if w_row_start < w.len() {
+                    let w_row_end = (w_row_start + in_f).min(w.len());
+                    let w_row = &w[w_row_start..w_row_end];
+                    
+                    for (k, &xv) in x_row.iter().enumerate() {
+                        if k < w_row.len() {
+                            acc += xv.to_f32() * w_row[k].to_f32();
+                        }
                     }
                 }
-            }
-            if let Some(bias) = b {
-                if j < bias.len() {
-                    acc += bias[j].to_f32();
+                if let Some(bias) = b {
+                    if j < bias.len() {
+                        acc += bias[j].to_f32();
+                    }
                 }
-            }
-            if j < out_row.len() {
-                out_row[j] = f16::from_f32(acc);
+                if j < out_row.len() {
+                    out_row[j] = f16::from_f32(acc);
+                }
             }
         }
     });
