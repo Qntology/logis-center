@@ -1216,7 +1216,7 @@ impl NativeQwen3VLModel {
             let current_st = if is_support_layer { st_sec.as_ref().unwrap() } else { &st };
             let current_mmap = if is_support_layer { s_mmap.as_ref().unwrap() } else { &m_mmap };
             
-            let get_hybrid_l = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
+            let get_hybrid_l = |base: &str, target_in: usize, target_out: usize| -> Result<NativeLinear> {
                 let key = base;
                 let p_n = format!("{}.packed", key);
                 let s_n = format!("{}.scales", key);
@@ -1224,37 +1224,81 @@ impl NativeQwen3VLModel {
                 if current_st.tensor(&p_n).is_ok() {
                     let vp = current_st.tensor(&p_n)?; 
                     let vs = current_st.tensor(&s_n)?;
-                    let op = unsafe { vp.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                    let os = unsafe { vs.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                     
-                    let mut l = NativeLinear { 
-                        in_features: in_f,
-                        out_features: out_f,
+                    // 실제 파일에 들어있는 원본 feature 크기 계산
+                    let src_out = vp.shape()[0];
+                    let src_in = (vp.data().len() / 4 * 32) / src_out;
+                    
+                    let mut final_packed_ptr = vp.data().as_ptr();
+                    let mut final_scales_ptr = vs.data().as_ptr();
+                    let mut _leaked_p = None;
+                    let mut _leaked_s = None;
+
+                    // [PHYSICAL-REPETITION-ADAPTER] 차원이 다르면 실제로 데이터를 2번 반복 복사
+                    if target_in > src_in || target_out > src_out {
+                        println!("[HYBRID-PHYSICAL-ADAPT] Expanding {}: [{},{}] -> [{},{}]", base, src_in, src_out, target_in, target_out);
+                        
+                        let packed_u32 = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len() / 4) };
+                        let scales_f16 = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len() / 2) };
+                        
+                        // Bit-serial Layout: [N/8, K/32, 8]
+                        let src_k_blocks = src_in / 32;
+                        let src_n_outer = src_out / 8;
+                        let target_k_blocks = target_in / 32;
+                        let target_n_outer = target_out / 8;
+                        
+                        let mut new_packed = vec![0u32; target_n_outer * target_k_blocks * 8];
+                        let mut new_scales = vec![f16::ZERO; target_n_outer * target_k_blocks * 8];
+                        
+                        let r_k = target_in / src_in;
+                        let r_n = target_out / src_out;
+                        
+                        // 에너지 보정: 반복 횟수만큼 스케일을 나눠줌 (신호 증폭 방지)
+                        let energy_scale = f16::from_f32(1.0 / (r_k as f32));
+
+                        for no in 0..target_n_outer {
+                            for ko in 0..target_k_blocks {
+                                for sub_n in 0..8 {
+                                    let src_no = no % src_n_outer;
+                                    let src_ko = ko % src_k_blocks;
+                                    let src_idx = (src_no * src_k_blocks + src_ko) * 8 + sub_n;
+                                    let dst_idx = (no * target_k_blocks + ko) * 8 + sub_n;
+                                    
+                                    if src_idx < packed_u32.len() {
+                                        new_packed[dst_idx] = packed_u32[src_idx];
+                                        new_scales[dst_idx] = scales_f16[src_idx] * energy_scale;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 메모리 누수 방지를 위한 소유권 관리 (세션 동안 유지)
+                        let p_boxed = new_packed.into_boxed_slice();
+                        final_packed_ptr = p_boxed.as_ptr() as *const u8;
+                        _leaked_p = Some(p_boxed);
+                        
+                        let s_boxed = new_scales.into_boxed_slice();
+                        final_scales_ptr = s_boxed.as_ptr() as *const u8;
+                        _leaked_s = Some(s_boxed);
+                        
+                        std::mem::forget(_leaked_p);
+                        std::mem::forget(_leaked_s);
+                    }
+
+                    Ok(NativeLinear { 
+                        in_features: target_in,
+                        out_features: target_out,
                         variant: LinearVariant::BitSerial {
-                            weight_packed: NativeTensor::from_mmap(current_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
-                            scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
+                            weight_packed: NativeTensor { data_ptr: final_packed_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::U32, _mmap: None, device_id: -1 },
+                            scales: NativeTensor { data_ptr: final_scales_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::F16, _mmap: None, device_id: -1 },
                             bias: None,
                         }, 
                         device_id: -1,
-                    };
-                    
-                    if is_support_layer {
-                        let src_in = if key.contains("o_proj") || key.contains("down_proj") {
-                            if key.contains("down_proj") { 3072 } else { 1024 }
-                        } else { 1024 };
-                        let src_out = if key.contains("gate_proj") || key.contains("up_proj") { 3072 } else { 1024 };
-
-                        if in_f > src_in || out_f > src_out {
-                            println!("[HYBRID-ADAPT] Repeating weights for {}: [{},{}] -> [{},{}]", base, src_in, src_out, in_f, out_f);
-                            l.in_features = in_f;
-                            l.out_features = out_f;
-                        }
-                    }
-                    Ok(l)
+                    })
                 } else {
                     let v = current_st.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                    Ok(NativeLinear { in_features: target_in, out_features: target_out, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
                 }
             };
 
