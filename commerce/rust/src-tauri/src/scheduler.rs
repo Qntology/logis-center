@@ -23,12 +23,14 @@ type SharedInfResult = Shared<BoxFuture<'static, Arc<Result<String>>>>;
 pub struct InFlightRegistry {
     pub baking: DashMap<String, SharedBakeResult>,
     pub inference: DashMap<String, SharedInfResult>,
+    pub gpu_semaphore: Arc<tokio::sync::Semaphore>, // [NEW] Orderly execution guard
 }
 
 lazy_static::lazy_static! {
     pub static ref REGISTRY: InFlightRegistry = InFlightRegistry {
         baking: DashMap::new(),
         inference: DashMap::new(),
+        gpu_semaphore: Arc::new(tokio::sync::Semaphore::new(1)), // Max 1 heavy GPU task at a time
     };
 }
 
@@ -240,7 +242,7 @@ async fn process_task(
         }
     }
 
-    let _data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
+    let data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
     let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
     let effective_device_pref = device_preference.or_else(|| {
@@ -326,7 +328,8 @@ async fn process_task(
     println!("[PROCESS] Baking complete with 2B (2048-dim) format. Advancing to analysis phase.");
 
     // --- INTEGRATED INFERENCE PHASE ---
-    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, false, Some(&task.r#ref)).await?;
+    // [OPTIMIZATION] Set force_text_only: true (last param) for HTML analysis to save ~1GB VRAM.
+    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
     
     {
         let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
@@ -348,8 +351,9 @@ async fn process_task(
     let mut all_extracted_items = Vec::new();
 
     // [2026-SPECULATIVE-INIT] Load 0.6B to CPU RAM for parallel drafting
-    model.ensure_speculative_draftsman().await?;
-    {
+    if let Err(e) = model.ensure_speculative_draftsman().await {
+        println!("[SPECULATIVE] Skip loading draftsman (RAM pressure or IO?): {}. Proceeding with standard inference.", e);
+    } else {
         let gen_arc = model.generator.clone();
         let draft_arc = model.speculative_draftsman.clone();
         let mut gen_guard = gen_arc.lock().await;
@@ -364,8 +368,7 @@ async fn process_task(
         
         let type_prompt = parsing::page_type_prompt();
 
-        // 1. Ensure 2B is loaded and stitched with ONLY the PUG base
-        model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
+        // 1. Model is already loaded. Just ensure KV is stitched with ONLY the PUG base
         {
             let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
             let pug_base_path = kv_dir.join("shared_pug_base.safetensors");

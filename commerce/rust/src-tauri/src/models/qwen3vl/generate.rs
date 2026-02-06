@@ -495,25 +495,21 @@ impl Qwen3VLGenerateModel {
             }
         }
 
-        // 2. Process in parallel chunks
-        // We rely on Rayon's internal thread pool and the model's internal Mutexes 
-        // to naturally pipeline the execution across layers.
+        // 2. Process in sequential chunks
+        // [OPTIMIZATION] On limited GPUs (4GB), sequential execution is faster than 
+        // oversaturating the GPU queue with dozens of parallel requests.
         let chunks: Vec<_> = all_ids.chunks(chunk_size).enumerate().collect();
 
-        chunks.par_iter().for_each(|(chunk_idx, chunk)| {
+        for (chunk_idx, chunk) in chunks {
             if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) { return; }
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
             }
 
             let current_chunk_offset = initial_offset + (chunk_idx * chunk_size);
-            // No sleep, just push to the model. Internal Mutexes will handle serialization 
-            // at the layer level, effectively pipelining the GPU work.
             self.qwen3_vl.forward(chunk, None, None, current_chunk_offset);
             
-            if (chunk_idx + 1) % 5 == 0 || chunk_idx == &0 {
-                println!("[BAKE-PARALLEL] Progress: Chunk {}/{}", chunk_idx + 1, chunks.len());
-            }
-        });
+            println!("[BAKE-PROGRESS] Chunk {}/{}", chunk_idx + 1, (total_tokens + chunk_size - 1) / chunk_size);
+        }
 
         if let Some(flag) = &cancel_flag {
             if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }

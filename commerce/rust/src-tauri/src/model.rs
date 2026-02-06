@@ -56,6 +56,14 @@ impl LogisModel {
         let mut draftsman = self.speculative_draftsman.lock().await;
         if draftsman.is_some() { return Ok(()); }
 
+        // [STABILITY] Check if we have enough RAM to load the draftsman
+        let mut sys = System::new();
+        sys.refresh_memory();
+        let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        if free_ram_gb < 3.0 {
+            return Err(anyhow::anyhow!("Insufficient RAM ({:.2} GB) for speculative draftsman. Skipping.", free_ram_gb));
+        }
+
         println!("[SPECULATIVE] Loading 0.6B Draftsman into CPU RAM...");
         let path = self.small_model_path.clone();
         let limit = self.max_tokens_limit;
@@ -131,8 +139,8 @@ impl LogisModel {
         // 1. Clear Active Slot
         if let Ok(mut gen) = self.generator.try_lock() { *gen = None; }
         
-        // 2. Clear Hibernation Slots ONLY if forced or in GPU mode (to be safe)
-        if force_all || !self.is_cpu_mode {
+        // 2. Clear Hibernation Slots ONLY if forced
+        if force_all {
             if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
             if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
             
@@ -322,6 +330,10 @@ impl LogisModel {
         }
 
         println!("[BAKE-PUG] One-time site baking for: {} (Using current active generator)", address_hash);
+        // [ORDERLY-EXECUTION] Acquire global GPU semaphore to prevent overlapping heavy computations
+        let _gpu_guard = crate::scheduler::REGISTRY.gpu_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+        println!("[BAKE-ORDER] GPU Slot secured for baking: {}", address_hash);
+
         // Do NOT call ensure_generator here, use whatever is already active (secured by scheduler)
         {
             let gen_clone = self.generator.clone();
@@ -599,23 +611,23 @@ impl LogisModel {
 
     /// [STABILITY] Check if the system has enough overhead to keep models in RAM
     async fn is_system_under_pressure(&self) -> bool {
-        // 1. Check System RAM (Threshold: 4GB)
+        // 1. Check System RAM (Threshold: 2GB)
         let mut sys = System::new();
         sys.refresh_memory();
         let free_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         
-        if free_ram_gb < 4.0 {
+        if free_ram_gb < 2.0 {
             println!("[STABILITY-WATCH] High RAM Pressure detected ({:.2} GB free).", free_ram_gb);
             return true;
         }
 
-        // 2. Check GPU VRAM if applicable (Threshold: 2GB)
+        // 2. Check GPU VRAM if applicable (Threshold: 1GB)
         if !self.is_cpu_mode {
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
                         let free_vram_gb = mem.free as f64 / 1024.0 / 1024.0 / 1024.0;
-                        if free_vram_gb < 2.0 {
+                        if free_vram_gb < 1.0 {
                             println!("[STABILITY-WATCH] High VRAM Pressure detected ({:.2} GB free).", free_vram_gb);
                             return true;
                         }
@@ -867,6 +879,9 @@ Return valid JSON only. No explanation.
             }
         }
         
+        // [ORDERLY-EXECUTION] Acquire global GPU semaphore
+        let _gpu_guard = crate::scheduler::REGISTRY.gpu_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
+
         let self_clone = self.generator.clone();
         let sid_clone = session_id.clone();
         
@@ -985,6 +1000,9 @@ Return valid JSON only. No explanation.
         if let Some(task_id) = base_payload.get("task_id").and_then(|v| v.as_str()) {
             crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
         }
+
+        // [ORDERLY-EXECUTION] Acquire global GPU semaphore
+        let _gpu_guard = crate::scheduler::REGISTRY.gpu_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("Semaphore error: {}", e))?;
 
         let self_clone = self.generator.clone();
         
