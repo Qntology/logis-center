@@ -935,10 +935,9 @@ impl NativeVisionModel {
         // 1. Patch Embedding (Result to hidden_a)
         let embed_out = self.patch_embed.forward(pixel_values, global_scratch);
         workspace.hidden_a[..embed_out.len()].copy_from_slice(&embed_out);
-        // [BORROW-CHECKER-FIX] Detach slice from workspace
-        let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(workspace.hidden_a.as_ptr(), embed_out.len()) };
         
         // 2. Transformer Blocks
+        // [FIX] Single definition of cur_x with proper raw pointer detachment
         let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(workspace.hidden_a.as_ptr(), embed_out.len()) };
         
         for (i, block) in self.blocks.iter().enumerate() {
@@ -958,13 +957,13 @@ impl NativeVisionModel {
                 rope_scaling: None,
             }, 0, 0, rope_cos, rope_sin, false, global_scratch, workspace, use_b);
             
-            // [BORROW-CHECKER-FIX] Detach slice from mutable workspace borrow to allow next iteration
+            // Detach slice from mutable workspace borrow to allow next iteration
             cur_x = unsafe { std::slice::from_raw_parts(out_slice.as_ptr(), out_slice.len()) };
         }
         
         // 3. Patch Merger
         let last_use_b = self.blocks.len() % 2 != 0;
-        let final_vision_slice = self.merger.forward(cur_x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
+        let merger_out = self.merger.forward(cur_x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
             hidden_size: cur_x.len() / patches,
             intermediate_size: cur_x.len() / patches,
             num_hidden_layers: 1,
@@ -979,7 +978,7 @@ impl NativeVisionModel {
             rope_scaling: None,
         }, 0, 0, rope_cos, rope_sin, false, global_scratch, workspace, !last_use_b);
 
-        final_vision_slice
+        merger_out
     }
 }
 
@@ -1327,9 +1326,10 @@ impl NativeQwen3VLModel {
                     std::slice::from_raw_parts(vision_features_slice.as_ptr(), vision_features_slice.len())
                 };
 
-                let img_token_id = 151655;
+                let img_token_id = 151655; // <|image_pad|>
                 let hid = self.text_model.config.hidden_size;
                 let mut vision_idx = 0;
+                
                 for (i, &id) in i_ids.iter().enumerate() {
                     if id == img_token_id && vision_idx < (vision_features.len() / hid) {
                         embeds[i * hid .. (i + 1) * hid].copy_from_slice(&vision_features[vision_idx * hid .. (vision_idx + 1) * hid]);
