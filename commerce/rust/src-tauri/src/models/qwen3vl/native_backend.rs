@@ -352,24 +352,47 @@ pub fn bit_serial_matmul_f32_extreme_into(i: &[f16], w: &[u32], s: &[f16], out: 
 }
 
 pub fn native_rms_norm_f16_into(x: &[f16], w: &[f16], eps: f32, hid: usize, out: &mut [f16]) {
-    out.par_chunks_mut(hid).enumerate().for_each(|(i, row)| {
-        let start = i * hid;
+    // [STABILITY-FIX] Use safe chunking to prevent out-of-bounds access
+    let x_chunks = x.chunks(hid);
+    out.par_chunks_mut(hid).zip(x_chunks).for_each(|(out_row, x_row)| {
         let mut v = 0.0f32;
-        for j in 0..hid { let val = x[start + j].to_f32(); v += val * val; }
+        for &val in x_row {
+            let f = val.to_f32();
+            v += f * f;
+        }
         let inv = 1.0 / (v / hid as f32 + eps).sqrt();
-        for j in 0..hid { row[j] = f16::from_f32(x[start + j].to_f32() * inv * w[j].to_f32()); }
+        for (j, out_val) in out_row.iter_mut().enumerate() {
+            if j < w.len() && j < x_row.len() {
+                *out_val = f16::from_f32(x_row[j].to_f32() * inv * w[j].to_f32());
+            }
+        }
     });
 }
 
-pub fn native_linear_f16_into(x: &[f16], w: &[f16], b: Option<&[f16]>, out: &mut [f16], m: usize, out_f: usize, in_f: usize) {
-    out.par_chunks_mut(out_f).enumerate().for_each(|(i, row)| {
-        let x_row = &x[i * in_f..(i + 1) * in_f];
+pub fn native_linear_f16_into(x: &[f16], w: &[f16], b: Option<&[f16]>, out: &mut [f16], _m: usize, out_f: usize, in_f: usize) {
+    // [STABILITY-FIX] Use safe chunking for matrix multiply
+    let x_chunks = x.chunks(in_f);
+    out.par_chunks_mut(out_f).zip(x_chunks).for_each(|(out_row, x_row)| {
         for j in 0..out_f {
             let mut acc = 0.0f32;
-            let w_row = &w[j * in_f..(j + 1) * in_f];
-            for k in 0..in_f { acc += x_row[k].to_f32() * w_row[k].to_f32(); }
-            if let Some(bias) = b { acc += bias[j].to_f32(); }
-            row[j] = f16::from_f32(acc);
+            let w_row_start = j * in_f;
+            if w_row_start + in_f <= w.len() {
+                let w_row = &w[w_row_start .. w_row_start + in_f];
+                // Dot product of x_row and w_row
+                for (k, &xv) in x_row.iter().enumerate() {
+                    if k < w_row.len() {
+                        acc += xv.to_f32() * w_row[k].to_f32();
+                    }
+                }
+            }
+            if let Some(bias) = b {
+                if j < bias.len() {
+                    acc += bias[j].to_f32();
+                }
+            }
+            if j < out_row.len() {
+                out_row[j] = f16::from_f32(acc);
+            }
         }
     });
 }
@@ -383,11 +406,13 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
         let h_idx = idx % n_h;
         let q_idx = idx / n_h;
         let start = (q_idx * n_h * h_d) + (h_idx * h_d);
-        let src = &q[start..start + h_d];
-        for kb in 0..k_b {
-            let mut b = 0u32;
-            for bt in 0..32 { if kb * 32 + bt < h_d && src[kb * 32 + bt].to_f32() >= 0.0 { b |= 1 << bt; } }
-            row[kb] = b;
+        if start + h_d <= q.len() {
+            let src = &q[start..start + h_d];
+            for kb in 0..k_b {
+                let mut b = 0u32;
+                for bt in 0..32 { if kb * 32 + bt < h_d && src[kb * 32 + bt].to_f32() >= 0.0 { b |= 1 << bt; } }
+                row[kb] = b;
+            }
         }
     });
     let mut o = vec![f16::ZERO; q_l * hid];
@@ -400,18 +425,30 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
             let mut local_o = vec![0.0f32; h_d];
             for j in 0..t_s {
                 let mut dot = 0;
-                let k_p_ptr = unsafe { k_p.as_ptr().add((j * n_kv + h_kv) * k_b) };
-                for kb in 0..k_b { dot += 32 - 2 * (unsafe { *q_b_ptr.add(kb) ^ *k_p_ptr.add(kb) }).count_ones() as i32; }
+                let k_p_idx = (j * n_kv + h_kv) * k_b;
+                if k_p_idx + k_b <= k_p.len() {
+                    for kb in 0..k_b { 
+                        dot += 32 - 2 * (unsafe { *q_b_ptr.add(kb) ^ k_p[k_p_idx + kb] }).count_ones() as i32; 
+                    }
+                }
                 let score = ((dot as f32) + alpha) * (1.0 / (h_d as f32).sqrt());
                 let n_max = running_max.max(score);
                 let e_scale = (running_max - n_max).exp();
                 let e_score = (score - n_max).exp();
                 running_sum = running_sum * e_scale + e_score;
                 running_max = n_max;
-                let v_ptr = unsafe { v_f.as_ptr().add((j * n_kv + h_kv) * h_d) };
-                for d in 0..h_d { local_o[d] = local_o[d] * e_scale + e_score * unsafe { *v_ptr.add(d) }.to_f32(); }
+                let v_ptr_idx = (j * n_kv + h_kv) * h_d;
+                if v_ptr_idx + h_d <= v_f.len() {
+                    for d in 0..h_d { 
+                        local_o[d] = local_o[d] * e_scale + e_score * v_f[v_ptr_idx + d].to_f32(); 
+                    }
+                }
             }
-            for d in 0..h_d { row_o[h * h_d + d] = f16::from_f32(local_o[d] / (running_sum + 1e-9)); }
+            for d in 0..h_d { 
+                if h * h_d + d < row_o.len() {
+                    row_o[h * h_d + d] = f16::from_f32(local_o[d] / (running_sum + 1e-9)); 
+                }
+            }
         }
     });
     o
@@ -419,13 +456,7 @@ pub fn native_bit_serial_attn_f16(q: &[f16], k_p: &[u32], v_f: &[f16], hid: usiz
 
 pub fn native_rms_norm_f16(x: &[f16], w: &[f16], eps: f32, hid: usize) -> Vec<f16> {
     let mut out = vec![f16::ZERO; x.len()];
-    out.par_chunks_mut(hid).enumerate().for_each(|(i, row)| {
-        let start = i * hid;
-        let mut v = 0.0f32;
-        for j in 0..hid { let val = x[start + j].to_f32(); v += val * val; }
-        let inv = 1.0 / (v / hid as f32 + eps).sqrt();
-        for j in 0..hid { row[j] = f16::from_f32(x[start + j].to_f32() * inv * w[j].to_f32()); }
-    });
+    native_rms_norm_f16_into(x, w, eps, hid, &mut out);
     out
 }
 
@@ -439,9 +470,11 @@ pub fn native_silu_f16(x: &mut [f16]) {
 pub fn native_silu_mul_f16(gate: &[f16], up: &[f16]) -> Vec<f16> {
     let mut out = vec![f16::ZERO; gate.len()];
     out.par_iter_mut().enumerate().for_each(|(i, val)| {
-        let g = gate[i].to_f32();
-        let u = up[i].to_f32();
-        *val = f16::from_f32((g * (1.0 / (1.0 + (-g).exp()))) * u);
+        if i < gate.len() && i < up.len() {
+            let g = gate[i].to_f32();
+            let u = up[i].to_f32();
+            *val = f16::from_f32((g * (1.0 / (1.0 + (-g).exp()))) * u);
+        }
     });
     out
 }
@@ -450,23 +483,16 @@ pub fn native_embedding_lookup_f16(ids: &[u32], table: &[f16], hid: usize) -> Ve
     let mut out = vec![f16::ZERO; ids.len() * hid];
     for (i, &id) in ids.iter().enumerate() {
         let start = id as usize * hid;
-        out[i * hid..(i + 1) * hid].copy_from_slice(&table[start..start + hid]);
+        if start + hid <= table.len() {
+            out[i * hid..(i + 1) * hid].copy_from_slice(&table[start..start + hid]);
+        }
     }
     out
 }
 
 pub fn native_linear_f16(x: &[f16], w: &[f16], b: Option<&[f16]>, m: usize, out_f: usize, in_f: usize) -> Vec<f16> {
     let mut out = vec![f16::ZERO; m * out_f];
-    out.par_chunks_mut(out_f).enumerate().for_each(|(i, row)| {
-        let x_row = &x[i * in_f..(i + 1) * in_f];
-        for j in 0..out_f {
-            let mut acc = 0.0f32;
-            let w_row = &w[j * in_f..(j + 1) * in_f];
-            for k in 0..in_f { acc += x_row[k].to_f32() * w_row[k].to_f32(); }
-            if let Some(bias) = b { acc += bias[j].to_f32(); }
-            row[j] = f16::from_f32(acc);
-        }
-    });
+    native_linear_f16_into(x, w, b, &mut out, m, out_f, in_f);
     out
 }
 
