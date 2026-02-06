@@ -297,9 +297,9 @@ async fn process_task(
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     
-    // [2026-STRICT-2048-DIM] Use Large (2B) model for baking to match the 2048-dim requirement.
-    // We use baking_only: true to only load Layer 0, keeping it fast while maintaining dimensions.
-    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), true, true, Some(&task.r#ref)).await?;
+    // [2026-OPTIMIZED-BAKING] Use Small (0.6B) model for baking to save resources.
+    // The KV cache will be upscaled to 2048-dim during save to be compatible with the 2B model.
+    model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true, Some(&task.r#ref)).await?;
     
     // [2026-PHYSICAL-DEDUPLICATION] Check registry before baking
     let bake_key = format!("bake_{}", task.r#ref);

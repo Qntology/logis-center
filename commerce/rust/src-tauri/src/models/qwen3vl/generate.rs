@@ -209,10 +209,30 @@ impl Qwen3VLGenerateModel {
         let all_ids = if no_bridge && seqlen_offset > 0 {
             // Bypass ChatTemplate and use Raw Text Append (Matches backup success)
             let system_content = mes.messages.iter().find_map(|m| {
-                if let crate::openai_types::ChatCompletionRequestMessage::System(s) = m { Some(&s.content) } else { None }
-            }).cloned().unwrap_or_default();
+                if let crate::openai_types::ChatCompletionRequestMessage::System(s) = m { Some(s.content.clone()) } else { None }
+            }).unwrap_or_default();
+
+            // [FIX] Also retrieve User content which holds the actual instruction in nobridge mode
+            let user_content = mes.messages.iter().find_map(|m| {
+                if let crate::openai_types::ChatCompletionRequestMessage::User(u) = m {
+                    match &u.content {
+                        crate::openai_types::ChatCompletionRequestUserMessageContent::String(s) => Some(s.clone()),
+                        crate::openai_types::ChatCompletionRequestUserMessageContent::Array(parts) => {
+                            let mut acc = String::new();
+                            for p in parts {
+                                if let crate::openai_types::ChatCompletionRequestMessageContentPart::Text(t) = p {
+                                    acc.push_str(&t.text);
+                                }
+                            }
+                            if acc.is_empty() { None } else { Some(acc) }
+                        }
+                    }
+                } else { None }
+            }).unwrap_or_default();
+
+            let combined_task = if !user_content.is_empty() { user_content } else { system_content };
             
-            let raw_prompt = format!("\n\nTASK: {}\n\nACTION: JSON ONLY\n\nAssistant: ", system_content);
+            let raw_prompt = format!("\n\nTASK: {}\n\nACTION: JSON ONLY\n\nAssistant: ", combined_task);
             println!("[{}-RAW] Constructing raw prompt ({} chars) for stitched context.", tag, raw_prompt.len());
             self.tokenizer.text_encode_vec(raw_prompt, false)?
         } else {
@@ -554,8 +574,8 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn save_kv_to_disk(&self, path: &Path, start_token_idx: usize, tail_tokens: &[u32]) -> Result<()> {
-        let kvs = match &self.qwen3_vl {
-            ModelVariant::Native(m) => m.text_model.get_all_kv(start_token_idx),
+        let (kvs, current_hidden_size) = match &self.qwen3_vl {
+            ModelVariant::Native(m) => (m.text_model.get_all_kv(start_token_idx), m.text_model.config.hidden_size),
         };
 
         if kvs.is_empty() { 
@@ -577,16 +597,60 @@ impl Qwen3VLGenerateModel {
             tensors.insert("metadata.tokens".to_string(), (safetensors::Dtype::U32, vec![tail_tokens.len()], t_bytes));
         }
 
+        let needs_upscale = current_hidden_size == 1024;
+        if needs_upscale {
+            println!("[KV-DISK] Upscaling KV from 1024 (0.6B) to 2048 (2B) dimensions...");
+        }
+
         for (i, (k, v)) in kvs.into_iter().enumerate() {
+            let (final_k, final_v) = if needs_upscale {
+                // Upscale Logic: 0.6B (HeadDim 64) -> 2B (HeadDim 128)
+                // Assumption: num_heads and num_kv_heads are consistent (16), only head_dim doubles.
+                // K-Cache (u32 packed): 64/32=2 u32s -> 128/32=4 u32s (Pad 2 zeros)
+                // V-Cache (f16): 64 f16s -> 128 f16s (Pad 64 zeros)
+                
+                let num_kv_heads = 16; // Standard for Qwen2-VL family
+                let src_head_dim_k = 2; // 64 / 32
+                let dst_head_dim_k = 4; // 128 / 32
+                let src_head_dim_v = 64;
+                let dst_head_dim_v = 128;
+
+                let token_count = k.len() / (num_kv_heads * src_head_dim_k);
+                
+                let mut new_k = Vec::with_capacity(token_count * num_kv_heads * dst_head_dim_k);
+                let mut new_v = Vec::with_capacity(token_count * num_kv_heads * dst_head_dim_v);
+
+                // Transform K
+                for t in 0..token_count {
+                    for h in 0..num_kv_heads {
+                        let src_start = (t * num_kv_heads + h) * src_head_dim_k;
+                        new_k.extend_from_slice(&k[src_start..src_start + src_head_dim_k]);
+                        new_k.extend(std::iter::repeat(0u32).take(dst_head_dim_k - src_head_dim_k));
+                    }
+                }
+
+                // Transform V
+                for t in 0..token_count {
+                    for h in 0..num_kv_heads {
+                        let src_start = (t * num_kv_heads + h) * src_head_dim_v;
+                        new_v.extend_from_slice(&v[src_start..src_start + src_head_dim_v]);
+                        new_v.extend(std::iter::repeat(half::f16::ZERO).take(dst_head_dim_v - src_head_dim_v));
+                    }
+                }
+                (new_k, new_v)
+            } else {
+                (k, v)
+            };
+
             // K (u32) to bytes
-            let mut k_bytes = Vec::with_capacity(k.len() * 4);
-            for &val in &k { k_bytes.extend_from_slice(&val.to_ne_bytes()); }
-            tensors.insert(format!("layer.{}.k", i), (safetensors::Dtype::U32, vec![k.len()], k_bytes));
+            let mut k_bytes = Vec::with_capacity(final_k.len() * 4);
+            for &val in &final_k { k_bytes.extend_from_slice(&val.to_ne_bytes()); }
+            tensors.insert(format!("layer.{}.k", i), (safetensors::Dtype::U32, vec![final_k.len()], k_bytes));
             
             // V (f16) to bytes
-            let mut v_bytes = Vec::with_capacity(v.len() * 2);
-            for &val in &v { v_bytes.extend_from_slice(&val.to_ne_bytes()); }
-            tensors.insert(format!("layer.{}.v", i), (safetensors::Dtype::F16, vec![v.len()], v_bytes));
+            let mut v_bytes = Vec::with_capacity(final_v.len() * 2);
+            for &val in &final_v { v_bytes.extend_from_slice(&val.to_ne_bytes()); }
+            tensors.insert(format!("layer.{}.v", i), (safetensors::Dtype::F16, vec![final_v.len()], v_bytes));
         }
 
         // Safetensors 저장을 위한 View 생성
