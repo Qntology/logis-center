@@ -54,11 +54,35 @@ extern "C" {
 
     #[link_name = "cuda_apply_gain_f16"]
     pub fn cuda_apply_gain_f16(d_data: *mut f16, gain: f32, elements: i32);
+
+    #[link_name = "cuda_add_inplace_f16"]
+    pub fn cuda_add_inplace_f16(d_dst: *mut f16, d_src: *const f16, size: i32);
+
+    #[link_name = "cuda_hybrid_repeat_f16"]
+    pub fn cuda_hybrid_repeat_f16(d_data: *mut f16, src_size: i32, target_size: i32, q_len: i32);
+
+    #[link_name = "cuda_silu_inplace_f16"]
+    pub fn cuda_silu_inplace_f16(d_data: *mut f16, size: i32);
 }
 
 #[cfg(feature = "cuda")]
 pub fn native_cuda_apply_gain(d_data: CUdeviceptr, gain: f32, elements: usize) {
     unsafe { cuda_apply_gain_f16(d_data as *mut f16, gain, elements as i32); }
+}
+
+#[cfg(feature = "cuda")]
+pub fn native_cuda_add_inplace(d_dst: CUdeviceptr, d_src: CUdeviceptr, size: usize) {
+    unsafe { cuda_add_inplace_f16(d_dst as *mut f16, d_src as *const f16, size as i32); }
+}
+
+#[cfg(feature = "cuda")]
+pub fn native_cuda_hybrid_repeat(d_data: CUdeviceptr, src_size: usize, target_size: usize, q_len: usize) {
+    unsafe { cuda_hybrid_repeat_f16(d_data as *mut f16, src_size as i32, target_size as i32, q_len as i32); }
+}
+
+#[cfg(feature = "cuda")]
+pub fn native_cuda_silu_inplace(d_data: CUdeviceptr, size: usize) {
+    unsafe { cuda_silu_inplace_f16(d_data as *mut f16, size as i32); }
 }
 
 #[cfg(feature = "cuda")]
@@ -72,21 +96,14 @@ pub fn native_cuda_pack_bits(d_src: CUdeviceptr, d_dst: CUdeviceptr, elements: u
 }
 
 #[cfg(feature = "cuda")]
-pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32, src_h_d: usize, q_on_gpu: bool) -> Vec<f16> {
-    let eps_signal = f16::from_f32(1e-6);
-    if d_q == 0 || d_o == 0 || k_p.0.is_null() || v_p.0.is_null() {
-        return vec![eps_signal; q.len()];
-    }
+pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32, src_h_d: usize, q_on_gpu: bool) {
+    if d_q == 0 || d_o == 0 || k_p.0.is_null() || v_p.0.is_null() { return; }
     unsafe {
         if !q_on_gpu {
             lib().cuMemcpyHtoD_v2(d_q, q.as_ptr() as *const _, q.len() * 2);
         }
         let actual_q_len = if q.is_empty() { 1 } else { q.len() / (n_h * h_d) };
         cuda_attn_f16(d_q as *const f16, k_p.0 as *const u32, v_p.0 as *const f16, d_o as *mut f16, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, actual_q_len as i32, alpha, src_h_d as i32);
-        let out_len = actual_q_len * n_h * h_d;
-        let mut o_f = vec![eps_signal; out_len]; 
-        lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, out_len * 2);
-        o_f
     }
 }
 
