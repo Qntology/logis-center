@@ -564,22 +564,31 @@ impl NativeLayer {
         gpu_cache.current_len = 0;
     }
 
-    pub fn get_kv_data(&self, head_dim: usize, n_kv: usize) -> Option<(Vec<u32>, Vec<f16>)> {
+    pub fn get_kv_data(&self, head_dim: usize, n_kv: usize, start_token: usize) -> Option<(Vec<u32>, Vec<f16>)> {
         #[cfg(feature = "cuda")]
         if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
             use cudarc::driver::sys::{lib, CUdeviceptr};
             let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
             if let (Some(k_ptr), Some(v_ptr)) = (gpu_cache_guard.k_ptr, gpu_cache_guard.v_ptr) {
                 let current_len = gpu_cache_guard.current_len;
-                if current_len > 0 {
-                    let k_size = current_len * n_kv * (head_dim / 32);
-                    let v_size = current_len * n_kv * head_dim;
+                if current_len > start_token {
+                    let extract_len = current_len - start_token;
+                    let k_unit = n_kv * (head_dim / 32);
+                    let v_unit = n_kv * head_dim;
+                    
+                    let k_size = extract_len * k_unit;
+                    let v_size = extract_len * v_unit;
                     let mut k_host = vec![0u32; k_size];
                     let mut v_host = vec![f16::ZERO; v_size];
+                    
                     unsafe {
                         let cuda_lib = lib();
-                        let d_k_src = k_ptr.0 as usize as CUdeviceptr;
-                        let d_v_src = v_ptr.0 as usize as CUdeviceptr;
+                        let k_offset_bytes = (start_token * k_unit * 4) as u64;
+                        let v_offset_bytes = (start_token * v_unit * 2) as u64;
+                        
+                        let d_k_src = (k_ptr.0 as u64 + k_offset_bytes) as CUdeviceptr;
+                        let d_v_src = (v_ptr.0 as u64 + v_offset_bytes) as CUdeviceptr;
+                        
                         let _ = cuda_lib.cuMemcpyDtoH_v2(k_host.as_mut_ptr() as *mut _, d_k_src, k_size * 4);
                         let _ = cuda_lib.cuMemcpyDtoH_v2(v_host.as_mut_ptr() as *mut _, d_v_src, v_size * 2);
                     }
@@ -589,12 +598,14 @@ impl NativeLayer {
         }
 
         let cache = self.kv_cache.lock().unwrap();
-        if cache.current_len > 0 {
+        if cache.current_len > start_token {
             let k_unit = n_kv * (head_dim / 32);
             let v_unit = n_kv * head_dim;
+            let extract_len = cache.current_len - start_token;
+            
             Some((
-                cache.k[..cache.current_len * k_unit].to_vec(),
-                cache.v[..cache.current_len * v_unit].to_vec()
+                cache.k[start_token * k_unit .. cache.current_len * k_unit].to_vec(),
+                cache.v[start_token * v_unit .. cache.current_len * v_unit].to_vec()
             ))
         } else {
             None
@@ -887,10 +898,10 @@ impl NativeQwen3TextModel {
         self.layers[0].get_kv_len(h_d, n_kv)
     }
 
-    pub fn get_all_kv(&self) -> Vec<(Vec<u32>, Vec<f16>)> {
+    pub fn get_all_kv(&self, start_token_idx: usize) -> Vec<(Vec<u32>, Vec<f16>)> {
         let h_d = self.config.head_dim;
         let n_kv = self.config.num_key_value_heads;
-        self.layers.iter().filter_map(|l| l.get_kv_data(h_d, n_kv)).collect()
+        self.layers.iter().filter_map(|l| l.get_kv_data(h_d, n_kv, start_token_idx)).collect()
     }
 }
 

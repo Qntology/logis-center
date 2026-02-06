@@ -343,15 +343,10 @@ impl Qwen3VLGenerateModel {
             current_offset += chunk.len();
         }
 
-        // 3. Final Pull: Extract the COMPLETE KV state from Layer 0 once
-        let ModelVariant::Native(m) = &self.qwen3_vl;
-        let h_d = m.text_model.config.head_dim;
-        let n_kv = m.text_model.config.num_key_value_heads;
-        if let Some((k, v)) = m.text_model.layers[0].get_kv_data(h_d, n_kv) {
-            let final_path = crate::utils::paths::get_kv_dir(None, address_hash).join(format!("{}_{}.safetensors", task_id, suffix));
-            self.save_raw_kv_to_disk(&final_path, &k, &v)?;
-            println!("[BAKE-STREAM] SUCCESS: Saved context ({} tokens) to {:?}", k.len() * 32 / (n_kv * h_d), final_path);
-        }
+        // 3. Final Pull: Extract the COMPLETE KV state from ALL layers once, but only from initial_offset
+        let final_path = crate::utils::paths::get_kv_dir(None, address_hash).join(format!("{}_{}.safetensors", task_id, suffix));
+        self.save_kv_to_disk(&final_path, initial_offset)?;
+        println!("[BAKE-STREAM] SUCCESS: Saved component context ({} tokens added) to {:?}", (all_ids.len()), final_path);
 
         self.clear_kv_cache(); 
         Ok(())
@@ -378,8 +373,8 @@ impl Qwen3VLGenerateModel {
             current_offset += chunk.len();
         }
 
-        // [FIX] Save ALL layers, not just layer 0
-        self.save_kv_to_disk(final_path)?;
+        // [FIX] Save ONLY the newly baked tokens starting from initial_offset
+        self.save_kv_to_disk(final_path, initial_offset)?;
         
         self.clear_kv_cache();
         Ok(())
@@ -414,9 +409,9 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
-    pub fn save_kv_to_disk(&self, path: &Path) -> Result<()> {
+    pub fn save_kv_to_disk(&self, path: &Path, start_token_idx: usize) -> Result<()> {
         let kvs = match &self.qwen3_vl {
-            ModelVariant::Native(m) => m.text_model.get_all_kv(),
+            ModelVariant::Native(m) => m.text_model.get_all_kv(start_token_idx),
         };
 
         if kvs.is_empty() { 
