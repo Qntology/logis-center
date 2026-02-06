@@ -520,7 +520,8 @@ impl NativeLayer {
                             cuda_lib.cuMemcpyHtoD_v2(d_i, workspace.q.as_ptr() as *const _, workspace.q.len() * 2);
 
                             let acc_corr = (1.0 - (_idx as f32 / 28.0) * 0.15).clamp(0.85, 1.0);
-                            let mut attn_out_raw = crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&workspace.q, k_ptr, v_ptr, n_h, n_kv, head_dim, needed_tokens, self.device_id as usize, d_i, d_o, final_alpha * acc_corr);
+                            let src_h_d = self.q_proj.src_in / n_h;
+                            let mut attn_out_raw = crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&workspace.q, k_ptr, v_ptr, n_h, n_kv, head_dim, needed_tokens, self.device_id as usize, d_i, d_o, final_alpha * acc_corr, src_h_d);
                             
                             // Apply Semantic Gain
                             if semantic_gain != 1.0 {
@@ -1159,6 +1160,7 @@ impl NativeQwen3VLModel {
                 
                 Ok(NativeLinear { 
                     in_features: in_f, out_features: out_f, 
+                    src_in: in_f, src_out: out_f,
                     variant: LinearVariant::BitSerial {
                         weight_packed: NativeTensor::from_mmap(current_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
@@ -1171,6 +1173,7 @@ impl NativeQwen3VLModel {
                 let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                 Ok(NativeLinear { 
                     in_features: in_f, out_features: out_f, 
+                    src_in: in_f, src_out: out_f,
                     variant: LinearVariant::Standard { 
                         weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
                         bias: None 
@@ -1227,6 +1230,7 @@ impl NativeQwen3VLModel {
 
                 Ok(NativeLinear { 
                     in_features: vocab, out_features: target_hid, 
+                    src_in: src_hid, src_out: target_hid,
                     variant: LinearVariant::Standard { 
                         weight: NativeTensor { data_ptr: leaked_ptr, gpu_ptr: None, shape: vec![vocab, target_hid], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, 
                         bias: None 
@@ -1386,6 +1390,8 @@ impl NativeQwen3VLModel {
                     .map(|mut emb_l| {
                         emb_l.in_features = t_c.hidden_size;
                         emb_l.out_features = 151936;
+                        emb_l.src_in = t_c.hidden_size;
+                        emb_l.src_out = 151936;
                         emb_l
                     })
             });
@@ -1495,6 +1501,8 @@ impl NativeQwen3VLModel {
             text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(rope_cache) }, 
             lm_head: head, 
             visual,
+            support_layer0,
+            support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
             global_scratch_i: std::sync::Mutex::new(None),
             global_scratch_o: std::sync::Mutex::new(None),
             workspace: std::sync::Mutex::new(ForwardWorkspace::new()),

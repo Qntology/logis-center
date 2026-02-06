@@ -61,6 +61,7 @@ impl NativeEmbeddingModel {
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()),
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 device_id: -1,
+                is_support_layer: false,
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
         }

@@ -222,12 +222,12 @@ pub fn pack_f16_to_bits(src: &[f16]) -> Vec<u32> {
 }
 
 #[cfg(feature = "cuda")]
-pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, alpha: f32) -> Vec<f16> {
+pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, alpha: f32, src_h_d: usize) -> Vec<f16> {
     unsafe {
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         lib().cuMemAlloc_v2(&mut d_q, q.len() * 2); 
         lib().cuMemAlloc_v2(&mut d_o, q.len() * 2);
-        let res = native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha);
+        let res = native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha, src_h_d);
         lib().cuMemFree_v2(d_q); lib().cuMemFree_v2(d_o);
         res
     }
