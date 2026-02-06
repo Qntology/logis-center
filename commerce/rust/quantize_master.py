@@ -92,8 +92,8 @@ def process_model(input_path, output_dir, is_vision=False, layer_limit=None, lay
         if is_vision != ("visual" in name): continue
 
         is_weight = "weight" in name and len(param.shape) == 2
-        # [CRITICAL] Skip layers that require high precision
-        should_quantize = is_weight and "norm" not in name and "ln" not in name and "embed" not in name and "patch" not in name
+        # [UNIFIED-QUANT] 임베딩, 패치 등을 포함한 모든 가중치 행렬을 양자화 대상으로 포함
+        should_quantize = is_weight and "norm" not in name and "ln" not in name
 
         if should_quantize:
             packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)

@@ -148,6 +148,37 @@ impl DynamicGpuKVCache {
     }
 }
 
+// [NEW] Bit-Serial Dequantizer for Unified Load Support
+pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, k: usize) -> Vec<f16> {
+    let k_blocks = (k + 31) / 32;
+    let n_padded = (n + 7) / 8 * 8;
+    let mut out = vec![f16::ZERO; n * k];
+    
+    // Layout is Shuffled: [N/8, K_blocks, 8]
+    for n_idx_outer in 0..(n_padded / 8) {
+        for kb in 0..k_blocks {
+            for sub_n in 0..8 {
+                let n_idx = n_idx_outer * 8 + sub_n;
+                if n_idx >= n { continue; }
+                
+                let shuffle_idx = (n_idx_outer * k_blocks + kb) * 8 + sub_n;
+                let bits = packed[shuffle_idx];
+                let scale = scales[shuffle_idx];
+                
+                for b in 0..32 {
+                    let k_idx = kb * 32 + b;
+                    if k_idx >= k { break; }
+                    
+                    let bit = (bits >> b) & 1;
+                    let val = if bit == 1 { scale } else { -scale };
+                    out[n_idx * k + k_idx] = val;
+                }
+            }
+        }
+    }
+    out
+}
+
 pub struct NativeLinear {
     pub in_features: usize, 
     pub out_features: usize, 
@@ -1113,23 +1144,43 @@ impl NativeQwen3VLModel {
 
         println!("[LOAD] Initializing Native Engine (Baking: {})...", baking);
 
-        // [CRITICAL-FIX] 임베딩 로더: 임베딩은 항상 F16 룩업 테이블이어야 함
+        // [CRITICAL-FIX] 임베딩 로더: 1비트로 압축된 경우 로딩 시점에 FP16으로 복원
         let get_embed = |base: &str, vocab: usize, hid: usize| -> Result<NativeLinear> {
             let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref(), -1).ok_or_else(|| anyhow!("EmbedTensorNotFound: {}", base))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
 
-            if current_st.tensor(&format!("{}.packed", key)).is_ok() {
-                println!("[LOAD] WARNING: embed_tokens was bit-quantized. Reverting to F16 for lookup table...");
-                // 양자화된 경우 matmul을 통해 F16으로 복구 (단순 lookup이 불가능하므로 로딩 시점에 미리 계산)
-                // 하지만 여기서는 간결성을 위해 Standard로 강제 로드 시도 (GGUF 원본이 F16인 경우 대비)
-                if current_st.tensor(&key).is_ok() {
-                    let v = current_st.tensor(&key)?;
-                    let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                    return Ok(NativeLinear { in_features: vocab, out_features: hid, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 });
-                }
+            let p_n = format!("{}.packed", key);
+            let s_n = format!("{}.scales", key);
+            
+            if current_st.tensor(&p_n).is_ok() {
+                println!("[LOAD] De-quantizing bit-serial embedding for lookup: {}", key);
+                let vp = current_st.tensor(&p_n)?;
+                let vs = current_st.tensor(&s_n)?;
+                
+                let packed_ref = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len() / 4) };
+                let scales_ref = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len() / 2) };
+                
+                let dequantized = dequantize_bit_serial_to_f16(packed_ref, scales_ref, vocab, hid);
+                
+                // [MEM-COPY] 복원된 FP16 데이터를 담은 NativeTensor 생성
+                let mut dest = Vec::with_capacity(dequantized.len() * 2);
+                for v in dequantized { dest.extend_from_slice(&v.to_le_bytes()); }
+                let boxed_data = dest.into_boxed_slice();
+                let leaked_ptr = boxed_data.as_ptr();
+                std::mem::forget(boxed_data); // Keep alive for the session
+
+                Ok(NativeLinear { 
+                    in_features: vocab, out_features: hid, 
+                    variant: LinearVariant::Standard { 
+                        weight: NativeTensor { data_ptr: leaked_ptr, gpu_ptr: None, shape: vec![vocab, hid], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, 
+                        bias: None 
+                    }, 
+                    device_id: -1 
+                })
+            } else {
+                get_l(base, vocab, hid, -1)
             }
-            get_l(base, vocab, hid, -1)
         };
 
         let emb = get_embed("model.embed_tokens.weight", 151936, t_c.hidden_size)

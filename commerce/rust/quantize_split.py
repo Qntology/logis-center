@@ -95,8 +95,8 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
         if is_vision != ("visual" in name): continue
 
         is_weight = "weight" in name and len(param.shape) == 2
-        # 양자화 대상 제외 (임베딩, 노름 등)
-        should_quantize = is_weight and "norm" not in name and "ln" not in name and "embed" not in name and "patch" not in name
+        # [UNIFIED-QUANT] 임베딩 포함 모든 레이어 양자화 통일
+        should_quantize = is_weight and "norm" not in name and "ln" not in name
 
         if should_quantize:
             packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
