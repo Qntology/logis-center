@@ -643,10 +643,12 @@ impl NativeLayer {
 
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            let max_tokens_gpu = 200000;
+            // [DYNAMIC-ALLOCATION] Allocate exactly what is needed for the injected component
+            let k_bytes = tokens * n_kv * (head_dim / 32) * 4;
+            let v_bytes = tokens * n_kv * head_dim * 2;
             
-            cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
-            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
+            cuda_lib.cuMemAlloc_v2(&mut kp, k_bytes); 
+            cuda_lib.cuMemAlloc_v2(&mut vp, v_bytes); 
             
             // Copy data via F16 path
             cuda_lib.cuMemcpyHtoD_v2(kp, k_data.as_ptr() as *const _, k_data.len() * 4);
@@ -654,7 +656,7 @@ impl NativeLayer {
             
             gpu_cache_guard.k_ptr = Some(GpuPtr(kp as *mut _));
             gpu_cache_guard.v_ptr = Some(GpuPtr(vp as *mut _));
-            gpu_cache_guard.capacity = max_tokens_gpu;
+            gpu_cache_guard.capacity = tokens;
             gpu_cache_guard.current_len = tokens;
         }
     }
@@ -679,19 +681,20 @@ impl NativeLayer {
 
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            let max_tokens_gpu = 4096;
-            cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
-            cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
+            // [DYNAMIC-ALLOCATION] Allocate exactly what is needed for the component
+            let k_bytes = tokens * n_kv * (head_dim / 32) * 4;
+            let v_bytes = tokens * n_kv * head_dim * 2;
+            
+            cuda_lib.cuMemAlloc_v2(&mut kp, k_bytes); 
+            cuda_lib.cuMemAlloc_v2(&mut vp, v_bytes); 
             
             // Copy data via DtoD (Device to Device)
-            let k_size = tokens * n_kv * (head_dim / 32) * 4;
-            let v_size = tokens * n_kv * head_dim * 2;
-            cuda_lib.cuMemcpyDtoD_v2(kp, k_src.0 as CUdeviceptr, k_size);
-            cuda_lib.cuMemcpyDtoD_v2(vp, v_src.0 as CUdeviceptr, v_size);
+            cuda_lib.cuMemcpyDtoD_v2(kp, k_src.0 as CUdeviceptr, k_bytes);
+            cuda_lib.cuMemcpyDtoD_v2(vp, v_src.0 as CUdeviceptr, v_bytes);
             
             gpu_cache_guard.k_ptr = Some(GpuPtr(kp as *mut _));
             gpu_cache_guard.v_ptr = Some(GpuPtr(vp as *mut _));
-            gpu_cache_guard.capacity = max_tokens_gpu;
+            gpu_cache_guard.capacity = tokens;
             gpu_cache_guard.current_len = tokens;
         }
     }
