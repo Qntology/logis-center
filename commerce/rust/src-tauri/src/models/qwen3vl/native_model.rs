@@ -40,23 +40,14 @@ impl ForwardWorkspace {
         let req_q = q_len * n_h * head_dim;
         let req_kv = q_len * n_kv * head_dim;
         
-        if self.hidden_a.capacity() < req_hidden { self.hidden_a.reserve(req_hidden.saturating_sub(self.hidden_a.len())); }
-        if self.hidden_b.capacity() < req_hidden { self.hidden_b.reserve(req_hidden.saturating_sub(self.hidden_b.len())); }
-        if self.intermediate_a.capacity() < req_inter { self.intermediate_a.reserve(req_inter.saturating_sub(self.intermediate_a.len())); }
-        if self.intermediate_b.capacity() < req_inter { self.intermediate_b.reserve(req_inter.saturating_sub(self.intermediate_b.len())); }
-        if self.q.capacity() < req_q { self.q.reserve(req_q.saturating_sub(self.q.len())); }
-        if self.k.capacity() < req_kv { self.k.reserve(req_kv.saturating_sub(self.k.len())); }
-        if self.v.capacity() < req_kv { self.v.reserve(req_kv.saturating_sub(self.v.len())); }
-        
-        unsafe {
-            self.hidden_a.set_len(req_hidden);
-            self.hidden_b.set_len(req_hidden);
-            self.intermediate_a.set_len(req_inter);
-            self.intermediate_b.set_len(req_inter);
-            self.q.set_len(req_q);
-            self.k.set_len(req_kv);
-            self.v.set_len(req_kv);
-        }
+        // [SAFE-GROWTH] Use resize to ensure both capacity and length are valid
+        if self.hidden_a.len() < req_hidden { self.hidden_a.resize(req_hidden, f16::ZERO); }
+        if self.hidden_b.len() < req_hidden { self.hidden_b.resize(req_hidden, f16::ZERO); }
+        if self.intermediate_a.len() < req_inter { self.intermediate_a.resize(req_inter, f16::ZERO); }
+        if self.intermediate_b.len() < req_inter { self.intermediate_b.resize(req_inter, f16::ZERO); }
+        if self.q.len() < req_q { self.q.resize(req_q, f16::ZERO); }
+        if self.k.len() < req_kv { self.k.resize(req_kv, f16::ZERO); }
+        if self.v.len() < req_kv { self.v.resize(req_kv, f16::ZERO); }
     }
 }
 
@@ -640,17 +631,21 @@ impl NativeQwen3TextModel {
     ) -> Vec<f16> {
         let hid = self.config.hidden_size;
         let is_baking = self.layers.len() <= 1;
+        let q_len = embeds.len() / hid;
         
+        // [STABILITY-FIX] Always ensure we have a valid workspace with correct capacity
         let mut internal_ws = ForwardWorkspace::new();
         let ws = match workspace {
             Some(w) => w,
-            None => {
-                internal_ws.ensure_capacity(hid, self.config.intermediate_size, embeds.len()/hid, self.config.num_attention_heads, self.config.num_key_value_heads, self.config.head_dim);
-                &mut internal_ws
-            }
+            None => &mut internal_ws,
         };
 
+        // Ensure buffers are large enough before copying anything
+        ws.ensure_capacity(hid, self.config.intermediate_size, q_len, self.config.num_attention_heads, self.config.num_key_value_heads, self.config.head_dim);
+
+        // Copy input to hidden_a
         ws.hidden_a[..embeds.len()].copy_from_slice(&embeds);
+        
         // [BORROW-CHECKER-FIX] Detach initial slice from ws to allow first mutable borrow in loop
         let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), embeds.len()) };
 
