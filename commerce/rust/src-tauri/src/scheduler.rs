@@ -336,15 +336,36 @@ async fn process_task(
     let mut is_detail = false;
     let mut all_extracted_items = Vec::new();
 
-    // [PHASE 1 & 2] Integrated Analysis (Using Backup Mechanism: Integrated Prefill)
+    // [PHASE 1 & 2] Integrated Analysis (Using File-Baking Mechanism)
     {
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Syncing context and identifying structure...", "spinner": "⠋" }));
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Baking system prompts...", "spinner": "⠋" }));
         
         let type_prompt = parsing::page_type_prompt();
-        // [STRICT-PARITY] 백업 버전처럼 베이킹된 문맥 뒤에 질문을 'nobridge' 모드로 즉시 주입
-        // 이 방식은 모델이 PUG 문맥 전체를 완벽히 이해한 상태에서 응답을 시작하게 합니다.
-        let res = model.chat("", &type_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
-        
+        // 1. Bake System Prompt for Page Type Identification
+        model.bake_system_prompt(&task.r#ref, "page_type", &type_prompt, Some(cancellation_token.clone())).await?;
+
+        // 2. Load 2B and Stitch (PUG + TYPE_PROMPT)
+        model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
+        {
+            let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
+            let pug_path = kv_dir.join("shared_pug_base.safetensors");
+            let type_path = kv_dir.join("shared_prompt_page_type.safetensors");
+            let mut components = Vec::new();
+            if pug_path.exists() { components.push(pug_path); }
+            if type_path.exists() { components.push(type_path); }
+
+            let gen_arc = model.generator.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut gen_guard = gen_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.load_kv_stitched(&components)?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }).await??;
+        }
+
+        // 3. Inference (User Input only)
+        let res = model.chat("", "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
@@ -353,9 +374,26 @@ async fn process_task(
             return Ok(()); 
         }
 
-        // [BACKUP-MECHANISM] Selector 추출도 동일 세션(Context 유지)에서 연속 진행
+        // 4. Selector Analysis (Repeat File-Baking Pattern)
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        let res_sel = model.chat("", &selector_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
+        model.bake_system_prompt(&task.r#ref, "selectors", &selector_prompt, Some(cancellation_token.clone())).await?;
+        
+        // Re-stitch with SELECTORS prompt
+        {
+            let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
+            let pug_path = kv_dir.join("shared_pug_base.safetensors");
+            let sel_path = kv_dir.join("shared_prompt_selectors.safetensors");
+            let gen_arc = model.generator.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut gen_guard = gen_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.load_kv_stitched(&[pug_path, sel_path])?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }).await??;
+        }
+
+        let res_sel = model.chat("", "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         selector_info = parsing::parse_json_from_llm(&res_sel);
         
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);

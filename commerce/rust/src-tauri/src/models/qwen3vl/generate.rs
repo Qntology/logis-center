@@ -543,23 +543,22 @@ impl Qwen3VLGenerateModel {
                             }
                             
                             // Append to target layer's cache (allowing multiple components to stack)
-                            let mut cache_k = m.text_model.layers[l_idx].kv_cache.lock().unwrap();
-                            cache_k.k.extend(k_data); 
-                            cache_k.v.extend(v_data);
+                            let mut cache_guard = m.text_model.layers[l_idx].kv_cache.lock().unwrap();
+                            cache_guard.k.extend(k_data); 
+                            cache_guard.v.extend(v_data);
                             
-                            // Re-calculate current length and capacity after manual extension
+                            // [STABILITY] Explicitly sync current_len after extension
                             let k_unit = target_dim / 32;
                             if k_unit > 0 {
-                                cache_k.current_len = cache_k.k.len() / k_unit;
-                                cache_k.capacity = cache_k.current_len;
+                                cache_guard.current_len = cache_guard.k.len() / k_unit;
+                                cache_guard.capacity = cache_guard.current_len; // Update capacity to match physical size
                             }
                         }
                     }
                 }
 
-                // Final Step: Sync Layer 0's cache to GPU if applicable (other layers will DtoD during forward)
-                // Or simply let the first forward pass handle the HtoD.
-                println!("[KV-STITCH-VERIFY] Load Complete across all layers.");
+                // Final Step: Sync Load Status
+                println!("[KV-STITCH-VERIFY] Load Complete across all layers. Total tokens in Layer 0: {}", m.text_model.layers[0].kv_cache.lock().unwrap().current_len);
             },
             _ => return Err(anyhow!("GGUF not supported for stitching")),
         }

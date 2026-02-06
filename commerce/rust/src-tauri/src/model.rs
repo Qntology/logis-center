@@ -317,6 +317,41 @@ impl LogisModel {
         Ok(())
     }
 
+    /// [NEW] Bake a specific system prompt into a file for later stitching
+    pub async fn bake_system_prompt(&self, address_hash: &str, prompt_name: &str, system_prompt: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+        let kv_dir = crate::utils::paths::get_kv_dir(None, Some(address_hash));
+        let final_path = kv_dir.join(format!("shared_prompt_{}.safetensors", prompt_name));
+        let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
+
+        if final_path.exists() {
+            return Ok(());
+        }
+
+        println!("[BAKE-PROMPT] Baking system prompt: {} for address: {}", prompt_name, address_hash);
+        let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
+        
+        self.ensure_generator_ext(ModelSize::Small, true, true).await?;
+        {
+            let gen_clone = self.generator.clone();
+            let text = formatted_prompt;
+            let p_path = final_path.clone();
+            let b_path = pug_base_path.clone();
+            let token_clone = cancel_token.clone();
+            
+            tokio::task::spawn_blocking(move || {
+                let mut gen_guard = gen_clone.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    // PUG 베이스 뒤에 붙을 것이므로 오프셋을 계산하여 베이킹
+                    let offset = if b_path.exists() { gen.get_kv_file_token_count(&b_path).unwrap_or(0) } else { 0 };
+                    gen.bake_text_in_parts_to_path(text, &p_path, "baked_sys", offset, token_clone)?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }).await??;
+        }
+        self.unload_generator().await;
+        Ok(())
+    }
+
     /// Step 2: Bake a specific prompt and run inference by stitching with PUG base
     pub async fn run_modular_inference(&self, address_hash: &str, _task_id: &str, prompt_name: &str, system_prompt: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<String> {
         let prompt_session = format!("shared_prompt_{}", prompt_name);
