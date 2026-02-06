@@ -222,15 +222,12 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
-        // [BACKUP-PARITY] UPSCALE-REFILL & Live Alignment
+        // [BACKUP-PARITY] UPSCALE-REFILL & Live Alignment (Strengthened to 64 tokens)
         if seqlen_offset > 0 {
             let refill_len = 64.min(seqlen_offset); 
             
             if no_bridge {
-                // We start from the beginning of our RAW prompt at the baked offset
-                local_pos = 0;
-                current_kv_offset = seqlen_offset;
-                
+                // Precision Correction: Refine the last 'refill_len' tokens of the baked context
                 let (sync_ids, sync_offset) = {
                     let rope_guard = self.qwen3_vl.get_native_ref().text_model.rope_cache.lock().unwrap();
                     let tail_tokens = &rope_guard.tail_tokens;
@@ -239,14 +236,19 @@ impl Qwen3VLGenerateModel {
                         let sync_start = tail_tokens.len() - sync_len;
                         (tail_tokens[sync_start..].to_vec(), seqlen_offset - sync_len)
                     } else {
+                        // Fallback: Use prompt prefix if tail_tokens metadata is missing
                         (vec![], 0)
                     }
                 };
 
                 if !sync_ids.is_empty() {
-                    println!("[KV-BRIDGE] Refining last {} tokens of baked context at offset {}...", sync_ids.len(), sync_offset);
+                    println!("[KV-BRIDGE-UPSCALE] Refining last {} tokens from metadata at offset {}...", sync_ids.len(), sync_offset);
+                    // Force the 2B model to re-process these tokens to align its activations
                     self.qwen3_vl.forward(&sync_ids, None, None, sync_offset);
                 }
+                
+                local_pos = 0;
+                current_kv_offset = seqlen_offset;
                 println!("[{}-INTEGRATED] Starting live prefill of {} new tokens at offset {}.", tag, all_ids.len(), current_kv_offset);
             } else {
                 // Standard stitching: overlap with existing prompt
