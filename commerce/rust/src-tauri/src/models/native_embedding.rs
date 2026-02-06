@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use memmap2::Mmap;
 use crate::models::qwen3vl::native_backend::*;
-use crate::models::qwen3vl::native_model::{NativeLayer, NativeLinear, LinearVariant, DynamicKVCache, ForwardWorkspace};
+use crate::models::qwen3vl::native_model::{NativeLayer, NativeLinear, LinearVariant, DynamicKVCache, ForwardWorkspace, DynamicGpuKVCache};
 use crate::models::qwen3vl::config::Qwen3VLTextConfig;
 use anyhow::{Result, anyhow};
 use half::f16;
@@ -59,7 +59,7 @@ impl NativeEmbeddingModel {
                 up_proj: NativeLinear { in_features: hidden_size, out_features: 1152, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.up_proj.weight", p))?, bias: None }, device_id: -1 },
                 down_proj: NativeLinear { in_features: 1152, out_features: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.down_proj.weight", p))?, bias: None }, device_id: -1 },
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()),
-                gpu_kv_cache: std::sync::Mutex::new(None),
+                gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 device_id: -1,
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });

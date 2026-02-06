@@ -261,8 +261,9 @@ impl NativeLinear {
     #[cfg(feature = "cuda")]
     fn ensure_gpu_buffers_ext(&self, m: usize, scratch_i: &std::sync::Mutex<Option<(GpuPtr, usize)>>, scratch_o: &std::sync::Mutex<Option<(GpuPtr, usize)>>) -> (CUdeviceptr, CUdeviceptr) {
         use cudarc::driver::sys::*;
-        let req_i = m * self.in_features * 4;
-        let req_o = m * self.out_features * 4;
+        // [ADAPTIVE-POOLING] Request 25% extra padding to prevent jittering allocs
+        let req_i = (m * self.in_features * 4 * 125) / 100;
+        let req_o = (m * self.out_features * 4 * 125) / 100;
         let cuda_lib = unsafe { crate::models::qwen3vl::native_backend::lib() };
         
         unsafe {
@@ -278,12 +279,14 @@ impl NativeLinear {
 
         let mut si_guard = scratch_i.lock().unwrap();
         let d_i = if let Some((ptr, size)) = *si_guard {
-            if size >= req_i { ptr.0 as CUdeviceptr }
+            if size >= (m * self.in_features * 4) { ptr.0 as CUdeviceptr }
             else {
+                // Grow only if significantly smaller
                 let mut new_ptr: CUdeviceptr = 0;
                 let _ = unsafe { cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr) };
                 let res = unsafe { cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_i) };
                 if (res as i32) == 0 && new_ptr != 0 {
+                    println!("[VRAM-POOL] Growing Input Scratch to {} bytes.", req_i);
                     *si_guard = Some((GpuPtr(new_ptr as *mut _), req_i));
                     new_ptr
                 } else { 0 as CUdeviceptr }
@@ -299,12 +302,13 @@ impl NativeLinear {
 
         let mut so_guard = scratch_o.lock().unwrap();
         let d_o = if let Some((ptr, size)) = *so_guard {
-            if size >= req_o { ptr.0 as CUdeviceptr }
+            if size >= (m * self.out_features * 4) { ptr.0 as CUdeviceptr }
             else {
                 let mut new_ptr: CUdeviceptr = 0;
                 let _ = unsafe { cuda_lib.cuMemFree_v2(ptr.0 as CUdeviceptr) };
                 let res = unsafe { cuda_lib.cuMemAlloc_v2(&mut new_ptr, req_o) };
                 if (res as i32) == 0 && new_ptr != 0 {
+                    println!("[VRAM-POOL] Growing Output Scratch to {} bytes.", req_o);
                     *so_guard = Some((GpuPtr(new_ptr as *mut _), req_o));
                     new_ptr
                 } else { 0 as CUdeviceptr }
@@ -626,7 +630,7 @@ impl NativeLayer {
         
         unsafe {
             use cudarc::driver::sys::*;
-            let cuda_lib = lib();
+            let cuda_lib = crate::models::qwen3vl::native_backend::lib();
             // [STABILITY] Ensure valid context
             let mut ctx = std::ptr::null_mut() as CUcontext;
             cuda_lib.cuCtxGetCurrent(&mut ctx);
@@ -639,8 +643,7 @@ impl NativeLayer {
 
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            // Allocate capped buffer (4k)
-                                let max_tokens_gpu = 200000;
+            let max_tokens_gpu = 200000;
             
             cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
             cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
@@ -649,7 +652,10 @@ impl NativeLayer {
             cuda_lib.cuMemcpyHtoD_v2(kp, k_data.as_ptr() as *const _, k_data.len() * 4);
             cuda_lib.cuMemcpyHtoD_v2(vp, v_data.as_ptr() as *const _, v_data.len() * 2);
             
-            *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
+            gpu_cache_guard.k_ptr = Some(GpuPtr(kp as *mut _));
+            gpu_cache_guard.v_ptr = Some(GpuPtr(vp as *mut _));
+            gpu_cache_guard.capacity = max_tokens_gpu;
+            gpu_cache_guard.current_len = tokens;
         }
     }
 
@@ -660,7 +666,7 @@ impl NativeLayer {
         
         unsafe {
             use cudarc::driver::sys::*;
-            let cuda_lib = lib();
+            let cuda_lib = crate::models::qwen3vl::native_backend::lib();
             // [STABILITY] Ensure valid context
             let mut ctx = std::ptr::null_mut() as CUcontext;
             cuda_lib.cuCtxGetCurrent(&mut ctx);
@@ -673,7 +679,6 @@ impl NativeLayer {
 
             let mut kp: CUdeviceptr = 0;
             let mut vp: CUdeviceptr = 0;
-            // Allocate capped buffer (4k)
             let max_tokens_gpu = 4096;
             cuda_lib.cuMemAlloc_v2(&mut kp, max_tokens_gpu * n_kv * (head_dim/32) * 4); 
             cuda_lib.cuMemAlloc_v2(&mut vp, max_tokens_gpu * n_kv * head_dim * 2); 
@@ -684,7 +689,10 @@ impl NativeLayer {
             cuda_lib.cuMemcpyDtoD_v2(kp, k_src.0 as CUdeviceptr, k_size);
             cuda_lib.cuMemcpyDtoD_v2(vp, v_src.0 as CUdeviceptr, v_size);
             
-            *gpu_cache_guard = Some((GpuPtr(kp as *mut _), GpuPtr(vp as *mut _), tokens));
+            gpu_cache_guard.k_ptr = Some(GpuPtr(kp as *mut _));
+            gpu_cache_guard.v_ptr = Some(GpuPtr(vp as *mut _));
+            gpu_cache_guard.capacity = max_tokens_gpu;
+            gpu_cache_guard.current_len = tokens;
         }
     }
 }
@@ -923,6 +931,8 @@ impl NativeVisionModel {
         let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(workspace.hidden_a.as_ptr(), embed_out.len()) };
         
         // 2. Transformer Blocks
+        let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(workspace.hidden_a.as_ptr(), embed_out.len()) };
+        
         for (i, block) in self.blocks.iter().enumerate() {
             let use_b = i % 2 != 0; // Toggle based on embedding being in A
             let out_slice = block.forward(cur_x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
@@ -946,7 +956,7 @@ impl NativeVisionModel {
         
         // 3. Patch Merger
         let last_use_b = self.blocks.len() % 2 != 0;
-        self.merger.forward(cur_x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
+        let final_vision_slice = self.merger.forward(cur_x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
             hidden_size: cur_x.len() / patches,
             intermediate_size: cur_x.len() / patches,
             num_hidden_layers: 1,
@@ -959,7 +969,9 @@ impl NativeVisionModel {
             max_position_embeddings: 4096,
             dtype: None,
             rope_scaling: None,
-        }, 0, 0, rope_cos, rope_sin, false, global_scratch, workspace, !last_use_b)
+        }, 0, 0, rope_cos, rope_sin, false, global_scratch, workspace, !last_use_b);
+
+        final_vision_slice
     }
 }
 

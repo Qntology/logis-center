@@ -62,12 +62,83 @@ impl Qwen3VLGenerateModel {
         baking_only: bool,
         force_text_only: bool,
     ) -> Result<Self> {
-        // ... (existing loading logic) ...
+        let path_obj = Path::new(path);
+        let tok_path = tokenizer_path.unwrap_or(path);
+        let cfg_path = config_path.unwrap_or(path);
+
+        let chat_template = ChatTemplate::init(tok_path)?;
+        let tokenizer = TokenizerModel::init(tok_path)?;
+        
+        let text_config_path = path_obj.join("config.json");
+        let text_raw_bytes = std::fs::read(&text_config_path)?;
+        let text_json: Value = serde_json::from_slice(&text_raw_bytes)?;
+        
+        let vision_config_path = Path::new(cfg_path).join("config.json");
+        let vision_raw_bytes = std::fs::read(&vision_config_path)?;
+        let vision_json: Value = serde_json::from_slice(&vision_raw_bytes)?;
+
+        let mut vl_config: Qwen3VLConfig = serde_json::from_value(vision_json.clone())?;
+
+        let mut correct_text_config = if text_json.get("text_config").is_some() {
+             serde_json::from_value(text_json.get("text_config").unwrap().clone())?
+        } else {
+             crate::models::qwen3vl::config::Qwen3VLTextConfig {
+                hidden_size: text_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(1024) as usize,
+                intermediate_size: text_json.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(3072) as usize,
+                num_hidden_layers: text_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(28) as usize,
+                num_attention_heads: text_json.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
+                num_key_value_heads: text_json.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
+                head_dim: text_json.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
+                rms_norm_eps: text_json.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6),
+                rope_theta: text_json.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1000000.0) as f32,
+                vocab_size: text_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(151936) as usize,
+                max_position_embeddings: text_json.get("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(40960) as usize,
+                dtype: text_json.get("torch_dtype").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                rope_scaling: None,
+            }
+        };
+
+        if baking_only && vision_json.get("text_config").is_some() {
+            let v_text_cfg = vision_json.get("text_config").unwrap();
+            if let Some(v_theta) = v_text_cfg.get("rope_theta").and_then(|v| v.as_f64()) {
+                correct_text_config.rope_theta = v_theta as f32;
+            }
+            if let Some(v_scaling) = v_text_cfg.get("rope_scaling") {
+                correct_text_config.rope_scaling = serde_json::from_value(v_scaling.clone()).ok();
+            }
+        }
+        
+        vl_config.text_config = Some(correct_text_config);
+        vl_config.hidden_size = Some(vl_config.text_config.as_ref().unwrap().hidden_size);
+
+        let main_filename = if baking_only { "model-BITSERIAL_LAYER0.safetensors" } else { "model-BITSERIAL_ALL.safetensors" };
+        let main_path = path_obj.join(main_filename);
+        let main_file = std::fs::File::open(main_path)?;
+        let main_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&main_file)? });
+        
+        let vision_mmap = if !force_text_only {
+            let vision_filename = if baking_only { "mmproj-BITSERIAL_LAYER0.safetensors" } else { "mmproj-BITSERIAL_ALL.safetensors" };
+            let vision_root = config_path.map(Path::new).unwrap_or(path_obj);
+            let vision_path = vision_root.join(vision_filename);
+            if vision_path.exists() {
+                let vision_file = std::fs::File::open(vision_path)?;
+                Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&vision_file)? }))
+            } else { None }
+        } else { None };
+
+        let secondary_mmap = if baking_only && tokenizer_path.is_some() {
+            let large_path = Path::new(tokenizer_path.unwrap()).join("model-BITSERIAL_ALL.safetensors");
+            if large_path.exists() {
+                let large_file = std::fs::File::open(large_path)?;
+                Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&large_file)? }))
+            } else { None }
+        } else { None };
+
         let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only, secondary_mmap)?;
         let mut qwen3_vl_native = Arc::new(native_model);
 
         // [ADAPTIVE-CHUNKING] Determine optimal chunk size based on VRAM
-        let mut max_chunk_size = 512; // Default
+        let mut max_chunk_size = 512;
         #[cfg(feature = "cuda")]
         if _text_device_id < 8 {
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
@@ -78,22 +149,19 @@ impl Qwen3VLGenerateModel {
                                         else if total_gb >= 6.0 { 1024 }
                                         else if total_gb >= 4.0 { 512 }
                                         else { 256 };
-                        println!("[ADAPTIVE] VRAM: {:.2}GB detected. Setting prefill chunk size to {}.", total_gb, max_chunk_size);
+                        println!("[ADAPTIVE] VRAM: {:.2}GB detected. Prefill chunk size: {}.", total_gb, max_chunk_size);
                     }
                 }
             }
         }
 
         if _text_device_id < 8 { 
-            println!("[LOAD] Moving Native Model to GPU-{}...", _text_device_id);
             if let Some(m) = Arc::get_mut(&mut qwen3_vl_native) {
                 m.move_to_gpu(_text_device_id as i32);
             }
         }
 
-        let qwen3_vl = ModelVariant::Native(qwen3_vl_native);
         let pre_processor = Qwen3VLProcessor::new_native(tok_path)?;
-
         let generation_config_path = Path::new(cfg_path).join("generation_config.json");
         let generation_config: Qwen3VLGenerationConfig = if generation_config_path.exists() {
             serde_json::from_slice(&std::fs::read(generation_config_path)?)? 
@@ -105,7 +173,7 @@ impl Qwen3VLGenerateModel {
             chat_template,
             tokenizer,
             pre_processor,
-            qwen3_vl,
+            qwen3_vl: ModelVariant::Native(qwen3_vl_native),
             eos_token_id1: 151643,
             eos_token_id2: 151645,
             generation_config,
