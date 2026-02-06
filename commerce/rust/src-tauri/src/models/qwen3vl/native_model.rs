@@ -354,7 +354,7 @@ pub struct NativeLayer {
     pub down_proj: NativeLinear,
     pub device_id: i32,
     pub kv_cache: std::sync::Mutex<DynamicKVCache>, 
-    pub gpu_kv_cache: std::sync::Mutex<Option<(GpuPtr, GpuPtr, usize)>>, 
+    pub gpu_kv_cache: std::sync::Mutex<DynamicGpuKVCache>, 
     // [REMOVED] Individual scratch buffers to save VRAM
     pub gpu_broken: std::sync::atomic::AtomicBool,
 }
@@ -429,20 +429,29 @@ impl NativeLayer {
                         native_apply_rope_f16_with_offset(&mut workspace.q, &mut workspace.k, q_len, seqlen_offset, n_h, head_dim, config.rope_theta, rope_cos, rope_sin);
 
                         let mut gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
-                        if let Some((k_ptr, v_ptr, current_len)) = *gpu_cache_guard {
+                        let needed_tokens = seqlen_offset + q_len;
+                        
+                        // [DYNAMIC-GROWTH] Ensure VRAM is allocated and large enough
+                        gpu_cache_guard.grow(needed_tokens, n_kv, head_dim, self.device_id);
+                        
+                        if let (Some(k_ptr), Some(v_ptr)) = (gpu_cache_guard.k_ptr, gpu_cache_guard.v_ptr) {
                             let k_packed = pack_f16_to_bits(&workspace.k);
-                            cuda_lib.cuMemcpyHtoD_v2((k_ptr.0 as u64 + (current_len * n_kv * (head_dim/32) * 4) as u64) as CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
-                            cuda_lib.cuMemcpyHtoD_v2((v_ptr.0 as u64 + (current_len * n_kv * head_dim * 2) as u64) as CUdeviceptr, workspace.v.as_ptr() as *const _, workspace.v.len() * 2);
+                            let k_target_offset = (seqlen_offset * n_kv * (head_dim/32) * 4) as u64;
+                            let v_target_offset = (seqlen_offset * n_kv * head_dim * 2) as u64;
+
+                            cuda_lib.cuMemcpyHtoD_v2((k_ptr.0 as u64 + k_target_offset) as cudarc::driver::sys::CUdeviceptr, k_packed.as_ptr() as *const _, k_packed.len() * 4);
+                            cuda_lib.cuMemcpyHtoD_v2((v_ptr.0 as u64 + v_target_offset) as cudarc::driver::sys::CUdeviceptr, workspace.v.as_ptr() as *const _, workspace.v.len() * 2);
                             cuda_lib.cuMemcpyHtoD_v2(d_i, workspace.q.as_ptr() as *const _, workspace.q.len() * 2);
 
                             let acc_corr = (1.0 - (_idx as f32 / 28.0) * 0.15).clamp(0.85, 1.0);
-                            let mut attn_out_raw = crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&workspace.q, k_ptr, v_ptr, n_h, n_kv, head_dim, current_len + q_len, self.device_id as usize, d_i, d_o, final_alpha * acc_corr);
+                            let mut attn_out_raw = crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&workspace.q, k_ptr, v_ptr, n_h, n_kv, head_dim, needed_tokens, self.device_id as usize, d_i, d_o, final_alpha * acc_corr);
                             
                             // Apply Semantic Gain
                             if semantic_gain != 1.0 {
                                 for val in attn_out_raw.iter_mut() { *val = f16::from_f32(val.to_f32() * semantic_gain); }
                             }
-                            *gpu_cache_guard = Some((k_ptr, v_ptr, current_len + q_len));
+                            
+                            gpu_cache_guard.current_len = needed_tokens;
                         }
 
                         self.o_proj.forward_gpu(d_o, d_i, q_len);
@@ -530,9 +539,7 @@ impl NativeLayer {
         let mut cache = self.kv_cache.lock().unwrap();
         cache.clear();
         let mut gpu_cache = self.gpu_kv_cache.lock().unwrap();
-        if let Some((k, v, _)) = *gpu_cache {
-            *gpu_cache = Some((k, v, 0));
-        }
+        gpu_cache.clear();
     }
 
     pub fn force_free_kv_cache(&self) {
@@ -541,15 +548,16 @@ impl NativeLayer {
         cache.v = Vec::new();
         cache.capacity = 0;
         cache.current_len = 0;
+        
         let mut gpu_cache = self.gpu_kv_cache.lock().unwrap();
-        if let Some((k, v, _)) = gpu_cache.take() {
-            #[cfg(feature = "cuda")]
-            unsafe {
-                use cudarc::driver::sys::*;
-                let _ = lib().cuMemFree_v2(k.0 as CUdeviceptr);
-                let _ = lib().cuMemFree_v2(v.0 as CUdeviceptr);
-            }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            use cudarc::driver::sys::*;
+            if let Some(k) = gpu_cache.k_ptr.take() { let _ = lib().cuMemFree_v2(k.0 as CUdeviceptr); }
+            if let Some(v) = gpu_cache.v_ptr.take() { let _ = lib().cuMemFree_v2(v.0 as CUdeviceptr); }
         }
+        gpu_cache.capacity = 0;
+        gpu_cache.current_len = 0;
     }
 
     pub fn get_kv_data(&self, head_dim: usize, n_kv: usize) -> Option<(Vec<u32>, Vec<f16>)> {
@@ -557,7 +565,8 @@ impl NativeLayer {
         if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
             use cudarc::driver::sys::{lib, CUdeviceptr};
             let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
-            if let Some((k_ptr, v_ptr, current_len)) = *gpu_cache_guard {
+            if let (Some(k_ptr), Some(v_ptr)) = (gpu_cache_guard.k_ptr, gpu_cache_guard.v_ptr) {
+                let current_len = gpu_cache_guard.current_len;
                 if current_len > 0 {
                     let k_size = current_len * n_kv * (head_dim / 32);
                     let v_size = current_len * n_kv * head_dim;
@@ -592,9 +601,7 @@ impl NativeLayer {
         #[cfg(feature = "cuda")]
         if self.device_id >= 0 {
             let gpu_cache_guard = self.gpu_kv_cache.lock().unwrap();
-            if let Some((_, _, current_len)) = *gpu_cache_guard {
-                if current_len > 0 { return current_len; }
-            }
+            if gpu_cache_guard.current_len > 0 { return gpu_cache_guard.current_len; }
         }
 
         let cache = self.kv_cache.lock().unwrap();
@@ -682,13 +689,54 @@ impl NativeLayer {
     }
 }
 
+// [NEW] Dynamic RoPE Cache (Position Optimizer)
+pub struct RopeCache {
+    pub cos: Vec<f16>,
+    pub sin: Vec<f16>,
+    pub head_dim: usize,
+    pub theta: f32,
+    pub current_max_len: usize,
+}
+
+impl RopeCache {
+    pub fn new(head_dim: usize, theta: f32, initial_len: usize) -> Self {
+        let mut cache = Self {
+            cos: Vec::with_capacity(initial_len * head_dim),
+            sin: Vec::with_capacity(initial_len * head_dim),
+            head_dim,
+            theta,
+            current_max_len: 0,
+        };
+        cache.ensure_length(initial_len);
+        cache
+    }
+
+    pub fn ensure_length(&mut self, needed_len: usize) {
+        if needed_len > self.current_max_len {
+            let start = self.current_max_len;
+            let end = (needed_len + 1023) / 1024 * 1024; // Expand in 1k blocks
+            
+            for p in start..end {
+                for d in 0..(self.head_dim / 2) {
+                    let exponent = (2.0 * d as f32) / (self.head_dim as f32);
+                    let freq = 1.0 / self.theta.powf(exponent);
+                    let (sn, cs) = ((p as f32) * freq).sin_cos();
+                    self.cos.push(f16::from_f32(cs));
+                    self.sin.push(f16::from_f32(sn));
+                }
+            }
+            self.current_max_len = end;
+            if start > 0 { println!("[ROPE-GROW] Expanded RoPE table to {} tokens.", end); }
+        }
+    }
+}
+
 pub struct NativeQwen3TextModel {
     pub config: Qwen3VLTextConfig, 
     pub embed_tokens: NativeLinear, 
     pub layers: Vec<NativeLayer>, 
     pub norm: NativeTensor,
-    pub rope_cos: Vec<f16>,
-    pub rope_sin: Vec<f16>,
+    pub rope_cache: std::sync::Mutex<RopeCache>,
 }
 
 unsafe impl Send for NativeQwen3TextModel {}
@@ -742,10 +790,14 @@ impl NativeQwen3TextModel {
         ws.ensure_capacity(hid, self.config.intermediate_size, q_len, self.config.num_attention_heads, self.config.num_key_value_heads, self.config.head_dim);
 
         // Copy input to hidden_a
-        ws.hidden_a[..embeds.len()].copy_from_slice(&embeds);
+        // [DYNAMIC-ROPE] Ensure we have enough positional embeddings for current offset
+        let needed_rope = seqlen_offset + q_len;
+        let mut rope_guard = self.rope_cache.lock().unwrap();
+        rope_guard.ensure_length(needed_rope);
         
-        // [BORROW-CHECKER-FIX] Detach initial slice from ws to allow first mutable borrow in loop
-        let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), embeds.len()) };
+        // Break link to mutex for the loop (Read-only access to internal buffers is safe here)
+        let r_cos = &rope_guard.cos;
+        let r_sin = &rope_guard.sin;
 
         for (i, layer) in self.layers.iter().enumerate() { 
             let use_b = i % 2 == 0;
@@ -754,8 +806,8 @@ impl NativeQwen3TextModel {
                 &self.config, 
                 seqlen_offset, 
                 i, 
-                &self.rope_cos, 
-                &self.rope_sin, 
+                r_cos, 
+                r_sin, 
                 is_baking, 
                 global_scratch,
                 ws,
@@ -1074,7 +1126,7 @@ impl NativeQwen3VLModel {
                 down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size, layer_idx)?,
                 device_id: -1, 
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
-                gpu_kv_cache: std::sync::Mutex::new(None),
+                gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
         }
@@ -1101,21 +1153,7 @@ impl NativeQwen3VLModel {
         })?;
 
         // [PRECOMPUTE-ROPE]
-        let max_seq_len = 16384;
-        let h_d = t_c.head_dim;
-        let theta = t_c.rope_theta;
-        let mut rope_cos = Vec::with_capacity(max_seq_len * h_d);
-        let mut rope_sin = Vec::with_capacity(max_seq_len * h_d);
-
-        for p in 0..max_seq_len {
-            for d in 0..(h_d / 2) {
-                let exponent = (2.0 * d as f32) / (h_d as f32);
-                let freq = 1.0 / theta.powf(exponent);
-                let (sn, cs) = ((p as f32) * freq).sin_cos();
-                rope_cos.push(f16::from_f32(cs));
-                rope_sin.push(f16::from_f32(sn));
-            }
-        }
+        let rope_cache = RopeCache::new(t_c.head_dim, t_c.rope_theta, 4096); // Start with safe 4k
 
         let visual = if let Some(vm) = v_mmap {
             let vst = SafeTensors::deserialize(&vm)?;
@@ -1184,7 +1222,7 @@ impl NativeQwen3VLModel {
                     down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_cfg.hidden_size)?,
                     device_id: -1, 
                     kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
-                    gpu_kv_cache: std::sync::Mutex::new(None),
+                    gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                     gpu_broken: std::sync::atomic::AtomicBool::new(false),
                 });
             }
@@ -1201,7 +1239,7 @@ impl NativeQwen3VLModel {
                 down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
                 device_id: -1, 
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
-                gpu_kv_cache: std::sync::Mutex::new(None),
+                gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
             };
             Some(NativeVisionModel { patch_embed, blocks, merger })
@@ -1209,7 +1247,7 @@ impl NativeQwen3VLModel {
             
         Ok(Self { 
             config: config.clone(), 
-            text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cos, rope_sin }, 
+            text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(rope_cache) }, 
             lm_head: head, 
             visual,
             global_scratch_i: std::sync::Mutex::new(None),
@@ -1251,12 +1289,20 @@ impl NativeQwen3VLModel {
 
         let scratch = Some((&self.global_scratch_i, &self.global_scratch_o));
 
+        // [DYNAMIC-ROPE] Pre-fetch or grow RoPE for fusion
+        let (r_cos, r_sin) = {
+            let mut guard = self.text_model.rope_cache.lock().unwrap();
+            guard.ensure_length(s_o + i_ids.len() + 1024); // Extra buffer for vision
+            (unsafe { std::slice::from_raw_parts(guard.cos.as_ptr(), guard.cos.len()) },
+             unsafe { std::slice::from_raw_parts(guard.sin.as_ptr(), guard.sin.len()) })
+        };
+
         // [VISION-FUSION]
         if let (Some(pv), Some(gt)) = (p_v, g_t) {
             if let Some(ref visual) = self.visual {
-                let vision_features_slice = visual.forward(pv, gt, &self.text_model.rope_cos, &self.text_model.rope_sin, scratch, ws);
+                let vision_features_slice = visual.forward(pv, gt, r_cos, r_sin, scratch, ws);
                 
-                // [BORROW-CHECKER-FIX] Detach vision_features from ws to allow passing ws to text_model
+                // [BORROW-CHECKER-FIX] Detach vision_features from ws
                 let vision_features: &[f16] = unsafe {
                     std::slice::from_raw_parts(vision_features_slice.as_ptr(), vision_features_slice.len())
                 };
