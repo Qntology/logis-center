@@ -801,6 +801,9 @@ impl NativeQwen3TextModel {
         ws.ensure_capacity(hid, self.config.intermediate_size, q_len, self.config.num_attention_heads, self.config.num_key_value_heads, self.config.head_dim);
 
         // Copy input to hidden_a
+        ws.hidden_a[..embeds.len()].copy_from_slice(&embeds);
+        let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), embeds.len()) };
+
         // [DYNAMIC-ROPE] Ensure we have enough positional embeddings for current offset
         let needed_rope = seqlen_offset + q_len;
         let mut rope_guard = self.rope_cache.lock().unwrap();
@@ -860,7 +863,9 @@ impl NativeQwen3TextModel {
             self.layers[0].inject_gpu_kv(&k, &v, n_kv, h_d);
             
             // 2. Replicate from Layer 0 to all other layers (DtoD)
-            if let Some((k_src, v_src, tokens)) = *self.layers[0].gpu_kv_cache.lock().unwrap() {
+            let l0_cache = self.layers[0].gpu_kv_cache.lock().unwrap();
+            if let (Some(k_src), Some(v_src)) = (l0_cache.k_ptr, l0_cache.v_ptr) {
+                let tokens = l0_cache.current_len;
                 for i in 1..self.layers.len() {
                     self.layers[i].inject_gpu_kv_direct(k_src, v_src, tokens, n_kv, h_d);
                 }
