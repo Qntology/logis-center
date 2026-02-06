@@ -947,7 +947,7 @@ impl NativeQwen3TextModel {
         
         let norm_cow = self.norm.get_slice::<f16>();
         let eps_signal = f16::from_f32(1e-6);
-        let mut cpu_norm = vec![eps_signal; x.len()];
+        let mut cpu_norm = vec![eps_signal; cur_x.len()];
         native_rms_norm_f16_into(cur_x, norm_cow.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cpu_norm);
         cpu_norm
     }
