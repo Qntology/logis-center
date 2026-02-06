@@ -3,8 +3,8 @@ use crate::{
     chat_template::ChatTemplate,
     models::{
         qwen3vl::{
-            config::{Qwen3VLConfig, Qwen3VLVisionConfig, Qwen3VLGenerationConfig},
-            native_model::{NativeQwen3VLModel, ForwardWorkspace},
+            config::{Qwen3VLConfig, Qwen3VLGenerationConfig},
+            native_model::{NativeQwen3VLModel},
             processor::Qwen3VLProcessor,
         },
     },
