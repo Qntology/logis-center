@@ -33,6 +33,7 @@ pub enum ModelSize {
 #[derive(Clone)]
 pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
+    pub speculative_draftsman: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Speculative 0.6B (CPU RAM)
     pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
     pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<NativeEmbeddingModel>>>,
@@ -51,10 +52,33 @@ pub struct LogisModel {
 }
 
 impl LogisModel {
+    pub async fn ensure_speculative_draftsman(&self) -> anyhow::Result<()> {
+        let mut draftsman = self.speculative_draftsman.lock().await;
+        if draftsman.is_some() { return Ok(()); }
+
+        println!("[SPECULATIVE] Loading 0.6B Draftsman into CPU RAM...");
+        let path = self.small_model_path.clone();
+        let limit = self.max_tokens_limit;
+
+        let gen = tokio::task::spawn_blocking(move || {
+            Qwen3VLGenerateModel::init_with_config(
+                &path, None, None, 
+                None, 9, // Device ID 9 = Force CPU
+                None, 9, None, Some(limit as usize),
+                false, true
+            )
+        }).await??;
+
+        *draftsman = Some(gen);
+        Ok(())
+    }
+
     pub async fn unload_generator(&self) {
         // Clear everything
         let mut gen = self.generator.lock().await;
         *gen = None;
+        let mut spec = self.speculative_draftsman.lock().await;
+        *spec = None;
         let mut s_hib = self.small_hibernation.lock().await;
         *s_hib = None;
         let mut l_hib = self.large_hibernation.lock().await;
@@ -63,7 +87,7 @@ impl LogisModel {
         let mut size = self.current_size.lock().await;
         *size = None;
 
-        println!("[MODEL] All generators (Active & Hibernated) destroyed.");
+        println!("[MODEL] All generators (Active, Speculative & Hibernated) destroyed.");
     }
 
     pub async fn unload_embedding(&self) {
@@ -297,8 +321,8 @@ impl LogisModel {
             return Ok(());
         }
 
-        println!("[BAKE-PUG] One-time site baking for: {}", address_hash);
-        self.ensure_generator_ext(ModelSize::Small, true, true).await?;
+        println!("[BAKE-PUG] One-time site baking for: {} (Using current active generator)", address_hash);
+        // Do NOT call ensure_generator here, use whatever is already active (secured by scheduler)
         {
             let gen_clone = self.generator.clone();
             let text = pug_content.to_string();
@@ -309,11 +333,12 @@ impl LogisModel {
                 if let Some(gen) = gen_guard.as_mut() {
                     let path = crate::utils::paths::get_kv_dir(None, Some(&ah)).join("shared_pug_base.safetensors");
                     gen.bake_text_in_parts_to_path(text, &path, "pug_base", 0, token_clone)?;
+                } else {
+                    return Err(anyhow::anyhow!("Generator not initialized for baking"));
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
         }
-        self.unload_generator().await;
         Ok(())
     }
 
@@ -783,6 +808,7 @@ impl LogisModel {
 
         Ok(Self {
             generator: Arc::new(TokioMutex::new(None)),
+            speculative_draftsman: Arc::new(TokioMutex::new(None)),
             small_hibernation: Arc::new(TokioMutex::new(None)),
             large_hibernation: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),

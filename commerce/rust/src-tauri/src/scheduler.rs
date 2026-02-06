@@ -288,6 +288,10 @@ async fn process_task(
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     
+    // [2026-STRICT-COMPATIBILITY] Always use LARGE model for baking site context.
+    // Even in baking mode (Layer 0), the dimensions must match the final inference model.
+    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
+    
     // [2026-PHYSICAL-DEDUPLICATION] Check registry before baking
     let bake_key = format!("bake_{}", task.r#ref);
     let bake_future = if let Some(existing) = REGISTRY.baking.get(&bake_key) {
@@ -302,6 +306,7 @@ async fn process_task(
         let cancel = cancellation_token.clone();
         
         let new_bake = async move {
+            // Internal call will use the Large model since we secured it above
             Arc::new(model_arc.bake_pug_context(&ref_id, &task_id, &pug, Some(cancel)).await)
         }.boxed().shared();
         
@@ -312,10 +317,10 @@ async fn process_task(
     let _bake_result = (*bake_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
     REGISTRY.baking.remove(&bake_key);
     
-    println!("[PROCESS] Baking complete. Advancing to INTEGRATED analysis phase.");
+    println!("[PROCESS] Baking complete with 2B dimensions. Advancing to INTEGRATED analysis phase.");
 
     // --- INTEGRATED INFERENCE PHASE ---
-    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
+    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, false, Some(&task.r#ref)).await?;
     
     {
         let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
@@ -335,6 +340,17 @@ async fn process_task(
     let mut selector_info = json!({});
     let mut is_detail = false;
     let mut all_extracted_items = Vec::new();
+
+    // [2026-SPECULATIVE-INIT] Load 0.6B to CPU RAM for parallel drafting
+    model.ensure_speculative_draftsman().await?;
+    {
+        let gen_arc = model.generator.clone();
+        let draft_arc = model.speculative_draftsman.clone();
+        let mut gen_guard = gen_arc.lock().await;
+        if let Some(gen) = gen_guard.as_mut() {
+            gen.speculative_draft = Some(draft_arc);
+        }
+    }
 
     // [PHASE 1 & 2] Integrated Analysis (Live Prompting over Stitched Base)
     {
@@ -692,18 +708,26 @@ fn cleanup_task_resources(task_id: &str, app_handle: Option<&tauri::AppHandle>) 
 
 pub fn pre_fetch_weights(path: &std::path::Path) -> Result<()> {
     use std::io::Read;
-    println!("[PRE-FETCH] Warming up OS Page Cache for weights in: {:?}", path);
+    use rayon::prelude::*;
+
+    println!("[PRE-FETCH] Parallel Warm-up for weights in: {:?}", path);
     if path.is_dir() {
         if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors") {
-                    if let Ok(mut file) = std::fs::File::open(&p) {
-                        let mut buffer = [0u8; 1024 * 1024]; 
-                        while let Ok(n) = file.read(&mut buffer) { if n == 0 { break; } }
+            let files: Vec<_> = entries.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |ext| ext == "gguf" || ext == "safetensors"))
+                .collect();
+
+            // Parallelize file pre-fetching using Rayon
+            files.par_iter().for_each(|p| {
+                if let Ok(mut file) = std::fs::File::open(p) {
+                    // Larger 8MB buffer for high-speed sequential read
+                    let mut buffer = vec![0u8; 8 * 1024 * 1024]; 
+                    while let Ok(n) = file.read(&mut buffer) { 
+                        if n == 0 { break; } 
                     }
                 }
-            }
+            });
         }
     }
     println!("[PRE-FETCH] Warm-up complete.");
