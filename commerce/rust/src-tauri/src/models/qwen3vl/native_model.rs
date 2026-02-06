@@ -189,6 +189,8 @@ pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, sr
 pub struct NativeLinear {
     pub in_features: usize, 
     pub out_features: usize, 
+    pub src_in: usize,  // [NEW] Original source dimension before hybrid expansion
+    pub src_out: usize, // [NEW] Original source dimension
     pub variant: LinearVariant, 
     pub device_id: i32,
 }
@@ -208,7 +210,7 @@ impl NativeLinear {
                 LinearVariant::BitSerial { weight_packed, scales, .. } => {
                     let d_w = weight_packed.gpu_ptr.expect("BitSerial weight must be on GPU").0 as *const u32;
                     let d_s = scales.gpu_ptr.expect("Scales must be on GPU").0 as *const f16;
-                    crate::models::qwen3vl::native_backend::cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id as i32);
+                    crate::models::qwen3vl::native_backend::cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id as i32, self.src_in as i32);
                 }
             }
         }
@@ -257,7 +259,7 @@ impl NativeLinear {
 
                             if d_i != 0 && d_o != 0 {
                                 // Bit-Serial Matrix Multiply (Inplace version)
-                                bit_serial_matmul_gpu_buffered_into(x, weight_packed, scales, out, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o);
+                                crate::models::qwen3vl::native_backend::bit_serial_matmul_gpu_buffered_into(x, weight_packed, scales, out, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o, self.src_in);
                                 
                                 if let Some(b) = bias { 
                                     unsafe {
@@ -1288,6 +1290,8 @@ impl NativeQwen3VLModel {
                     Ok(NativeLinear { 
                         in_features: target_in,
                         out_features: target_out,
+                        src_in: if target_in > src_in { src_in } else { target_in },
+                        src_out: if target_out > src_out { src_out } else { target_out },
                         variant: LinearVariant::BitSerial {
                             weight_packed: NativeTensor { data_ptr: final_packed_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::U32, _mmap: None, device_id: -1 },
                             scales: NativeTensor { data_ptr: final_scales_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::F16, _mmap: None, device_id: -1 },
@@ -1298,7 +1302,7 @@ impl NativeQwen3VLModel {
                 } else {
                     let v = current_st.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: target_in, out_features: target_out, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                    Ok(NativeLinear { in_features: target_in, out_features: target_out, src_in: target_in, src_out: target_out, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
                 }
             };
 

@@ -3,13 +3,13 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// [2026-SPEED-MASTER] Ultra-Fast Tiled Bit-serial Matmul for F16
+// [2026-HYBRID-MASTER] Optimized Folding Bit-serial Matmul for F16
 __global__ void bit_serial_matmul_kernel_f16(
     const half* __restrict__ input,    
     const uint32_t* __restrict__ weight, 
     const half* __restrict__ scale,     
     half* __restrict__ output,          
-    int M, int N, int K
+    int M, int N, int K, int src_k
 ) {
     const int TILE_M = 32;
     __shared__ uint32_t s_input_bits[TILE_M]; 
@@ -21,28 +21,37 @@ __global__ void bit_serial_matmul_kernel_f16(
     
     int m = m_base + m_sub;
     int n = n_group * 8 + n_sub;
-    int k_blocks = (K + 31) / 32;
+    
+    // [HYBRID-FOLDING] 타겟 차원(K)이 원본(src_k)보다 크면 접어서 연산
+    int src_k_blocks = (src_k + 31) / 32;
+    int repetition = (K > src_k) ? (K / src_k) : 1;
 
     float acc = 0.0f;
 
-    for (int kb = 0; kb < k_blocks; ++kb) {
+    for (int kb = 0; kb < src_k_blocks; ++kb) {
         if (n_sub == 0) {
-            uint32_t bts = 0;
+            uint32_t folded_bts = 0;
             if (m < M) {
                 #pragma unroll
                 for (int b = 0; b < 32; ++b) {
-                    int k_idx = kb * 32 + b;
-                    if (k_idx < K) {
-                        if (__half2float(input[m * K + k_idx]) >= 0.0f) bts |= (1u << b);
+                    int k_base = kb * 32 + b;
+                    if (k_base < src_k) {
+                        float combined_signal = 0.0f;
+                        // 여러 파트(0~1023, 1024~2047 등)의 신호를 하나로 접음(Folding)
+                        for (int r = 0; r < repetition; ++r) {
+                            combined_signal += __half2float(input[m * K + k_base + (r * src_k)]);
+                        }
+                        if (combined_signal >= 0.0f) folded_bts |= (1u << b);
                     }
                 }
             }
-            s_input_bits[m_sub] = bts;
+            s_input_bits[m_sub] = folded_bts;
         }
         __syncthreads();
 
         if (m < M && n < N) {
-            int idx = n_group * k_blocks * 8 + kb * 8 + n_sub;
+            // 가중치는 원본 src_k 분량만 읽으므로 메모리 효율 2배
+            int idx = n_group * src_k_blocks * 8 + kb * 8 + n_sub;
             uint32_t w_val = weight[idx];
             float s_val = __half2float(scale[idx]);
             uint32_t diff = s_input_bits[m_sub] ^ w_val;
@@ -56,14 +65,14 @@ __global__ void bit_serial_matmul_kernel_f16(
     }
 }
 
-// [FAST-ATTENTION] High-speed online softmax attention for F16
+// [FAST-ATTENTION-HYBRID] Folding-aware online softmax attention for F16
 __global__ void bit_serial_attn_kernel_f16(
     const half* __restrict__ Q,        
     const uint32_t* __restrict__ K_p,   
     const half* __restrict__ V,        
     half* __restrict__ O,              
     int n_h, int n_kv, int h_d, int t_s, float sc, int q_len,
-    float alpha
+    float alpha, int src_h_d
 ) {
     int q_idx = blockIdx.x; 
     int h = blockIdx.y;     
@@ -71,18 +80,25 @@ __global__ void bit_serial_attn_kernel_f16(
     
     if (q_idx >= q_len || h >= n_h) return;
 
-    int k_b = (h_d + 31) / 32;
+    int src_k_b = (src_h_d + 31) / 32;
     int h_kv = h / (n_h / n_kv);
+    int repetition = (h_d > src_h_d) ? (h_d / src_h_d) : 1;
     
     __shared__ uint32_t s_q_bits[16]; 
     
-    if (tid < k_b) {
-        uint32_t bts = 0;
+    if (tid < src_k_b) {
+        uint32_t folded_bts = 0;
         for (int b = 0; b < 32; ++b) {
-            int d_idx = tid * 32 + b;
-            if (d_idx < h_d && __half2float(Q[(q_idx * n_h * h_d) + (h * h_d) + d_idx]) >= 0.0f) bts |= (1u << b);
+            int d_base = tid * 32 + b;
+            if (d_base < src_h_d) {
+                float combined_q = 0.0f;
+                for (int r = 0; r < repetition; ++r) {
+                    combined_q += __half2float(Q[(q_idx * n_h * h_d) + (h * h_d) + d_base + (r * src_h_d)]);
+                }
+                if (combined_q >= 0.0f) folded_bts |= (1u << b);
+            }
         }
-        s_q_bits[tid] = bts;
+        s_q_bits[tid] = folded_bts;
     }
     __syncthreads();
     
@@ -92,8 +108,8 @@ __global__ void bit_serial_attn_kernel_f16(
 
     for (int j = 0; j < t_s; ++j) {
         int dot = 0;
-        for (int kb = 0; kb < k_b; ++kb) {
-            dot += (32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * k_b + kb]));
+        for (int kb = 0; kb < src_k_b; ++kb) {
+            dot += (32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * src_k_b + kb]));
         }
         float score = ((float)dot + alpha) * sc;
         if (score < -15.0f) score = -15.0f;
@@ -103,6 +119,17 @@ __global__ void bit_serial_attn_kernel_f16(
         float e_score = expf(score - n_max);
         
         running_sum = running_sum * e_scale + e_score;
+        running_max = n_max;
+
+        if (tid < h_d) {
+            local_o = local_o * e_scale + e_score * __half2float(V[(j * n_kv + h_kv) * h_d + tid]);
+        }
+    }
+
+    if (tid < h_d) {
+        O[(q_idx * n_h * h_d) + (h * h_d) + tid] = __float2half(local_o / (running_sum + 1e-9f));
+    }
+}
         running_max = n_max;
 
         if (tid < h_d) {
@@ -205,27 +232,43 @@ extern "C" {
 
 
 
-    void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha) {
-
-        bit_serial_attn_kernel_f16<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha);
-
-    }
+        void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha, int src_h_d) {
 
 
 
-    void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {
-
-        bit_serial_matmul_kernel_shuffled<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
-
-    }
+            bit_serial_attn_kernel_f16<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha, src_h_d);
 
 
 
-        void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev) {
+        }
 
 
 
-            bit_serial_matmul_kernel_f16<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
+    
+
+
+
+        void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {
+
+
+
+            bit_serial_matmul_kernel_shuffled<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
+
+
+
+        }
+
+
+
+    
+
+
+
+        void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k) {
+
+
+
+            bit_serial_matmul_kernel_f16<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
 
 
 

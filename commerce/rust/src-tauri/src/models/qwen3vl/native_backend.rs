@@ -30,13 +30,13 @@ extern "C" {
     fn cuda_matmul_f32(d_i: *const f32, d_w: *const u32, d_s: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, dev: i32);
     
     #[link_name = "bit_serial_matmul_cuda_f16"]
-    pub fn cuda_matmul_f16(d_i: *const f16, d_w: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32);
+    pub fn cuda_matmul_f16(d_i: *const f16, d_w: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
     
     #[link_name = "bit_serial_attn_cuda_direct"]
     fn cuda_attn_f32(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, n_kv: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32, alpha: f32);
     
     #[link_name = "bit_serial_attn_cuda_f16"]
-    fn cuda_attn_f16(d_q: *const f16, d_k: *const u32, d_v: *const f16, d_o: *mut f16, n_h: i32, n_kv: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32, alpha: f32);
+    fn cuda_attn_f16(d_q: *const f16, d_k: *const u32, d_v: *const f16, d_o: *mut f16, n_h: i32, n_kv: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32, alpha: f32, src_h_d: i32);
 
     #[link_name = "standard_matmul_cuda_f16"]
     pub fn standard_matmul_cuda_f16(d_i: *const f16, d_w: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32);
@@ -49,7 +49,7 @@ extern "C" {
 }
 
 #[cfg(feature = "cuda")]
-pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32) -> Vec<f16> {
+pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32, src_h_d: usize) -> Vec<f16> {
     if d_q == 0 || d_o == 0 || k_p.0.is_null() || v_p.0.is_null() {
         return vec![f16::ZERO; q.len()];
     }
@@ -59,7 +59,7 @@ pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, 
         lib().cuMemcpyHtoD_v2(d_q, q.as_ptr() as *const _, q.len() * 2);
         
         // Call via link_name mapped function
-        cuda_attn_f16(d_q as *const f16, k_p.0 as *const u32, v_p.0 as *const f16, d_o as *mut f16, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, q_len as i32, alpha);
+        cuda_attn_f16(d_q as *const f16, k_p.0 as *const u32, v_p.0 as *const f16, d_o as *mut f16, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, q_len as i32, alpha, src_h_d as i32);
         
         let mut o_f = vec![f16::ZERO; q.len()]; 
         lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 2);
@@ -71,7 +71,7 @@ pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, 
 pub fn bit_serial_matmul_gpu_buffered(
     i: &[f16], w: &NativeTensor, s: &NativeTensor, 
     m: usize, n: usize, k: usize, dev: usize,
-    d_i: CUdeviceptr, d_o: CUdeviceptr
+    d_i: CUdeviceptr, d_o: CUdeviceptr, src_k: usize
 ) -> Vec<f16> {
     if d_i == 0 || d_o == 0 {
         return vec![f16::ZERO; m * n];
@@ -90,7 +90,7 @@ pub fn bit_serial_matmul_gpu_buffered(
         let d_s = s.gpu_ptr.expect("Scale must be on GPU").0 as *const f16;
         
         // Call via link_name mapped function
-        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32);
+        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32);
         
         let mut o_f = vec![f16::ZERO; m * n]; 
         lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 2);
