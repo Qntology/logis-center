@@ -202,25 +202,35 @@ impl Qwen3VLGenerateModel {
         
         println!("[{}] Initial KV Offset: {}, No-Bridge: {}", tag, seqlen_offset, no_bridge);
 
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let input = self.pre_processor.process_info_native(&mes, &mes_render)?;
-        let all_ids = self.tokenizer.text_encode_vec(input.replace_text, false)?;
+        // [BACKUP-PARITY] Construction of the prompt IDs
+        let all_ids = if no_bridge && seqlen_offset > 0 {
+            // Bypass ChatTemplate and use Raw Text Append (Matches backup success)
+            let system_content = mes.messages.iter().find_map(|m| {
+                if let crate::openai_types::ChatCompletionRequestMessage::System(s) = m { Some(&s.content) } else { None }
+            }).cloned().unwrap_or_default();
+            
+            let raw_prompt = format!("\n\nTASK: {}\n\nACTION: JSON ONLY\n\nAssistant: ", system_content);
+            println!("[{}-RAW] Constructing raw prompt ({} chars) for stitched context.", tag, raw_prompt.len());
+            self.tokenizer.text_encode_vec(raw_prompt, false)?
+        } else {
+            let mes_render = self.chat_template.apply_chat_template(&mes)?;
+            self.tokenizer.text_encode_vec(mes_render, false)?
+        };
+
+        let input = self.pre_processor.process_info_native(&mes, &"".to_string())?;
         
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
         // [BACKUP-PARITY] UPSCALE-REFILL & Live Alignment
         if seqlen_offset > 0 {
-            let refill_len = 64.min(seqlen_offset); // 64 tokens of overlap for numerical stability
+            let refill_len = 64.min(seqlen_offset); 
             
             if no_bridge {
-                // In no-bridge mode (Live Prompt over Baked Base), we don't expect the baked part 
-                // to be in all_ids. all_ids is just the NEW system/user prompt.
-                // We must start from the very beginning of all_ids at the seqlen_offset.
+                // We start from the beginning of our RAW prompt at the baked offset
                 local_pos = 0;
                 current_kv_offset = seqlen_offset;
                 
-                // [LBR-PRE-SYNC] Refine the last 'refill_len' tokens of the baked context with 2B model
                 let (sync_ids, sync_offset) = {
                     let rope_guard = self.qwen3_vl.get_native_ref().text_model.rope_cache.lock().unwrap();
                     let tail_tokens = &rope_guard.tail_tokens;
