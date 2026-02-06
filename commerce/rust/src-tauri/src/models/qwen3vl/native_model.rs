@@ -84,6 +84,70 @@ impl DynamicKVCache {
     }
 }
 
+// [NEW] GPU-Side Dynamic KV Cache (VRAM Memory Optimizer)
+pub struct DynamicGpuKVCache {
+    pub k_ptr: Option<GpuPtr>,
+    pub v_ptr: Option<GpuPtr>,
+    pub capacity: usize,
+    pub current_len: usize,
+}
+
+impl DynamicGpuKVCache {
+    pub fn new() -> Self {
+        Self { k_ptr: None, v_ptr: None, capacity: 0, current_len: 0 }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn grow(&mut self, needed_len: usize, n_kv: usize, head_dim: usize, device_id: i32) {
+        if needed_len > self.capacity {
+            let new_cap = (needed_len + 1023) / 1024 * 1024;
+            let k_bytes = new_cap * n_kv * (head_dim / 32) * 4;
+            let v_bytes = new_cap * n_kv * head_dim * 2;
+
+            unsafe {
+                let cuda_lib = crate::models::qwen3vl::native_backend::lib();
+                
+                // [STABILITY] Ensure valid context
+                let mut ctx = std::ptr::null_mut() as cudarc::driver::sys::CUcontext;
+                cuda_lib.cuCtxGetCurrent(&mut ctx);
+                if ctx == std::ptr::null_mut() && device_id >= 0 {
+                    let mut dev = 0 as cudarc::driver::sys::CUdevice;
+                    cuda_lib.cuDeviceGet(&mut dev, device_id);
+                    cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
+                    cuda_lib.cuCtxSetCurrent(ctx);
+                }
+
+                let mut new_kp: cudarc::driver::sys::CUdeviceptr = 0;
+                let mut new_vp: cudarc::driver::sys::CUdeviceptr = 0;
+                cuda_lib.cuMemAlloc_v2(&mut new_kp, k_bytes);
+                cuda_lib.cuMemAlloc_v2(&mut new_vp, v_bytes);
+
+                // If existing data, copy to new buffer (Realloc behavior)
+                if let (Some(old_k), Some(old_v)) = (self.k_ptr.take(), self.v_ptr.take()) {
+                    if self.current_len > 0 {
+                        let old_k_bytes = self.current_len * n_kv * (head_dim / 32) * 4;
+                        let old_v_bytes = self.current_len * n_kv * head_dim * 2;
+                        cuda_lib.cuMemcpyDtoD_v2(new_kp, old_k.0 as cudarc::driver::sys::CUdeviceptr, old_k_bytes);
+                        cuda_lib.cuMemcpyDtoD_v2(new_vp, old_v.0 as cudarc::driver::sys::CUdeviceptr, old_v_bytes);
+                    }
+                    // Free old buffers
+                    cuda_lib.cuMemFree_v2(old_k.0 as cudarc::driver::sys::CUdeviceptr);
+                    cuda_lib.cuMemFree_v2(old_v.0 as cudarc::driver::sys::CUdeviceptr);
+                }
+
+                self.k_ptr = Some(GpuPtr(new_kp as *mut _));
+                self.v_ptr = Some(GpuPtr(new_vp as *mut _));
+                self.capacity = new_cap;
+                println!("[GPU-GROW] VRAM KV Cache expanded to {} tokens on Device {}.", new_cap, device_id);
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.current_len = 0;
+    }
+}
+
 pub struct NativeLinear {
     pub in_features: usize, 
     pub out_features: usize, 
