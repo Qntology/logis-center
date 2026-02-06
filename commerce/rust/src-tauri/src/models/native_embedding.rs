@@ -60,6 +60,7 @@ impl NativeEmbeddingModel {
                 down_proj: NativeLinear { in_features: 1152, out_features: hidden_size, src_in: 1152, src_out: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.down_proj.weight", p))?, bias: None }, device_id: -1 },
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()),
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
+                rope_cache_gpu: std::sync::Mutex::new(None),
                 device_id: -1,
                 is_support_layer: false,
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),

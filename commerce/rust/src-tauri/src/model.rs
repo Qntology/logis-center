@@ -467,6 +467,9 @@ impl LogisModel {
 
     // --- [SCENARIO B] Image Preprocessing (0.6B 1L Bake -> 2B 1L Vision Bake -> 2B Full Inf) ---
     pub async fn bake_image_kv(&self, task_id: &str, region: &str, language: &str, page_type: &str, address: &str, address_hash: Option<&str>, image: DynamicImage, cancel_token: Option<Arc<AtomicBool>>, app_handle: &tauri::AppHandle) -> anyhow::Result<()> {
+        // [ORDERLY-EXECUTION] Acquire global GPU semaphore for the entire multi-step vision pipeline
+        let _gpu_guard = crate::scheduler::REGISTRY.gpu_semaphore.acquire().await.map_err(|e| anyhow::anyhow!("GPU Semaphore error: {}", e))?;
+        
         let sys_session = format!("{}_sys", task_id);
         let img_session = format!("{}_img", task_id);
         let system_prompt = Self::get_image_extraction_prompt(region, language, page_type, address);

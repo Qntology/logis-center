@@ -272,34 +272,73 @@ __global__ void silu_mul_kernel_f16(half* gate, const half* up, int size) {
 }
 
 // --- [CRITICAL] EXTERN C WRAPPERS ---
+// [GPU-ROPE] Fast In-place RoPE Application
+__global__ void apply_rope_inplace_kernel_f16(half* Q, half* K, const half* cos_table, const half* sin_table, int q_len, int s_o, int n_h, int n_kv, int h_d) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int head_idx = idx / h_d;
+    int d_idx = idx % h_d;
+    if (d_idx >= h_d / 2) return; // Process pairs
+
+    int token_idx = head_idx / (n_h + n_kv);
+    int p = token_idx + s_o;
+    int target_head = head_idx % (n_h + n_kv);
+    
+    half* target_ptr = (target_head < n_h) ? 
+        &Q[token_idx * n_h * h_d + target_head * h_d] : 
+        &K[token_idx * n_kv * h_d + (target_head - n_h) * h_d];
+
+    float q0 = __half2float(target_ptr[d_idx]);
+    float q1 = __half2float(target_ptr[d_idx + h_d / 2]);
+    float c = __half2float(cos_table[p * (h_d / 2) + d_idx]);
+    float s = __half2float(sin_table[p * (h_d / 2) + d_idx]);
+
+    target_ptr[d_idx] = __float2half(q0 * c - q1 * s);
+    target_ptr[d_idx + h_d / 2] = __float2half(q0 * s + q1 * c);
+}
+
+// [GPU-PACKING] Fast Bit-serial Compression
+__global__ void pack_f16_to_u32_kernel(const half* src, uint32_t* dst, int total_elements) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid * 32 >= total_elements) return;
+
+    uint32_t packed = 0;
+    for (int i = 0; i < 32; ++i) {
+        int idx = tid * 32 + i;
+        if (idx < total_elements && __half2float(src[idx]) >= 0.0f) {
+            packed |= (1u << i);
+        }
+    }
+    dst[tid] = packed;
+}
+
 extern "C" {
-    void bit_serial_attn_cuda_direct(const float* d_q, const uint32_t* d_k, const float* d_v, float* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha) {
-        bit_serial_attn_kernel_v2026<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha);
+    void cuda_apply_rope_f16(half* d_q, half* d_k, const half* d_cos, const half* d_sin, int q_len, int s_o, int n_h, int n_kv, int h_d) {
+        int total_heads = (n_h + n_kv) * q_len;
+        apply_rope_inplace_kernel_f16<<< (total_heads * (h_d/2) + 255)/256, 256 >>>(d_q, d_k, d_cos, d_sin, q_len, s_o, n_h, n_kv, h_d);
     }
 
-    void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha, int src_h_d) {
-        bit_serial_attn_kernel_f16<<<dim3(q_len, n_h), h_d>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha, src_h_d);
+    void cuda_pack_bits_f16(const half* d_src, uint32_t* d_dst, int elements) {
+        int blocks = (elements + 31) / 32;
+        pack_f16_to_u32_kernel<<< (blocks + 255)/256, 256 >>>(d_src, d_dst, elements);
     }
 
-    void bit_serial_matmul_cuda_direct(const float* d_i, const uint32_t* d_w, const float* d_s, float* d_o, int m, int n, int k, int dev) {
-        bit_serial_matmul_kernel_shuffled<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k);
+    void cuda_apply_gain_f16(half* d_data, float gain, int elements) {
+        auto kernel = [] __device__ (half* data, float g, int total) {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i < total) data[i] = __float2half(__half2float(data[i]) * g);
+        };
+        // [MOD] We can't use lambda in extern C directly with nvcc in some versions easily, 
+        // but for now let's define it properly above and call it.
     }
+}
 
-    void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k) {
-        bit_serial_matmul_kernel_f16<<<dim3((n + 7) / 8, (m + 31) / 32), dim3(8, 32)>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
-    }
+__global__ void apply_gain_kernel_f16(half* data, float gain, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) data[i] = __float2half(__half2float(data[i]) * gain);
+}
 
-    void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
-        dim3 block(16, 16);
-        dim3 grid((n + 15) / 16, (m + 15) / 16);
-        standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
-    }
-
-    void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
-        rms_norm_kernel_f16<<<m, 256, 256 * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
-    }
-
-    void cuda_silu_mul_f16(half* d_gate, const half* d_up, int size) {
-        silu_mul_kernel_f16<<<(size + 255) / 256, 256>>>(d_gate, d_up, size);
+extern "C" {
+    void cuda_apply_gain_f16(half* d_data, float gain, int elements) {
+        apply_gain_kernel_f16<<<(elements + 255)/256, 256>>>(d_data, gain, elements);
     }
 }
