@@ -421,6 +421,7 @@ impl NativeLayer {
         rope_cos: &[f16], 
         rope_sin: &[f16], 
         is_baking: bool, 
+        is_vision: bool, // [NEW] Explicit modality flag from task level
         global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
         workspace: &'a mut ForwardWorkspace,
         ping_pong: bool
@@ -434,7 +435,7 @@ impl NativeLayer {
         workspace.ensure_capacity(hidden_size, config.intermediate_size, q_len, n_h, n_kv, head_dim);
 
         // [2026-COGNITIVE-STABILITY-MAX] Precision energy measurement for Layer 0
-        let mut final_alpha = if is_baking { 1.5f32 } else { 1.0f32 };
+        let mut final_alpha = 1.0f32;
         let mut semantic_gain = 1.0f32;
 
         if _idx == 0 && q_len > 0 {
@@ -443,47 +444,58 @@ impl NativeLayer {
             let max_abs = samples.iter().fold(1e-9f32, |a, &b| a.max(b));
             let density = (mean_abs / max_abs).clamp(0.0, 1.0);
             
-            // --- [CHUNK-AWARE DYNAMIC SCALING] ---
             let total_context = seqlen_offset + q_len;
-            
-            // 1. Context Fatigue Compensation: Increase intensity for deeper context history
-            // Signal dilution starts becoming critical after 1024 tokens.
-            let fatigue_comp = if total_context > 1024 {
-                (1.0 + (total_context as f32 / 1024.0).ln() * 0.12).clamp(1.0, 1.6)
-            } else { 1.0 };
+            // Adaptive log-scale factor: starts at 0.0, grows as context increases
+            let context_log = (total_context as f32 / 1024.0).max(1.0).ln();
 
-            // 2. Chunk Momentum: Boost focus for large parallel prefill blocks
-            // This stabilizes long HTML/Pug structures during heavy baking.
+            // --- [SCENARIO-BASED ADAPTIVE CURVES] ---
+            if is_vision {
+                // Scenario A: VISION (Image/OCR)
+                // Steep growth: As visual data grows, signal clarity needs aggressive protection
+                let base_vision_alpha = 1.55f32 + (context_log * 0.18); 
+                final_alpha = base_vision_alpha.clamp(1.5, 2.5);
+                semantic_gain = 1.15f32 + (context_log * 0.05);
+                
+                if is_baking { final_alpha *= 1.45f32; } 
+            } else {
+                // Scenario B: TEXT/PUG (Language/Structure)
+                // Shallow growth: Focus on structural stability without saturating the signal
+                let base_text_alpha = 1.10f32 + (context_log * 0.08);
+                final_alpha = base_text_alpha.clamp(1.0, 1.8);
+                semantic_gain = 1.02f32 + (context_log * 0.03);
+                
+                if is_baking { final_alpha *= 1.30f32; } 
+            }
+
+            // --- [DYNAMIC CHUNK & DENSITY CORRECTION] ---
+            // Chunk Momentum: Stabilize large parallel prefill blocks
             let chunk_momentum = if q_len > 128 {
-                (1.0 + (q_len as f32 / 128.0).log2() * 0.06).clamp(1.0, 1.25)
+                (1.0 + (q_len as f32 / 128.0).log2() * 0.04).clamp(1.0, 1.15)
             } else { 1.0 };
 
-            // Apply both axes to the base calculation
+            // Apply statistical density boost (universal hardware-level correction)
             let depth_ratio = _idx as f32 / config.num_hidden_layers as f32;
             let accuracy_correction = (1.0 - depth_ratio * 0.15).clamp(0.85, 1.0);
-            let density_boost = if density < 0.2f32 { 8.0f32 } else { (1.0f32 / (density + 0.1f32)).min(5.0f32) };
+            let density_boost = if density < 0.2f32 { 6.0f32 } else { (1.0f32 / (density + 0.1f32)).min(4.0f32) };
             
-            final_alpha = (0.1f32 / (mean_abs + 1e-9f32) * density_boost * accuracy_correction * fatigue_comp * chunk_momentum).clamp(0.2f32, 3.5f32);
-            semantic_gain = (density * 2.0 + 0.85).clamp(0.95, 1.35); 
+            // Final Fluid Alpha Calculation
+            // Combined: Modality Base * Hardware-Level Normalization * Context Fatigue * Chunk Momentum
+            final_alpha = (final_alpha * (0.1f32 / (mean_abs + 1e-9f32)) * density_boost * accuracy_correction * chunk_momentum).clamp(0.2f32, 5.0f32);
+            semantic_gain = (semantic_gain * (density * 1.5 + 0.85)).clamp(0.90, 1.50); 
             
-            if is_baking { final_alpha *= 1.55f32; } 
-            
-            // 3. Hybrid Modality Logic: Distinguish Vision vs Text within the chunk
+            // [HYBRID-EXTRA-BOOST] Apply additional strength for the 0.6B Support Layer
             if self.is_support_layer && !is_baking {
-                let is_vision = q_len >= 512 && density > 0.45; // Statistical vision heuristic
-                
-                if is_vision {
-                    final_alpha *= 1.45f32; // Aggressive boost for visual signal clarity
-                    semantic_gain *= 1.18f32; // Sharp contrast for OCR precision
-                } else {
-                    final_alpha *= 1.25f32; // Standard hybrid text bridge
-                    semantic_gain *= 1.10f32;
-                }
+                final_alpha *= 1.12f32; 
+                semantic_gain *= 1.04f32;
             }
             
+            // [STABILITY-CAP] Scenario-specific caps for extreme long-context
+            let max_safe_alpha = if is_vision { 4.8f32 } else { 3.8f32 };
+            if final_alpha > max_safe_alpha { final_alpha = max_safe_alpha; }
+            
             if q_len > 100 || seqlen_offset % 1024 == 0 {
-                println!("[COGNITIVE-CHUNK] L0 | Context: {}t (Off: {}) | QLen: {} | Alpha: {:.4} | Modality: {}", 
-                    total_context, seqlen_offset, q_len, final_alpha, if density > 0.45 { "VISION" } else { "TEXT" });
+                println!("[COGNITIVE-FLUID] L0 | Modality: {} | Alpha: {:.4} | Gain: {:.2} | Context: {}t | Momentum: {:.2}x", 
+                    if is_vision { "VISION" } else { "TEXT/PUG" }, final_alpha, semantic_gain, total_context, chunk_momentum);
             }
         }
 
@@ -561,6 +573,19 @@ impl NativeLayer {
                         
                         let mlp_h = std::slice::from_raw_parts_mut(workspace.q.as_mut_ptr(), x.len());
                         cuda_lib.cuMemcpyDtoH_v2(mlp_h.as_mut_ptr() as *mut _, d_o, x.len() * 2);
+                        
+                        // [HYBRID-OUTPUT-ADAPT] If 0.6B output is smaller than 2B input, repeat signal
+                        let src_out_size = self.down_proj.src_out; 
+                        let target_out_size = self.down_proj.out_features;
+                        
+                        if target_out_size > src_out_size {
+                            for t in 0..q_len {
+                                for i in src_out_size..target_out_size {
+                                    mlp_h[t * target_out_size + i] = mlp_h[t * target_out_size + (i % src_out_size)];
+                                }
+                            }
+                        }
+
                         for i in 0..x.len() { res_slice[i] += mlp_h[i]; }
                         return res_slice;
                     }
@@ -610,8 +635,20 @@ impl NativeLayer {
             workspace.intermediate_b[i] *= workspace.intermediate_c[i]; 
         }
         
-        let mut mlp_out_h = vec![f16::ZERO; x.len()];
+        let mut mlp_out_h = vec![f16::from_f32(1e-6); x.len()];
         self.down_proj.forward_into(&workspace.intermediate_b[..q_len * config.intermediate_size], &mut mlp_out_h, global_scratch);
+        
+        // [HYBRID-OUTPUT-ADAPT-CPU] Repeat 0.6B signal if needed before adding residual
+        let src_out_size = self.down_proj.src_out;
+        let target_out_size = self.down_proj.out_features;
+        if target_out_size > src_out_size {
+            for t in 0..q_len {
+                for i in src_out_size..target_out_size {
+                    mlp_out_h[t * target_out_size + i] = mlp_out_h[t * target_out_size + (i % src_out_size)];
+                }
+            }
+        }
+
         for i in 0..x.len() { out_slice[i] += mlp_out_h[i]; }
         
         out_slice
@@ -867,6 +904,7 @@ impl NativeQwen3TextModel {
         global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
         workspace: Option<&mut ForwardWorkspace>,
         support_layer: Option<&NativeLayer>, // [NEW] Optional support path
+        is_vision: bool, // [NEW] Modality flag
     ) -> Vec<f16> {
         let hid = self.config.hidden_size;
         let embeds = match &self.embed_tokens.variant {
@@ -880,7 +918,7 @@ impl NativeQwen3TextModel {
             }
         };
 
-        self.forward_ext(input_ids, embeds, seqlen_offset, global_scratch, workspace, support_layer)
+        self.forward_ext(input_ids, embeds, seqlen_offset, global_scratch, workspace, support_layer, is_vision)
     }
 
     pub fn forward_ext(
@@ -891,6 +929,7 @@ impl NativeQwen3TextModel {
         global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
         workspace: Option<&mut ForwardWorkspace>,
         support_layer: Option<&NativeLayer>, // [NEW] Optional support path
+        is_vision: bool, // [NEW] Modality flag
     ) -> Vec<f16> {
         let hid = self.config.hidden_size;
         let is_baking = self.layers.len() <= 1;
@@ -936,6 +975,7 @@ impl NativeQwen3TextModel {
                 r_cos, 
                 r_sin, 
                 is_baking, 
+                is_vision, // [NEW] Pass modality
                 global_scratch,
                 ws,
                 use_b
@@ -1640,6 +1680,7 @@ impl NativeQwen3VLModel {
 
         // [HYBRID-ROUTING] Use support workspace and layer for baking tasks
         let is_baking = self.text_model.layers.len() <= 1;
+        let is_vision = p_v.is_some(); // [NEW] Explicit vision modality detection
         let mut ws_lock = if is_baking { self.support_workspace.lock().unwrap() } else { self.workspace.lock().unwrap() };
         let ws = &mut *ws_lock;
         
@@ -1689,7 +1730,7 @@ impl NativeQwen3VLModel {
 
         // [HOT-SWAP] Pass support layer to text model if baking or if it exists as static header
         let active_support = if is_baking || self.support_layer0.is_some() { self.support_layer0.as_ref() } else { None };
-        let norm_x = self.text_model.forward_ext(i_ids, embeds, s_o, scratch, Some(ws), active_support);
+        let norm_x = self.text_model.forward_ext(i_ids, embeds, s_o, scratch, Some(ws), active_support, is_vision);
         self.lm_head.forward(&norm_x, scratch)
     }
         pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
