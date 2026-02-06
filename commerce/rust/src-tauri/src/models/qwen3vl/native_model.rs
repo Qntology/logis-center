@@ -320,6 +320,29 @@ impl NativeLayer {
         
         workspace.ensure_capacity(hidden_size, config.intermediate_size, q_len, n_h, n_kv, head_dim);
 
+        // [2026-COGNITIVE-STABILITY] Dynamic energy measurement for Layer 0
+        let mut final_alpha = if is_baking { 1.5f32 } else { 1.0f32 };
+        let mut semantic_gain = 1.0f32;
+
+        if _idx == 0 && q_len > 0 {
+            let samples = x.iter().take(500).map(|v| v.to_f32().abs()).collect::<Vec<_>>();
+            let mean_abs = samples.iter().sum::<f32>() / samples.len() as f32;
+            let max_abs = samples.iter().fold(1e-9f32, |a, &b| a.max(b));
+            let density = (mean_abs / max_abs).clamp(0.0, 1.0);
+            
+            // [ADAPTIVE] Adjust amplification based on signal density
+            let density_boost = if density < 0.2f32 { 8.0f32 } else { (1.0f32 / (density + 0.1f32)).min(5.0f32) };
+            let depth_corr = (1.0 - (_idx as f32 / config.num_hidden_layers as f32) * 0.15).clamp(0.85, 1.0);
+            
+            final_alpha = (0.1f32 / (mean_abs + 1e-9f32) * density_boost * depth_corr).clamp(0.2f32, 2.5f32);
+            semantic_gain = (density * 2.0 + 0.8).clamp(0.9, 1.2);
+            
+            if is_baking { final_alpha *= 1.5f32; }
+            
+            println!("[COGNITIVE] Layer 0 {} -> Alpha: {:.4}, Gain: {:.4} (Density: {:.4})", 
+                if is_baking { "BAKING" } else { "INF" }, final_alpha, semantic_gain, density);
+        }
+
         // Target buffer based on ping-pong flag
         let out_ptr = if ping_pong { workspace.hidden_b.as_mut_ptr() } else { workspace.hidden_a.as_mut_ptr() };
 
@@ -349,7 +372,12 @@ impl NativeLayer {
                             cuda_lib.cuMemcpyHtoD_v2(d_i, workspace.q.as_ptr() as *const _, workspace.q.len() * 2);
 
                             let acc_corr = (1.0 - (_idx as f32 / 28.0) * 0.15).clamp(0.85, 1.0);
-                            crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&workspace.q, k_ptr, v_ptr, n_h, n_kv, head_dim, current_len + q_len, self.device_id as usize, d_i, d_o, (if is_baking { 1.5 } else { 1.0 }) * acc_corr);
+                            let mut attn_out_raw = crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&workspace.q, k_ptr, v_ptr, n_h, n_kv, head_dim, current_len + q_len, self.device_id as usize, d_i, d_o, final_alpha * acc_corr);
+                            
+                            // Apply Semantic Gain
+                            if semantic_gain != 1.0 {
+                                for val in attn_out_raw.iter_mut() { *val = f16::from_f32(val.to_f32() * semantic_gain); }
+                            }
                             *gpu_cache_guard = Some((k_ptr, v_ptr, current_len + q_len));
                         }
 
@@ -396,7 +424,13 @@ impl NativeLayer {
         cache.v[seqlen_offset * (n_kv * head_dim) .. seqlen_offset * (n_kv * head_dim) + workspace.v.len()].copy_from_slice(&workspace.v);
         cache.current_len = needed_len;
 
-        let attn_out = native_bit_serial_attn_f16(&workspace.q, &cache.k, &cache.v, hidden_size, n_h, n_kv, q_len, needed_len, if is_baking { 1.5 } else { 1.0 });
+        let mut attn_out = native_bit_serial_attn_f16(&workspace.q, &cache.k, &cache.v, hidden_size, n_h, n_kv, q_len, needed_len, final_alpha);
+        
+        // Apply Semantic Gain
+        if semantic_gain != 1.0 {
+            for val in attn_out.iter_mut() { *val = f16::from_f32(val.to_f32() * semantic_gain); }
+        }
+
         let out_slice = unsafe { std::slice::from_raw_parts_mut(out_ptr, x.len()) };
         self.o_proj.forward_into(&attn_out, out_slice, global_scratch);
         for i in 0..x.len() { out_slice[i] += x[i]; }
