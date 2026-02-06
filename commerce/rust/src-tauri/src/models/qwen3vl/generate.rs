@@ -209,21 +209,42 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = 0;
         let mut current_kv_offset = seqlen_offset;
 
-        if no_bridge && seqlen_offset > 0 {
-            // [BACKUP-PARITY] 베이킹된 문맥이 이미 있으므로, 전체 프롬프트 중 
-            // 베이킹된 부분(HTML)을 건너뛰고 순수 질문 토큰만 찾아서 주입해야 함.
-            // 보통 <|im_start|>user\n 문구 뒤부터가 실제 질문임.
-            let user_trigger = self.tokenizer.text_encode_vec("<|im_start|>user\n".to_string(), false)?;
-            if let Some(pos) = all_ids.windows(user_trigger.len()).position(|window| window == user_trigger) {
-                local_pos = pos;
-                println!("[{}-INTEGRATED] Fast-forwarding to user query at pos {}.", tag, local_pos);
+        // [BACKUP-PARITY] UPSCALE-REFILL & Live Alignment
+        if seqlen_offset > 0 {
+            let refill_len = 64.min(seqlen_offset); // 64 tokens of overlap for numerical stability
+            
+            if no_bridge {
+                // In no-bridge mode (Live Prompt over Baked Base), we don't expect the baked part 
+                // to be in all_ids. all_ids is just the NEW system/user prompt.
+                // We must start from the very beginning of all_ids at the seqlen_offset.
+                local_pos = 0;
+                current_kv_offset = seqlen_offset;
+                
+                // [LBR-PRE-SYNC] Refine the last 'refill_len' tokens of the baked context with 2B model
+                let (sync_ids, sync_offset) = {
+                    let rope_guard = self.qwen3_vl.get_native_ref().text_model.rope_cache.lock().unwrap();
+                    let tail_tokens = &rope_guard.tail_tokens;
+                    if !tail_tokens.is_empty() {
+                        let sync_len = tail_tokens.len().min(refill_len);
+                        let sync_start = tail_tokens.len() - sync_len;
+                        (tail_tokens[sync_start..].to_vec(), seqlen_offset - sync_len)
+                    } else {
+                        (vec![], 0)
+                    }
+                };
+
+                if !sync_ids.is_empty() {
+                    println!("[KV-BRIDGE] Refining last {} tokens of baked context at offset {}...", sync_ids.len(), sync_offset);
+                    self.qwen3_vl.forward(&sync_ids, None, None, sync_offset);
+                }
+                println!("[{}-INTEGRATED] Starting live prefill of {} new tokens at offset {}.", tag, all_ids.len(), current_kv_offset);
+            } else {
+                // Standard stitching: overlap with existing prompt
+                let bridge_len = all_ids.len().min(refill_len);
+                current_kv_offset = seqlen_offset.saturating_sub(bridge_len);
+                local_pos = 0;
+                println!("[{}-STITCH] Overlapping {} tokens at offset {} for smooth transition.", tag, bridge_len, current_kv_offset);
             }
-        } else if seqlen_offset > 0 && !no_bridge {
-            let recalibration_len = 32;
-            let bridge_len = all_ids.len().min(recalibration_len);
-            current_kv_offset = seqlen_offset.saturating_sub(bridge_len);
-            local_pos = 0;
-            println!("[{}-STITCH] Bridging {} tokens at offset {} to sync context.", tag, bridge_len, current_kv_offset);
         }
 
         let prefill_chunk_size = self.max_chunk_size;
@@ -245,9 +266,10 @@ impl Qwen3VLGenerateModel {
             current_kv_offset += chunk.len();
         }
 
-        // [LBR-STABILITY-FINAL] Recalibrate activations at the boundary of stitched files
-        // Uses the REAL tokens extracted from the baked component metadata.
-        if seqlen_offset > 0 {
+        // [LBR-STABILITY-FINAL] Final calibration check before generation
+        if seqlen_offset > 0 && no_bridge {
+            // No extra calibration needed as we already did UPSCALE-REFILL
+        } else if seqlen_offset > 0 {
             let (recalib_chunk, safe_offset) = {
                 let rope_guard = self.qwen3_vl.get_native_ref().text_model.rope_cache.lock().unwrap();
                 let tokens = &rope_guard.tail_tokens;

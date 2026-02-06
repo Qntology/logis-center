@@ -336,36 +336,30 @@ async fn process_task(
     let mut is_detail = false;
     let mut all_extracted_items = Vec::new();
 
-    // [PHASE 1 & 2] Integrated Analysis (Using File-Baking Mechanism)
+    // [PHASE 1 & 2] Integrated Analysis (Live Prompting over Stitched Base)
     {
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Baking system prompts...", "spinner": "⠋" }));
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Identifying page type...", "spinner": "⠋" }));
         
         let type_prompt = parsing::page_type_prompt();
-        // 1. Bake System Prompt for Page Type Identification
-        model.bake_system_prompt(&task.r#ref, "page_type", &type_prompt, Some(cancellation_token.clone())).await?;
 
-        // 2. Load 2B and Stitch (PUG + TYPE_PROMPT)
+        // 1. Ensure 2B is loaded and stitched with ONLY the PUG base
         model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
         {
             let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
-            let pug_path = kv_dir.join("shared_pug_base.safetensors");
-            let type_path = kv_dir.join("shared_prompt_page_type.safetensors");
-            let mut components = Vec::new();
-            if pug_path.exists() { components.push(pug_path); }
-            if type_path.exists() { components.push(type_path); }
-
+            let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
             let gen_arc = model.generator.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_arc.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    gen.load_kv_stitched(&components)?;
+                    gen.load_kv_stitched(&[pug_base_path])?;
+                    println!("[PROCESS] KV Base Stitched for Analysis. Offset: {} tokens.", gen.get_kv_len());
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
         }
 
-        // 3. Inference (User Input only)
-        let res = model.chat("", "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
+        // 2. Inference: Pass system prompt LIVE (No-Bridge mode will handle the offset)
+        let res = model.chat(&type_prompt, "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
@@ -374,26 +368,26 @@ async fn process_task(
             return Ok(()); 
         }
 
-        // 4. Selector Analysis (Repeat File-Baking Pattern)
+        // 3. Selector Analysis (Live Prompting)
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": format!("Identified {}. Finding selectors...", page_type), "spinner": "⠋" }));
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
-        model.bake_system_prompt(&task.r#ref, "selectors", &selector_prompt, Some(cancellation_token.clone())).await?;
         
-        // Re-stitch with SELECTORS prompt
+        // No need to re-stitch if we are using the same PUG base, 
+        // but to be safe and clean, we reset to the PUG base state for each new "question"
         {
             let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
-            let pug_path = kv_dir.join("shared_pug_base.safetensors");
-            let sel_path = kv_dir.join("shared_prompt_selectors.safetensors");
+            let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
             let gen_arc = model.generator.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_arc.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    gen.load_kv_stitched(&[pug_path, sel_path])?;
+                    gen.load_kv_stitched(&[pug_base_path])?;
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
         }
 
-        let res_sel = model.chat("", "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
+        let res_sel = model.chat(&selector_prompt, "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         selector_info = parsing::parse_json_from_llm(&res_sel);
         
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
