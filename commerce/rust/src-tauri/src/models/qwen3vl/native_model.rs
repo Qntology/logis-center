@@ -1387,7 +1387,7 @@ impl NativeQwen3VLModel {
                     let vp = vst.tensor(&p_n)?; let vs = vst.tensor(&s_n)?;
                     let op = unsafe { vp.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
                     let os = unsafe { vs.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::BitSerial {
+                    Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant: LinearVariant::BitSerial {
                         weight_packed: NativeTensor::from_mmap(vm.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(vm.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                         bias: None,
@@ -1395,7 +1395,7 @@ impl NativeQwen3VLModel {
                 } else {
                     let v = vst.tensor(&key)?;
                     let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                    Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
                 }
             };
 

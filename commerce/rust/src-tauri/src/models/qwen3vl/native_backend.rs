@@ -334,14 +334,14 @@ pub fn bit_serial_matmul_gpu_buffered_into(
     i: &[f16], w: &NativeTensor, s: &NativeTensor, 
     out: &mut [f16],
     m: usize, n: usize, k: usize, dev: usize,
-    d_i: CUdeviceptr, d_o: CUdeviceptr
+    d_i: CUdeviceptr, d_o: CUdeviceptr, src_k: usize
 ) {
     if d_i == 0 || d_o == 0 { return; }
     unsafe {
         let _ = lib().cuMemcpyHtoD_v2(d_i, i.as_ptr() as *const _, m * k * 2);
         let d_w = w.gpu_ptr.expect("Weight must be on GPU").0 as *const u32;
         let d_s = s.gpu_ptr.expect("Scale must be on GPU").0 as *const f16;
-        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32);
+        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32);
         lib().cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, m * n * 2);
     }
 }
