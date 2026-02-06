@@ -384,7 +384,8 @@ async fn process_task(
         }
 
         // 2. Inference: Pass system prompt LIVE (No-Bridge mode will handle the offset)
-        let res = model.chat(&type_prompt, "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
+        // [FIX] Pass instructions as user_input (2nd arg) so they survive the nobridge wipe
+        let res = model.chat("", &type_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         
@@ -412,7 +413,7 @@ async fn process_task(
             }).await??;
         }
 
-        let res_sel = model.chat(&selector_prompt, "", Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
+        let res_sel = model.chat("", &selector_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         selector_info = parsing::parse_json_from_llm(&res_sel);
         
         is_detail = selector_info.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
