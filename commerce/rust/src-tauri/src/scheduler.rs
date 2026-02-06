@@ -484,7 +484,7 @@ async fn process_task(
     // PHASE 4: AI Refinement (Detail Target-Scan vs List Refine)
     let mut extracted_data = json!({});
     if is_detail {
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Scanning target detail content...", "spinner": "⠋" }));
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Baking detail extraction prompt...", "spinner": "⠋" }));
         
         let target_selector = selector_info.get("node").or(selector_info.get("item")).and_then(|v| v.as_str()).unwrap_or("body");
         let content_pug = {
@@ -500,13 +500,35 @@ async fn process_task(
         };
 
         let ins = parsing::item2json(&page_type, &url, "english");
-        let query_text = format!("[TARGET CONTENT]\n{}\n\nTASK: {}\n\nACTION: SAVE", content_pug, ins);
+        // 1. Bake System Prompt for Detail Extraction
+        model.bake_system_prompt(&task.r#ref, "detail_extract", &ins, Some(cancellation_token.clone())).await?;
+
+        // 2. Stitch and Inference
+        {
+            let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
+            let pug_path = kv_dir.join("shared_pug_base.safetensors");
+            let ins_path = kv_dir.join("shared_prompt_detail_extract.safetensors");
+            let gen_arc = model.generator.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut gen_guard = gen_arc.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    gen.load_kv_stitched(&[pug_path, ins_path])?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }).await??;
+        }
+
+        let query_text = format!("[TARGET CONTENT]\n{}\n\nACTION: SAVE", content_pug);
         let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some("detail_extraction_nobridge".to_string())).await?;
         extracted_data = parsing::parse_json_from_llm(&res);
         all_extracted_items = vec![extracted_data.clone()];
     } else if !all_extracted_items.is_empty() {
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Refinement", "summary": format!("AI Refinement loop for {} items...", all_extracted_items.len()), "spinner": "⠋" }));
+        log_task_progress(app_handle, &task.id, &json!({ "category": "Refinement", "summary": "Baking refinement instruction...", "spinner": "⠋" }));
         
+        let ins = parsing::list2json(&page_type, "english");
+        // 1. Bake System Prompt for Batch Refinement
+        model.bake_system_prompt(&task.r#ref, "batch_refine", &ins, Some(cancellation_token.clone())).await?;
+
         let mut refined_items = Vec::new();
         let batch_size = 10;
         
@@ -518,13 +540,27 @@ async fn process_task(
             
             println!("[PROCESS] Refining batch {} (Items {}-{} of {})", batch_idx + 1, start_item, end_item, all_extracted_items.len());
             
+            // 2. Stitch (Each batch needs a clean context start)
+            {
+                let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
+                let pug_path = kv_dir.join("shared_pug_base.safetensors");
+                let ins_path = kv_dir.join("shared_prompt_batch_refine.safetensors");
+                let gen_arc = model.generator.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut gen_guard = gen_arc.blocking_lock();
+                    if let Some(gen) = gen_guard.as_mut() {
+                        gen.load_kv_stitched(&[pug_path, ins_path])?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }).await??;
+            }
+
             let batch_text: String = batch.iter().enumerate()
                 .map(|(i, it)| format!("Item {}:\n{}", i + 1, it.to_string()))
                 .collect::<Vec<_>>().join("\n\n");
                 
-            let ins = parsing::list2json(&page_type, "english");
             let action_flag = if end_item == all_extracted_items.len() { "ACTION: SAVE" } else { "ACTION: INGEST" };
-            let query_text = format!("{}\n\n{}\n\n{}", batch_text, ins, action_flag);
+            let query_text = format!("{}\n\n{}", batch_text, action_flag);
             
             let res = model.chat("", &query_text, Some(cancellation_token.clone()), Some(format!("batch_refinement_{}", batch_idx))).await?;
             let parsed = parsing::parse_json_from_llm(&res);

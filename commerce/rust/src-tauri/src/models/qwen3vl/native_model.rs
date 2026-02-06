@@ -388,7 +388,7 @@ impl NativeLayer {
         
         workspace.ensure_capacity(hidden_size, config.intermediate_size, q_len, n_h, n_kv, head_dim);
 
-        // [2026-COGNITIVE-STABILITY] Dynamic energy measurement for Layer 0
+        // [2026-COGNITIVE-STABILITY-MAX] Precision energy measurement for Layer 0
         let mut final_alpha = if is_baking { 1.5f32 } else { 1.0f32 };
         let mut semantic_gain = 1.0f32;
 
@@ -398,17 +398,20 @@ impl NativeLayer {
             let max_abs = samples.iter().fold(1e-9f32, |a, &b| a.max(b));
             let density = (mean_abs / max_abs).clamp(0.0, 1.0);
             
-            // [ADAPTIVE] Adjust amplification based on signal density
+            // [PRECISION] Attenuate memory intensity for deeper layers
+            let depth_ratio = _idx as f32 / config.num_hidden_layers as f32;
+            let accuracy_correction = (1.0 - depth_ratio * 0.15).clamp(0.85, 1.0);
+            
             let density_boost = if density < 0.2f32 { 8.0f32 } else { (1.0f32 / (density + 0.1f32)).min(5.0f32) };
-            let depth_corr = (1.0 - (_idx as f32 / config.num_hidden_layers as f32) * 0.15).clamp(0.85, 1.0);
             
-            final_alpha = (0.1f32 / (mean_abs + 1e-9f32) * density_boost * depth_corr).clamp(0.2f32, 2.5f32);
-            semantic_gain = (density * 2.0 + 0.8).clamp(0.9, 1.2);
+            // Re-calculate alpha with high-precision factors
+            final_alpha = (0.1f32 / (mean_abs + 1e-9f32) * density_boost * accuracy_correction).clamp(0.2f32, 2.5f32);
+            semantic_gain = (density * 2.0 + 0.85).clamp(0.95, 1.25); // Slightly wider gain range for better contrast
             
-            if is_baking { final_alpha *= 1.5f32; }
+            if is_baking { final_alpha *= 1.55f32; } // 1.55x boost for small-model ingestion
             
-            println!("[COGNITIVE] Layer 0 {} -> Alpha: {:.4}, Gain: {:.4} (Density: {:.4})", 
-                if is_baking { "BAKING" } else { "INF" }, final_alpha, semantic_gain, density);
+            println!("[COGNITIVE-PRECISION] Layer 0 {} -> Alpha: {:.4}, Gain: {:.4} (D: {:.4}, Corr: {:.2})", 
+                if is_baking { "BAKE" } else { "INF" }, final_alpha, semantic_gain, density, accuracy_correction);
         }
 
         // Target buffer based on ping-pong flag

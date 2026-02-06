@@ -239,19 +239,20 @@ impl Qwen3VLGenerateModel {
             current_kv_offset += chunk.len();
         }
 
-        // [LBR-STABILITY] Recalibrate the last block to bridge 0.6B -> 2B drift
-        // This is critical for 1-bit models to maintain context coherence after stitching.
+        // [LBR-STABILITY-MAX] Recalibrate the last block to bridge 0.6B -> 2B drift
+        // Using native 2B activations for the immediate context before generation.
         if !no_bridge || seqlen_offset > 0 {
             let recalib_len = current_kv_offset.min(32);
             let safe_offset = current_kv_offset.saturating_sub(recalib_len);
             
             if recalib_len > 0 {
-                // Ensure we use the most recent tokens from all_ids if available, or just re-run the tail
-                let recalib_start = all_ids.len().saturating_sub(recalib_len);
-                let recalib_chunk = &all_ids[recalib_start..];
+                // Determine the correct slice from all_ids to match the end of the context
+                let recalib_start = all_ids.len().saturating_sub(recalib_len + 1); // +1 to exclude current trigger
+                let recalib_end = all_ids.len().saturating_sub(1);
+                let recalib_chunk = &all_ids[recalib_start..recalib_end];
                 
-                println!("[LBR-STITCH] Synchronizing last {} tokens at offset {} for 2B activation alignment...", recalib_chunk.len(), safe_offset);
-                // [CRITICAL] We don't need pixels/grid here, just text activation sync
+                println!("[LBR-MAX] Re-aligning {} tokens at offset {} with native 2B weights...", recalib_chunk.len(), safe_offset);
+                // Force update KV cache with 2B's native numerical characteristics
                 self.qwen3_vl.forward(recalib_chunk, None, None, safe_offset);
             }
         }
@@ -507,22 +508,21 @@ impl Qwen3VLGenerateModel {
                             
                             if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
                                 let ratio = target_dim / actual_source_dim;
-                                println!("[KV-UPSCALE] Applying 2026-H1 Drift Compensation (1.12x + 0.005 bias)");
-                                
+                                // [2026-H1-PRECISION] Layer-aware drift attenuation
+                                // Deeper layers (larger l_idx) need slightly less aggressive scaling
+                                let layer_factor = 1.0 - (l_idx as f32 / num_target_layers as f32) * 0.05;
+                                let semantic_multiplier = f16::from_f32(1.12 * layer_factor);
+                                let drift_bias = f16::from_f32(0.005 * layer_factor); 
+
+                                let k_units_per_token = actual_source_dim / 32;
                                 let mut new_k = Vec::with_capacity(k_data.len() * ratio);
                                 let mut new_v = Vec::with_capacity(v_data.len() * ratio);
                                 
-                                // [2026-COGNITIVE-STABILITY] Drift Compensation Factor
-                                let semantic_multiplier = f16::from_f32(1.12);
-                                let drift_bias = f16::from_f32(0.005); 
-
-                                let k_units_per_token = actual_source_dim / 32;
                                 for chunk in k_data.chunks_exact(k_units_per_token) { for _ in 0..ratio { new_k.extend_from_slice(chunk); } }
                                 for chunk in v_data.chunks_exact(actual_source_dim) {
                                     for _ in 0..ratio { 
                                         let mut v_scaled = chunk.to_vec();
                                         for val in v_scaled.iter_mut() { 
-                                            // Scale signal and shift mean to Large model's activation center
                                             *val = (*val * semantic_multiplier) + drift_bias; 
                                         }
                                         new_v.extend_from_slice(&v_scaled); 
