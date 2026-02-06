@@ -107,7 +107,7 @@ pub fn native_cuda_pack_bits(d_src: CUdeviceptr, d_dst: CUdeviceptr, elements: u
 pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32, src_h_d: usize, q_on_gpu: bool) {
     if d_q == 0 || d_o == 0 || k_p.0.is_null() || v_p.0.is_null() { return; }
     unsafe {
-        if !q_on_gpu { lib().cuMemcpyHtoD_v2(d_q, q.as_ptr() as *const _, q.len() * 2); }
+        if !q_on_gpu { let _ = lib().cuMemcpyHtoD_v2(d_q, q.as_ptr() as *const _, q.len() * 2); }
         let actual_q_len = if q.is_empty() { 1 } else { q.len() / (n_h * h_d) };
         cuda_attn_f16(d_q as *const f16, k_p.0 as *const u32, v_p.0 as *const f16, d_o as *mut f16, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, actual_q_len as i32, alpha, src_h_d as i32);
     }
@@ -118,31 +118,12 @@ pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usiz
     let eps_signal = f16::from_f32(1e-6);
     unsafe {
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
-        lib().cuMemAlloc_v2(&mut d_q, q.len() * 2); 
-        lib().cuMemAlloc_v2(&mut d_o, q.len() * 2);
+        let _ = lib().cuMemAlloc_v2(&mut d_q, q.len() * 2); 
+        let _ = lib().cuMemAlloc_v2(&mut d_o, q.len() * 2);
         native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha, src_h_d, false);
         let mut o_f = vec![eps_signal; q.len()]; 
-        lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 2);
-        lib().cuMemFree_v2(d_q); lib().cuMemFree_v2(d_o);
-        res
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub fn bit_serial_matmul_gpu_buffered(i: &[f16], w: &NativeTensor, s: &NativeTensor, m: usize, n: usize, k: usize, dev: usize, d_i: CUdeviceptr, d_o: CUdeviceptr, src_k: usize) -> Vec<f16> {
-    let eps_signal = f16::from_f32(1e-6);
-    if d_i == 0 || d_o == 0 { return vec![eps_signal; m * n]; }
-    unsafe {
-        let res_cp = lib().cuMemcpyHtoD_v2(d_i, i.as_ptr() as *const _, m * k * 2);
-        if (res_cp as i32) != 0 {
-            let wp_ref = w.get_raw_slice::<u32>(); let s_ref = s.get_raw_slice::<f16>();
-            return bit_serial_matmul_f32_shuffled(i, wp_ref, s_ref, m, n, k).into_iter().map(f16::from_f32).collect();
-        }
-        let d_w = w.gpu_ptr.expect("Weight on GPU").0 as *const u32;
-        let d_s = s.gpu_ptr.expect("Scale on GPU").0 as *const f16;
-        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32);
-        let mut o_f = vec![eps_signal; m * n]; 
-        lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 2);
+        let _ = lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 2);
+        let _ = lib().cuMemFree_v2(d_q); let _ = lib().cuMemFree_v2(d_o);
         o_f
     }
 }
@@ -155,7 +136,7 @@ pub fn bit_serial_matmul_gpu_buffered_into(i: &[f16], w: &NativeTensor, s: &Nati
         let d_w = w.gpu_ptr.expect("W on GPU").0 as *const u32;
         let d_s = s.gpu_ptr.expect("S on GPU").0 as *const f16;
         cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32);
-        lib().cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, m * n * 2);
+        let _ = lib().cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, m * n * 2);
     }
 }
 
@@ -227,12 +208,10 @@ impl NativeTensor {
                 if (cuda_lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size_bytes) as i32) == 0 {
                     self.gpu_ptr = Some(GpuPtr(ptr as *mut _));
                     self.device_id = device_id;
-                } else { cuda_lib.cuMemFree_v2(ptr); }
+                } else { let _ = cuda_lib.cuMemFree_v2(ptr); }
             }
         }
     }
-
-    pub fn move_to_gpu_f16(&mut self, device_id: i32) { self.move_to_gpu(device_id); }
 }
 
 pub fn pack_f16_to_bits(src: &[f16]) -> Vec<u32> {
@@ -256,7 +235,7 @@ pub fn bit_serial_matmul_f32_shuffled(i: &[f16], w: &[u32], s: &[f16], m: usize,
         let src = &i[start..end];
         for kb in 0..k_b {
             let mut b = 0u32;
-            for bt in 0..32 { let l = kb * 32 + bt; if l < src.len() && src[l].to_f32() >= 0.0 { b |= 1 << bt; } }
+            for bt in 0..32 { if kb * 32 + bt < src.len() && src[kb * 32 + bt].to_f32() >= 0.0 { b |= 1 << bt; } }
             row[kb] = b;
         }
     });
@@ -381,15 +360,6 @@ pub fn native_silu_f16(x: &mut [f16]) {
     x.par_iter_mut().for_each(|val| { let f = val.to_f32(); *val = f16::from_f32(f * (1.0 / (1.0 + (-f).exp()))); });
 }
 
-pub fn native_silu_mul_f16(gate: &[f16], up: &[f16]) -> Vec<f16> {
-    let eps_signal = f16::from_f32(1e-6);
-    let mut out = vec![eps_signal; gate.len()];
-    out.par_iter_mut().enumerate().for_each(|(i, val)| {
-        if i < gate.len() && i < up.len() { let g = gate[i].to_f32(); let u = up[i].to_f32(); *val = f16::from_f32((g * (1.0 / (1.0 + (-g).exp()))) * u); }
-    });
-    out
-}
-
 pub fn native_embedding_lookup_f16(ids: &[u32], table: &[f16], hid: usize) -> Vec<f16> {
     let eps_signal = f16::from_f32(1e-6);
     let mut out = vec![eps_signal; ids.len() * hid];
@@ -397,13 +367,6 @@ pub fn native_embedding_lookup_f16(ids: &[u32], table: &[f16], hid: usize) -> Ve
         let start = id as usize * hid;
         if start + hid <= table.len() { out[i * hid..(i + 1) * hid].copy_from_slice(&table[start..start + hid]); }
     }
-    out
-}
-
-pub fn native_linear_f16(x: &[f16], w: &[f16], b: Option<&[f16]>, m: usize, out_f: usize, in_f: usize) -> Vec<f16> {
-    let eps_signal = f16::from_f32(1e-6);
-    let mut out = vec![eps_signal; m * out_f];
-    native_linear_f16_into(x, w, b, &mut out, m, out_f, in_f);
     out
 }
 
@@ -418,4 +381,42 @@ pub fn native_precompute_rope_f16(h_d: usize, max_len: usize, theta: f32) -> (Ve
         }
     }
     (cos, sin)
+}
+
+pub fn native_apply_rope_f16_with_offset(q: &mut [f16], k: &mut [f16], q_len: usize, s_o: usize, n_h: usize, h_d: usize, _theta: f32, cos: &[f16], sin: &[f16]) {
+    let n_kv = k.len() / (q_len * h_d);
+    for t in 0..q_len {
+        let p = t + s_o;
+        for h in 0..n_h {
+            let q_ptr = &mut q[t * n_h * h_d + h * h_d .. t * n_h * h_d + (h + 1) * h_d];
+            for d in 0..(h_d / 2) {
+                let (c, s) = (cos[p * (h_d / 2) + d].to_f32(), sin[p * (h_d / 2) + d].to_f32());
+                let (v0, v1) = (q_ptr[d].to_f32(), q_ptr[d + h_d / 2].to_f32());
+                q_ptr[d] = f16::from_f32(v0 * c - v1 * s); q_ptr[d + h_d / 2] = f16::from_f32(v0 * s + v1 * c);
+            }
+        }
+        for h in 0..n_kv {
+            let k_ptr = &mut k[t * n_kv * h_d + h * h_d .. t * n_kv * h_d + (h + 1) * h_d];
+            for d in 0..(h_d / 2) {
+                let (c, s) = (cos[p * (h_d / 2) + d].to_f32(), sin[p * (h_d / 2) + d].to_f32());
+                let (v0, v1) = (k_ptr[d].to_f32(), k_ptr[d + h_d / 2].to_f32());
+                k_ptr[d] = f16::from_f32(v0 * c - v1 * s); k_ptr[d + h_d / 2] = f16::from_f32(v0 * s + v1 * c);
+            }
+        }
+    }
+}
+
+pub struct RopeCache { pub cos: Vec<f16>, pub sin: Vec<f16>, pub head_dim: usize, pub theta: f32, pub tail_tokens: Vec<u32> }
+impl RopeCache {
+    pub fn new(h_d: usize, theta: f32, initial_len: usize) -> Self {
+        let (cos, sin) = native_precompute_rope_f16(h_d, initial_len, theta);
+        Self { cos, sin, head_dim: h_d, theta, tail_tokens: Vec::new() }
+    }
+    pub fn ensure_length(&mut self, needed: usize) {
+        let current = self.cos.len() / (self.head_dim / 2);
+        if needed > current {
+            let (c, s) = native_precompute_rope_f16(self.head_dim, needed, self.theta);
+            self.cos = c; self.sin = s;
+        }
+    }
 }

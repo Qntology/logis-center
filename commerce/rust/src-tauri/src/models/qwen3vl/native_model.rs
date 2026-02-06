@@ -218,8 +218,7 @@ impl NativeLinear {
     }
     #[cfg(feature = "cuda")]
     fn ensure_gpu_buffers_ext(&self, m: usize, si: &std::sync::Mutex<Option<(GpuPtr, usize)>>, so: &std::sync::Mutex<Option<(GpuPtr, usize)>>, sr: &std::sync::Mutex<Option<(GpuPtr, usize)>>) -> (CUdeviceptr, CUdeviceptr, CUdeviceptr) {
-        let req_i = (m * self.in_features * 4 * 125) / 100; 
-        let req_o = (m * self.out_features * 4 * 125) / 100;
+        let req_i = (m * self.in_features * 4 * 125) / 100; let req_o = (m * self.out_features * 4 * 125) / 100;
         let req_r = (m * self.in_features.max(self.out_features) * 4 * 125) / 100;
         let cl = unsafe { crate::models::qwen3vl::native_backend::lib() };
         unsafe {
@@ -352,19 +351,19 @@ impl NativeLayer {
                         }
                         crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&[], gkg.k_ptr.unwrap(), gkg.v_ptr.unwrap(), n_h, n_kv, h_d, n_tok, self.device_id as usize, dq, dog, f_alpha * (1.0 - (_idx as f32 / 28.0) * 0.15).clamp(0.85, 1.0), self.q_proj.src_in / n_h, true);
                         if s_gain != 1.0 { crate::models::qwen3vl::native_backend::native_cuda_apply_gain(dog, s_gain, q_len * h_s); }
-                        self.o_proj.forward_gpu(dog, drg, q_len); // [FIX] Store attn result in drg
-                        cl.cuMemcpyHtoD_v2(dog, x.as_ptr() as *const _, x.len() * 2); // [REUSE dog] Upload x
-                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(drg, dog, x.len()); // [OK] drg = x + attn_out
+                        self.o_proj.forward_gpu(dog, drg, q_len); // attn_out in drg
+                        cl.cuMemcpyHtoD_v2(dog, x.as_ptr() as *const _, x.len() * 2); // upload x
+                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(drg, dog, x.len()); // drg = x + attn_out
                         let dpw = self.post_attention_layernorm.gpu_ptr.as_ref().unwrap().0 as *const f16;
-                        crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(drg as *const f16, dpw, dog as *mut f16, q_len as i32, h_s as i32, config.rms_norm_eps as f32); // [OK] dog = norm(drg)
+                        crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(drg as *const f16, dpw, dog as *mut f16, q_len as i32, h_s as i32, config.rms_norm_eps as f32);
                         self.gate_proj.forward_gpu(dog, di, q_len); // Gate in di
-                        self.up_proj.forward_gpu(dog, dq, q_len); // [REUSE dq] Up in dq
+                        self.up_proj.forward_gpu(dog, dq, q_len); // Up in dq
                         crate::models::qwen3vl::native_backend::native_cuda_silu_inplace(di, q_len * config.intermediate_size);
-                        crate::models::qwen3vl::native_backend::native_cuda_element_mul(di, dq, q_len * config.intermediate_size); // [OK] di = SwiGLU result
-                        self.down_proj.forward_gpu(di, dog, q_len); // [OK] dog = MLP result
+                        crate::models::qwen3vl::native_backend::native_cuda_element_mul(di, dq, q_len * config.intermediate_size);
+                        self.down_proj.forward_gpu(di, dog, q_len); // MLP res in dog
                         let so_size = self.down_proj.src_out; let to_size = self.down_proj.out_features;
                         if to_size > so_size { crate::models::qwen3vl::native_backend::native_cuda_hybrid_repeat(dog, so_size, to_size, q_len); }
-                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(dog, drg, x.len()); // [OK] result = MLP + (x + attn_out)
+                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(dog, drg, x.len()); // result = MLP + (x + attn_out)
                         let rs = std::slice::from_raw_parts_mut(out_ptr, x.len());
                         cl.cuMemcpyDtoH_v2(rs.as_mut_ptr() as *mut _, dog, x.len() * 2);
                         return rs;
@@ -450,8 +449,8 @@ impl NativeLayer {
                 cl.cuDevicePrimaryCtxRetain(&mut ctx, dev); cl.cuCtxSetCurrent(ctx);
             }
             let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
-            cl.cuMemAlloc_v2(&mut kp, tok * n_kv * (h_d/32) * 4); cl.cuMemAlloc_v2(&mut vp, tok * n_kv * h_d * 2);
-            cl.cuMemcpyHtoD_v2(kp, k.as_ptr() as *const _, k.len()*4); cl.cuMemcpyHtoD_v2(vp, v.as_ptr() as *const _, v.len()*2);
+            let _ = cl.cuMemAlloc_v2(&mut kp, tok * n_kv * (h_d/32) * 4); let _ = cl.cuMemAlloc_v2(&mut vp, tok * n_kv * h_d * 2);
+            let _ = cl.cuMemcpyHtoD_v2(kp, k.as_ptr() as *const _, k.len()*4); let _ = cl.cuMemcpyHtoD_v2(vp, v.as_ptr() as *const _, v.len()*2);
             g.k_ptr = Some(GpuPtr(kp as *mut _)); g.v_ptr = Some(GpuPtr(vp as *mut _)); g.capacity = tok; g.current_len = tok;
         }
     }
@@ -467,8 +466,8 @@ impl NativeLayer {
             }
             let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
             let kb = tok * n_kv * (h_d/32) * 4; let vb = tok * n_kv * h_d * 2;
-            cl.cuMemAlloc_v2(&mut kp, kb); cl.cuMemAlloc_v2(&mut vp, vb);
-            cl.cuMemcpyDtoD_v2(kp, ks.0 as CUdeviceptr, kb); cl.cuMemcpyDtoD_v2(vp, vs.0 as CUdeviceptr, vb);
+            let _ = cl.cuMemAlloc_v2(&mut kp, kb); let _ = cl.cuMemAlloc_v2(&mut vp, vb);
+            let _ = cl.cuMemcpyDtoD_v2(kp, ks.0 as CUdeviceptr, kb); let _ = cl.cuMemcpyDtoD_v2(vp, vs.0 as CUdeviceptr, vb);
             g.k_ptr = Some(GpuPtr(kp as *mut _)); g.v_ptr = Some(GpuPtr(vp as *mut _)); g.capacity = tok; g.current_len = tok;
         }
     }
@@ -526,6 +525,10 @@ impl NativeQwen3TextModel {
         for layer in &self.layers { layer.set_kv_data(k.clone(), v.clone()); }
     }
     pub fn get_kv_len(&self) -> usize { self.layers[0].get_kv_len(self.config.head_dim, self.config.num_key_value_heads) }
+    pub fn get_all_kv(&self, start_idx: usize) -> Vec<(Vec<u32>, Vec<f16>)> {
+        let hd = self.config.head_dim; let nkv = self.config.num_key_value_heads;
+        self.layers.iter().filter_map(|l| l.get_kv_data(hd, nkv, start_idx)).collect()
+    }
 }
 
 pub struct NativeQwen3VLModel {
