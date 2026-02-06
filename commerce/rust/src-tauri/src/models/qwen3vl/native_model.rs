@@ -148,30 +148,37 @@ impl DynamicGpuKVCache {
     }
 }
 
-// [NEW] Bit-Serial Dequantizer for Unified Load Support
-pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, k: usize) -> Vec<f16> {
-    let k_blocks = (k + 31) / 32;
+// [NEW] Bit-Serial Dequantizer for Unified Load Support with Repetition
+pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, src_k: usize, target_k: usize) -> Vec<f16> {
+    let src_k_blocks = (src_k + 31) / 32;
+    let target_k_blocks = (target_k + 31) / 32;
     let n_padded = (n + 7) / 8 * 8;
-    let mut out = vec![f16::ZERO; n * k];
+    let mut out = vec![f16::ZERO; n * target_k];
     
+    let repetition_ratio = if target_k > src_k { target_k / src_k } else { 1 };
+
     // Layout is Shuffled: [N/8, K_blocks, 8]
     for n_idx_outer in 0..(n_padded / 8) {
-        for kb in 0..k_blocks {
+        for src_kb in 0..src_k_blocks {
             for sub_n in 0..8 {
                 let n_idx = n_idx_outer * 8 + sub_n;
                 if n_idx >= n { continue; }
                 
-                let shuffle_idx = (n_idx_outer * k_blocks + kb) * 8 + sub_n;
+                let shuffle_idx = (n_idx_outer * src_k_blocks + src_kb) * 8 + sub_n;
                 let bits = packed[shuffle_idx];
                 let scale = scales[shuffle_idx];
                 
-                for b in 0..32 {
-                    let k_idx = kb * 32 + b;
-                    if k_idx >= k { break; }
-                    
-                    let bit = (bits >> b) & 1;
-                    let val = if bit == 1 { scale } else { -scale };
-                    out[n_idx * k + k_idx] = val;
+                // [REPETITION] 타겟 차원이 더 크면 반복해서 채움
+                for r in 0..repetition_ratio {
+                    let target_kb = src_kb + (r * src_k_blocks);
+                    for b in 0..32 {
+                        let k_idx = target_kb * 32 + b;
+                        if k_idx >= target_k { break; }
+                        
+                        let bit = (bits >> b) & 1;
+                        let val = if bit == 1 { scale } else { -scale };
+                        out[n_idx * target_k + k_idx] = val;
+                    }
                 }
             }
         }
@@ -1144,8 +1151,8 @@ impl NativeQwen3VLModel {
 
         println!("[LOAD] Initializing Native Engine (Baking: {})...", baking);
 
-        // [CRITICAL-FIX] 임베딩 로더: 1비트로 압축된 경우 로딩 시점에 FP16으로 복원
-        let get_embed = |base: &str, vocab: usize, hid: usize| -> Result<NativeLinear> {
+        // [CRITICAL-FIX] 임베딩 로더: 1비트로 압축된 경우 로딩 시점에 FP16으로 복원 (반복 확장 지원)
+        let get_embed = |base: &str, vocab: usize, target_hid: usize, is_support: bool| -> Result<NativeLinear> {
             let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref(), -1).ok_or_else(|| anyhow!("EmbedTensorNotFound: {}", base))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
@@ -1158,10 +1165,17 @@ impl NativeQwen3VLModel {
                 let vp = current_st.tensor(&p_n)?;
                 let vs = current_st.tensor(&s_n)?;
                 
+                // 실제 파일에 들어있는 원본 hidden_size 계산
+                let src_hid = (vp.data().len() / 4 * 32) / vocab;
+                
                 let packed_ref = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len() / 4) };
                 let scales_ref = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len() / 2) };
                 
-                let dequantized = dequantize_bit_serial_to_f16(packed_ref, scales_ref, vocab, hid);
+                if target_hid > src_hid {
+                    println!("[HYBRID-EMBED] Repeating embedding: {} -> {}", src_hid, target_hid);
+                }
+
+                let dequantized = dequantize_bit_serial_to_f16(packed_ref, scales_ref, vocab, src_hid, target_hid);
                 
                 // [MEM-COPY] 복원된 FP16 데이터를 담은 NativeTensor 생성
                 let mut dest = Vec::with_capacity(dequantized.len() * 2);
@@ -1171,20 +1185,20 @@ impl NativeQwen3VLModel {
                 std::mem::forget(boxed_data); // Keep alive for the session
 
                 Ok(NativeLinear { 
-                    in_features: vocab, out_features: hid, 
+                    in_features: vocab, out_features: target_hid, 
                     variant: LinearVariant::Standard { 
-                        weight: NativeTensor { data_ptr: leaked_ptr, gpu_ptr: None, shape: vec![vocab, hid], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, 
+                        weight: NativeTensor { data_ptr: leaked_ptr, gpu_ptr: None, shape: vec![vocab, target_hid], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, 
                         bias: None 
                     }, 
                     device_id: -1 
                 })
             } else {
-                get_l(base, vocab, hid, -1)
+                get_l(base, vocab, target_hid, -1)
             }
         };
 
-        let emb = get_embed("model.embed_tokens.weight", 151936, t_c.hidden_size)
-            .or_else(|_| get_embed("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size))?;
+        let emb = get_embed("model.embed_tokens.weight", 151936, t_c.hidden_size, s_mmap.is_some())
+            .or_else(|_| get_embed("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size, s_mmap.is_some()))?;
             
         let mut layers = Vec::new(); 
         let l_to_l = if baking { 1 } else { t_c.num_hidden_layers };
@@ -1203,9 +1217,6 @@ impl NativeQwen3VLModel {
             let current_mmap = if is_support_layer { s_mmap.as_ref().unwrap() } else { &m_mmap };
             
             let get_hybrid_l = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
-                // get_l 내부에서 current_st와 current_mmap을 참조하도록 클로저 캡처 유지
-                // [FIX] get_l 대신 직접 로딩 로직 구현 (또는 get_l 파라미터 확장)
-                
                 let key = base;
                 let p_n = format!("{}.packed", key);
                 let s_n = format!("{}.scales", key);
@@ -1217,8 +1228,8 @@ impl NativeQwen3VLModel {
                     let os = unsafe { vs.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                     
                     let mut l = NativeLinear { 
-                        in_features: vp.shape()[1] * 32 / (if key.contains("o_proj") || key.contains("down_proj") { 1 } else { 1 }), // Dummy, will fix
-                        out_features: vp.shape()[0],
+                        in_features: in_f,
+                        out_features: out_f,
                         variant: LinearVariant::BitSerial {
                             weight_packed: NativeTensor::from_mmap(current_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                             scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
@@ -1227,19 +1238,17 @@ impl NativeQwen3VLModel {
                         device_id: -1,
                     };
                     
-                    // [REPETITION-ADAPTER] 0.6B(1024) 레이어를 2B(2048) 시스템에 맞게 확장
                     if is_support_layer {
-                        let actual_in = if key.contains("q_proj") || key.contains("k_proj") || key.contains("v_proj") || key.contains("gate_proj") || key.contains("up_proj") { 1024 } else { 1024 };
-                        let actual_out = if key.contains("o_proj") || key.contains("down_proj") { 1024 } else { 1024 };
-                        
-                        if in_f > actual_in || out_f > actual_out {
-                            println!("[HYBRID-ADAPT] Repeating weights for {}: [{},{}] -> [{},{}]", base, actual_in, actual_out, in_f, out_f);
+                        let src_in = if key.contains("o_proj") || key.contains("down_proj") {
+                            if key.contains("down_proj") { 3072 } else { 1024 }
+                        } else { 1024 };
+                        let src_out = if key.contains("gate_proj") || key.contains("up_proj") { 3072 } else { 1024 };
+
+                        if in_f > src_in || out_f > src_out {
+                            println!("[HYBRID-ADAPT] Repeating weights for {}: [{},{}] -> [{},{}]", base, src_in, src_out, in_f, out_f);
                             l.in_features = in_f;
                             l.out_features = out_f;
                         }
-                    } else {
-                        l.in_features = in_f;
-                        l.out_features = out_f;
                     }
                     Ok(l)
                 } else {
