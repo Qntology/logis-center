@@ -8,6 +8,7 @@ use half::f16;
 use safetensors::SafeTensors;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
+use std::sync::atomic::Ordering;
 
 pub enum LinearVariant {
     Standard { weight: NativeTensor, bias: Option<NativeTensor> },
@@ -302,7 +303,7 @@ impl NativeLayer {
         }
         let out_ptr = if ping_pong { workspace.hidden_b.as_mut_ptr() } else { workspace.hidden_a.as_mut_ptr() };
         #[cfg(feature = "cuda")]
-        if self.device_id >= 0 && !self.gpu_broken.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.device_id >= 0 && !self.gpu_broken.load(Ordering::Relaxed) {
             if let Some((si, so)) = global_scratch {
                 let (di, dog) = self.q_proj.ensure_gpu_buffers_ext(q_len, si, so);
                 if di != 0 && dog != 0 {
@@ -310,19 +311,12 @@ impl NativeLayer {
                         let cl = crate::models::qwen3vl::native_backend::lib();
                         cl.cuMemcpyHtoD_v2(di, x.as_ptr() as *const _, x.len() * 2);
                         if self.input_layernorm.gpu_ptr.is_none() || self.post_attention_layernorm.gpu_ptr.is_none() { 
-                            if _idx == 0 { println!("[GPU-FALLBACK] Layer-{} missing GPU weights.", _idx); }
-                            self.gpu_broken.store(true, std::sync::atomic::Ordering::Relaxed); return &[]; 
+                            self.gpu_broken.store(true, Ordering::Relaxed); return &[]; 
                         }
                         let dlw = self.input_layernorm.gpu_ptr.as_ref().unwrap().0 as *const f16;
                         crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(di as *const f16, dlw, dog as *mut f16, q_len as i32, h_s as i32, config.rms_norm_eps as f32);
-                        
-                        // [GPU-SPEED-BOOST] Sequence Projections and RoPE directly on GPU
-                        self.q_proj.forward_gpu(dog, di, q_len); // Q in di
-                        let dq = di;
-                        self.k_proj.forward_gpu(dog, dog, q_len); // K in dog
-                        let dk = dog;
-                        
-                        // GPU-side RoPE
+                        self.q_proj.forward_gpu(dog, di, q_len); let dq = di;
+                        self.k_proj.forward_gpu(dog, dog, q_len); let dk = dog;
                         {
                             let mut rg = self.rope_cache_gpu.lock().unwrap();
                             if rg.is_none() {
@@ -338,68 +332,35 @@ impl NativeLayer {
                                 crate::models::qwen3vl::native_backend::native_cuda_apply_rope(dq, dk, dc, ds, q_len, s_o, n_h, n_kv, h_d);
                             }
                         }
-                        
                         let mut gkg = self.gpu_kv_cache.lock().unwrap();
                         let n_tok = s_o + q_len; gkg.grow(n_tok, n_kv, h_d, self.device_id);
                         if let (Some(kp), Some(vp)) = (gkg.k_ptr, gkg.v_ptr) {
                             let ko = (s_o * n_kv * (h_d/32) * 4) as u64; let vo = (s_o * n_kv * h_d * 2) as u64;
                             let dkd = (kp.0 as u64 + ko) as CUdeviceptr; let dvd = (vp.0 as u64 + vo) as CUdeviceptr;
                             crate::models::qwen3vl::native_backend::native_cuda_pack_bits(dk, dkd, q_len * n_kv * h_d);
-                            self.v_proj.forward_gpu(dq, dvd, q_len); // V directly into cache
-                            gkg.current_len = n_tok;
+                            self.v_proj.forward_gpu(dq, dvd, q_len); gkg.current_len = n_tok;
                         }
-                        
-                        let ac = (1.0 - (_idx as f32 / 28.0) * 0.15).clamp(0.85, 1.0);
-                        // [OPTIMIZATION] Attention result directly to dog, skip DtoH for Query
-                        crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&[], gkg.k_ptr.unwrap(), gkg.v_ptr.unwrap(), n_h, n_kv, h_d, n_tok, self.device_id as usize, dq, dog, f_alpha * ac, self.q_proj.src_in / n_h, true);
-                        
-                        // Apply Semantic Gain on GPU
+                        // [OPTIMIZATION] Attention result directly to dog
+                        crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&[], gkg.k_ptr.unwrap(), gkg.v_ptr.unwrap(), n_h, n_kv, h_d, n_tok, self.device_id as usize, dq, dog, f_alpha * (1.0 - (_idx as f32 / 28.0) * 0.15).clamp(0.85, 1.0), self.q_proj.src_in / n_h, true);
                         if s_gain != 1.0 { crate::models::qwen3vl::native_backend::native_cuda_apply_gain(dog, s_gain, q_len * h_s); }
-                        
-                        self.o_proj.forward_gpu(dog, di, q_len); // Result in di
-                        
-                        // Residual Add on GPU
-                        // Upload current residual input 'x' to dog if it's not there? No, we need a buffer for x.
-                        // Let's reuse di for output and dog for x temporarily.
+                        self.o_proj.forward_gpu(dog, di, q_len);
+                        // Residual Add on GPU: di = di + x (x uploaded to dog)
                         cl.cuMemcpyHtoD_v2(dog, x.as_ptr() as *const _, x.len() * 2);
                         crate::models::qwen3vl::native_backend::native_cuda_add_inplace(di, dog, x.len());
                         
-                        // MLP Path
-                        let d_post_w = self.post_attention_layernorm.gpu_ptr.as_ref().unwrap().0 as *const f16;
-                        crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(di as *const f16, d_post_w, dog as *mut f16, q_len as i32, h_s as i32, config.rms_norm_eps as f32);
-                        
+                        let dpw = self.post_attention_layernorm.gpu_ptr.as_ref().unwrap().0 as *const f16;
+                        crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(di as *const f16, dpw, dog as *mut f16, q_len as i32, h_s as i32, config.rms_norm_eps as f32);
                         self.gate_proj.forward_gpu(dog, di, q_len); // Gate in di
                         self.up_proj.forward_gpu(dog, dog, q_len); // Up in dog
-                        
                         crate::models::qwen3vl::native_backend::native_cuda_silu_inplace(di, q_len * config.intermediate_size);
-                        // [GPU-STREET-LOGIC] Multiply gate and up. We need a simple mul kernel. 
-                        // Reuse apply_gain kernel but for element-wise? No, let's just do it on CPU for SiLU-Mul if we don't have kernel yet.
-                        // Wait, I can add a simple multiply kernel to .cu.
-                        
-                        // For now, download to finish MLP to ensure correctness, then add remaining kernels
-                        let isz = q_len * config.intermediate_size;
-                        let mut gate_h = vec![f16::ZERO; isz]; cl.cuMemcpyDtoH_v2(gate_h.as_mut_ptr() as *mut _, di, isz * 2);
-                        let mut up_h = vec![f16::ZERO; isz]; cl.cuMemcpyDtoH_v2(up_h.as_mut_ptr() as *mut _, dog, isz * 2);
-                        for i in 0..isz { gate_h[i] = f16::from_f32(gate_h[i].to_f32() * up_h[i].to_f32()); }
-                        cl.cuMemcpyHtoD_v2(di, gate_h.as_ptr() as *const _, isz * 2);
-                        
-                        self.down_proj.forward_gpu(di, dog, q_len); // MLP result in dog
-                        
-                        // Hybrid Output Adapt on GPU
+                        crate::models::qwen3vl::native_backend::native_cuda_element_mul(di, dog, q_len * config.intermediate_size);
+                        self.down_proj.forward_gpu(di, dog, q_len); // MLP res in dog
                         let so_size = self.down_proj.src_out; let to_size = self.down_proj.out_features;
                         if to_size > so_size { crate::models::qwen3vl::native_backend::native_cuda_hybrid_repeat(dog, so_size, to_size, q_len); }
-                        
-                        // Final Residual Add on GPU
-                        // Result of attention was in di (after first add). 
-                        // Actually it was di. Let's upload di to another scratch or just download result.
-                        // Optimization: Download final result only once at end of layer.
+                        // Final Residual Add: result = dog + previous_sum(di)
+                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(dog, di, x.len());
                         let rs = std::slice::from_raw_parts_mut(out_ptr, x.len());
                         cl.cuMemcpyDtoH_v2(rs.as_mut_ptr() as *mut _, dog, x.len() * 2);
-                        
-                        // Original x is from CPU, we need the intermediate sum from GPU di
-                        let mut attn_plus_x = vec![f16::ZERO; x.len()]; cl.cuMemcpyDtoH_v2(attn_plus_x.as_mut_ptr() as *mut _, di, x.len() * 2);
-                        for i in 0..x.len() { rs[i] = f16::from_f32(rs[i].to_f32() + attn_plus_x[i].to_f32()); }
-                        
                         return rs;
                     }
                 }
@@ -416,7 +377,7 @@ impl NativeLayer {
         c.k[s_o * (n_kv * h_d / 32) .. s_o * (n_kv * h_d / 32) + kp.len()].copy_from_slice(&kp);
         c.v[s_o * (n_kv * h_d) .. s_o * (n_kv * h_d) + workspace.v.len()].copy_from_slice(&workspace.v);
         c.current_len = nl;
-        let mut ao = native_bit_serial_attn_f16(&workspace.q, &c.k, &c.v, h_s, n_h, n_kv, q_len, nl, f_alpha);
+        let mut ao = native_bit_serial_attn_f16(&workspace.q, &c.k, &c.v, h_s, n_h, n_kv, q_l, nl, f_alpha);
         if s_gain != 1.0 { for v in ao.iter_mut() { *v = f16::from_f32(v.to_f32() * s_gain); } }
         let os = unsafe { std::slice::from_raw_parts_mut(out_ptr, x.len()) };
         self.o_proj.forward_into(&ao, os, global_scratch); for i in 0..x.len() { os[i] += x[i]; }
@@ -474,7 +435,7 @@ impl NativeLayer {
     pub fn set_kv_data(&self, k: Vec<u32>, v: Vec<f16>) { let mut c = self.kv_cache.lock().unwrap(); c.k = k; c.v = v; c.capacity = 0; }
     #[cfg(feature = "cuda")]
     pub fn inject_gpu_kv(&self, k: &[u32], v: &[f16], n_kv: usize, h_d: usize) {
-        let tok = (k.len() * 32) / (n_kv * head_dim); let mut g = self.gpu_kv_cache.lock().unwrap();
+        let tok = (k.len() * 32) / (n_kv * h_d); let mut g = self.gpu_kv_cache.lock().unwrap();
         unsafe {
             let cl = crate::models::qwen3vl::native_backend::lib();
             let mut ctx = std::ptr::null_mut() as cudarc::driver::sys::CUcontext; cl.cuCtxGetCurrent(&mut ctx);
@@ -743,8 +704,8 @@ impl NativeQwen3VLModel {
             let get_vvt = |name: &str, ts: usize| -> Result<NativeTensor> {
                 let key = find_vkey(name).ok_or_else(|| anyhow!("VNotFound: {}", name))?; let v = vst.tensor(&key)?; let sd = v.data(); let sl = sd.len()/2;
                 if ts > sl {
-                    let sf = unsafe { std::slice::from_raw_parts(sd.as_ptr() as *const f16, sl) }; let mut nd = Vec::with_capacity(ts*2);
-                    for _ in 0..(ts/sl) { for &val in sf { nd.extend_from_slice(&val.to_le_bytes()); } }
+                    let sf = unsafe { std::slice::from_raw_parts(sd.as_ptr() as *const f16, sl) }; let ratio = ts/sl;
+                    let mut nd = Vec::with_capacity(ts*2); for _ in 0..ratio { for &val in sf { nd.extend_from_slice(&val.to_le_bytes()); } }
                     let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr() as *const u8; std::mem::forget(boxed);
                     Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![ts], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
                 } else {

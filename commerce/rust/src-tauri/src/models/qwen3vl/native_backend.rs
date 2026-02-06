@@ -63,6 +63,14 @@ extern "C" {
 
     #[link_name = "cuda_silu_inplace_f16"]
     pub fn cuda_silu_inplace_f16(d_data: *mut f16, size: i32);
+
+    #[link_name = "cuda_element_mul_f16"]
+    pub fn cuda_element_mul_f16(d_dst: *mut f16, d_src: *const f16, size: i32);
+}
+
+#[cfg(feature = "cuda")]
+pub fn native_cuda_element_mul(d_dst: CUdeviceptr, d_src: CUdeviceptr, size: usize) {
+    unsafe { cuda_element_mul_f16(d_dst as *mut f16, d_src as *const f16, size as i32); }
 }
 
 #[cfg(feature = "cuda")]
@@ -99,9 +107,7 @@ pub fn native_cuda_pack_bits(d_src: CUdeviceptr, d_dst: CUdeviceptr, elements: u
 pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32, src_h_d: usize, q_on_gpu: bool) {
     if d_q == 0 || d_o == 0 || k_p.0.is_null() || v_p.0.is_null() { return; }
     unsafe {
-        if !q_on_gpu {
-            lib().cuMemcpyHtoD_v2(d_q, q.as_ptr() as *const _, q.len() * 2);
-        }
+        if !q_on_gpu { lib().cuMemcpyHtoD_v2(d_q, q.as_ptr() as *const _, q.len() * 2); }
         let actual_q_len = if q.is_empty() { 1 } else { q.len() / (n_h * h_d) };
         cuda_attn_f16(d_q as *const f16, k_p.0 as *const u32, v_p.0 as *const f16, d_o as *mut f16, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, actual_q_len as i32, alpha, src_h_d as i32);
     }
@@ -109,11 +115,14 @@ pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, 
 
 #[cfg(feature = "cuda")]
 pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, alpha: f32, src_h_d: usize) -> Vec<f16> {
+    let eps_signal = f16::from_f32(1e-6);
     unsafe {
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         lib().cuMemAlloc_v2(&mut d_q, q.len() * 2); 
         lib().cuMemAlloc_v2(&mut d_o, q.len() * 2);
-        let res = native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha, src_h_d, false);
+        native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha, src_h_d, false);
+        let mut o_f = vec![eps_signal; q.len()]; 
+        lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 2);
         lib().cuMemFree_v2(d_q); lib().cuMemFree_v2(d_o);
         res
     }
@@ -135,6 +144,18 @@ pub fn bit_serial_matmul_gpu_buffered(i: &[f16], w: &NativeTensor, s: &NativeTen
         let mut o_f = vec![eps_signal; m * n]; 
         lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, m * n * 2);
         o_f
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn bit_serial_matmul_gpu_buffered_into(i: &[f16], w: &NativeTensor, s: &NativeTensor, out: &mut [f16], m: usize, n: usize, k: usize, dev: usize, d_i: CUdeviceptr, d_o: CUdeviceptr, src_k: usize) {
+    if d_i == 0 || d_o == 0 { return; }
+    unsafe {
+        let _ = lib().cuMemcpyHtoD_v2(d_i, i.as_ptr() as *const _, m * k * 2);
+        let d_w = w.gpu_ptr.expect("W on GPU").0 as *const u32;
+        let d_s = s.gpu_ptr.expect("S on GPU").0 as *const f16;
+        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32);
+        lib().cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, m * n * 2);
     }
 }
 
