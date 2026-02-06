@@ -439,26 +439,48 @@ impl NativeLayer {
             let max_abs = samples.iter().fold(1e-9f32, |a, &b| a.max(b));
             let density = (mean_abs / max_abs).clamp(0.0, 1.0);
             
-            // [PRECISION] Attenuate memory intensity for deeper layers
+            // --- [CHUNK-AWARE DYNAMIC SCALING] ---
+            let total_context = seqlen_offset + q_len;
+            
+            // 1. Context Fatigue Compensation: Increase intensity for deeper context history
+            // Signal dilution starts becoming critical after 1024 tokens.
+            let fatigue_comp = if total_context > 1024 {
+                (1.0 + (total_context as f32 / 1024.0).ln() * 0.12).clamp(1.0, 1.6)
+            } else { 1.0 };
+
+            // 2. Chunk Momentum: Boost focus for large parallel prefill blocks
+            // This stabilizes long HTML/Pug structures during heavy baking.
+            let chunk_momentum = if q_len > 128 {
+                (1.0 + (q_len as f32 / 128.0).log2() * 0.06).clamp(1.0, 1.25)
+            } else { 1.0 };
+
+            // Apply both axes to the base calculation
             let depth_ratio = _idx as f32 / config.num_hidden_layers as f32;
             let accuracy_correction = (1.0 - depth_ratio * 0.15).clamp(0.85, 1.0);
-            
             let density_boost = if density < 0.2f32 { 8.0f32 } else { (1.0f32 / (density + 0.1f32)).min(5.0f32) };
             
-            // Re-calculate alpha with high-precision factors
-            final_alpha = (0.1f32 / (mean_abs + 1e-9f32) * density_boost * accuracy_correction).clamp(0.2f32, 2.5f32);
-            semantic_gain = (density * 2.0 + 0.85).clamp(0.95, 1.25); // Slightly wider gain range for better contrast
+            final_alpha = (0.1f32 / (mean_abs + 1e-9f32) * density_boost * accuracy_correction * fatigue_comp * chunk_momentum).clamp(0.2f32, 3.5f32);
+            semantic_gain = (density * 2.0 + 0.85).clamp(0.95, 1.35); 
             
-            if is_baking { final_alpha *= 1.55f32; } // 1.55x boost for small-model ingestion
+            if is_baking { final_alpha *= 1.55f32; } 
             
-            // [HYBRID-BOOST] Apply additional strength when using 0.6B Layer 0 as support for 2B model
+            // 3. Hybrid Modality Logic: Distinguish Vision vs Text within the chunk
             if self.is_support_layer && !is_baking {
-                final_alpha *= 1.25f32; // 25% signal boost for hybrid transition
-                semantic_gain *= 1.10f32; // Sharpen contrast for 2B body
+                let is_vision = q_len >= 512 && density > 0.45; // Statistical vision heuristic
+                
+                if is_vision {
+                    final_alpha *= 1.45f32; // Aggressive boost for visual signal clarity
+                    semantic_gain *= 1.18f32; // Sharp contrast for OCR precision
+                } else {
+                    final_alpha *= 1.25f32; // Standard hybrid text bridge
+                    semantic_gain *= 1.10f32;
+                }
             }
-
-            println!("[COGNITIVE-PRECISION] Layer 0 {} -> Alpha: {:.4}, Gain: {:.4} (D: {:.4}, Support: {})", 
-                if is_baking { "BAKE" } else { "INF" }, final_alpha, semantic_gain, density, self.is_support_layer);
+            
+            if q_len > 100 || seqlen_offset % 1024 == 0 {
+                println!("[COGNITIVE-CHUNK] L0 | Context: {}t (Off: {}) | QLen: {} | Alpha: {:.4} | Modality: {}", 
+                    total_context, seqlen_offset, q_len, final_alpha, if density > 0.45 { "VISION" } else { "TEXT" });
+            }
         }
 
         // Target buffer based on ping-pong flag
