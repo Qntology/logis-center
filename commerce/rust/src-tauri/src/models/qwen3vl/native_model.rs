@@ -397,6 +397,7 @@ pub struct NativeLayer {
     pub up_proj: NativeLinear,
     pub down_proj: NativeLinear,
     pub device_id: i32,
+    pub is_support_layer: bool,
     pub kv_cache: std::sync::Mutex<DynamicKVCache>, 
     pub gpu_kv_cache: std::sync::Mutex<DynamicGpuKVCache>, 
     // [REMOVED] Individual scratch buffers to save VRAM
@@ -450,8 +451,14 @@ impl NativeLayer {
             
             if is_baking { final_alpha *= 1.55f32; } // 1.55x boost for small-model ingestion
             
-            println!("[COGNITIVE-PRECISION] Layer 0 {} -> Alpha: {:.4}, Gain: {:.4} (D: {:.4}, Corr: {:.2})", 
-                if is_baking { "BAKE" } else { "INF" }, final_alpha, semantic_gain, density, accuracy_correction);
+            // [HYBRID-BOOST] Apply additional strength when using 0.6B Layer 0 as support for 2B model
+            if self.is_support_layer && !is_baking {
+                final_alpha *= 1.25f32; // 25% signal boost for hybrid transition
+                semantic_gain *= 1.10f32; // Sharpen contrast for 2B body
+            }
+
+            println!("[COGNITIVE-PRECISION] Layer 0 {} -> Alpha: {:.4}, Gain: {:.4} (D: {:.4}, Support: {})", 
+                if is_baking { "BAKE" } else { "INF" }, final_alpha, semantic_gain, density, self.is_support_layer);
         }
 
         // Target buffer based on ping-pong flag
@@ -817,7 +824,8 @@ impl NativeQwen3TextModel {
         _grid_thw: Option<&[u32; 3]>, 
         seqlen_offset: usize, 
         global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
-        workspace: Option<&mut ForwardWorkspace>
+        workspace: Option<&mut ForwardWorkspace>,
+        support_layer: Option<&NativeLayer>, // [NEW] Optional support path
     ) -> Vec<f16> {
         let hid = self.config.hidden_size;
         let embeds = match &self.embed_tokens.variant {
@@ -831,7 +839,7 @@ impl NativeQwen3TextModel {
             }
         };
 
-        self.forward_ext(input_ids, embeds, seqlen_offset, global_scratch, workspace)
+        self.forward_ext(input_ids, embeds, seqlen_offset, global_scratch, workspace, support_layer)
     }
 
     pub fn forward_ext(
@@ -840,7 +848,8 @@ impl NativeQwen3TextModel {
         embeds: Vec<f16>, 
         seqlen_offset: usize, 
         global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
-        workspace: Option<&mut ForwardWorkspace>
+        workspace: Option<&mut ForwardWorkspace>,
+        support_layer: Option<&NativeLayer>, // [NEW] Optional support path
     ) -> Vec<f16> {
         let hid = self.config.hidden_size;
         let is_baking = self.layers.len() <= 1;
@@ -870,8 +879,15 @@ impl NativeQwen3TextModel {
         let r_sin = &rope_guard.sin;
 
         for (i, layer) in self.layers.iter().enumerate() { 
+            // [HOT-SWAP] Use Support Layer for index 0 if provided
+            let active_layer = if i == 0 && support_layer.is_some() {
+                support_layer.unwrap()
+            } else {
+                layer
+            };
+
             let use_b = i % 2 == 0;
-            let out_slice = layer.forward(
+            let out_slice = active_layer.forward(
                 cur_x, 
                 &self.config, 
                 seqlen_offset, 
@@ -955,7 +971,8 @@ pub struct NativeQwen3VLModel {
     pub text_model: NativeQwen3TextModel, 
     pub lm_head: NativeLinear,
     pub visual: Option<NativeVisionModel>,
-    // [VRAM-SHARING] Global scratch buffers for all layers
+    pub support_layer0: Option<NativeLayer>, // [NEW] Permanent 0.6B Layer 0 slot
+    pub support_workspace: std::sync::Mutex<ForwardWorkspace>, // [NEW] Isolated workspace for baking
     pub global_scratch_i: std::sync::Mutex<Option<(GpuPtr, usize)>>,
     pub global_scratch_o: std::sync::Mutex<Option<(GpuPtr, usize)>>,
     pub workspace: std::sync::Mutex<ForwardWorkspace>,
@@ -1209,92 +1226,98 @@ impl NativeQwen3VLModel {
         let q_out = t_c.num_attention_heads * t_c.head_dim;
         let kv_out = t_c.num_key_value_heads * t_c.head_dim;
 
+        // [NEW] Dedicated loader for the Support Slot (Static Header)
+        let mut support_layer0 = None;
+        if let Some(ref sec_mmap) = s_mmap {
+            let sec_st = SafeTensors::deserialize(sec_mmap)?;
+            println!("[LOAD-HYBRID] Initializing Support Layer 0 from 0.6B...");
+            
+            let get_sec_l = |base: &str, target_in: usize, target_out: usize| -> Result<NativeLinear> {
+                let p_n = format!("{}.packed", base);
+                let s_n = format!("{}.scales", base);
+                let vp = sec_st.tensor(&p_n)?; let vs = sec_st.tensor(&s_n)?;
+                let src_out = vp.shape()[0];
+                let src_in = (vp.data().len() / 4 * 32) / src_out;
+                
+                let packed_u32 = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len() / 4) };
+                let scales_f16 = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len() / 2) };
+                
+                let mut new_packed = vec![0u32; (target_out/8) * (target_in/32) * 8];
+                let mut new_scales = vec![f16::ZERO; (target_out/8) * (target_in/32) * 8];
+                let energy_scale = f16::from_f32(1.0 / ((target_in/src_in) as f32));
+
+                for no in 0..(target_out/8) {
+                    for ko in 0..(target_in/32) {
+                        for sub_n in 0..8 {
+                            let src_idx = ((no % (src_out/8)) * (src_in/32) + (ko % (src_in/32))) * 8 + sub_n;
+                            let dst_idx = (no * (target_in/32) + ko) * 8 + sub_n;
+                            new_packed[dst_idx] = packed_u32[src_idx];
+                            new_scales[dst_idx] = scales_f16[src_idx] * energy_scale;
+                        }
+                    }
+                }
+                let p_boxed = new_packed.into_boxed_slice();
+                let s_boxed = new_scales.into_boxed_slice();
+                let p_ptr = p_boxed.as_ptr() as *const u8;
+                let s_ptr = s_boxed.as_ptr() as *const u8;
+                std::mem::forget(p_boxed); std::mem::forget(s_boxed);
+
+                Ok(NativeLinear { 
+                    in_features: target_in, out_features: target_out, src_in, src_out,
+                    variant: LinearVariant::BitSerial {
+                        weight_packed: NativeTensor { data_ptr: p_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::U32, _mmap: None, device_id: -1 },
+                        scales: NativeTensor { data_ptr: s_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::F16, _mmap: None, device_id: -1 },
+                        bias: None,
+                    }, 
+                    device_id: -1,
+                })
+            };
+
+            let get_sec_t = |name: &str| -> Result<NativeTensor> {
+                let v = sec_st.tensor(name)?;
+                let off = unsafe { v.data().as_ptr().offset_from(sec_mmap.as_ptr()) } as usize;
+                Ok(NativeTensor::from_mmap(sec_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+            };
+
+            let p = "model.language_model.layers.0";
+            support_layer0 = Some(NativeLayer {
+                input_layernorm: get_sec_t(&format!("{}.input_layernorm.weight", p))?,
+                post_attention_layernorm: get_sec_t(&format!("{}.post_attention_layernorm.weight", p))?,
+                q_norm: get_sec_t(&format!("{}.self_attn.q_norm.weight", p)).ok(),
+                k_norm: get_sec_t(&format!("{}.self_attn.k_norm.weight", p)).ok(),
+                q_proj: get_sec_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out)?,
+                k_proj: get_sec_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out)?,
+                v_proj: get_sec_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out)?,
+                o_proj: get_sec_l(&format!("{}.self_attn.o_proj.weight", p), q_out, t_c.hidden_size)?,
+                gate_proj: get_sec_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
+                up_proj: get_sec_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
+                down_proj: get_sec_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
+                device_id: -1, is_support_layer: true,
+                kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
+                gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
+                gpu_broken: std::sync::atomic::AtomicBool::new(false),
+            });
+        }
+
         for i in 0..t_c.num_hidden_layers {
-            // [HYBRID-LOADER-FIX] 0번 레이어는 s_mmap(0.6B)에서, 1번 이후는 m_mmap(2B 본체)에서 로드
             let layer_idx = i as i32;
-            let is_support_layer = i == 0 && s_mmap.is_some(); 
+            let current_st = &st;
+            let current_mmap = &m_mmap;
             
-            // Logic: i == 0 이면 0.6B 파일(st_sec)을, 아니면 2B 본체(st)를 선택
-            let current_st = if is_support_layer { st_sec.as_ref().unwrap() } else { &st };
-            let current_mmap = if is_support_layer { s_mmap.as_ref().unwrap() } else { &m_mmap };
-            
-            let get_hybrid_l = |base: &str, target_in: usize, target_out: usize| -> Result<NativeLinear> {
-                let key = base;
+            let mut get_hybrid_l = |base: &str, target_in: usize, target_out: usize| -> Result<NativeLinear> {
+                let (key, _) = find_key_ext(base, current_st, None, layer_idx).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
                 let p_n = format!("{}.packed", key);
                 let s_n = format!("{}.scales", key);
                 
                 if current_st.tensor(&p_n).is_ok() {
-                    let vp = current_st.tensor(&p_n)?; 
-                    let vs = current_st.tensor(&s_n)?;
-                    
-                    // 실제 파일에 들어있는 원본 feature 크기 계산
-                    let src_out = vp.shape()[0];
-                    let src_in = (vp.data().len() / 4 * 32) / src_out;
-                    
-                    let mut final_packed_ptr = vp.data().as_ptr();
-                    let mut final_scales_ptr = vs.data().as_ptr();
-                    let mut _leaked_p = None;
-                    let mut _leaked_s = None;
-
-                    // [PHYSICAL-REPETITION-ADAPTER] 차원이 다르면 실제로 데이터를 2번 반복 복사
-                    if target_in > src_in || target_out > src_out {
-                        println!("[HYBRID-PHYSICAL-ADAPT] Expanding {}: [{},{}] -> [{},{}]", base, src_in, src_out, target_in, target_out);
-                        
-                        let packed_u32 = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len() / 4) };
-                        let scales_f16 = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len() / 2) };
-                        
-                        // Bit-serial Layout: [N/8, K/32, 8]
-                        let src_k_blocks = src_in / 32;
-                        let src_n_outer = src_out / 8;
-                        let target_k_blocks = target_in / 32;
-                        let target_n_outer = target_out / 8;
-                        
-                        let mut new_packed = vec![0u32; target_n_outer * target_k_blocks * 8];
-                        let mut new_scales = vec![f16::ZERO; target_n_outer * target_k_blocks * 8];
-                        
-                        let r_k = target_in / src_in;
-                        let r_n = target_out / src_out;
-                        
-                        // 에너지 보정: 반복 횟수만큼 스케일을 나눠줌 (신호 증폭 방지)
-                        let energy_scale = f16::from_f32(1.0 / (r_k as f32));
-
-                        for no in 0..target_n_outer {
-                            for ko in 0..target_k_blocks {
-                                for sub_n in 0..8 {
-                                    let src_no = no % src_n_outer;
-                                    let src_ko = ko % src_k_blocks;
-                                    let src_idx = (src_no * src_k_blocks + src_ko) * 8 + sub_n;
-                                    let dst_idx = (no * target_k_blocks + ko) * 8 + sub_n;
-                                    
-                                    if src_idx < packed_u32.len() {
-                                        new_packed[dst_idx] = packed_u32[src_idx];
-                                        new_scales[dst_idx] = scales_f16[src_idx] * energy_scale;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // 메모리 누수 방지를 위한 소유권 관리 (세션 동안 유지)
-                        let p_boxed = new_packed.into_boxed_slice();
-                        final_packed_ptr = p_boxed.as_ptr() as *const u8;
-                        _leaked_p = Some(p_boxed);
-                        
-                        let s_boxed = new_scales.into_boxed_slice();
-                        final_scales_ptr = s_boxed.as_ptr() as *const u8;
-                        _leaked_s = Some(s_boxed);
-                        
-                        std::mem::forget(_leaked_p);
-                        std::mem::forget(_leaked_s);
-                    }
-
+                    let vp = current_st.tensor(&p_n)?; let vs = current_st.tensor(&s_n)?;
+                    let op = unsafe { vp.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                    let os = unsafe { vs.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                     Ok(NativeLinear { 
-                        in_features: target_in,
-                        out_features: target_out,
-                        src_in: if target_in > src_in { src_in } else { target_in },
-                        src_out: if target_out > src_out { src_out } else { target_out },
+                        in_features: target_in, out_features: target_out, src_in: target_in, src_out: target_out,
                         variant: LinearVariant::BitSerial {
-                            weight_packed: NativeTensor { data_ptr: final_packed_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::U32, _mmap: None, device_id: -1 },
-                            scales: NativeTensor { data_ptr: final_scales_ptr, gpu_ptr: None, shape: vec![target_out, target_in/32 * 8], dtype: NativeDType::F16, _mmap: None, device_id: -1 },
+                            weight_packed: NativeTensor::from_mmap(current_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32),
+                            scales: NativeTensor::from_mmap(current_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16),
                             bias: None,
                         }, 
                         device_id: -1,
@@ -1307,10 +1330,7 @@ impl NativeQwen3VLModel {
             };
 
             let p = format!("model.language_model.layers.{}", i);
-            if current_st.tensor(&format!("{}.input_layernorm.weight", p)).is_err() {
-                println!("[LOAD-WARNING] Layer {} not found. Skipping.", i);
-                continue;
-            }
+            if current_st.tensor(&format!("{}.input_layernorm.weight", p)).is_err() { continue; }
 
             layers.push(NativeLayer {
                 input_layernorm: get_t(&format!("{}.input_layernorm.weight", p), layer_idx)?,
@@ -1325,6 +1345,7 @@ impl NativeQwen3VLModel {
                 up_proj: get_hybrid_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?,
                 down_proj: get_hybrid_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
                 device_id: -1, 
+                is_support_layer: false,
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
@@ -1421,6 +1442,7 @@ impl NativeQwen3VLModel {
                     up_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?, 
                     down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_cfg.hidden_size)?,
                     device_id: -1, 
+                    is_support_layer: false,
                     kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                     gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                     gpu_broken: std::sync::atomic::AtomicBool::new(false),
@@ -1438,6 +1460,7 @@ impl NativeQwen3VLModel {
                 up_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
                 down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
                 device_id: -1, 
+                is_support_layer: false,
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
@@ -1473,8 +1496,10 @@ impl NativeQwen3VLModel {
             }
         }
 
-        let mut ws_guard = self.workspace.lock().unwrap();
-        let ws = &mut *ws_guard;
+        // [HYBRID-ROUTING] Use support workspace and layer for baking tasks
+        let is_baking = self.text_model.layers.len() <= 1;
+        let mut ws_lock = if is_baking { self.support_workspace.lock().unwrap() } else { self.workspace.lock().unwrap() };
+        let ws = &mut *ws_lock;
         
         let mut embeds = match &self.text_model.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => {
@@ -1520,7 +1545,9 @@ impl NativeQwen3VLModel {
             }
         }
 
-        let norm_x = self.text_model.forward_ext(i_ids, embeds, s_o, scratch, Some(ws));
+        // [HOT-SWAP] Pass support layer to text model if baking or if it exists as static header
+        let active_support = if is_baking || self.support_layer0.is_some() { self.support_layer0.as_ref() } else { None };
+        let norm_x = self.text_model.forward_ext(i_ids, embeds, s_o, scratch, Some(ws), active_support);
         self.lm_head.forward(&norm_x, scratch)
     }
         pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }

@@ -82,7 +82,7 @@ impl LogisModel {
     }
 
     pub async fn unload_generator(&self) {
-        // Clear everything
+        // [HARD-RESET] Completely destroy everything (For OOM recovery)
         let mut gen = self.generator.lock().await;
         *gen = None;
         let mut spec = self.speculative_draftsman.lock().await;
@@ -95,7 +95,25 @@ impl LogisModel {
         let mut size = self.current_size.lock().await;
         *size = None;
 
-        println!("[MODEL] All generators (Active, Speculative & Hibernated) destroyed.");
+        println!("[MODEL] Hard Reset: All weights and memory purged from VRAM/RAM.");
+    }
+
+    pub async fn soft_reset_generator(&self) {
+        // [SOFT-RESET] Clear ONLY the dynamic context (KV Cache)
+        // This keeps the weights (Brain) loaded but resets all memory pointers.
+        let mut gen_guard = self.generator.lock().await;
+        if let Some(gen) = gen_guard.as_mut() {
+            gen.clear_kv_cache();
+        }
+        
+        // Also clear hibernation slots if they exist to prevent memory creep
+        let mut s_hib = self.small_hibernation.lock().await;
+        if let Some(m) = s_hib.as_mut() { m.clear_kv_cache(); }
+        
+        let mut l_hib = self.large_hibernation.lock().await;
+        if let Some(m) = l_hib.as_mut() { m.clear_kv_cache(); }
+
+        println!("[MODEL] Soft Reset: Context cleared, weights preserved (Warm State).");
     }
 
     pub async fn unload_embedding(&self) {

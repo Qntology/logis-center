@@ -168,16 +168,23 @@ pub async fn start_background_worker(
                         let store_guard = store.lock().await;
                         if let Some(db) = store_guard.as_ref() { let _ = db.update_task_status(&task.id, 9).await; }
                         cleanup_task_resources(&task.id, Some(&app_handle));
+                        
+                        // [INTELLIGENT-CLEANUP] 
+                        // Instead of unloading, just clear the KV cache to keep weights warm.
+                        let mut model_lock = model.lock().await;
+                        if let Some(m) = model_lock.as_ref() {
+                            m.soft_reset_generator().await;
+                        }
                         current_device_pref = None;
                     },
                     Err(e) => {
                         let err_msg = e.to_string();
-                        {
-                            let mut model_lock = model.lock().await;
-                            if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
-                            *model_lock = None;
-                        }
+                        
                         if err_msg.contains("Task cancelled") {
+                            // Cancelled tasks also get a soft reset
+                            let mut model_lock = model.lock().await;
+                            if let Some(m) = model_lock.as_ref() { m.soft_reset_generator().await; }
+                            
                             let store_guard = store.lock().await;
                             if let Some(db) = store_guard.as_ref() {
                                 let _ = db.update_task_status(&task.id, 3).await;
@@ -186,13 +193,23 @@ pub async fn start_background_worker(
                             let _ = app_handle.emit("extraction-progress", json!({ "task_id": task.id, "category": "Done", "summary": "Cancelled", "spinner": "🛑" }));
                             cleanup_task_resources(&task.id, Some(&app_handle));
                             break;
-                        } else {
-                            if err_msg.contains("out of memory") || err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") {
-                                current_device_pref = Some("cpu".to_string());
-                                log_task_progress(&app_handle, &task.id, &json!({ "category": "Error", "summary": "GPU OOM. Retrying on CPU.", "spinner": "⚠️" }));
-                                sleep(Duration::from_secs(2)).await;
-                                continue;
+                        } else if err_msg.contains("out of memory") || err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") {
+                            // [OOM-RECOVERY] Only here we do a HARD reset
+                            println!("[SCHEDULER] VRAM Exhausted. Performing Hard Reset and switching to CPU.");
+                            {
+                                let mut model_lock = model.lock().await;
+                                if let Some(m) = model_lock.as_ref() { m.unload_generator().await; }
+                                *model_lock = None;
                             }
+                            current_device_pref = Some("cpu".to_string());
+                            log_task_progress(&app_handle, &task.id, &json!({ "category": "Error", "summary": "GPU OOM. Retrying on CPU.", "spinner": "⚠️" }));
+                            sleep(Duration::from_secs(2)).await;
+                            continue;
+                        } else {
+                            // For other errors, keep the model but reset context
+                            let mut model_lock = model.lock().await;
+                            if let Some(m) = model_lock.as_ref() { m.soft_reset_generator().await; }
+
                             let store_guard = store.lock().await;
                             if let Some(db) = store_guard.as_ref() {
                                 let _ = db.update_task_status(&task.id, 6).await;
