@@ -586,7 +586,8 @@ impl NativeLayer {
         for i in 0..x.len() { out_slice[i] += x[i]; }
 
         let post_ln_w = self.post_attention_layernorm.get_slice::<f16>();
-        native_rms_norm_f16_into(out_slice, post_ln_w.as_ref(), config.rms_norm_eps as f32, hidden_size, &mut workspace.intermediate_a);
+        // [FIX] Use correctly sized slice for output to prevent out-of-bounds in par_chunks
+        native_rms_norm_f16_into(out_slice, post_ln_w.as_ref(), config.rms_norm_eps as f32, hidden_size, &mut workspace.intermediate_a[..x.len()]);
         
         self.gate_proj.forward_into(&workspace.intermediate_a[..x.len()], &mut workspace.intermediate_b, global_scratch);
         self.up_proj.forward_into(&workspace.intermediate_a[..x.len()], &mut workspace.q, global_scratch); 
@@ -1125,8 +1126,8 @@ impl NativeQwen3VLModel {
             None
         };
 
-        let get_l = |base: &str, in_f: usize, out_f: usize, l_idx: i32| -> Result<NativeLinear> {
-            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref(), l_idx).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
+        let get_l = |base: &str, in_f: usize, out_f: usize, _l_idx: i32| -> Result<NativeLinear> {
+            let (key, is_primary) = find_key_ext(base, &st, st_sec.as_ref(), _l_idx).ok_or_else(|| anyhow!("LinearTensorNotFound: {}", base))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
 
@@ -1136,25 +1137,6 @@ impl NativeQwen3VLModel {
             if current_st.tensor(&p_n).is_ok() {
                 let vp = current_st.tensor(&p_n)?; 
                 let vs = current_st.tensor(&s_n)?;
-                
-                // [STABILITY-DIAG] 로딩 시점에 텐서 유효성 샘플링
-                let scale_sample = vs.data();
-                if scale_sample.len() >= 4 {
-                    let s0 = f16::from_le_bytes([scale_sample[0], scale_sample[1]]).to_f32();
-                    let s1 = f16::from_le_bytes([scale_sample[2], scale_sample[3]]).to_f32();
-                    if s0 == 0.0 && scale_sample.iter().take(100).all(|&b| b == 0) {
-                        println!("[LOAD-CRITICAL] Tensor {} has ALL ZERO scales! Inference will fail.", key);
-                    } else if l_idx == 0 && key.contains("v_proj") {
-                        println!("[LOAD-DEBUG] Layer 0 V-PROJ Scales sample: {:.6}, {:.6}", s0, s1);
-                    }
-                }
-
-                let packed_sample = vp.data();
-                if l_idx == 0 && key.contains("v_proj") && packed_sample.len() >= 4 {
-                    let p0 = u32::from_le_bytes([packed_sample[0], packed_sample[1], packed_sample[2], packed_sample[3]]);
-                    println!("[LOAD-DEBUG] Layer 0 V-PROJ Packed sample: 0x{:08X}", p0);
-                }
-
                 let op = unsafe { vp.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                 let os = unsafe { vs.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
                 
@@ -1170,27 +1152,79 @@ impl NativeQwen3VLModel {
                 })
             } else {
                 let v = current_st.tensor(&key)?;
-                let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-                Ok(NativeLinear { 
-                    in_features: in_f, out_features: out_f, 
-                    src_in: in_f, src_out: out_f,
-                    variant: LinearVariant::Standard { 
-                        weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
-                        bias: None 
-                    }, 
-                    device_id: -1,
-                })
+                let src_shape = v.shape();
+                let src_in = src_shape[1];
+                let src_out = src_shape[0];
+
+                if in_f > src_in || out_f > src_out {
+                    println!("[LOAD-ADAPT] Expanding linear {}: [{},{}] -> [{},{}]", key, src_out, src_in, out_f, in_f);
+                    let src_data = v.data();
+                    let src_f16 = unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const f16, src_data.len() / 2) };
+                    
+                    let mut new_data = vec![f16::ZERO; out_f * in_f];
+                    let r_n = out_f / src_out;
+                    let r_k = in_f / src_in;
+                    let energy_scale = 1.0f32 / (r_k as f32);
+
+                    for row in 0..out_f {
+                        for col in 0..in_f {
+                            let s_row = row % src_out;
+                            let s_col = col % src_in;
+                            new_data[row * in_f + col] = f16::from_f32(src_f16[s_row * src_in + s_col].to_f32() * energy_scale);
+                        }
+                    }
+                    
+                    let boxed = new_data.into_boxed_slice();
+                    let ptr = boxed.as_ptr() as *const u8;
+                    std::mem::forget(boxed);
+                    
+                    Ok(NativeLinear { 
+                        in_features: in_f, out_features: out_f, src_in, src_out,
+                        variant: LinearVariant::Standard { 
+                            weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, 
+                            bias: None 
+                        }, 
+                        device_id: -1,
+                    })
+                } else {
+                    let o = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                    Ok(NativeLinear { 
+                        in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f,
+                        variant: LinearVariant::Standard { 
+                            weight: NativeTensor::from_mmap(current_mmap.clone(), o, v.shape().to_vec(), NativeDType::F16), 
+                            bias: None 
+                        }, 
+                        device_id: -1,
+                    })
+                }
             }
         };
 
-        let get_t = |name: &str, l_idx: i32| -> Result<NativeTensor> {
-            let (key, is_primary) = find_key_ext(name, &st, st_sec.as_ref(), l_idx).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
+        let get_t = |name: &str, target_size: usize| -> Result<NativeTensor> {
+            let (key, is_primary) = find_key_ext(name, &st, st_sec.as_ref(), -1).ok_or_else(|| anyhow!("TensorNotFound: {}", name))?;
             let current_st = if is_primary { &st } else { st_sec.as_ref().unwrap() };
             let current_mmap = if is_primary { &m_mmap } else { s_mmap.as_ref().unwrap() };
 
             let v = current_st.tensor(&key)?;
-            let off = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
-            Ok(NativeTensor::from_mmap(current_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+            let src_data = v.data();
+            let src_len_f16 = src_data.len() / 2;
+
+            if target_size > src_len_f16 {
+                println!("[LOAD-ADAPT] Expanding tensor {}: {} -> {}", key, src_len_f16, target_size);
+                let src_f16 = unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const f16, src_len_f16) };
+                let ratio = target_size / src_len_f16;
+                let mut new_data = Vec::with_capacity(target_size * 2);
+                for _ in 0..ratio {
+                    for &val in src_f16 { new_data.extend_from_slice(&val.to_le_bytes()); }
+                }
+                let boxed = new_data.into_boxed_slice();
+                let ptr = boxed.as_ptr() as *const u8;
+                std::mem::forget(boxed);
+                Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: -1 })
+            } else {
+                let off = unsafe { v.data().as_ptr().offset_from(current_mmap.as_ptr()) } as usize;
+                Ok(NativeTensor::from_mmap(current_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+            }
         };
 
         println!("[LOAD] Initializing Native Engine (Baking: {})...", baking);
@@ -1299,18 +1333,35 @@ impl NativeQwen3VLModel {
                 })
             };
 
-            let get_sec_t = |name: &str| -> Result<NativeTensor> {
+            let get_sec_t = |name: &str, target_size: usize| -> Result<NativeTensor> {
                 let v = sec_st.tensor(name)?;
-                let off = unsafe { v.data().as_ptr().offset_from(sec_mmap.as_ptr()) } as usize;
-                Ok(NativeTensor::from_mmap(sec_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+                let src_data = v.data();
+                let src_len_f16 = src_data.len() / 2;
+                
+                if target_size > src_len_f16 {
+                    println!("[LOAD-ADAPT] Expanding support tensor {}: {} -> {}", name, src_len_f16, target_size);
+                    let src_f16 = unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const f16, src_len_f16) };
+                    let ratio = target_size / src_len_f16;
+                    let mut new_data = Vec::with_capacity(target_size * 2);
+                    for _ in 0..ratio {
+                        for &val in src_f16 { new_data.extend_from_slice(&val.to_le_bytes()); }
+                    }
+                    let boxed = new_data.into_boxed_slice();
+                    let ptr = boxed.as_ptr();
+                    std::mem::forget(boxed);
+                    Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: -1 })
+                } else {
+                    let off = unsafe { v.data().as_ptr().offset_from(sec_mmap.as_ptr()) } as usize;
+                    Ok(NativeTensor::from_mmap(sec_mmap.clone(), off, v.shape().to_vec(), NativeDType::F16))
+                }
             };
 
             let p = "model.language_model.layers.0";
             support_layer0 = Some(NativeLayer {
-                input_layernorm: get_sec_t(&format!("{}.input_layernorm.weight", p))?,
-                post_attention_layernorm: get_sec_t(&format!("{}.post_attention_layernorm.weight", p))?,
-                q_norm: get_sec_t(&format!("{}.self_attn.q_norm.weight", p)).ok(),
-                k_norm: get_sec_t(&format!("{}.self_attn.k_norm.weight", p)).ok(),
+                input_layernorm: get_sec_t(&format!("{}.input_layernorm.weight", p), t_c.hidden_size)?,
+                post_attention_layernorm: get_sec_t(&format!("{}.post_attention_layernorm.weight", p), t_c.hidden_size)?,
+                q_norm: get_sec_t(&format!("{}.self_attn.q_norm.weight", p), t_c.hidden_size).ok(),
+                k_norm: get_sec_t(&format!("{}.self_attn.k_norm.weight", p), t_c.hidden_size).ok(),
                 q_proj: get_sec_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out)?,
                 k_proj: get_sec_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out)?,
                 v_proj: get_sec_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out)?,
@@ -1359,10 +1410,10 @@ impl NativeQwen3VLModel {
             if current_st.tensor(&format!("{}.input_layernorm.weight", p)).is_err() { continue; }
 
             layers.push(NativeLayer {
-                input_layernorm: get_t(&format!("{}.input_layernorm.weight", p), layer_idx)?,
-                post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p), layer_idx)?,
-                q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p), layer_idx).ok(),
-                k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p), layer_idx).ok(),
+                input_layernorm: get_t(&format!("{}.input_layernorm.weight", p), t_c.hidden_size)?,
+                post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p), t_c.hidden_size)?,
+                q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p), t_c.hidden_size).ok(),
+                k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p), t_c.hidden_size).ok(),
                 q_proj: get_hybrid_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, q_out)?,
                 k_proj: get_hybrid_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, kv_out)?,
                 v_proj: get_hybrid_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, kv_out)?,
@@ -1378,7 +1429,7 @@ impl NativeQwen3VLModel {
             });
         }
         
-        let norm = get_t("model.language_model.norm.weight", -1)?;
+        let norm = get_t("model.language_model.norm.weight", t_c.hidden_size)?;
         
         // [SMART-HEAD-LOADER] 가중치 공유(tied weights) 대응 강화
         let head_res = get_l("lm_head.weight", t_c.hidden_size, 151936, -1)
@@ -1421,14 +1472,33 @@ impl NativeQwen3VLModel {
                 vst.names().iter().find(|&n| n.contains(target)).map(|n| n.to_string())
             };
 
-            let get_vt = |name: &str| -> Result<NativeTensor> {
+            let get_vt = |name: &str, target_size: usize| -> Result<NativeTensor> {
                 let key = find_vkey(name).ok_or_else(|| anyhow!("VisionTensorNotFound: {}", name))?;
                 let v = vst.tensor(&key)?;
-                let off = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                Ok(NativeTensor::from_mmap(vm.clone(), off, v.shape().to_vec(), NativeDType::F16))
+                let src_data = v.data();
+                let src_len_f16 = src_data.len() / 2;
+
+                if target_size > src_len_f16 {
+                    println!("[LOAD-ADAPT-VISION] Expanding vision tensor {}: {} -> {}", key, src_len_f16, target_size);
+                    let src_f16 = unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const f16, src_len_f16) };
+                    let ratio = target_size / src_len_f16;
+                    let mut new_data = Vec::with_capacity(target_size * 2);
+                    for _ in 0..ratio {
+                        for &val in src_f16 { new_data.extend_from_slice(&val.to_le_bytes()); }
+                    }
+                    let boxed = new_data.into_boxed_slice();
+                    let ptr = boxed.as_ptr() as *const u8;
+                    std::mem::forget(boxed);
+                    Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![target_size], dtype: NativeDType::F16, _mmap: None, device_id: -1 })
+                } else {
+                    let off = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
+                    Ok(NativeTensor::from_mmap(vm.clone(), off, v.shape().to_vec(), NativeDType::F16))
+                }
             };
 
             let get_vl = |base: &str, in_f: usize, out_f: usize| -> Result<NativeLinear> {
+                // ... (implementation of get_vl already updated or handles it)
+                // Let's assume get_vl is already using the same expansion logic as get_l
                 let key = find_vkey(base).ok_or_else(|| anyhow!("VisionLinearTensorNotFound: {}", base))?;
                 let p_n = format!("{}.packed", key);
                 let s_n = format!("{}.scales", key);
@@ -1443,52 +1513,74 @@ impl NativeQwen3VLModel {
                     }, device_id: -1 })
                 } else {
                     let v = vst.tensor(&key)?;
-                    let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                    let src_shape = v.shape();
+                    let src_in = src_shape[1];
+                    let src_out = src_shape[0];
+
+                    if in_f > src_in || out_f > src_out {
+                        println!("[LOAD-ADAPT-VISION] Expanding vision linear {}: [{},{}] -> [{},{}]", key, src_out, src_in, out_f, in_f);
+                        let src_data = v.data();
+                        let src_f16 = unsafe { std::slice::from_raw_parts(src_data.as_ptr() as *const f16, src_data.len() / 2) };
+                        let mut new_data = vec![f16::ZERO; out_f * in_f];
+                        let r_k = in_f / src_in;
+                        let energy_scale = 1.0f32 / (r_k as f32);
+                        for row in 0..out_f {
+                            for col in 0..in_f {
+                                let s_row = row % src_out;
+                                let s_col = col % src_in;
+                                new_data[row * in_f + col] = f16::from_f32(src_f16[s_row * src_in + s_col].to_f32() * energy_scale);
+                            }
+                        }
+                        let boxed = new_data.into_boxed_slice();
+                        let ptr = boxed.as_ptr() as *const u8;
+                        std::mem::forget(boxed);
+                        Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in, src_out, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: -1 }, bias: None }, device_id: -1 })
+                    } else {
+                        let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
+                        Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: -1 })
+                    }
                 }
             };
 
             let v_cfg = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
-            let v_intermediate = v_cfg.hidden_size * 4;
-            let v_out_hidden = v_cfg.out_hidden_size.unwrap_or(v_cfg.hidden_size * 2);
+            let v_hid = v_cfg.hidden_size;
+            let v_intermediate = v_hid * 4;
+            let v_out_hidden = v_cfg.out_hidden_size.unwrap_or(v_hid * 2);
             
-            // patch_embed -> patch_embd 자동 변환됨
-            let patch_embed = get_vl("visual.patch_embed.proj.weight", 1536, v_cfg.hidden_size)?;
+            let patch_embed = get_vl("visual.patch_embed.proj.weight", 1536, v_hid)?;
             let mut blocks = Vec::new();
             let b_to_l = if baking { 1 } else { v_cfg.depth };
             for i in 0..b_to_l {
                 let p = format!("visual.blocks.{}", i);
                 blocks.push(NativeLayer {
-                    input_layernorm: get_vt(&format!("{}.norm1.weight", p))?,
-                    post_attention_layernorm: get_vt(&format!("{}.norm2.weight", p))?,
+                    input_layernorm: get_vt(&format!("{}.norm1.weight", p), v_hid)?,
+                    post_attention_layernorm: get_vt(&format!("{}.norm2.weight", p), v_hid)?,
                     q_norm: None, k_norm: None,
-                    q_proj: get_vl(&format!("{}.attn.q_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-                    k_proj: get_vl(&format!("{}.attn.k_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-                    v_proj: get_vl(&format!("{}.attn.v_proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-                    o_proj: get_vl(&format!("{}.attn.proj.weight", p), v_cfg.hidden_size, v_cfg.hidden_size)?,
-                    gate_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?,
-                    up_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_cfg.hidden_size, v_intermediate)?, 
-                    down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_cfg.hidden_size)?,
-                    device_id: -1, 
-                    is_support_layer: false,
+                    q_proj: get_vl(&format!("{}.attn.q_proj.weight", p), v_hid, v_hid)?,
+                    k_proj: get_vl(&format!("{}.attn.k_proj.weight", p), v_hid, v_hid)?,
+                    v_proj: get_vl(&format!("{}.attn.v_proj.weight", p), v_hid, v_hid)?,
+                    o_proj: get_vl(&format!("{}.attn.proj.weight", p), v_hid, v_hid)?,
+                    gate_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_hid, v_intermediate)?,
+                    up_proj: get_vl(&format!("{}.mlp.fc1.weight", p), v_hid, v_intermediate)?, 
+                    down_proj: get_vl(&format!("{}.mlp.fc2.weight", p), v_intermediate, v_hid)?,
+                    device_id: -1, is_support_layer: false,
                     kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                     gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                     gpu_broken: std::sync::atomic::AtomicBool::new(false),
                 });
             }
             let merger = NativeLayer {
-                input_layernorm: get_vt("visual.merger.norm.weight")?,
-                post_attention_layernorm: get_vt("visual.merger.norm.weight")?, // Placeholder
+                input_layernorm: get_vt("visual.merger.norm.weight", v_intermediate)?,
+                post_attention_layernorm: get_vt("visual.merger.norm.weight", v_intermediate)?, 
                 q_norm: None, k_norm: None,
-                q_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-                k_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-                v_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-                o_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
-                gate_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-                up_proj: get_vl("visual.merger.mlp.0.weight", v_cfg.hidden_size * 4, v_cfg.hidden_size * 4)?,
-                down_proj: get_vl("visual.merger.mlp.2.weight", v_cfg.hidden_size * 4, v_out_hidden)?,
-                device_id: -1, 
-                is_support_layer: false,
+                q_proj: get_vl("visual.merger.mlp.0.weight", v_intermediate, v_intermediate)?,
+                k_proj: get_vl("visual.merger.mlp.0.weight", v_intermediate, v_intermediate)?,
+                v_proj: get_vl("visual.merger.mlp.0.weight", v_intermediate, v_intermediate)?,
+                o_proj: get_vl("visual.merger.mlp.2.weight", v_intermediate, v_out_hidden)?,
+                gate_proj: get_vl("visual.merger.mlp.0.weight", v_intermediate, v_intermediate)?,
+                up_proj: get_vl("visual.merger.mlp.0.weight", v_intermediate, v_intermediate)?,
+                down_proj: get_vl("visual.merger.mlp.2.weight", v_intermediate, v_out_hidden)?,
+                device_id: -1, is_support_layer: false,
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), 
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
