@@ -101,7 +101,7 @@ impl NativeEmbeddingModel {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let use_b = i % 2 == 0;
-            let out_slice = layer.forward(cur_x, &cfg, 0, i, &[], &[], false, None, &mut *ws_guard, use_b);
+            let out_slice = layer.forward(cur_x, &cfg, 0, i, &[], &[], false, false, None, &mut *ws_guard, use_b);
             
             // Detach slice from mutable borrow
             unsafe {

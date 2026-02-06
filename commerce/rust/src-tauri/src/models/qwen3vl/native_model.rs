@@ -1112,7 +1112,7 @@ impl NativeVisionModel {
                 max_position_embeddings: 4096,
                 dtype: None,
                 rope_scaling: None,
-            }, 0, 0, rope_cos, rope_sin, false, global_scratch, workspace, use_b);
+            }, 0, 0, rope_cos, rope_sin, false, true, global_scratch, workspace, use_b);
             
             // Detach slice from mutable workspace borrow to allow next iteration
             cur_x = unsafe { std::slice::from_raw_parts(out_slice.as_ptr(), out_slice.len()) };
@@ -1133,7 +1133,7 @@ impl NativeVisionModel {
             max_position_embeddings: 4096,
             dtype: None,
             rope_scaling: None,
-        }, 0, 0, rope_cos, rope_sin, false, global_scratch, workspace, !last_use_b);
+        }, 0, 0, rope_cos, rope_sin, false, true, global_scratch, workspace, !last_use_b);
 
         merger_out
     }
