@@ -84,7 +84,7 @@ impl DynamicGpuKVCache {
     #[cfg(feature = "cuda")]
     pub fn grow(&mut self, needed_len: usize, n_kv: usize, head_dim: usize, device_id: i32) {
         if needed_len > self.capacity {
-            let new_cap = (needed_len + 255) / 256 * 256;
+            let new_cap = (needed_len + 127) / 128 * 128;
             let k_bytes = new_cap * n_kv * (head_dim/32) * 4;
             let v_bytes = new_cap * n_kv * head_dim * 2;
             unsafe {
@@ -244,8 +244,8 @@ impl NativeLinear {
     }
     #[cfg(feature = "cuda")]
     fn ensure_gpu_buffers_ext(&self, m: usize, si: &std::sync::Mutex<Option<(GpuPtr, usize)>>, so: &std::sync::Mutex<Option<(GpuPtr, usize)>>, sr: &std::sync::Mutex<Option<(GpuPtr, usize)>>) -> (CUdeviceptr, CUdeviceptr, CUdeviceptr) {
-        let req_i = (m * self.in_features * 4 * 125) / 100; let req_o = (m * self.out_features * 4 * 125) / 100;
-        let req_r = (m * self.in_features.max(self.out_features) * 4 * 125) / 100;
+        let req_i = (m * self.in_features * 4 * 110) / 100; let req_o = (m * self.out_features * 4 * 110) / 100;
+        let req_r = (m * self.in_features.max(self.out_features) * 4 * 110) / 100;
         let cl = unsafe { crate::models::qwen3vl::native_backend::lib() };
         unsafe {
             let mut ctx = std::ptr::null_mut() as cudarc::driver::sys::CUcontext;
