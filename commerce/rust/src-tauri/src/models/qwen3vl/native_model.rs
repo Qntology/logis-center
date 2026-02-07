@@ -524,7 +524,7 @@ impl NativeQwen3TextModel {
         { let mut rg = self.rope_cache.lock().unwrap(); rg.ensure_length(s_o + q_len); }
         let rg_lock = self.rope_cache.lock().unwrap(); let r_cos = &rg_lock.cos; let r_sin = &rg_lock.sin;
         for (i, layer) in self.layers.iter().enumerate() {
-            let active = if i == 0 && sl.is_some() { sl.unwrap() } else { layer };
+            let active = layer;
             let use_b = i % 2 == 0;
             let out = active.forward(cur_x, &self.config, s_o, i, r_cos, r_sin, is_baking, is_vision, gs, ws, use_b);
             cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
@@ -848,7 +848,8 @@ impl NativeQwen3VLModel {
                 for (i, &id) in i_ids.iter().enumerate() { if id == 151655 && vidx < (vf.len()/hid) { embeds[i*hid..(i+1) * hid].copy_from_slice(&vf[vidx*hid..(vidx+1)*hid]); vidx += 1; } }
             }
         }
-        let sl = if is_baking || self.support_layer0.is_some() { self.support_layer0.as_ref() } else { None };
+        // [FIX] Disable support_layer0 for inference. 2B model should use its own Layer 0 with the stitched KV.
+        let sl = None; 
         let nx = self.text_model.forward_ext(i_ids, embeds, so, sc, Some(&mut wl), sl, is_vision);
         self.lm_head.forward(&nx, sc)
     }
