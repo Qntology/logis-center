@@ -519,56 +519,52 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
-    /// [PARALLEL] Context-aware splitting - Save to specific path with VRAM safety
-    pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
-        use rayon::prelude::*;
-
-        println!("[BAKE-PARALLEL] Starting high-speed parallel baking for {:?} (Offset: {})", final_path, initial_offset);
-        
+    /// [SHARDED-BAKING] Context-aware splitting - Save to multiple shards for VRAM safety
+    pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, _suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
         let all_ids = self.tokenizer.text_encode_vec(text, false)?;
         let total_tokens = all_ids.len();
-        let chunk_size = self.max_chunk_size;
+        let chunk_size = self.max_chunk_size; // 512
+        let shard_size = 2048; // [NEW] Save a new safetensors file every 2048 tokens
         
-        // 1. Pre-allocate everything once (Silent expansion)
-        {
-            let ModelVariant::Native(m) = &self.qwen3_vl;
-            let needed_total = initial_offset + total_tokens;
-            
-            let mut rope_guard = m.text_model.rope_cache.lock().unwrap();
-            rope_guard.ensure_length(needed_total);
-            
-            for layer in &m.text_model.layers {
-                let mut gpu_cache = layer.gpu_kv_cache.lock().unwrap();
-                gpu_cache.grow(needed_total, m.text_model.config.num_key_value_heads, m.text_model.config.head_dim, layer.device_id);
-            }
-        }
+        let mut current_shard_tokens = Vec::new();
+        let mut shard_count = 0;
+        let base_dir = final_path.parent().unwrap();
+        let base_name = final_path.file_stem().unwrap().to_str().unwrap();
 
-        // 2. Process in sequential chunks
-        // [OPTIMIZATION] On limited GPUs (4GB), sequential execution is faster than 
-        // oversaturating the GPU queue with dozens of parallel requests.
-        let chunks: Vec<_> = all_ids.chunks(chunk_size).enumerate().collect();
+        println!("[BAKE-SHARDED] Starting sharded baking. Total: {} tokens", total_tokens);
 
-        for (chunk_idx, chunk) in chunks {
+        for (chunk_idx, chunk) in all_ids.chunks(chunk_size).enumerate() {
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
             }
 
             let current_chunk_offset = initial_offset + (chunk_idx * chunk_size);
             self.qwen3_vl.forward(chunk, None, None, current_chunk_offset);
+            current_shard_tokens.extend_from_slice(chunk);
+
+            // [SHARD-SAVE] Every 2048 tokens, or at the very end
+            if current_shard_tokens.len() >= shard_size || (chunk_idx + 1) * chunk_size >= total_tokens {
+                let shard_path = base_dir.join(format!("{}_shard{}.safetensors", base_name, shard_count));
+                
+                // Save the current KV state for this shard
+                // Note: save_kv_to_disk needs to be modified or we use a temporary offset
+                let tail_64 = if current_shard_tokens.len() > 64 { &current_shard_tokens[current_shard_tokens.len()-64..] } else { &current_shard_tokens };
+                
+                // We save only the NEWLY generated KV since the last shard
+                let start_idx = shard_count * shard_size;
+                self.save_kv_to_disk(&shard_path, start_idx, tail_64)?;
+                
+                println!("[BAKE-SHARD] Saved shard {} ({} tokens) to {:?}", shard_count, current_shard_tokens.len(), shard_path);
+                
+                shard_count += 1;
+                current_shard_tokens.clear();
+            }
             
             println!("[BAKE-PROGRESS] Chunk {}/{}", chunk_idx + 1, (total_tokens + chunk_size - 1) / chunk_size);
         }
 
-        if let Some(flag) = &cancel_flag {
-            if flag.load(Ordering::Relaxed) { return Err(anyhow!("Baking Cancelled")); }
-        }
-
-        // 3. Final Save: Extract the COMPLETE KV state
-        let tail_tokens = if all_ids.len() > 64 { &all_ids[all_ids.len()-64..] } else { &all_ids };
-        self.save_kv_to_disk(final_path, initial_offset, tail_tokens)?;
-        
         self.clear_kv_cache();
-        println!("[BAKE-PARALLEL] SUCCESS: Context saved to {:?}", final_path);
+        println!("[BAKE-SHARDED] SUCCESS: All shards saved to {:?}", base_dir);
         Ok(())
     }
 
