@@ -637,14 +637,14 @@ impl NativeVisionModel {
             let use_b = i % 2 != 0;
             let out = block.forward(cur_x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
                 hidden_size: self.patch_embed.out_features, intermediate_size: block.gate_proj.out_features, num_hidden_layers: 1, num_attention_heads: 16, num_key_value_heads: 16,
-                head_dim: self.patch_embed.out_features / 16, rms_norm_eps: 1e-6, rope_theta: 10000.0, vocab_size: 0, max_position_embeddings: config.max_position_embeddings, dtype: None, rope_scaling: None,
+                head_dim: self.patch_embed.out_features / 16, rms_norm_eps: 1e-6, rope_theta: 10000.0, vocab_size: 0, max_position_embeddings: 32768, dtype: None, rope_scaling: None,
             }, 0, 0, rc, rs, false, true, gs, ws, use_b, rope_cache_gpu);
             cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
         }
         let last_b = self.blocks.len() % 2 != 0;
         self.merger.forward(cur_x, &crate::models::qwen3vl::config::Qwen3VLTextConfig {
             hidden_size: cur_x.len() / patches, intermediate_size: cur_x.len() / patches, num_hidden_layers: 1, num_attention_heads: 1, num_key_value_heads: 1,
-            head_dim: cur_x.len() / patches, rms_norm_eps: 1e-6, rope_theta: 10000.0, vocab_size: 0, max_position_embeddings: config.max_position_embeddings, dtype: None, rope_scaling: None,
+            head_dim: cur_x.len() / patches, rms_norm_eps: 1e-6, rope_theta: 10000.0, vocab_size: 0, max_position_embeddings: 32768, dtype: None, rope_scaling: None,
         }, 0, 0, rc, rs, false, true, gs, ws, !last_b, rope_cache_gpu)
     }
 }
