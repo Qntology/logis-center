@@ -779,6 +779,33 @@ impl Qwen3VLGenerateModel {
                                 k_data = new_k; v_data = new_v;
                             }
                             
+                            // [2026-LOGIC-RESCUE] Hierarchical Adaptive Decay (1/L) with L2 Normalization
+                            // We normalize the energy of each token to prevent 'exploding attention' from noisy 0.6B features.
+                            if l_idx != src_idx {
+                                let factor = 1.0 / (l_idx as f32 + 1.0);
+                                
+                                // Process per token (unit of 'target_dim')
+                                if target_dim > 0 {
+                                    for token_chunk in v_data.chunks_exact_mut(target_dim) {
+                                        // 1. Calculate L2 Norm
+                                        let mut sum_sq = 0.0f32;
+                                        for &val in token_chunk.iter() {
+                                            let v_f32 = val.to_f32();
+                                            sum_sq += v_f32 * v_f32;
+                                        }
+                                        let norm = sum_sq.sqrt();
+                                        
+                                        // 2. Normalize and Apply Decay Factor
+                                        let scale = if norm > 1e-6 { factor / norm } else { factor };
+                                        let scale_f16 = f16::from_f32(scale);
+                                        
+                                        for val in token_chunk.iter_mut() {
+                                            *val = *val * scale_f16;
+                                        }
+                                    }
+                                }
+                            }
+
                             // Append to target layer's cache (allowing multiple components to stack)
                             let mut cache_guard = m.text_model.layers[l_idx].kv_cache.lock().unwrap();
                             cache_guard.k.extend(k_data); 

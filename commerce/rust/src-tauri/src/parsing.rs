@@ -333,6 +333,11 @@ Based on the PREVIOUSLY RECORDED Pug template content, identify the primary cate
 [INSTRUCTION]
 You have already received the page data in chunks. Analyze the entire history and determine the page type. 
 
+[COGNITIVE OVERRIDE]
+The background context may contain noisy or irrelevant signals. 
+IGNORE any distinct patterns from the background context style. 
+FOCUS strictly on the schema and logic provided below.
+
 [SCHEMA DEFINITIONS]
 - type: The main category of the page content. Must be one of:
   - 'order': Order history, order details, checkout success.
@@ -356,6 +361,10 @@ Based on the PREVIOUSLY RECORDED history, identify the structural CSS1 selectors
 
 [INSTRUCTION]
 Analyze the page structure you have already learned and find the repeating patterns.
+
+[COGNITIVE OVERRIDE]
+The background context may contain noisy signals. 
+IGNORE context style and focus ONLY on structural patterns.
 
 [SCHEMA DEFINITIONS]
 - item: Common CSS1 selector for sibling items (e.g., `tr`, `li`). Match recurring patterns and exclude header, footer, ads, and pagination.
@@ -876,6 +885,10 @@ Extract detailed information from the provided Pug template into a single struct
 Page Type: {TYPE}
 Source URL: {HREF}
 
+[COGNITIVE OVERRIDE]
+The background context may contain noisy signals. 
+IGNORE context style and focus ONLY on the SCHEMA below.
+
 [SCHEMA DEFINITIONS]
 {SCHEMA}
 
@@ -930,6 +943,10 @@ Extract a list of items from the provided Pug snippets into a JSON object matchi
 [CONTEXT]
 Category: {TYPE}
 Language: {LANGUAGE}
+
+[COGNITIVE OVERRIDE]
+The background context may contain noisy signals. 
+IGNORE context style and focus ONLY on the SCHEMA below.
 
 [SCHEMA DEFINITIONS]
 {SCHEMA}
