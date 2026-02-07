@@ -671,7 +671,16 @@ impl NativeQwen3VLModel {
                 let vp = cst.tensor(&pn)?; let vs = cst.tensor(&sn)?; let shid = (vp.data().len()/4*32)/vocab;
                 let pr = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) };
                 let sr = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) };
-                let dq = dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid);
+                let dq = dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid); // Note: dequantize usually returns flattened [vocab * target_k] if we pass thid?
+                // Wait, dequantize_bit_serial_to_f16 signature is (packed, scales, n, src_k, target_k).
+                // It already has logic to expand 'ratio' inside! Let's verify 'dequantize_bit_serial_to_f16'.
+                
+                // [VERIFICATION] The 'dequantize_bit_serial_to_f16' function ALREADY implements the repeat logic:
+                // "let ratio = if target_k > src_k { target_k / src_k } else { 1 }; ... for r in 0..ratio ..."
+                // So we just need to ensure we pass 'thid' as target_k.
+                // The current call is: dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid);
+                // So it should be correct!
+                
                 let mut dst = Vec::with_capacity(dq.len()*2); for v in dq { dst.extend_from_slice(&v.to_le_bytes()); }
                 let boxed = dst.into_boxed_slice(); let ptr = boxed.as_ptr(); 
                 let h_size = vocab * thid * 2;
@@ -701,29 +710,87 @@ impl NativeQwen3VLModel {
                 let pu = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) };
                 let sf = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) };
                 
-                let mut np = vec![0u32; (to/8)*(ti/32)*8]; let mut ns = vec![f16::ZERO; (to/8)*(ti/32)*8];
-                let es = f16::from_f32(1.0/((ti as f32 / si as f32).max(1.0)));
+                // [HYBRID-UPSCALING] Repeat weights if target dims are larger (e.g. 0.6B -> 2B)
+                let ratio_i = if ti > si { ti / si } else { 1 };
+                let ratio_o = if to > so { to / so } else { 1 };
                 
-                let src_k_blocks = si / 32;
-                let dst_k_blocks = ti / 32;
+                if ratio_i > 1 || ratio_o > 1 {
+                    println!("[HYBRID-LOAD] Upscaling layer {} from {}x{} to {}x{} (Repeat: {}x{})", base, so, si, to, ti, ratio_o, ratio_i);
+                    let mut np = vec![0u32; (to/8)*(ti/32)*8]; 
+                    let mut ns = vec![f16::ZERO; (to/8)*(ti/32)*8];
+                    
+                    let src_k_blocks = si / 32;
+                    let dst_k_blocks = ti / 32;
+                    let src_n_blocks = so / 8;
+                    let dst_n_blocks = to / 8;
 
-                for no in 0..(to/8) { 
-                    for ko in 0..dst_k_blocks { 
-                        for sn in 0..8 {
-                            let s_idx = ((no % (so/8)) * src_k_blocks + (ko % src_k_blocks)) * 8 + sn; 
-                            let d_idx = (no * dst_k_blocks + ko) * 8 + sn;
-                            if s_idx < pu.len() {
-                                np[d_idx] = pu[s_idx]; ns[d_idx] = sf[s_idx] * es;
-                            }
+                    for no in 0..dst_n_blocks { 
+                        let src_no = no % src_n_blocks;
+                        for ko in 0..dst_k_blocks { 
+                            let src_ko = ko % src_k_blocks;
+                            
+                            // Copy 8-row block
+                            for sn in 0..8 {
+                                let s_idx = (src_no * src_k_blocks + src_ko) * 8 + sn; 
+                                let d_idx = (no * dst_k_blocks + ko) * 8 + sn;
+                                if s_idx < pu.len() {
+                                    np[d_idx] = pu[s_idx]; 
+                                    // Scale adjustment might be needed if norm distribution changes, 
+                                    // but for direct repetition, keeping scale is usually safer for signal magnitude preservation.
+                                    ns[d_idx] = sf[s_idx]; 
+                                }
+                            } 
                         } 
-                    } 
+                    }
+                    
+                    let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
+                    let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
+                    let h_size_packed = (to/8)*(ti/32)*8 * 4;
+                    let h_size_scales = (to/8)*(ti/32)*8 * 2;
+                    std::mem::forget(pb); std::mem::forget(sb);
+                    
+                    Ok(NativeLinear { 
+                        in_features: ti, out_features: to, src_in: ti, src_out: to, // It is now upscaled
+                        variant: LinearVariant::BitSerial { 
+                            weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, 
+                            scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, 
+                            bias: None 
+                        }, 
+                        device_id: active_gpu_id 
+                    })
+                } else {
+                    // Standard load logic (No upscale needed)
+                    // ... (Original logic for direct mmap if dims match)
+                    // Actually, if we are loading from secondary, we might want to ensure it's loaded into RAM if we can't mmap easily with different strides.
+                    // But if sizes match, we can try to use the mmap slice if contiguous?
+                    // The original code tried to construct new vectors anyway for layout shuffling logic in 'get_sec_l' 
+                    // Wait, the original code ALREADY constructed new vectors: "let mut np = vec![...]"
+                    // So we just stick with that logic but without the ratio loop if ratio is 1.
+                    
+                    let mut np = vec![0u32; (to/8)*(ti/32)*8]; let mut ns = vec![f16::ZERO; (to/8)*(ti/32)*8];
+                    let es = f16::from_f32(1.0/((ti as f32 / si as f32).max(1.0)));
+                    
+                    let src_k_blocks = si / 32;
+                    let dst_k_blocks = ti / 32;
+
+                    for no in 0..(to/8) { 
+                        for ko in 0..dst_k_blocks { 
+                            for sn in 0..8 {
+                                let s_idx = ((no % (so/8)) * src_k_blocks + (ko % src_k_blocks)) * 8 + sn; 
+                                let d_idx = (no * dst_k_blocks + ko) * 8 + sn;
+                                if s_idx < pu.len() {
+                                    np[d_idx] = pu[s_idx]; ns[d_idx] = sf[s_idx] * es;
+                                }
+                            } 
+                        } 
+                    }
+                    let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
+                    let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
+                    let h_size_packed = (to/8)*(ti/32)*8 * 4;
+                    let h_size_scales = (to/8)*(ti/32)*8 * 2;
+                    std::mem::forget(pb); std::mem::forget(sb);
+                    Ok(NativeLinear { in_features: ti, out_features: to, src_in: si, src_out: so, variant: LinearVariant::BitSerial { weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
                 }
-                let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
-                let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
-                let h_size_packed = (to/8)*(ti/32)*8 * 4;
-                let h_size_scales = (to/8)*(ti/32)*8 * 2;
-                std::mem::forget(pb); std::mem::forget(sb);
-                Ok(NativeLinear { in_features: ti, out_features: to, src_in: si, src_out: so, variant: LinearVariant::BitSerial { weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
             };
             let get_sec_t = |name: &str, ts: usize| -> Result<NativeTensor> {
                 let v = sec_st.tensor(name)?; let sd = v.data(); let sl = sd.len()/2;

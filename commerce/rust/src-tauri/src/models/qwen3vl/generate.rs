@@ -140,16 +140,26 @@ impl Qwen3VLGenerateModel {
         } else { None };
 
         let secondary_mmap = if !baking_only {
-            // Inference 모드일 때, Small 모델의 Layer 0를 서포트용으로 로드
+            // [HYBRID-LOAD] Load 0.6B Layer 0 file to fill missing parts (Embed, Layer 0) in 2B model.
+            // native_model.rs will handle the dimension upscaling (Repeat 1024 -> 2048).
             let base_models_path = path_obj.parent().unwrap();
-            let small_path = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-BITSERIAL_LAYER0.safetensors");
-            if small_path.exists() {
-                println!("[HYBRID] Loading 0.6B Layer 0 support for 2B model...");
-                let small_file = std::fs::File::open(small_path)?;
-                Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&small_file)? }))
-            } else { None }
+            // Assuming 0.6B model is in a parallel directory named "Qwen3-0.6B-Instruct-gguf"
+            // or in the same directory depending on user setup. Let's try same directory first, then sibling.
+            let local_l0 = path_obj.join("model-BITSERIAL_LAYER0.safetensors");
+            if local_l0.exists() {
+                 println!("[HYBRID] Loading local Layer 0 file: {:?}", local_l0);
+                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(local_l0)?)? }))
+            } else {
+                let sibling_l0 = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-BITSERIAL_LAYER0.safetensors");
+                if sibling_l0.exists() {
+                    println!("[HYBRID] Loading sibling 0.6B Layer 0 file: {:?}", sibling_l0);
+                    Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(sibling_l0)?)? }))
+                } else {
+                    println!("[HYBRID] WARNING: Layer 0 source file not found. Model may crash if embeddings are missing.");
+                    None
+                }
+            }
         } else {
-            // [FIX] Baking 모드일 때는 서포트 레이어 로드 안함 (순수 0.6B 엔진 사용)
             None
         };
 
