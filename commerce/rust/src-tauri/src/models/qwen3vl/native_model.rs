@@ -943,7 +943,7 @@ impl NativeQwen3VLModel {
         } else { None };
         Ok(Self {
             config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, t_c.rope_theta, 4096)) },
-            lm_head: h_res, visual, support_layer0, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
+            lm_head, visual, support_layer0, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
         })
     }
     pub fn forward(&self, i_ids: &[u32], pv: Option<&[f16]>, gt: Option<&[u32; 3]>, so: usize) -> Vec<f16> {
