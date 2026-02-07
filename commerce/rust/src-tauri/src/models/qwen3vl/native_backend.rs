@@ -151,6 +151,7 @@ pub enum NativeDType { F32, F16, BF16, U32 }
 #[derive(Clone)]
 pub struct NativeTensor {
     pub data_ptr: *const u8,
+    pub host_size: usize, // [STABILITY] Track host buffer size for validation
     pub gpu_ptr: Option<GpuPtr>, 
     pub shape: Vec<usize>,
     pub dtype: NativeDType,
@@ -163,7 +164,12 @@ unsafe impl Sync for NativeTensor {}
 
 impl NativeTensor {
     pub fn from_mmap(mmap: Arc<Mmap>, offset: usize, shape: Vec<usize>, dtype: NativeDType) -> Self {
-        unsafe { let data_ptr = mmap.as_ptr().add(offset); Self { data_ptr, gpu_ptr: None, shape, dtype, _mmap: Some(mmap), device_id: -1 } }
+        let size_raw = shape.iter().product::<usize>();
+        let host_size = size_raw * if dtype == NativeDType::U32 || dtype == NativeDType::F32 { 4 } else { 2 };
+        unsafe { 
+            let data_ptr = mmap.as_ptr().add(offset); 
+            Self { data_ptr, host_size, gpu_ptr: None, shape, dtype, _mmap: Some(mmap), device_id: -1 } 
+        }
     }
 
     pub fn get_slice<T: Clone>(&self) -> std::borrow::Cow<'_, [T]> {
@@ -189,32 +195,40 @@ impl NativeTensor {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn move_to_gpu(&mut self, device_id: i32) {
-        if self.gpu_ptr.is_some() { return; }
+    pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> {
+        if self.gpu_ptr.is_some() { return Ok(()); }
         unsafe {
             let cuda_lib = lib();
             let mut ctx = std::ptr::null_mut() as CUcontext;
             cuda_lib.cuCtxGetCurrent(&mut ctx);
             if ctx == std::ptr::null_mut() {
                 let mut dev = 0 as CUdevice;
-                cuda_lib.cuDeviceGet(&mut dev, device_id);
+                if cuda_lib.cuDeviceGet(&mut dev, device_id) as i32 != 0 {
+                    return Err(anyhow::anyhow!("Failed to get CUDA device {}", device_id));
+                }
                 cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
                 cuda_lib.cuCtxSetCurrent(ctx);
             }
             let size_raw = self.shape.iter().product::<usize>();
             let size_bytes = size_raw * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
-            // println!("[GPU-ALLOC] Allocating {} bytes for tensor (Ptr: {:p})", size_bytes, self.data_ptr);
+            
+            // [CRITICAL] Validation: Ensure we are not reading past host memory
+            if size_bytes > self.host_size {
+                return Err(anyhow::anyhow!("Tensor shape exceeds host buffer size! ({} > {})", size_bytes, self.host_size));
+            }
+
             let mut ptr: CUdeviceptr = 0;
             if (cuda_lib.cuMemAlloc_v2(&mut ptr, size_bytes) as i32) == 0 && ptr != 0 {
                 if (cuda_lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size_bytes) as i32) == 0 {
                     self.gpu_ptr = Some(GpuPtr(ptr as *mut _));
                     self.device_id = device_id;
+                    Ok(())
                 } else { 
-                    println!("[GPU-ERROR] Memcpy failed for tensor (Ptr: {:p}, Size: {})", self.data_ptr, size_bytes);
                     let _ = cuda_lib.cuMemFree_v2(ptr); 
+                    Err(anyhow::anyhow!("Memcpy failed for tensor size {}", size_bytes))
                 }
             } else {
-                println!("[GPU-ERROR] MemAlloc failed for size {}", size_bytes);
+                Err(anyhow::anyhow!("MemAlloc failed for size {}", size_bytes))
             }
         }
     }

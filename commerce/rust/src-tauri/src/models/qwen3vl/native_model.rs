@@ -255,12 +255,20 @@ impl NativeLinear {
         };
         (di, dog, drg)
     }
-    pub fn move_to_gpu(&mut self, device_id: i32) {
+    pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> {
         self.device_id = device_id;
         match &mut self.variant {
-            LinearVariant::Standard { weight, bias } => { weight.move_to_gpu(device_id); if let Some(b) = bias { b.move_to_gpu(device_id); } },
-            LinearVariant::BitSerial { weight_packed, scales, bias } => { weight_packed.move_to_gpu(device_id); scales.move_to_gpu(device_id); if let Some(b) = bias { b.move_to_gpu(device_id); } }
+            LinearVariant::Standard { weight, bias } => { 
+                weight.move_to_gpu(device_id)?; 
+                if let Some(b) = bias { b.move_to_gpu(device_id)?; } 
+            },
+            LinearVariant::BitSerial { weight_packed, scales, bias } => { 
+                weight_packed.move_to_gpu(device_id)?; 
+                scales.move_to_gpu(device_id)?; 
+                if let Some(b) = bias { b.move_to_gpu(device_id)?; } 
+            }
         }
+        Ok(())
     }
 }
 
@@ -279,29 +287,20 @@ unsafe impl Send for NativeLayer {}
 unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
-    pub fn move_to_gpu(&mut self, device_id: i32) {
+    pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> {
         self.device_id = device_id;
-        println!("[GPU-MOVE] Layer moving... input_layernorm");
-        self.input_layernorm.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer moving... post_attention_layernorm");
-        self.post_attention_layernorm.move_to_gpu(device_id);
-        if let Some(ref mut qn) = self.q_norm { println!("[GPU-MOVE] Layer moving... q_norm"); qn.move_to_gpu(device_id); }
-        if let Some(ref mut kn) = self.k_norm { println!("[GPU-MOVE] Layer moving... k_norm"); kn.move_to_gpu(device_id); }
-        println!("[GPU-MOVE] Layer moving... q_proj");
-        self.q_proj.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer moving... k_proj");
-        self.k_proj.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer moving... v_proj");
-        self.v_proj.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer moving... o_proj");
-        self.o_proj.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer moving... gate_proj");
-        self.gate_proj.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer moving... up_proj");
-        self.up_proj.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer moving... down_proj");
-        self.down_proj.move_to_gpu(device_id);
-        println!("[GPU-MOVE] Layer move complete");
+        self.input_layernorm.move_to_gpu(device_id)?;
+        self.post_attention_layernorm.move_to_gpu(device_id)?;
+        if let Some(ref mut qn) = self.q_norm { qn.move_to_gpu(device_id)?; }
+        if let Some(ref mut kn) = self.k_norm { kn.move_to_gpu(device_id)?; }
+        self.q_proj.move_to_gpu(device_id)?;
+        self.k_proj.move_to_gpu(device_id)?;
+        self.v_proj.move_to_gpu(device_id)?;
+        self.o_proj.move_to_gpu(device_id)?;
+        self.gate_proj.move_to_gpu(device_id)?;
+        self.up_proj.move_to_gpu(device_id)?;
+        self.down_proj.move_to_gpu(device_id)?;
+        Ok(())
     }
 
     pub fn forward<'a>(
@@ -533,7 +532,12 @@ impl NativeQwen3TextModel {
         let mut cn = vec![eps; cur_x.len()]; native_rms_norm_f16_into(cur_x, n_cow.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
         cn
     }
-    pub fn move_to_gpu(&mut self, device_id: i32) { self.embed_tokens.move_to_gpu(device_id); self.norm.move_to_gpu(device_id); for layer in &mut self.layers { layer.move_to_gpu(device_id); } }
+    pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> { 
+        self.embed_tokens.move_to_gpu(device_id)?; 
+        self.norm.move_to_gpu(device_id)?; 
+        for layer in &mut self.layers { layer.move_to_gpu(device_id)?; } 
+        Ok(())
+    }
     pub fn clear_kv_cache(&self) { for layer in &self.layers { layer.clear_kv_cache(); } }
     pub fn force_free_kv_cache(&self) { for layer in &self.layers { layer.force_free_kv_cache(); } }
     pub fn batch_upload_stitched_cache(&self, k: Vec<u32>, v: Vec<f16>) {
@@ -570,7 +574,12 @@ unsafe impl Send for NativeVisionModel {}
 unsafe impl Sync for NativeVisionModel {}
 
 impl NativeVisionModel {
-    pub fn move_to_gpu(&mut self, dev: i32) { self.patch_embed.move_to_gpu(dev); for b in &mut self.blocks { b.move_to_gpu(dev); } self.merger.move_to_gpu(dev); }
+    pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { 
+        self.patch_embed.move_to_gpu(dev)?; 
+        for b in &mut self.blocks { b.move_to_gpu(dev)?; } 
+        self.merger.move_to_gpu(dev)?;
+        Ok(())
+    }
     pub fn forward<'a>(&self, pv: &[f16], gt: &[u32; 3], rc: &[f16], rs: &[f16], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>, ws: &'a mut ForwardWorkspace) -> &'a [f16] {
         let patches = (gt[1] * gt[2]) as usize; let eo = self.patch_embed.forward(pv, gs); ws.hidden_a[..eo.len()].copy_from_slice(&eo);
         let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), eo.len()) };
@@ -591,12 +600,14 @@ impl NativeVisionModel {
 }
 
 impl NativeQwen3VLModel {
-    pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>) -> Result<Self> {
-        let mut active_gpu_id = -1;
+    pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>, device_id: i32) -> Result<Self> {
+        let mut active_gpu_id = device_id;
         #[cfg(feature = "cuda")]
         unsafe {
-            let cl = crate::models::qwen3vl::native_backend::lib(); let mut c = 0;
-            if (cl.cuInit(0) as i32) == 0 && (cl.cuDeviceGetCount(&mut c) as i32) == 0 && c > 0 { active_gpu_id = 0; println!("[LOAD] GPU detected at index 0."); }
+            let cl = crate::models::qwen3vl::native_backend::lib();
+            if active_gpu_id >= 0 {
+                println!("[LOAD] Using GPU-{} as requested.", active_gpu_id);
+            }
         }
         let st = SafeTensors::deserialize(&m_mmap)?; let st_sec = s_mmap.as_ref().map(|m| SafeTensors::deserialize(m)).transpose()?;
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
@@ -823,10 +834,15 @@ impl NativeQwen3VLModel {
         let nx = self.text_model.forward_ext(i_ids, embeds, so, sc, Some(&mut wl), sl, is_vision);
         self.lm_head.forward(&nx, sc)
     }
-    pub fn move_to_gpu(&mut self, dev: i32) {
-        self.text_model.move_to_gpu(dev); self.lm_head.move_to_gpu(dev);
-        if let Some(ref mut v) = self.visual { v.move_to_gpu(dev); }
-        if let Some(ref mut l0) = self.support_layer0 { l0.move_to_gpu(dev); println!("[LOAD] Hybrid Support Layer 0 moved to GPU-{}", dev); }
+    pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> {
+        self.text_model.move_to_gpu(dev)?; 
+        self.lm_head.move_to_gpu(dev)?;
+        if let Some(ref mut v) = self.visual { v.move_to_gpu(dev)?; }
+        if let Some(ref mut l0) = self.support_layer0 { 
+            l0.move_to_gpu(dev)?; 
+            println!("[LOAD] Hybrid Support Layer 0 moved to GPU-{}", dev); 
+        }
+        Ok(())
     }
     pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
     pub fn force_free_kv_cache(&self) { 

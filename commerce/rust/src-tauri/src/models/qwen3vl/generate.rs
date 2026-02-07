@@ -153,7 +153,7 @@ impl Qwen3VLGenerateModel {
             None
         };
 
-        let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only, secondary_mmap)?;
+        let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only, secondary_mmap, _text_device_id as i32)?;
         let mut qwen3_vl_native = Arc::new(native_model);
 
         // [ADAPTIVE-CHUNKING] Determine optimal chunk size based on VRAM
@@ -177,8 +177,11 @@ impl Qwen3VLGenerateModel {
         if _text_device_id < 8 { 
             println!("[DIAG] Attempting GPU offload to device index: {}", _text_device_id);
             if let Some(m) = Arc::get_mut(&mut qwen3_vl_native) {
-                println!("[DIAG] Arc::get_mut success. Calling move_to_gpu.");
-                m.move_to_gpu(_text_device_id as i32);
+                if let Err(e) = m.move_to_gpu(_text_device_id as i32) {
+                    println!("[GPU-FALLBACK] Offload failed: {}. Continuing in CPU mode.", e);
+                } else {
+                    println!("[DIAG] GPU offload successful.");
+                }
             } else {
                 println!("[DIAG] Arc::get_mut FAILED. Another reference exists. GPU offload SKIPPED!");
             }
