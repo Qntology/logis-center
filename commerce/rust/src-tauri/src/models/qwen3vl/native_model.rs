@@ -972,7 +972,8 @@ impl NativeQwen3VLModel {
                 for path in &sorted_paths {
                     let file = std::fs::File::open(path)?;
                     let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
-                    let st = SafeTensors::deserialize(&mmap)?;
+                    let mmap_cloned = mmap.clone();
+                    let st = SafeTensors::deserialize(&mmap_cloned)?;
                     
                     let tokens = if let Ok(meta_tensor) = st.tensor("metadata.tokens") {
                         meta_tensor.shape()[0]
@@ -1005,8 +1006,8 @@ impl NativeQwen3VLModel {
                     let mut gpu_kv = layer.gpu_kv_cache.lock().unwrap();
                     
                     #[cfg(feature = "cuda")]
-                    if self.device_id >= 0 {
-                        gpu_kv.grow(total_tokens, n_kv, h_d, self.device_id);
+                    if self.lm_head.device_id >= 0 {
+                        gpu_kv.grow(total_tokens, n_kv, h_d, self.lm_head.device_id);
                     }
                     
                     let mut current_offset = 0;
@@ -1030,7 +1031,7 @@ impl NativeQwen3VLModel {
                             let actual_source_dim = if vt.shape().len() >= 2 { vt.shape()[1] } else { 1024 };
                             
                             #[cfg(feature = "cuda")]
-                            if self.device_id >= 0 {
+                            if self.lm_head.device_id >= 0 {
                                 unsafe {
                                     let cl = crate::models::qwen3vl::native_backend::lib();
                                     if let Some(kp) = gpu_kv.k_ptr {
@@ -1068,7 +1069,7 @@ impl NativeQwen3VLModel {
                         current_offset += tokens_in_part;
                     }
                     gpu_kv.current_len = total_tokens;
-                    if self.device_id < 0 {
+                    if self.lm_head.device_id < 0 {
                         layer.kv_cache.lock().unwrap().current_len = total_tokens;
                     }
                 }

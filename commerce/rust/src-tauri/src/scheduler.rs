@@ -12,6 +12,7 @@ use crate::model::{LogisModel, ModelSize};
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
+use chrono;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::fs;
 use std::path::PathBuf;
@@ -167,7 +168,7 @@ pub async fn start_background_worker(
                     Ok(_) => {
                         let store_guard = store.lock().await;
                         if let Some(db) = store_guard.as_ref() { let _ = db.update_task_status(&task.id, 9).await; }
-                        cleanup_task_resources(&task.id, Some(&app_handle));
+                        // cleanup_task_resources(&task.id, Some(&app_handle));
                         
                         // [INTELLIGENT-CLEANUP] 
                         // Instead of unloading, just clear the KV cache to keep weights warm.
@@ -191,7 +192,7 @@ pub async fn start_background_worker(
                                 let _ = db.update_message_status(&task.id, 3, Some("Cancelled by user")).await;
                             }
                             let _ = app_handle.emit("extraction-progress", json!({ "task_id": task.id, "category": "Done", "summary": "Cancelled", "spinner": "🛑" }));
-                            cleanup_task_resources(&task.id, Some(&app_handle));
+                            // cleanup_task_resources(&task.id, Some(&app_handle));
                             break;
                         } else if err_msg.contains("out of memory") || err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") {
                             // [OOM-RECOVERY] Only here we do a HARD reset
@@ -259,8 +260,8 @@ async fn process_task(
         }
     }
 
-    let data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
-    let task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
+    let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
 
     let effective_device_pref = device_preference.or_else(|| {
         task_data.get("device_preference").and_then(|v| {
@@ -302,13 +303,29 @@ async fn process_task(
     if url.is_empty() { return Ok(()); }
 
     let raw_html = if let Some(h) = task_data.get("html").and_then(|s| s.as_str()) {
-        h.to_string()
+        let content = h.to_string();
+        if let Some(obj) = task_data.as_object_mut() {
+            obj.remove("html"); // Clear from JSON object in memory
+        }
+        content
     } else {
         reqwest::get(&url).await?.text().await?
     };
+    let _ = data_manager.offload(&raw_html, "raw_html");
     
     let clean = parsing::pre_clean_html(&raw_html);
+    let _ = data_manager.offload(&clean, "clean_html");
+
     let light_pug = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
+    
+    // [DEBUG-LOG] Save generated Pug with nanosecond precision to prevent overwriting
+    let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let log_path = pug_logs_dir.join(format!("light_{}_{}.pug", task.id, ts_nano));
+    if let Err(e) = std::fs::write(&log_path, &light_pug) {
+        println!("[ERROR] Failed to write light pug: {}", e);
+    } else {
+        println!("[DEBUG] Saved light pug to: {:?}", log_path);
+    }
     
     if light_pug.trim().len() < 10 { return Ok(()); }
 
@@ -544,6 +561,10 @@ async fn process_task(
             }
             if pug_output.is_empty() { light_pug.clone() } else { pug_output }
         };
+
+        // [DEBUG-LOG] Save content pug
+        let ts_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let _ = std::fs::write(pug_logs_dir.join(format!("content_{}_{}.pug", task.id, ts_nano)), &content_pug);
 
         let ins = parsing::item2json(&page_type, &url, "english");
         // 1. Bake System Prompt for Detail Extraction
