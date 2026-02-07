@@ -139,6 +139,10 @@ pub async fn start_background_worker(
     app_handle: tauri::AppHandle,
 ) {
     println!("[Scheduler] Background worker started with OOM recovery.");
+    
+    // [NEW] Clear ALL temporary data directories at startup for a clean slate
+    clear_all_temp_data(Some(&app_handle));
+
     tokio::spawn(async move {
         if !UI_READY_FLAG.load(Ordering::SeqCst) { UI_READY_SIGNAL.notified().await; }
         let mut delay_secs = 1;
@@ -168,7 +172,7 @@ pub async fn start_background_worker(
                     Ok(_) => {
                         let store_guard = store.lock().await;
                         if let Some(db) = store_guard.as_ref() { let _ = db.update_task_status(&task.id, 9).await; }
-                        // cleanup_task_resources(&task.id, Some(&app_handle));
+                        cleanup_task_resources(&task.id, Some(&app_handle));
                         
                         // [INTELLIGENT-CLEANUP] 
                         // Instead of unloading, just clear the KV cache to keep weights warm.
@@ -192,7 +196,7 @@ pub async fn start_background_worker(
                                 let _ = db.update_message_status(&task.id, 3, Some("Cancelled by user")).await;
                             }
                             let _ = app_handle.emit("extraction-progress", json!({ "task_id": task.id, "category": "Done", "summary": "Cancelled", "spinner": "🛑" }));
-                            // cleanup_task_resources(&task.id, Some(&app_handle));
+                            cleanup_task_resources(&task.id, Some(&app_handle));
                             break;
                         } else if err_msg.contains("out of memory") || err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") {
                             // [OOM-RECOVERY] Only here we do a HARD reset
@@ -815,4 +819,9 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Ok(())
+}
+
+fn clear_all_temp_data(app_handle: Option<&tauri::AppHandle>) {
+    println!("[Cleanup] Clearing all temporary data directories...");
+    utils::paths::cleanup_temp_dirs(app_handle);
 }

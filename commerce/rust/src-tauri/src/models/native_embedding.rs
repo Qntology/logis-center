@@ -15,6 +15,7 @@ pub struct NativeEmbeddingModel {
     pub norm: NativeTensor,
     pub hidden_size: usize,
     pub workspace: std::sync::Mutex<ForwardWorkspace>,
+    pub rope_cache_gpu: std::sync::Mutex<Option<(NativeTensor, NativeTensor)>>,
 }
 
 impl NativeEmbeddingModel {
@@ -60,7 +61,6 @@ impl NativeEmbeddingModel {
                 down_proj: NativeLinear { in_features: 1152, out_features: hidden_size, src_in: 1152, src_out: hidden_size, variant: LinearVariant::Standard { weight: get_t(&format!("{}.mlp.down_proj.weight", p))?, bias: None }, device_id: -1 },
                 kv_cache: std::sync::Mutex::new(DynamicKVCache::new()),
                 gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()),
-                rope_cache_gpu: std::sync::Mutex::new(None),
                 device_id: -1,
                 is_support_layer: false,
                 gpu_broken: std::sync::atomic::AtomicBool::new(false),
@@ -69,8 +69,9 @@ impl NativeEmbeddingModel {
 
         let norm = get_t("model.norm.weight")?;
         let workspace = std::sync::Mutex::new(ForwardWorkspace::new());
+        let rope_cache_gpu = std::sync::Mutex::new(None);
 
-        Ok(Self { tokenizer, embed_tokens, layers, norm, hidden_size, workspace })
+        Ok(Self { tokenizer, embed_tokens, layers, norm, hidden_size, workspace, rope_cache_gpu })
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -102,7 +103,7 @@ impl NativeEmbeddingModel {
 
         for (i, layer) in self.layers.iter().enumerate() {
             let use_b = i % 2 == 0;
-            let out_slice = layer.forward(cur_x, &cfg, 0, i, &[], &[], false, false, None, &mut *ws_guard, use_b);
+            let out_slice = layer.forward(cur_x, &cfg, 0, i, &[], &[], false, false, None, &mut *ws_guard, use_b, &self.rope_cache_gpu);
             
             // Detach slice from mutable borrow
             unsafe {
