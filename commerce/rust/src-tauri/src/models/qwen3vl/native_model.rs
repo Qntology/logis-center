@@ -353,8 +353,9 @@ impl NativeLayer {
                         {
                             let mut rg = self.rope_cache_gpu.lock().unwrap();
                             if rg.is_none() {
-                                let mut ct = NativeTensor { data_ptr: std::ptr::null(), gpu_ptr: None, shape: vec![16384, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
-                                let mut st = NativeTensor { data_ptr: std::ptr::null(), gpu_ptr: None, shape: vec![16384, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
+                                let h_s_rope = 16384 * (h_d / 2) * 2;
+                                let mut ct = NativeTensor { data_ptr: std::ptr::null(), host_size: h_s_rope, gpu_ptr: None, shape: vec![16384, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
+                                let mut st = NativeTensor { data_ptr: std::ptr::null(), host_size: h_s_rope, gpu_ptr: None, shape: vec![16384, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
                                 let cp = crate::models::qwen3vl::native_backend::native_precompute_rope_f16(h_d, 16384, config.rope_theta);
                                 ct.data_ptr = cp.0.as_ptr() as *const u8; st.data_ptr = cp.1.as_ptr() as *const u8;
                                 ct.move_to_gpu(self.device_id); st.move_to_gpu(self.device_id); *rg = Some((ct, st));
@@ -635,8 +636,10 @@ impl NativeQwen3VLModel {
                     let sd = v.data(); let sf = unsafe { std::slice::from_raw_parts(sd.as_ptr() as *const f16, sd.len()/2) };
                     let mut nd = vec![f16::ZERO; out_f * in_f]; let rk = in_f/si; let es = 1.0/(rk as f32);
                     for row in 0..out_f { for col in 0..in_f { nd[row*in_f+col] = f16::from_f32(sf[(row%so)*si+(col%si)].to_f32() * es); } }
-                    let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr() as *const u8; std::mem::forget(boxed);
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: si, src_out: so, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
+                    let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr() as *const u8; 
+                    let h_size = out_f * in_f * 2;
+                    std::mem::forget(boxed);
+                    Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: si, src_out: so, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, host_size: h_size, gpu_ptr: None, shape: vec![out_f, in_f], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
                 } else {
                     let o = unsafe { v.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
                     Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: in_f, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(cm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: active_gpu_id })
@@ -650,11 +653,14 @@ impl NativeQwen3VLModel {
             if ts > sl {
                 let sf = unsafe { std::slice::from_raw_parts(sd.as_ptr() as *const f16, sl) }; let ratio = ts/sl;
                 let mut nd = Vec::with_capacity(ts*2); for _ in 0..ratio { for &val in sf { nd.extend_from_slice(&val.to_le_bytes()); } }
-                let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr() as *const u8; std::mem::forget(boxed);
-                Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![ts], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
+                let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr() as *const u8; 
+                let h_size = ts * 2;
+                std::mem::forget(boxed);
+                Ok(NativeTensor { data_ptr: ptr, host_size: h_size, gpu_ptr: None, shape: vec![ts], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
             } else {
                 let off = unsafe { v.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
-                Ok(NativeTensor { data_ptr: unsafe { cm.as_ptr().add(off) }, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(cm.clone()), device_id: active_gpu_id })
+                let h_size = v.shape().iter().product::<usize>() * 2;
+                Ok(NativeTensor { data_ptr: unsafe { cm.as_ptr().add(off) }, host_size: h_size, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(cm.clone()), device_id: active_gpu_id })
             }
         };
         let mut get_embed = |base: &str, vocab: usize, thid: usize, _hsec: bool| -> Result<NativeLinear> {
@@ -667,8 +673,10 @@ impl NativeQwen3VLModel {
                 let sr = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) };
                 let dq = dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid);
                 let mut dst = Vec::with_capacity(dq.len()*2); for v in dq { dst.extend_from_slice(&v.to_le_bytes()); }
-                let boxed = dst.into_boxed_slice(); let ptr = boxed.as_ptr(); std::mem::forget(boxed);
-                Ok(NativeLinear { in_features: vocab, out_features: thid, src_in: shid, src_out: thid, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![vocab, thid], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
+                let boxed = dst.into_boxed_slice(); let ptr = boxed.as_ptr(); 
+                let h_size = vocab * thid * 2;
+                std::mem::forget(boxed);
+                Ok(NativeLinear { in_features: vocab, out_features: thid, src_in: shid, src_out: thid, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, host_size: h_size, gpu_ptr: None, shape: vec![vocab, thid], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
             } else { get_l(base, vocab, thid, -1) }
         };
         let emb = get_embed("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size, s_mmap.is_some())?;
@@ -711,19 +719,25 @@ impl NativeQwen3VLModel {
                     } 
                 }
                 let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
-                let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; std::mem::forget(pb); std::mem::forget(sb);
-                Ok(NativeLinear { in_features: ti, out_features: to, src_in: si, src_out: so, variant: LinearVariant::BitSerial { weight_packed: NativeTensor { data_ptr: pp, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, scales: NativeTensor { data_ptr: sp, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
+                let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
+                let h_size_packed = (to/8)*(ti/32)*8 * 4;
+                let h_size_scales = (to/8)*(ti/32)*8 * 2;
+                std::mem::forget(pb); std::mem::forget(sb);
+                Ok(NativeLinear { in_features: ti, out_features: to, src_in: si, src_out: so, variant: LinearVariant::BitSerial { weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
             };
             let get_sec_t = |name: &str, ts: usize| -> Result<NativeTensor> {
                 let v = sec_st.tensor(name)?; let sd = v.data(); let sl = sd.len()/2;
                 if ts > sl {
                     let sf = unsafe { std::slice::from_raw_parts(sd.as_ptr() as *const f16, sl) }; let ratio = ts/sl;
                     let mut nd = Vec::with_capacity(ts*2); for _ in 0..ratio { for &val in sf { nd.extend_from_slice(&val.to_le_bytes()); } }
-                    let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr(); std::mem::forget(boxed);
-                    Ok(NativeTensor { data_ptr: ptr as *const u8, gpu_ptr: None, shape: vec![ts], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
+                    let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr(); 
+                    let h_size = ts * 2;
+                    std::mem::forget(boxed);
+                    Ok(NativeTensor { data_ptr: ptr as *const u8, host_size: h_size, gpu_ptr: None, shape: vec![ts], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
                 } else {
                     let off = unsafe { v.data().as_ptr().offset_from(sec_mmap.as_ptr()) } as usize;
-                    Ok(NativeTensor { data_ptr: unsafe { sec_mmap.as_ptr().add(off) }, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(sec_mmap.clone()), device_id: active_gpu_id })
+                    let h_size = v.shape().iter().product::<usize>() * 2;
+                    Ok(NativeTensor { data_ptr: unsafe { sec_mmap.as_ptr().add(off) }, host_size: h_size, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(sec_mmap.clone()), device_id: active_gpu_id })
                 }
             };
             let p = "model.language_model.layers.0";
@@ -775,16 +789,20 @@ impl NativeQwen3VLModel {
                 if ts > sl {
                     let sf = unsafe { std::slice::from_raw_parts(sd.as_ptr() as *const f16, sl) }; let mut nd = Vec::with_capacity(ts*2);
                     for _ in 0..(ts/sl) { for &val in sf { nd.extend_from_slice(&val.to_le_bytes()); } }
-                    let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr() as *const u8; std::mem::forget(boxed);
-                    Ok(NativeTensor { data_ptr: ptr, gpu_ptr: None, shape: vec![ts], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
+                    let boxed = nd.into_boxed_slice(); let ptr = boxed.as_ptr() as *const u8; 
+                    let h_size = ts * 2;
+                    std::mem::forget(boxed);
+                    Ok(NativeTensor { data_ptr: ptr, host_size: h_size, gpu_ptr: None, shape: vec![ts], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id })
                 } else {
                     let off = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
-                    Ok(NativeTensor { data_ptr: unsafe { vm.as_ptr().add(off) }, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(vm.clone()), device_id: active_gpu_id })
+                    let h_size = v.shape().iter().product::<usize>() * 2;
+                    Ok(NativeTensor { data_ptr: unsafe { vm.as_ptr().add(off) }, host_size: h_size, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(vm.clone()), device_id: active_gpu_id })
                 }
             };
             let get_vvl = |base: &str, ti: usize, to: usize| -> Result<NativeLinear> {
                 let key = find_vkey(base).ok_or_else(|| anyhow!("VLNotFound: {}", base))?; let v = vst.tensor(&key)?;
                 let o = unsafe { v.data().as_ptr().offset_from(vm.as_ptr()) } as usize;
+                let h_size = v.shape().iter().product::<usize>() * 2;
                 Ok(NativeLinear { in_features: ti, out_features: to, src_in: ti, src_out: to, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(vm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: active_gpu_id })
             };
             let v_cfg = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
