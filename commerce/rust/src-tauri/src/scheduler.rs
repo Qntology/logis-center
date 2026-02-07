@@ -315,8 +315,10 @@ async fn process_task(
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     
     // [2026-OPTIMIZED-BAKING] Use Small (0.6B) model for baking to save resources.
-    // The KV cache will be upscaled to 2048-dim during save to be compatible with the 2B model.
-    model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true, Some(&task.r#ref)).await?;
+    if let Err(e) = model.secure_vram_relay_ext(ModelSize::Small, None, Some(cancellation_token.clone()), true, true, Some(&task.r#ref)).await {
+        println!("[PROCESS-ERROR] Secure VRAM relay failed: {}", e);
+        return Err(e);
+    }
     
     // [2026-PHYSICAL-DEDUPLICATION] Check registry before baking
     let bake_key = format!("bake_{}", task.r#ref);
@@ -339,14 +341,21 @@ async fn process_task(
         new_bake
     };
 
-    let _bake_result = (*bake_future.await).as_ref().map_err(|e| anyhow::anyhow!("{}", e))?;
+    if let Err(e) = (*bake_future.await).as_ref() {
+        println!("[PROCESS-ERROR] Baking failed: {}", e);
+        REGISTRY.baking.remove(&bake_key);
+        return Err(anyhow::anyhow!("Baking failed: {}", e));
+    }
     REGISTRY.baking.remove(&bake_key);
     
     println!("[PROCESS] Baking complete with 2B (2048-dim) format. Advancing to analysis phase.");
 
     // --- INTEGRATED INFERENCE PHASE ---
     // [OPTIMIZATION] Set force_text_only: true (last param) for HTML analysis to save ~1GB VRAM.
-    model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await?;
+    if let Err(e) = model.secure_vram_relay_ext(ModelSize::Large, None, Some(cancellation_token.clone()), false, true, Some(&task.r#ref)).await {
+        println!("[PROCESS-ERROR] Transition to Large model failed: {}", e);
+        return Err(e);
+    }
     
     {
         let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));

@@ -773,10 +773,58 @@ impl NativeQwen3VLModel {
                 device_id: active_gpu_id, is_support_layer: false, kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()), rope_cache_gpu: std::sync::Mutex::new(None), gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
         }
-        let norm = get_t("model.language_model.norm.weight", t_c.hidden_size)?;
+        
+        // [FIX] For baking mode (Layer 0 only), 'norm' and 'lm_head' might be missing.
+        // We create dummy tensors to satisfy the struct requirements without crashing.
+        let norm = match get_t("model.language_model.norm.weight", t_c.hidden_size) {
+            Ok(t) => t,
+            Err(_) if baking => {
+                // Create dummy norm
+                let h_size = t_c.hidden_size * 2;
+                let dummy_data = vec![0u8; h_size].into_boxed_slice();
+                let ptr = dummy_data.as_ptr();
+                std::mem::forget(dummy_data);
+                NativeTensor {
+                    data_ptr: ptr, host_size: h_size, gpu_ptr: None,
+                    shape: vec![t_c.hidden_size], dtype: NativeDType::F16,
+                    _mmap: None, device_id: active_gpu_id
+                }
+            },
+            Err(e) => return Err(e),
+        };
+
         let h_res = get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936, -1).or_else(|_| {
             get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size, -1).map(|mut el| { el.in_features = t_c.hidden_size; el.out_features = 151936; el.device_id = active_gpu_id; el })
-        })?;
+        });
+
+        let lm_head = match h_res {
+            Ok(l) => l,
+            Err(_) if baking => {
+                // Create dummy lm_head
+                let h_size = t_c.hidden_size * 151936 * 2; // Very large, but virtual
+                // We won't allocate real memory for this big dummy, just a minimal placeholder
+                // Actually, let's just make a small one and lie about the shape to avoid OOM
+                // Since we never use it in baking, it's safe.
+                let dummy_data = vec![0u8; 16].into_boxed_slice();
+                let ptr = dummy_data.as_ptr();
+                std::mem::forget(dummy_data);
+                
+                NativeLinear { 
+                    in_features: t_c.hidden_size, out_features: 151936, src_in: t_c.hidden_size, src_out: 151936, 
+                    variant: LinearVariant::Standard { 
+                        weight: NativeTensor { 
+                            data_ptr: ptr, host_size: 16, gpu_ptr: None, 
+                            shape: vec![151936, t_c.hidden_size], dtype: NativeDType::F16, 
+                            _mmap: None, device_id: active_gpu_id 
+                        }, 
+                        bias: None 
+                    }, 
+                    device_id: active_gpu_id 
+                }
+            },
+            Err(e) => return Err(e),
+        };
+
         let visual = if let Some(vm) = v_mmap {
             let vst = SafeTensors::deserialize(&vm)?;
             let find_vkey = |target: &str| -> Option<String> {
