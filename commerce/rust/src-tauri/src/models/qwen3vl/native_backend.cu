@@ -41,8 +41,6 @@ __global__ void bit_serial_matmul_kernel_f16(
                     if (k_base < src_k) {
                         float combined_signal = 0.0f;
                         // [HYBRID-CYCLIC-REPETITION] Repeat input signal to match expanded target dimension
-                        // Instead of simple sum, we use the value at (k_base % src_k) 
-                        // but since we are within kb block, we just ensure k_base is safe.
                         for (int r = 0; r < repetition; ++r) {
                             int target_k_idx = k_base + (r * src_k);
                             combined_signal += __half2float(input[m * K + (target_k_idx % K)]);
@@ -151,84 +149,6 @@ __global__ void bit_serial_attn_kernel_f16(
     if (tid < h_d) {
         O[(q_idx * n_h * h_d) + (h * h_d) + tid] = __float2half(local_o / (running_sum + 1e-9f));
     }
-}
-
-// [LEGACY] Kernels for Float32 support
-__global__ void bit_serial_matmul_kernel_shuffled(
-    const float* __restrict__ input,    
-    const uint32_t* __restrict__ weight, 
-    const float* __restrict__ scale,     
-    float* __restrict__ output,          
-    int M, int N, int K
-) {
-    const int TILE_M = 32;
-    __shared__ uint32_t s_input_bits[TILE_M]; 
-    int m_base = blockIdx.y * TILE_M;
-    int n_group = blockIdx.x;
-    int n_sub = threadIdx.x; 
-    int m_sub = threadIdx.y; 
-    int m = m_base + m_sub;
-    int n = n_group * 8 + n_sub;
-    int k_blocks = (K + 31) / 32;
-    float acc = 0.0f;
-    for (int kb = 0; kb < k_blocks; ++kb) {
-        if (n_sub == 0) {
-            uint32_t bts = 0;
-            if (m < M) {
-                #pragma unroll
-                for (int b = 0; b < 32; ++b) {
-                    int k_idx = kb * 32 + b;
-                    if (k_idx < K && input[m * K + k_idx] >= 0.0f) bts |= (1u << b);
-                }
-            }
-            s_input_bits[m_sub] = bts;
-        }
-        __syncthreads();
-        if (m < M && n < N) {
-            int idx = n_group * k_blocks * 8 + kb * 8 + n_sub;
-            acc += (float)(32 - 2 * (int)__popc(s_input_bits[m_sub] ^ weight[idx])) * scale[idx];
-        }
-        __syncthreads();
-    }
-    if (m < M && n < N) output[m * N + n] = acc;
-}
-
-__global__ void bit_serial_attn_kernel_v2026(
-    const float* __restrict__ Q,        
-    const uint32_t* __restrict__ K_p,   
-    const float* __restrict__ V,        
-    float* __restrict__ O,              
-    int n_h, int n_kv, int h_d, int t_s, float sc, int q_len,
-    float alpha
-) {
-    int q_idx = blockIdx.x; int h = blockIdx.y; int tid = threadIdx.x;
-    if (q_idx >= q_len || h >= n_h) return;
-    int k_b = (h_d + 31) / 32;
-    int h_kv = h / (n_h / n_kv);
-    __shared__ uint32_t s_q_bits[16]; 
-    if (tid < k_b) {
-        uint32_t bts = 0;
-        for (int b = 0; b < 32; ++b) {
-            int d_idx = tid * 32 + b;
-            if (d_idx < h_d && Q[(q_idx * n_h * h_d) + (h * h_d) + d_idx] >= 0.0f) bts |= (1u << b);
-        }
-        s_q_bits[tid] = bts;
-    }
-    __syncthreads();
-    float running_max = -1e20f; float running_sum = 0.0f; float local_o = 0.0f; 
-    for (int j = 0; j < t_s; ++j) {
-        int dot = 0;
-        for (int kb = 0; kb < k_b; ++kb) dot += (32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * k_b + kb]));
-        float score = ((float)dot + alpha) * sc;
-        if (score < -15.0f) score = -15.0f;
-        float n_max = fmaxf(running_max, score);
-        float e_scale = expf(running_max - n_max);
-        float e_score = expf(score - n_max);
-        running_sum = running_sum * e_scale + e_score;
-        running_max = n_max;
-        if (tid < h_d) local_o = local_o * e_scale + e_score * V[(j * n_kv + h_kv) * h_d + tid];
-    }
-    if (tid < h_d) O[(q_idx * n_h * h_d) + (h * h_d) + tid] = local_o / (running_sum + 1e-9f);
 }
 
 // [STANDARD-F16-MATMUL] For non-quantized layers like lm_head or standard projections
@@ -352,6 +272,37 @@ __global__ void element_mul_kernel_f16(half* dst, const half* src, int total) {
 
 // --- EXTERN C INTERFACE ---
 extern "C" {
+    // 1. Bit-Serial Matmul
+    void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k) {
+        dim3 block(8, 32);
+        dim3 grid((n + 7) / 8, (m + 31) / 32);
+        bit_serial_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
+    }
+
+    // 2. Bit-Serial Attention
+    void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha, int src_h_d) {
+        dim3 block(h_d < 1024 ? h_d : 1024); 
+        dim3 grid(q_len, n_h);
+        bit_serial_attn_kernel_f16<<<grid, block>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha, src_h_d);
+    }
+
+    // 3. Standard F16 Matmul
+    void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
+        dim3 block(16, 16);
+        dim3 grid((n + 15) / 16, (m + 15) / 16);
+        standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
+    }
+
+    // 4. RMS Norm
+    void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
+        rms_norm_kernel_f16<<<m, hid, hid * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
+    }
+
+    // 5. Silu Mul
+    void cuda_silu_mul_f16(half* d_gate, const half* d_up, int size) {
+        silu_mul_kernel_f16<<<(size + 255) / 256, 256>>>(d_gate, d_up, size);
+    }
+
     void cuda_apply_rope_f16(half* d_q, half* d_k, const half* d_cos, const half* d_sin, int q_len, int s_o, int n_h, int n_kv, int h_d) {
         int total_heads = (n_h + n_kv) * q_len;
         apply_rope_inplace_kernel_f16<<< (total_heads * (h_d/2) + 255)/256, 256 >>>(d_q, d_k, d_cos, d_sin, q_len, s_o, n_h, n_kv, h_d);
