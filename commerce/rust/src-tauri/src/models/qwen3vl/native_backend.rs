@@ -209,7 +209,7 @@ impl NativeTensor {
                     // [RESCUE] Try to release and re-acquire primary context
                     let mut dummy_dev = 0 as CUdevice;
                     if cuda_lib.cuDeviceGet(&mut dummy_dev, device_id) as i32 == 0 {
-                        cuda_lib.cuDevicePrimaryCtxRelease(dummy_dev);
+                        cuda_lib.cuDevicePrimaryCtxRelease_v2(dummy_dev);
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                     
