@@ -529,7 +529,12 @@ impl NativeLayer {
             }
             let mut kp: CUdeviceptr = 0; let mut vp: CUdeviceptr = 0;
             let kb = tok * n_kv * (h_d/32) * 4; let vb = tok * n_kv * h_d * 2;
-            let _ = cl.cuMemAlloc_v2(&mut kp, kb); let _ = cl.cuMemAlloc_v2(&mut vp, vb);
+            let r1 = cl.cuMemAlloc_v2(&mut kp, kb); 
+            let r2 = cl.cuMemAlloc_v2(&mut vp, vb);
+            if r1 as i32 != 0 || r2 as i32 != 0 {
+                println!("[GPU-ERROR] Failed to allocate KV cache in inject_direct: {:?}, {:?}", r1, r2);
+                return;
+            }
             let _ = cl.cuMemcpyDtoD_v2(kp, ks.0 as CUdeviceptr, kb); let _ = cl.cuMemcpyDtoD_v2(vp, vs.0 as CUdeviceptr, vb);
             g.k_ptr = Some(GpuPtr(kp as *mut _)); g.v_ptr = Some(GpuPtr(vp as *mut _)); g.capacity = tok; g.current_len = tok;
         }
@@ -1208,3 +1213,4 @@ impl NativeQwen3VLModel {
         self.text_model.get_all_kv(start_idx)
     }
 }
+

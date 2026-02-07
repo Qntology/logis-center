@@ -445,21 +445,6 @@ async fn process_task(
         log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": format!("Identified {}. Finding selectors...", page_type), "spinner": "⠋" }));
         let selector_prompt = parsing::page_selectors_prompt(&page_type);
         
-        // No need to re-stitch if we are using the same PUG base, 
-        // but to be safe and clean, we reset to the PUG base state for each new "question"
-        {
-            let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
-            let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
-            let gen_arc = model.generator.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut gen_guard = gen_arc.blocking_lock();
-                if let Some(gen) = gen_guard.as_mut() {
-                    gen.load_kv_stitched(&[pug_base_path])?;
-                }
-                Ok::<(), anyhow::Error>(())
-            }).await??;
-        }
-
         let res_sel = model.chat("", &selector_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         selector_info = parsing::parse_json_from_llm(&res_sel);
         
