@@ -203,12 +203,18 @@ impl NativeTensor {
             }
             let size_raw = self.shape.iter().product::<usize>();
             let size_bytes = size_raw * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };
+            // println!("[GPU-ALLOC] Allocating {} bytes for tensor (Ptr: {:p})", size_bytes, self.data_ptr);
             let mut ptr: CUdeviceptr = 0;
             if (cuda_lib.cuMemAlloc_v2(&mut ptr, size_bytes) as i32) == 0 && ptr != 0 {
                 if (cuda_lib.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, size_bytes) as i32) == 0 {
                     self.gpu_ptr = Some(GpuPtr(ptr as *mut _));
                     self.device_id = device_id;
-                } else { let _ = cuda_lib.cuMemFree_v2(ptr); }
+                } else { 
+                    println!("[GPU-ERROR] Memcpy failed for tensor (Ptr: {:p}, Size: {})", self.data_ptr, size_bytes);
+                    let _ = cuda_lib.cuMemFree_v2(ptr); 
+                }
+            } else {
+                println!("[GPU-ERROR] MemAlloc failed for size {}", size_bytes);
             }
         }
     }

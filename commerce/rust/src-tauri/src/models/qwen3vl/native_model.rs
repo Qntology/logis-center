@@ -281,17 +281,27 @@ unsafe impl Sync for NativeLayer {}
 impl NativeLayer {
     pub fn move_to_gpu(&mut self, device_id: i32) {
         self.device_id = device_id;
+        println!("[GPU-MOVE] Layer moving... input_layernorm");
         self.input_layernorm.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer moving... post_attention_layernorm");
         self.post_attention_layernorm.move_to_gpu(device_id);
-        if let Some(ref mut qn) = self.q_norm { qn.move_to_gpu(device_id); }
-        if let Some(ref mut kn) = self.k_norm { kn.move_to_gpu(device_id); }
+        if let Some(ref mut qn) = self.q_norm { println!("[GPU-MOVE] Layer moving... q_norm"); qn.move_to_gpu(device_id); }
+        if let Some(ref mut kn) = self.k_norm { println!("[GPU-MOVE] Layer moving... k_norm"); kn.move_to_gpu(device_id); }
+        println!("[GPU-MOVE] Layer moving... q_proj");
         self.q_proj.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer moving... k_proj");
         self.k_proj.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer moving... v_proj");
         self.v_proj.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer moving... o_proj");
         self.o_proj.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer moving... gate_proj");
         self.gate_proj.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer moving... up_proj");
         self.up_proj.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer moving... down_proj");
         self.down_proj.move_to_gpu(device_id);
+        println!("[GPU-MOVE] Layer move complete");
     }
 
     pub fn forward<'a>(
@@ -658,18 +668,40 @@ impl NativeQwen3VLModel {
             let sec_st = SafeTensors::deserialize(sec_mmap)?;
             let get_sec_l = |base: &str, ti: usize, to: usize| -> Result<NativeLinear> {
                 let pn = format!("{}.packed", base); let sn = format!("{}.scales", base);
-                let vp = sec_st.tensor(&pn)?; let vs = sec_st.tensor(&sn)?; let si = (vp.data().len()/4*32)/vp.shape()[0];
+                let vp = sec_st.tensor(&pn)?; let vs = sec_st.tensor(&sn)?;
+                
+                // [FIX] Read original source shape if available, otherwise fallback to heuristic
+                let (so, si) = if let Ok(st) = sec_st.tensor(&format!("{}.shape", base)) {
+                    let s_data = unsafe { std::slice::from_raw_parts(st.data().as_ptr() as *const i32, 2) };
+                    (s_data[0] as usize, s_data[1] as usize)
+                } else {
+                    let s_out = (vs.data().len() / 2) / ((vp.data().len() / 4 * 32) / (vs.data().len() / 2)); // Heuristic
+                    (s_out, (vp.data().len() / 4 * 32) / s_out)
+                };
+
                 let pu = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) };
                 let sf = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) };
+                
                 let mut np = vec![0u32; (to/8)*(ti/32)*8]; let mut ns = vec![f16::ZERO; (to/8)*(ti/32)*8];
-                let es = f16::from_f32(1.0/((ti/si) as f32));
-                for no in 0..(to/8) { for ko in 0..(ti/32) { for sn in 0..8 {
-                    let s_idx = ((no%(vp.shape()[0]/8))*(si/32)+(ko%(si/32)))*8+sn; let d_idx = (no*(ti/32)+ko)*8+sn;
-                    np[d_idx] = pu[s_idx]; ns[d_idx] = sf[s_idx]*es;
-                } } }
+                let es = f16::from_f32(1.0/((ti as f32 / si as f32).max(1.0)));
+                
+                let src_k_blocks = si / 32;
+                let dst_k_blocks = ti / 32;
+
+                for no in 0..(to/8) { 
+                    for ko in 0..dst_k_blocks { 
+                        for sn in 0..8 {
+                            let s_idx = ((no % (so/8)) * src_k_blocks + (ko % src_k_blocks)) * 8 + sn; 
+                            let d_idx = (no * dst_k_blocks + ko) * 8 + sn;
+                            if s_idx < pu.len() {
+                                np[d_idx] = pu[s_idx]; ns[d_idx] = sf[s_idx] * es;
+                            }
+                        } 
+                    } 
+                }
                 let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
                 let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; std::mem::forget(pb); std::mem::forget(sb);
-                Ok(NativeLinear { in_features: ti, out_features: to, src_in: si, src_out: vp.shape()[0], variant: LinearVariant::BitSerial { weight_packed: NativeTensor { data_ptr: pp, gpu_ptr: None, shape: vec![to, ti/32*8], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, scales: NativeTensor { data_ptr: sp, gpu_ptr: None, shape: vec![to, ti/32*8], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
+                Ok(NativeLinear { in_features: ti, out_features: to, src_in: si, src_out: so, variant: LinearVariant::BitSerial { weight_packed: NativeTensor { data_ptr: pp, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, scales: NativeTensor { data_ptr: sp, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
             };
             let get_sec_t = |name: &str, ts: usize| -> Result<NativeTensor> {
                 let v = sec_st.tensor(name)?; let sd = v.data(); let sl = sd.len()/2;
