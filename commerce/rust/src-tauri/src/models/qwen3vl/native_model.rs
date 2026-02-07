@@ -995,7 +995,7 @@ impl NativeQwen3VLModel {
             pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<()> {
                 if paths.is_empty() { return Ok(()); }
         
-                // 1. ?�일 ?�렬 (?�자 기반 ?�렬�?part10??part2 ?�로 가�???
+                // 1. ??�� ??�� (??�� ��� ??��??part10??part2 ??�� ��????
                 let mut sorted_paths = paths.to_vec();
                 let re = Regex::new(r"_part(\d+)").unwrap();
                 sorted_paths.sort_by(|a, b| {
@@ -1008,7 +1008,7 @@ impl NativeQwen3VLModel {
                     extract_num(a).cmp(&extract_num(b))
                 });
         
-                // 2. ?�체 ?�큰 길이 �?메�??�이??미리 로드
+                // 2. ??ü ??ū ���� ??��????��??�̸� �ε�
                 let mut total_tokens = 0;
                 let mut part_metadatas = Vec::new();
                 let mut part_mmaps = Vec::new();
@@ -1044,13 +1044,13 @@ impl NativeQwen3VLModel {
                 let h_d = self.text_model.config.head_dim;
                 let target_dim = n_kv * h_d;
         
-                // 3. ?�체 ?�트 ?�이??미리 로드 (?�이??루프 밖에???�행?�여 I/O 병목 ?�거)
+                // 3. ??ü ??Ʈ ??��??�̸� �ε� (??��??���� �ۿ�????��??�� I/O ���� ??��)
                 let mut decoded_parts = Vec::new();
                 for mmap in &part_mmaps {
                     decoded_parts.push(SafeTensors::deserialize(mmap)?);
                 }
 
-                // 4. ?�이?�별�??�회?�며 GPU 메모�??�당 �??�이??복사
+                // 4. ??��??��????ȸ??�� GPU �޸�????�� ????��??����
                 for l_idx in 0..num_target_layers {
                     let layer = &self.text_model.layers[l_idx];
                     let mut gpu_kv = layer.gpu_kv_cache.lock().unwrap();
@@ -1221,6 +1221,7 @@ impl NativeQwen3VLModel {
         self.text_model.get_all_kv(start_idx)
     }
 }
+
 
 
 
