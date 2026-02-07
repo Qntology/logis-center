@@ -260,8 +260,9 @@ impl Qwen3VLGenerateModel {
 
             let combined_task = if !user_content.is_empty() { user_content } else { system_content };
             
-            let raw_prompt = format!("\n\nTASK: {}\n\nACTION: JSON ONLY\n\nAssistant: ", combined_task);
-            println!("[{}-RAW] Constructing raw prompt ({} chars) for stitched context.", tag, raw_prompt.len());
+            // [STABILITY] Use standard ChatML markers even in no-bridge mode to ground the model
+            let raw_prompt = format!("<|im_start|>user\n{}\n\nACTION: JSON ONLY<|im_end|>\n<|im_start|>assistant\n", combined_task);
+            println!("[{}-RAW] Using structured prompt ({} chars) for stitched context.", tag, raw_prompt.len());
             self.tokenizer.text_encode_vec(raw_prompt, false)?
         } else {
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
@@ -532,6 +533,27 @@ impl Qwen3VLGenerateModel {
         let base_name = final_path.file_stem().unwrap().to_str().unwrap();
 
         println!("[BAKE-SHARDED] Starting sharded baking. Total: {} tokens", total_tokens);
+
+        // [OPTIMIZATION] Pre-allocate full VRAM capacity once before the loop
+        {
+            let needed_total = initial_offset + total_tokens;
+            match &self.qwen3_vl {
+                ModelVariant::Native(m) => {
+                    let n_kv = m.text_model.config.num_key_value_heads;
+                    let h_d = m.text_model.config.head_dim;
+                    let dev_id = m.lm_head.device_id;
+                    if dev_id >= 0 && dev_id < 8 {
+                        println!("[BAKE-VRAM] Pre-allocating KV Cache for {} tokens...", needed_total);
+                        for layer in &m.text_model.layers {
+                            let mut gkg = layer.gpu_kv_cache.lock().unwrap();
+                            gkg.grow(needed_total, n_kv, h_d, dev_id);
+                        }
+                        unsafe { crate::models::qwen3vl::native_backend::lib().cuStreamSynchronize(std::ptr::null_mut()); }
+                    }
+                },
+                _ => {}
+            }
+        }
 
         for (chunk_idx, chunk) in all_ids.chunks(chunk_size).enumerate() {
             if let Some(flag) = &cancel_flag {

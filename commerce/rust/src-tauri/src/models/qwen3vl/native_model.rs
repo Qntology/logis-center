@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use memmap2::Mmap;
 use crate::models::qwen3vl::config::{Qwen3VLConfig, Qwen3VLTextConfig};
 use crate::models::qwen3vl::native_backend::*;
@@ -84,7 +84,7 @@ impl DynamicGpuKVCache {
     #[cfg(feature = "cuda")]
     pub fn grow(&mut self, needed_len: usize, n_kv: usize, head_dim: usize, device_id: i32) {
         if needed_len > self.capacity {
-            let new_cap = (needed_len + 127) / 128 * 128;
+            let new_cap = (needed_len + 1023) / 1024 * 1024;
             let k_bytes = new_cap * n_kv * (head_dim/32) * 4;
             let v_bytes = new_cap * n_kv * head_dim * 2;
             unsafe {
@@ -92,14 +92,13 @@ impl DynamicGpuKVCache {
                 let mut ctx = std::ptr::null_mut() as cudarc::driver::sys::CUcontext;
                 cl.cuCtxGetCurrent(&mut ctx);
                 if ctx == std::ptr::null_mut() && device_id >= 0 && device_id < 8 {
-                    println!("[CUDA-CTX] Setting context for thread. Device: {}", device_id);
                     let mut dev = 0 as cudarc::driver::sys::CUdevice; cl.cuDeviceGet(&mut dev, device_id);
                     cl.cuDevicePrimaryCtxRetain(&mut ctx, dev); cl.cuCtxSetCurrent(ctx);
                 }
                 let mut new_kp: cudarc::driver::sys::CUdeviceptr = 0;
                 let mut new_vp: cudarc::driver::sys::CUdeviceptr = 0;
                 
-                let mut res_k = 1; // Default to error if not GPU
+                let mut res_k = 1;
                 let mut res_v = 1;
                 
                 if device_id >= 0 && device_id < 8 {
@@ -110,11 +109,8 @@ impl DynamicGpuKVCache {
                 if res_k != 0 || res_v != 0 {
                     if device_id >= 0 && device_id < 8 {
                         println!("[CUDA-ERROR] VRAM Allocation failed in grow! K-res: {}, V-res: {}, New Cap: {}", res_k, res_v, new_cap);
-                        // Do NOT update capacity here, so it knows it failed
-                    } else {
-                        // For CPU mode (ID 999), we update capacity to signal we handled the "growth" in RAM
-                        self.capacity = new_cap;
                     }
+                    self.capacity = new_cap;
                     return;
                 }
 
@@ -131,12 +127,7 @@ impl DynamicGpuKVCache {
                 self.k_ptr = Some(GpuPtr(new_kp as *mut _));
                 self.v_ptr = Some(GpuPtr(new_vp as *mut _));
                 self.capacity = new_cap;
-                
-                // [STABILITY] Synchronize once after allocation to ensure GPU is ready for kernels
-                if device_id >= 0 && device_id < 8 {
-                    cl.cuStreamSynchronize(std::ptr::null_mut());
-                    println!("[VRAM] Expanded GPU KV Cache to {} tokens and synchronized.", new_cap);
-                }
+                println!("[VRAM] Expanded GPU KV Cache to {} tokens", new_cap);
             }
         }
     }
@@ -1165,13 +1156,29 @@ impl NativeQwen3VLModel {
         let sl = None; 
         let nx = self.text_model.forward_ext(i_ids, embeds, so, sc, Some(&mut wl), sl, is_vision);
         
+        // [SHIELD-BAKING] During baking, we ONLY care about the KV Cache side-effects in forward_ext.
+        // Skipping LM Head saves a massive 1024x151936 matrix multiplication and host-transfer.
         if is_baking {
-            // [OPTIMIZATION] Skip LM Head during baking as we only need the KV Cache side-effect.
-            // This saves ~600MB of data transfer per chunk.
             return vec![]; 
         }
+
+        let res = self.lm_head.forward(&nx, sc);
+
+        // [DIAGNOSTIC] Log first 5 tokens and top-1 logit to detect corruption (Inference only)
+        if !res.is_empty() {
+            let mut max_val = -1e9f32;
+            let mut max_idx = 0;
+            let vocab_size = 151936;
+            let last_logits = &res[res.len() - vocab_size..];
+            for (idx, &val) in last_logits.iter().enumerate() {
+                let v = val.to_f32();
+                if v > max_val { max_val = v; max_idx = idx; }
+            }
+            println!("[GPU-DIAG] Offset: {}, InputIDs: {:?}, TopIdx: {}, MaxLogit: {:.2}", 
+                     so, &i_ids[..i_ids.len().min(5)], max_idx, max_val);
+        }
         
-        self.lm_head.forward(&nx, sc)
+        res
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> {
         self.text_model.move_to_gpu(dev)?; 
@@ -1214,5 +1221,6 @@ impl NativeQwen3VLModel {
         self.text_model.get_all_kv(start_idx)
     }
 }
+
 
 

@@ -380,13 +380,22 @@ async fn process_task(
     
     {
         let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
-        let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
+        let mut shards = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&kv_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "safetensors") && 
+                   path.file_name().unwrap().to_string_lossy().contains("shared_pug_base") {
+                    shards.push(path);
+                }
+            }
+        }
         let gen_arc = model.generator.clone();
         tokio::task::spawn_blocking(move || {
             let mut gen_guard = gen_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                gen.load_kv_stitched(&[pug_base_path])?;
-                println!("[PROCESS] KV Cache Stitched. Offset: {} tokens.", gen.get_kv_len());
+                gen.load_kv_stitched(&shards)?;
+                println!("[PROCESS] KV Cache Stitched ({} shards). Offset: {} tokens.", shards.len(), gen.get_kv_len());
             }
             Ok::<(), anyhow::Error>(())
         }).await??;
@@ -415,16 +424,25 @@ async fn process_task(
         
         let type_prompt = parsing::page_type_prompt();
 
-        // 1. Model is already loaded. Just ensure KV is stitched with ONLY the PUG base
+        // 1. Model is already loaded. Just ensure KV is stitched with ALL PUG shards
         {
             let kv_dir = utils::paths::get_kv_dir(None, Some(&task.r#ref));
-            let pug_base_path = kv_dir.join("shared_pug_base.safetensors");
+            let mut shards = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&kv_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "safetensors") && 
+                       path.file_name().unwrap().to_string_lossy().contains("shared_pug_base") {
+                        shards.push(path);
+                    }
+                }
+            }
             let gen_arc = model.generator.clone();
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_arc.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    gen.load_kv_stitched(&[pug_base_path])?;
-                    println!("[PROCESS] KV Base Stitched for Analysis. Offset: {} tokens.", gen.get_kv_len());
+                    gen.load_kv_stitched(&shards)?;
+                    println!("[PROCESS] KV Base Stitched for Analysis ({} shards). Offset: {} tokens.", shards.len(), gen.get_kv_len());
                 }
                 Ok::<(), anyhow::Error>(())
             }).await??;
