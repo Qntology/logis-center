@@ -786,16 +786,35 @@ impl Qwen3VLGenerateModel {
                                 
                                 // Process per token (unit of 'target_dim')
                                 if target_dim > 0 {
-                                    for token_chunk in v_data.chunks_exact_mut(target_dim) {
-                                        // 1. Calculate L2 Norm
+                                    for (token_idx, token_chunk) in v_data.chunks_exact_mut(target_dim).enumerate() {
+                                        // [ANCHOR-TOKEN] Attention Sink Theory: Preserve first 4 tokens
+                                        // The first few tokens establish the 'attention base'. 
+                                        // If we damp them, the model loses its 'grounding' and collapses.
+                                        if token_idx < 4 { continue; }
+
+                                        // 1. Calculate L2 Norm (with Stochastic Noise)
                                         let mut sum_sq = 0.0f32;
-                                        for &val in token_chunk.iter() {
+                                        
+                                        // [STOCHASTIC-STITCHING] Inject micro-noise to break rigid patterns
+                                        // Pseudo-random generator using simple arithmetic (No 'rand' crate dependency)
+                                        let noise_seed = (l_idx * 1000 + token_idx) as f32;
+                                        
+                                        for (i, val) in token_chunk.iter_mut().enumerate() {
                                             let v_f32 = val.to_f32();
-                                            sum_sq += v_f32 * v_f32;
+                                            
+                                            // Tiny noise: +/- 0.001 based on seed
+                                            let noise = ((noise_seed + i as f32).sin() * 0.001) as f32; 
+                                            let noisy_val = v_f32 + noise;
+                                            
+                                            *val = f16::from_f32(noisy_val); // Write back noise
+                                            sum_sq += noisy_val * noisy_val;
                                         }
+                                        
                                         let norm = sum_sq.sqrt();
                                         
                                         // 2. Normalize and Apply Decay Factor
+                                        // L2 Normalization ensures all feature vectors have Unit Energy (1.0).
+                                        // Then we scale it down by 1/L.
                                         let scale = if norm > 1e-6 { factor / norm } else { factor };
                                         let scale_f16 = f16::from_f32(scale);
                                         
