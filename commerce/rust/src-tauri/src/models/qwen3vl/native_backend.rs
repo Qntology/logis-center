@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use half::f16;
@@ -8,6 +8,28 @@ use std::arch::x86_64::*;
 
 #[cfg(feature = "cuda")]
 pub use cudarc::driver::sys::{lib, CUdeviceptr, CUcontext, CUdevice, CUresult};
+
+#[cfg(feature = "cuda")]
+static CUDA_INIT: Once = Once::new();
+
+#[cfg(feature = "cuda")]
+pub fn ensure_cuda_init() {
+    CUDA_INIT.call_once(|| {
+        unsafe {
+            let res = lib().cuInit(0);
+            if res as i32 != 0 {
+                println!("[CUDA-ERROR] cuInit failed: {:?}", res);
+            } else {
+                println!("[CUDA-INIT] Driver initialized successfully.");
+            }
+        }
+    });
+}
+
+#[cfg(feature = "cuda")]
+pub fn test_cuda_init() {
+    ensure_cuda_init();
+}
 
 pub static GPU_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -197,8 +219,10 @@ impl NativeTensor {
     #[cfg(feature = "cuda")]
     pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> {
         if self.gpu_ptr.is_some() { return Ok(()); }
+        ensure_cuda_init();
         unsafe {
             let cuda_lib = lib();
+
             let mut ctx = std::ptr::null_mut() as CUcontext;
             cuda_lib.cuCtxGetCurrent(&mut ctx);
             if ctx == std::ptr::null_mut() {

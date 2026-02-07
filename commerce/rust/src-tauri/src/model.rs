@@ -816,6 +816,8 @@ impl LogisModel {
 
     pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
         println!("[MODEL-00] Initializing LogisModel (Preference: {:?})", device_preference);
+        #[cfg(feature = "cuda")]
+        crate::models::qwen3vl::native_backend::test_cuda_init();
 
         let mut config = utils::get_optimal_device_config();
         

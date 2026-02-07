@@ -108,11 +108,13 @@ impl DynamicGpuKVCache {
                 }
                 
                 if res_k != 0 || res_v != 0 {
-                    // [INFO] For CPU-forced models, we still update capacity to prevent repeat attempts
-                    if device_id < 8 {
+                    if device_id >= 0 && device_id < 8 {
                         println!("[CUDA-ERROR] VRAM Allocation failed in grow! K-res: {}, V-res: {}, New Cap: {}", res_k, res_v, new_cap);
+                        // Do NOT update capacity here, so it knows it failed
+                    } else {
+                        // For CPU mode (ID 999), we update capacity to signal we handled the "growth" in RAM
+                        self.capacity = new_cap;
                     }
-                    self.capacity = new_cap;
                     return;
                 }
 
