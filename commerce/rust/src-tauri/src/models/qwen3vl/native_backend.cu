@@ -271,7 +271,6 @@ __global__ void silu_mul_kernel_f16(half* gate, const half* up, int size) {
     }
 }
 
-// --- [CRITICAL] EXTERN C WRAPPERS ---
 // [GPU-ROPE] Fast In-place RoPE Application
 __global__ void apply_rope_inplace_kernel_f16(half* Q, half* K, const half* cos_table, const half* sin_table, int q_len, int s_o, int n_h, int n_kv, int h_d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -311,27 +310,7 @@ __global__ void pack_f16_to_u32_kernel(const half* src, uint32_t* dst, int total
     dst[tid] = packed;
 }
 
-extern "C" {
-    void cuda_apply_rope_f16(half* d_q, half* d_k, const half* d_cos, const half* d_sin, int q_len, int s_o, int n_h, int n_kv, int h_d) {
-        int total_heads = (n_h + n_kv) * q_len;
-        apply_rope_inplace_kernel_f16<<< (total_heads * (h_d/2) + 255)/256, 256 >>>(d_q, d_k, d_cos, d_sin, q_len, s_o, n_h, n_kv, h_d);
-    }
-
-    void cuda_pack_bits_f16(const half* d_src, uint32_t* d_dst, int elements) {
-        int blocks = (elements + 31) / 32;
-        pack_f16_to_u32_kernel<<< (blocks + 255)/256, 256 >>>(d_src, d_dst, elements);
-    }
-
-    void cuda_apply_gain_f16(half* d_data, float gain, int elements) {
-        auto kernel = [] __device__ (half* data, float g, int total) {
-            int i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i < total) data[i] = __float2half(__half2float(data[i]) * g);
-        };
-        // [MOD] We can't use lambda in extern C directly with nvcc in some versions easily, 
-        // but for now let's define it properly above and call it.
-    }
-}
-
+// [GPU-GAIN] Apply gain
 __global__ void apply_gain_kernel_f16(half* data, float gain, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) data[i] = __float2half(__half2float(data[i]) * gain);
@@ -365,7 +344,24 @@ __global__ void silu_inplace_kernel_f16(half* data, int size) {
     }
 }
 
+// [GPU-ELEMENT-MUL] Element-wise Multiplication
+__global__ void element_mul_kernel_f16(half* dst, const half* src, int total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < total) dst[i] = __float2half(__half2float(dst[i]) * __half2float(src[i]));
+}
+
+// --- EXTERN C INTERFACE ---
 extern "C" {
+    void cuda_apply_rope_f16(half* d_q, half* d_k, const half* d_cos, const half* d_sin, int q_len, int s_o, int n_h, int n_kv, int h_d) {
+        int total_heads = (n_h + n_kv) * q_len;
+        apply_rope_inplace_kernel_f16<<< (total_heads * (h_d/2) + 255)/256, 256 >>>(d_q, d_k, d_cos, d_sin, q_len, s_o, n_h, n_kv, h_d);
+    }
+
+    void cuda_pack_bits_f16(const half* d_src, uint32_t* d_dst, int elements) {
+        int blocks = (elements + 31) / 32;
+        pack_f16_to_u32_kernel<<< (blocks + 255)/256, 256 >>>(d_src, d_dst, elements);
+    }
+
     void cuda_add_inplace_f16(half* d_dst, const half* d_src, int size) {
         add_inplace_kernel_f16<<<(size + 255)/256, 256>>>(d_dst, d_src, size);
     }
@@ -383,21 +379,6 @@ extern "C" {
         apply_gain_kernel_f16<<<(elements + 255)/256, 256>>>(d_data, gain, elements);
     }
 
-    void cuda_element_mul_f16(half* d_dst, const half* d_src, int size) {
-        auto kernel = [] __device__ (half* dst, const half* src, int total) {
-            int i = blockIdx.x * blockDim.x + threadIdx.x;
-            if (i < total) dst[i] = __float2half(__half2float(dst[i]) * __half2float(src[i]));
-        };
-        // [MOD] Define properly below
-    }
-}
-
-__global__ void element_mul_kernel_f16(half* dst, const half* src, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total) dst[i] = __float2half(__half2float(dst[i]) * __half2float(src[i]));
-}
-
-extern "C" {
     void cuda_element_mul_f16(half* d_dst, const half* d_src, int size) {
         element_mul_kernel_f16<<<(size + 255)/256, 256>>>(d_dst, d_src, size);
     }

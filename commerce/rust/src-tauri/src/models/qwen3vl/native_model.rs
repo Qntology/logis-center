@@ -279,6 +279,21 @@ unsafe impl Send for NativeLayer {}
 unsafe impl Sync for NativeLayer {}
 
 impl NativeLayer {
+    pub fn move_to_gpu(&mut self, device_id: i32) {
+        self.device_id = device_id;
+        self.input_layernorm.move_to_gpu(device_id);
+        self.post_attention_layernorm.move_to_gpu(device_id);
+        if let Some(ref mut qn) = self.q_norm { qn.move_to_gpu(device_id); }
+        if let Some(ref mut kn) = self.k_norm { kn.move_to_gpu(device_id); }
+        self.q_proj.move_to_gpu(device_id);
+        self.k_proj.move_to_gpu(device_id);
+        self.v_proj.move_to_gpu(device_id);
+        self.o_proj.move_to_gpu(device_id);
+        self.gate_proj.move_to_gpu(device_id);
+        self.up_proj.move_to_gpu(device_id);
+        self.down_proj.move_to_gpu(device_id);
+    }
+
     pub fn forward<'a>(
         &self, x: &[f16], config: &Qwen3VLTextConfig, s_o: usize, _idx: usize, _r_cos: &[f16], _r_sin: &[f16], 
         is_baking: bool, is_vision: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
