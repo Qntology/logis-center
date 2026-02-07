@@ -9,6 +9,7 @@ use safetensors::SafeTensors;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use std::sync::atomic::Ordering;
+use regex::Regex;
 
 pub enum LinearVariant {
     Standard { weight: NativeTensor, bias: Option<NativeTensor> },
@@ -941,12 +942,142 @@ impl NativeQwen3VLModel {
             };
             Some(NativeVisionModel { patch_embed: pe, blocks: vb, merger })
         } else { None };
-        Ok(Self {
-            config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, t_c.rope_theta, 4096)) },
-            lm_head, visual, support_layer0, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
-        })
-    }
-    pub fn forward(&self, i_ids: &[u32], pv: Option<&[f16]>, gt: Option<&[u32; 3]>, so: usize) -> Vec<f16> {
+                Ok(Self {
+                    config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, t_c.rope_theta, 4096)) },
+                    lm_head, visual, support_layer0, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
+                })
+            }
+        
+            pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<()> {
+                if paths.is_empty() { return Ok(()); }
+        
+                // 1. 파일 정렬 (숫자 기반 정렬로 part10이 part2 뒤로 가게 함)
+                let mut sorted_paths = paths.to_vec();
+                let re = Regex::new(r"_part(\d+)").unwrap();
+                sorted_paths.sort_by(|a, b| {
+                    let extract_num = |p: &std::path::Path| {
+                        p.file_name().and_then(|s| s.to_str())
+                            .and_then(|s| {
+                                re.captures(s).and_then(|cap| cap[1].parse::<usize>().ok())
+                            }).unwrap_or(0)
+                    };
+                    extract_num(a).cmp(&extract_num(b))
+                });
+        
+                // 2. 전체 토큰 길이 및 메타데이터 미리 로드
+                let mut total_tokens = 0;
+                let mut part_metadatas = Vec::new();
+                let mut part_mmaps = Vec::new();
+        
+                for path in &sorted_paths {
+                    let file = std::fs::File::open(path)?;
+                    let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
+                    let st = SafeTensors::deserialize(&mmap)?;
+                    
+                    let tokens = if let Ok(meta_tensor) = st.tensor("metadata.tokens") {
+                        meta_tensor.shape()[0]
+                    } else {
+                        st.tensor("layer.0.k")?.shape()[0]
+                    };
+                    
+                    total_tokens += tokens;
+                    part_metadatas.push(tokens);
+                    part_mmaps.push(mmap);
+        
+                    // [BRIDGE-LOAD] Extract tail tokens for synchronization
+                    if let Ok(tt) = st.tensor("metadata.tokens") {
+                        let tokens_u32: Vec<u32> = tt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                        let mut rope_guard = self.text_model.rope_cache.lock().unwrap();
+                        rope_guard.tail_tokens = tokens_u32;
+                    }
+                }
+        
+                println!("[KV-STITCH] Total tokens to stitch: {} across {} parts", total_tokens, sorted_paths.len());
+        
+                let num_target_layers = self.text_model.layers.len();
+                let n_kv = self.text_model.config.num_key_value_heads;
+                let h_d = self.text_model.config.head_dim;
+                let target_dim = n_kv * h_d;
+        
+                // 3. 레이어별로 순회하며 GPU 메모리 할당 및 데이터 복사
+                for l_idx in 0..num_target_layers {
+                    let layer = &self.text_model.layers[l_idx];
+                    let mut gpu_kv = layer.gpu_kv_cache.lock().unwrap();
+                    
+                    #[cfg(feature = "cuda")]
+                    if self.device_id >= 0 {
+                        gpu_kv.grow(total_tokens, n_kv, h_d, self.device_id);
+                    }
+                    
+                    let mut current_offset = 0;
+                    for (p_idx, mmap) in part_mmaps.iter().enumerate() {
+                        let st = SafeTensors::deserialize(mmap)?;
+                        let tokens_in_part = part_metadatas[p_idx];
+                        
+                        let mut file_layers = 0;
+                        while st.tensor(&format!("layer.{}.k", file_layers)).is_ok() { file_layers += 1; }
+                        let src_idx = if file_layers == 1 { 0 } else { l_idx };
+                        
+                        if src_idx >= file_layers {
+                            current_offset += tokens_in_part;
+                            continue; 
+                        }
+        
+                        let k_key = format!("layer.{}.k", src_idx);
+                        let v_key = format!("layer.{}.v", src_idx);
+                        
+                        if let (Ok(kt), Ok(vt)) = (st.tensor(&k_key), st.tensor(&v_key)) {
+                            let actual_source_dim = if vt.shape().len() >= 2 { vt.shape()[1] } else { 1024 };
+                            
+                            #[cfg(feature = "cuda")]
+                            if self.device_id >= 0 {
+                                unsafe {
+                                    let cl = crate::models::qwen3vl::native_backend::lib();
+                                    if let Some(kp) = gpu_kv.k_ptr {
+                                        let dest_k = (kp.0 as u64 + (current_offset * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr;
+                                        cl.cuMemcpyHtoD_v2(dest_k, kt.data().as_ptr() as *const _, kt.data().len());
+                                    }
+                                    if let Some(vp) = gpu_kv.v_ptr {
+                                        let dest_v = (vp.0 as u64 + (current_offset * n_kv * h_d * 2) as u64) as CUdeviceptr;
+                                        cl.cuMemcpyHtoD_v2(dest_v, vt.data().as_ptr() as *const _, vt.data().len());
+                                    }
+                                }
+                            } else {
+                                let mut kv_host = layer.kv_cache.lock().unwrap();
+                                kv_host.grow(total_tokens, n_kv, h_d);
+                                
+                                let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                                let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
+                                
+                                if target_dim > actual_source_dim && target_dim % actual_source_dim == 0 {
+                                    let ratio = target_dim / actual_source_dim;
+                                    let k_units_per_token = actual_source_dim / 32;
+                                    let mut new_k = Vec::with_capacity(k_data.len() * ratio);
+                                    let mut new_v = Vec::with_capacity(v_data.len() * ratio);
+                                    for chunk in k_data.chunks_exact(k_units_per_token) { for _ in 0..ratio { new_k.extend_from_slice(chunk); } }
+                                    for chunk in v_data.chunks_exact(actual_source_dim) { for _ in 0..ratio { new_v.extend_from_slice(chunk); } }
+                                    k_data = new_k; v_data = new_v;
+                                }
+        
+                                let k_unit = n_kv * (h_d/32);
+                                let v_unit = n_kv * h_d;
+                                kv_host.k[current_offset * k_unit .. (current_offset + tokens_in_part) * k_unit].copy_from_slice(&k_data);
+                                kv_host.v[current_offset * v_unit .. (current_offset + tokens_in_part) * v_unit].copy_from_slice(&v_data);
+                            }
+                        }
+                        current_offset += tokens_in_part;
+                    }
+                    gpu_kv.current_len = total_tokens;
+                    if self.device_id < 0 {
+                        layer.kv_cache.lock().unwrap().current_len = total_tokens;
+                    }
+                }
+                println!("[KV-STITCH] Successfully stitched {} tokens into GPU/CPU cache.", total_tokens);
+                Ok(())
+            }
+        
+            pub fn forward(&self, i_ids: &[u32], pv: Option<&[f16]>, gt: Option<&[u32; 3]>, so: usize) -> Vec<f16> {
+        
         let is_baking = self.text_model.layers.len() <= 1; let is_vision = pv.is_some();
         let mut wl = if is_baking { self.support_workspace.lock().unwrap() } else { self.workspace.lock().unwrap() };
         let mut embeds = match &self.text_model.embed_tokens.variant {

@@ -203,27 +203,11 @@ impl NativeTensor {
             cuda_lib.cuCtxGetCurrent(&mut ctx);
             if ctx == std::ptr::null_mut() {
                 let mut dev = 0 as CUdevice;
-                let res_get = cuda_lib.cuDeviceGet(&mut dev, device_id);
-                if res_get as i32 != 0 {
-                    println!("[GPU-RECOVERY] cuDeviceGet failed (Code: {}). Attempting Hard Reset...", res_get as i32);
-                    // [RESCUE] Try to release and re-acquire primary context
-                    let mut dummy_dev = 0 as CUdevice;
-                    if cuda_lib.cuDeviceGet(&mut dummy_dev, device_id) as i32 == 0 {
-                        cuda_lib.cuDevicePrimaryCtxRelease_v2(dummy_dev);
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    
-                    if cuda_lib.cuDeviceGet(&mut dev, device_id) as i32 != 0 {
-                        return Err(anyhow::anyhow!("CUDA Recovery Failed: Cannot get device {} (Code: {})", device_id, res_get as i32));
-                    }
+                if cuda_lib.cuDeviceGet(&mut dev, device_id) as i32 != 0 {
+                    return Err(anyhow::anyhow!("Failed to get CUDA device {}", device_id));
                 }
-                
-                let res_retain = cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
-                if res_retain as i32 != 0 {
-                    return Err(anyhow::anyhow!("CUDA PrimaryCtxRetain Failed (Code: {})", res_retain as i32));
-                }
+                cuda_lib.cuDevicePrimaryCtxRetain(&mut ctx, dev);
                 cuda_lib.cuCtxSetCurrent(ctx);
-                println!("[GPU-SUCCESS] CUDA Context initialized for device {}", device_id);
             }
             let size_raw = self.shape.iter().product::<usize>();
             let size_bytes = size_raw * if self.dtype == NativeDType::U32 || self.dtype == NativeDType::F32 { 4 } else { 2 };

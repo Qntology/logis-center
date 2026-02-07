@@ -779,57 +779,6 @@ impl Qwen3VLGenerateModel {
                                 k_data = new_k; v_data = new_v;
                             }
                             
-                            // [2026-LOGIC-RESCUE] Hierarchical Attention Smoothing (1/L)
-                            // We fix the 'Brain' (Attention) instead of 'Mouth' (Logits).
-                            // By scaling both K and V, we ensure that upper layers treat the 0.6B memory 
-                            // as a 'Blurred Background Context' rather than sharp, noisy facts.
-                            if l_idx != src_idx {
-                                let factor = 1.0 / (l_idx as f32 + 1.0);
-                                
-                                // 1. Smooth the Keys (K) - Controls Attention Entropy
-                                // Scaling K towards zero makes the softmax distribution uniform (Smooth).
-                                let k_unit = target_dim / 32;
-                                if k_unit > 0 {
-                                    // K is packed bits (u32), we can't easily scale bits.
-                                    // However, the model's logic handles scaling in the forward pass if we inject it.
-                                    // Wait, in this engine, K is bit-packed. We can't scale it here.
-                                    // [CRITICAL-CORRECTION] Since K is bit-packed, we focus on aggressive V scaling 
-                                    // and Energy Normalization to achieve the smoothing effect.
-                                }
-
-                                // 2. Normalize and Scale the Values (V)
-                                if target_dim > 0 {
-                                    for (token_idx, token_chunk) in v_data.chunks_exact_mut(target_dim).enumerate() {
-                                        if token_idx < 4 { continue; } // Anchor protection
-
-                                        let mut sum_sq = 0.0f32;
-                                        let noise_seed = (l_idx * 1000 + token_idx) as f32;
-                                        
-                                        for (i, val) in token_chunk.iter_mut().enumerate() {
-                                            let v_f32 = val.to_f32();
-                                            let noise = ((noise_seed + i as f32).sin() * 0.001) as f32; 
-                                            let noisy_val = v_f32 + noise;
-                                            *val = f16::from_f32(noisy_val);
-                                            sum_sq += noisy_val * noisy_val;
-                                        }
-                                        
-                                        let norm = sum_sq.sqrt();
-                                        // We use an even more aggressive 'factor^2' for V to compensate for non-scalable K
-                                        let final_factor = factor * factor; 
-                                        let scale = if norm > 1e-6 { final_factor / norm } else { final_factor };
-                                        let scale_f16 = f16::from_f32(scale);
-                                        
-                                        if l_idx == 5 && token_idx == 10 {
-                                            println!("[KV-STITCH-BRAIN-FIX] Layer: {} | Smoothing Applied (Factor: {:.4})", l_idx, final_factor);
-                                        }
-
-                                        for val in token_chunk.iter_mut() {
-                                            *val = *val * scale_f16;
-                                        }
-                                    }
-                                }
-                            }
-
                             // Append to target layer's cache (allowing multiple components to stack)
                             let mut cache_guard = m.text_model.layers[l_idx].kv_cache.lock().unwrap();
                             cache_guard.k.extend(k_data); 
