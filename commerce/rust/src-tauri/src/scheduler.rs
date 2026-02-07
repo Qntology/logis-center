@@ -286,7 +286,7 @@ async fn process_task(
             if m.is_cpu_mode != wants_cpu {
                 m.unload_generator().await;
                 *model_lock = None;
-                let _ = wait_for_resources_settled(1000, 500, cancellation_token).await;
+                let _ = wait_for_resources_settled(600, 300, cancellation_token).await;
             }
         }
 

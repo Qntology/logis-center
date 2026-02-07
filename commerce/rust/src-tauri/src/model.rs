@@ -688,9 +688,9 @@ impl LogisModel {
         self.deep_purge_resources(force_purge).await;
         
         if !self.is_cpu_mode {
-            // [LATENCY-HIDE] Reduced wait time due to pre-warmed cache
+            // [LATENCY-HIDE] Reduced wait time due to pre-warmed cache and RoPE optimization
             tokio::time::sleep(Duration::from_millis(100)).await;
-            self.wait_for_vram_settle(1200, 3, cancel_token.clone()).await?;
+            self.wait_for_vram_settle(800, 3, cancel_token.clone()).await?;
         }
 
         self.ensure_generator_ext(target_size, baking_only, force_text_only).await?;
