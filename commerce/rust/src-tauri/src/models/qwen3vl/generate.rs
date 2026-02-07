@@ -148,13 +148,10 @@ impl Qwen3VLGenerateModel {
                 let small_file = std::fs::File::open(small_path)?;
                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&small_file)? }))
             } else { None }
-        } else if baking_only && tokenizer_path.is_some() {
-            let large_path = Path::new(tokenizer_path.unwrap()).join("model-BITSERIAL_ALL.safetensors");
-            if large_path.exists() {
-                let large_file = std::fs::File::open(large_path)?;
-                Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&large_file)? }))
-            } else { None }
-        } else { None };
+        } else {
+            // [FIX] Baking 모드일 때는 서포트 레이어 로드 안함 (순수 0.6B 엔진 사용)
+            None
+        };
 
         let native_model = NativeQwen3VLModel::load(vl_config.clone(), main_mmap, vision_mmap, baking_only, secondary_mmap)?;
         let mut qwen3_vl_native = Arc::new(native_model);
@@ -593,7 +590,7 @@ impl Qwen3VLGenerateModel {
 
     pub fn save_kv_to_disk(&self, path: &Path, start_token_idx: usize, tail_tokens: &[u32]) -> Result<()> {
         let (kvs, current_hidden_size) = match &self.qwen3_vl {
-            ModelVariant::Native(m) => (m.text_model.get_all_kv(start_token_idx), m.text_model.config.hidden_size),
+            ModelVariant::Native(m) => (m.get_all_kv(start_token_idx), m.text_model.config.hidden_size),
         };
 
         if kvs.is_empty() { 
@@ -810,7 +807,7 @@ impl Qwen3VLGenerateModel {
 
     pub fn get_kv_len(&self) -> usize {
         match &self.qwen3_vl {
-            ModelVariant::Native(m) => m.text_model.get_kv_len()
+            ModelVariant::Native(m) => m.get_kv_len()
         }
     }
 

@@ -829,5 +829,33 @@ impl NativeQwen3VLModel {
         if let Some(ref mut l0) = self.support_layer0 { l0.move_to_gpu(dev); println!("[LOAD] Hybrid Support Layer 0 moved to GPU-{}", dev); }
     }
     pub fn clear_kv_cache(&self) { self.text_model.clear_kv_cache(); }
-    pub fn force_free_kv_cache(&self) { self.text_model.force_free_kv_cache(); }
+    pub fn force_free_kv_cache(&self) { 
+        self.text_model.force_free_kv_cache(); 
+        if let Some(ref l0) = self.support_layer0 { l0.force_free_kv_cache(); }
+    }
+
+    pub fn get_kv_len(&self) -> usize {
+        // [HYBRID-VISIBILITY] If in baking mode and support_layer0 exists, it's the one holding the context
+        if self.text_model.layers.len() <= 1 && self.support_layer0.is_some() {
+            let l0 = self.support_layer0.as_ref().unwrap();
+            return l0.get_kv_len(self.text_model.config.head_dim, self.text_model.config.num_key_value_heads);
+        }
+        self.text_model.get_kv_len()
+    }
+
+    pub fn get_all_kv(&self, start_idx: usize) -> Vec<(Vec<u32>, Vec<f16>)> {
+        let hd = self.text_model.config.head_dim; 
+        let nkv = self.text_model.config.num_key_value_heads;
+        
+        // [HYBRID-VISIBILITY] Baking mode check
+        if self.text_model.layers.len() <= 1 && self.support_layer0.is_some() {
+            let l0 = self.support_layer0.as_ref().unwrap();
+            if let Some(kv) = l0.get_kv_data(hd, nkv, start_idx) {
+                return vec![kv];
+            }
+            return vec![];
+        }
+        
+        self.text_model.get_all_kv(start_idx)
+    }
 }
