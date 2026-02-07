@@ -770,6 +770,22 @@ impl Qwen3VLGenerateModel {
                             }
                             
                             // Append to target layer's cache (allowing multiple components to stack)
+                            if l_idx == 0 {
+                                if let Some(ref l0) = m.support_layer0 {
+                                    let mut l0_cache = l0.kv_cache.lock().unwrap();
+                                    l0_cache.k.extend(k_data.clone());
+                                    l0_cache.v.extend(v_data.clone());
+                                    let k_unit = target_dim / 32;
+                                    l0_cache.current_len = l0_cache.k.len() / k_unit;
+                                    l0_cache.capacity = l0_cache.current_len;
+                                    
+                                    #[cfg(feature = "cuda")]
+                                    if l0.device_id >= 0 {
+                                        l0.inject_gpu_kv(&k_data, &v_data, target_n_kv, target_head_dim);
+                                    }
+                                }
+                            }
+
                             let mut cache_guard = m.text_model.layers[l_idx].kv_cache.lock().unwrap();
                             cache_guard.k.extend(k_data); 
                             cache_guard.v.extend(v_data);
