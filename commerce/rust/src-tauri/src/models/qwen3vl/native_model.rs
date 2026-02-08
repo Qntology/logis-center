@@ -115,6 +115,7 @@ impl DynamicGpuKVCache {
                         let okb = self.current_len * n_kv * (head_dim/32) * 4;
                         let ovb = self.current_len * n_kv * head_dim * 2;
                         cl.cuMemcpyDtoD_v2(new_kp, old_k.0 as cudarc::driver::sys::CUdeviceptr, okb);
+                        cl.cuMemcpyDtoH_v2(std::ptr::null_mut(), 0, 0); // Flush
                         cl.cuMemcpyDtoD_v2(new_vp, old_v.0 as cudarc::driver::sys::CUdeviceptr, ovb);
                     }
                     cl.cuMemFree_v2(old_k.0 as cudarc::driver::sys::CUdeviceptr);
@@ -234,7 +235,7 @@ impl NativeLinear {
                 let w_cow = weight.get_slice::<f16>(); let b_cow = bias.as_ref().map(|t| t.get_slice::<f16>());
                 native_linear_f16_into(x, w_cow.as_ref(), b_cow.as_ref().map(|b| b.as_ref()), out, m, self.out_features, self.in_features);
             },
-            _ => { /* Other variants handled by forward_gpu in layer forward */ }
+            _ => { }
         }
     }
     pub fn forward(&self, x: &[f16], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
@@ -277,15 +278,15 @@ impl NativeLayer {
 
     pub fn forward<'a>(
         &self, x: &[f16], config: &Qwen3VLTextConfig, s_o: usize, _idx: usize, _r_cos: &[f16], _r_sin: &[f16], 
-        is_baking: bool, is_vision: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
+        _is_baking: bool, is_vision: bool, global_scratch: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>,
         workspace: &'a mut ForwardWorkspace, ping_pong: bool,
         rope_cache_gpu: &std::sync::Mutex<Option<(NativeTensor, NativeTensor)>>,
     ) -> &'a [f16] {
         let h_s = config.hidden_size; let q_len = x.len() / h_s; let h_d = config.head_dim;
         let n_h = config.num_attention_heads; let n_kv = config.num_key_value_heads;
         let out_ptr = if ping_pong { workspace.hidden_b.as_mut_ptr() } else { workspace.hidden_a.as_mut_ptr() };
-        let mut f_alpha = if is_vision { 2.0f32 } else { 1.2f32 };
-        let mut s_gain = if is_vision { 1.15f32 } else { 1.02f32 };
+        let f_alpha = if is_vision { 2.0f32 } else { 1.2f32 };
+        let s_gain = if is_vision { 1.15f32 } else { 1.02f32 };
 
         #[cfg(feature = "cuda")]
         if self.device_id >= 0 && self.device_id < 8 && !self.gpu_broken.load(Ordering::Relaxed) {
@@ -558,7 +559,7 @@ impl NativeQwen3VLModel {
                     let op = unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize; let os = unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
                     let variant = if format == 4 { LinearVariant::BitSliced4 { weight_packed: NativeTensor::from_mmap(cm.clone(), op, vp.shape().to_vec(), NativeDType::U32), scales: NativeTensor::from_mmap(cm.clone(), os, vs.shape().to_vec(), NativeDType::F16), bias: None } }
                                   else { LinearVariant::BitSerial { weight_packed: NativeTensor::from_mmap(cm.clone(), op, vp.shape().to_vec(), NativeDType::U32), scales: NativeTensor::from_mmap(cm.clone(), os, vs.shape().to_vec(), NativeDType::F16), bias: None } };
-                    Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant, device_id: active_gpu_id })
+                    Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: in_f, variant, device_id: active_gpu_id })
                 }
             } else {
                 let v = cst.tensor(&key)?; let si = v.shape()[1]; let so = v.shape()[0];
@@ -608,7 +609,6 @@ impl NativeQwen3VLModel {
         let q_out = t_c.num_attention_heads * t_c.head_dim; let kv_out = t_c.num_key_value_heads * t_c.head_dim;
         let mut support_layer0 = None;
         if let Some(ref sec_mmap) = s_mmap {
-            let sec_st = SafeTensors::deserialize(sec_mmap)?;
             let p = "model.language_model.layers.0";
             support_layer0 = Some(NativeLayer {
                 input_layernorm: get_t(&format!("{}.input_layernorm.weight", p), t_c.hidden_size)?,
@@ -634,8 +634,14 @@ impl NativeQwen3VLModel {
                 device_id: active_gpu_id, is_support_layer: false, kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()), gpu_broken: std::sync::atomic::AtomicBool::new(false),
             });
         }
-        let norm = get_t("model.language_model.norm.weight", t_c.hidden_size)?;
-        let lm_head = get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936, -1).or_else(|_| get_l("model.language_model.embed_tokens.weight", t_c.hidden_size, 151936, -1))?;
+        let norm = match get_t("model.language_model.norm.weight", t_c.hidden_size) {
+            Ok(t) => t,
+            Err(e) => { if baking { let h_size = t_c.hidden_size * 2; let dummy_vec = vec![0u8; h_size]; let boxed = dummy_vec.into_boxed_slice(); let ptr = boxed.as_ptr(); std::mem::forget(boxed); NativeTensor { data_ptr: ptr, host_size: h_size, gpu_ptr: None, shape: vec![t_c.hidden_size], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id } } else { return Err(e); } }
+        };
+        let lm_head = match get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936, -1).or_else(|_| get_l("model.language_model.embed_tokens.weight", t_c.hidden_size, 151936, -1)) {
+            Ok(l) => l,
+            Err(e) => { if baking { let dummy_vec = vec![0u8; 16]; let boxed = dummy_vec.into_boxed_slice(); let ptr = boxed.as_ptr(); std::mem::forget(boxed); NativeLinear { in_features: t_c.hidden_size, out_features: 151936, src_in: t_c.hidden_size, src_out: 151936, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr, host_size: 16, gpu_ptr: None, shape: vec![151936, t_c.hidden_size], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id } } else { return Err(e); } }
+        };
         let visual = if let Some(vm) = v_mmap {
             let vst = SafeTensors::deserialize(&vm)?;
             let get_vvl = |base: &str, ti: usize, to: usize| -> Result<NativeLinear> {
@@ -712,35 +718,27 @@ impl NativeQwen3VLModel {
         }
         if expanded_paths.is_empty() { return Ok(()); }
         let mut total_tokens = 0; let mut part_metadatas = Vec::new(); let mut part_mmaps = Vec::new();
-                        for path in &expanded_paths {
-                            let file = std::fs::File::open(path)?;
-                            let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
-                            let tokens = {
-                                let st = SafeTensors::deserialize(&mmap)?;
-                                let tokens = if let Ok(meta) = st.tensor("metadata.tokens") {
-                                    meta.shape()[0]
-                                } else if let Ok(kt) = st.tensor("layer.0.k") {
-                                    let total_u32s = kt.data().len() / 4;
-                                    let u32_per_token = n_kv * (h_d / 32);
-                                    if u32_per_token > 0 { total_u32s / u32_per_token } else { 0 }
-                                } else { 0 };
-                                
-                                if tokens > 0 {
-                                    if let Ok(tt) = st.tensor("metadata.tokens") {
-                                        let tokens_u32: Vec<u32> = tt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
-                                        self.text_model.rope_cache.lock().unwrap().tail_tokens = tokens_u32;
-                                    }
-                                }
-                                tokens
-                            };
-                            
-                            if tokens > 0 {
-                                total_tokens += tokens;
-                                part_metadatas.push(tokens);
-                                part_mmaps.push(mmap);
-                            }
-                        }
-        
+        for path in &expanded_paths {
+            let file = std::fs::File::open(path)?;
+            let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
+            let tokens = {
+                let st = SafeTensors::deserialize(&mmap)?;
+                let tokens = if let Ok(meta) = st.tensor("metadata.tokens") { meta.shape()[0] }
+                             else if let Ok(kt) = st.tensor("layer.0.k") { 
+                                 let total_u32s = kt.data().len() / 4;
+                                 let u32_per_token = n_kv * (h_d / 32);
+                                 if u32_per_token > 0 { total_u32s / u32_per_token } else { 0 }
+                             } else { 0 };
+                if tokens > 0 {
+                    if let Ok(tt) = st.tensor("metadata.tokens") {
+                        let tokens_u32: Vec<u32> = tt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
+                        self.text_model.rope_cache.lock().unwrap().tail_tokens = tokens_u32;
+                    }
+                }
+                tokens
+            };
+            if tokens > 0 { total_tokens += tokens; part_metadatas.push(tokens); part_mmaps.push(mmap); }
+        }
         if total_tokens == 0 { return Ok(()); }
         for l_idx in 0..num_target_layers {
             let layer = &self.text_model.layers[l_idx];
