@@ -144,7 +144,7 @@ impl DynamicGpuKVCache {
     pub fn clear(&mut self) { self.current_len = 0; }
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn log_tensor_health(name: &str, data: &[f16], shape: &[usize]) {
@@ -663,9 +663,12 @@ impl NativeQwen3TextModel {
         
         // [FIX] Execute support_layer0 if provided (Bridge for 2B models)
         if let Some(layer0) = sl {
-            let out = layer0.forward(cur_x, &self.config, s_o, 0, r_cos, r_sin, is_baking, is_vision, gs, ws, true, &self.rope_cache_gpu);
-            if should_log { log_tensor_health("Support Layer 0 Output", out, &[q_len, hid]); }
-            cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
+            let out_vec = layer0.forward(cur_x, &self.config, s_o, 0, r_cos, r_sin, is_baking, is_vision, gs, ws, true, &self.rope_cache_gpu);
+            if should_log { log_tensor_health("Support Layer 0 Output", &out_vec, &[q_len, hid]); }
+            
+            // Copy out_vec into hidden_b to ensure it stays alive and stable
+            ws.hidden_b[..out_vec.len()].copy_from_slice(&out_vec);
+            cur_x = unsafe { std::slice::from_raw_parts(ws.hidden_b.as_ptr(), out_vec.len()) };
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
