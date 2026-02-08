@@ -124,8 +124,8 @@ impl NativeLinear {
     #[cfg(feature = "cuda")]
     pub fn forward_gpu(&self, di: CUdeviceptr, dog: CUdeviceptr, m: usize) {
         unsafe { match &self.variant {
-            LinearVariant::Standard { weight, .. } => crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(di as *const f16, weight.gpu_ptr.unwrap().0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32),
-            LinearVariant::BitSerial { weight_packed, scales, .. } => crate::models::qwen3vl::native_backend::cuda_matmul_f16(di as *const f16, weight_packed.gpu_ptr.unwrap().0 as *const u32, scales.gpu_ptr.unwrap().0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32),
+            LinearVariant::Standard { weight, .. } => crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(di as *const f16, weight.gpu_ptr.expect("Weight must be on GPU").0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32),
+            LinearVariant::BitSerial { weight_packed, scales, .. } => crate::models::qwen3vl::native_backend::cuda_matmul_f16(di as *const f16, weight_packed.gpu_ptr.expect("Packed weight must be on GPU").0 as *const u32, scales.gpu_ptr.expect("Scales must be on GPU").0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32),
         } }
     }
     pub fn forward_into(&self, x: &[f16], out: &mut [f16], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) {
@@ -358,6 +358,7 @@ impl NativeQwen3VLModel {
             if cst.tensor(&format!("{}.packed", key)).is_ok() {
                 let vp = cst.tensor(&format!("{}.packed", key))?; let vs = cst.tensor(&format!("{}.scales", key))?; let format = cst.tensor(&format!("{}.format", key)).map(|t| t.data()[0] as i8).unwrap_or(1);
                 let (so, si) = if let Ok(sh) = cst.tensor(&format!("{}.shape", key)) { let sd = unsafe { std::slice::from_raw_parts(sh.data().as_ptr() as *const i32, 2) }; (sd[0] as usize, sd[1] as usize) } else { (outf, inf) };
+                
                 if format == 4 || inf > si || outf > so {
                     let dq = dequantize_bit_serial_to_f16(unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) }, unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) }, so, si, inf, if format == 4 { 4 } else { 1 });
                     let boxed = dq.into_boxed_slice(); let ptr = boxed.as_ptr(); std::mem::forget(boxed);
@@ -397,17 +398,22 @@ impl NativeQwen3VLModel {
         }
         let norm = match get_t("model.language_model.norm.weight", t_c.hidden_size) { Ok(t) => t, Err(e) => if baking { let h = t_c.hidden_size*2; let d = vec![0u8; h]; let b = d.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b); NativeTensor { data_ptr: p, host_size: h, gpu_ptr: None, shape: vec![t_c.hidden_size], dtype: NativeDType::F16, _mmap: None, device_id: dev_id } } else { return Err(e); } };
         let head = match get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936).or_else(|_| get_l("model.language_model.embed_tokens.weight", t_c.hidden_size, 151936)) { Ok(l) => l, Err(e) => if baking { let d = vec![0u8; 16]; let b = d.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b); NativeLinear { in_features: t_c.hidden_size, out_features: 151936, src_in: t_c.hidden_size, src_out: 151936, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: p, host_size: 16, gpu_ptr: None, shape: vec![151936, t_c.hidden_size], dtype: NativeDType::F16, _mmap: None, device_id: dev_id }, bias: None }, device_id: dev_id } } else { return Err(e); } };
+        
         let mut model = Self {
             config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, t_c.rope_theta, 32768)), rope_cache_gpu: std::sync::Mutex::new(None) },
             lm_head: head, visual: None, support_layer0: None, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
         };
+
         #[cfg(feature = "cuda")] if dev_id >= 0 { 
+            println!("[MODEL-PUSH] Initiating VRAM Offload for all weights...");
+            let _ = model.move_to_gpu(dev_id); 
             let pb = 2048 * t_c.hidden_size.max(t_c.intermediate_size) * 4; 
             unsafe { let cl = crate::models::qwen3vl::native_backend::lib(); let (mut p1, mut p2, mut p3) = (0, 0, 0); 
-                if (cl.cuMemAlloc_v2(&mut p1, pb) as i32) == 0 { *model.global_scratch_i.get_mut().unwrap() = Some((GpuPtr(p1 as *mut _), pb)); println!("[DIAG-LOAD] Scratch I Secured at {:p}", p1 as *mut ()); } 
-                if (cl.cuMemAlloc_v2(&mut p2, pb) as i32) == 0 { *model.global_scratch_o.get_mut().unwrap() = Some((GpuPtr(p2 as *mut _), pb)); println!("[DIAG-LOAD] Scratch O Secured at {:p}", p2 as *mut ()); } 
-                if (cl.cuMemAlloc_v2(&mut p3, pb) as i32) == 0 { *model.global_scratch_r.get_mut().unwrap() = Some((GpuPtr(p3 as *mut _), pb)); println!("[DIAG-LOAD] Scratch R Secured at {:p}", p3 as *mut ()); } 
+                if (cl.cuMemAlloc_v2(&mut p1, pb) as i32) == 0 { *model.global_scratch_i.get_mut().unwrap() = Some((GpuPtr(p1 as *mut _), pb)); } 
+                if (cl.cuMemAlloc_v2(&mut p2, pb) as i32) == 0 { *model.global_scratch_o.get_mut().unwrap() = Some((GpuPtr(p2 as *mut _), pb)); } 
+                if (cl.cuMemAlloc_v2(&mut p3, pb) as i32) == 0 { *model.global_scratch_r.get_mut().unwrap() = Some((GpuPtr(p3 as *mut _), pb)); } 
             } 
+            println!("[MODEL-PUSH] VRAM Offload Complete.");
         }
         Ok(model)
     }
@@ -437,8 +443,7 @@ impl NativeQwen3VLModel {
                 }
             }
         }
-        if expanded.is_empty() { println!("[DIAG-KV] No shards found in search paths."); return Ok(()); }
-        println!("[DIAG-KV] Discovered {} shard(s).", expanded.len());
+        if expanded.is_empty() { println!("[DIAG-KV] No shards found."); return Ok(()); }
         let mut total_t = 0; let mut metadatas = Vec::new(); let mut mmaps = Vec::new();
         for path in &expanded {
             let file = std::fs::File::open(path)?; let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
@@ -455,12 +460,9 @@ impl NativeQwen3VLModel {
                 }
                 t
             };
-            if tokens > 0 {
-                println!("[DIAG-KV] Shard: {:?} | Tokens: {}", path.file_name().unwrap(), tokens);
-                total_t += tokens; metadatas.push(tokens); mmaps.push(mmap);
-            }
+            if tokens > 0 { total_t += tokens; metadatas.push(tokens); mmaps.push(mmap); }
         }
-        if total_t == 0 { println!("[DIAG-KV] Error: Total token count is 0 after scanning."); return Ok(()); }
+        if total_t == 0 { return Ok(()); }
         println!("[DIAG-KV] Total Stitched Tokens: {}", total_t);
         for l_idx in 0..self.text_model.layers.len() {
             let layer = &self.text_model.layers[l_idx]; let mut gpu_kv = layer.gpu_kv_cache.lock().unwrap();
