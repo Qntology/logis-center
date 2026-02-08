@@ -64,6 +64,7 @@ impl DynamicGpuKVCache {
                     cl.cuDevicePrimaryCtxRetain(&mut ctx, d); cl.cuCtxSetCurrent(ctx);
                 }
                 let mut nkp: cudarc::driver::sys::CUdeviceptr = 0; let mut nvp: cudarc::driver::sys::CUdeviceptr = 0;
+                // [FIX] Correct return type comparison
                 if (cl.cuMemAlloc_v2(&mut nkp, kb) as i32) != 0 || (cl.cuMemAlloc_v2(&mut nvp, vb) as i32) != 0 { return; }
                 if let (Some(ok), Some(ov)) = (self.k_ptr.take(), self.v_ptr.take()) {
                     if self.current_len > 0 {
@@ -242,7 +243,7 @@ impl NativeLayer {
         self.gate_proj.forward_into(&ws.intermediate_a[..x.len()], &mut ws.intermediate_b, gs); self.up_proj.forward_into(&ws.intermediate_a[..x.len()], &mut ws.intermediate_c, gs);
         native_silu_f16(&mut ws.intermediate_b[..q_len * config.intermediate_size]);
         for i in 0..q_len * config.intermediate_size { ws.intermediate_b[i] *= ws.intermediate_c[i]; }
-        let mut moh = vec![f16::ZERO; x.len()]; self.down_proj.forward_into(&workspace.intermediate_b[..q_len * config.intermediate_size], &mut moh, global_scratch);
+        let mut moh = vec![f16::ZERO; x.len()]; self.down_proj.forward_into(&ws.intermediate_b[..q_len * config.intermediate_size], &mut moh, gs);
         if self.down_proj.out_features > self.down_proj.src_out { for t in 0..q_len { for i in self.down_proj.src_out..self.down_proj.out_features { moh[t*self.down_proj.out_features+i] = moh[t*self.down_proj.out_features+(i%self.down_proj.src_out)]; } } }
         for i in 0..x.len() { os[i] += moh[i]; } os
     }
