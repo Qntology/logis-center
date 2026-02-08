@@ -139,6 +139,9 @@ unsafe impl Send for NativeLinear {}
 unsafe impl Sync for NativeLinear {}
 
 impl NativeLinear {
+    pub fn forward(&self, x: &[f16], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
+        let mut out = vec![f16::ZERO; (x.len() / self.in_features) * self.out_features]; self.forward_into(x, &mut out, gs); out
+    }
     #[cfg(feature = "cuda")]
     pub fn forward_gpu(&self, di: CUdeviceptr, dog: CUdeviceptr, m: usize) {
         unsafe { match &self.variant {
@@ -151,9 +154,9 @@ impl NativeLinear {
         match &self.variant {
             LinearVariant::Standard { weight, bias } => {
                 #[cfg(feature = "cuda")] if self.device_id >= 0 {
-                    if let Some(w_gpu) = weight.gpu_ptr {
-                        let di = gs.and_then(|(si, _, _)| si.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr)).unwrap_or(0);
-                        let dog = gs.and_then(|(_, so, _)| so.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr)).unwrap_or(0);
+                    if let (Some(w_gpu), Some((si, so, _))) = (weight.gpu_ptr, gs) {
+                        let di = si.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr).unwrap_or(0);
+                        let dog = so.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr).unwrap_or(0);
                         if di != 0 && dog != 0 { unsafe {
                             let cl = crate::models::qwen3vl::native_backend::lib(); let _ = cl.cuMemcpyHtoD_v2(di, x.as_ptr() as *const _, x.len() * 2);
                             crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(di as *const f16, w_gpu.0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32);
@@ -263,7 +266,17 @@ impl NativeLayer {
         }
         for i in 0..x.len() { os[i] += moh[i]; } os
     }
-    pub fn clear_kv_cache(&self) { self.kv_cache.lock().unwrap().k = Vec::new(); self.kv_cache.lock().unwrap().v = Vec::new(); self.gpu_kv_cache.lock().unwrap().capacity = 0; }
+    pub fn clear_kv_cache(&self) { self.kv_cache.lock().unwrap().current_len = 0; self.gpu_kv_cache.lock().unwrap().current_len = 0; }
+}
+
+pub struct NativeVisionModel { pub patch_embed: NativeLinear, pub blocks: Vec<NativeLayer>, pub merger: NativeLayer }
+impl NativeVisionModel {
+    pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.patch_embed.move_to_gpu(dev)?; for b in &mut self.blocks { b.move_to_gpu(dev)?; } self.merger.move_to_gpu(dev)?; Ok(()) }
+    pub fn forward<'a>(&self, pv: &[f16], gt: &[u32; 3], rc: &[f16], rs: &[f16], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>, ws: &'a mut ForwardWorkspace, rope_gpu: &std::sync::Mutex<Option<(NativeTensor, NativeTensor)>>) -> &'a [f16] {
+        let eo = self.patch_embed.forward(pv, gs); ws.hidden_a[..eo.len()].copy_from_slice(&eo); let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), eo.len()) };
+        for (i, block) in self.blocks.iter().enumerate() { let out = block.forward(cur_x, &Qwen3VLTextConfig { hidden_size: self.patch_embed.out_features, intermediate_size: block.gate_proj.out_features, num_hidden_layers: 1, num_attention_heads: 16, num_key_value_heads: 16, head_dim: self.patch_embed.out_features / 16, rms_norm_eps: 1e-6, rope_theta: 10000.0, vocab_size: 0, max_position_embeddings: 32768, dtype: None, rope_scaling: None }, 0, 0, rc, rs, false, true, gs, ws, i % 2 != 0, rope_gpu); cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) }; }
+        self.merger.forward(cur_x, &Qwen3VLTextConfig { hidden_size: cur_x.len() / (gt[1] * gt[2]) as usize, intermediate_size: cur_x.len() / (gt[1] * gt[2]) as usize, num_hidden_layers: 1, num_attention_heads: 1, num_key_value_heads: 1, head_dim: cur_x.len() / (gt[1] * gt[2]) as usize, rms_norm_eps: 1e-6, rope_theta: 10000.0, vocab_size: 0, max_position_embeddings: 32768, dtype: None, rope_scaling: None }, 0, 0, rc, rs, false, true, gs, ws, self.blocks.len() % 2 == 0, rope_gpu)
+    }
 }
 
 pub struct NativeQwen3TextModel {
@@ -285,11 +298,12 @@ impl NativeQwen3TextModel {
             if i == 0 || i == self.layers.len() - 1 { log_tensor_health(&format!("Layer {} Output", i), out, &[q_len, hid]); }
             cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
         }
-        let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()];
-        native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
+        let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()]; native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
         log_tensor_health("Final Norm Output", &cn, &[q_len, hid]); cn
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.embed_tokens.move_to_gpu(dev)?; self.norm.move_to_gpu(dev)?; for l in &mut self.layers { l.move_to_gpu(dev)?; } Ok(()) }
+    pub fn force_free_kv_cache(&self) { for l in &self.layers { l.kv_cache.lock().unwrap().k = Vec::new(); l.kv_cache.lock().unwrap().v = Vec::new(); } }
+    pub fn batch_upload_stitched_cache(&self, k: Vec<u32>, v: Vec<f16>) { for l in &self.layers { l.kv_cache.lock().unwrap().k = k.clone(); l.kv_cache.lock().unwrap().v = v.clone(); } }
 }
 
 pub struct NativeQwen3VLModel {
@@ -300,6 +314,12 @@ pub struct NativeQwen3VLModel {
 }
 
 impl NativeQwen3VLModel {
+    pub fn get_kv_len(&self) -> usize { self.text_model.layers[0].kv_cache.lock().unwrap().k.len() / (self.text_model.config.num_key_value_heads * self.text_model.config.head_dim / 32) }
+    pub fn clear_kv_cache(&self) { self.text_model.layers.iter().for_each(|l| l.clear_kv_cache()); }
+    pub fn get_all_kv(&self, st: usize) -> Vec<(Vec<u32>, Vec<f16>)> { 
+        let hd = self.text_model.config.head_dim; let nkv = self.text_model.config.num_key_value_heads;
+        self.text_model.layers.iter().filter_map(|l| l.get_kv_data(hd, nkv, st)).collect()
+    }
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>, dev_id: i32) -> Result<Self> {
         let st = SafeTensors::deserialize(&m_mmap)?; let st_sec = s_mmap.as_ref().map(|m| SafeTensors::deserialize(m)).transpose()?;
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
@@ -359,7 +379,7 @@ impl NativeQwen3VLModel {
         Ok(model)
     }
     pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<()> {
-        let n_kv = self.text_model.config.num_key_value_heads; let h_d = self.text_model.config.head_dim; self.text_model.force_free_kv_cache();
+        let n_kv = self.text_model.config.num_key_value_heads; let h_d = self.text_model.config.head_dim;
         let mut expanded = Vec::new();
         for p in paths {
             if p.exists() && p.is_file() { expanded.push(p.clone()); } else {
@@ -383,7 +403,6 @@ impl NativeQwen3VLModel {
             if tokens > 0 { total_t += tokens; metadatas.push(tokens); mmaps.push(mmap); }
         }
         if total_t == 0 { return Ok(()); }
-        println!("[DIAG-KV] Total Stitched Tokens: {}", total_t);
         for l_idx in 0..self.text_model.layers.len() {
             let layer = &self.text_model.layers[l_idx]; let mut gpu_kv = layer.gpu_kv_cache.lock().unwrap();
             #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { gpu_kv.grow(total_t, n_kv, h_d, self.lm_head.device_id); }
@@ -395,8 +414,8 @@ impl NativeQwen3VLModel {
                 if let (Ok(kt), Ok(vt)) = (st.tensor(&format!("layer.{}.k", si)), st.tensor(&format!("layer.{}.v", si))) {
                     #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { unsafe {
                         let cl = crate::models::qwen3vl::native_backend::lib();
-                        if let Some(kp) = gpu_kv.k_ptr { cl.cuMemcpyHtoD_v2((kp.0 as u64 + (curr_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr, kt.data().as_ptr() as *const _, kt.data().len()); }
-                        if let Some(vp) = gpu_kv.v_ptr { cl.cuMemcpyHtoD_v2((vp.0 as u64 + (curr_o * n_kv * h_d * 2) as u64) as CUdeviceptr, vt.data().as_ptr() as *const _, vt.data().len()); }
+                        if let Some(kp) = gpu_kv.k_ptr { let _ = cl.cuMemcpyHtoD_v2((kp.0 as u64 + (curr_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr, kt.data().as_ptr() as *const _, kt.data().len()); }
+                        if let Some(vp) = gpu_kv.v_ptr { let _ = cl.cuMemcpyHtoD_v2((vp.0 as u64 + (curr_o * n_kv * h_d * 2) as u64) as CUdeviceptr, vt.data().as_ptr() as *const _, vt.data().len()); }
                     } }
                 }
                 curr_o += tip;
@@ -431,11 +450,5 @@ impl RopeCache {
 }
 
 impl NativeTensor {
-
-    pub fn from_raw(p: *const u8, sz: usize, sh: Vec<usize>, dt: NativeDType, dev: i32) -> Self { 
-
-        Self { data_ptr: p, host_size: sz, gpu_ptr: None, shape: sh, dtype: dt, _mmap: None, device_id: dev } 
-
-    }
-
+    pub fn from_raw(p: *const u8, sz: usize, sh: Vec<usize>, dt: NativeDType, dev: i32) -> Self { Self { data_ptr: p, host_size: sz, gpu_ptr: None, shape: sh, dtype: dt, _mmap: None, device_id: dev } }
 }
