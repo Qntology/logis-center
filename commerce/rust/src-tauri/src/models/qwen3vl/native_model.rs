@@ -100,9 +100,22 @@ pub fn dequantize_bit_serial_to_f16(p: &[u32], s: &[f16], n: usize, sk: usize, t
                 for b in 0..32 {
                     let k_base = skb_idx * 32 + b; if k_base >= sk { break; }
                     let mut b_sum = 0.0f32;
-                    for sl in 0..sc { if ((p[sl * ss + (no * skb + skb_idx) * 8 + sub_n] >> b) & 1) == 1 { b_sum += (1 << sl) as f32; } }
-                    let f_val = if sc == 4 { (b_sum - 8.0) * s[n_idx].to_f32() } else { (if b_sum >= 1.0 { 1.0 } else { -1.0 }) * s[(no * skb + skb_idx) * 8 + sub_n].to_f32() };
-                    for r in 0..ratio { out[n_idx * tk + k_base + (r * sk)] = f16::from_f32(f_val); }
+                    for sl in 0..sc { 
+                        if ((p[sl * ss + (no * skb + skb_idx) * 8 + sub_n] >> b) & 1) == 1 { 
+                            b_sum += (1 << sl) as f32; 
+                        } 
+                    }
+                    let f_val = if sc == 4 { 
+                        (b_sum - 8.0f32) * s[n_idx].to_f32() 
+                    } else { 
+                        (if b_sum >= 1.0 { 1.0f32 } else { -1.0f32 }) * s[(no * skb + skb_idx) * 8 + sub_n].to_f32() 
+                    };
+                    for r in 0..ratio { 
+                        let target_idx = n_idx * tk + k_base + (r * sk);
+                        if target_idx < out.len() {
+                            out[target_idx] = f16::from_f32(f_val); 
+                        }
+                    }
                 }
             }
         }
@@ -358,12 +371,15 @@ impl NativeQwen3VLModel {
             if cst.tensor(&format!("{}.packed", key)).is_ok() {
                 let vp = cst.tensor(&format!("{}.packed", key))?; let vs = cst.tensor(&format!("{}.scales", key))?; let format = cst.tensor(&format!("{}.format", key)).map(|t| t.data()[0] as i8).unwrap_or(1);
                 let (so, si) = if let Ok(sh) = cst.tensor(&format!("{}.shape", key)) { let sd = unsafe { std::slice::from_raw_parts(sh.data().as_ptr() as *const i32, 2) }; (sd[0] as usize, sd[1] as usize) } else { (outf, inf) };
-                if inf > si || outf > so {
+                
+                // [STABILITY] Always dequantize 4-bit sliced (Format 4) to FP16 at load time.
+                // These are critical layers (lm_head, embed) where precision is paramount.
+                if format == 4 || inf > si || outf > so {
                     let dq = dequantize_bit_serial_to_f16(unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) }, unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) }, so, si, inf, if format == 4 { 4 } else { 1 });
                     let boxed = dq.into_boxed_slice(); let ptr = boxed.as_ptr(); std::mem::forget(boxed);
                     return Ok(NativeLinear { in_features: inf, out_features: outf, src_in: si, src_out: so, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: ptr as *const u8, host_size: outf*inf*2, gpu_ptr: None, shape: vec![outf, inf], dtype: NativeDType::F16, _mmap: None, device_id: dev_id }, bias: None }, device_id: dev_id });
                 }
-                Ok(NativeLinear { in_features: inf, out_features: outf, src_in: inf, src_out: outf, variant: if format == 4 { LinearVariant::BitSliced4 { weight_packed: NativeTensor::from_mmap(cm.clone(), unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vp.shape().to_vec(), NativeDType::U32), scales: NativeTensor::from_mmap(cm.clone(), unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vs.shape().to_vec(), NativeDType::F16), bias: None } } else { LinearVariant::BitSerial { weight_packed: NativeTensor::from_mmap(cm.clone(), unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vp.shape().to_vec(), NativeDType::U32), scales: NativeTensor::from_mmap(cm.clone(), unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vs.shape().to_vec(), NativeDType::F16), bias: None } }, device_id: dev_id })
+                Ok(NativeLinear { in_features: inf, out_features: outf, src_in: inf, src_out: outf, variant: LinearVariant::BitSerial { weight_packed: NativeTensor::from_mmap(cm.clone(), unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vp.shape().to_vec(), NativeDType::U32), scales: NativeTensor::from_mmap(cm.clone(), unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vs.shape().to_vec(), NativeDType::F16), bias: None }, device_id: dev_id })
             } else {
                 let v = cst.tensor(&key)?; let o = unsafe { v.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
                 Ok(NativeLinear { in_features: inf, out_features: outf, src_in: inf, src_out: outf, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(cm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: dev_id })
