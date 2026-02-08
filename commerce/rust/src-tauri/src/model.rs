@@ -299,6 +299,7 @@ impl LogisModel {
             if let Some(gen) = gen_guard.as_mut() {
                 // [FIX] Always use address_hash if available, as that's where shared_pug_base lives
                 let kv_dir = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref());
+                let base_path = kv_dir.join(format!("{}.safetensors", task_id_str));
                 println!("[SSD-BRIDGE] Looking for memory shards in: {:?}", kv_dir);
                 
                 let mut target_paths = Vec::new();
