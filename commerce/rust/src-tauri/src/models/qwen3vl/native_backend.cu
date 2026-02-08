@@ -102,7 +102,6 @@ __global__ void bit_serial_matmul_kernel_4bit_f16(
     float r_scale = rsqrtf((float)repetition);
 
     float acc = 0.0f;
-    float s_val = (m < M && n < N) ? __half2float(scale[n]) : 0.0f; 
 
     for (int kb = 0; kb < src_k_blocks; ++kb) {
         if (n_sub == 0) {
@@ -131,6 +130,7 @@ __global__ void bit_serial_matmul_kernel_4bit_f16(
 
         if (m < M && n < N) {
             int base_idx = n_group * K_blocks * 8 + kb * 8 + n_sub;
+            float s_val = __half2float(scale[n]); // [FIX] Dynamic scale fetch per output channel
             
             float slice_acc_sum = 0.0f;
             #pragma unroll
@@ -140,7 +140,7 @@ __global__ void bit_serial_matmul_kernel_4bit_f16(
                 float pop = (float)(32 - 2 * (int)__popc(diff));
                 slice_acc_sum += pop * (float)(1 << b);
             }
-            // Accurate 4-bit accumulation without arbitrary offsets
+            // Accurate 4-bit accumulation
             acc += slice_acc_sum * s_val * s_input_scales[m_sub]; 
         }
         __syncthreads();

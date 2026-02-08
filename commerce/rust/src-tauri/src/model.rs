@@ -294,10 +294,35 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref()).join(format!("{}.safetensors", task_id_str));
-                if path.exists() {
-                    println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
-                    gen.load_kv_from_disk(&path)?;
+                let kv_dir = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref());
+                let base_path = kv_dir.join(format!("{}.safetensors", task_id_str));
+                
+                let mut target_paths = Vec::new();
+                if base_path.exists() {
+                    target_paths.push(base_path);
+                } else {
+                    // Try to find shards
+                    if let Ok(entries) = std::fs::read_dir(&kv_dir) {
+                        let mut shards = Vec::new();
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                            if name.starts_with(&task_id_str) && name.contains("_shard") && name.ends_with(".safetensors") {
+                                shards.push(p);
+                            }
+                        }
+                        // Sort shards
+                        shards.sort_by_key(|p| {
+                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                            name.split("_shard").last().and_then(|s| s.replace(".safetensors", "").parse::<usize>().ok()).unwrap_or(0)
+                        });
+                        target_paths = shards;
+                    }
+                }
+
+                if !target_paths.is_empty() {
+                    println!("[SSD-BRIDGE] Loading {} KV component(s) for {}", target_paths.len(), task_id_str);
+                    gen.load_kv_stitched(&target_paths)?;
                     Ok(())
                 } else {
                     println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
