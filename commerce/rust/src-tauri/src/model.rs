@@ -302,26 +302,45 @@ impl LogisModel {
                 if base_path.exists() {
                     target_paths.push(base_path);
                 } else {
-                    // [FIX] Try to find shards using both task_id and common base patterns
-                    if let Ok(entries) = std::fs::read_dir(&kv_dir) {
-                        let mut shards = Vec::new();
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                            // Look for task-specific shards OR shared pug base shards
-                            if (name.starts_with(&task_id_str) || name.starts_with("shared_pug_base")) 
-                               && name.contains("_shard") && name.ends_with(".safetensors") {
-                                shards.push(p);
+                    // [DIAG-KV] Deep Shard Discovery
+                    let mut shards = Vec::new();
+                    let scan_roots = vec![kv_dir.clone(), kv_dir.parent().unwrap_or(&kv_dir).to_path_buf()];
+                    
+                    for root in scan_roots {
+                        println!("[DIAG-KV] Deep scanning: {:?}", root);
+                        if let Ok(entries) = std::fs::read_dir(&root) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.is_dir() {
+                                    // Also scan subdirectories (one level deep)
+                                    if let Ok(sub_entries) = std::fs::read_dir(&p) {
+                                        for sub_entry in sub_entries.flatten() {
+                                            let sp = sub_entry.path();
+                                            let name = sp.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                            if name.contains("shared_pug_base") && name.ends_with(".safetensors") {
+                                                println!("[DIAG-KV] Found shard in subfolder: {}", sp.display());
+                                                shards.push(sp);
+                                            }
+                                        }
+                                    }
+                                }
+                                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                if name.contains("shared_pug_base") && name.ends_with(".safetensors") {
+                                    println!("[DIAG-KV] Found shard in root: {}", p.display());
+                                    shards.push(p);
+                                }
                             }
                         }
-                        // Sort shards by their numeric suffix
-                        shards.sort_by_key(|p| {
-                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                            let re = Regex::new(r"_shard(\d+)").unwrap();
-                            re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
-                        });
-                        target_paths = shards;
+                        if !shards.is_empty() { break; }
                     }
+                    
+                    // Numeric Sort
+                    let re = Regex::new(r"shard(\d+)").unwrap();
+                    shards.sort_by_key(|p| {
+                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
+                    });
+                    target_paths = shards;
                 }
 
                 if !target_paths.is_empty() {
