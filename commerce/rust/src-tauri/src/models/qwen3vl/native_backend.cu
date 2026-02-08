@@ -366,7 +366,8 @@ extern "C" {
     // 2. Bit-Serial Attention
     void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha, int src_h_d) {
         dim3 block(h_d < 1024 ? h_d : 1024); 
-        dim3 grid(q_len, n_h);
+        // [FIX] Correct axis mapping: x=heads, y=tokens to match kernel internals
+        dim3 grid(n_h, q_len); 
         bit_serial_attn_kernel_f16<<<grid, block>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha, src_h_d);
     }
 
@@ -379,7 +380,8 @@ extern "C" {
 
     // 4. RMS Norm
     void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
-        rms_norm_kernel_f16<<<m, hid, hid * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
+        int threads = (hid < 1024) ? hid : 1024;
+        rms_norm_kernel_f16<<<m, threads, threads * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
     }
 
     // 5. Silu Mul
