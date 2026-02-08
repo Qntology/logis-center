@@ -197,18 +197,19 @@ __global__ void bit_serial_attn_kernel_f16(
     }
     __syncthreads();
     
-    float running_max = -1e20f;
+    float running_max = -10000.0f; // [STABILITY] Use a safer initial max for half-precision ranges
     float running_sum = 0.0f;
     float local_o = 0.0f; 
 
     for (int j = 0; j < t_s; ++j) {
         float dot = 0.0f;
         for (int kb = 0; kb < src_k_b; ++kb) {
-            // [FIX] Use h_d_blocks for correct KV memory stride
             dot += (float)(32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * h_d_blocks + kb])) * s_q_scales[kb];
         }
         float score = (dot + alpha) * sc;
-        if (score < -15.0f) score = -15.0f;
+        // [STABILITY] Clamp scores to prevent exp() overflow
+        if (score < -20.0f) score = -20.0f;
+        if (score > 20.0f) score = 20.0f;
 
         float n_max = fmaxf(running_max, score);
         float e_scale = expf(running_max - n_max);
@@ -223,7 +224,8 @@ __global__ void bit_serial_attn_kernel_f16(
     }
 
     if (tid < h_d) {
-        O[(q_idx * n_h * h_d) + (h * h_d) + tid] = __float2half(local_o / (running_sum + 1e-9f));
+        // [STABILITY] Add stronger epsilon to prevent division by zero
+        O[(q_idx * n_h * h_d) + (h * h_d) + tid] = __float2half(local_o / (running_sum + 1e-12f));
     }
 }
 
