@@ -84,8 +84,7 @@ fn log_tensor_health(name: &str, data: &[f16], shape: &[usize]) {
     if data.is_empty() { return; }
     let (mut min, mut max, mut sum) = (3.4e38f32, -3.4e38f32, 0.0f32);
     for &v in data { 
-        let f = v.to_f32(); 
-        if f.is_nan() || f.is_infinite() { continue; }
+        let f = v.to_f32(); if f.is_nan() || f.is_infinite() { continue; }
         if f < min { min = f; } if f > max { max = f; } sum += f.abs(); 
     }
     println!("[HEALTH] {:<40} | Shape: {:<12?} | Min: {:>8.4} | Max: {:>8.4} | AbsAvg: {:>8.4}", name, shape, if min > 3e38 { 0.0 } else { min }, if max < -3e38 { 0.0 } else { max }, sum / data.len() as f32);
@@ -120,7 +119,7 @@ impl NativeLinear {
     #[cfg(feature = "cuda")]
     pub fn forward_gpu(&self, di: CUdeviceptr, dog: CUdeviceptr, m: usize) {
         unsafe { match &self.variant {
-            LinearVariant::Standard { weight, .. } => crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(di as *const f16, weight.gpu_ptr.unwrap().0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32),
+            LinearVariant::Standard { weight, .. } => crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(di as *const f16, weight.gpu_ptr.expect("W not on GPU").0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32),
             LinearVariant::BitSerial { weight_packed, scales, .. } => crate::models::qwen3vl::native_backend::cuda_matmul_f16(di as *const f16, weight_packed.gpu_ptr.unwrap().0 as *const u32, scales.gpu_ptr.unwrap().0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32),
             LinearVariant::BitSliced4 { weight_packed, scales, .. } => crate::models::qwen3vl::native_backend::cuda_matmul_4bit_f16(di as *const f16, weight_packed.gpu_ptr.unwrap().0 as *const u32, scales.gpu_ptr.unwrap().0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32),
         } }
@@ -198,81 +197,35 @@ impl NativeLayer {
                 let drg = sr.lock().unwrap().as_ref().map(|(p, s)| if *s >= rb { p.0 as CUdeviceptr } else { 0 }).unwrap_or(0);
                 if di != 0 && dog != 0 && drg != 0 {
                     unsafe {
-                        let cl = crate::models::qwen3vl::native_backend::lib(); 
-                        // x is in host memory. x.len() = q_len * h_s
-                        
-                        // Buffer Strategy:
-                        // di: holds Q, then later holds Normalized Residual
-                        // dog: holds Normalized Input, then later holds Attention Output
-                        // drg: holds K, then later holds Up Projection
-                        
-                        // 1. RMSNorm(input) -> dog
-                        cl.cuMemcpyHtoD_v2(di, x.as_ptr() as *const _, x.len() * 2);
-                        let dlw = self.input_layernorm.gpu_ptr.as_ref().unwrap().0 as *const f16;
+                        let cl = crate::models::qwen3vl::native_backend::lib(); cl.cuMemcpyHtoD_v2(di, x.as_ptr() as *const _, x.len() * 2);
+                        let dlw = self.input_layernorm.gpu_ptr.as_ref().expect("LN weights missing").0 as *const f16;
                         crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(di as *const f16, dlw, dog as *mut f16, q_len as i32, h_s as i32, config.rms_norm_eps as f32);
-                        
-                        // 2. Q_proj(dog) -> di
-                        self.q_proj.forward_gpu(dog, di, q_len); let dq = di; 
-                        
-                        // 3. K_proj(dog) -> drg
-                        self.k_proj.forward_gpu(dog, drg, q_len); let dk = drg;
-                        
-                        // 4. V_proj(dog) -> direct to GPU KV Cache
+                        self.q_proj.forward_gpu(dog, di, q_len); let dq = di; self.k_proj.forward_gpu(dog, drg, q_len); let dk = drg;
+                        { let mut rgl = rope_gpu.lock().unwrap(); if rgl.is_none() {
+                            let cp = crate::models::qwen3vl::native_backend::native_precompute_rope_f16(h_d, 32768, config.rope_theta);
+                            let mut ct = NativeTensor { data_ptr: cp.0.as_ptr() as *const u8, host_size: cp.0.len()*2, gpu_ptr: None, shape: vec![32768, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
+                            let mut st = NativeTensor { data_ptr: cp.1.as_ptr() as *const u8, host_size: cp.1.len()*2, gpu_ptr: None, shape: vec![32768, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
+                            let _ = ct.move_to_gpu(self.device_id); let _ = st.move_to_gpu(self.device_id); *rgl = Some((ct, st));
+                        } if let Some((ref c, ref s)) = *rgl { crate::models::qwen3vl::native_backend::native_cuda_apply_rope(dq, dk, c.gpu_ptr.unwrap().0 as CUdeviceptr, s.gpu_ptr.unwrap().0 as CUdeviceptr, q_len, s_o, n_h, n_kv, h_d); } }
                         let mut gkg = self.gpu_kv_cache.lock().unwrap(); let n_tok = s_o + q_len; gkg.grow(n_tok, n_kv, h_d, self.device_id);
                         if let (Some(kp), Some(vp)) = (gkg.k_ptr, gkg.v_ptr) {
-                            let dvd = (vp.0 as u64 + (s_o * n_kv * h_d * 2) as u64) as CUdeviceptr;
-                            self.v_proj.forward_gpu(dog, dvd, q_len);
-                            
-                            // 5. Apply RoPE(dq, dk)
-                            { let mut rgl = rope_gpu.lock().unwrap(); if rgl.is_none() {
-                                let cp = crate::models::qwen3vl::native_backend::native_precompute_rope_f16(h_d, 32768, config.rope_theta);
-                                let mut ct = NativeTensor { data_ptr: cp.0.as_ptr() as *const u8, host_size: cp.0.len()*2, gpu_ptr: None, shape: vec![32768, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
-                                let mut st = NativeTensor { data_ptr: cp.1.as_ptr() as *const u8, host_size: cp.1.len()*2, gpu_ptr: None, shape: vec![32768, h_d/2], dtype: NativeDType::F16, _mmap: None, device_id: self.device_id };
-                                let _ = ct.move_to_gpu(self.device_id); let _ = st.move_to_gpu(self.device_id); *rgl = Some((ct, st));
-                            } if let Some((ref c, ref s)) = *rgl { crate::models::qwen3vl::native_backend::native_cuda_apply_rope(dq, dk, c.gpu_ptr.unwrap().0 as CUdeviceptr, s.gpu_ptr.unwrap().0 as CUdeviceptr, q_len, s_o, n_h, n_kv, h_d); } }
-                            
-                            // 6. Pack K(dk) -> direct to GPU KV Cache
                             let dkd = (kp.0 as u64 + (s_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr;
+                            let dvd = (vp.0 as u64 + (s_o * n_kv * h_d * 2) as u64) as CUdeviceptr;
                             crate::models::qwen3vl::native_backend::native_cuda_pack_bits(dk, dkd, q_len * n_kv * h_d);
-                            gkg.current_len = n_tok;
-                            
-                            // 7. Attention(Q=dq, K_cache, V_cache) -> dog
-                            // dq holds Q. dog will now hold Attention Output.
-                            crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&[], gkg.k_ptr.unwrap(), gkg.v_ptr.unwrap(), n_h, n_kv, h_d, n_tok, self.device_id as usize, dq, dog, f_alpha, self.q_proj.src_in / n_h, true, q_len);
+                            self.v_proj.forward_gpu(dog, dvd, q_len); gkg.current_len = n_tok;
                         }
-                        
-                        // 8. Residual Add (AttnOut + X)
-                        // AttnOut is in dog. X is on host. 
-                        // Use di as temporary to upload X (no longer need Q).
+                        crate::models::qwen3vl::native_backend::native_bit_serial_attn_gpu_buffered(&[], gkg.k_ptr.unwrap(), gkg.v_ptr.unwrap(), n_h, n_kv, h_d, n_tok, self.device_id as usize, dq, dog, f_alpha, self.q_proj.src_in / n_h, true, q_len);
                         cl.cuMemcpyHtoD_v2(di, x.as_ptr() as *const _, x.len() * 2);
-                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(dog, di, x.len()); // dog = AttnOut + X
-                        
-                        // 9. RMSNorm(dog) -> di (Normalized residual)
-                        let dpw = self.post_attention_layernorm.gpu_ptr.as_ref().unwrap().0 as *const f16;
+                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(dog, di, x.len());
+                        let dpw = self.post_attention_layernorm.gpu_ptr.as_ref().expect("Post LN weights missing").0 as *const f16;
                         crate::models::qwen3vl::native_backend::cuda_rms_norm_f16(dog as *const f16, dpw, di as *mut f16, q_len as i32, h_s as i32, config.rms_norm_eps as f32);
-                        
-                        // 10. Gate_proj(di) -> drg
-                        self.gate_proj.forward_gpu(di, drg, q_len); 
-                        // 11. Up_proj(di) -> dq (Wait, dq is di. Use dq?)
-                        // We need a temporary for Up. Let's use dog (since we saved Residual in dog, we need to add it later).
-                        // Let's copy Residual from dog to drg? No, drg is busy.
-                        // Let's use a 4th buffer? No.
-                        // Wait, h_s is 2048, rb is 8192*tokens. We can offset pointers!
-                        let dog_residual = dog;
-                        let dog_up = (dog as u64 + (q_len * h_s * 2) as u64) as CUdeviceptr;
-                        
-                        self.up_proj.forward_gpu(di, dog_up, q_len);
+                        let dog_res = dog; let dog_up = (dog as u64 + (q_len * h_s * 2) as u64) as CUdeviceptr;
+                        self.gate_proj.forward_gpu(di, drg, q_len); self.up_proj.forward_gpu(di, dog_up, q_len);
                         crate::models::qwen3vl::native_backend::native_cuda_silu_inplace(drg, q_len * config.intermediate_size);
                         crate::models::qwen3vl::native_backend::native_cuda_element_mul(drg, dog_up, q_len * config.intermediate_size);
-                        
-                        // 12. Down_proj(drg) -> di
-                        self.down_proj.forward_gpu(drg, di, q_len);
+                        self.down_proj.forward_gpu(drg, di, q_len); 
                         if self.down_proj.out_features > self.down_proj.src_out { crate::models::qwen3vl::native_backend::native_cuda_hybrid_repeat(di, self.down_proj.src_out, self.down_proj.out_features, q_len); }
-                        
-                        // 13. Final Residual Add (MLPOut + Residual)
-                        // MLPOut is in di. Residual is in dog_residual.
-                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(di, dog_residual, x.len());
-                        
+                        crate::models::qwen3vl::native_backend::native_cuda_add_inplace(di, dog_res, x.len());
                         let rs_sl = std::slice::from_raw_parts_mut(out_ptr, x.len()); cl.cuMemcpyDtoH_v2(rs_sl.as_mut_ptr() as *mut _, di, x.len() * 2); return rs_sl;
                     }
                 }
@@ -286,7 +239,6 @@ impl NativeLayer {
         let kp = pack_f16_to_bits(&ws.k); cache.k[s_o*(n_kv*h_d/32)..s_o*(n_kv*h_d/32)+kp.len()].copy_from_slice(&kp);
         cache.v[s_o*(n_kv*h_d)..s_o*(n_kv*h_d)+ws.v.len()].copy_from_slice(&ws.v); cache.current_len = nl;
         let mut ao = native_bit_serial_attn_f16(&ws.q, &cache.k, &cache.v, h_s, n_h, n_kv, q_len, nl, f_alpha);
-        if use_b { for v in ao.iter_mut() { *v = f16::from_f32(v.to_f32() * 1.02); } }
         let os = unsafe { std::slice::from_raw_parts_mut(out_ptr, x.len()) }; self.o_proj.forward_into(&ao, os, gs);
         for i in 0..x.len() { os[i] += x[i]; } let plnw = self.post_attention_layernorm.get_slice::<f16>();
         native_rms_norm_f16_into(os, plnw.as_ref(), config.rms_norm_eps as f32, h_s, &mut ws.intermediate_a[..x.len()]);
@@ -445,6 +397,7 @@ impl NativeQwen3VLModel {
         }
         let norm = match get_t("model.language_model.norm.weight", t_c.hidden_size) { Ok(t) => t, Err(e) => if baking { let h = t_c.hidden_size*2; let d = vec![0u8; h]; let b = d.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b); NativeTensor { data_ptr: p, host_size: h, gpu_ptr: None, shape: vec![t_c.hidden_size], dtype: NativeDType::F16, _mmap: None, device_id: dev_id } } else { return Err(e); } };
         let head = match get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936).or_else(|_| get_l("model.language_model.embed_tokens.weight", t_c.hidden_size, 151936)) { Ok(l) => l, Err(e) => if baking { let d = vec![0u8; 16]; let b = d.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b); NativeLinear { in_features: t_c.hidden_size, out_features: 151936, src_in: t_c.hidden_size, src_out: 151936, variant: LinearVariant::Standard { weight: NativeTensor { data_ptr: p, host_size: 16, gpu_ptr: None, shape: vec![151936, t_c.hidden_size], dtype: NativeDType::F16, _mmap: None, device_id: dev_id }, bias: None }, device_id: dev_id } } else { return Err(e); } };
+        
         let mut model = Self {
             config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, t_c.rope_theta, 32768)), rope_cache_gpu: std::sync::Mutex::new(None) },
             lm_head: head, visual: None, support_layer0: None, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
