@@ -422,35 +422,50 @@ impl NativeQwen3VLModel {
     pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<usize> {
         let n_kv = self.text_model.config.num_key_value_heads; let h_d = self.text_model.config.head_dim;
         let mut expanded = Vec::new();
+        
+        // [SHARD-EXPANSION] Resolve base patterns into individual shard files
         for p in paths {
-            if p.exists() && p.is_file() { expanded.push(p.clone()); } else {
-                let dir = p.parent().unwrap_or(std::path::Path::new(".")); let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if p.exists() && p.is_file() {
+                expanded.push(p.clone());
+            } else {
+                let dir = p.parent().unwrap_or(std::path::Path::new("."));
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     let mut shards = Vec::new();
                     for entry in entries.flatten() {
-                        let path = entry.path(); let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        if name.contains("shared_pug_base") && name.contains("_shard") && name.ends_with(".safetensors") { shards.push(path); }
+                        let path = entry.path();
+                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        // Match both exact name OR shard pattern
+                        if name.starts_with(stem) && name.ends_with(".safetensors") {
+                            shards.push(path);
+                        }
                     }
+                    // Crucial: Sort numerically (shard0, shard1, ..., shard11)
                     let re = Regex::new(r"shard(\d+)").unwrap();
-                    shards.sort_by_key(|p| re.captures(p.file_name().unwrap().to_str().unwrap()).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0));
+                    shards.sort_by_key(|p| {
+                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
+                    });
                     expanded.extend(shards);
                 }
             }
         }
+        
+        // Remove duplicates just in case
+        expanded.dedup();
+        
         let mut total_t = 0; let mut metadatas = Vec::new(); let mut mmaps = Vec::new();
         for path in &expanded {
-            println!("[DIAG-KV] Attempting to open shard: {:?}", path);
-            let file = std::fs::File::open(path)?; let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
+            println!("[DIAG-KV] Attempting to open memory shard: {:?}", path);
+            let file = std::fs::File::open(path)?; 
+            let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
             let tokens = { 
                 let st = SafeTensors::deserialize(&mmap)?; 
                 if let Ok(kt) = st.tensor("layer.0.k") {
                     let t = kt.data().len() / (n_kv * (h_d/32) * 4);
-                    println!("[DIAG-KV] Shard contains {} tokens in 'layer.0.k'", t);
+                    println!("[DIAG-KV] Shard loaded: {} tokens", t);
                     t
-                } else {
-                    println!("[DIAG-KV] WARNING: 'layer.0.k' NOT FOUND in shard! Available keys: {:?}", st.names());
-                    0
-                }
+                } else { 0 }
             };
             if tokens > 0 { total_t += tokens; metadatas.push(tokens); mmaps.push(mmap); }
         }
