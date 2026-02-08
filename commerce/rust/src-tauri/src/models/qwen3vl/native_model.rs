@@ -13,7 +13,7 @@ use regex::Regex;
 
 pub enum LinearVariant {
     Standard { weight: NativeTensor, bias: Option<NativeTensor> },
-    BitSerial { weight_packed: NativeTensor, scales: NativeTensor, bias: Option<NativeTensor> },
+    BitSerial { weight_planes: Vec<NativeTensor>, scales: NativeTensor, bias: Option<NativeTensor> },
 }
 
 pub struct ForwardWorkspace {
@@ -177,10 +177,15 @@ impl NativeLinear {
                     let d_w = weight.gpu_ptr.expect("W on GPU").0 as *const f16;
                     crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(d_i as *const f16, d_w, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32);
                 },
-                LinearVariant::BitSerial { weight_packed, scales, .. } => {
-                    let d_w = weight_packed.gpu_ptr.expect("W on GPU").0 as *const u32;
+                LinearVariant::BitSerial { weight_planes, scales, .. } => {
+                    let d_w0 = weight_planes[0].gpu_ptr.expect("W on GPU").0 as *const u32;
                     let d_s = scales.gpu_ptr.expect("S on GPU").0 as *const f16;
-                    crate::models::qwen3vl::native_backend::cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32);
+                    let null = std::ptr::null();
+                    crate::models::qwen3vl::native_backend::cuda_matmul_f16(
+                        d_i as *const f16, d_w0, null, null, null, d_s, d_o as *mut f16, 
+                        m as i32, self.out_features as i32, self.in_features as i32, 
+                        self.device_id, self.src_in as i32, 1
+                    );
                 }
             }
         }
@@ -211,19 +216,60 @@ impl NativeLinear {
                 let w_cow = weight.get_slice::<f16>(); let b_cow = bias.as_ref().map(|t| t.get_slice::<f16>());
                 native_linear_f16_into(x, w_cow.as_ref(), b_cow.as_ref().map(|b| b.as_ref()), out, m, self.out_features, self.in_features);
             },
-            LinearVariant::BitSerial { weight_packed, scales, bias } => {
+            LinearVariant::BitSerial { weight_planes, scales, bias } => {
                 #[cfg(feature = "cuda")]
-                if self.device_id >= 0 && weight_packed.gpu_ptr.is_some() {
+                if self.device_id >= 0 && !weight_planes.is_empty() && weight_planes[0].gpu_ptr.is_some() {
                     let (d_i, d_o, _) = if let Some((si, so, sr)) = global_scratch { self.ensure_gpu_buffers_ext(m, si, so, sr) } else { (0, 0, 0) };
                     if d_i != 0 && d_o != 0 {
-                        crate::models::qwen3vl::native_backend::bit_serial_matmul_gpu_buffered_into(x, weight_packed, scales, out, m, self.out_features, self.in_features, self.device_id as usize, d_i, d_o, self.src_in);
-                        if let Some(b) = bias { unsafe { let br = b.get_raw_slice::<f16>(); for i in 0..m { for j in 0..self.out_features { out[i * self.out_features + j] += br[j]; } } } }
-                        return;
+                        unsafe {
+                            let cl = crate::models::qwen3vl::native_backend::lib();
+                            let res_i = cl.cuMemcpyHtoD_v2(d_i, x.as_ptr() as *const _, x.len() * 2);
+                            
+                            let w0 = weight_planes[0].gpu_ptr.expect("B0 on GPU").0 as *const u32;
+                            let w1 = weight_planes.get(1).and_then(|p| p.gpu_ptr).map(|p| p.0).unwrap_or(std::ptr::null_mut()) as *const u32;
+                            let w2 = weight_planes.get(2).and_then(|p| p.gpu_ptr).map(|p| p.0).unwrap_or(std::ptr::null_mut()) as *const u32;
+                            let w3 = weight_planes.get(3).and_then(|p| p.gpu_ptr).map(|p| p.0).unwrap_or(std::ptr::null_mut()) as *const u32;
+                            let d_s = scales.gpu_ptr.expect("S on GPU").0 as *const f16;
+                            
+                            // [DEBUG] Log once per layer to confirm CUDA call
+                            if m == 1 && self.out_features > 1000 { // Only log for significant layers like MLP
+                                // println!("[CUDA-CALL] Layer {}x{}, bits: {}", self.out_features, self.in_features, weight_planes.len());
+                            }
+
+                            crate::models::qwen3vl::native_backend::cuda_matmul_f16(
+                                d_i as *const f16, w0, w1, w2, w3, d_s, d_o as *mut f16, 
+                                m as i32, self.out_features as i32, self.in_features as i32, 
+                                self.device_id, self.src_in as i32, weight_planes.len() as i32
+                            );
+
+                            let res_o = cl.cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, out.len() * 2);
+                            
+                            if (res_i as i32) != 0 || (res_o as i32) != 0 {
+                                println!("[CUDA-ERROR] Memcpy failed: in={}, out={}", res_i as i32, res_o as i32);
+                            }
+
+                            if let Some(b) = bias {
+                                let br = b.get_raw_slice::<f16>();
+                                for i in 0..m { for j in 0..self.out_features { out[i * self.out_features + j] += br[j]; } }
+                            }
+                            return;
+                        }
+                    } else {
+                        println!("[CUDA-WARN] Scratch buffers zero: d_i={}, d_o={}", d_i, d_o);
                     }
                 }
+                // println!("[CPU-FALLBACK] Linear {}x{}", self.out_features, self.in_features);
                 unsafe {
-                    let wpr = weight_packed.get_raw_slice::<u32>(); let sr = scales.get_raw_slice::<f16>();
-                    bit_serial_matmul_f32_extreme_into(x, wpr, sr, out, m, self.out_features, self.in_features);
+                    let mut out_f32 = vec![0.0f32; out.len()];
+                    for (b, plane) in weight_planes.iter().enumerate() {
+                        let bit_scale = (1 << b) as f32 / (weight_planes.len() as f32 * 2.0);
+                        let wpr = plane.get_raw_slice::<u32>();
+                        let sr = scales.get_raw_slice::<f16>();
+                        let mut plane_out = vec![f16::ZERO; out.len()];
+                        bit_serial_matmul_f32_extreme_into(x, wpr, sr, &mut plane_out, m, self.out_features, self.in_features);
+                        for i in 0..out.len() { out_f32[i] += plane_out[i].to_f32() * bit_scale; }
+                    }
+                    for i in 0..out.len() { out[i] = f16::from_f32(out_f32[i]); }
                     if let Some(b) = bias { let br = b.get_raw_slice::<f16>(); for i in 0..m { for j in 0..self.out_features { out[i * self.out_features + j] += br[j]; } } }
                 }
             }
@@ -279,8 +325,8 @@ impl NativeLinear {
                 weight.move_to_gpu(device_id)?; 
                 if let Some(b) = bias { b.move_to_gpu(device_id)?; } 
             },
-            LinearVariant::BitSerial { weight_packed, scales, bias } => { 
-                weight_packed.move_to_gpu(device_id)?; 
+            LinearVariant::BitSerial { weight_planes, scales, bias } => { 
+                for plane in weight_planes { plane.move_to_gpu(device_id)?; }
                 scales.move_to_gpu(device_id)?; 
                 if let Some(b) = bias { b.move_to_gpu(device_id)?; } 
             }
@@ -542,13 +588,21 @@ unsafe impl Send for NativeQwen3TextModel {}
 unsafe impl Sync for NativeQwen3TextModel {}
 
 impl NativeQwen3TextModel {
-    pub fn forward(&self, i_ids: &[u32], _pv: Option<&[f16]>, _gt: Option<&[u32; 3]>, s_o: usize, gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>, workspace: Option<&mut ForwardWorkspace>, sl: Option<&NativeLayer>, is_vision: bool) -> Vec<f16> {
+    pub fn forward(&self, i_ids: &[u32], _pv: Option<&[f16]>, _gt: Option<&[u32; 3]>, s_o: usize, gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>, workspace: Option<&mut ForwardWorkspace>, _sl: Option<&NativeLayer>, is_vision: bool) -> Vec<f16> {
         let hid = self.config.hidden_size;
         let embeds = match &self.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => native_embedding_lookup_f16(i_ids, weight.get_slice::<f16>().as_ref(), hid),
-            LinearVariant::BitSerial { weight_packed, .. } => native_embedding_lookup_f16(i_ids, weight_packed.get_slice::<f16>().as_ref(), hid)
+            LinearVariant::BitSerial { weight_planes, .. } => {
+                let mut accumulated_f32 = vec![0.0f32; i_ids.len() * hid];
+                for (b, plane) in weight_planes.iter().enumerate() {
+                    let bit_scale = (1 << b) as f32 / (weight_planes.len() as f32 * 2.0);
+                    let dq = native_embedding_lookup_f16(i_ids, plane.get_slice::<f16>().as_ref(), hid);
+                    for i in 0..dq.len() { accumulated_f32[i] += dq[i].to_f32() * bit_scale; }
+                }
+                accumulated_f32.iter().map(|&v| f16::from_f32(v)).collect()
+            }
         };
-        self.forward_ext(i_ids, embeds, s_o, gs, workspace, sl, is_vision)
+        self.forward_ext(i_ids, embeds, s_o, gs, workspace, _sl, is_vision)
     }
     pub fn forward_ext(&self, _i_ids: &[u32], embeds: Vec<f16>, s_o: usize, gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>, workspace: Option<&mut ForwardWorkspace>, sl: Option<&NativeLayer>, is_vision: bool) -> Vec<f16> {
         let hid = self.config.hidden_size; let is_baking = self.layers.len() <= 1; let q_len = embeds.len() / hid;
@@ -653,21 +707,40 @@ impl NativeQwen3VLModel {
         let st = SafeTensors::deserialize(&m_mmap)?; let st_sec = s_mmap.as_ref().map(|m| SafeTensors::deserialize(m)).transpose()?;
         let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
         let find_key_ext = |target: &str, primary: &SafeTensors, secondary: Option<&SafeTensors>, _l_idx: i32| -> Option<(String, bool)> {
-            if primary.tensor(target).is_ok() || primary.tensor(&format!("{}.packed", target)).is_ok() { return Some((target.to_string(), true)); }
-            if let Some(sec) = secondary { if sec.tensor(target).is_ok() || sec.tensor(&format!("{}.packed", target)).is_ok() { return Some((target.to_string(), false)); } }
+            if primary.tensor(target).is_ok() || primary.tensor(&format!("{}.packed", target)).is_ok() || primary.tensor(&format!("{}.packed_b0", target)).is_ok() { return Some((target.to_string(), true)); }
+            if let Some(sec) = secondary { if sec.tensor(target).is_ok() || sec.tensor(&format!("{}.packed", target)).is_ok() || sec.tensor(&format!("{}.packed_b0", target)).is_ok() { return Some((target.to_string(), false)); } }
             let vars = vec![target.to_string(), target.replace("lm_head", "model.lm_head"), target.replace("lm_head", "output")];
-            for v in vars { if primary.tensor(&v).is_ok() || primary.tensor(&format!("{}.packed", v)).is_ok() { return Some((v, true)); } }
+            for v in vars { if primary.tensor(&v).is_ok() || primary.tensor(&format!("{}.packed", v)).is_ok() || primary.tensor(&format!("{}.packed_b0", v)).is_ok() { return Some((v, true)); } }
             None
         };
         let mut get_l = |base: &str, in_f: usize, out_f: usize, l_idx: i32| -> Result<NativeLinear> {
             let (key, is_p) = find_key_ext(base, &st, st_sec.as_ref(), l_idx).ok_or_else(|| anyhow!("LinearNotFound: {}", base))?;
             let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
-            let pn = format!("{}.packed", key); let sn = format!("{}.scales", key);
-            if cst.tensor(&pn).is_ok() {
-                let vp = cst.tensor(&pn)?; let vs = cst.tensor(&sn)?;
-                let op = unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize; let os = unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
+            
+            // [PRECISION-UPGRADE] Try to load multiple bit-planes
+            let mut weight_planes = Vec::new();
+            for b in 0..8 { // Support up to 8-bit sliced
+                let pn = format!("{}.packed_b{}", key, b);
+                if let Ok(vp) = cst.tensor(&pn) {
+                    let op = unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
+                    weight_planes.push(NativeTensor::from_mmap(cm.clone(), op, vp.shape().to_vec(), NativeDType::U32));
+                } else if b == 0 {
+                    // Fallback for old single-plane format
+                    let pn_old = format!("{}.packed", key);
+                    if let Ok(vp) = cst.tensor(&pn_old) {
+                        let op = unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
+                        weight_planes.push(NativeTensor::from_mmap(cm.clone(), op, vp.shape().to_vec(), NativeDType::U32));
+                    }
+                    break;
+                } else { break; }
+            }
+
+            if !weight_planes.is_empty() {
+                let sn = format!("{}.scales", key);
+                let vs = cst.tensor(&sn)?;
+                let os = unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
                 Ok(NativeLinear { in_features: in_f, out_features: out_f, src_in: in_f, src_out: out_f, variant: LinearVariant::BitSerial {
-                    weight_packed: NativeTensor::from_mmap(cm.clone(), op, vp.shape().to_vec(), NativeDType::U32),
+                    weight_planes,
                     scales: NativeTensor::from_mmap(cm.clone(), os, vs.shape().to_vec(), NativeDType::F16), bias: None,
                 }, device_id: active_gpu_id })
             } else {
@@ -706,22 +779,33 @@ impl NativeQwen3VLModel {
         let mut get_embed = |base: &str, vocab: usize, thid: usize, _hsec: bool| -> Result<NativeLinear> {
             let (key, is_p) = find_key_ext(base, &st, st_sec.as_ref(), -1).ok_or_else(|| anyhow!("EmbedNotFound: {}", base))?;
             let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
-            let pn = format!("{}.packed", key); let sn = format!("{}.scales", key);
-            if cst.tensor(&pn).is_ok() {
-                let vp = cst.tensor(&pn)?; let vs = cst.tensor(&sn)?; let shid = (vp.data().len()/4*32)/vocab;
-                let pr = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) };
+            
+            let mut planes = Vec::new();
+            for b in 0..8 {
+                let pn = format!("{}.packed_b{}", key, b);
+                if let Ok(vp) = cst.tensor(&pn) { planes.push(vp); }
+                else if b == 0 {
+                    if let Ok(vp) = cst.tensor(&format!("{}.packed", key)) { planes.push(vp); }
+                    break;
+                } else { break; }
+            }
+
+            if !planes.is_empty() {
+                let vs = cst.tensor(&format!("{}.scales", key))?;
                 let sr = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) };
-                let dq = dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid); // Note: dequantize usually returns flattened [vocab * target_k] if we pass thid?
-                // Wait, dequantize_bit_serial_to_f16 signature is (packed, scales, n, src_k, target_k).
-                // It already has logic to expand 'ratio' inside! Let's verify 'dequantize_bit_serial_to_f16'.
+                let shid = (planes[0].data().len()/4*32)/vocab;
                 
-                // [VERIFICATION] The 'dequantize_bit_serial_to_f16' function ALREADY implements the repeat logic:
-                // "let ratio = if target_k > src_k { target_k / src_k } else { 1 }; ... for r in 0..ratio ..."
-                // So we just need to ensure we pass 'thid' as target_k.
-                // The current call is: dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid);
-                // So it should be correct!
+                let mut accumulated_f32 = vec![0.0f32; vocab * thid];
+                for (b, vp) in planes.iter().enumerate() {
+                    let bit_scale = (1 << b) as f32 / (planes.len() as f32 * 2.0);
+                    let pr = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) };
+                    let dq = dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid);
+                    for i in 0..dq.len() { accumulated_f32[i] += dq[i].to_f32() * bit_scale; }
+                }
                 
-                let mut dst = Vec::with_capacity(dq.len()*2); for v in dq { dst.extend_from_slice(&v.to_le_bytes()); }
+                let mut dst = Vec::with_capacity(vocab * thid * 2);
+                for v in accumulated_f32 { dst.extend_from_slice(&f16::from_f32(v).to_le_bytes()); }
+                
                 let boxed = dst.into_boxed_slice(); let ptr = boxed.as_ptr(); 
                 let h_size = vocab * thid * 2;
                 std::mem::forget(boxed);
@@ -735,102 +819,48 @@ impl NativeQwen3VLModel {
         if let Some(ref sec_mmap) = s_mmap {
             let sec_st = SafeTensors::deserialize(sec_mmap)?;
             let get_sec_l = |base: &str, ti: usize, to: usize| -> Result<NativeLinear> {
-                let pn = format!("{}.packed", base); let sn = format!("{}.scales", base);
-                let vp = sec_st.tensor(&pn)?; let vs = sec_st.tensor(&sn)?;
-                
-                // [FIX] Read original source shape if available, otherwise fallback to heuristic
-                let (so, si) = if let Ok(st) = sec_st.tensor(&format!("{}.shape", base)) {
-                    let s_data = unsafe { std::slice::from_raw_parts(st.data().as_ptr() as *const i32, 2) };
-                    (s_data[0] as usize, s_data[1] as usize)
-                } else {
-                    let s_out = (vs.data().len() / 2) / ((vp.data().len() / 4 * 32) / (vs.data().len() / 2)); // Heuristic
-                    (s_out, (vp.data().len() / 4 * 32) / s_out)
-                };
-
-                let pu = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) };
-                let sf = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) };
-                
-                // [HYBRID-UPSCALING] Repeat weights if target dims are larger (e.g. 0.6B -> 2B)
-                let ratio_i = if ti > si { ti / si } else { 1 };
-                let ratio_o = if to > so { to / so } else { 1 };
-                
-                if ratio_i > 1 || ratio_o > 1 {
-                    println!("[HYBRID-LOAD] Upscaling layer {} from {}x{} to {}x{} (Repeat: {}x{})", base, so, si, to, ti, ratio_o, ratio_i);
-                    let mut np = vec![0u32; (to/8)*(ti/32)*8]; 
-                    let mut ns = vec![f16::ZERO; (to/8)*(ti/32)*8];
-                    
-                    let src_k_blocks = si / 32;
-                    let dst_k_blocks = ti / 32;
-                    let src_n_blocks = so / 8;
-                    let dst_n_blocks = to / 8;
-
-                    for no in 0..dst_n_blocks { 
-                        let src_no = no % src_n_blocks;
-                        for ko in 0..dst_k_blocks { 
-                            let src_ko = ko % src_k_blocks;
-                            
-                            // Copy 8-row block
-                            for sn in 0..8 {
-                                let s_idx = (src_no * src_k_blocks + src_ko) * 8 + sn; 
-                                let d_idx = (no * dst_k_blocks + ko) * 8 + sn;
-                                if s_idx < pu.len() {
-                                    np[d_idx] = pu[s_idx]; 
-                                    // Scale adjustment might be needed if norm distribution changes, 
-                                    // but for direct repetition, keeping scale is usually safer for signal magnitude preservation.
-                                    ns[d_idx] = sf[s_idx]; 
-                                }
-                            } 
-                        } 
-                    }
-                    
-                    let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
-                    let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
-                    let h_size_packed = (to/8)*(ti/32)*8 * 4;
-                    let h_size_scales = (to/8)*(ti/32)*8 * 2;
-                    std::mem::forget(pb); std::mem::forget(sb);
-                    
-                    Ok(NativeLinear { 
-                        in_features: ti, out_features: to, src_in: ti, src_out: to, // It is now upscaled
-                        variant: LinearVariant::BitSerial { 
-                            weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, 
-                            scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, 
-                            bias: None 
-                        }, 
-                        device_id: active_gpu_id 
-                    })
-                } else {
-                    // Standard load logic (No upscale needed)
-                    // ... (Original logic for direct mmap if dims match)
-                    // Actually, if we are loading from secondary, we might want to ensure it's loaded into RAM if we can't mmap easily with different strides.
-                    // But if sizes match, we can try to use the mmap slice if contiguous?
-                    // The original code tried to construct new vectors anyway for layout shuffling logic in 'get_sec_l' 
-                    // Wait, the original code ALREADY constructed new vectors: "let mut np = vec![...]"
-                    // So we just stick with that logic but without the ratio loop if ratio is 1.
-                    
-                    let mut np = vec![0u32; (to/8)*(ti/32)*8]; let mut ns = vec![f16::ZERO; (to/8)*(ti/32)*8];
-                    let es = f16::from_f32(1.0/((ti as f32 / si as f32).max(1.0)));
-                    
-                    let src_k_blocks = si / 32;
-                    let dst_k_blocks = ti / 32;
-
-                    for no in 0..(to/8) { 
-                        for ko in 0..dst_k_blocks { 
-                            for sn in 0..8 {
-                                let s_idx = ((no % (so/8)) * src_k_blocks + (ko % src_k_blocks)) * 8 + sn; 
-                                let d_idx = (no * dst_k_blocks + ko) * 8 + sn;
-                                if s_idx < pu.len() {
-                                    np[d_idx] = pu[s_idx]; ns[d_idx] = sf[s_idx] * es;
-                                }
-                            } 
-                        } 
-                    }
-                    let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
-                    let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
-                    let h_size_packed = (to/8)*(ti/32)*8 * 4;
-                    let h_size_scales = (to/8)*(ti/32)*8 * 2;
-                    std::mem::forget(pb); std::mem::forget(sb);
-                    Ok(NativeLinear { in_features: ti, out_features: to, src_in: si, src_out: so, variant: LinearVariant::BitSerial { weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, bias: None }, device_id: active_gpu_id })
+                let mut planes = Vec::new();
+                for b in 0..8 {
+                    let pn = format!("{}.packed_b{}", base, b);
+                    if let Ok(vp) = sec_st.tensor(&pn) { planes.push(vp); }
+                    else if b == 0 {
+                        if let Ok(vp) = sec_st.tensor(&format!("{}.packed", base)) { planes.push(vp); }
+                        break;
+                    } else { break; }
                 }
+
+            let vs = sec_st.tensor(&format!("{}.scales", base))?;
+            let (so, si) = if let Ok(st) = sec_st.tensor(&format!("{}.shape", base)) {
+                let s_data = unsafe { std::slice::from_raw_parts(st.data().as_ptr() as *const i32, 2) };
+                (s_data[0] as usize, s_data[1] as usize)
+            } else {
+                let s_out = (vs.data().len() / 2) / ((planes[0].data().len() / 4 * 32) / (vs.data().len() / 2)); 
+                (s_out, (planes[0].data().len() / 4 * 32) / s_out)
+            };
+
+            // [OPTIMIZED-HYBRID-LOAD] Load bit-planes directly WITHOUT CPU upscaling
+            let mut weight_planes = Vec::new();
+            for vp in planes {
+                let op = unsafe { vp.data().as_ptr().offset_from(sec_mmap.as_ptr()) } as usize;
+                weight_planes.push(NativeTensor::from_mmap(sec_mmap.clone(), op, vp.shape().to_vec(), NativeDType::U32));
+            }
+
+            let os = unsafe { vs.data().as_ptr().offset_from(sec_mmap.as_ptr()) } as usize;
+            let scales = NativeTensor::from_mmap(sec_mmap.clone(), os, vs.shape().to_vec(), NativeDType::F16);
+
+            // Set virtual target dimensions (to, ti) while keeping original (so, si) as source
+            Ok(NativeLinear { 
+                in_features: ti, 
+                out_features: to, 
+                src_in: si, 
+                src_out: so, 
+                variant: LinearVariant::BitSerial {
+                    weight_planes,
+                    scales,
+                    bias: None,
+                }, 
+                device_id: active_gpu_id 
+            })
             };
             let get_sec_t = |name: &str, ts: usize| -> Result<NativeTensor> {
                 let v = sec_st.tensor(name)?; let sd = v.data(); let sl = sd.len()/2;
@@ -901,35 +931,34 @@ impl NativeQwen3VLModel {
         };
 
         let h_res = get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936, -1).or_else(|_| {
-            get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size, -1).map(|mut el| { el.in_features = t_c.hidden_size; el.out_features = 151936; el.device_id = active_gpu_id; el })
+            // If lm_head is missing, try loading embed_tokens but keep it as LinearVariant if possible
+            get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size, -1).map(|mut el| { 
+                el.in_features = t_c.hidden_size; 
+                el.out_features = 151936; 
+                el.src_in = el.src_out; // Swap dims for head projection
+                el.device_id = active_gpu_id; 
+                el 
+            })
         });
 
         let lm_head = match h_res {
             Ok(l) => l,
             Err(_) if baking => {
-                // Create dummy lm_head
-                let h_size = t_c.hidden_size * 151936 * 2; // Very large, but virtual
-                // We won't allocate real memory for this big dummy, just a minimal placeholder
-                // Actually, let's just make a small one and lie about the shape to avoid OOM
-                // Since we never use it in baking, it's safe.
-                let dummy_data = vec![0u8; 16].into_boxed_slice();
+                let h_size = 16; 
+                let dummy_data = vec![0u8; h_size].into_boxed_slice();
                 let ptr = dummy_data.as_ptr();
                 std::mem::forget(dummy_data);
-                
                 NativeLinear { 
                     in_features: t_c.hidden_size, out_features: 151936, src_in: t_c.hidden_size, src_out: 151936, 
                     variant: LinearVariant::Standard { 
-                        weight: NativeTensor { 
-                            data_ptr: ptr, host_size: 16, gpu_ptr: None, 
-                            shape: vec![151936, t_c.hidden_size], dtype: NativeDType::F16, 
-                            _mmap: None, device_id: active_gpu_id 
-                        }, 
+                        weight: NativeTensor { data_ptr: ptr, host_size: h_size, gpu_ptr: None, shape: vec![151936, t_c.hidden_size], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, 
                         bias: None 
                     }, 
                     device_id: active_gpu_id 
                 }
             },
             Err(e) => return Err(e),
+        };
         };
 
         let visual = if let Some(vm) = v_mmap {
@@ -1136,9 +1165,33 @@ impl NativeQwen3VLModel {
             self.workspace.lock().unwrap() 
         };
         
+        let hid = self.text_model.config.hidden_size;
         let mut embeds = match &self.text_model.embed_tokens.variant {
-            LinearVariant::Standard { weight, .. } => native_embedding_lookup_f16(i_ids, weight.get_slice::<f16>().as_ref(), self.text_model.config.hidden_size),
-            LinearVariant::BitSerial { weight_packed, .. } => native_embedding_lookup_f16(i_ids, weight_packed.get_slice::<f16>().as_ref(), self.text_model.config.hidden_size),
+            LinearVariant::Standard { weight, .. } => native_embedding_lookup_f16(i_ids, weight.get_slice::<f16>().as_ref(), hid),
+            LinearVariant::BitSerial { weight_planes, scales, .. } => {
+                // [FIX] Correctly dequantize 4-bit sliced embeddings from U32 planes
+                let mut accumulated_f32 = vec![0.0f32; i_ids.len() * hid];
+                unsafe {
+                    let sr = scales.get_raw_slice::<f16>();
+                    for (b, plane) in weight_planes.iter().enumerate() {
+                        let bit_scale = (1 << b) as f32 / (weight_planes.len() as f32 * 2.0);
+                        let pr = plane.get_raw_slice::<u32>();
+                        for (i, &token_id) in i_ids.iter().enumerate() {
+                            let tid = token_id as usize;
+                            let row_bits = &pr[(tid * hid) / 32 .. ((tid + 1) * hid) / 32];
+                            
+                            // Correctly dequantize bit-serial embedding to -1.0..1.0 range with scaling
+                            for k in 0..hid {
+                                let bit = (row_bits[k / 32] >> (k % 32)) & 1;
+                                // Map bit 0/1 to -1.0/1.0 and apply bit-weight and per-token scale
+                                let bit_val = if bit == 1 { 1.0f32 } else { -1.0f32 };
+                                accumulated_f32[i * hid + k] += bit_val * sr[tid].to_f32() * bit_scale * 0.125f32;
+                            }
+                        }
+                    }
+                }
+                accumulated_f32.iter().map(|&v| f16::from_f32(v)).collect()
+            }
         };
         
         let sc = Some((&self.global_scratch_i, &self.global_scratch_o, &self.global_scratch_r));
@@ -1153,8 +1206,58 @@ impl NativeQwen3VLModel {
         }
         
         // [GPU-OP] Execution starting
-        let sl = None; 
-        let nx = self.text_model.forward_ext(i_ids, embeds, so, sc, Some(&mut wl), sl, is_vision);
+        let mut cur_x = embeds;
+        let sc = Some((&self.global_scratch_i, &self.global_scratch_o, &self.global_scratch_r));
+
+        // [SIGNAL-FLOW-DIAG] Initial Embedding Magnitude
+        let e_max = cur_x.iter().map(|v| v.to_f32().abs()).fold(0.0, f32::max);
+        let e_mean = cur_x.iter().map(|v| v.to_f32().abs()).sum::<f32>() / cur_x.len() as f32;
+        println!("[FLOW] Input Embeds -> Max: {:.4}, Mean: {:.4}", e_max, e_mean);
+
+        // [HYBRID-INFERENCE-FIX] Run Support Layer 0 on GPU if it exists
+        if let Some(ref l0) = self.support_layer0 {
+            if !is_baking {
+                let rc = { let mut rg = self.text_model.rope_cache.lock().unwrap(); rg.ensure_length(so+i_ids.len()+1024); rg.cos.clone() };
+                let rs = { let rg = self.text_model.rope_cache.lock().unwrap(); rg.sin.clone() };
+                
+                // 1. Run 0.6B Layer 0
+                let l0_out = l0.forward(&cur_x, &self.text_model.config, 0, so, &rc, &rs, is_vision, false, sc, &mut wl, false, &self.text_model.rope_cache_gpu);
+                
+                // [SIGNAL-FLOW-DIAG] Layer 0 Output
+                let l0_max = l0_out.iter().map(|v| v.to_f32().abs()).fold(0.0, f32::max);
+                println!("[FLOW] Layer 0 (0.6B) -> Max: {:.4}", l0_max);
+
+                // 2. [ENERGY-NORMALIZATION] Upscale signal from 1024 to 2048
+                let ti = self.text_model.config.hidden_size; // 2048
+                let si = l0.input_layernorm.shape[0]; // 1024
+                if ti > si {
+                    let mut upscaled = vec![f16::ZERO; i_ids.len() * ti];
+                    let ratio = ti / si;
+                    let energy_scale = 1.0 / (ratio as f32).sqrt();
+                    for t in 0..i_ids.len() {
+                        for r in 0..ratio {
+                            for k in 0..si {
+                                upscaled[t * ti + r * si + k] = f16::from_f32(l0_out[t * si + k].to_f32() * energy_scale);
+                            }
+                        }
+                    }
+                    cur_x = upscaled;
+                    println!("[FLOW] Upscaled 1024 -> 2048 (Scale: {:.4})", energy_scale);
+                } else {
+                    cur_x = l0_out.to_vec();
+                }
+            }
+        }
+
+        // [SIGNAL-FLOW-DIAG] Pre-L1 Magnitude
+        let pre_max = cur_x.iter().map(|v| v.to_f32().abs()).fold(0.0, f32::max);
+        println!("[FLOW] Entering Main Model (L1+) -> Max: {:.4}", pre_max);
+
+        let nx = self.text_model.forward_ext(i_ids, cur_x, so, sc, Some(&mut wl), None, is_vision);
+        
+        // [SIGNAL-FLOW-DIAG] Post-Model Magnitude
+        let post_max = nx.iter().map(|v| v.to_f32().abs()).fold(0.0, f32::max);
+        println!("[FLOW] Exit Main Model -> Max: {:.4}", post_max);
         
         // [SHIELD-BAKING] During baking, we ONLY care about the KV Cache side-effects in forward_ext.
         // Skipping LM Head saves a massive 1024x151936 matrix multiplication and host-transfer.

@@ -121,16 +121,24 @@ impl Qwen3VLGenerateModel {
 
         // [HYBRID-INIT] 2B 모델 본체(L1_ALL)와 0.6B 모델 조각(LAYER0)을 함께 로드할 수 있도록 파일명 설정
         let main_filename = if baking_only { 
-            "model-BITSERIAL_LAYER0.safetensors" 
+            let f = "model-4BIT_SLICED_LAYER0.safetensors";
+            if path_obj.join(f).exists() { f } else { "model-BITSERIAL_LAYER0.safetensors" }
         } else { 
-            "model-BITSERIAL_L1_ALL.safetensors" 
+            let f = "model-4BIT_SLICED_L1_ALL.safetensors";
+            if path_obj.join(f).exists() { f } else { "model-BITSERIAL_L1_ALL.safetensors" }
         };
         let main_path = path_obj.join(main_filename);
         let main_file = std::fs::File::open(main_path)?;
         let main_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&main_file)? });
         
         let vision_mmap = if !force_text_only {
-            let vision_filename = if baking_only { "mmproj-BITSERIAL_LAYER0.safetensors" } else { "mmproj-BITSERIAL_ALL.safetensors" };
+            let vision_filename = if baking_only { 
+                let f = "mmproj-4BIT_SLICED_LAYER0.safetensors";
+                if config_path.map(Path::new).unwrap_or(path_obj).join(f).exists() { f } else { "mmproj-BITSERIAL_LAYER0.safetensors" }
+            } else { 
+                let f = "mmproj-4BIT_SLICED_ALL.safetensors";
+                if config_path.map(Path::new).unwrap_or(path_obj).join(f).exists() { f } else { "mmproj-BITSERIAL_ALL.safetensors" }
+            };
             let vision_root = config_path.map(Path::new).unwrap_or(path_obj);
             let vision_path = vision_root.join(vision_filename);
             if vision_path.exists() {
@@ -143,17 +151,24 @@ impl Qwen3VLGenerateModel {
             // [HYBRID-LOAD] Load 0.6B Layer 0 file to fill missing parts (Embed, Layer 0) in 2B model.
             // native_model.rs will handle the dimension upscaling (Repeat 1024 -> 2048).
             let base_models_path = path_obj.parent().unwrap();
-            // Assuming 0.6B model is in a parallel directory named "Qwen3-0.6B-Instruct-gguf"
-            // or in the same directory depending on user setup. Let's try same directory first, then sibling.
-            let local_l0 = path_obj.join("model-BITSERIAL_LAYER0.safetensors");
-            if local_l0.exists() {
-                 println!("[HYBRID] Loading local Layer 0 file: {:?}", local_l0);
-                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(local_l0)?)? }))
+            let local_l0_4b = path_obj.join("model-4BIT_SLICED_LAYER0.safetensors");
+            let local_l0_bs = path_obj.join("model-BITSERIAL_LAYER0.safetensors");
+            
+            if local_l0_4b.exists() {
+                 println!("[HYBRID] Loading local 4-bit Layer 0 file: {:?}", local_l0_4b);
+                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(local_l0_4b)?)? }))
+            } else if local_l0_bs.exists() {
+                 println!("[HYBRID] Loading local BitSerial Layer 0 file: {:?}", local_l0_bs);
+                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(local_l0_bs)?)? }))
             } else {
-                let sibling_l0 = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-BITSERIAL_LAYER0.safetensors");
-                if sibling_l0.exists() {
-                    println!("[HYBRID] Loading sibling 0.6B Layer 0 file: {:?}", sibling_l0);
-                    Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(sibling_l0)?)? }))
+                let sib_4b = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-4BIT_SLICED_LAYER0.safetensors");
+                let sib_bs = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-BITSERIAL_LAYER0.safetensors");
+                if sib_4b.exists() {
+                    println!("[HYBRID] Loading sibling 4-bit Layer 0 file: {:?}", sib_4b);
+                    Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(sib_4b)?)? }))
+                } else if sib_bs.exists() {
+                    println!("[HYBRID] Loading sibling BitSerial Layer 0 file: {:?}", sib_bs);
+                    Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(sib_bs)?)? }))
                 } else {
                     println!("[HYBRID] WARNING: Layer 0 source file not found. Model may crash if embeddings are missing.");
                     None

@@ -3,17 +3,20 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// [2026-HYBRID-MASTER] Optimized Folding Bit-serial Matmul for F16 with Dynamic Stabilization
+// [2026-HYBRID-MASTER] Ultra-Stable Multi-plane Bit-serial Matmul for F16
 __global__ void bit_serial_matmul_kernel_f16(
     const half* __restrict__ input,    
-    const uint32_t* __restrict__ weight, 
+    const uint32_t* __restrict__ w0, 
+    const uint32_t* __restrict__ w1, 
+    const uint32_t* __restrict__ w2, 
+    const uint32_t* __restrict__ w3, 
     const half* __restrict__ scale,     
     half* __restrict__ output,          
-    int M, int N, int K, int src_k
+    int M, int N, int K, int src_k, int bits
 ) {
     const int TILE_M = 32;
     __shared__ uint32_t s_input_bits[TILE_M]; 
-    __shared__ float s_input_scales[TILE_M]; // [STABILITY] Dynamic Input Scale Pool
+    __shared__ float s_input_scales[TILE_M]; 
 
     int m_base = blockIdx.y * TILE_M;
     int n_group = blockIdx.x;
@@ -23,10 +26,11 @@ __global__ void bit_serial_matmul_kernel_f16(
     int m = m_base + m_sub;
     int n = n_group * 8 + n_sub;
     
+    // [HYBRID-FIX] src_k_blocks is the memory stride of quantized weights (e.g. 1024 or 2048)
     int src_k_blocks = (src_k + 31) / 32;
-    int K_blocks = (K + 31) / 32; // Actual physical stride in memory
+    int K_blocks = (K + 31) / 32; 
     int repetition = (K > src_k) ? (K / src_k) : 1;
-    float r_scale = rsqrtf((float)repetition); // [STABILITY] Magnitude correction factor
+    float r_scale = rsqrtf((float)repetition);
 
     float acc = 0.0f;
 
@@ -40,12 +44,11 @@ __global__ void bit_serial_matmul_kernel_f16(
                     int k_base = kb * 32 + b;
                     if (k_base < src_k) {
                         float combined_signal = 0.0f;
-                        // [HYBRID-CYCLIC-REPETITION] Repeat input signal to match expanded target dimension
+                        // Handle dimensional mismatch (e.g., input 2048 -> weight 1024)
                         for (int r = 0; r < repetition; ++r) {
                             int target_k_idx = k_base + (r * src_k);
                             combined_signal += __half2float(input[m * K + (target_k_idx % K)]);
                         }
-                        // [STABILITY] Normalize folded signal energy
                         combined_signal *= r_scale;
                         if (combined_signal >= 0.0f) folded_bts |= (1u << b);
                         block_sum_sq += combined_signal * combined_signal;
@@ -53,19 +56,28 @@ __global__ void bit_serial_matmul_kernel_f16(
                 }
             }
             s_input_bits[m_sub] = folded_bts;
-            // [STABILITY] Per-block RMS for dynamic input scaling
-            s_input_scales[m_sub] = sqrtf(block_sum_sq / 32.0f + 1e-8f);
+            s_input_scales[m_sub] = sqrtf(block_sum_sq / 32.0f + 1e-6f);
         }
         __syncthreads();
 
         if (m < M && n < N) {
-            // [FIX] Use K_blocks for correct weight memory stride in expanded hybrid models
-            int idx = n_group * K_blocks * 8 + kb * 8 + n_sub;
-            uint32_t w_val = weight[idx];
+            // [CRITICAL] Indexing must follow src_k_blocks for correct weight plane access
+            int idx = n_group * src_k_blocks * 8 + kb * 8 + n_sub;
+            
             float s_val = __half2float(scale[idx]);
-            uint32_t diff = s_input_bits[m_sub] ^ w_val;
-            // [HYBRID-PRECISION] Combine weight scale with dynamic input scale
-            acc += (float)(32 - 2 * (int)__popc(diff)) * s_val * s_input_scales[m_sub];
+            uint32_t in_bits = s_input_bits[m_sub];
+            
+            float bit_acc = 0.0f;
+            // Plane 0 (Always)
+            bit_acc += (float)(32 - 2 * (int)__popc(in_bits ^ w0[idx])) * 1.0f;
+            // Planes 1-3 (Conditional)
+            if (bits > 1 && w1 != nullptr) bit_acc += (float)(32 - 2 * (int)__popc(in_bits ^ w1[idx])) * 2.0f;
+            if (bits > 2 && w2 != nullptr) bit_acc += (float)(32 - 2 * (int)__popc(in_bits ^ w2[idx])) * 4.0f;
+            if (bits > 3 && w3 != nullptr) bit_acc += (float)(32 - 2 * (int)__popc(in_bits ^ w3[idx])) * 8.0f;
+            
+            // [PRECISION-STABILITY] Magnitude-aware normalization
+            float norm_factor = 1.0f / (16.0f * (float)bits);
+            acc += bit_acc * s_val * (s_input_scales[m_sub] + 1e-4f) * norm_factor;
         }
         __syncthreads();
     }
@@ -75,7 +87,7 @@ __global__ void bit_serial_matmul_kernel_f16(
     }
 }
 
-// [FAST-ATTENTION-HYBRID] Folding-aware online softmax attention for F16 with Dynamic Stabilization
+// [FAST-ATTENTION-HYBRID] Folding-aware online softmax attention for F16
 __global__ void bit_serial_attn_kernel_f16(
     const half* __restrict__ Q,        
     const uint32_t* __restrict__ K_p,   
@@ -91,22 +103,21 @@ __global__ void bit_serial_attn_kernel_f16(
     if (q_idx >= q_len || h >= n_h) return;
 
     int src_k_b = (src_h_d + 31) / 32;
-    int h_d_blocks = (h_d + 31) / 32; // Actual physical stride in KV cache
+    int h_d_blocks = (h_d + 31) / 32; 
     int h_kv = h / (n_h / n_kv);
     int repetition = (h_d > src_h_d) ? (h_d / src_h_d) : 1;
-    float r_scale = rsqrtf((float)repetition); // [STABILITY] Magnitude correction
+    float r_scale = rsqrtf((float)repetition);
     
-    __shared__ uint32_t s_q_bits[16]; 
-    __shared__ float s_q_scales[16]; // [STABILITY] Dynamic Q-Scale Pool
+    __shared__ uint32_t s_q_bits[32]; 
+    __shared__ float s_q_scales[32]; 
     
-    if (tid < src_k_b) {
+    if (tid < src_k_b && tid < 32) {
         uint32_t folded_bts = 0;
         float q_block_sum_sq = 0.0f;
         for (int b = 0; b < 32; ++b) {
             int d_base = tid * 32 + b;
             if (d_base < src_h_d) {
                 float combined_q = 0.0f;
-                // [HYBRID-CYCLIC-REPETITION] Cyclic read for Query signals
                 for (int r = 0; r < repetition; ++r) {
                     int target_d_idx = d_base + (r * src_h_d);
                     combined_q += __half2float(Q[(q_idx * n_h * h_d) + (h * h_d) + (target_d_idx % h_d)]);
@@ -117,7 +128,7 @@ __global__ void bit_serial_attn_kernel_f16(
             }
         }
         s_q_bits[tid] = folded_bts;
-        s_q_scales[tid] = sqrtf(q_block_sum_sq / 32.0f + 1e-8f);
+        s_q_scales[tid] = sqrtf(q_block_sum_sq / 32.0f + 1e-6f);
     }
     __syncthreads();
     
@@ -128,7 +139,6 @@ __global__ void bit_serial_attn_kernel_f16(
     for (int j = 0; j < t_s; ++j) {
         float dot = 0.0f;
         for (int kb = 0; kb < src_k_b; ++kb) {
-            // [FIX] Use h_d_blocks for correct KV memory stride
             dot += (float)(32 - 2 * (int)__popc(s_q_bits[kb] ^ K_p[(j * n_kv + h_kv) * h_d_blocks + kb])) * s_q_scales[kb];
         }
         float score = (dot + alpha) * sc;
@@ -151,7 +161,6 @@ __global__ void bit_serial_attn_kernel_f16(
     }
 }
 
-// [STANDARD-F16-MATMUL] For non-quantized layers like lm_head or standard projections
 __global__ void standard_matmul_kernel_f16(const half* __restrict__ A, const half* __restrict__ B, half* __restrict__ C, int M, int N, int K) {
     int m = blockIdx.y * blockDim.y + threadIdx.y;
     int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -164,7 +173,6 @@ __global__ void standard_matmul_kernel_f16(const half* __restrict__ A, const hal
     }
 }
 
-// [RMS-NORM-F16] High-speed RMS Normalization
 __global__ void rms_norm_kernel_f16(const half* i, const half* w, half* o, int h, float e) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
@@ -181,7 +189,6 @@ __global__ void rms_norm_kernel_f16(const half* i, const half* w, half* o, int h
     for (int j = tid; j < h; j += blockDim.x) o[row * h + j] = __float2half(__half2float(i[row * h + j]) * inv_rms * __half2float(w[j]));
 }
 
-// [SILU-MUL-F16] High-speed Swiglu Activation
 __global__ void silu_mul_kernel_f16(half* gate, const half* up, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -191,12 +198,11 @@ __global__ void silu_mul_kernel_f16(half* gate, const half* up, int size) {
     }
 }
 
-// [GPU-ROPE] Fast In-place RoPE Application
 __global__ void apply_rope_inplace_kernel_f16(half* Q, half* K, const half* cos_table, const half* sin_table, int q_len, int s_o, int n_h, int n_kv, int h_d) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int head_idx = idx / h_d;
     int d_idx = idx % h_d;
-    if (d_idx >= h_d / 2) return; // Process pairs
+    if (d_idx >= h_d / 2) return; 
 
     int token_idx = head_idx / (n_h + n_kv);
     int p = token_idx + s_o;
@@ -215,7 +221,6 @@ __global__ void apply_rope_inplace_kernel_f16(half* Q, half* K, const half* cos_
     target_ptr[d_idx + h_d / 2] = __float2half(q0 * s + q1 * c);
 }
 
-// [GPU-PACKING] Fast Bit-serial Compression
 __global__ void pack_f16_to_u32_kernel(const half* src, uint32_t* dst, int total_elements) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid * 32 >= total_elements) return;
@@ -230,19 +235,16 @@ __global__ void pack_f16_to_u32_kernel(const half* src, uint32_t* dst, int total
     dst[tid] = packed;
 }
 
-// [GPU-GAIN] Apply gain
 __global__ void apply_gain_kernel_f16(half* data, float gain, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) data[i] = __float2half(__half2float(data[i]) * gain);
 }
 
-// [GPU-RESIDUAL] Fast In-place Addition
 __global__ void add_inplace_kernel_f16(half* dst, const half* src, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) dst[i] = __float2half(__half2float(dst[i]) + __half2float(src[i]));
 }
 
-// [GPU-HYBRID-EXPAND] Fast repetition for 0.6B -> 2B transition
 __global__ void hybrid_repeat_kernel_f16(half* data, int src_size, int target_size, int q_len) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total_elements = q_len * target_size;
@@ -255,7 +257,6 @@ __global__ void hybrid_repeat_kernel_f16(half* data, int src_size, int target_si
     }
 }
 
-// [GPU-SILU] Fast element-wise SiLU
 __global__ void silu_inplace_kernel_f16(half* data, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
@@ -264,73 +265,63 @@ __global__ void silu_inplace_kernel_f16(half* data, int size) {
     }
 }
 
-// [GPU-ELEMENT-MUL] Element-wise Multiplication
 __global__ void element_mul_kernel_f16(half* dst, const half* src, int total) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total) dst[i] = __float2half(__half2float(dst[i]) * __half2float(src[i]));
 }
 
-// --- EXTERN C INTERFACE ---
 extern "C" {
-    // 1. Bit-Serial Matmul
-    void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k) {
+    void bit_serial_matmul_cuda_f16(const half* d_i, const uint32_t* w0, const uint32_t* w1, const uint32_t* w2, const uint32_t* w3, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k, int bits) {
         dim3 block(8, 32);
         dim3 grid((n + 7) / 8, (m + 31) / 32);
-        bit_serial_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
+        bit_serial_matmul_kernel_f16<<<grid, block>>>(d_i, w0, w1, w2, w3, d_s, d_o, m, n, k, src_k, bits);
     }
 
-    // 2. Bit-Serial Attention
     void bit_serial_attn_cuda_f16(const half* d_q, const uint32_t* d_k, const half* d_v, half* d_o, int n_h, int n_kv, int h_d, int t_s, float scale, int dev, int q_len, float alpha, int src_h_d) {
         dim3 block(h_d < 1024 ? h_d : 1024); 
         dim3 grid(q_len, n_h);
         bit_serial_attn_kernel_f16<<<grid, block>>>(d_q, d_k, d_v, d_o, n_h, n_kv, h_d, t_s, scale, q_len, alpha, src_h_d);
     }
 
-    // 3. Standard F16 Matmul
     void standard_matmul_cuda_f16(const half* d_i, const half* d_w, half* d_o, int m, int n, int k) {
         dim3 block(16, 16);
         dim3 grid((n + 15) / 16, (m + 15) / 16);
         standard_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_o, m, n, k);
     }
 
-    // 4. RMS Norm
     void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
         rms_norm_kernel_f16<<<m, hid, hid * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
     }
 
-    // 5. Silu Mul
-    void cuda_silu_mul_f16(half* d_gate, const half* d_up, int size) {
-        silu_mul_kernel_f16<<<(size + 255) / 256, 256>>>(d_gate, d_up, size);
+    void cuda_silu_mul_f16(half* gate, const half* up, int size) {
+        silu_mul_kernel_f16<<<(size + 255) / 256, 256>>>(gate, up, size);
     }
 
     void cuda_apply_rope_f16(half* d_q, half* d_k, const half* d_cos, const half* d_sin, int q_len, int s_o, int n_h, int n_kv, int h_d) {
-        int total_heads = (n_h + n_kv) * q_len;
-        apply_rope_inplace_kernel_f16<<< (total_heads * (h_d/2) + 255)/256, 256 >>>(d_q, d_k, d_cos, d_sin, q_len, s_o, n_h, n_kv, h_d);
+        apply_rope_inplace_kernel_f16<<<(q_len * (n_h + n_kv) * h_d + 255) / 256, 256>>>(d_q, d_k, d_cos, d_sin, q_len, s_o, n_h, n_kv, h_d);
     }
 
     void cuda_pack_bits_f16(const half* d_src, uint32_t* d_dst, int elements) {
-        int blocks = (elements + 31) / 32;
-        pack_f16_to_u32_kernel<<< (blocks + 255)/256, 256 >>>(d_src, d_dst, elements);
-    }
-
-    void cuda_add_inplace_f16(half* d_dst, const half* d_src, int size) {
-        add_inplace_kernel_f16<<<(size + 255)/256, 256>>>(d_dst, d_src, size);
-    }
-
-    void cuda_hybrid_repeat_f16(half* d_data, int src_size, int target_size, int q_len) {
-        int total = q_len * target_size;
-        hybrid_repeat_kernel_f16<<<(total + 255)/256, 256>>>(d_data, src_size, target_size, q_len);
-    }
-
-    void cuda_silu_inplace_f16(half* d_data, int size) {
-        silu_inplace_kernel_f16<<<(size + 255)/256, 256>>>(d_data, size);
+        pack_f16_to_u32_kernel<<<(elements + 31) / 32 / 256 + 1, 256>>>(d_src, d_dst, elements);
     }
 
     void cuda_apply_gain_f16(half* d_data, float gain, int elements) {
-        apply_gain_kernel_f16<<<(elements + 255)/256, 256>>>(d_data, gain, elements);
+        apply_gain_kernel_f16<<<(elements + 255) / 256, 256>>>(d_data, gain, elements);
     }
 
-    void cuda_element_mul_f16(half* d_dst, const half* d_src, int size) {
-        element_mul_kernel_f16<<<(size + 255)/256, 256>>>(d_dst, d_src, size);
+    void cuda_add_inplace_f16(half* d_dst, const half* src, int size) {
+        add_inplace_kernel_f16<<<(size + 255) / 256, 256>>>(d_dst, src, size);
+    }
+
+    void cuda_hybrid_repeat_f16(half* d_data, int src_size, int target_size, int q_len) {
+        hybrid_repeat_kernel_f16<<<(q_len * target_size + 255) / 256, 256>>>(d_data, src_size, target_size, q_len);
+    }
+
+    void cuda_silu_inplace_f16(half* d_data, int size) {
+        silu_inplace_kernel_f16<<<(size + 255) / 256, 256>>>(d_data, size);
+    }
+
+    void cuda_element_mul_f16(half* d_dst, const half* src, int size) {
+        element_mul_kernel_f16<<<(size + 255) / 256, 256>>>(d_dst, src, size);
     }
 }
