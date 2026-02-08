@@ -18,6 +18,7 @@ use serde_json::{Value, json, Map};
 use std::sync::{Arc, atomic::AtomicBool};
 use tauri::Emitter;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use regex::Regex;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
@@ -302,44 +303,38 @@ impl LogisModel {
                 if base_path.exists() {
                     target_paths.push(base_path);
                 } else {
-                    // [DIAG-KV] Deep Shard Discovery
+                    // [DIAG-KV] Recursive Shard Discovery
                     let mut shards = Vec::new();
-                    let scan_roots = vec![kv_dir.clone(), kv_dir.parent().unwrap_or(&kv_dir).to_path_buf()];
+                    let scan_root = kv_dir.parent().unwrap_or(&kv_dir);
                     
-                    for root in scan_roots {
-                        println!("[DIAG-KV] Deep scanning: {:?}", root);
-                        if let Ok(entries) = std::fs::read_dir(&root) {
+                    fn collect_shards(dir: &Path, shards: &mut Vec<PathBuf>) {
+                        if let Ok(entries) = std::fs::read_dir(dir) {
                             for entry in entries.flatten() {
                                 let p = entry.path();
-                                if p.is_dir() {
-                                    // Also scan subdirectories (one level deep)
-                                    if let Ok(sub_entries) = std::fs::read_dir(&p) {
-                                        for sub_entry in sub_entries.flatten() {
-                                            let sp = sub_entry.path();
-                                            let name = sp.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                                            if name.contains("shared_pug_base") && name.ends_with(".safetensors") {
-                                                println!("[DIAG-KV] Found shard in subfolder: {}", sp.display());
-                                                shards.push(sp);
-                                            }
-                                        }
+                                if p.is_dir() { collect_shards(&p, shards); }
+                                else {
+                                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                    if name.contains("shared_pug_base") && name.contains("shard") && name.ends_with(".safetensors") {
+                                        println!("[DIAG-KV] Found memory shard: {}", p.display());
+                                        shards.push(p);
                                     }
-                                }
-                                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                                if name.contains("shared_pug_base") && name.ends_with(".safetensors") {
-                                    println!("[DIAG-KV] Found shard in root: {}", p.display());
-                                    shards.push(p);
                                 }
                             }
                         }
-                        if !shards.is_empty() { break; }
                     }
+                    
+                    println!("[DIAG-KV] Starting recursive search from: {:?}", scan_root);
+                    collect_shards(scan_root, &mut shards);
                     
                     // Numeric Sort
                     let re = Regex::new(r"shard(\d+)").unwrap();
-                    shards.sort_by_key(|p| {
+                    shards.sort_by_key(|p: &PathBuf| {
                         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
                         re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
                     });
+                    
+                    // Final deduplication
+                    shards.dedup_by(|a: &mut PathBuf, b: &mut PathBuf| a.file_name() == b.file_name());
                     target_paths = shards;
                 }
 

@@ -303,16 +303,22 @@ impl NativeQwen3TextModel {
         let mut int_ws = ForwardWorkspace::new(); let ws = workspace.unwrap_or(&mut int_ws);
         ws.ensure_capacity(hid, self.config.intermediate_size, q_len, self.config.num_attention_heads, self.config.num_key_value_heads, self.config.head_dim);
         ws.hidden_a[..embeds.len()].copy_from_slice(&embeds); let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), embeds.len()) };
-        if !cur_x.is_empty() { log_tensor_health("Embeddings", cur_x, &[q_len, hid]); }
+        
+        // [LOG-DIET] Only log health during prefill (q_len > 1) to keep the output clean
+        if q_len > 1 { log_tensor_health("Embeddings", cur_x, &[q_len, hid]); }
+        
         { let mut rg = self.rope_cache.lock().unwrap(); rg.ensure_length(s_o + q_len); }
         let rg = self.rope_cache.lock().unwrap();
         for (i, layer) in self.layers.iter().enumerate() {
             let out = layer.forward(cur_x, &self.config, s_o, i, &rg.cos, &rg.sin, false, is_vision, gs, ws, i % 2 == 0, &self.rope_cache_gpu);
-            if i == 0 || i == self.layers.len() - 1 { log_tensor_health(&format!("Layer {} Output", i), out, &[q_len, hid]); }
+            if q_len > 1 && (i == 0 || i == self.layers.len() - 1) { 
+                log_tensor_health(&format!("Layer {} Output", i), out, &[q_len, hid]); 
+            }
             cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
         }
         let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()]; native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
-        log_tensor_health("Final Norm Output", &cn, &[q_len, hid]); cn
+        if q_len > 1 { log_tensor_health("Final Norm Output", &cn, &[q_len, hid]); }
+        cn
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.embed_tokens.move_to_gpu(dev)?; self.norm.move_to_gpu(dev)?; for l in &mut self.layers { l.move_to_gpu(dev)?; } Ok(()) }
     pub fn force_free_kv_cache(&self) { for l in &self.layers { l.kv_cache.lock().unwrap().k = Vec::new(); l.kv_cache.lock().unwrap().v = Vec::new(); } }
