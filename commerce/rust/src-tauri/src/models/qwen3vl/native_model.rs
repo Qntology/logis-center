@@ -144,20 +144,36 @@ impl DynamicGpuKVCache {
     pub fn clear(&mut self) { self.current_len = 0; }
 }
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 fn log_tensor_health(name: &str, data: &[f16], shape: &[usize]) {
     if data.is_empty() { return; }
     let mut min = f32::MAX;
     let mut max = f32::MIN;
     let mut sum_abs = 0.0f32;
+    let mut nan_count = 0;
+    
     for &v in data {
         let f = v.to_f32();
+        if f.is_nan() { nan_count += 1; continue; }
         if f < min { min = f; }
         if f > max { max = f; }
         sum_abs += f.abs();
     }
-    let avg_abs = sum_abs / data.len() as f32;
-    println!("[HEALTH] {:<40} | Shape: {:<12?} | Min: {:>8.4} | Max: {:>8.4} | AbsAvg: {:>8.4}", 
-             name, shape, min, max, avg_abs);
+    
+    let avg_abs = sum_abs / (data.len() - nan_count).max(1) as f32;
+    
+    if nan_count > 0 {
+        println!("[CRITICAL] {:<30} | !!! CONTAINS {} NaNs !!!", name, nan_count);
+    }
+
+    if min == f32::MAX { // All NaNs
+        println!("[HEALTH] {:<40} | Shape: {:<12?} | ALL DATA IS INVALID (NaN/Inf)", name, shape);
+    } else {
+        println!("[HEALTH] {:<40} | Shape: {:<12?} | Min: {:>8.4} | Max: {:>8.4} | AbsAvg: {:>8.4}", 
+                 name, shape, min, max, avg_abs);
+    }
 }
 
 pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, src_k: usize, target_k: usize, slice_count: usize) -> Vec<f16> {
@@ -635,22 +651,35 @@ impl NativeQwen3TextModel {
         
         ws.hidden_a[..embeds.len()].copy_from_slice(&embeds);
         let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), embeds.len()) };
-        log_tensor_health("Embeddings", cur_x, &[q_len, hid]);
+        
+        // --- Log Throttling ---
+        let count = LOG_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let should_log = count == 0 || (count % 100 == 0); // Log prefill and every 100th token
+
+        if should_log { log_tensor_health("Embeddings", cur_x, &[q_len, hid]); }
 
         { let mut rg = self.rope_cache.lock().unwrap(); rg.ensure_length(s_o + q_len); }
         let rg_lock = self.rope_cache.lock().unwrap(); let r_cos = &rg_lock.cos; let r_sin = &rg_lock.sin;
+        
+        // [FIX] Execute support_layer0 if provided (Bridge for 2B models)
+        if let Some(layer0) = sl {
+            let out = layer0.forward(cur_x, &self.config, s_o, 0, r_cos, r_sin, is_baking, is_vision, gs, ws, true, &self.rope_cache_gpu);
+            if should_log { log_tensor_health("Support Layer 0 Output", out, &[q_len, hid]); }
+            cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
+        }
+
         for (i, layer) in self.layers.iter().enumerate() {
             let active = layer;
             let use_b = i % 2 == 0;
-            let out = active.forward(cur_x, &self.config, s_o, i, r_cos, r_sin, is_baking, is_vision, gs, ws, use_b, &self.rope_cache_gpu);
-            if i == 0 || i == self.layers.len() - 1 {
-                log_tensor_health(&format!("Layer {} Output", i), out, &[q_len, hid]);
+            let out = active.forward(cur_x, &self.config, s_o, i + (if sl.is_some() { 1 } else { 0 }), r_cos, r_sin, is_baking, is_vision, gs, ws, use_b, &self.rope_cache_gpu);
+            if should_log && (i == 0 || i == self.layers.len() - 1) {
+                log_tensor_health(&format!("Layer {} Output", i + (if sl.is_some() { 1 } else { 0 })), out, &[q_len, hid]);
             }
             cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
         }
         let n_cow = self.norm.get_slice::<f16>(); let eps = f16::from_f32(1e-6);
         let mut cn = vec![eps; cur_x.len()]; native_rms_norm_f16_into(cur_x, n_cow.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
-        log_tensor_health("Final Norm Output", &cn, &[q_len, hid]);
+        if should_log { log_tensor_health("Final Norm Output", &cn, &[q_len, hid]); }
         cn
     }
     pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> { 
@@ -1251,6 +1280,8 @@ impl NativeQwen3VLModel {
             pub fn forward(&self, i_ids: &[u32], pv: Option<&[f16]>, gt: Option<&[u32; 3]>, so: usize) -> Vec<f16> {
         let is_baking = self.text_model.layers.len() <= 1; 
         let is_vision = pv.is_some();
+        let count = LOG_COUNTER.load(Ordering::Relaxed);
+        let should_log = count == 0 || (count % 100 == 0);
         
         let mut wl = if is_baking { 
             self.support_workspace.lock().unwrap() 
@@ -1276,7 +1307,7 @@ impl NativeQwen3VLModel {
         }
         
         // [GPU-OP] Execution starting
-        let sl = None; 
+        let sl = self.support_layer0.as_ref(); 
         let nx = self.text_model.forward_ext(i_ids, embeds, so, sc, Some(&mut wl), sl, is_vision);
         
         if is_baking {
@@ -1285,7 +1316,11 @@ impl NativeQwen3VLModel {
             return vec![]; 
         }
         
-        self.lm_head.forward(&nx, sc)
+        let logits = self.lm_head.forward(&nx, sc);
+        if should_log {
+            log_tensor_health("Final Logits", &logits, &[i_ids.len(), 151936]);
+        }
+        logits
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> {
         self.text_model.move_to_gpu(dev)?; 
