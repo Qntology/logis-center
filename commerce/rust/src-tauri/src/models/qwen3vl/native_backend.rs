@@ -129,23 +129,23 @@ pub fn native_cuda_pack_bits(d_src: CUdeviceptr, d_dst: CUdeviceptr, elements: u
 }
 
 #[cfg(feature = "cuda")]
-pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32, src_h_d: usize, q_on_gpu: bool) {
+pub fn native_bit_serial_attn_gpu_buffered(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, d_q: CUdeviceptr, d_o: CUdeviceptr, alpha: f32, src_h_d: usize, q_on_gpu: bool, q_len: usize) {
     if d_q == 0 || d_o == 0 || k_p.0.is_null() || v_p.0.is_null() { return; }
     unsafe {
         if !q_on_gpu { let _ = lib().cuMemcpyHtoD_v2(d_q, q.as_ptr() as *const _, q.len() * 2); }
-        let actual_q_len = if q.is_empty() { 1 } else { q.len() / (n_h * h_d) };
-        cuda_attn_f16(d_q as *const f16, k_p.0 as *const u32, v_p.0 as *const f16, d_o as *mut f16, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, actual_q_len as i32, alpha, src_h_d as i32);
+        cuda_attn_f16(d_q as *const f16, k_p.0 as *const u32, v_p.0 as *const f16, d_o as *mut f16, n_h as i32, n_kv as i32, h_d as i32, t_s as i32, 1.0/(h_d as f32).sqrt(), dev as i32, q_len as i32, alpha, src_h_d as i32);
     }
 }
 
 #[cfg(feature = "cuda")]
 pub fn native_bit_serial_attn_gpu(q: &[f16], k_p: GpuPtr, v_p: GpuPtr, n_h: usize, n_kv: usize, h_d: usize, t_s: usize, dev: usize, alpha: f32, src_h_d: usize) -> Vec<f16> {
     let eps_signal = f16::from_f32(1e-6);
+    let q_len = if q.is_empty() { 1 } else { q.len() / (n_h * h_d) };
     unsafe {
         let mut d_q: CUdeviceptr = 0; let mut d_o: CUdeviceptr = 0;
         let _ = lib().cuMemAlloc_v2(&mut d_q, q.len() * 2); 
         let _ = lib().cuMemAlloc_v2(&mut d_o, q.len() * 2);
-        native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha, src_h_d, false);
+        native_bit_serial_attn_gpu_buffered(q, k_p, v_p, n_h, n_kv, h_d, t_s, dev, d_q, d_o, alpha, src_h_d, false, q_len);
         let mut o_f = vec![eps_signal; q.len()]; 
         let _ = lib().cuMemcpyDtoH_v2(o_f.as_mut_ptr() as *mut _, d_o, q.len() * 2);
         let _ = lib().cuMemFree_v2(d_q); let _ = lib().cuMemFree_v2(d_o);
