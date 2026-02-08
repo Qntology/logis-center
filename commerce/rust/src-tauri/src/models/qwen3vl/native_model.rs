@@ -267,6 +267,19 @@ impl NativeLayer {
         for i in 0..x.len() { os[i] += moh[i]; } os
     }
     pub fn clear_kv_cache(&self) { self.kv_cache.lock().unwrap().current_len = 0; self.gpu_kv_cache.lock().unwrap().current_len = 0; }
+    pub fn get_kv_data(&self, hd: usize, nkv: usize, st: usize) -> Option<(Vec<u32>, Vec<f16>)> {
+        #[cfg(feature = "cuda")] if self.device_id >= 0 {
+            let g = self.gpu_kv_cache.lock().unwrap(); if let (Some(kp), Some(vp)) = (g.k_ptr, g.v_ptr) { if g.current_len > st {
+                let el = g.current_len - st; let ku = nkv * (hd/32); let vu = nkv * hd; let mut kh = vec![0u32; el * ku]; let mut vh = vec![f16::ZERO; el * vu];
+                unsafe { let cl = crate::models::qwen3vl::native_backend::lib(); let _ = cl.cuMemcpyDtoH_v2(kh.as_mut_ptr() as *mut _, (kp.0 as u64 + (st * ku * 4) as u64) as CUdeviceptr, kh.len()*4); let _ = cl.cuMemcpyDtoH_v2(vh.as_mut_ptr() as *mut _, (vp.0 as u64 + (st * vu * 2) as u64) as CUdeviceptr, vh.len()*2); }
+                return Some((kh, vh));
+            } }
+        }
+        let c = self.kv_cache.lock().unwrap(); if c.current_len > st { 
+            let ku = nkv * (hd/32); let vu = nkv * hd; 
+            Some((c.k[st * ku .. c.current_len * ku].to_vec(), c.v[st * vu .. c.current_len * vu].to_vec())) 
+        } else { None }
+    }
 }
 
 pub struct NativeVisionModel { pub patch_embed: NativeLinear, pub blocks: Vec<NativeLayer>, pub merger: NativeLayer }
