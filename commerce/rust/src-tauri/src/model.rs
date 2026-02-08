@@ -18,6 +18,7 @@ use serde_json::{Value, json, Map};
 use std::sync::{Arc, atomic::AtomicBool};
 use tauri::Emitter;
 use std::io::Cursor;
+use regex::Regex;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use sysinfo::System;
@@ -301,20 +302,23 @@ impl LogisModel {
                 if base_path.exists() {
                     target_paths.push(base_path);
                 } else {
-                    // Try to find shards
+                    // [FIX] Try to find shards using both task_id and common base patterns
                     if let Ok(entries) = std::fs::read_dir(&kv_dir) {
                         let mut shards = Vec::new();
                         for entry in entries.flatten() {
                             let p = entry.path();
                             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                            if name.starts_with(&task_id_str) && name.contains("_shard") && name.ends_with(".safetensors") {
+                            // Look for task-specific shards OR shared pug base shards
+                            if (name.starts_with(&task_id_str) || name.starts_with("shared_pug_base")) 
+                               && name.contains("_shard") && name.ends_with(".safetensors") {
                                 shards.push(p);
                             }
                         }
-                        // Sort shards
+                        // Sort shards by their numeric suffix
                         shards.sort_by_key(|p| {
                             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                            name.split("_shard").last().and_then(|s| s.replace(".safetensors", "").parse::<usize>().ok()).unwrap_or(0)
+                            let re = Regex::new(r"_shard(\d+)").unwrap();
+                            re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
                         });
                         target_paths = shards;
                     }

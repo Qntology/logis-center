@@ -7,7 +7,6 @@ use cudarc::driver::sys::{CUdeviceptr, lib};
 use half::f16;
 use safetensors::SafeTensors;
 use anyhow::{Result, anyhow};
-use rayon::prelude::*;
 use std::sync::atomic::{Ordering, AtomicU64};
 use regex::Regex;
 use std::fs::OpenOptions;
@@ -31,13 +30,10 @@ fn log_vram_state(stage: &str) {
             let sys_used = (total - free) / (1024 * 1024);
             let engine_actual = ACTIVE_GPU_BYTES.load(Ordering::Relaxed) / (1024 * 1024);
             let free_mb = free / (1024 * 1024);
-            
-            // [DIAG] sys_used: Task Manager value | engine_actual: Real model data
             let line = format!(
                 "[{:<15}] Sys-Occupied: {:>4} MB | Engine-Data: {:>4} MB | Free: {:>4} MB\n", 
                 stage, sys_used, engine_actual, free_mb
             );
-            
             if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("vram_diagnostics.log") {
                 let _ = file.write_all(line.as_bytes());
             }
@@ -96,10 +92,10 @@ impl DynamicGpuKVCache {
                 if (cl.cuMemAlloc_v2(&mut nkp, kb) as i32) != 0 || (cl.cuMemAlloc_v2(&mut nvp, vb) as i32) != 0 { return; }
                 if let (Some(ok), Some(ov)) = (self.k_ptr.take(), self.v_ptr.take()) {
                     if self.current_len > 0 {
-                        cl.cuMemcpyDtoD_v2(nkp, ok.0 as CUdeviceptr, self.current_len * n_kv * (h_d/32) * 4);
-                        cl.cuMemcpyDtoD_v2(nvp, ov.0 as CUdeviceptr, self.current_len * n_kv * h_d * 2);
+                        let _ = cl.cuMemcpyDtoD_v2(nkp, ok.0 as CUdeviceptr, self.current_len * n_kv * (h_d/32) * 4);
+                        let _ = cl.cuMemcpyDtoD_v2(nvp, ov.0 as CUdeviceptr, self.current_len * n_kv * h_d * 2);
                     }
-                    cl.cuMemFree_v2(ok.0 as CUdeviceptr); cl.cuMemFree_v2(ov.0 as CUdeviceptr);
+                    let _ = cl.cuMemFree_v2(ok.0 as CUdeviceptr); let _ = cl.cuMemFree_v2(ov.0 as CUdeviceptr);
                     let old_size = self.capacity * (n_kv * (h_d/32) * 4 + n_kv * h_d * 2);
                     ACTIVE_GPU_BYTES.fetch_sub(old_size as u64, Ordering::Relaxed);
                 }
@@ -107,7 +103,7 @@ impl DynamicGpuKVCache {
                 self.capacity = nc; 
                 let new_size = nc * (n_kv * (h_d/32) * 4 + n_kv * h_d * 2);
                 ACTIVE_GPU_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-                cl.cuStreamSynchronize(std::ptr::null_mut());
+                let _ = cl.cuStreamSynchronize(std::ptr::null_mut());
             }
         }
     }
@@ -196,9 +192,17 @@ impl NativeLinear {
         let mut out = vec![f16::ZERO; (x.len() / self.in_features) * self.out_features]; self.forward_into(x, &mut out, gs); out
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> {
-        self.device_id = dev; match &mut self.variant {
-            LinearVariant::Standard { weight, bias } => { weight.move_to_gpu(dev)?; if let Some(b) = bias { b.move_to_gpu(dev)?; } },
-            LinearVariant::BitSerial { weight_packed, scales, bias } => { weight_packed.move_to_gpu(dev)?; scales.move_to_gpu(dev)?; if let Some(b) = bias { b.move_to_gpu(dev)?; } },
+        self.device_id = dev; 
+        match &mut self.variant {
+            LinearVariant::Standard { weight, bias } => { 
+                let ws = weight.host_size as u64; weight.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(ws, Ordering::Relaxed);
+                if let Some(b) = bias { let bs = b.host_size as u64; b.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(bs, Ordering::Relaxed); } 
+            },
+            LinearVariant::BitSerial { weight_packed, scales, bias } => { 
+                let wps = weight_packed.host_size as u64; weight_packed.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(wps, Ordering::Relaxed);
+                let ss = scales.host_size as u64; scales.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(ss, Ordering::Relaxed);
+                if let Some(b) = bias { let bs = b.host_size as u64; b.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(bs, Ordering::Relaxed); } 
+            },
         }
         Ok(())
     }
@@ -212,8 +216,11 @@ pub struct NativeLayer {
 
 impl NativeLayer {
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> {
-        self.device_id = dev; self.input_layernorm.move_to_gpu(dev)?; self.post_attention_layernorm.move_to_gpu(dev)?;
-        if let Some(ref mut qn) = self.q_norm { qn.move_to_gpu(dev)?; } if let Some(ref mut kn) = self.k_norm { kn.move_to_gpu(dev)?; }
+        self.device_id = dev; 
+        let s1 = self.input_layernorm.host_size as u64; self.input_layernorm.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(s1, Ordering::Relaxed);
+        let s2 = self.post_attention_layernorm.host_size as u64; self.post_attention_layernorm.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(s2, Ordering::Relaxed);
+        if let Some(ref mut qn) = self.q_norm { let s = qn.host_size as u64; qn.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(s, Ordering::Relaxed); } 
+        if let Some(ref mut kn) = self.k_norm { let s = kn.host_size as u64; kn.move_to_gpu(dev)?; ACTIVE_GPU_BYTES.fetch_add(s, Ordering::Relaxed); }
         self.q_proj.move_to_gpu(dev)?; self.k_proj.move_to_gpu(dev)?; self.v_proj.move_to_gpu(dev)?; self.o_proj.move_to_gpu(dev)?;
         self.gate_proj.move_to_gpu(dev)?; self.up_proj.move_to_gpu(dev)?; self.down_proj.move_to_gpu(dev)?; Ok(())
     }
@@ -487,16 +494,14 @@ impl NativeQwen3VLModel {
             let file = std::fs::File::open(path)?; let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
             let tokens = {
                 let st = SafeTensors::deserialize(&mmap)?;
-                let t = if let Ok(meta) = st.tensor("metadata.tokens") { meta.shape()[0] } else if let Ok(kt) = st.tensor("layer.0.k") {
-                    let u32s = kt.data().len() / 4; let upt = n_kv * (h_d / 32); if upt > 0 { u32s / upt } else { 0 }
-                } else { 0 };
-                if t > 0 {
-                    if let Ok(tt) = st.tensor("metadata.tokens") {
-                        let tu32: Vec<u32> = tt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
-                        self.text_model.rope_cache.lock().unwrap().tail_tokens = tu32;
-                    }
-                }
-                t
+                if let Ok(meta) = st.tensor("metadata.tokens") {
+                    meta.shape()[0]
+                } else if let Ok(kt) = st.tensor("layer.0.k") {
+                    // [FIX] Correctly calculate tokens based on raw bytes and stride
+                    let bytes = kt.data().len();
+                    let bytes_per_token = n_kv * (h_d / 32) * 4;
+                    if bytes_per_token > 0 { bytes / bytes_per_token } else { 0 }
+                } else { 0 }
             };
             if tokens > 0 { total_t += tokens; metadatas.push(tokens); mmaps.push(mmap); }
         }
@@ -559,25 +564,4 @@ pub struct RopeCache { pub cos: Vec<f16>, pub sin: Vec<f16>, pub head_dim: usize
 impl RopeCache {
     pub fn new(head_dim: usize, theta: f32, max_len: usize) -> Self { let (cos, sin) = crate::models::qwen3vl::native_backend::native_precompute_rope_f16(head_dim, max_len, theta); Self { cos, sin, head_dim, theta, tail_tokens: Vec::new() } }
     pub fn ensure_length(&mut self, len: usize) { if len * (self.head_dim / 2) > self.cos.len() { let (cos, sin) = crate::models::qwen3vl::native_backend::native_precompute_rope_f16(self.head_dim, (len + 1023) / 1024 * 1024, self.theta); self.cos = cos; self.sin = sin; } }
-}
-
-impl NativeTensor {
-    #[cfg(feature = "cuda")]
-    pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> {
-        if self.gpu_ptr.is_some() { return Ok(()); }
-        unsafe {
-            let cl = crate::models::qwen3vl::native_backend::lib();
-            let mut ptr: CUdeviceptr = 0;
-            if (cl.cuMemAlloc_v2(&mut ptr, self.host_size) as i32) == 0 {
-                if (cl.cuMemcpyHtoD_v2(ptr, self.data_ptr as *const _, self.host_size) as i32) == 0 {
-                    self.gpu_ptr = Some(GpuPtr(ptr as *mut _));
-                    self.device_id = device_id;
-                    ACTIVE_GPU_BYTES.fetch_add(self.host_size as u64, Ordering::Relaxed);
-                    return Ok(());
-                }
-                let _ = cl.cuMemFree_v2(ptr);
-            }
-            Err(anyhow!("GPU Alloc/Copy failed"))
-        }
-    }
 }

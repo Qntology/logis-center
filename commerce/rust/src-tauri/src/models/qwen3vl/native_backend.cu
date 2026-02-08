@@ -242,21 +242,36 @@ __global__ void standard_matmul_kernel_f16(const half* __restrict__ A, const hal
     }
 }
 
-// [RMS-NORM-F16] High-speed RMS Normalization
+// [RMS-NORM-F16] Ultra-stable Warp-Shuffle based RMS Normalization
 __global__ void rms_norm_kernel_f16(const half* i, const half* w, half* o, int h, float e) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
-    extern __shared__ float s_part_sum[];
     float sum = 0.0f;
-    for (int j = tid; j < h; j += blockDim.x) { float val = __half2float(i[row * h + j]); sum += val * val; }
-    s_part_sum[tid] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) s_part_sum[tid] += s_part_sum[tid + stride];
-        __syncthreads();
+
+    for (int col = tid; col < h; col += blockDim.x) {
+        float val = __half2float(i[row * h + col]);
+        sum += val * val;
     }
-    float inv_rms = rsqrtf(s_part_sum[0] / h + e);
-    for (int j = tid; j < h; j += blockDim.x) o[row * h + j] = __float2half(__half2float(i[row * h + j]) * inv_rms * __half2float(w[j]));
+
+    for (int offset = 16; offset > 0; offset /= 2) sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    __shared__ float s_warp_sums[32];
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) s_warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (tid < 32) {
+        float s = (tid < (blockDim.x + 31) / 32) ? s_warp_sums[tid] : 0.0f;
+        for (int offset = 16; offset > 0; offset /= 2) s += __shfl_down_sync(0xFFFFFFFF, s, offset);
+        if (tid == 0) s_warp_sums[0] = s;
+    }
+    __syncthreads();
+
+    float inv_rms = rsqrtf(s_warp_sums[0] / h + e);
+    for (int col = tid; col < h; col += blockDim.x) {
+        o[row * h + col] = __float2half(__half2float(i[row * h + col]) * inv_rms * __half2float(w[col]));
+    }
 }
 
 // [SILU-MUL-F16] High-speed Swiglu Activation
@@ -380,8 +395,8 @@ extern "C" {
 
     // 4. RMS Norm
     void cuda_rms_norm_f16(const half* d_i, const half* d_w, half* d_o, int m, int hid, float eps) {
-        int threads = (hid < 1024) ? hid : 1024;
-        rms_norm_kernel_f16<<<m, threads, threads * sizeof(float)>>>(d_i, d_w, d_o, hid, eps);
+        int threads = 256; 
+        rms_norm_kernel_f16<<<m, threads>>>(d_i, d_w, d_o, hid, eps);
     }
 
     // 5. Silu Mul
