@@ -144,6 +144,22 @@ impl DynamicGpuKVCache {
     pub fn clear(&mut self) { self.current_len = 0; }
 }
 
+fn log_tensor_health(name: &str, data: &[f16], shape: &[usize]) {
+    if data.is_empty() { return; }
+    let mut min = f32::MAX;
+    let mut max = f32::MIN;
+    let mut sum_abs = 0.0f32;
+    for &v in data {
+        let f = v.to_f32();
+        if f < min { min = f; }
+        if f > max { max = f; }
+        sum_abs += f.abs();
+    }
+    let avg_abs = sum_abs / data.len() as f32;
+    println!("[HEALTH] {:<40} | Shape: {:<12?} | Min: {:>8.4} | Max: {:>8.4} | AbsAvg: {:>8.4}", 
+             name, shape, min, max, avg_abs);
+}
+
 pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, src_k: usize, target_k: usize, slice_count: usize) -> Vec<f16> {
     let src_k_blocks = (src_k + 31) / 32;
     let n_padded = (n + 7) / 8 * 8;
@@ -156,20 +172,6 @@ pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, sr
             for sub_n in 0..8 {
                 let n_idx = no * 8 + sub_n; if n_idx >= n { continue; }
                 
-                // [NEW] Aggregate multiple slices if slice_count > 1
-                let mut val_sum = 0.0f32;
-                for sl in 0..slice_count {
-                    let s_idx = sl * slice_stride + (no * src_k_blocks + skb) * 8 + sub_n;
-                    let bits = packed[s_idx];
-                    let scale = scales[(no * src_k_blocks + skb) * 8 + sub_n].to_f32();
-                    
-                    for b in 0..32 {
-                        // This internal loop is complex for a direct flat dequant, 
-                        // but let's stick to the bit-level sum.
-                    }
-                    // Actually, we need to map the bits to the target output.
-                }
-
                 // [RE-IMPLEMENT] Correct flat dequantization with slice support
                 for b in 0..32 {
                     let k_idx_base = skb * 32 + b;
@@ -185,7 +187,7 @@ pub fn dequantize_bit_serial_to_f16(packed: &[u32], scales: &[f16], n: usize, sr
                     
                     // Center-shift for 4-bit (0..15 -> -8..7) or 1-bit (0..1 -> -1..1)
                     let final_val = if slice_count == 4 {
-                        (bit_sum - 8.0) * scales[(no * src_k_blocks + skb) * 8 + sub_n].to_f32()
+                        (bit_sum - 8.0) * scales[n_idx].to_f32()
                     } else {
                         (if bit_sum >= 1.0 { 1.0 } else { -1.0 }) * scales[(no * src_k_blocks + skb) * 8 + sub_n].to_f32()
                     };
@@ -275,6 +277,27 @@ impl NativeLinear {
                     bit_serial_matmul_f32_extreme_into(x, wpr, sr, out, m, self.out_features, self.in_features);
                     if let Some(b) = bias { let br = b.get_raw_slice::<f16>(); for i in 0..m { for j in 0..self.out_features { out[i * self.out_features + j] += br[j]; } } }
                 }
+            },
+            LinearVariant::BitSliced4 { weight_packed, scales, bias } => {
+                #[cfg(feature = "cuda")]
+                if self.device_id >= 0 && weight_packed.gpu_ptr.is_some() {
+                    let (d_i, d_o, _) = if let Some((si, so, sr)) = global_scratch { self.ensure_gpu_buffers_ext(m, si, so, sr) } else { (0, 0, 0) };
+                    if d_i != 0 && d_o != 0 {
+                        let cl = unsafe { crate::models::qwen3vl::native_backend::lib() };
+                        unsafe {
+                            crate::models::qwen3vl::native_backend::cuda_matmul_4bit_f16(d_i as *const f16, weight_packed.gpu_ptr.unwrap().0 as *const u32, scales.gpu_ptr.unwrap().0 as *const f16, d_o as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32);
+                            cl.cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, out.len() * 2);
+                        }
+                        if let Some(b) = bias { unsafe { let br = b.get_raw_slice::<f16>(); for i in 0..m { for j in 0..self.out_features { out[i * self.out_features + j] += br[j]; } } } }
+                        return;
+                    }
+                }
+                // Fallback: 4-bit CPU dequantization
+                let wpr = weight_packed.get_slice::<u32>();
+                let sr = scales.get_slice::<f16>();
+                let dequant = dequantize_bit_serial_to_f16(wpr.as_ref(), sr.as_ref(), self.out_features, self.src_in, self.in_features, 4);
+                let b_cow = bias.as_ref().map(|b| b.get_slice::<f16>());
+                native_linear_f16_into(x, &dequant, b_cow.as_ref().map(|b| b.as_ref()), out, m, self.out_features, self.in_features);
             }
         }
     }
@@ -329,6 +352,11 @@ impl NativeLinear {
                 if let Some(b) = bias { b.move_to_gpu(device_id)?; } 
             },
             LinearVariant::BitSerial { weight_packed, scales, bias } => { 
+                weight_packed.move_to_gpu(device_id)?; 
+                scales.move_to_gpu(device_id)?; 
+                if let Some(b) = bias { b.move_to_gpu(device_id)?; } 
+            },
+            LinearVariant::BitSliced4 { weight_packed, scales, bias } => { 
                 weight_packed.move_to_gpu(device_id)?; 
                 scales.move_to_gpu(device_id)?; 
                 if let Some(b) = bias { b.move_to_gpu(device_id)?; } 
@@ -595,7 +623,8 @@ impl NativeQwen3TextModel {
         let hid = self.config.hidden_size;
         let embeds = match &self.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => native_embedding_lookup_f16(i_ids, weight.get_slice::<f16>().as_ref(), hid),
-            LinearVariant::BitSerial { weight_packed, .. } => native_embedding_lookup_f16(i_ids, weight_packed.get_slice::<f16>().as_ref(), hid)
+            LinearVariant::BitSerial { weight_packed, .. } => native_embedding_lookup_f16(i_ids, weight_packed.get_slice::<f16>().as_ref(), hid),
+            LinearVariant::BitSliced4 { weight_packed, .. } => native_embedding_lookup_f16(i_ids, weight_packed.get_slice::<f16>().as_ref(), hid),
         };
         self.forward_ext(i_ids, embeds, s_o, gs, workspace, sl, is_vision)
     }
@@ -606,16 +635,22 @@ impl NativeQwen3TextModel {
         
         ws.hidden_a[..embeds.len()].copy_from_slice(&embeds);
         let mut cur_x: &[f16] = unsafe { std::slice::from_raw_parts(ws.hidden_a.as_ptr(), embeds.len()) };
+        log_tensor_health("Embeddings", cur_x, &[q_len, hid]);
+
         { let mut rg = self.rope_cache.lock().unwrap(); rg.ensure_length(s_o + q_len); }
         let rg_lock = self.rope_cache.lock().unwrap(); let r_cos = &rg_lock.cos; let r_sin = &rg_lock.sin;
         for (i, layer) in self.layers.iter().enumerate() {
             let active = layer;
             let use_b = i % 2 == 0;
             let out = active.forward(cur_x, &self.config, s_o, i, r_cos, r_sin, is_baking, is_vision, gs, ws, use_b, &self.rope_cache_gpu);
+            if i == 0 || i == self.layers.len() - 1 {
+                log_tensor_health(&format!("Layer {} Output", i), out, &[q_len, hid]);
+            }
             cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
         }
         let n_cow = self.norm.get_slice::<f16>(); let eps = f16::from_f32(1e-6);
         let mut cn = vec![eps; cur_x.len()]; native_rms_norm_f16_into(cur_x, n_cow.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
+        log_tensor_health("Final Norm Output", &cn, &[q_len, hid]);
         cn
     }
     pub fn move_to_gpu(&mut self, device_id: i32) -> anyhow::Result<()> { 
@@ -691,10 +726,10 @@ impl NativeVisionModel {
 
 impl NativeQwen3VLModel {
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>, device_id: i32) -> Result<Self> {
-        let mut active_gpu_id = device_id;
+        let active_gpu_id = device_id;
         #[cfg(feature = "cuda")]
         unsafe {
-            let cl = crate::models::qwen3vl::native_backend::lib();
+            let _cl = crate::models::qwen3vl::native_backend::lib();
             if active_gpu_id >= 0 {
                 println!("[LOAD] Using GPU-{} as requested.", active_gpu_id);
             }
@@ -708,22 +743,26 @@ impl NativeQwen3VLModel {
             for v in vars { if primary.tensor(&v).is_ok() || primary.tensor(&format!("{}.packed", v)).is_ok() { return Some((v, true)); } }
             None
         };
-        let mut get_l = |base: &str, in_f: usize, out_f: usize, l_idx: i32| -> Result<NativeLinear> {
+        let get_l = |base: &str, in_f: usize, out_f: usize, l_idx: i32| -> Result<NativeLinear> {
             let (key, is_p) = find_key_ext(base, &st, st_sec.as_ref(), l_idx).ok_or_else(|| anyhow!("LinearNotFound: {}", base))?;
             let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
             let pn = format!("{}.packed", key); let sn = format!("{}.scales", key);
             let fn_ = format!("{}.format", key);
             if cst.tensor(&pn).is_ok() {
                 let vp = cst.tensor(&pn)?; let vs = cst.tensor(&sn)?;
-                let format = cst.tensor(&fn_).map(|t| t.get_slice::<i8>()[0]).unwrap_or(1);
+                let format = cst.tensor(&fn_).map(|t| t.data()[0] as i8).unwrap_or(1);
                 let op = unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize; let os = unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
                 
                 let variant = if format == 4 {
+                    let s_slice = unsafe { std::slice::from_raw_parts(cm.as_ptr().add(os) as *const f16, vs.data().len()/2) };
+                    log_tensor_health(&format!("{}(4bit-scale)", key), s_slice, vs.shape());
                     LinearVariant::BitSliced4 {
                         weight_packed: NativeTensor::from_mmap(cm.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(cm.clone(), os, vs.shape().to_vec(), NativeDType::F16), bias: None,
                     }
                 } else {
+                    let s_slice = unsafe { std::slice::from_raw_parts(cm.as_ptr().add(os) as *const f16, vs.data().len()/2) };
+                    log_tensor_health(&format!("{}(1bit-scale)", key), s_slice, vs.shape());
                     LinearVariant::BitSerial {
                         weight_packed: NativeTensor::from_mmap(cm.clone(), op, vp.shape().to_vec(), NativeDType::U32),
                         scales: NativeTensor::from_mmap(cm.clone(), os, vs.shape().to_vec(), NativeDType::F16), bias: None,
@@ -747,7 +786,7 @@ impl NativeQwen3VLModel {
                 }
             }
         };
-        let mut get_t = |name: &str, ts: usize| -> Result<NativeTensor> {
+        let get_t = |name: &str, ts: usize| -> Result<NativeTensor> {
             let (key, is_p) = find_key_ext(name, &st, st_sec.as_ref(), -1).ok_or_else(|| anyhow!("TNotFound: {}", name))?;
             let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
             let v = cst.tensor(&key)?; let sd = v.data(); let sl = sd.len()/2;
@@ -764,18 +803,19 @@ impl NativeQwen3VLModel {
                 Ok(NativeTensor { data_ptr: unsafe { cm.as_ptr().add(off) }, host_size: h_size, gpu_ptr: None, shape: v.shape().to_vec(), dtype: NativeDType::F16, _mmap: Some(cm.clone()), device_id: active_gpu_id })
             }
         };
-        let mut get_embed = |base: &str, vocab: usize, thid: usize, _hsec: bool| -> Result<NativeLinear> {
+        let get_embed = |base: &str, vocab: usize, thid: usize, _hsec: bool| -> Result<NativeLinear> {
             let (key, is_p) = find_key_ext(base, &st, st_sec.as_ref(), -1).ok_or_else(|| anyhow!("EmbedNotFound: {}", base))?;
             let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
             let pn = format!("{}.packed", key); let sn = format!("{}.scales", key);
             let fn_ = format!("{}.format", key);
             if cst.tensor(&pn).is_ok() {
                 let vp = cst.tensor(&pn)?; let vs = cst.tensor(&sn)?; 
-                let format = cst.tensor(&fn_).map(|t| t.get_slice::<i8>()[0]).unwrap_or(1);
+                let format = cst.tensor(&fn_).map(|t| t.data()[0] as i8).unwrap_or(1);
                 let slice_count = if format == 4 { 4 } else { 1 };
                 let shid = (vp.data().len() / 4 * 32) / (vocab * slice_count);
                 let pr = unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) };
                 let sr = unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) };
+                log_tensor_health(&format!("{}({}-scale)", key, if format == 4 { "4bit" } else { "1bit" }), sr, vs.shape());
                 let dq = dequantize_bit_serial_to_f16(pr, sr, vocab, shid, thid, slice_count);
                 // Wait, dequantize_bit_serial_to_f16 signature is (packed, scales, n, src_k, target_k).
                 // It already has logic to expand 'ratio' inside! Let's verify 'dequantize_bit_serial_to_f16'.
@@ -803,7 +843,7 @@ impl NativeQwen3VLModel {
                 let pn = format!("{}.packed", base); let sn = format!("{}.scales", base);
                 let fn_ = format!("{}.format", base);
                 let vp = sec_st.tensor(&pn)?; let vs = sec_st.tensor(&sn)?;
-                let format = sec_st.tensor(&fn_).map(|t| t.get_slice::<i8>()[0]).unwrap_or(1);
+                let format = sec_st.tensor(&fn_).map(|t| t.data()[0] as i8).unwrap_or(1);
                 
                 // [FIX] Read original source shape if available, otherwise fallback to heuristic
                 let (so, si) = if let Ok(st) = sec_st.tensor(&format!("{}.shape", base)) {
@@ -852,19 +892,23 @@ impl NativeQwen3VLModel {
                         }
                     }
                     
+                    let h_size_packed = np.len() * 4;
+                    let h_size_scales = ns.len() * 2;
                     let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
                     let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
-                    let h_size_packed = np.len() * 4;
-                    let h_size_scales = (to/8)*(ti/32)*8 * 2;
                     std::mem::forget(pb); std::mem::forget(sb);
                     
                     let variant = if format == 4 {
+                        let s_slice = unsafe { std::slice::from_raw_parts(sp as *const f16, h_size_scales/2) };
+                        log_tensor_health(&format!("{}(4bit-scale-sec)", base), s_slice, &[to, ti/32]);
                         LinearVariant::BitSliced4 { 
                             weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to * 4, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, 
                             scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, 
                             bias: None 
                         }
                     } else {
+                        let s_slice = unsafe { std::slice::from_raw_parts(sp as *const f16, h_size_scales/2) };
+                        log_tensor_health(&format!("{}(1bit-scale-sec)", base), s_slice, &[to, ti/32]);
                         LinearVariant::BitSerial { 
                             weight_packed: NativeTensor { data_ptr: pp, host_size: h_size_packed, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::U32, _mmap: None, device_id: active_gpu_id }, 
                             scales: NativeTensor { data_ptr: sp, host_size: h_size_scales, gpu_ptr: None, shape: vec![to, ti/32], dtype: NativeDType::F16, _mmap: None, device_id: active_gpu_id }, 
@@ -897,10 +941,10 @@ impl NativeQwen3VLModel {
                             } 
                         }
                     }
+                    let h_size_packed = np.len() * 4;
+                    let h_size_scales = ns.len() * 2;
                     let pb = np.into_boxed_slice(); let sb = ns.into_boxed_slice();
                     let pp = pb.as_ptr() as *const u8; let sp = sb.as_ptr() as *const u8; 
-                    let h_size_packed = np.len() * 4;
-                    let h_size_scales = (to/8)*(ti/32)*8 * 2;
                     std::mem::forget(pb); std::mem::forget(sb);
 
                     let variant = if format == 4 {
@@ -1217,6 +1261,7 @@ impl NativeQwen3VLModel {
         let mut embeds = match &self.text_model.embed_tokens.variant {
             LinearVariant::Standard { weight, .. } => native_embedding_lookup_f16(i_ids, weight.get_slice::<f16>().as_ref(), self.text_model.config.hidden_size),
             LinearVariant::BitSerial { weight_packed, .. } => native_embedding_lookup_f16(i_ids, weight_packed.get_slice::<f16>().as_ref(), self.text_model.config.hidden_size),
+            LinearVariant::BitSliced4 { weight_packed, .. } => native_embedding_lookup_f16(i_ids, weight_packed.get_slice::<f16>().as_ref(), self.text_model.config.hidden_size),
         };
         
         let sc = Some((&self.global_scratch_i, &self.global_scratch_o, &self.global_scratch_r));
