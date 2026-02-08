@@ -297,71 +297,61 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                // [FIX] Always use address_hash if available, as that's where shared_pug_base lives
                 let kv_dir = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref());
-                let base_path = kv_dir.join(format!("{}.safetensors", task_id_str));
-                println!("[SSD-BRIDGE] Looking for memory shards in: {:?}", kv_dir);
+                println!("[SSD-BRIDGE] Exhaustive search for shards in: {:?}", kv_dir);
                 
-                let mut target_paths = Vec::new();
-                if base_path.exists() {
-                    target_paths.push(base_path);
-                } else {
-                    // [DIAG-KV] Recursive Shard Discovery
-                    let mut shards = Vec::new();
-                    let scan_root = kv_dir.parent().unwrap_or(&kv_dir);
-                    
-                    fn collect_shards(dir: &Path, shards: &mut Vec<PathBuf>) {
-                        if let Ok(entries) = std::fs::read_dir(dir) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.is_dir() { collect_shards(&p, shards); }
-                                else {
-                                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                                    if name.contains("shared_pug_base") && name.contains("shard") && name.ends_with(".safetensors") {
-                                        println!("[DIAG-KV] Found memory shard: {}", p.display());
-                                        shards.push(p);
-                                    }
+                let mut shards = Vec::new();
+                fn collect_shards_recursive(dir: &Path, shards: &mut Vec<PathBuf>) {
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() { collect_shards_recursive(&p, shards); }
+                            else {
+                                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                                if name.contains("shared_pug_base") && name.contains("shard") && name.ends_with(".safetensors") {
+                                    shards.push(p);
                                 }
                             }
                         }
                     }
-                    
-                    println!("[DIAG-KV] Starting recursive search from: {:?}", scan_root);
-                    collect_shards(scan_root, &mut shards);
-                    
-                    // Numeric Sort
-                    let re = Regex::new(r"shard(\d+)").unwrap();
-                    shards.sort_by_key(|p: &PathBuf| {
-                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
-                    });
-                    
-                    // Final deduplication
-                    shards.dedup_by(|a: &mut PathBuf, b: &mut PathBuf| a.file_name() == b.file_name());
-                    target_paths = shards;
+                }
+                
+                collect_shards_recursive(&kv_dir, &mut shards);
+                
+                // Also check parent just in case
+                if shards.is_empty() {
+                    if let Some(parent) = kv_dir.parent() {
+                        println!("[SSD-BRIDGE] No shards in primary dir, checking parent: {:?}", parent);
+                        collect_shards_recursive(parent, &mut shards);
+                    }
                 }
 
-                if !target_paths.is_empty() {
-                    println!("[SSD-BRIDGE] Loading {} KV component(s) for {}", target_paths.len(), task_id_str);
+                // Numeric Sort
+                let re = Regex::new(r"shard(\d+)").unwrap();
+                shards.sort_by_key(|p: &PathBuf| {
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
+                });
+                shards.dedup();
+
+                if !shards.is_empty() {
+                    println!("[SSD-BRIDGE] Found {} shard(s). Loading now...", shards.len());
                     
-                    let total_loaded = match &gen.qwen3_vl {
-                        ModelVariant::Native(m) => m.load_kv_stitched(&target_paths)?,
-                        _ => 0 // GGUF not supported for stitching yet
-                    };
+                    // [FIX] Call load_kv_stitched on the engine itself (2B model)
+                    let total_loaded = gen.load_kv_stitched(&shards)?;
                     
                     println!("[SSD-BRIDGE] SUCCESS: Loaded {} tokens of context memory.", total_loaded);
                     
                     if total_loaded < 500 {
-                        println!("[SSD-BRIDGE] QUALITY-GUARD: Context too small ({} tokens). Aborting.", total_loaded);
-                        return Err(anyhow::anyhow!("Insufficient context: {} tokens. 500+ required for analysis.", total_loaded));
+                        return Err(anyhow::anyhow!("Insufficient context: {} tokens. 500+ required.", total_loaded));
                     }
                     Ok(())
                 } else {
-                    println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
+                    println!("[SSD-BRIDGE] CRITICAL: No context shards found anywhere!");
                     Ok(())
                 }
             } else {
-                Err(anyhow::anyhow!("No active generator to load snapshot into"))
+                Err(anyhow::anyhow!("No active generator"))
             }
         }).await?
     }
