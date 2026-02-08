@@ -696,10 +696,11 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn load_kv_from_disk(&self, path: &Path) -> Result<()> {
-        self.load_kv_stitched(&[path.to_path_buf()])
+        let _ = self.load_kv_stitched(&[path.to_path_buf()])?;
+        Ok(())
     }
 
-    pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<()> {
+    pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<usize> {
         match &self.qwen3_vl {
             ModelVariant::Native(m) => {
                 let target_head_dim = m.text_model.config.head_dim;
@@ -794,11 +795,12 @@ impl Qwen3VLGenerateModel {
                 }
 
                 // Final Step: Sync Load Status
-                println!("[KV-STITCH-VERIFY] Load Complete across all layers. Total tokens in Layer 0: {}", m.text_model.layers[0].kv_cache.lock().unwrap().current_len);
+                let total = m.text_model.layers[0].kv_cache.lock().unwrap().current_len;
+                println!("[KV-STITCH-VERIFY] Load Complete across all layers. Total tokens in Layer 0: {}", total);
+                Ok(total)
             },
             _ => return Err(anyhow!("GGUF not supported for stitching")),
         }
-        Ok(())
     }
 
     fn sample_greedy(&self, logits: &[f16]) -> u32 {

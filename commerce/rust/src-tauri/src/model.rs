@@ -19,7 +19,6 @@ use std::sync::{Arc, atomic::AtomicBool};
 use tauri::Emitter;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use crate::models::qwen3vl::generate::ModelVariant;
 use regex::Regex;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
@@ -289,67 +288,59 @@ impl LogisModel {
         }).await?
     }
 
-    pub async fn load_kv_snapshot(&self, task_id: &str, address_hash: Option<&str>) -> anyhow::Result<()> {
+    /// [INTERNAL] Logic to find and load KV shards into a locked generator
+    fn load_kv_into_gen(gen: &mut Qwen3VLGenerateModel, address_hash: Option<&str>) -> anyhow::Result<usize> {
+        let kv_dir = crate::utils::paths::get_kv_dir(None, address_hash);
+        println!("[SSD-BRIDGE] Scanning KV Directory: {:?}", kv_dir);
+        
+        let mut shards = Vec::new();
+        let mut scan_dirs = vec![kv_dir.clone()];
+        if let Some(parent) = kv_dir.parent() { scan_dirs.push(parent.to_path_buf()); }
+
+        for dir in scan_dirs {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.contains("shared_pug_base") && name.ends_with(".safetensors") {
+                        shards.push(p);
+                    }
+                }
+            }
+            if !shards.is_empty() { break; }
+        }
+
+        // Numeric Sort
+        let re = Regex::new(r"shard(\d+)").unwrap();
+        shards.sort_by_key(|p: &PathBuf| {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
+        });
+        shards.dedup_by(|a, b| a.file_name() == b.file_name());
+
+        if !shards.is_empty() {
+            println!("[SSD-BRIDGE] Found {} shard(s). Injecting...", shards.len());
+            let total = gen.load_kv_stitched(&shards)?;
+            println!("[SSD-BRIDGE] SUCCESS: Internal Load {} tokens.", total);
+            Ok(total)
+        } else {
+            println!("[SSD-BRIDGE] WARNING: No shards found in {:?}", kv_dir);
+            Ok(0)
+        }
+    }
+
+    pub async fn load_kv_snapshot(&self, _task_id: &str, address_hash: Option<&str>) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
-        let task_id_str = task_id.to_string();
         let addr_hash = address_hash.map(|s| s.to_string());
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let kv_dir = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref());
-                println!("[SSD-BRIDGE] Exhaustive search for shards in: {:?}", kv_dir);
-                
-                let mut shards = Vec::new();
-                fn collect_shards_recursive(dir: &Path, shards: &mut Vec<PathBuf>) {
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.is_dir() { collect_shards_recursive(&p, shards); }
-                            else {
-                                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-                                if name.contains("shared_pug_base") && name.contains("shard") && name.ends_with(".safetensors") {
-                                    shards.push(p);
-                                }
-                            }
-                        }
-                    }
+                let total = Self::load_kv_into_gen(gen, addr_hash.as_deref())?;
+                if total < 500 && total > 0 {
+                    return Err(anyhow::anyhow!("Insufficient context: {} tokens.", total));
                 }
-                
-                collect_shards_recursive(&kv_dir, &mut shards);
-                
-                // Also check parent just in case
-                if shards.is_empty() {
-                    if let Some(parent) = kv_dir.parent() {
-                        println!("[SSD-BRIDGE] No shards in primary dir, checking parent: {:?}", parent);
-                        collect_shards_recursive(parent, &mut shards);
-                    }
-                }
-
-                // Numeric Sort
-                let re = Regex::new(r"shard(\d+)").unwrap();
-                shards.sort_by_key(|p: &PathBuf| {
-                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
-                });
-                shards.dedup();
-
-                if !shards.is_empty() {
-                    println!("[SSD-BRIDGE] Found {} shard(s). Loading now...", shards.len());
-                    
-                    // [FIX] Call load_kv_stitched on the engine itself (2B model)
-                    let total_loaded = gen.load_kv_stitched(&shards)?;
-                    
-                    println!("[SSD-BRIDGE] SUCCESS: Loaded {} tokens of context memory.", total_loaded);
-                    
-                    if total_loaded < 500 {
-                        return Err(anyhow::anyhow!("Insufficient context: {} tokens. 500+ required.", total_loaded));
-                    }
-                    Ok(())
-                } else {
-                    println!("[SSD-BRIDGE] CRITICAL: No context shards found anywhere!");
-                    Ok(())
-                }
+                Ok(())
             } else {
                 Err(anyhow::anyhow!("No active generator"))
             }
