@@ -331,7 +331,10 @@ async fn process_task(
         println!("[DEBUG] Saved light pug to: {:?}", log_path);
     }
     
-    if light_pug.trim().len() < 10 { return Ok(()); }
+    if light_pug.trim().len() < 1000 { 
+        println!("[PROCESS-ERROR] Incomplete HTML detected! Content: '{}'", light_pug.trim());
+        return Err(anyhow::anyhow!("HTML extraction failed or too small. Check browser state.")); 
+    }
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking HTML context on GPU...", "spinner": "⠋" }));
     
@@ -413,6 +416,25 @@ async fn process_task(
     {
         log_task_progress(app_handle, &task.id, &json!({ "category": "Analysis", "summary": "Identifying page type...", "spinner": "⠋" }));
         
+        // [DATA-RECOVERY] Ensure we have the full HTML content
+        let mut full_html = clean.clone();
+        let log_dir = utils::paths::get_logs_dir(None).join(&task.id);
+        
+        if full_html.len() < 500 {
+            if let Ok(entries) = std::fs::read_dir(&log_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().map_or(false, |e| e == "pug") {
+                        if let Ok(recovered) = std::fs::read_to_string(&p) {
+                            println!("[SCHEDULER] DATA-RECOVERY SUCCESS! File: {:?}, Size: {} bytes", p, recovered.len());
+                            full_html = recovered;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let type_prompt = parsing::page_type_prompt();
 
         // 1. Model is already loaded. Just ensure KV is stitched with ONLY the PUG base
@@ -432,7 +454,7 @@ async fn process_task(
 
         // 2. Inference: Pass system prompt LIVE (No-Bridge mode will handle the offset)
         // [FIX] Pass instructions as user_input (2nd arg) so they survive the nobridge wipe
-        let res = model.chat("", &type_prompt, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
+        let res = model.chat("", &full_html, Some(cancellation_token.clone()), Some("integrated_analysis_nobridge".to_string())).await?;
         let type_info = parsing::parse_json_from_llm(&res);
         page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
         

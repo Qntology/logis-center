@@ -419,7 +419,7 @@ impl NativeQwen3VLModel {
         }
         Ok(model)
     }
-    pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<()> {
+    pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<usize> {
         let n_kv = self.text_model.config.num_key_value_heads; let h_d = self.text_model.config.head_dim;
         let mut expanded = Vec::new();
         for p in paths {
@@ -429,9 +429,9 @@ impl NativeQwen3VLModel {
                     let mut shards = Vec::new();
                     for entry in entries.flatten() {
                         let path = entry.path(); let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        if name.starts_with(stem) && name.contains("_shard") && name.ends_with(".safetensors") { shards.push(path); }
+                        if name.contains("shared_pug_base") && name.contains("_shard") && name.ends_with(".safetensors") { shards.push(path); }
                     }
-                    let re = Regex::new(r"_shard(\d+)").unwrap();
+                    let re = Regex::new(r"shard(\d+)").unwrap();
                     shards.sort_by_key(|p| re.captures(p.file_name().unwrap().to_str().unwrap()).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0));
                     expanded.extend(shards);
                 }
@@ -439,11 +439,28 @@ impl NativeQwen3VLModel {
         }
         let mut total_t = 0; let mut metadatas = Vec::new(); let mut mmaps = Vec::new();
         for path in &expanded {
+            println!("[DIAG-KV] Attempting to open shard: {:?}", path);
             let file = std::fs::File::open(path)?; let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
-            let tokens = { let st = SafeTensors::deserialize(&mmap)?; if let Ok(meta) = st.tensor("metadata.tokens") { meta.shape()[0] } else if let Ok(kt) = st.tensor("layer.0.k") { kt.data().len() / (n_kv * (h_d/32) * 4) } else { 0 } };
+            let tokens = { 
+                let st = SafeTensors::deserialize(&mmap)?; 
+                if let Ok(kt) = st.tensor("layer.0.k") {
+                    let t = kt.data().len() / (n_kv * (h_d/32) * 4);
+                    println!("[DIAG-KV] Shard contains {} tokens in 'layer.0.k'", t);
+                    t
+                } else {
+                    println!("[DIAG-KV] WARNING: 'layer.0.k' NOT FOUND in shard! Available keys: {:?}", st.names());
+                    0
+                }
+            };
             if tokens > 0 { total_t += tokens; metadatas.push(tokens); mmaps.push(mmap); }
         }
-        if total_t == 0 { return Ok(()); }
+        
+        // [QUALITY-GUARD] Enforce 500 token minimum for meaningful analysis
+        if total_t < 500 {
+            println!("[KV-ERROR] Context too small ({} tokens). Minimum 500 required.", total_t);
+            return Err(anyhow!("Insufficient context tokens: {}. Expected at least 500.", total_t));
+        }
+
         for l_idx in 0..self.text_model.layers.len() {
             let layer = &self.text_model.layers[l_idx]; let mut gpu_kv = layer.gpu_kv_cache.lock().unwrap();
             #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { gpu_kv.grow(total_t, n_kv, h_d, self.lm_head.device_id); }
@@ -463,7 +480,7 @@ impl NativeQwen3VLModel {
             }
             gpu_kv.current_len = total_t;
         }
-        Ok(())
+        Ok(total_t)
     }
     pub fn forward(&self, i_ids: &[u32], pv: Option<&[f16]>, gt: Option<&[u32; 3]>, so: usize) -> Vec<f16> {
         let is_b = self.text_model.layers.len() <= 1; let mut wl = if is_b { self.support_workspace.lock().unwrap() } else { self.workspace.lock().unwrap() };

@@ -19,6 +19,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 use tauri::Emitter;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use crate::models::qwen3vl::generate::ModelVariant;
 use regex::Regex;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
@@ -296,8 +297,9 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
+                // [FIX] Always use address_hash if available, as that's where shared_pug_base lives
                 let kv_dir = crate::utils::paths::get_kv_dir(None, addr_hash.as_deref());
-                let base_path = kv_dir.join(format!("{}.safetensors", task_id_str));
+                println!("[SSD-BRIDGE] Looking for memory shards in: {:?}", kv_dir);
                 
                 let mut target_paths = Vec::new();
                 if base_path.exists() {
@@ -340,7 +342,18 @@ impl LogisModel {
 
                 if !target_paths.is_empty() {
                     println!("[SSD-BRIDGE] Loading {} KV component(s) for {}", target_paths.len(), task_id_str);
-                    gen.load_kv_stitched(&target_paths)?;
+                    
+                    let total_loaded = match &gen.qwen3_vl {
+                        ModelVariant::Native(m) => m.load_kv_stitched(&target_paths)?,
+                        _ => 0 // GGUF not supported for stitching yet
+                    };
+                    
+                    println!("[SSD-BRIDGE] SUCCESS: Loaded {} tokens of context memory.", total_loaded);
+                    
+                    if total_loaded < 500 {
+                        println!("[SSD-BRIDGE] QUALITY-GUARD: Context too small ({} tokens). Aborting.", total_loaded);
+                        return Err(anyhow::anyhow!("Insufficient context: {} tokens. 500+ required for analysis.", total_loaded));
+                    }
                     Ok(())
                 } else {
                     println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
@@ -404,7 +417,18 @@ impl LogisModel {
             tokio::task::spawn_blocking(move || {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
-                    let path = crate::utils::paths::get_kv_dir(None, Some(&ah)).join("shared_pug_base.safetensors");
+                    let kv_dir = crate::utils::paths::get_kv_dir(None, Some(&ah));
+                    let path = kv_dir.join("shared_pug_base.safetensors");
+                    
+                    println!("[BAKE-PUG] Target KV Directory: {:?}", kv_dir);
+                    println!("[BAKE-PUG] Target Shard Pattern: shared_pug_base_shard*.safetensors");
+                    
+                    // [BAKE-INTEGRITY] Diagnostic log for input size
+                    println!("[BAKE-PUG] Input text size: {} bytes", text.len());
+                    if text.len() < 500 {
+                        println!("[BAKE-PUG] WARNING: Very small input detected. This might cause the '8 tokens' issue.");
+                    }
+
                     gen.bake_text_in_parts_to_path(text, &path, "pug_base", 0, token_clone)?;
                 } else {
                     return Err(anyhow::anyhow!("Generator not initialized for baking"));
@@ -956,7 +980,8 @@ Return valid JSON only. No explanation.
         
         // [INTEGRATED-PREFILL] nobridge 모드일 때는 시스템 프롬프트를 비워 
         // generate.rs가 기존 KV 캐시(베이킹된 HTML)를 훼손하지 않게 함.
-        let final_system = if sid_clone.as_ref().map_or(false, |s| s.contains("nobridge")) {
+        let is_nobridge = sid_clone.as_ref().map_or(false, |s| s.contains("nobridge"));
+        let final_system = if is_nobridge {
             "".to_string()
         } else {
             system.to_string()
@@ -970,6 +995,12 @@ Return valid JSON only. No explanation.
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
+            
+            // [CRITICAL-CHECK] If we are in no-bridge mode, KV cache MUST be loaded.
+            if is_nobridge && gen.get_kv_len() == 0 {
+                println!("[MODEL-CHAT] ABORTED: No context tokens loaded for nobridge inference!");
+                return Err(anyhow!("Context missing for sharded inference. Aborting to prevent incoherent output."));
+            }
             
             let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                 content: final_system,

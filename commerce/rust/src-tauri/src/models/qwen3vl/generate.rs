@@ -521,6 +521,9 @@ impl Qwen3VLGenerateModel {
 
     /// [SHARDED-BAKING] Context-aware splitting - Save to multiple shards for VRAM safety
     pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, _suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
+        let sample = if text.len() > 100 { &text[..100] } else { &text };
+        println!("[BAKE-SHARDED] Baking Sample: '{}...'", sample.replace("\n", " "));
+        
         let all_ids = self.tokenizer.tokenizer.encode(text, true).map_err(|e| anyhow!(e))?.get_ids().to_vec();
         let total_tokens = all_ids.len();
         let chunk_size = self.max_chunk_size; // 512
