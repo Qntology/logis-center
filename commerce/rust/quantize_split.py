@@ -43,13 +43,57 @@ def quantize_tensor_bit_serial_shuffled(param):
 
     return shuffled_w.view(-1), shuffled_s.view(-1), torch.tensor([N, K], dtype=torch.int32)
 
+def quantize_tensor_4bit_sliced(param):
+    """
+    [NEW] 4-bit Sliced Quantization
+    Splits 4-bit weights into 4 bit-planes for bit-serial execution.
+    """
+    BLOCK_SIZE = 32
+    N, K = param.shape[0], param.shape[1]
+    
+    # 1. Normalization & 4-bit Quantization (0-15)
+    # [IMPROVED] Per-channel scaling for higher precision
+    scale = param.abs().max(dim=1).values / 15.0
+    scale[scale == 0] = 1.0
+    
+    # Apply per-channel scale
+    q_val = (param / scale.unsqueeze(1)).round().clamp(-8, 7) + 8
+    q_val = q_val.to(torch.int32)
+
+    # 2. Bit-plane extraction
+    planes = []
+    for b in range(4):
+        plane_bits = (q_val >> b) & 1
+        
+        # Apply standard bit-packing and shuffling for each plane
+        pad_k = (BLOCK_SIZE - (K % BLOCK_SIZE)) % BLOCK_SIZE
+        p_param = torch.nn.functional.pad(plane_bits, (0, pad_k))
+        K_padded = K + pad_k
+        K_blocks = K_padded // BLOCK_SIZE
+
+        flat_w = p_param.view(N, K_blocks, BLOCK_SIZE)
+        packed_rows = torch.zeros((N, K_blocks), dtype=torch.int32)
+        for i in range(BLOCK_SIZE):
+            packed_rows |= (flat_w[:, :, i] << i)
+
+        pad_n = (8 - (N % 8)) % 8
+        if pad_n > 0:
+            packed_rows = torch.nn.functional.pad(packed_rows, (0, 0, 0, pad_n))
+        
+        N_padded = N + pad_n
+        shuffled_w = packed_rows.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
+        planes.append(shuffled_w.view(-1))
+
+    # Return concatenated planes, single scale per layer, and shape
+    return torch.cat(planes), scale.to(torch.float16), torch.tensor([N, K], dtype=torch.int32)
+
 def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=None, layer_start=0):
     mode_name = "LAYER0" if layer_limit == 1 else ("L1_ALL" if layer_start > 0 else "ALL")
-    suffix = f"BITSERIAL_{mode_name}.safetensors"
+    suffix = f"4BIT_SLICED_{mode_name}.safetensors"
     prefix = "mmproj-" if is_vision else "model-"
     out_path = os.path.join(output_dir, f"{prefix}{suffix}")
 
-    print(f"\n[PROCESS-{mode_name}] Layout: Shuffled (Format 1) | Path: {input_path}")
+    print(f"\n[PROCESS-{mode_name}] Layout: 4-bit Sliced | Path: {input_path}")
     
     tensors = {}
     if input_path.endswith(".gguf"):
@@ -62,9 +106,16 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
     else:
         tensors = load_file(input_path)
 
+    # [FORCE-LM-HEAD] If lm_head is missing (Weight Tying), duplicate embed_tokens as lm_head
+    has_head = any("lm_head" in k for k in tensors.keys())
+    if not has_head:
+        embed_key = next((k for k in tensors.keys() if "embed_tokens" in k), None)
+        if embed_key:
+            print(f"  -> [AUTO-HEAD] Creating lm_head from {embed_key}")
+            tensors["model.language_model.lm_head.weight"] = tensors[embed_key].clone()
+
     final_dict = {}
     for name, param in tensors.items():
-        # [NAMING-UNITY] 0.6B 모델의 이름을 2B 모델과 일치하도록 완벽 변환
         new_name = name
         if "layers." in name and "language_model" not in name:
             new_name = name.replace("model.layers", "model.language_model.layers")
@@ -74,43 +125,48 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
             new_name = name.replace("model.norm", "model.language_model.norm")
         elif name.startswith("lm_head"):
             new_name = "model.language_model.lm_head" + name[7:]
-            
-        if new_name != name:
-            print(f"  -> Unified Name: {name} to {new_name}")
 
-        # 레이어 인덱스 추출
         idx_match = re.search(r'(layers|blk|blocks|language_model\.layers)\.(\d+)\.', new_name)
         layer_idx = int(idx_match.group(2)) if idx_match else -1
         
-        # [NEW] 레이어 범위 필터링 및 중복 제거
-        if layer_limit is not None: # LAYER0
+        if layer_limit is not None: 
             if layer_idx >= layer_limit: continue
             if layer_idx == -1 and ("norm" in new_name or "lm_head" in new_name): continue
             
-        if layer_start > 0: # L1_ALL
+        if layer_start > 0: 
             if 0 <= layer_idx < layer_start: continue
             if layer_idx == -1 and "embed_tokens" in new_name: continue
         
-        # 비전/텍스트 분리
         if is_vision != ("visual" in name): continue
 
         is_weight = "weight" in name and len(param.shape) == 2
-        # [UNIFIED-QUANT] 임베딩 포함 모든 레이어 양자화 통일
         should_quantize = is_weight and "norm" not in name and "ln" not in name
+        
+        # [CRITICAL] IO Layers use 4-bit Sliced (Format 4), Others use 1-bit Shuffled (Format 1)
+        is_io_layer = "embed_tokens" in new_name or "lm_head" in new_name
 
         if should_quantize:
-            packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
-            final_dict.update({
-                f"{new_name}.packed": packed,
-                f"{new_name}.scales": scales,
-                f"{new_name}.shape": shape,
-                f"{new_name}.format": torch.tensor([1], dtype=torch.int8) # Format 1 = Shuffled
-            })
+            if is_io_layer:
+                packed, scale, shape = quantize_tensor_4bit_sliced(param)
+                final_dict.update({
+                    f"{new_name}.packed": packed,
+                    f"{new_name}.scales": scale.to(torch.float16), # N scales
+                    f"{new_name}.shape": shape,
+                    f"{new_name}.format": torch.tensor([4], dtype=torch.int8) 
+                })
+            else:
+                packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
+                final_dict.update({
+                    f"{new_name}.packed": packed,
+                    f"{new_name}.scales": scales,
+                    f"{new_name}.shape": shape,
+                    f"{new_name}.format": torch.tensor([1], dtype=torch.int8) 
+                })
         else:
             final_dict[new_name] = param.to(torch.float16)
 
     save_file(final_dict, out_path)
-    print(f" -> Saved to {out_path} ({len(final_dict)} tensors)")
+    print(f" -> Saved to {out_path}")
 
 if __name__ == "__main__":
     BASE_DIR = "src-tauri/models"

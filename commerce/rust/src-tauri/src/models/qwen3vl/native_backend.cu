@@ -75,6 +75,82 @@ __global__ void bit_serial_matmul_kernel_f16(
     }
 }
 
+// [NEW] 4-bit Sliced Matmul Kernel (Bit-serial variant)
+__global__ void bit_serial_matmul_kernel_4bit_f16(
+    const half* __restrict__ input,    
+    const uint32_t* __restrict__ weight, 
+    const half* __restrict__ scale,     
+    half* __restrict__ output,          
+    int M, int N, int K, int src_k
+) {
+    const int TILE_M = 32;
+    __shared__ uint32_t s_input_bits[TILE_M]; 
+    __shared__ float s_input_scales[TILE_M];
+
+    int m_base = blockIdx.y * TILE_M;
+    int n_group = blockIdx.x;
+    int n_sub = threadIdx.x; 
+    int m_sub = threadIdx.y; 
+    
+    int m = m_base + m_sub;
+    int n = n_group * 8 + n_sub;
+    
+    int src_k_blocks = (src_k + 31) / 32;
+    int K_blocks = (K + 31) / 32;
+    int slice_stride = (N + 7) / 8 * K_blocks * 8; 
+    int repetition = (K > src_k) ? (K / src_k) : 1;
+    float r_scale = rsqrtf((float)repetition);
+
+    float acc = 0.0f;
+    float s_val = (m < M && n < N) ? __half2float(scale[n]) : 0.0f; 
+
+    for (int kb = 0; kb < src_k_blocks; ++kb) {
+        if (n_sub == 0) {
+            uint32_t folded_bts = 0;
+            float block_sum_sq = 0.0f;
+            if (m < M) {
+                #pragma unroll
+                for (int b = 0; b < 32; ++b) {
+                    int k_base = kb * 32 + b;
+                    if (k_base < src_k) {
+                        float combined_signal = 0.0f;
+                        for (int r = 0; r < repetition; ++r) {
+                            int target_k_idx = k_base + (r * src_k);
+                            combined_signal += __half2float(input[m * K + (target_k_idx % K)]);
+                        }
+                        combined_signal *= r_scale;
+                        if (combined_signal >= 0.0f) folded_bts |= (1u << b);
+                        block_sum_sq += combined_signal * combined_signal;
+                    }
+                }
+            }
+            s_input_bits[m_sub] = folded_bts;
+            s_input_scales[m_sub] = sqrtf(block_sum_sq / 32.0f + 1e-8f);
+        }
+        __syncthreads();
+
+        if (m < M && n < N) {
+            int base_idx = n_group * K_blocks * 8 + kb * 8 + n_sub;
+            
+            float slice_acc_sum = 0.0f;
+            #pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                uint32_t w_val = weight[b * slice_stride + base_idx];
+                uint32_t diff = s_input_bits[m_sub] ^ w_val;
+                float pop = (float)(32 - 2 * (int)__popc(diff));
+                slice_acc_sum += pop * (float)(1 << b);
+            }
+            // Accurate 4-bit accumulation without arbitrary offsets
+            acc += slice_acc_sum * s_val * s_input_scales[m_sub]; 
+        }
+        __syncthreads();
+    }
+
+    if (m < M && n < N) {
+        output[m * N + n] = __float2half(acc);
+    }
+}
+
 // [FAST-ATTENTION-HYBRID] Folding-aware online softmax attention for F16 with Dynamic Stabilization
 __global__ void bit_serial_attn_kernel_f16(
     const half* __restrict__ Q,        
@@ -277,6 +353,12 @@ extern "C" {
         dim3 block(8, 32);
         dim3 grid((n + 7) / 8, (m + 31) / 32);
         bit_serial_matmul_kernel_f16<<<grid, block>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
+    }
+
+    void bit_serial_matmul_cuda_4bit_f16(const half* d_i, const uint32_t* d_w, const half* d_s, half* d_o, int m, int n, int k, int dev, int src_k) {
+        dim3 block(8, 32);
+        dim3 grid((n + 7) / 8, (m + 31) / 32);
+        bit_serial_matmul_kernel_4bit_f16<<<grid, block>>>(d_i, d_w, d_s, d_o, m, n, k, src_k);
     }
 
     // 2. Bit-Serial Attention

@@ -53,6 +53,9 @@ extern "C" {
     #[link_name = "bit_serial_matmul_cuda_f16"]
     pub fn cuda_matmul_f16(d_i: *const f16, d_w: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
     
+    #[link_name = "bit_serial_matmul_cuda_4bit_f16"]
+    pub fn cuda_matmul_4bit_f16(d_i: *const f16, d_w: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
+
     #[link_name = "bit_serial_attn_cuda_direct"]
     fn cuda_attn_f32(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, n_kv: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32, alpha: f32);
     
