@@ -51,7 +51,7 @@ extern "C" {
     fn cuda_matmul_f32(d_i: *const f32, d_w: *const u32, d_s: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, dev: i32);
     
     #[link_name = "bit_serial_matmul_cuda_f16"]
-    pub fn cuda_matmul_f16(d_i: *const f16, w0: *const u32, w1: *const u32, w2: *const u32, w3: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32, bits: i32);
+    pub fn cuda_matmul_f16(d_i: *const f16, d_w: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
     
     #[link_name = "bit_serial_attn_cuda_direct"]
     fn cuda_attn_f32(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, n_kv: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32, alpha: f32);
@@ -157,8 +157,7 @@ pub fn bit_serial_matmul_gpu_buffered_into(i: &[f16], w: &NativeTensor, s: &Nati
         let _ = lib().cuMemcpyHtoD_v2(d_i, i.as_ptr() as *const _, m * k * 2);
         let d_w = w.gpu_ptr.expect("W on GPU").0 as *const u32;
         let d_s = s.gpu_ptr.expect("S on GPU").0 as *const f16;
-        let null = std::ptr::null();
-        cuda_matmul_f16(d_i as *const f16, d_w, null, null, null, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32, 1);
+        cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32);
         let _ = lib().cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, m * n * 2);
     }
 }

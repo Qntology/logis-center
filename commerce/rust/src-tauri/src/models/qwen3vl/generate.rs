@@ -121,24 +121,16 @@ impl Qwen3VLGenerateModel {
 
         // [HYBRID-INIT] 2B 모델 본체(L1_ALL)와 0.6B 모델 조각(LAYER0)을 함께 로드할 수 있도록 파일명 설정
         let main_filename = if baking_only { 
-            let f = "model-4BIT_SLICED_LAYER0.safetensors";
-            if path_obj.join(f).exists() { f } else { "model-BITSERIAL_LAYER0.safetensors" }
+            "model-BITSERIAL_LAYER0.safetensors" 
         } else { 
-            let f = "model-4BIT_SLICED_L1_ALL.safetensors";
-            if path_obj.join(f).exists() { f } else { "model-BITSERIAL_L1_ALL.safetensors" }
+            "model-BITSERIAL_L1_ALL.safetensors" 
         };
         let main_path = path_obj.join(main_filename);
         let main_file = std::fs::File::open(main_path)?;
         let main_mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&main_file)? });
         
         let vision_mmap = if !force_text_only {
-            let vision_filename = if baking_only { 
-                let f = "mmproj-4BIT_SLICED_LAYER0.safetensors";
-                if config_path.map(Path::new).unwrap_or(path_obj).join(f).exists() { f } else { "mmproj-BITSERIAL_LAYER0.safetensors" }
-            } else { 
-                let f = "mmproj-4BIT_SLICED_ALL.safetensors";
-                if config_path.map(Path::new).unwrap_or(path_obj).join(f).exists() { f } else { "mmproj-BITSERIAL_ALL.safetensors" }
-            };
+            let vision_filename = if baking_only { "mmproj-BITSERIAL_LAYER0.safetensors" } else { "mmproj-BITSERIAL_ALL.safetensors" };
             let vision_root = config_path.map(Path::new).unwrap_or(path_obj);
             let vision_path = vision_root.join(vision_filename);
             if vision_path.exists() {
@@ -151,24 +143,17 @@ impl Qwen3VLGenerateModel {
             // [HYBRID-LOAD] Load 0.6B Layer 0 file to fill missing parts (Embed, Layer 0) in 2B model.
             // native_model.rs will handle the dimension upscaling (Repeat 1024 -> 2048).
             let base_models_path = path_obj.parent().unwrap();
-            let local_l0_4b = path_obj.join("model-4BIT_SLICED_LAYER0.safetensors");
-            let local_l0_bs = path_obj.join("model-BITSERIAL_LAYER0.safetensors");
-            
-            if local_l0_4b.exists() {
-                 println!("[HYBRID] Loading local 4-bit Layer 0 file: {:?}", local_l0_4b);
-                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(local_l0_4b)?)? }))
-            } else if local_l0_bs.exists() {
-                 println!("[HYBRID] Loading local BitSerial Layer 0 file: {:?}", local_l0_bs);
-                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(local_l0_bs)?)? }))
+            // Assuming 0.6B model is in a parallel directory named "Qwen3-0.6B-Instruct-gguf"
+            // or in the same directory depending on user setup. Let's try same directory first, then sibling.
+            let local_l0 = path_obj.join("model-BITSERIAL_LAYER0.safetensors");
+            if local_l0.exists() {
+                 println!("[HYBRID] Loading local Layer 0 file: {:?}", local_l0);
+                 Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(local_l0)?)? }))
             } else {
-                let sib_4b = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-4BIT_SLICED_LAYER0.safetensors");
-                let sib_bs = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-BITSERIAL_LAYER0.safetensors");
-                if sib_4b.exists() {
-                    println!("[HYBRID] Loading sibling 4-bit Layer 0 file: {:?}", sib_4b);
-                    Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(sib_4b)?)? }))
-                } else if sib_bs.exists() {
-                    println!("[HYBRID] Loading sibling BitSerial Layer 0 file: {:?}", sib_bs);
-                    Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(sib_bs)?)? }))
+                let sibling_l0 = base_models_path.join("Qwen3-0.6B-Instruct-gguf").join("model-BITSERIAL_LAYER0.safetensors");
+                if sibling_l0.exists() {
+                    println!("[HYBRID] Loading sibling 0.6B Layer 0 file: {:?}", sibling_l0);
+                    Some(Arc::new(unsafe { memmap2::MmapOptions::new().map(&std::fs::File::open(sibling_l0)?)? }))
                 } else {
                     println!("[HYBRID] WARNING: Layer 0 source file not found. Model may crash if embeddings are missing.");
                     None
@@ -275,9 +260,8 @@ impl Qwen3VLGenerateModel {
 
             let combined_task = if !user_content.is_empty() { user_content } else { system_content };
             
-            // [STABILITY] Use standard ChatML markers even in no-bridge mode to ground the model
-            let raw_prompt = format!("<|im_start|>user\n{}\n\nACTION: JSON ONLY<|im_end|>\n<|im_start|>assistant\n", combined_task);
-            println!("[{}-RAW] Using structured prompt ({} chars) for stitched context.", tag, raw_prompt.len());
+            let raw_prompt = format!("\n\nTASK: {}\n\nACTION: JSON ONLY\n\nAssistant: ", combined_task);
+            println!("[{}-RAW] Constructing raw prompt ({} chars) for stitched context.", tag, raw_prompt.len());
             self.tokenizer.text_encode_vec(raw_prompt, false)?
         } else {
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
@@ -548,27 +532,6 @@ impl Qwen3VLGenerateModel {
         let base_name = final_path.file_stem().unwrap().to_str().unwrap();
 
         println!("[BAKE-SHARDED] Starting sharded baking. Total: {} tokens", total_tokens);
-
-        // [OPTIMIZATION] Pre-allocate full VRAM capacity once before the loop
-        {
-            let needed_total = initial_offset + total_tokens;
-            match &self.qwen3_vl {
-                ModelVariant::Native(m) => {
-                    let n_kv = m.text_model.config.num_key_value_heads;
-                    let h_d = m.text_model.config.head_dim;
-                    let dev_id = m.lm_head.device_id;
-                    if dev_id >= 0 && dev_id < 8 {
-                        println!("[BAKE-VRAM] Pre-allocating KV Cache for {} tokens...", needed_total);
-                        for layer in &m.text_model.layers {
-                            let mut gkg = layer.gpu_kv_cache.lock().unwrap();
-                            gkg.grow(needed_total, n_kv, h_d, dev_id);
-                        }
-                        unsafe { crate::models::qwen3vl::native_backend::lib().cuStreamSynchronize(std::ptr::null_mut()); }
-                    }
-                },
-                _ => {}
-            }
-        }
 
         for (chunk_idx, chunk) in all_ids.chunks(chunk_size).enumerate() {
             if let Some(flag) = &cancel_flag {

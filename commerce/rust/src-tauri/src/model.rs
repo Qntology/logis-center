@@ -842,8 +842,7 @@ impl LogisModel {
         let large_model_path = large_gguf_dir.to_str().unwrap().to_string();
         let embedding_path = base_path.join("embeddinggemma-300m");
 
-        // [2026-DYNAMIC-LIMIT] Use a large virtual limit, actual physical limit is managed by VRAM grow logic
-        let max_tokens_limit = 262144; 
+        let max_tokens_limit = 16384; 
 
         Ok(Self {
             generator: Arc::new(TokioMutex::new(None)),
