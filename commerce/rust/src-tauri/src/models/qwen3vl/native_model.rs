@@ -364,7 +364,29 @@ impl NativeQwen3VLModel {
             let v = cst.tensor(&key)?; if ts > v.data().len()/2 { let mut nd = Vec::with_capacity(ts*2); let sf = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f16, v.data().len()/2) }; for _ in 0..(ts/(v.data().len()/2)) { for &val in sf { nd.extend_from_slice(&val.to_le_bytes()); } } let b = nd.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b); Ok(NativeTensor::from_raw(p as *const u8, ts*2, vec![ts], NativeDType::F16, dev_id)) }
             else { Ok(NativeTensor::from_mmap(cm.clone(), unsafe { v.data().as_ptr().offset_from(cm.as_ptr()) } as usize, v.shape().to_vec(), NativeDType::F16)) }
         };
-        let emb = get_l("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size)?;
+        let get_embed = |base: &str, vocab: usize, thid: usize| -> Result<NativeLinear> {
+            let (key, is_p) = find_key(base, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("EmbedNotFound: {}", base))?;
+            let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
+            
+            // [FIX] Ensure we don't calculate insane sizes for embeddings
+            if cst.tensor(&format!("{}.packed", key)).is_ok() {
+                let vp = cst.tensor(&format!("{}.packed", key))?;
+                let vs = cst.tensor(&format!("{}.scales", key))?;
+                let format = cst.tensor(&format!("{}.format", key)).map(|t| t.data()[0] as i8).unwrap_or(1);
+                
+                // Safe dimension extraction
+                let (so, si) = (vocab, thid);
+                let dq = dequantize_bit_serial_to_f16(
+                    unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) },
+                    unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) },
+                    so, si, thid, if format == 4 { 4 } else { 1 }
+                );
+                let b = dq.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b);
+                return Ok(NativeLinear { in_features: vocab, out_features: thid, src_in: thid, src_out: thid, variant: LinearVariant::Standard { weight: NativeTensor::from_raw(p as *const u8, vocab*thid*2, vec![vocab, thid], NativeDType::F16, dev_id), bias: None }, device_id: dev_id });
+            }
+            get_l(base, vocab, thid)
+        };
+        let emb = get_embed("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size)?;
         let mut layers = Vec::new(); for i in 0..(if baking { 1 } else { t_c.num_hidden_layers }) {
             let p = format!("model.language_model.layers.{}", i);
             layers.push(NativeLayer {
