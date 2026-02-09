@@ -333,7 +333,14 @@ pub struct NativeQwen3VLModel {
 }
 
 impl NativeQwen3VLModel {
-    pub fn get_kv_len(&self) -> usize { self.text_model.layers[0].kv_cache.lock().unwrap().k.len() / (self.text_model.config.num_key_value_heads * self.text_model.config.head_dim / 32) }
+    pub fn get_kv_len(&self) -> usize { 
+        // [FIX] Priority: Check the high-performance GPU KV cache first (used by 2B model)
+        let gpu_len = self.text_model.layers[0].gpu_kv_cache.lock().unwrap().current_len;
+        if gpu_len > 0 { return gpu_len; }
+        
+        // Fallback: Check standard cache (used by 0.6B model)
+        self.text_model.layers[0].kv_cache.lock().unwrap().current_len
+    }
     pub fn clear_kv_cache(&self) { self.text_model.layers.iter().for_each(|l| l.clear_kv_cache()); }
     pub fn get_all_kv(&self, st: usize) -> Vec<(Vec<u32>, Vec<f16>)> { 
         let hd = self.text_model.config.head_dim; let nkv = self.text_model.config.num_key_value_heads;
@@ -487,13 +494,36 @@ impl NativeQwen3VLModel {
                 if let (Ok(kt), Ok(vt)) = (st.tensor(&format!("layer.{}.k", si)), st.tensor(&format!("layer.{}.v", si))) {
                     #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { unsafe {
                         let cl = crate::models::qwen3vl::native_backend::lib();
-                        if let Some(kp) = gpu_kv.k_ptr { let _ = cl.cuMemcpyHtoD_v2((kp.0 as u64 + (curr_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr, kt.data().as_ptr() as *const _, kt.data().len()); }
-                        if let Some(vp) = gpu_kv.v_ptr { let _ = cl.cuMemcpyHtoD_v2((vp.0 as u64 + (curr_o * n_kv * h_d * 2) as u64) as CUdeviceptr, vt.data().as_ptr() as *const _, vt.data().len()); }
+                        let k_data = kt.data();
+                        let v_data = vt.data();
+                        
+                        // [DIAGNOSTIC] Calculate numerical fingerprint of the shard
+                        let f16_ptr = k_data.as_ptr() as *const f16;
+                        let sample_len = (k_data.len() / 2).min(100);
+                        let sample = std::slice::from_raw_parts(f16_ptr, sample_len);
+                        let sum: f32 = sample.iter().map(|x| x.to_f32().abs()).sum();
+                        println!("[VERIFY-KV] Shard {:?} Fingerprint: AbsAvg={:.4}, Tokens={}", path.file_name().unwrap(), sum / sample_len as f32, tip);
+
+                        if let Some(kp) = gpu_kv.k_ptr { let _ = cl.cuMemcpyHtoD_v2((kp.0 as u64 + (curr_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr, k_data.as_ptr() as *const _, k_data.len()); }
+                        if let Some(vp) = gpu_kv.v_ptr { let _ = cl.cuMemcpyHtoD_v2((vp.0 as u64 + (curr_o * n_kv * h_d * 2) as u64) as CUdeviceptr, v_data.as_ptr() as *const _, v_data.len()); }
                     } }
                 }
                 curr_o += tip;
             }
             gpu_kv.current_len = total_t;
+            
+            // [STABILITY] Gain Correction (0.707x) to neutralize energy boost from 0.6B->2B dimension expansion
+            #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 {
+                unsafe {
+                    use crate::models::qwen3vl::native_backend::apply_gain;
+                    if let Some(kp) = gpu_kv.k_ptr { 
+                        apply_gain(kp.0 as u64, 0.7071, (total_t * n_kv * (h_d/32)) as u32); 
+                    }
+                    if let Some(vp) = gpu_kv.v_ptr { 
+                        apply_gain(vp.0 as u64, 0.7071, (total_t * n_kv * h_d) as u32); 
+                    }
+                }
+            }
         }
         Ok(total_t)
     }

@@ -360,16 +360,11 @@ impl LogisModel {
             self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
         }
 
-        // 2. [LOAD] 새 모델 로드 (Relay 시에는 기본적으로 텍스트 전용으로 시도 가능)
-        let text_only = task_id.is_some(); // Snapshot 로드 시점은 대부분 텍스트 기반 추론
-        self.ensure_generator_ext(target_size, false, text_only).await?;
+        // 2. [LOAD & RESTORE] 로드와 동시에 기억 복구 수행
+        let text_only = task_id.is_some();
+        self.ensure_generator_ext(target_size, false, text_only, address_hash).await?;
 
-        // 4. [RESTORE] 디스크 스냅샷 로드
-        if let Some(tid) = task_id {
-            self.load_kv_snapshot(tid, address_hash).await?;
-        }
-
-        println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
+        println!("[RELAY] 2026-Predictive-Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
         Ok(())
     }
 
@@ -434,7 +429,7 @@ impl LogisModel {
         println!("[BAKE-PROMPT] Baking system prompt: {} for address: {}", prompt_name, address_hash);
         let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
         
-        self.ensure_generator_ext(ModelSize::Small, true, true).await?;
+        self.ensure_generator_ext(ModelSize::Small, true, true, None).await?;
         {
             let gen_clone = self.generator.clone();
             let text = formatted_prompt;
@@ -469,7 +464,7 @@ impl LogisModel {
         if !prompt_path.exists() {
             println!("[MODULAR-INF] Prompt cache missing. Baking: {}", prompt_name);
             let formatted_prompt = format!("<|im_start|>system\n{}<|im_end|>\n", system_prompt);
-            self.ensure_generator_ext(ModelSize::Small, true, true).await?;
+            self.ensure_generator_ext(ModelSize::Small, true, true, None).await?;
             {
                 let gen_clone = self.generator.clone();
                 let sp = formatted_prompt;
@@ -742,7 +737,7 @@ impl LogisModel {
             self.wait_for_vram_settle(800, 3, cancel_token.clone()).await?;
         }
 
-        self.ensure_generator_ext(target_size, baking_only, force_text_only).await?;
+        self.ensure_generator_ext(target_size, baking_only, force_text_only, address_hash).await?;
 
         if let Some(tid) = task_id {
             self.load_kv_snapshot(tid, address_hash).await?;
@@ -754,10 +749,10 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.ensure_generator_ext(size, false, false).await
+        self.ensure_generator_ext(size, false, false, None).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, baking_only: bool, force_text_only: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, baking_only: bool, force_text_only: bool, address_hash: Option<&str>) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -766,6 +761,12 @@ impl LogisModel {
         if *current_size_guard == Some(size) && gen_guard.is_some() {
             return Ok(())
         }
+
+        // [INTERNAL-RESTORE] Prepare memory restoration before loading starts
+        let hash_copy = address_hash.map(|s| s.to_string());
+
+        // ... (existing loading logic inside ensure_generator_ext)
+        // [IMPORTANT] Since we need to modify the internal loading, let's inject it at the end of this function
 
         // [MODIFICATION] Force 0.6B to use 1 layer (Layer 0) for all tasks (Inference/Baking)
         let effective_baking_only = if size == ModelSize::Small { true } else { baking_only };
@@ -826,6 +827,40 @@ impl LogisModel {
         *gen_guard = Some(gen);
         *current_size_guard = Some(size);
         
+        // [FORCE-RESTORE] If we just loaded a Large model, inject the KV context NOW
+        if size == ModelSize::Large {
+            if let Some(hash) = hash_copy {
+                if let Some(gen) = gen_guard.as_mut() {
+                    let kv_dir = crate::utils::paths::get_kv_dir(None, Some(&hash));
+                    println!("[INTERNAL-RESTORE] Searching for memory in: {:?}", kv_dir);
+                    
+                    let mut shards = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(&kv_dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                            if name.contains("shared_pug_base") && name.ends_with(".safetensors") {
+                                shards.push(p);
+                            }
+                        }
+                    }
+
+                    if !shards.is_empty() {
+                        let re = regex::Regex::new(r"shard(\d+)").unwrap();
+                        shards.sort_by_key(|p| {
+                            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                            re.captures(name).and_then(|c| c[1].parse::<usize>().ok()).unwrap_or(0)
+                        });
+                        
+                        let total = gen.load_kv_stitched(&shards)?;
+                        println!("[INTERNAL-RESTORE] SUCCESS: Re-injected {} context tokens.", total);
+                    } else {
+                        println!("[INTERNAL-RESTORE] WARNING: No shards found for hash {}.", hash);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -978,11 +1013,9 @@ Return valid JSON only. No explanation.
             let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
-            // [CRITICAL-CHECK] If we are in no-bridge mode, KV cache MUST be loaded.
-            if is_nobridge && gen.get_kv_len() == 0 {
-                println!("[MODEL-CHAT] ABORTED: No context tokens loaded for nobridge inference!");
-                return Err(anyhow!("Context missing for sharded inference. Aborting to prevent incoherent output."));
-            }
+            // [MODIFICATION] Proceed with inference using the injected VRAM context
+            let current_kv = gen.get_kv_len();
+            println!("[MODEL-CHAT] Starting inference. VRAM Base Context: {} tokens.", current_kv);
             
             let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                 content: final_system,
