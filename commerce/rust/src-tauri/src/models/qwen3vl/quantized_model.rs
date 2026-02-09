@@ -262,24 +262,36 @@ impl QuantizedQwen3VLTextAttention {
         let v_proj_name = format!("{base_name}.{v}");
         let qkv_combined_name = format!("{base_name}.attn_qkv");
 
+        // [DETECTION] Use GGUF info to find correct hidden size for THIS model file
+        let actual_h_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
+            info.shape.dims()[0]
+        } else if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.input_layernorm.weight")) {
+            info.shape.dims()[0]
+        } else {
+            1024 // Fallback for 0.6B
+        };
+
         let has_individual = ct.tensor_infos.contains_key(&format!("{q_proj_name}.weight"));
         let has_combined = ct.tensor_infos.contains_key(&format!("{qkv_combined_name}.weight"));
 
         let (q_proj, k_proj, v_proj) = if has_individual {
-            let qp = get_qlinear(ct, reader, &q_proj_name, device, dtype)?;
+            let mut qp = get_qlinear(ct, reader, &q_proj_name, device, dtype)?;
             let kp = get_qlinear(ct, reader, &k_proj_name, device, dtype)?;
             let vp = get_qlinear(ct, reader, &v_proj_name, device, dtype)?;
+            
+            // [HARDENING] 만약 로드된 Q의 입력 차원이 2048인데 현재 모델이 1024 기반이라면 슬라이싱 시도
+            if qp.inner_shape().len() >= 2 && qp.inner_shape()[1] == 2048 && actual_h_size == 1024 {
+                println!("[MODEL-FIX] Slicing individual Q from 2048-dim container for 0.6B layer.");
+                qp = get_sliced_qlinear(ct, reader, &q_proj_name, device, dtype, 1, 0, 1024)?;
+            }
             (qp, kp, vp)
         } else if has_combined {
-            // [0.6B-SPECIFIC] Split attn_qkv into Q, K, V
-            // Total out_features = 3 * hidden_size (usually)
-            let hidden_size = config.hidden_size; 
-            let qp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 0, hidden_size)?;
-            let kp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, hidden_size, hidden_size)?;
-            let vp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 2 * hidden_size, hidden_size)?;
+            let qp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 0, actual_h_size)?;
+            let kp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, actual_h_size, actual_h_size)?;
+            let vp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 2 * actual_h_size, actual_h_size)?;
             (qp, kp, vp)
         } else {
-            return Err(anyhow!("Could not find QKV tensors (individual or combined) for layer {}", layer_idx));
+            return Err(anyhow!("Could not find QKV tensors for layer {}", layer_idx));
         };
 
         let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
@@ -922,20 +934,30 @@ impl QuantizedQwen3VLTextModel {
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
-             // [HYBRID-FALLBACK] If no embedding found, we might be in hybrid mode.
-             // We'll create a dummy embedding for now, to be replaced or bypassed.
              println!("[HYBRID] Embedding not found in GGUF. Using config hidden size: {}", config.hidden_size);
              let dummy_tensor = Tensor::zeros((config.vocab_size, config.hidden_size), dtype, device)?;
              (Embedding::new(dummy_tensor, config.hidden_size), config.hidden_size)
         };
 
-        if actual_hidden_size != config.hidden_size {
-            println!("[MODEL-FIX] Hidden Size Mismatch. Config: {}, Actual: {}. Patching...", config.hidden_size, actual_hidden_size);
+        if actual_hidden_size == 1024 && config.hidden_size == 2048 {
+            println!("[MODEL-FIX] 0.6B detected. Using 1024 hidden size for internal consistency.");
+            let mut patched_config = config.clone();
+            patched_config.hidden_size = 1024;
+            // Also patch heads if needed (Qwen3-0.6B is usually 8 heads)
+            if patched_config.num_attention_heads == 16 { patched_config.num_attention_heads = 8; }
+            if patched_config.num_key_value_heads == 8 { patched_config.num_key_value_heads = 8; } // Consistent
+            
+            let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&patched_config, ct, mmap_handle.clone(), "model", device, device_id, dtype, kv_reserve, baking_only, is_text, is_image)?;
+            let lm_head = if !baking_only {
+                let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+                let mut reader = std::io::Cursor::new(mmap);
+                let head_dtype = if device.is_cpu() { DType::F32 } else { dtype };
+                if let Ok(l) = get_qlinear(ct, &mut reader, "lm_head", device, head_dtype) { Some(l) }
+                else if let Ok(l) = get_qlinear(ct, &mut reader, "output", device, head_dtype) { Some(l) }
+                else { get_qlinear(ct, &mut reader, "token_embd", device, head_dtype).ok() }
+            } else { None };
+            return Ok(Self { language_model, lm_head, text_device: device.clone(), mmap: mmap_handle, is_text, is_image });
         }
-
-        let mut patched_config = config.clone();
-        patched_config.hidden_size = actual_hidden_size;
-        let config = &patched_config;
 
         let nvml = Nvml::init().ok();
         let current_device = device.clone(); 
@@ -1693,6 +1715,7 @@ impl QuantizedQwen3TextModel {
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+
         let start = if let Some(cp) = cache_position { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { 0 };
         let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
