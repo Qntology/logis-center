@@ -922,32 +922,47 @@ impl QuantizedQwen3VLTextModel {
         let is_forced_cpu = device.is_cpu();
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
+
+        // [DETECTION-FIRST] Determine actual hidden size from GGUF BEFORE initializing anything
+        let actual_hidden_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
+            info.shape.dims()[0]
+        } else if let Some(info) = ct.tensor_infos.get(&"token_embd.weight".to_string()) {
+            info.shape.dims()[1]
+        } else {
+            // Try to find ANY layer norm weight to guess hidden size
+            ct.tensor_infos.keys().find(|k| k.contains("attn_norm.weight") || k.contains("input_layernorm.weight"))
+                .and_then(|k| ct.tensor_infos.get(k))
+                .map(|info| info.shape.dims()[0])
+                .unwrap_or(config.hidden_size)
+        };
+
+        let mut patched_config_owned = config.clone();
+        if actual_hidden_size == 1024 && config.hidden_size == 2048 {
+            println!("[MODEL-FIX] 0.6B detected early. Forcing 1024 hidden size/8 heads.");
+            patched_config_owned.hidden_size = 1024;
+            patched_config_owned.num_attention_heads = 8;
+        } else if actual_hidden_size != config.hidden_size {
+            println!("[MODEL-FIX] Hidden size mismatch. Config: {}, GGUF: {}. Patching...", config.hidden_size, actual_hidden_size);
+            patched_config_owned.hidden_size = actual_hidden_size;
+        }
+        let config = &patched_config_owned;
+
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
-        let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
+        let embed_tokens = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
-             (Embedding::new(tensor, h), h)
+             Embedding::new(tensor, h)
         } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
-             (Embedding::new(tensor, h), h)
+             Embedding::new(tensor, h)
         } else {
-             println!("[HYBRID] Embedding not found in GGUF. Using config hidden size: {}", config.hidden_size);
+             println!("[HYBRID] Embedding not found in GGUF. Using config size: {}", config.hidden_size);
              let dummy_tensor = Tensor::zeros((config.vocab_size, config.hidden_size), dtype, device)?;
-             (Embedding::new(dummy_tensor, config.hidden_size), config.hidden_size)
+             Embedding::new(dummy_tensor, config.hidden_size)
         };
-
-        if actual_hidden_size == 1024 && config.hidden_size == 2048 {
-            println!("[MODEL-FIX] 0.6B detected. Using 1024 hidden size for internal consistency.");
-            let mut patched_config = config.clone();
-            patched_config.hidden_size = 1024;
-            if patched_config.num_attention_heads == 16 { patched_config.num_attention_heads = 8; }
-            
-            let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&patched_config, ct, mmap_handle.clone(), "model", device, device_id, dtype, kv_reserve, baking_only, is_text, is_image)?;
-            return Ok(language_model);
-        }
 
         let nvml = Nvml::init().ok();
         let current_device = device.clone(); 
@@ -1611,14 +1626,13 @@ impl QuantizedQwen3VLModel {
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
 
         // [HYBRID-BRIDGE] Upscale 1024 -> 2048 ONLY if we are in a 2048-dim model (Large)
-        let model_expected_dim = self.config.text_config.as_ref().map(|c| c.hidden_size).unwrap_or(2048);
+        // [FIX] Check the ACTUAL hidden size of the underlying model layers, not just the config.
+        let model_actual_dim = self.language_model.embed_tokens.hidden_size();
         let current_input_dim = inputs_embeds.dim(candle_core::D::Minus1)?;
         
-        if model_expected_dim == 2048 && current_input_dim == 1024 {
+        if model_actual_dim == 2048 && current_input_dim == 1024 {
             println!("[HYBRID-BRIDGE-TOP] Scaling inputs_embeds 1024 -> 2048 for Large Model.");
             inputs_embeds = candle_core::Tensor::cat(&[&inputs_embeds, &inputs_embeds], candle_core::D::Minus1)?.contiguous()?;
-        } else {
-            // println!("[HYBRID-BRIDGE-SKIP] Dim match or Small model. Expected: {}, Input: {}", model_expected_dim, current_input_dim);
         }
 
         if let Some(pixel_values) = pixel_values { 
