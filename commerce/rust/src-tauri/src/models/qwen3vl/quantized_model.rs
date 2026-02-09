@@ -924,26 +924,30 @@ impl QuantizedQwen3VLTextModel {
         let mut reader = std::io::Cursor::new(mmap);
 
         // [DETECTION-FIRST] Determine actual hidden size from GGUF BEFORE initializing anything
-        let actual_hidden_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
+        let actual_h_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
+            info.shape.dims()[0]
+        } else if let Some(info) = ct.tensor_infos.get(&format!("blk.0.attn_norm.weight")) {
             info.shape.dims()[0]
         } else if let Some(info) = ct.tensor_infos.get(&"token_embd.weight".to_string()) {
             info.shape.dims()[1]
         } else {
-            // Try to find ANY layer norm weight to guess hidden size
+            // Last resort: search for any layer norm weight
             ct.tensor_infos.keys().find(|k| k.contains("attn_norm.weight") || k.contains("input_layernorm.weight"))
                 .and_then(|k| ct.tensor_infos.get(k))
                 .map(|info| info.shape.dims()[0])
                 .unwrap_or(config.hidden_size)
         };
 
+        println!("[MODEL-INIT] Name: {}, Config Hidden: {}, GGUF Actual: {}, Layers: {}", base_name, config.hidden_size, actual_h_size, config.num_hidden_layers);
+
         let mut patched_config_owned = config.clone();
-        if actual_hidden_size == 1024 && config.hidden_size == 2048 {
-            println!("[MODEL-FIX] 0.6B detected early. Forcing 1024 hidden size/8 heads.");
+        if actual_h_size == 1024 {
+            println!("[MODEL-FIX] 0.6B detected early. Overriding all settings to 1024/8 heads.");
             patched_config_owned.hidden_size = 1024;
             patched_config_owned.num_attention_heads = 8;
-        } else if actual_hidden_size != config.hidden_size {
-            println!("[MODEL-FIX] Hidden size mismatch. Config: {}, GGUF: {}. Patching...", config.hidden_size, actual_hidden_size);
-            patched_config_owned.hidden_size = actual_hidden_size;
+            patched_config_owned.num_key_value_heads = 8;
+        } else {
+            patched_config_owned.hidden_size = actual_h_size;
         }
         let config = &patched_config_owned;
 
