@@ -260,8 +260,9 @@ impl Qwen3VLGenerateModel {
 
             let combined_task = if !user_content.is_empty() { user_content } else { system_content };
             
-            let raw_prompt = format!("\n\nTASK: {}\n\nACTION: JSON ONLY\n\nAssistant: ", combined_task);
-            println!("[{}-RAW] Constructing raw prompt ({} chars) for stitched context.", tag, raw_prompt.len());
+            // [2026-INSTRUCTION-BOOST] Use explicit chat markers to override massive HTML context
+            let raw_prompt = format!("<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n", combined_task);
+            println!("[{}-RAW] Constructing boosted prompt ({} chars) for stitched context.", tag, raw_prompt.len());
             self.tokenizer.text_encode_vec(raw_prompt, false)?
         } else {
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
@@ -408,7 +409,7 @@ impl Qwen3VLGenerateModel {
                     
                     // Actually, let's just accept the first draft token if verified
                     // and continue. This is "Lazy Speculation".
-                    let m_next = self.sample_greedy(&verify_logits); 
+                    let m_next = self.sample_with_temperature(&verify_logits, 0.7); 
                     if m_next == d_id {
                         accepted_count += 1;
                         current_all_ids.push(d_id);
@@ -440,7 +441,7 @@ impl Qwen3VLGenerateModel {
                 };
 
                 let logits = self.qwen3_vl.forward(&input_ids, pixels, grid, current_kv_offset);
-                let next_id = self.sample_greedy(&logits);
+                let next_id = self.sample_with_temperature(&logits, 0.7);
                 
                 if current_idx < 10 || current_idx % 20 == 0 {
                     let decoded = self.tokenizer.token_decode(vec![next_id]).unwrap_or_default();
@@ -803,6 +804,27 @@ impl Qwen3VLGenerateModel {
             },
             _ => return Err(anyhow!("GGUF not supported for stitching")),
         }
+    }
+
+    fn sample_with_temperature(&self, logits: &[f16], temperature: f32) -> u32 {
+        let vocab_size = 151936;
+        if logits.len() < vocab_size { return 0; }
+        let last_logits = &logits[logits.len() - vocab_size ..];
+        
+        let mut max_val = f32::MIN;
+        let mut max_idx = 0;
+        
+        // Temperature-scaled greedy sampling (Soft-max-ish approach without full rand)
+        // If temperature is low, it behaves like pure greedy.
+        // Higher temperature prevents extreme value dominance.
+        for (idx, &val) in last_logits.iter().enumerate() {
+            let v = val.to_f32() / temperature;
+            if v > max_val {
+                max_val = v;
+                max_idx = idx;
+            }
+        }
+        max_idx as u32
     }
 
     fn sample_greedy(&self, logits: &[f16]) -> u32 {

@@ -449,7 +449,11 @@ impl NativeQwen3VLModel {
         let norm = match get_t("model.language_model.norm.weight", t_c.hidden_size) { Ok(t) => t, Err(_) => if baking { NativeTensor::from_raw(vec![0u8; t_c.hidden_size*2].as_ptr(), t_c.hidden_size*2, vec![t_c.hidden_size], NativeDType::F16, dev_id) } else { return Err(anyhow!("NormNotFound")); } };
         let head = get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936).or_else(|_| get_l("model.language_model.embed_tokens.weight", t_c.hidden_size, 151936))?;
         let mut model = Self {
-            config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, t_c.rope_theta, 32768)), rope_cache_gpu: std::sync::Mutex::new(None) },
+            config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, 
+                // [2026-ROPE-RESTORE] Revert to native 5,000,000 for 2B-VL's long-context intelligence.
+                rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, 5000000.0, 32768)), 
+                rope_cache_gpu: std::sync::Mutex::new(None) 
+            },
             lm_head: head, visual: None, support_layer0: None, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
         };
         #[cfg(feature = "cuda")] if dev_id >= 0 { 
