@@ -11,11 +11,8 @@ pub fn get_app_tmp_root(_app: Option<&AppHandle>) -> PathBuf {
     path
 }
 
-pub fn get_kv_dir(app: Option<&AppHandle>, sub_folder: Option<&str>) -> PathBuf {
-    let mut path = get_app_tmp_root(app).join("kv");
-    if let Some(sub) = sub_folder {
-        path = path.join(sub);
-    }
+pub fn get_kv_dir(app: Option<&AppHandle>) -> PathBuf {
+    let path = get_app_tmp_root(app).join("kv");
     if !path.exists() { let _ = fs::create_dir_all(&path); }
     path
 }
@@ -56,20 +53,22 @@ pub fn get_stop_signal_file() -> PathBuf {
 
 /// Initialize all necessary directories
 pub fn init_directories(app: Option<&AppHandle>) {
-    let _ = get_kv_dir(app, None);
+    let _ = get_kv_dir(app);
     let _ = get_task_data_dir(app);
     let _ = get_logs_dir(app);
 }
 
 /// Cleanup temporary directories (called on startup or shutdown)
 pub fn cleanup_temp_dirs(app: Option<&AppHandle>) {
+    let kv = get_kv_dir(app);
     let data = get_task_data_dir(app);
     let logs = get_logs_dir(app);
     
+    let _ = fs::remove_dir_all(&kv);
     let _ = fs::remove_dir_all(&data);
     let _ = fs::remove_dir_all(&logs);
     
+    let _ = fs::create_dir_all(&kv);
     let _ = fs::create_dir_all(&data);
     let _ = fs::create_dir_all(&logs);
-    // KV directory is preserved to keep baked cache
 }

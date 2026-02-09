@@ -309,26 +309,10 @@ impl VectorStore {
     }
 
     pub async fn cleanup_zombie_tasks(&self) -> Result<()> {
-        let tasks_table = self.conn.open_table("tasks").execute().await?;
-        let talks_table = self.conn.open_table("talks").execute().await?;
-        
-        // 1. Get IDs of tasks to be cleared
-        let filter = "status = 1 OR status = 10";
-        let results = tasks_table.query().only_if(filter).execute().await?.try_collect::<Vec<_>>().await?;
-        
-        for batch in results {
-            let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            for i in 0..batch.num_rows() {
-                let task_id = ids.value(i);
-                // 2. Clear associated messages first
-                let _ = talks_table.delete(&format!("task_id = '{}'", task_id)).await;
-            }
-        }
-
-        // 3. Delete the zombie tasks
-        tasks_table.delete(filter).await?;
-        
-        println!("[Store] All zombie tasks and associated messages cleared on startup.");
+        let table = self.conn.open_table("tasks").execute().await?;
+        // 앱 시작 시 '진행 중(1)' 또는 '대기 중(10)' 상태인 모든 작업을 삭제하여 좀비 방지
+        table.delete("status = 1 OR status = 10").await?;
+        println!("[Store] All zombie tasks cleared on startup.");
         Ok(())
     }
 

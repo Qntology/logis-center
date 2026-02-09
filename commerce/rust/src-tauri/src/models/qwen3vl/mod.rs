@@ -1,7 +1,5 @@
 pub mod config;
 pub mod generate;
-pub mod native_model;
-pub mod native_backend;
+pub mod model;
 pub mod processor;
-// pub mod model;
-// pub mod quantized_model;
+pub mod quantized_model;

@@ -52,7 +52,7 @@ pub struct ChatCompletionRequestUserMessage {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ChatCompletionRequestUserMessageContent {
-    String(String),
+    Text(String),
     Array(Vec<ChatCompletionRequestMessageContentPart>),
 }
 
