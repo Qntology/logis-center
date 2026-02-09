@@ -343,8 +343,18 @@ impl NativeQwen3TextModel {
             unsafe { std::ptr::copy_nonoverlapping(stabilized_out.as_ptr(), target_ptr, stabilized_out.len()); }
             cur_x = unsafe { std::slice::from_raw_parts(target_ptr, stabilized_out.len()) };
         }
-        let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()]; native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
-        if q_len > 1 { log_tensor_health("Final Norm Output", &cn, &[q_len, hid]); }
+        let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()]; 
+        native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
+        
+        // [2026-FINAL-ATTENUATION-V2] 0.05 was too quiet, 0.18 is the 'sweet spot'.
+        // This allows semantic signals to survive while keeping 1-bit noise under control.
+        for v in cn.iter_mut() {
+            let mut f = v.to_f32() * 0.18;
+            if f > 4.0 { f = 4.0; } if f < -4.0 { f = -4.0; } // Sane range for 4-bit LM Head
+            *v = f16::from_f32(f);
+        }
+
+        if q_len > 1 { log_tensor_health("Final Norm Output (Corrected)", &cn, &[q_len, hid]); }
         cn
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.embed_tokens.move_to_gpu(dev)?; self.norm.move_to_gpu(dev)?; for l in &mut self.layers { l.move_to_gpu(dev)?; } Ok(()) }
