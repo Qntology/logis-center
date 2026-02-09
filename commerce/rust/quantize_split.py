@@ -182,7 +182,7 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
                 
             final_dict.update({
                 f"{new_name}.packed": packed,
-                f"{new_name}.scales": scales,
+                f"{new_name}.scales": scales.to(torch.float32),
                 f"{new_name}.shape": shape,
                 f"{new_name}.format": torch.tensor([format_type], dtype=torch.int8) 
             })

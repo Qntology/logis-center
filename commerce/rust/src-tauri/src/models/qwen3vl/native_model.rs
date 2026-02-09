@@ -125,11 +125,8 @@ pub fn dequantize_bit_serial_to_f16(p: &[u32], s: &[f16], n: usize, sk: usize, t
                     let k_base = skb_idx * 32 + b; if k_base >= sk { break; }
                     let mut b_sum = 0.0f32;
                     for sl in 0..sc { if ((p[sl * ss + (no * skb + skb_idx) * 8 + sub_n] >> b) & 1) == 1 { b_sum += (1 << sl) as f32; } }
-                    
-                    // [2026-BLOCK-WISE-PRECISION] Use granular scales for both 1-bit and 4-bit
                     let block_scale = s[(no * skb + skb_idx) * 8 + sub_n].to_f32();
                     let f_val = if sc == 4 { (b_sum - 8.0f32) * block_scale } else { (if b_sum >= 1.0 { 1.0f32 } else { -1.0f32 }) * block_scale };
-                    
                     let target_idx = n_idx * tk + k_base; if target_idx < out.len() { out[target_idx] = f16::from_f32(f_val); }
                 }
             }
@@ -147,11 +144,9 @@ impl NativeLinear {
         let mut out = vec![f16::ZERO; (x.len() / self.in_features) * self.out_features]; self.forward_into(x, &mut out, gs); out
     }
     
-    // [2026-PRECISION-RESTORE] High-precision F32 forward for LM Head and Alignment
     pub fn forward_f32(&self, x: &[f32], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f32> {
         let m = x.len() / self.in_features;
         let mut out = vec![0.0f32; m * self.out_features];
-        
         match &self.variant {
             LinearVariant::Standard { weight, bias } => {
                 #[cfg(feature = "cuda")] if self.device_id >= 0 {
@@ -159,27 +154,26 @@ impl NativeLinear {
                         let di = si.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr).unwrap_or(0);
                         let dog = so.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr).unwrap_or(0);
                         let dbg = bias.as_ref().and_then(|b| b.gpu_ptr).map(|p| p.0 as *const f32).unwrap_or(std::ptr::null());
-                        
                         if di != 0 && dog != 0 { unsafe {
                             let cl = crate::models::qwen3vl::native_backend::lib();
                             let _ = cl.cuMemcpyHtoD_v2(di, x.as_ptr() as *const _, x.len() * 4);
-                            crate::models::qwen3vl::native_backend::high_precision_matmul_f32_bias(di as *const f32, w_gpu.0 as *const f32, dbg, dog as *mut f32, m as i32, self.out_features as i32, self.in_features as i32);
+                            // [PRECISION-MATCHING] Pass custom sharpening (1.15 for Head, 1.0 for Align)
+                            let sharpen_val = if self.out_features > 100000 { 1.15f32 } else { 1.0f32 };
+                            crate::models::qwen3vl::native_backend::high_precision_matmul_f32_bias(di as *const f32, w_gpu.0 as *const f32, dbg, dog as *mut f32, m as i32, self.out_features as i32, self.in_features as i32, sharpen_val);
                             let _ = cl.cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, dog, out.len() * 4);
                             return out;
                         } }
                     }
                 }
-                
-                let w_raw = weight.get_slice::<f32>();
-                let b_raw = bias.as_ref().map(|b| b.get_slice::<f32>());
+                let w_raw = weight.to_f32_vec();
+                let b_raw = bias.as_ref().map(|b| b.to_f32_vec());
+                let sharpen_val = if self.out_features > 100000 { 1.15f32 } else { 1.0f32 };
                 for i in 0..m {
                     for j in 0..self.out_features {
                         let mut sum = 0.0f32;
-                        for k in 0..self.in_features {
-                            sum += x[i * self.in_features + k] * w_raw[j * self.in_features + k];
-                        }
+                        for k in 0..self.in_features { sum += x[i * self.in_features + k] * w_raw[j * self.in_features + k]; }
                         if let Some(ref b) = b_raw { sum += b[j]; }
-                        out[i * self.out_features + j] = sum;
+                        out[i * self.out_features + j] = sum * sharpen_val;
                     }
                 }
             },
@@ -193,13 +187,15 @@ impl NativeLinear {
         }
         out
     }
+
     #[cfg(feature = "cuda")]
     pub fn forward_gpu(&self, di: CUdeviceptr, dog: CUdeviceptr, m: usize) {
         unsafe { match &self.variant {
             LinearVariant::Standard { weight, .. } => crate::models::qwen3vl::native_backend::standard_matmul_cuda_f16(di as *const f16, weight.gpu_ptr.expect("W on GPU").0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32),
-            LinearVariant::BitSerial { weight_packed, scales, .. } => crate::models::qwen3vl::native_backend::cuda_matmul_f16(di as *const f16, weight_packed.gpu_ptr.expect("PW on GPU").0 as *const u32, scales.gpu_ptr.expect("S on GPU").0 as *const f16, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32),
+            LinearVariant::BitSerial { weight_packed, scales, .. } => crate::models::qwen3vl::native_backend::cuda_matmul_4bit_f16(di as *const f16, weight_packed.gpu_ptr.expect("PW on GPU").0 as *const u32, scales.gpu_ptr.expect("S on GPU").0 as *const f32, dog as *mut f16, m as i32, self.out_features as i32, self.in_features as i32, self.device_id, self.src_in as i32),
         } }
     }
+    
     pub fn forward_into(&self, x: &[f16], out: &mut [f16], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) {
         let m = x.len() / self.in_features;
         match &self.variant {
@@ -361,70 +357,41 @@ impl NativeQwen3TextModel {
         { let mut rg = self.rope_cache.lock().unwrap(); rg.ensure_length(s_o + q_len); }
         let rg = self.rope_cache.lock().unwrap();
         for (i, layer) in self.layers.iter().enumerate() {
+            let out_len = cur_x.len();
             let out = layer.forward(cur_x, &self.config, s_o, i, &rg.cos, &rg.sin, false, is_vision, gs, ws, i % 2 == 0, &self.rope_cache_gpu);
             
-            // [2026-DYNAMIC-SCALING] Adaptive RMS Normalization per token
-            let mut stabilized_out = out.to_vec();
-            let num_layers = self.layers.len();
+            // [2026-NATIVE-FLOW] Minimal intervention to maintain signal integrity
+            let out_ptr = out.as_ptr();
+            let target_ptr = if i % 2 == 0 { ws.hidden_b.as_mut_ptr() } else { ws.hidden_a.as_mut_ptr() };
             
-            for (t_idx, chunk) in stabilized_out.chunks_exact_mut(hid).enumerate() {
-                // [2026-SEMANTIC-PRIORITY] Distinguish between 'Baked Context' and 'Live Instruction'
-                // Tokens from 0.6B (baked) are treated as background knowledge.
-                // Tokens in the current chunk (especially if s_o > 0) are treated as primary focus.
-                let is_instruction = if t_idx < _i_ids.len() {
-                    let id = _i_ids[t_idx];
-                    // Instruction markers OR being part of a new prompt after baking
-                    id == 151644 || id == 151645 || id == 151655 || s_o > 1000 
-                } else { s_o > 1000 };
-
-                let base_target = if i == 0 { 0.45 } else { 0.8 + (i as f32 / num_layers as f32) * 0.4 };
-                
-                // Boost Instruction by 1.3x, Dampen Background by 0.7x
-                let target_rms = if is_instruction { base_target * 1.3 } else { base_target * 0.7 };
-
-                let mut sum_sq = 0.0f32;
-                for v in chunk.iter() { let f = v.to_f32(); sum_sq += f * f; }
-                let rms = (sum_sq / hid as f32).sqrt().max(1e-5);
-                let scale = (target_rms / rms).clamp(0.05, 5.0); 
-                
-                let clamp_range = 16.0 + (i as f32 / num_layers as f32) * 8.0;
-                for v in chunk.iter_mut() {
-                    let mut f = v.to_f32() * scale;
-                    if f > clamp_range { f = clamp_range; } if f < -clamp_range { f = -clamp_range; }
-                    *v = f16::from_f32(f);
+            // Only perform a very loose safety check to prevent Inf/NaN before it spreads
+            unsafe {
+                for j in 0..out_len {
+                    let mut f = (*out_ptr.add(j)).to_f32();
+                    if f.is_nan() || f.is_infinite() { f = 0.0; }
+                    // Loose clamp only for extreme outliers
+                    if f > 64.0 { f = 64.0; } else if f < -64.0 { f = -64.0; }
+                    *(target_ptr.add(j)) = f16::from_f32(f);
                 }
             }
-
-            if q_len > 1 && (i == 0 || i % 5 == 0 || i == num_layers - 1) { 
-                log_tensor_health(&format!("Layer {} Output (Adaptive-RMS)", i), &stabilized_out, &[q_len, hid]); 
-            }
-            
-            // Since we created a new Vec for stabilization, we need to manage its lifetime.
-            // For efficiency, we copy it back to the workspace buffer.
-            let target_ptr = if i % 2 == 0 { ws.hidden_b.as_mut_ptr() } else { ws.hidden_a.as_mut_ptr() };
-            unsafe { std::ptr::copy_nonoverlapping(stabilized_out.as_ptr(), target_ptr, stabilized_out.len()); }
-            cur_x = unsafe { std::slice::from_raw_parts(target_ptr, stabilized_out.len()) };
+            cur_x = unsafe { std::slice::from_raw_parts(target_ptr, out_len) };
         }
+        
         let n_w = self.norm.get_slice::<f16>(); 
         let mut cn_f32 = vec![0.0f32; cur_x.len()]; 
         
-        // [2026-FINAL-PRECISION] High-precision RMS Norm in F32
+        // [2026-FINAL-PRECISION] Original Formula in F32
         for (t_idx, chunk) in cur_x.chunks_exact(hid).enumerate() {
             let mut sum_sq = 0.0f32;
             for &v in chunk { let f = v.to_f32(); sum_sq += f * f; }
             let inv_rms = 1.0 / (sum_sq / hid as f32 + self.config.rms_norm_eps as f32).sqrt();
             for (i, &v) in chunk.iter().enumerate() {
+                // Return to original signal magnitude
                 cn_f32[t_idx * hid + i] = v.to_f32() * inv_rms * n_w[i].to_f32();
             }
         }
-        
-        // Final energy control
-        for v in cn_f32.iter_mut() {
-            let f = *v * 0.22;
-            *v = if f > 4.0 { 4.0 } else if f < -4.0 { -4.0 } else { f };
-        }
 
-        if q_len > 1 { log_tensor_health("Final Norm Output (F32-Adaptive)", unsafe { std::slice::from_raw_parts(cn_f32.as_ptr() as *const f16, 0) }, &[q_len, hid]); }
+        if q_len > 1 { log_tensor_health("Final Norm Output (F32-Restore)", unsafe { std::slice::from_raw_parts(cn_f32.as_ptr() as *const f16, 0) }, &[q_len, hid]); }
         cn_f32.into_iter().map(|v| f16::from_f32(v)).collect()
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.embed_tokens.move_to_gpu(dev)?; self.norm.move_to_gpu(dev)?; for l in &mut self.layers { l.move_to_gpu(dev)?; } Ok(()) }
@@ -599,39 +566,37 @@ impl NativeQwen3VLModel {
             for (p_idx, mmap) in mmaps.iter().enumerate() {
                 let st = SafeTensors::deserialize(mmap)?; let tip = metadatas[p_idx];
                 let mut fl = 0; while st.tensor(&format!("layer.{}.k", fl)).is_ok() { fl += 1; }
-                let si = if fl == 1 { 0 } else { l_idx }; if si >= fl { curr_o += tip; continue; }
+                let si = if fl == 0 { 0 } else { l_idx }; if si >= fl { curr_o += tip; continue; }
                 if let (Ok(kt), Ok(vt)) = (st.tensor(&format!("layer.{}.k", si)), st.tensor(&format!("layer.{}.v", si))) {
                     let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
                     let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
                     let actual_source_dim = if k_data.len() > 0 && v_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
+                    
                     if let Some(ref align) = self.align_matrix {
                         if target_dim > actual_source_dim && actual_source_dim == align.in_features {
-                            // [2026-RESIDUAL-ALIGNMENT] Blend linear projection with raw residual
-                            let v_projected = align.forward(&v_data, None);
-                            let ratio = target_dim / actual_source_dim;
-                            
+                            let v_f32: Vec<f32> = v_data.iter().map(|&v| v.to_f32()).collect();
+                            let v_projected = align.forward_f32(&v_f32, None);
                             let mut v_final = Vec::with_capacity(v_projected.len());
                             for (idx, &proj_val) in v_projected.iter().enumerate() {
                                 let orig_idx = (idx / target_dim) * actual_source_dim + ((idx % target_dim) % actual_source_dim);
-                                let orig_val = v_data[orig_idx].to_f32();
-                                // 70% Projection + 30% Residual Repeat for semantic stability
-                                v_final.push(f16::from_f32(proj_val.to_f32() * 0.7 + orig_val * 0.3));
+                                let orig_val = v_f32[orig_idx];
+                                v_final.push(f16::from_f32(proj_val * 0.7 + orig_val * 0.3));
                             }
                             v_data = v_final;
 
-                            let mut k_f16 = Vec::with_capacity(k_data.len() * 32);
-                            for &packed in &k_data { for b in 0..32 { k_f16.push(if (packed >> b) & 1 == 1 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) }); } }
-                            let k_projected = align.forward(&k_f16, None);
-                            
+                            let mut k_f32 = Vec::with_capacity(k_data.len() * 32);
+                            for &packed in &k_data { for b in 0..32 { k_f32.push(if (packed >> b) & 1 == 1 { 1.0f32 } else { -1.0f32 }); } }
+                            let k_projected = align.forward_f32(&k_f32, None);
                             let mut k_final = Vec::with_capacity(k_projected.len());
                             for (idx, &proj_val) in k_projected.iter().enumerate() {
                                 let orig_idx = (idx / target_dim) * actual_source_dim + ((idx % target_dim) % actual_source_dim);
-                                let orig_val = k_f16[orig_idx].to_f32();
-                                k_final.push(f16::from_f32(proj_val.to_f32() * 0.7 + orig_val * 0.3));
+                                let orig_val = k_f32[orig_idx];
+                                k_final.push(proj_val * 0.7 + orig_val * 0.3);
                             }
-                            k_data = pack_f16_to_bits(&k_final);
+                            k_data = pack_f16_to_bits(&k_final.iter().map(|&v| f16::from_f32(v)).collect::<Vec<_>>());
                         }
                     }
+                    
                     #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { unsafe {
                         let cl = crate::models::qwen3vl::native_backend::lib();
                         if let Some(kp) = gpu_kv.k_ptr { let _ = cl.cuMemcpyHtoD_v2((kp.0 as u64 + (curr_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr, k_data.as_ptr() as *const _, k_data.len() * 4); }
@@ -664,15 +629,9 @@ impl NativeQwen3VLModel {
         let nx = self.text_model.forward_ext(i_ids, fe, so, sc, Some(&mut wl), None, pv.is_some());
         if is_b { return vec![]; }
         
-        // [2026-LOGIT-SHARPENING] Recover confidence in the LM Head
         let nx_f32: Vec<f32> = nx.iter().map(|v| v.to_f32()).collect();
         let raw_logits = self.lm_head.forward_f32(&nx_f32, sc);
-        
-        // Apply Sharpening: Boost the contrast of the distribution
-        raw_logits.into_iter().map(|v| {
-            let sharpened = v * 1.15; // 15% boost to separation
-            f16::from_f32(sharpened)
-        }).collect()
+        raw_logits.into_iter().map(|v| f16::from_f32(v)).collect()
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.text_model.move_to_gpu(dev)?; self.lm_head.move_to_gpu(dev)?; if let Some(ref mut v) = self.visual { v.move_to_gpu(dev)?; } Ok(()) }
 }

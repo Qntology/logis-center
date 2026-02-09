@@ -51,10 +51,10 @@ extern "C" {
     fn cuda_matmul_f32(d_i: *const f32, d_w: *const u32, d_s: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, dev: i32);
     
     #[link_name = "bit_serial_matmul_cuda_f16"]
-    pub fn cuda_matmul_f16(d_i: *const f16, d_w: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
+    pub fn cuda_matmul_f16(d_i: *const f16, d_w: *const u32, d_s: *const f32, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
     
     #[link_name = "bit_serial_matmul_cuda_4bit_f16"]
-    pub fn cuda_matmul_4bit_f16(d_i: *const f16, d_w: *const u32, d_s: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
+    pub fn cuda_matmul_4bit_f16(d_i: *const f16, d_w: *const u32, d_s: *const f32, d_o: *mut f16, m: i32, n: i32, k: i32, dev: i32, src_k: i32);
 
     #[link_name = "bit_serial_attn_cuda_direct"]
     fn cuda_attn_f32(d_q: *const f32, d_k: *const u32, d_v: *const f32, d_o: *mut f32, n_h: i32, n_kv: i32, h_d: i32, t_s: i32, scale: f32, dev: i32, q_len: i32, alpha: f32);
@@ -66,10 +66,7 @@ extern "C" {
     pub fn standard_matmul_cuda_f16(d_i: *const f16, d_w: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32);
 
     #[link_name = "high_precision_matmul_f32_bias"]
-    pub fn high_precision_matmul_f32_bias(d_i: *const f32, d_w: *const f32, d_b: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32);
-
-    #[link_name = "cuda_logit_sharpening_f32"]
-    pub fn cuda_logit_sharpening_f32(d_logits: *mut f32, factor: f32, size: i32);
+    pub fn high_precision_matmul_f32_bias(d_i: *const f32, d_w: *const f32, d_b: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32, sharpen: f32);
 
     #[link_name = "cuda_rms_norm_f16"]
     pub fn cuda_rms_norm_f16(d_i: *const f16, d_w: *const f16, d_o: *mut f16, m: i32, hid: i32, eps: f32);
@@ -165,7 +162,7 @@ pub fn bit_serial_matmul_gpu_buffered_into(i: &[f16], w: &NativeTensor, s: &Nati
     unsafe {
         let _ = lib().cuMemcpyHtoD_v2(d_i, i.as_ptr() as *const _, m * k * 2);
         let d_w = w.gpu_ptr.expect("W on GPU").0 as *const u32;
-        let d_s = s.gpu_ptr.expect("S on GPU").0 as *const f16;
+        let d_s = s.gpu_ptr.expect("S on GPU").0 as *const f32;
         cuda_matmul_f16(d_i as *const f16, d_w, d_s, d_o as *mut f16, m as i32, n as i32, k as i32, dev as i32, src_k as i32);
         let _ = lib().cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, d_o, m * n * 2);
     }
@@ -223,6 +220,15 @@ impl NativeTensor {
     pub unsafe fn get_raw_slice<T>(&self) -> &[T] {
         let size = self.shape.iter().product::<usize>();
         std::slice::from_raw_parts(self.data_ptr as *const T, size)
+    }
+
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        let size = self.shape.iter().product::<usize>();
+        match self.dtype {
+            NativeDType::F32 => unsafe { self.get_raw_slice::<f32>().to_vec() },
+            NativeDType::F16 => unsafe { self.get_raw_slice::<f16>().iter().map(|&v| v.to_f32()).collect() },
+            _ => vec![0.0f32; size],
+        }
     }
 
     #[cfg(feature = "cuda")]
