@@ -405,16 +405,19 @@ impl NativeQwen3VLModel {
     pub fn load(config: Qwen3VLConfig, m_mmap: Arc<Mmap>, v_mmap: Option<Arc<Mmap>>, baking: bool, s_mmap: Option<Arc<Mmap>>, dev_id: i32) -> Result<Self> {
         let align_path = std::path::Path::new("src-tauri/models/align_matrix.safetensors");
         let align_matrix = if align_path.exists() {
-            println!("[MODEL] Loading alignment matrix...");
+            println!("[MODEL] Loading high-precision alignment matrix...");
             if let Ok(data) = std::fs::read(align_path) {
                 if let Ok(st_align) = SafeTensors::deserialize(&data) {
                     if let Ok(weight) = st_align.tensor("weight") {
                         let shape = weight.shape().to_vec();
+                        let bias = st_align.tensor("bias").ok().map(|b| {
+                            NativeTensor::from_raw(b.data().as_ptr(), b.data().len(), b.shape().to_vec(), NativeDType::F32, dev_id)
+                        });
                         Some(NativeLinear {
                             in_features: shape[0], out_features: shape[1], src_in: shape[0], src_out: shape[1],
                             variant: LinearVariant::Standard {
-                                weight: NativeTensor::from_raw(weight.data().as_ptr(), weight.data().len(), shape, NativeDType::F16, dev_id),
-                                bias: None
+                                weight: NativeTensor::from_raw(weight.data().as_ptr(), weight.data().len(), shape, NativeDType::F32, dev_id),
+                                bias
                             },
                             device_id: dev_id
                         })

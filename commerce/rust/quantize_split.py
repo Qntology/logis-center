@@ -23,7 +23,14 @@ def quantize_tensor_bit_serial_shuffled(param):
     # 2. Basic Bit-packing [N, K_blocks]
     flat_w = param.view(N, K_blocks, BLOCK_SIZE)
     # Scales are also stored per block
-    scales = torch.mean(torch.abs(flat_w), dim=2).to(torch.float16)
+    scales = torch.mean(torch.abs(flat_w), dim=2)
+    
+    # [2026-TERNARY-NOISE-BLOCK] Force bottom 20% energy blocks to absolute zero
+    # Ensure float32 for quantile calculation
+    threshold = torch.quantile(scales.to(torch.float32), 0.20)
+    scales[scales < threshold] = 0.0
+    scales = scales.to(torch.float16)
+
     binary = (flat_w >= 0).to(torch.int32)
     
     packed_rows = torch.zeros((N, K_blocks), dtype=torch.int32)
