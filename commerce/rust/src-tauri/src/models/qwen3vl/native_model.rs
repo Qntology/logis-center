@@ -116,7 +116,7 @@ fn log_tensor_health(name: &str, data: &[f16], shape: &[usize]) {
 
 pub fn dequantize_bit_serial_to_f16(p: &[u32], s: &[f16], n: usize, sk: usize, tk: usize, sc: usize) -> Vec<f16> {
     let skb = (sk + 31) / 32; let np = (n + 7) / 8 * 8; let mut out = vec![f16::ZERO; n * tk];
-    let ratio = tk / sk; let ss = (np / 8) * skb * 8;
+    let ss = (np / 8) * skb * 8;
     for no in 0..(np / 8) {
         for skb_idx in 0..skb {
             for sub_n in 0..8 {
@@ -126,7 +126,7 @@ pub fn dequantize_bit_serial_to_f16(p: &[u32], s: &[f16], n: usize, sk: usize, t
                     let mut b_sum = 0.0f32;
                     for sl in 0..sc { if ((p[sl * ss + (no * skb + skb_idx) * 8 + sub_n] >> b) & 1) == 1 { b_sum += (1 << sl) as f32; } }
                     let f_val = if sc == 4 { (b_sum - 8.0f32) * s[n_idx].to_f32() } else { (if b_sum >= 1.0 { 1.0f32 } else { -1.0f32 }) * s[(no * skb + skb_idx) * 8 + sub_n].to_f32() };
-                    for r in 0..ratio { let target_idx = n_idx * tk + k_base + (r * sk); if target_idx < out.len() { out[target_idx] = f16::from_f32(f_val); } }
+                    let target_idx = n_idx * tk + k_base; if target_idx < out.len() { out[target_idx] = f16::from_f32(f_val); }
                 }
             }
         }
@@ -333,7 +333,7 @@ impl NativeQwen3TextModel {
                 }
             }
 
-            if q_len > 1 && (i == 0 || i == num_layers - 1) { 
+            if q_len > 1 && (i == 0 || i % 5 == 0 || i == num_layers - 1) { 
                 log_tensor_health(&format!("Layer {} Output (Stabilized-V2)", i), &stabilized_out, &[q_len, hid]); 
             }
             
@@ -470,78 +470,6 @@ impl NativeQwen3VLModel {
             lm_head: head, visual: None, support_layer0: None, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
             align_matrix,
         };
-        let t_c = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?;
-        let find_key = |target: &str, p: &SafeTensors, s: Option<&SafeTensors>| -> Option<(String, bool)> {
-            if p.tensor(target).is_ok() || p.tensor(&format!("{}.packed", target)).is_ok() { return Some((target.to_string(), true)); }
-            if let Some(sec) = s { if sec.tensor(target).is_ok() || sec.tensor(&format!("{}.packed", target)).is_ok() { return Some((target.to_string(), false)); } }
-            None
-        };
-        let get_l = |base: &str, inf: usize, outf: usize| -> Result<NativeLinear> {
-            let (key, is_p) = find_key(base, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("LinearNotFound: {}", base))?;
-            let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
-            if cst.tensor(&format!("{}.packed", key)).is_ok() {
-                let vp = cst.tensor(&format!("{}.packed", key))?; let vs = cst.tensor(&format!("{}.scales", key))?; let format = cst.tensor(&format!("{}.format", key)).map(|t| t.data()[0] as i8).unwrap_or(1);
-                let (so, si) = if let Ok(sh) = cst.tensor(&format!("{}.shape", key)) { let sd = unsafe { std::slice::from_raw_parts(sh.data().as_ptr() as *const i32, 2) }; (sd[0] as usize, sd[1] as usize) } else { (outf, inf) };
-                if format == 4 || inf > si || outf > so {
-                    let dq = dequantize_bit_serial_to_f16(unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) }, unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) }, so, si, inf, if format == 4 { 4 } else { 1 });
-                    let b = dq.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b);
-                    return Ok(NativeLinear { in_features: inf, out_features: outf, src_in: si, src_out: so, variant: LinearVariant::Standard { weight: NativeTensor::from_raw(p as *const u8, outf*inf*2, vec![outf, inf], NativeDType::F16, dev_id), bias: None }, device_id: dev_id });
-                }
-                Ok(NativeLinear { in_features: inf, out_features: outf, src_in: inf, src_out: outf, variant: LinearVariant::BitSerial { weight_packed: NativeTensor::from_mmap(cm.clone(), unsafe { vp.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vp.shape().to_vec(), NativeDType::U32), scales: NativeTensor::from_mmap(cm.clone(), unsafe { vs.data().as_ptr().offset_from(cm.as_ptr()) } as usize, vs.shape().to_vec(), NativeDType::F16), bias: None }, device_id: dev_id })
-            } else {
-                let v = cst.tensor(&key)?; let o = unsafe { v.data().as_ptr().offset_from(cm.as_ptr()) } as usize;
-                Ok(NativeLinear { in_features: inf, out_features: outf, src_in: inf, src_out: outf, variant: LinearVariant::Standard { weight: NativeTensor::from_mmap(cm.clone(), o, v.shape().to_vec(), NativeDType::F16), bias: None }, device_id: dev_id })
-            }
-        };
-        let get_t = |name: &str, ts: usize| -> Result<NativeTensor> {
-            let (key, is_p) = find_key(name, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("TNotFound: {}", name))?;
-            let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
-            let v = cst.tensor(&key)?; if ts > v.data().len()/2 { let mut nd = Vec::with_capacity(ts*2); let sf = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const f16, v.data().len()/2) }; for _ in 0..(ts/(v.data().len()/2)) { for &val in sf { nd.extend_from_slice(&val.to_le_bytes()); } } let b = nd.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b); Ok(NativeTensor::from_raw(p as *const u8, ts*2, vec![ts], NativeDType::F16, dev_id)) }
-            else { Ok(NativeTensor::from_mmap(cm.clone(), unsafe { v.data().as_ptr().offset_from(cm.as_ptr()) } as usize, v.shape().to_vec(), NativeDType::F16)) }
-        };
-        let get_embed = |base: &str, vocab: usize, thid: usize| -> Result<NativeLinear> {
-            let (key, is_p) = find_key(base, &st, st_sec.as_ref()).ok_or_else(|| anyhow!("EmbedNotFound: {}", base))?;
-            let cst = if is_p { &st } else { st_sec.as_ref().unwrap() }; let cm = if is_p { &m_mmap } else { s_mmap.as_ref().unwrap() };
-            
-            // [FIX] Ensure we don't calculate insane sizes for embeddings
-            if cst.tensor(&format!("{}.packed", key)).is_ok() {
-                let vp = cst.tensor(&format!("{}.packed", key))?;
-                let vs = cst.tensor(&format!("{}.scales", key))?;
-                let format = cst.tensor(&format!("{}.format", key)).map(|t| t.data()[0] as i8).unwrap_or(1);
-                
-                // Safe dimension extraction
-                let (so, si) = (vocab, thid);
-                let dq = dequantize_bit_serial_to_f16(
-                    unsafe { std::slice::from_raw_parts(vp.data().as_ptr() as *const u32, vp.data().len()/4) },
-                    unsafe { std::slice::from_raw_parts(vs.data().as_ptr() as *const f16, vs.data().len()/2) },
-                    so, si, thid, if format == 4 { 4 } else { 1 }
-                );
-                let b = dq.into_boxed_slice(); let p = b.as_ptr(); std::mem::forget(b);
-                return Ok(NativeLinear { in_features: vocab, out_features: thid, src_in: thid, src_out: thid, variant: LinearVariant::Standard { weight: NativeTensor::from_raw(p as *const u8, vocab*thid*2, vec![vocab, thid], NativeDType::F16, dev_id), bias: None }, device_id: dev_id });
-            }
-            get_l(base, vocab, thid)
-        };
-        let emb = get_embed("model.language_model.embed_tokens.weight", 151936, t_c.hidden_size)?;
-        let mut layers = Vec::new(); for i in 0..(if baking { 1 } else { t_c.num_hidden_layers }) {
-            let p = format!("model.language_model.layers.{}", i);
-            layers.push(NativeLayer {
-                input_layernorm: get_t(&format!("{}.input_layernorm.weight", p), t_c.hidden_size)?, post_attention_layernorm: get_t(&format!("{}.post_attention_layernorm.weight", p), t_c.hidden_size)?, q_norm: get_t(&format!("{}.self_attn.q_norm.weight", p), t_c.hidden_size).ok(), k_norm: get_t(&format!("{}.self_attn.k_norm.weight", p), t_c.hidden_size).ok(),
-                q_proj: get_l(&format!("{}.self_attn.q_proj.weight", p), t_c.hidden_size, t_c.num_attention_heads*t_c.head_dim)?, k_proj: get_l(&format!("{}.self_attn.k_proj.weight", p), t_c.hidden_size, t_c.num_key_value_heads*t_c.head_dim)?, v_proj: get_l(&format!("{}.self_attn.v_proj.weight", p), t_c.hidden_size, t_c.num_key_value_heads*t_c.head_dim)?, o_proj: get_l(&format!("{}.self_attn.o_proj.weight", p), t_c.num_attention_heads*t_c.head_dim, t_c.hidden_size)?,
-                gate_proj: get_l(&format!("{}.mlp.gate_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?, up_proj: get_l(&format!("{}.mlp.up_proj.weight", p), t_c.hidden_size, t_c.intermediate_size)?, down_proj: get_l(&format!("{}.mlp.down_proj.weight", p), t_c.intermediate_size, t_c.hidden_size)?,
-                device_id: dev_id, is_support_layer: false, kv_cache: std::sync::Mutex::new(DynamicKVCache::new()), gpu_kv_cache: std::sync::Mutex::new(DynamicGpuKVCache::new()), gpu_broken: std::sync::atomic::AtomicBool::new(false),
-            });
-        }
-        let norm = match get_t("model.language_model.norm.weight", t_c.hidden_size) { Ok(t) => t, Err(_) => if baking { NativeTensor::from_raw(vec![0u8; t_c.hidden_size*2].as_ptr(), t_c.hidden_size*2, vec![t_c.hidden_size], NativeDType::F16, dev_id) } else { return Err(anyhow!("NormNotFound")); } };
-        let head = get_l("model.language_model.lm_head.weight", t_c.hidden_size, 151936).or_else(|_| get_l("model.language_model.embed_tokens.weight", t_c.hidden_size, 151936))?;
-        let mut model = Self {
-            config: config.clone(), text_model: NativeQwen3TextModel { config: t_c.clone(), embed_tokens: emb, layers, norm, 
-                // [2026-ROPE-RESTORE] Revert to native 5,000,000 for 2B-VL's long-context intelligence.
-                rope_cache: std::sync::Mutex::new(RopeCache::new(t_c.head_dim, 5000000.0, 32768)), 
-                rope_cache_gpu: std::sync::Mutex::new(None) 
-            },
-            lm_head: head, visual: None, support_layer0: None, support_workspace: std::sync::Mutex::new(ForwardWorkspace::new()), global_scratch_i: std::sync::Mutex::new(None), global_scratch_o: std::sync::Mutex::new(None), global_scratch_r: std::sync::Mutex::new(None), workspace: std::sync::Mutex::new(ForwardWorkspace::new()),
-            align_matrix,
-        };
         #[cfg(feature = "cuda")] if dev_id >= 0 { 
             log_vram_state("BEFORE-OFFLOAD"); let _ = model.move_to_gpu(dev_id); log_vram_state("AFTER-OFFLOAD");
             let pb = 2048 * t_c.hidden_size.max(t_c.intermediate_size) * 4; 
@@ -556,12 +484,9 @@ impl NativeQwen3VLModel {
     pub fn load_kv_stitched(&self, paths: &[std::path::PathBuf]) -> Result<usize> {
         let n_kv = self.text_model.config.num_key_value_heads; let h_d = self.text_model.config.head_dim;
         let mut expanded = Vec::new();
-        
-        // [SHARD-EXPANSION] Resolve base patterns into individual shard files
         for p in paths {
-            if p.exists() && p.is_file() {
-                expanded.push(p.clone());
-            } else {
+            if p.exists() && p.is_file() { expanded.push(p.clone()); } 
+            else {
                 let dir = p.parent().unwrap_or(std::path::Path::new("."));
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 if let Ok(entries) = std::fs::read_dir(dir) {
@@ -569,12 +494,8 @@ impl NativeQwen3VLModel {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                        // Match both exact name OR shard pattern
-                        if name.starts_with(stem) && name.ends_with(".safetensors") {
-                            shards.push(path);
-                        }
+                        if name.starts_with(stem) && name.ends_with(".safetensors") { shards.push(path); }
                     }
-                    // Crucial: Sort numerically (shard0, shard1, ..., shard11)
                     let re = Regex::new(r"shard(\d+)").unwrap();
                     shards.sort_by_key(|p| {
                         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -584,36 +505,22 @@ impl NativeQwen3VLModel {
                 }
             }
         }
-        
-        // Remove duplicates just in case
         expanded.dedup();
-        
         let mut total_t = 0; let mut metadatas = Vec::new(); let mut mmaps = Vec::new();
         for path in &expanded {
-            println!("[DIAG-KV] Attempting to open memory shard: {:?}", path);
             let file = std::fs::File::open(path)?; 
             let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
             let tokens = { 
                 let st = SafeTensors::deserialize(&mmap)?; 
-                if let Ok(kt) = st.tensor("layer.0.k") {
-                    let t = kt.data().len() / (n_kv * (h_d/32) * 4);
-                    println!("[DIAG-KV] Shard loaded: {} tokens", t);
-                    t
-                } else { 0 }
+                if let Ok(kt) = st.tensor("layer.0.k") { kt.data().len() / (n_kv * (h_d/32) * 4) } else { 0 }
             };
             if tokens > 0 { total_t += tokens; metadatas.push(tokens); mmaps.push(mmap); }
         }
-        
-        // [QUALITY-GUARD] Enforce 500 token minimum for meaningful analysis
-        if total_t < 500 {
-            println!("[KV-ERROR] Context too small ({} tokens). Minimum 500 required.", total_t);
-            return Err(anyhow!("Insufficient context tokens: {}. Expected at least 500.", total_t));
-        }
+        if total_t < 500 { return Err(anyhow!("Insufficient context tokens: {}", total_t)); }
 
         for l_idx in 0..self.text_model.layers.len() {
             let layer = &self.text_model.layers[l_idx]; let mut gpu_kv = layer.gpu_kv_cache.lock().unwrap();
             let target_dim = self.text_model.config.hidden_size;
-            
             #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { gpu_kv.grow(total_t, n_kv, h_d, self.lm_head.device_id); }
             let mut curr_o = 0;
             for (p_idx, mmap) in mmaps.iter().enumerate() {
@@ -623,24 +530,15 @@ impl NativeQwen3VLModel {
                 if let (Ok(kt), Ok(vt)) = (st.tensor(&format!("layer.{}.k", si)), st.tensor(&format!("layer.{}.v", si))) {
                     let mut k_data: Vec<u32> = kt.data().chunks_exact(4).map(|c| u32::from_ne_bytes(c.try_into().unwrap())).collect();
                     let mut v_data: Vec<f16> = vt.data().chunks_exact(2).map(|c| f16::from_ne_bytes(c.try_into().unwrap())).collect();
-                    
                     let actual_source_dim = if k_data.len() > 0 && v_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
-                    
-                    // [2026-SEMANTIC-ALIGNMENT] Project 0.6B memories into 2B space
                     if let Some(ref align) = self.align_matrix {
                         if target_dim > actual_source_dim && actual_source_dim == align.in_features {
                             v_data = align.forward(&v_data, None);
                             let mut k_f16 = Vec::with_capacity(k_data.len() * 32);
-                            for &packed in &k_data {
-                                for b in 0..32 {
-                                    k_f16.push(if (packed >> b) & 1 == 1 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) });
-                                }
-                            }
-                            let k_projected = align.forward(&k_f16, None);
-                            k_data = pack_f16_to_bits(&k_projected);
+                            for &packed in &k_data { for b in 0..32 { k_f16.push(if (packed >> b) & 1 == 1 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) }); } }
+                            let k_projected = align.forward(&k_f16, None); k_data = pack_f16_to_bits(&k_projected);
                         }
                     }
-
                     #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { unsafe {
                         let cl = crate::models::qwen3vl::native_backend::lib();
                         if let Some(kp) = gpu_kv.k_ptr { let _ = cl.cuMemcpyHtoD_v2((kp.0 as u64 + (curr_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr, k_data.as_ptr() as *const _, k_data.len() * 4); }
@@ -650,16 +548,10 @@ impl NativeQwen3VLModel {
                 curr_o += tip;
             }
             gpu_kv.current_len = total_t;
-            
-            // [STABILITY] Gain Correction (0.50x) to neutralize energy boost from 0.6B->2B dimension expansion
             #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 {
                 unsafe {
-                    if let Some(kp) = gpu_kv.k_ptr { 
-                        crate::models::qwen3vl::native_backend::native_cuda_apply_gain(kp.0 as CUdeviceptr, 0.50, (total_t * n_kv * (h_d/32)) as usize); 
-                    }
-                    if let Some(vp) = gpu_kv.v_ptr { 
-                        crate::models::qwen3vl::native_backend::native_cuda_apply_gain(vp.0 as CUdeviceptr, 0.50, (total_t * n_kv * h_d) as usize); 
-                    }
+                    if let Some(kp) = gpu_kv.k_ptr { crate::models::qwen3vl::native_backend::native_cuda_apply_gain(kp.0 as CUdeviceptr, 0.50, (total_t * n_kv * (h_d/32)) as usize); }
+                    if let Some(vp) = gpu_kv.v_ptr { crate::models::qwen3vl::native_backend::native_cuda_apply_gain(vp.0 as CUdeviceptr, 0.50, (total_t * n_kv * h_d) as usize); }
                 }
             }
         }
@@ -676,7 +568,6 @@ impl NativeQwen3VLModel {
             let hid = self.text_model.config.hidden_size; let mut vidx = 0;
             for (i, &id) in i_ids.iter().enumerate() { if id == 151655 && vidx < (vf.len()/hid) { fe[i*hid..(i+1)*hid].copy_from_slice(&vf[vidx*hid..(vidx+1)*hid]); vidx += 1; } }
         } }
-        log_vram_state("IN-FORWARD");
         let nx = self.text_model.forward_ext(i_ids, fe, so, sc, Some(&mut wl), None, pv.is_some());
         if is_b { return vec![]; }
         self.lm_head.forward(&nx, sc)
