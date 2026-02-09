@@ -162,7 +162,9 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
         if is_vision != ("visual" in name): continue
 
         is_weight = "weight" in name and len(param.shape) == 2
-        should_quantize = is_weight and "norm" not in name and "ln" not in name
+        # [2026-LANGUAGE-GUARD] Keep LM Head in FP16 to preserve vocabulary nuances
+        is_lm_head = "lm_head" in new_name
+        should_quantize = is_weight and "norm" not in name and "ln" not in name and not is_lm_head
 
         if should_quantize:
             # [2026-STRATEGIC-HYBRID] Protect Intelligence with 4-bit Attention

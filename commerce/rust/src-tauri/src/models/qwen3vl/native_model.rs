@@ -146,6 +146,53 @@ impl NativeLinear {
     pub fn forward(&self, x: &[f16], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f16> {
         let mut out = vec![f16::ZERO; (x.len() / self.in_features) * self.out_features]; self.forward_into(x, &mut out, gs); out
     }
+    
+    // [2026-PRECISION-RESTORE] High-precision F32 forward for LM Head and Alignment
+    pub fn forward_f32(&self, x: &[f32], gs: Option<(&std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>, &std::sync::Mutex<Option<(GpuPtr, usize)>>)>) -> Vec<f32> {
+        let m = x.len() / self.in_features;
+        let mut out = vec![0.0f32; m * self.out_features];
+        
+        match &self.variant {
+            LinearVariant::Standard { weight, bias } => {
+                #[cfg(feature = "cuda")] if self.device_id >= 0 {
+                    if let (Some(w_gpu), Some((si, so, _))) = (weight.gpu_ptr, gs) {
+                        let di = si.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr).unwrap_or(0);
+                        let dog = so.lock().unwrap().as_ref().map(|(p, _)| p.0 as CUdeviceptr).unwrap_or(0);
+                        let dbg = bias.as_ref().and_then(|b| b.gpu_ptr).map(|p| p.0 as *const f32).unwrap_or(std::ptr::null());
+                        
+                        if di != 0 && dog != 0 { unsafe {
+                            let cl = crate::models::qwen3vl::native_backend::lib();
+                            let _ = cl.cuMemcpyHtoD_v2(di, x.as_ptr() as *const _, x.len() * 4);
+                            crate::models::qwen3vl::native_backend::high_precision_matmul_f32_bias(di as *const f32, w_gpu.0 as *const f32, dbg, dog as *mut f32, m as i32, self.out_features as i32, self.in_features as i32);
+                            let _ = cl.cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut _, dog, out.len() * 4);
+                            return out;
+                        } }
+                    }
+                }
+                
+                let w_raw = weight.get_slice::<f32>();
+                let b_raw = bias.as_ref().map(|b| b.get_slice::<f32>());
+                for i in 0..m {
+                    for j in 0..self.out_features {
+                        let mut sum = 0.0f32;
+                        for k in 0..self.in_features {
+                            sum += x[i * self.in_features + k] * w_raw[j * self.in_features + k];
+                        }
+                        if let Some(ref b) = b_raw { sum += b[j]; }
+                        out[i * self.out_features + j] = sum;
+                    }
+                }
+            },
+            LinearVariant::BitSerial { weight_packed, scales, bias } => {
+                let mut out_f16 = vec![f16::ZERO; out.len()];
+                let x_f16: Vec<f16> = x.iter().map(|&v| f16::from_f32(v)).collect();
+                bit_serial_matmul_f32_extreme_into(&x_f16, weight_packed.get_slice::<u32>().as_ref(), scales.get_slice::<f16>().as_ref(), &mut out_f16, m, self.out_features, self.in_features);
+                for i in 0..out.len() { out[i] = out_f16[i].to_f32(); }
+                if let Some(b) = bias { let br = unsafe { b.get_raw_slice::<f16>() }; for i in 0..m { for j in 0..self.out_features { out[i * self.out_features + j] += br[j].to_f32(); } } }
+            }
+        }
+        out
+    }
     #[cfg(feature = "cuda")]
     pub fn forward_gpu(&self, di: CUdeviceptr, dog: CUdeviceptr, m: usize) {
         unsafe { match &self.variant {
@@ -358,25 +405,27 @@ impl NativeQwen3TextModel {
             unsafe { std::ptr::copy_nonoverlapping(stabilized_out.as_ptr(), target_ptr, stabilized_out.len()); }
             cur_x = unsafe { std::slice::from_raw_parts(target_ptr, stabilized_out.len()) };
         }
-        let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()]; 
-        native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
+        let n_w = self.norm.get_slice::<f16>(); 
+        let mut cn_f32 = vec![0.0f32; cur_x.len()]; 
         
-        // [2026-FINAL-ADAPTIVE-V2] Dynamic energy control for LM Head
-        for chunk in cn.chunks_exact_mut(hid) {
+        // [2026-FINAL-PRECISION] High-precision RMS Norm in F32
+        for (t_idx, chunk) in cur_x.chunks_exact(hid).enumerate() {
             let mut sum_sq = 0.0f32;
-            for v in chunk.iter() { let f = v.to_f32(); sum_sq += f * f; }
-            let rms = (sum_sq / hid as f32).sqrt().max(1e-5);
-            let scale = (0.22 / rms).clamp(0.01, 2.0); 
-            
-            for v in chunk.iter_mut() {
-                let mut f = v.to_f32() * scale;
-                if f > 4.0 { f = 4.0; } if f < -4.0 { f = -4.0; }
-                *v = f16::from_f32(f);
+            for &v in chunk { let f = v.to_f32(); sum_sq += f * f; }
+            let inv_rms = 1.0 / (sum_sq / hid as f32 + self.config.rms_norm_eps as f32).sqrt();
+            for (i, &v) in chunk.iter().enumerate() {
+                cn_f32[t_idx * hid + i] = v.to_f32() * inv_rms * n_w[i].to_f32();
             }
         }
+        
+        // Final energy control
+        for v in cn_f32.iter_mut() {
+            let f = *v * 0.22;
+            *v = if f > 4.0 { 4.0 } else if f < -4.0 { -4.0 } else { f };
+        }
 
-        if q_len > 1 { log_tensor_health("Final Norm Output (Adaptive)", &cn, &[q_len, hid]); }
-        cn
+        if q_len > 1 { log_tensor_health("Final Norm Output (F32-Adaptive)", unsafe { std::slice::from_raw_parts(cn_f32.as_ptr() as *const f16, 0) }, &[q_len, hid]); }
+        cn_f32.into_iter().map(|v| f16::from_f32(v)).collect()
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.embed_tokens.move_to_gpu(dev)?; self.norm.move_to_gpu(dev)?; for l in &mut self.layers { l.move_to_gpu(dev)?; } Ok(()) }
     pub fn force_free_kv_cache(&self) { for l in &self.layers { l.kv_cache.lock().unwrap().k = Vec::new(); l.kv_cache.lock().unwrap().v = Vec::new(); } }
@@ -614,7 +663,16 @@ impl NativeQwen3VLModel {
         } }
         let nx = self.text_model.forward_ext(i_ids, fe, so, sc, Some(&mut wl), None, pv.is_some());
         if is_b { return vec![]; }
-        self.lm_head.forward(&nx, sc)
+        
+        // [2026-LOGIT-SHARPENING] Recover confidence in the LM Head
+        let nx_f32: Vec<f32> = nx.iter().map(|v| v.to_f32()).collect();
+        let raw_logits = self.lm_head.forward_f32(&nx_f32, sc);
+        
+        // Apply Sharpening: Boost the contrast of the distribution
+        raw_logits.into_iter().map(|v| {
+            let sharpened = v * 1.15; // 15% boost to separation
+            f16::from_f32(sharpened)
+        }).collect()
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.text_model.move_to_gpu(dev)?; self.lm_head.move_to_gpu(dev)?; if let Some(ref mut v) = self.visual { v.move_to_gpu(dev)?; } Ok(()) }
 }

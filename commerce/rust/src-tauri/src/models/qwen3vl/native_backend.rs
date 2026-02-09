@@ -65,6 +65,12 @@ extern "C" {
     #[link_name = "standard_matmul_cuda_f16"]
     pub fn standard_matmul_cuda_f16(d_i: *const f16, d_w: *const f16, d_o: *mut f16, m: i32, n: i32, k: i32);
 
+    #[link_name = "high_precision_matmul_f32_bias"]
+    pub fn high_precision_matmul_f32_bias(d_i: *const f32, d_w: *const f32, d_b: *const f32, d_o: *mut f32, m: i32, n: i32, k: i32);
+
+    #[link_name = "cuda_logit_sharpening_f32"]
+    pub fn cuda_logit_sharpening_f32(d_logits: *mut f32, factor: f32, size: i32);
+
     #[link_name = "cuda_rms_norm_f16"]
     pub fn cuda_rms_norm_f16(d_i: *const f16, d_w: *const f16, d_o: *mut f16, m: i32, hid: i32, eps: f32);
 

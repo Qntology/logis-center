@@ -130,7 +130,9 @@ __global__ void bit_serial_matmul_kernel_4bit_f16(
 
         if (m < M && n < N) {
             int base_idx = n_group * K_blocks * 8 + kb * 8 + n_sub;
-            float s_val = __half2float(scale[n]); // [FIX] Dynamic scale fetch per output channel
+            
+            // [2026-BLOCK-WISE-4BIT] Fetch precise scale for this specific 32-weight block
+            float s_val = __half2float(scale[base_idx]); 
             
             float slice_acc_sum = 0.0f;
             #pragma unroll
@@ -433,5 +435,34 @@ extern "C" {
 
     void cuda_element_mul_f16(half* d_dst, const half* d_src, int size) {
         element_mul_kernel_f16<<<(size + 255)/256, 256>>>(d_dst, d_src, size);
+    }
+
+    // [2026-F32-PRECISION-RESTORE]
+    void high_precision_matmul_f32_bias(const float* d_i, const float* d_w, const float* d_b, float* d_o, int m, int n, int k) {
+        // Simple but high-precision F32 matmul for alignment adapter and LM Head
+        dim3 block(16, 16);
+        dim3 grid((n + 15) / 16, (m + 15) / 16);
+        // Using a standard high-precision implementation
+        [] __device__ (const float* A, const float* B, const float* Bias, float* C, int M, int N, int K) {
+            int row = blockIdx.y * blockDim.y + threadIdx.y;
+            int col = blockIdx.x * blockDim.x + threadIdx.x;
+            if (row < M && col < N) {
+                float acc = 0.0f;
+                for (int i = 0; i < K; ++i) {
+                    acc += A[row * K + i] * B[col * K + i];
+                }
+                if (Bias) acc += Bias[col];
+                C[row * N + col] = acc;
+            }
+        }(d_i, d_w, d_b, d_o, m, n, k);
+    }
+
+    // [2026-LOGIT-SHARPENING]
+    void cuda_logit_sharpening_f32(float* d_logits, float factor, int size) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < size) {
+            // Apply a contrast-enhancing non-linear boost
+            d_logits[idx] *= factor;
+        }
     }
 }
