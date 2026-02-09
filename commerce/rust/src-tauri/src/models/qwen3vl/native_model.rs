@@ -311,10 +311,37 @@ impl NativeQwen3TextModel {
         let rg = self.rope_cache.lock().unwrap();
         for (i, layer) in self.layers.iter().enumerate() {
             let out = layer.forward(cur_x, &self.config, s_o, i, &rg.cos, &rg.sin, false, is_vision, gs, ws, i % 2 == 0, &self.rope_cache_gpu);
-            if q_len > 1 && (i == 0 || i == self.layers.len() - 1) { 
-                log_tensor_health(&format!("Layer {} Output", i), out, &[q_len, hid]); 
+            
+            // [2026-STABILITY-DAM-V2] Refined Adaptive Signal Control
+            let mut stabilized_out = out.to_vec();
+            let num_layers = self.layers.len();
+            
+            if i == 0 && num_layers > 1 {
+                // Layer 0 (4-bit) -> Layer 1 (1-bit): Use 0.45x Dampen for better signal
+                for v in stabilized_out.iter_mut() {
+                    let mut f = v.to_f32() * 0.45;
+                    if f > 16.0 { f = 16.0; } if f < -16.0 { f = -16.0; }
+                    *v = f16::from_f32(f);
+                }
+            } else if i > 0 {
+                // Progressive Clamping: Allow more variance in deeper layers
+                let clamp_range = 16.0 + (i as f32 / num_layers as f32) * 8.0; 
+                for v in stabilized_out.iter_mut() {
+                    let mut f = v.to_f32();
+                    if f > clamp_range { f = clamp_range; } if f < -clamp_range { f = -clamp_range; }
+                    *v = f16::from_f32(f);
+                }
             }
-            cur_x = unsafe { std::slice::from_raw_parts(out.as_ptr(), out.len()) };
+
+            if q_len > 1 && (i == 0 || i == num_layers - 1) { 
+                log_tensor_health(&format!("Layer {} Output (Stabilized-V2)", i), &stabilized_out, &[q_len, hid]); 
+            }
+            
+            // Since we created a new Vec for stabilization, we need to manage its lifetime.
+            // For efficiency, we copy it back to the workspace buffer.
+            let target_ptr = if i % 2 == 0 { ws.hidden_b.as_mut_ptr() } else { ws.hidden_a.as_mut_ptr() };
+            unsafe { std::ptr::copy_nonoverlapping(stabilized_out.as_ptr(), target_ptr, stabilized_out.len()); }
+            cur_x = unsafe { std::slice::from_raw_parts(target_ptr, stabilized_out.len()) };
         }
         let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()]; native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
         if q_len > 1 { log_tensor_health("Final Norm Output", &cn, &[q_len, hid]); }
@@ -512,15 +539,14 @@ impl NativeQwen3VLModel {
             }
             gpu_kv.current_len = total_t;
             
-            // [STABILITY] Gain Correction (0.707x) to neutralize energy boost from 0.6B->2B dimension expansion
+            // [STABILITY] Gain Correction (0.50x) to neutralize energy boost from 0.6B->2B dimension expansion
             #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 {
                 unsafe {
-                    use crate::models::qwen3vl::native_backend::native_cuda_apply_gain;
                     if let Some(kp) = gpu_kv.k_ptr { 
-                        native_cuda_apply_gain(kp.0 as CUdeviceptr, 0.7071, (total_t * n_kv * (h_d/32)) as usize); 
+                        crate::models::qwen3vl::native_backend::native_cuda_apply_gain(kp.0 as CUdeviceptr, 0.50, (total_t * n_kv * (h_d/32)) as usize); 
                     }
                     if let Some(vp) = gpu_kv.v_ptr { 
-                        native_cuda_apply_gain(vp.0 as CUdeviceptr, 0.7071, (total_t * n_kv * h_d) as usize); 
+                        crate::models::qwen3vl::native_backend::native_cuda_apply_gain(vp.0 as CUdeviceptr, 0.50, (total_t * n_kv * h_d) as usize); 
                     }
                 }
             }

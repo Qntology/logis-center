@@ -631,41 +631,43 @@ impl Qwen3VLGenerateModel {
 
         for (i, (k, v)) in kvs.into_iter().enumerate() {
             let (final_k, final_v) = if needs_upscale {
-                // Upscale Logic: 0.6B (HeadDim 64) -> 2B (HeadDim 128)
-                // Assumption: num_heads and num_kv_heads are consistent (16), only head_dim doubles.
-                // K-Cache (u32 packed): 64/32=2 u32s -> 128/32=4 u32s (Pad 2 zeros)
-                // V-Cache (f16): 64 f16s -> 128 f16s (Pad 64 zeros)
+                // [2026-STITCHING-FIX] Implement 'Head Repeating' Strategy
+                // 0.6B has smaller head_dim or hidden_size. 2B expects full 128 dim across 8 heads (1024).
+                // To avoid 'Head Starvation' (zeros in heads), we repeat the 0.6B KV data.
                 
-                let num_kv_heads = 16; // Standard for Qwen2-VL family
-                let src_head_dim_k = 2; // 64 / 32
-                let dst_head_dim_k = 4; // 128 / 32
-                let src_head_dim_v = 64;
-                let dst_head_dim_v = 128;
-
-                let token_count = k.len() / (num_kv_heads * src_head_dim_k);
+                let n_kv = match &self.qwen3_vl { ModelVariant::Native(m) => m.text_model.config.num_key_value_heads };
+                let h_d = match &self.qwen3_vl { ModelVariant::Native(m) => m.text_model.config.head_dim }; // Usually 128
                 
-                let mut new_k = Vec::with_capacity(token_count * num_kv_heads * dst_head_dim_k);
-                let mut new_v = Vec::with_capacity(token_count * num_kv_heads * dst_head_dim_v);
+                // Let's calculate actual source dimensions from the data
+                let total_elements_k = k.len();
+                let total_elements_v = v.len();
+                let token_count = total_elements_v / (n_kv * h_d / 2); // Assume source is half dim
+                
+                let src_h_d_v = h_d / 2; // 64
+                let src_h_d_k = src_h_d_v / 32; // 2 u32s
+                
+                let mut new_k = Vec::with_capacity(token_count * n_kv * (h_d / 32));
+                let mut new_v = Vec::with_capacity(token_count * n_kv * h_d);
 
-                // Transform K
-                for t in 0..token_count {
-                    for h in 0..num_kv_heads {
-                        let src_start = (t * num_kv_heads + h) * src_head_dim_k;
-                        // [OPTIMIZATION] Zero Padding 대신 2번 반복(Repeat)하여 신호 강도 유지
-                        let chunk = &k[src_start..src_start + src_head_dim_k];
-                        new_k.extend_from_slice(chunk);
-                        new_k.extend_from_slice(chunk); // Repeat once more to reach dst_head_dim_k (4 u32s)
-                    }
-                }
+                let gain = f16::from_f32(0.7071); // Energy normalization for repetition
 
-                // Transform V
                 for t in 0..token_count {
-                    for h in 0..num_kv_heads {
-                        let src_start = (t * num_kv_heads + h) * src_head_dim_v;
-                        // [OPTIMIZATION] Zero Padding 대신 2번 반복(Repeat)
-                        let chunk = &v[src_start..src_start + src_head_dim_v];
-                        new_v.extend_from_slice(chunk);
-                        new_v.extend_from_slice(chunk); // Repeat once more to reach dst_head_dim_v (128 f16s)
+                    for h in 0..n_kv {
+                        // Repeat K
+                        let k_start = (t * n_kv + h) * src_h_d_k;
+                        if k_start + src_h_d_k <= k.len() {
+                            let chunk = &k[k_start..k_start + src_h_d_k];
+                            new_k.extend_from_slice(chunk);
+                            new_k.extend_from_slice(chunk); // Repeat to fill 128 dim
+                        }
+                        
+                        // Repeat V with Gain
+                        let v_start = (t * n_kv + h) * src_h_d_v;
+                        if v_start + src_h_d_v <= v.len() {
+                            let chunk = &v[v_start..v_start + src_h_d_v];
+                            for &val in chunk { new_v.push(val * gain); }
+                            for &val in chunk { new_v.push(val * gain); } // Repeat to fill 128 dim
+                        }
                     }
                 }
                 (new_k, new_v)
