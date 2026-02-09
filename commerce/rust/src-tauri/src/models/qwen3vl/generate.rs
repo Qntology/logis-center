@@ -413,19 +413,27 @@ impl Qwen3VLGenerateModel {
                     if m_next == d_id {
                         accepted_count += 1;
                         current_all_ids.push(d_id);
-                        let word = self.tokenizer.token_decode(vec![d_id])?;
-                        generated_text.push_str(&word);
+                        
+                        // [FIX-ENCODING-SPEC]
+                        let full_generated_ids = current_all_ids[all_ids.len()..].to_vec();
+                        if let Ok(new_text) = self.tokenizer.tokenizer.decode(&full_generated_ids, true) {
+                            generated_text = new_text;
+                        }
+                        println!("[모델 답변 중(투기)] -> {}", generated_text.replace("\n", " "));
+
                         current_kv_offset += 1;
                         current_idx += 1;
-                        
-                        if current_idx % 10 == 0 {
-                            println!("[GENERATE-SPEC] Accepted: '{}' (Step {})", word.replace("\n", "\\n"), current_idx);
-                        }
                     } else {
                         // Main model disagreed. Take main model's token and stop speculation for this round.
                         current_all_ids.push(m_next);
-                        let word = self.tokenizer.token_decode(vec![m_next])?;
-                        generated_text.push_str(&word);
+                        
+                        // [FIX-ENCODING-SPEC]
+                        let full_generated_ids = current_all_ids[all_ids.len()..].to_vec();
+                        if let Ok(new_text) = self.tokenizer.tokenizer.decode(&full_generated_ids, true) {
+                            generated_text = new_text;
+                        }
+                        println!("[모델 답변 중(투기-수정)] -> {}", generated_text.replace("\n", " "));
+
                         current_kv_offset += 1;
                         current_idx += 1;
                         break; 
@@ -454,8 +462,19 @@ impl Qwen3VLGenerateModel {
                 }
                 
                 current_all_ids.push(next_id);
-                let new_word = self.tokenizer.token_decode(vec![next_id])?;
-                generated_text.push_str(&new_word);
+                
+                // [FIX-ENCODING] Decode the entire generated sequence to handle partial UTF-8 bytes correctly
+                let full_generated_ids = current_all_ids[all_ids.len()..].to_vec();
+                if let Ok(new_text) = self.tokenizer.tokenizer.decode(&full_generated_ids, true) {
+                    generated_text = new_text;
+                }
+                
+                // [READABILITY-GEN] Show the full sentence building in real-time with hex check
+                if current_idx % 5 == 0 {
+                    let bytes = generated_text.as_bytes();
+                    println!("[인코딩 체크] 바이트 길이: {}, 시작 4바이트 Hex: {:02X?}", bytes.len(), &bytes[..bytes.len().min(4)]);
+                }
+                println!("[모델 답변 중] -> {}", generated_text.replace("\n", " "));
                 
                 current_kv_offset += 1;
                 current_idx += 1;
