@@ -141,27 +141,16 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
 
         is_weight = "weight" in name and len(param.shape) == 2
         should_quantize = is_weight and "norm" not in name and "ln" not in name
-        
-        # [CRITICAL] IO Layers use 4-bit Sliced (Format 4), Others use 1-bit Shuffled (Format 1)
-        is_io_layer = "embed_tokens" in new_name or "lm_head" in new_name
 
         if should_quantize:
-            if is_io_layer:
-                packed, scale, shape = quantize_tensor_4bit_sliced(param)
-                final_dict.update({
-                    f"{new_name}.packed": packed,
-                    f"{new_name}.scales": scale.to(torch.float16), # N scales
-                    f"{new_name}.shape": shape,
-                    f"{new_name}.format": torch.tensor([4], dtype=torch.int8) 
-                })
-            else:
-                packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
-                final_dict.update({
-                    f"{new_name}.packed": packed,
-                    f"{new_name}.scales": scales,
-                    f"{new_name}.shape": shape,
-                    f"{new_name}.format": torch.tensor([1], dtype=torch.int8) 
-                })
+            # [FULL 1-BIT] All layers use bit-serial shuffled quantization (Format 1)
+            packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
+            final_dict.update({
+                f"{new_name}.packed": packed,
+                f"{new_name}.scales": scales,
+                f"{new_name}.shape": shape,
+                f"{new_name}.format": torch.tensor([1], dtype=torch.int8) 
+            })
         else:
             final_dict[new_name] = param.to(torch.float16)
 

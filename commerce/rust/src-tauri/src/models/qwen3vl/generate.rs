@@ -523,9 +523,19 @@ impl Qwen3VLGenerateModel {
     /// [SHARDED-BAKING] Context-aware splitting - Save to multiple shards for VRAM safety
     pub fn bake_text_in_parts_to_path(&mut self, text: String, final_path: &Path, _suffix: &str, initial_offset: usize, cancel_flag: Option<Arc<AtomicBool>>) -> Result<()> {
         let sample = if text.len() > 100 { &text[..100] } else { &text };
+        
+        // [DIAGNOSTIC] Log raw bytes of the input text to catch encoding corruption
+        let raw_bytes = sample.as_bytes();
+        println!("[BAKE-ENCODING-CHECK] Raw Sample Hex: {:02X?}", &raw_bytes[..raw_bytes.len().min(64)]);
         println!("[BAKE-SHARDED] Baking Sample: '{}...'", sample.replace("\n", " "));
         
         let all_ids = self.tokenizer.tokenizer.encode(text, true).map_err(|e| anyhow!(e))?.get_ids().to_vec();
+        
+        // [READABILITY-PREVIEW] Decode and show what the model is actually "reading"
+        if let Ok(preview_text) = self.tokenizer.token_decode(all_ids[..all_ids.len().min(50)].to_vec()) {
+            println!("\n[모델 읽기 시작] 분석 중인 내용 미리보기:\n--------------------------------------------------\n{}\n--------------------------------------------------\n", preview_text.replace("\n", " "));
+        }
+        
         let total_tokens = all_ids.len();
         let chunk_size = self.max_chunk_size; // 512
         let shard_size = 2048; // [NEW] Save a new safetensors file every 2048 tokens
