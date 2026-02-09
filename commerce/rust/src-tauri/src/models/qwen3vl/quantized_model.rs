@@ -943,20 +943,10 @@ impl QuantizedQwen3VLTextModel {
             println!("[MODEL-FIX] 0.6B detected. Using 1024 hidden size for internal consistency.");
             let mut patched_config = config.clone();
             patched_config.hidden_size = 1024;
-            // Also patch heads if needed (Qwen3-0.6B is usually 8 heads)
             if patched_config.num_attention_heads == 16 { patched_config.num_attention_heads = 8; }
-            if patched_config.num_key_value_heads == 8 { patched_config.num_key_value_heads = 8; } // Consistent
             
             let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&patched_config, ct, mmap_handle.clone(), "model", device, device_id, dtype, kv_reserve, baking_only, is_text, is_image)?;
-            let lm_head = if !baking_only {
-                let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
-                let mut reader = std::io::Cursor::new(mmap);
-                let head_dtype = if device.is_cpu() { DType::F32 } else { dtype };
-                if let Ok(l) = get_qlinear(ct, &mut reader, "lm_head", device, head_dtype) { Some(l) }
-                else if let Ok(l) = get_qlinear(ct, &mut reader, "output", device, head_dtype) { Some(l) }
-                else { get_qlinear(ct, &mut reader, "token_embd", device, head_dtype).ok() }
-            } else { None };
-            return Ok(Self { language_model, lm_head, text_device: device.clone(), mmap: mmap_handle, is_text, is_image });
+            return Ok(language_model);
         }
 
         let nvml = Nvml::init().ok();
