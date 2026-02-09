@@ -963,9 +963,9 @@ impl QuantizedQwen3VLTextModel {
              let h = tensor.dim(1)?;
              Embedding::new(tensor, h)
         } else {
-             println!("[HYBRID] Embedding not found in GGUF. Using config size: {}", config.hidden_size);
-             let dummy_tensor = Tensor::zeros((config.vocab_size, config.hidden_size), dtype, device)?;
-             Embedding::new(dummy_tensor, config.hidden_size)
+             println!("[HYBRID] Embedding not found in GGUF. Creating dummy with size: {}", actual_h_size);
+             let dummy_tensor = Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?;
+             Embedding::new(dummy_tensor, actual_h_size)
         };
 
         let nvml = Nvml::init().ok();
