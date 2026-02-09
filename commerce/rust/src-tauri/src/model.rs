@@ -215,10 +215,19 @@ impl LogisModel {
             }).await;
         }
 
-        // 1. Clear Active Slots
-        if let Ok(mut gen) = self.generator.try_lock() { *gen = None; }
-        if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
-        if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
+        // 1. Clear Active Slots (Forced wait for lock to ensure reclamation)
+        {
+            let mut gen = self.generator.lock().await;
+            *gen = None;
+        }
+        {
+            let mut s_hib = self.small_hibernation.lock().await;
+            *s_hib = None;
+        }
+        {
+            let mut l_hib = self.large_hibernation.lock().await;
+            *l_hib = None;
+        }
         
         // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]
@@ -329,7 +338,7 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                let path = crate::utils::paths::get_kv_dir(None).join(task_id_str);
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
                 gen.save_kv_to_disk(&path)?;
                 Ok(path.to_string_lossy().to_string())
@@ -346,7 +355,7 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+                let path = crate::utils::paths::get_kv_dir(None).join(task_id_str);
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
                     gen.load_kv_from_disk(&path)?;
