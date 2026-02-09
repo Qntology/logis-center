@@ -266,11 +266,12 @@ impl Qwen3VLGenerateModel {
                 } else { None }
             }).unwrap_or_default();
 
-            let combined_task = if !user_content.is_empty() { user_content } else { system_content };
+            let combined_task = if !user_content.is_empty() { user_content } else { system_content.clone() };
             
-            // [2026-INSTRUCTION-BOOST] Use explicit chat markers to override massive HTML context
-            let raw_prompt = format!("<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n", combined_task);
-            println!("[{}-RAW] Constructing boosted prompt ({} chars) for stitched context.", tag, raw_prompt.len());
+            // [2026-INSTRUCTION-SYNC] Reinforce the system role right before generation.
+            // This ensures the 2B model acts on its instruction-following logic.
+            let raw_prompt = format!("<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\nAnalyze the context and follow the instructions above.\n<|im_end|>\n<|im_start|>assistant\n", system_content);
+            println!("[{}-REINFORCE] Re-anchoring 2B logic with system prompt.", tag);
             self.tokenizer.text_encode_vec(raw_prompt, false)?
         } else {
             let mes_render = self.chat_template.apply_chat_template(&mes)?;
@@ -417,7 +418,7 @@ impl Qwen3VLGenerateModel {
                     
                     // Actually, let's just accept the first draft token if verified
                     // and continue. This is "Lazy Speculation".
-                    let m_next = self.sample_with_temperature(&verify_logits, 0.7); 
+                    let m_next = self.sample_with_temperature(&verify_logits, 0.7, &current_all_ids); 
                     if m_next == d_id {
                         accepted_count += 1;
                         current_all_ids.push(d_id);
@@ -457,7 +458,10 @@ impl Qwen3VLGenerateModel {
                 };
 
                 let logits = self.qwen3_vl.forward(&input_ids, pixels, grid, current_kv_offset);
-                let next_id = self.sample_with_temperature(&logits, 0.7);
+                
+                // [2026-DYNAMIC-TEMP] Higher flexibility at start, higher certainty later
+                let current_temp = if current_idx < 20 { 0.7 } else { 0.4 };
+                let next_id = self.sample_with_temperature(&logits, current_temp, &current_all_ids); 
                 
                 if current_idx < 10 || current_idx % 20 == 0 {
                     let decoded = self.tokenizer.token_decode(vec![next_id]).unwrap_or_default();
@@ -843,19 +847,44 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-    fn sample_with_temperature(&self, logits: &[f16], temperature: f32) -> u32 {
+    fn sample_with_temperature(&self, logits: &[f16], temperature: f32, recent_ids: &[u32]) -> u32 {
         let vocab_size = 151936;
         if logits.len() < vocab_size { return 0; }
         let last_logits = &logits[logits.len() - vocab_size ..];
         
+        let mut scores: Vec<f32> = last_logits.iter().map(|&v| v.to_f32()).collect();
+
+        // [2026-LANGUAGE-PENALTY] Repetition Penalty (Ollama Default: 1.1)
+        for &id in recent_ids {
+            let idx = id as usize;
+            if idx < scores.len() {
+                if scores[idx] > 0.0 { scores[idx] /= 1.1; }
+                else { scores[idx] *= 1.1; }
+            }
+        }
+
+        // [2026-MIN-P-SAMPLING] Filter out mathematical noise (Ollama/GGUF Best Practice)
+        // 1. Find max logit
+        let max_logit = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
+        // 2. Convert to probabilities (approx)
+        let mut probs: Vec<f32> = scores.iter().map(|&s| (s - max_logit).exp()).collect();
+        let sum_prob: f32 = probs.iter().sum();
+        for p in probs.iter_mut() { *p /= sum_prob; }
+        
+        let max_prob = probs.iter().fold(0.0f32, |a, &b| a.max(b));
+        let min_p_threshold = 0.05 * max_prob; // 5% of max prob
+
         let mut max_val = f32::MIN;
         let mut max_idx = 0;
         
-        // Temperature-scaled greedy sampling (Soft-max-ish approach without full rand)
-        // If temperature is low, it behaves like pure greedy.
-        // Higher temperature prevents extreme value dominance.
-        for (idx, &val) in last_logits.iter().enumerate() {
-            let v = val.to_f32() / temperature;
+        for (idx, &p) in probs.iter().enumerate() {
+            if p < min_p_threshold { continue; } // Wipe out the noise
+            
+            let mut v = p / (temperature + 1e-6);
+            
+            // Subtle Korean Nudge
+            if idx >= 100000 && idx <= 130000 { v *= 1.2; }
+            
             if v > max_val {
                 max_val = v;
                 max_idx = idx;

@@ -125,7 +125,11 @@ pub fn dequantize_bit_serial_to_f16(p: &[u32], s: &[f16], n: usize, sk: usize, t
                     let k_base = skb_idx * 32 + b; if k_base >= sk { break; }
                     let mut b_sum = 0.0f32;
                     for sl in 0..sc { if ((p[sl * ss + (no * skb + skb_idx) * 8 + sub_n] >> b) & 1) == 1 { b_sum += (1 << sl) as f32; } }
-                    let f_val = if sc == 4 { (b_sum - 8.0f32) * s[n_idx].to_f32() } else { (if b_sum >= 1.0 { 1.0f32 } else { -1.0f32 }) * s[(no * skb + skb_idx) * 8 + sub_n].to_f32() };
+                    
+                    // [2026-BLOCK-WISE-PRECISION] Use granular scales for both 1-bit and 4-bit
+                    let block_scale = s[(no * skb + skb_idx) * 8 + sub_n].to_f32();
+                    let f_val = if sc == 4 { (b_sum - 8.0f32) * block_scale } else { (if b_sum >= 1.0 { 1.0f32 } else { -1.0f32 }) * block_scale };
+                    
                     let target_idx = n_idx * tk + k_base; if target_idx < out.len() { out[target_idx] = f16::from_f32(f_val); }
                 }
             }
@@ -315,13 +319,26 @@ impl NativeQwen3TextModel {
             // [2026-DYNAMIC-SCALING] Adaptive RMS Normalization per token
             let mut stabilized_out = out.to_vec();
             let num_layers = self.layers.len();
-            let target_rms = if i == 0 { 0.45 } else { 1.0 + (i as f32 / num_layers as f32) * 0.5 };
+            
+            for (t_idx, chunk) in stabilized_out.chunks_exact_mut(hid).enumerate() {
+                // [2026-SEMANTIC-PRIORITY] Distinguish between 'Baked Context' and 'Live Instruction'
+                // Tokens from 0.6B (baked) are treated as background knowledge.
+                // Tokens in the current chunk (especially if s_o > 0) are treated as primary focus.
+                let is_instruction = if t_idx < _i_ids.len() {
+                    let id = _i_ids[t_idx];
+                    // Instruction markers OR being part of a new prompt after baking
+                    id == 151644 || id == 151645 || id == 151655 || s_o > 1000 
+                } else { s_o > 1000 };
 
-            for chunk in stabilized_out.chunks_exact_mut(hid) {
+                let base_target = if i == 0 { 0.45 } else { 0.8 + (i as f32 / num_layers as f32) * 0.4 };
+                
+                // Boost Instruction by 1.3x, Dampen Background by 0.7x
+                let target_rms = if is_instruction { base_target * 1.3 } else { base_target * 0.7 };
+
                 let mut sum_sq = 0.0f32;
                 for v in chunk.iter() { let f = v.to_f32(); sum_sq += f * f; }
-                let rms = (sum_sq / hid as f32).sqrt().max(1e-6);
-                let scale = target_rms / rms;
+                let rms = (sum_sq / hid as f32).sqrt().max(1e-5);
+                let scale = (target_rms / rms).clamp(0.05, 5.0); 
                 
                 let clamp_range = 16.0 + (i as f32 / num_layers as f32) * 8.0;
                 for v in chunk.iter_mut() {
@@ -348,8 +365,8 @@ impl NativeQwen3TextModel {
         for chunk in cn.chunks_exact_mut(hid) {
             let mut sum_sq = 0.0f32;
             for v in chunk.iter() { let f = v.to_f32(); sum_sq += f * f; }
-            let rms = (sum_sq / hid as f32).sqrt().max(1e-6);
-            let scale = 0.22 / rms; // 0.22 is the optimized target for 4-bit LM Head
+            let rms = (sum_sq / hid as f32).sqrt().max(1e-5);
+            let scale = (0.22 / rms).clamp(0.01, 2.0); 
             
             for v in chunk.iter_mut() {
                 let mut f = v.to_f32() * scale;

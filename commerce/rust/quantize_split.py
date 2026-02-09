@@ -45,47 +45,62 @@ def quantize_tensor_bit_serial_shuffled(param):
 
 def quantize_tensor_4bit_sliced(param):
     """
-    [NEW] 4-bit Sliced Quantization
-    Splits 4-bit weights into 4 bit-planes for bit-serial execution.
+    [UPGRADED] 4-bit Block-wise Sliced Quantization
+    Provides high-precision scaling for every 32 elements.
     """
     BLOCK_SIZE = 32
     N, K = param.shape[0], param.shape[1]
     
-    # 1. Normalization & 4-bit Quantization (0-15)
-    # [IMPROVED] Per-channel scaling for higher precision
-    scale = param.abs().max(dim=1).values / 15.0
-    scale[scale == 0] = 1.0
-    
-    # Apply per-channel scale
-    q_val = (param / scale.unsqueeze(1)).round().clamp(-8, 7) + 8
-    q_val = q_val.to(torch.int32)
+    # 1. Padding K to multiple of 32
+    pad_k = (BLOCK_SIZE - (K % BLOCK_SIZE)) % BLOCK_SIZE
+    if pad_k > 0:
+        param = torch.nn.functional.pad(param, (0, pad_k))
+    K_padded = K + pad_k
+    K_blocks = K_padded // BLOCK_SIZE
 
-    # 2. Bit-plane extraction
+    # 2. Block-wise Scaling (Crucial for Decimal Expressiveness)
+    # Calculate scale for every 32-element block
+    flat_w = param.view(N, K_blocks, BLOCK_SIZE)
+    scales = (flat_w.abs().max(dim=2).values / 7.0).to(torch.float16)
+    scales[scales == 0] = 1.0
+    
+    # 3. Quantize using block-wise scales
+    # q_val will be in range [-8, 7]
+    q_val = (flat_w / scales.unsqueeze(2)).round().clamp(-8, 7).to(torch.int32)
+    q_val += 8 # Offset to [0, 15] for bit-plane extraction
+
+    # 4. Bit-plane extraction & Layout Shuffling
     planes = []
     for b in range(4):
         plane_bits = (q_val >> b) & 1
         
-        # Apply standard bit-packing and shuffling for each plane
-        pad_k = (BLOCK_SIZE - (K % BLOCK_SIZE)) % BLOCK_SIZE
-        p_param = torch.nn.functional.pad(plane_bits, (0, pad_k))
-        K_padded = K + pad_k
-        K_blocks = K_padded // BLOCK_SIZE
-
-        flat_w = p_param.view(N, K_blocks, BLOCK_SIZE)
+        # Packing [N, K_blocks, BLOCK_SIZE] -> [N, K_blocks] (int32)
         packed_rows = torch.zeros((N, K_blocks), dtype=torch.int32)
         for i in range(BLOCK_SIZE):
-            packed_rows |= (flat_w[:, :, i] << i)
+            packed_rows |= (plane_bits[:, :, i] << i)
 
+        # Shuffle N-dimension for AVX/CUDA efficiency
         pad_n = (8 - (N % 8)) % 8
-        if pad_n > 0:
-            packed_rows = torch.nn.functional.pad(packed_rows, (0, 0, 0, pad_n))
-        
+        if b == 0: # Only once
+            if pad_n > 0:
+                packed_rows_padded = torch.nn.functional.pad(packed_rows, (0, 0, 0, pad_n))
+                scales_padded = torch.nn.functional.pad(scales, (0, 0, 0, pad_n))
+            else:
+                packed_rows_padded = packed_rows
+                scales_padded = scales
+        else:
+            packed_rows_padded = torch.nn.functional.pad(packed_rows, (0, 0, 0, pad_n)) if pad_n > 0 else packed_rows
+
         N_padded = N + pad_n
-        shuffled_w = packed_rows.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
+        shuffled_w = packed_rows_padded.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
         planes.append(shuffled_w.view(-1))
 
-    # Return concatenated planes, single scale per layer, and shape
-    return torch.cat(planes), scale.to(torch.float16), torch.tensor([N, K], dtype=torch.int32)
+    # Also shuffle the scales to match the weight layout!
+    N_padded = N + (8 - (N % 8)) % 8
+    scales_padded = torch.nn.functional.pad(scales, (0, 0, 0, (8 - (N % 8)) % 8)) if (N % 8) != 0 else scales
+    shuffled_s = scales_padded.view(N_padded // 8, 8, K_blocks).permute(0, 2, 1).contiguous()
+
+    return torch.cat(planes), shuffled_s.view(-1), torch.tensor([N, K], dtype=torch.int32)
 
 def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=None, layer_start=0):
     mode_name = "LAYER0" if layer_limit == 1 else ("L1_ALL" if layer_start > 0 else "ALL")
@@ -143,13 +158,24 @@ def process_model_shuffled(input_path, output_dir, is_vision=False, layer_limit=
         should_quantize = is_weight and "norm" not in name and "ln" not in name
 
         if should_quantize:
-            # [FULL 1-BIT] All layers use bit-serial shuffled quantization (Format 1)
-            packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
+            # [2026-STRATEGIC-HYBRID] Protect Intelligence with 4-bit Attention
+            is_attention = any(x in new_name for x in ["self_attn", "attn"])
+            is_embedding = "embed_tokens" in new_name
+            
+            if is_attention or is_embedding or layer_idx == 0:
+                # Use 4-bit for core intelligence
+                packed, scales, shape = quantize_tensor_4bit_sliced(param)
+                format_type = 4
+            else:
+                # Use 1-bit for heavy MLP layers to save memory
+                packed, scales, shape = quantize_tensor_bit_serial_shuffled(param)
+                format_type = 1
+                
             final_dict.update({
                 f"{new_name}.packed": packed,
                 f"{new_name}.scales": scales,
                 f"{new_name}.shape": shape,
-                f"{new_name}.format": torch.tensor([1], dtype=torch.int8) 
+                f"{new_name}.format": torch.tensor([format_type], dtype=torch.int8) 
             })
         else:
             final_dict[new_name] = param.to(torch.float16)
