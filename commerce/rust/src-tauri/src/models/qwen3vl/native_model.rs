@@ -312,29 +312,27 @@ impl NativeQwen3TextModel {
         for (i, layer) in self.layers.iter().enumerate() {
             let out = layer.forward(cur_x, &self.config, s_o, i, &rg.cos, &rg.sin, false, is_vision, gs, ws, i % 2 == 0, &self.rope_cache_gpu);
             
-            // [2026-STABILITY-DAM-V2] Refined Adaptive Signal Control
+            // [2026-DYNAMIC-SCALING] Adaptive RMS Normalization per token
             let mut stabilized_out = out.to_vec();
             let num_layers = self.layers.len();
-            
-            if i == 0 && num_layers > 1 {
-                // Layer 0 (4-bit) -> Layer 1 (1-bit): Use 0.45x Dampen for better signal
-                for v in stabilized_out.iter_mut() {
-                    let mut f = v.to_f32() * 0.45;
-                    if f > 16.0 { f = 16.0; } if f < -16.0 { f = -16.0; }
-                    *v = f16::from_f32(f);
-                }
-            } else if i > 0 {
-                // Progressive Clamping: Allow more variance in deeper layers
-                let clamp_range = 16.0 + (i as f32 / num_layers as f32) * 8.0; 
-                for v in stabilized_out.iter_mut() {
-                    let mut f = v.to_f32();
+            let target_rms = if i == 0 { 0.45 } else { 1.0 + (i as f32 / num_layers as f32) * 0.5 };
+
+            for chunk in stabilized_out.chunks_exact_mut(hid) {
+                let mut sum_sq = 0.0f32;
+                for v in chunk.iter() { let f = v.to_f32(); sum_sq += f * f; }
+                let rms = (sum_sq / hid as f32).sqrt().max(1e-6);
+                let scale = target_rms / rms;
+                
+                let clamp_range = 16.0 + (i as f32 / num_layers as f32) * 8.0;
+                for v in chunk.iter_mut() {
+                    let mut f = v.to_f32() * scale;
                     if f > clamp_range { f = clamp_range; } if f < -clamp_range { f = -clamp_range; }
                     *v = f16::from_f32(f);
                 }
             }
 
             if q_len > 1 && (i == 0 || i % 5 == 0 || i == num_layers - 1) { 
-                log_tensor_health(&format!("Layer {} Output (Stabilized-V2)", i), &stabilized_out, &[q_len, hid]); 
+                log_tensor_health(&format!("Layer {} Output (Adaptive-RMS)", i), &stabilized_out, &[q_len, hid]); 
             }
             
             // Since we created a new Vec for stabilization, we need to manage its lifetime.
@@ -346,15 +344,21 @@ impl NativeQwen3TextModel {
         let n_w = self.norm.get_slice::<f16>(); let mut cn = vec![f16::ZERO; cur_x.len()]; 
         native_rms_norm_f16_into(cur_x, n_w.as_ref(), self.config.rms_norm_eps as f32, hid, &mut cn);
         
-        // [2026-FINAL-ATTENUATION-V2] 0.05 was too quiet, 0.18 is the 'sweet spot'.
-        // This allows semantic signals to survive while keeping 1-bit noise under control.
-        for v in cn.iter_mut() {
-            let mut f = v.to_f32() * 0.18;
-            if f > 4.0 { f = 4.0; } if f < -4.0 { f = -4.0; } // Sane range for 4-bit LM Head
-            *v = f16::from_f32(f);
+        // [2026-FINAL-ADAPTIVE-V2] Dynamic energy control for LM Head
+        for chunk in cn.chunks_exact_mut(hid) {
+            let mut sum_sq = 0.0f32;
+            for v in chunk.iter() { let f = v.to_f32(); sum_sq += f * f; }
+            let rms = (sum_sq / hid as f32).sqrt().max(1e-6);
+            let scale = 0.22 / rms; // 0.22 is the optimized target for 4-bit LM Head
+            
+            for v in chunk.iter_mut() {
+                let mut f = v.to_f32() * scale;
+                if f > 4.0 { f = 4.0; } if f < -4.0 { f = -4.0; }
+                *v = f16::from_f32(f);
+            }
         }
 
-        if q_len > 1 { log_tensor_health("Final Norm Output (Corrected)", &cn, &[q_len, hid]); }
+        if q_len > 1 { log_tensor_health("Final Norm Output (Adaptive)", &cn, &[q_len, hid]); }
         cn
     }
     pub fn move_to_gpu(&mut self, dev: i32) -> anyhow::Result<()> { self.embed_tokens.move_to_gpu(dev)?; self.norm.move_to_gpu(dev)?; for l in &mut self.layers { l.move_to_gpu(dev)?; } Ok(()) }
@@ -533,10 +537,30 @@ impl NativeQwen3VLModel {
                     let actual_source_dim = if k_data.len() > 0 && v_data.len() > 0 { (v_data.len() * 32) / k_data.len() } else { 1024 };
                     if let Some(ref align) = self.align_matrix {
                         if target_dim > actual_source_dim && actual_source_dim == align.in_features {
-                            v_data = align.forward(&v_data, None);
+                            // [2026-RESIDUAL-ALIGNMENT] Blend linear projection with raw residual
+                            let v_projected = align.forward(&v_data, None);
+                            let ratio = target_dim / actual_source_dim;
+                            
+                            let mut v_final = Vec::with_capacity(v_projected.len());
+                            for (idx, &proj_val) in v_projected.iter().enumerate() {
+                                let orig_idx = (idx / target_dim) * actual_source_dim + ((idx % target_dim) % actual_source_dim);
+                                let orig_val = v_data[orig_idx].to_f32();
+                                // 70% Projection + 30% Residual Repeat for semantic stability
+                                v_final.push(f16::from_f32(proj_val.to_f32() * 0.7 + orig_val * 0.3));
+                            }
+                            v_data = v_final;
+
                             let mut k_f16 = Vec::with_capacity(k_data.len() * 32);
                             for &packed in &k_data { for b in 0..32 { k_f16.push(if (packed >> b) & 1 == 1 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) }); } }
-                            let k_projected = align.forward(&k_f16, None); k_data = pack_f16_to_bits(&k_projected);
+                            let k_projected = align.forward(&k_f16, None);
+                            
+                            let mut k_final = Vec::with_capacity(k_projected.len());
+                            for (idx, &proj_val) in k_projected.iter().enumerate() {
+                                let orig_idx = (idx / target_dim) * actual_source_dim + ((idx % target_dim) % actual_source_dim);
+                                let orig_val = k_f16[orig_idx].to_f32();
+                                k_final.push(f16::from_f32(proj_val.to_f32() * 0.7 + orig_val * 0.3));
+                            }
+                            k_data = pack_f16_to_bits(&k_final);
                         }
                     }
                     #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 { unsafe {

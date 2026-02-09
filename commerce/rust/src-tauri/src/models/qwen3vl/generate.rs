@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use std::io::{Write, stdout};
 use crate::{
     chat_template::ChatTemplate,
     models::{
@@ -16,6 +17,13 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::Mutex as TokioMutex;
 use std::path::Path;
 use half::f16;
+
+/// [2026-UTF8-FIX] Force write UTF-8 bytes to stdout and flush immediately.
+fn force_utf8_print(text: &str) {
+    let mut out = stdout();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
 
 #[derive(Clone)]
 pub enum ModelVariant {
@@ -472,9 +480,9 @@ impl Qwen3VLGenerateModel {
                 // [READABILITY-GEN] Show the full sentence building in real-time with hex check
                 if current_idx % 5 == 0 {
                     let bytes = generated_text.as_bytes();
-                    println!("[인코딩 체크] 바이트 길이: {}, 시작 4바이트 Hex: {:02X?}", bytes.len(), &bytes[..bytes.len().min(4)]);
+                    force_utf8_print(&format!("\r[인코딩 체크] 바이트 길이: {}, 시작 4바이트 Hex: {:02X?}\n", bytes.len(), &bytes[..bytes.len().min(4)]));
                 }
-                println!("[모델 답변 중] -> {}", generated_text.replace("\n", " "));
+                force_utf8_print(&format!("\r[모델 답변 중] -> {}\n", generated_text.replace("\n", " ")));
                 
                 current_kv_offset += 1;
                 current_idx += 1;
