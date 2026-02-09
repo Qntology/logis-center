@@ -502,7 +502,7 @@ impl NativeQwen3VLModel {
                         let sample_len = (k_data.len() / 2).min(100);
                         let sample = std::slice::from_raw_parts(f16_ptr, sample_len);
                         let sum: f32 = sample.iter().map(|x| x.to_f32().abs()).sum();
-                        println!("[VERIFY-KV] Shard {:?} Fingerprint: AbsAvg={:.4}, Tokens={}", path.file_name().unwrap(), sum / sample_len as f32, tip);
+                        println!("[VERIFY-KV] Shard {:?} Fingerprint: AbsAvg={:.4}, Tokens={}", expanded[p_idx].file_name().unwrap(), sum / sample_len as f32, tip);
 
                         if let Some(kp) = gpu_kv.k_ptr { let _ = cl.cuMemcpyHtoD_v2((kp.0 as u64 + (curr_o * n_kv * (h_d/32) * 4) as u64) as CUdeviceptr, k_data.as_ptr() as *const _, k_data.len()); }
                         if let Some(vp) = gpu_kv.v_ptr { let _ = cl.cuMemcpyHtoD_v2((vp.0 as u64 + (curr_o * n_kv * h_d * 2) as u64) as CUdeviceptr, v_data.as_ptr() as *const _, v_data.len()); }
@@ -515,12 +515,12 @@ impl NativeQwen3VLModel {
             // [STABILITY] Gain Correction (0.707x) to neutralize energy boost from 0.6B->2B dimension expansion
             #[cfg(feature = "cuda")] if self.lm_head.device_id >= 0 {
                 unsafe {
-                    use crate::models::qwen3vl::native_backend::apply_gain;
+                    use crate::models::qwen3vl::native_backend::native_cuda_apply_gain;
                     if let Some(kp) = gpu_kv.k_ptr { 
-                        apply_gain(kp.0 as u64, 0.7071, (total_t * n_kv * (h_d/32)) as u32); 
+                        native_cuda_apply_gain(kp.0 as CUdeviceptr, 0.7071, (total_t * n_kv * (h_d/32)) as usize); 
                     }
                     if let Some(vp) = gpu_kv.v_ptr { 
-                        apply_gain(vp.0 as u64, 0.7071, (total_t * n_kv * h_d) as u32); 
+                        native_cuda_apply_gain(vp.0 as CUdeviceptr, 0.7071, (total_t * n_kv * h_d) as usize); 
                     }
                 }
             }
