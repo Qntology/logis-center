@@ -81,6 +81,14 @@ impl QLinear {
         &self.device
     }
 
+    pub fn inner_shape(&self) -> Vec<usize> {
+        match &self.inner {
+            QMatMul::QTensor(q) => q.shape().dims().to_vec(),
+            QMatMul::Tensor(t) => t.dims().to_vec(),
+            QMatMul::TensorF16(t) => t.dims().to_vec(),
+        }
+    }
+
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         if !self.device.same_device(device) {
             let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -204,8 +212,15 @@ impl QuantizedQwen3VLTextAttention {
         let head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
+        let is_06b = config.hidden_size == 1024;
+        
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
-            ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
+            if is_06b {
+                // [0.6B-SPECIFIC] Qwen3-0.6B uses combined QKV or specific naming
+                ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
+            } else {
+                ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
+            }
         } else {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
@@ -241,10 +256,38 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
-        let k_proj = get_qlinear(ct, reader, &format!("{base_name}.{k}"), device, dtype)?;
-        let v_proj = get_qlinear(ct, reader, &format!("{base_name}.{v}"), device, dtype)?;
+        // [0.6B-HYBRID-FIX] Detect and handle combined attn_qkv tensors often found in 0.6B GGUF files
+        let q_proj_name = format!("{base_name}.{q}");
+        let k_proj_name = format!("{base_name}.{k}");
+        let v_proj_name = format!("{base_name}.{v}");
+        let qkv_combined_name = format!("{base_name}.attn_qkv");
+
+        let has_individual = ct.tensor_infos.contains_key(&format!("{q_proj_name}.weight"));
+        let has_combined = ct.tensor_infos.contains_key(&format!("{qkv_combined_name}.weight"));
+
+        let (q_proj, k_proj, v_proj) = if has_individual {
+            let qp = get_qlinear(ct, reader, &q_proj_name, device, dtype)?;
+            let kp = get_qlinear(ct, reader, &k_proj_name, device, dtype)?;
+            let vp = get_qlinear(ct, reader, &v_proj_name, device, dtype)?;
+            (qp, kp, vp)
+        } else if has_combined {
+            // [0.6B-SPECIFIC] Split attn_qkv into Q, K, V
+            // Total out_features = 3 * hidden_size (usually)
+            let hidden_size = config.hidden_size; 
+            let qp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 0, hidden_size)?;
+            let kp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, hidden_size, hidden_size)?;
+            let vp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 2 * hidden_size, hidden_size)?;
+            (qp, kp, vp)
+        } else {
+            return Err(anyhow!("Could not find QKV tensors (individual or combined) for layer {}", layer_idx));
+        };
+
         let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+
+        if layer_idx == 0 {
+            println!("[DEBUG-ATTN-L0] Q shape: {:?}, K shape: {:?}, V shape: {:?}, head_dim: {}", 
+                q_proj.inner_shape(), k_proj.inner_shape(), v_proj.inner_shape(), head_dim);
+        }
 
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;

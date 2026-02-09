@@ -542,10 +542,9 @@ impl LogisModel {
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         
-        // [FIX] Small model should use its own config if available, not force Large model's config.
-        // We only use shared_path for Tokenizer if needed, but for Config, let it be None 
-        // so it defaults to the model's own directory.
-        let shared_path: Option<&str> = None; 
+        // [HYBRID-FIX] Use Large model's tokenizer for Small model to ensure token ID compatibility
+        let tokenizer_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+        let config_path: Option<&str> = None; // Always use model's own config
         
         let mut target_device = self.device_config.device.clone();
         
@@ -567,13 +566,14 @@ impl LogisModel {
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
-        let shared_path_clone = shared_path.map(|s| s.to_string());
+        let tok_path_clone = tokenizer_path.map(|s| s.to_string());
+        let cfg_path_clone = config_path.map(|s| s.to_string());
 
         let gen = tokio::task::spawn_blocking(move || {
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
-                shared_path_clone.as_deref(), 
-                shared_path_clone.as_deref(), 
+                tok_path_clone.as_deref(), 
+                cfg_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
                 baking_only // [PASS-NEW]

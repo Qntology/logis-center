@@ -182,9 +182,13 @@ impl Qwen3VLGenerateModel {
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
         let qwen3_vl = if !gguf_files.is_empty() {
-            let mut model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q8_0.gguf")).cloned();
-            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
+            let mut model_path = gguf_files.iter().find(|f| f.contains("0.6B") && f.contains("Q8_0")).cloned();
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("0.6B") && f.contains("Q4_K_M")).cloned(); }
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("0.6B")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
+
+            let main_path = model_path.ok_or(anyhow!("No GGUF file found in {}", path))?;
+            println!("[MODEL] Selected Main GGUF: {}", main_path);
 
             let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;  
             let reserve_tokens = limit_tokens.min(8192);
@@ -192,7 +196,7 @@ impl Qwen3VLGenerateModel {
 
             if is_vision_model {
                 let mmproj = mmproj_path.ok_or(anyhow!("Missing mmproj GGUF"))?;
-                let main = model_path.ok_or(anyhow!("Missing main GGUF for VL model"))?;
+                let main = main_path;
                 let main_file = std::fs::File::open(&main)?;
                 let main_mmap = unsafe { memmap2::MmapOptions::new().map(&main_file)? };
                 let mmproj_file = std::fs::File::open(&mmproj)?;
@@ -208,7 +212,7 @@ impl Qwen3VLGenerateModel {
                 let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only, is_text_mode, is_image_mode)?;
                 ModelVariant::QuantizedVL(model)
             } else {
-                let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
+                let main = main_path;
                 let file = std::fs::File::open(&main)?;
                 let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
                 let mut cursor = std::io::Cursor::new(&mmap[..]);        
