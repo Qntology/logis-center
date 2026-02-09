@@ -355,7 +355,7 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(task_id_str);
+                let path = crate::utils::paths::get_kv_dir(None).join(task_id_str.clone());
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
                     gen.load_kv_from_disk(&path)?;
@@ -541,7 +541,11 @@ impl LogisModel {
         // 2. [LOAD] Load from disk if not found in any slot
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
-        let shared_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
+        
+        // [FIX] Small model should use its own config if available, not force Large model's config.
+        // We only use shared_path for Tokenizer if needed, but for Config, let it be None 
+        // so it defaults to the model's own directory.
+        let shared_path: Option<&str> = None; 
         
         let mut target_device = self.device_config.device.clone();
         
@@ -666,7 +670,7 @@ impl LogisModel {
         };
 
         let small_model_path = normalize_path(base_path.join("Qwen3-0.6B-Instruct-gguf"));
-        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Instruct-gguf"));
+        let large_model_path = normalize_path(base_path.join("Qwen3-VL-2B-Hybrid-gguf"));
         let embedding_path = base_path.join("embeddinggemma-300m");
 
         let max_tokens_limit = 65536; 

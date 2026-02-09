@@ -203,7 +203,9 @@ impl Qwen3VLGenerateModel {
                 let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
 
-                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only)?;
+                let is_text_mode = force_text_only;
+                let is_image_mode = !force_text_only;
+                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only, is_text_mode, is_image_mode)?;
                 ModelVariant::QuantizedVL(model)
             } else {
                 let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
@@ -216,7 +218,7 @@ impl Qwen3VLGenerateModel {
                 let actual_baking_only = baking_only || is_06b;
                 let single_layer_mode = baking_only || is_06b;
                 
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode)?;
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode, true, false)?;
                 ModelVariant::QuantizedText(model)
             }
         } else {

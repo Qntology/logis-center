@@ -293,9 +293,17 @@ impl QuantizedQwen3VLTextAttention {
             casted
         } else { xs };
 
-        let (b_sz, q_len, _) = xs.dims3()?;
+        let (b_sz, q_len, last_dim) = xs.dims3()?;
         
-        let query_states = self.q_proj.forward(&xs)?.reshape((
+        if self.layer_idx == 0 {
+            println!("[TRACE-ATTN-L0] xs shape: {:?}, q_proj device: {:?}, target_dtype: {:?}", xs.shape(), self.q_proj.device(), target_dtype);
+        }
+
+        let query_states = self.q_proj.forward(&xs).map_err(|e| {
+            println!("[ERROR-ATTN] q_proj mismatch at Layer {}: xs={:?}, weight_dev={:?}. Error: {}", 
+                self.layer_idx, xs.shape(), self.q_proj.device(), e);
+            e
+        })?.reshape((
             b_sz,
             q_len,
             self.num_attention_heads,
@@ -837,6 +845,8 @@ pub struct QuantizedQwen3VLTextModel {
     pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
     pub baking_only: bool, // [NEW] Skip MLP for KV baking
     pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
+    pub is_text: bool,
+    pub is_image: bool,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -849,8 +859,11 @@ impl QuantizedQwen3VLTextModel {
         device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        baking_only: bool, // [NEW]
+        baking_only: bool,
+        is_text: bool,
+        is_image: bool,
     ) -> Result<Self> {
+        println!("[MODEL-INIT-DEBUG] Name: {}, Hidden: {}, Layers: {}, TextMode: {}", base_name, config.hidden_size, config.num_hidden_layers, is_text);
         let is_forced_cpu = device.is_cpu();
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
@@ -866,7 +879,11 @@ impl QuantizedQwen3VLTextModel {
              let h = tensor.dim(1)?;
              (Embedding::new(tensor, h), h)
         } else {
-             return Err(anyhow!("Failed to load embedding."));
+             // [HYBRID-FALLBACK] If no embedding found, we might be in hybrid mode.
+             // We'll create a dummy embedding for now, to be replaced or bypassed.
+             println!("[HYBRID] Embedding not found in GGUF. Using config hidden size: {}", config.hidden_size);
+             let dummy_tensor = Tensor::zeros((config.vocab_size, config.hidden_size), dtype, device)?;
+             (Embedding::new(dummy_tensor, config.hidden_size), config.hidden_size)
         };
 
         if actual_hidden_size != config.hidden_size {
@@ -979,7 +996,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_text, is_image })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -990,7 +1007,9 @@ impl QuantizedQwen3VLTextModel {
         device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        baking_only: bool, // [NEW]
+        baking_only: bool,
+        is_text: bool,
+        is_image: bool,
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
         // ... (previous logic)
@@ -1091,6 +1110,8 @@ impl QuantizedQwen3VLTextModel {
             mmap: None,
             baking_only,
             is_forced_cpu,
+            is_text,
+            is_image,
         })
     }
 
@@ -1123,7 +1144,7 @@ impl QuantizedQwen3VLTextModel {
             self.mrope_section.clone(),
         )?;
         
-        let xs = inputs_embeds.clone();
+        let mut xs = inputs_embeds.clone();
         let target_dtype = if xs.device().is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
 
@@ -1416,7 +1437,9 @@ impl QuantizedQwen3VLModel {
         _vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        baking_only: bool, // [NEW] Support for 1-layer vision baker
+        baking_only: bool,
+        is_text: bool,
+        is_image: bool,
     ) -> Result<Self> {
         let mmproj_mmap = mmproj_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
@@ -1434,7 +1457,7 @@ impl QuantizedQwen3VLModel {
         }
 
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(
-            &t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
+            &t_config, ct_main, main_mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only, is_text, is_image
         )?;
 
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
@@ -1463,7 +1486,9 @@ impl QuantizedQwen3VLModel {
         _vision_device_id: usize,
         dtype: DType,
         kv_reserve: u64,
-        baking_only: bool, // [NEW]
+        baking_only: bool,
+        is_text: bool,
+        is_image: bool,
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
         let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { dtype };
@@ -1478,7 +1503,7 @@ impl QuantizedQwen3VLModel {
             t_config.num_hidden_layers = 1;
         }
 
-        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
+        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only, is_text, is_image)?;
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if !baking_only {
@@ -1529,7 +1554,26 @@ impl QuantizedQwen3VLModel {
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
-        if let Some(pixel_values) = pixel_values { if let Some(image_grid_thw) = image_grid_thw { let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?; let image_embeds = Tensor::cat(&image_embeds, 0)?; let vision_mask = self.get_placeholder_mask(&input_ids, true)?; inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; } }
+
+        // [HYBRID-BRIDGE] Upscale 1024 -> 2048 ONLY if we are in a 2048-dim model (Large)
+        let model_expected_dim = self.config.text_config.as_ref().map(|c| c.hidden_size).unwrap_or(2048);
+        let current_input_dim = inputs_embeds.dim(candle_core::D::Minus1)?;
+        
+        if model_expected_dim == 2048 && current_input_dim == 1024 {
+            println!("[HYBRID-BRIDGE-TOP] Scaling inputs_embeds 1024 -> 2048 for Large Model.");
+            inputs_embeds = candle_core::Tensor::cat(&[&inputs_embeds, &inputs_embeds], candle_core::D::Minus1)?.contiguous()?;
+        } else {
+            // println!("[HYBRID-BRIDGE-SKIP] Dim match or Small model. Expected: {}, Input: {}", model_expected_dim, current_input_dim);
+        }
+
+        if let Some(pixel_values) = pixel_values { 
+            if let Some(image_grid_thw) = image_grid_thw { 
+                let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?; 
+                let image_embeds = Tensor::cat(&image_embeds, 0)?; 
+                let vision_mask = self.get_placeholder_mask(&input_ids, true)?; 
+                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; 
+            } 
+        }
         let (position_ids, _) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
         let position_ids = if let Some(cache_pos) = cache_position { 
             let start = cache_pos.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
@@ -1562,15 +1606,17 @@ pub struct QuantizedQwen3TextModel {
     pub lm_head: Option<QLinear>,
     pub text_device: Device,
     pub mmap: Option<Arc<Mmap>>,
+    pub is_text: bool,
+    pub is_image: bool,
 }
 
 impl QuantizedQwen3TextModel {
-    pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
+    pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool, is_text: bool, is_image: bool) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         if single_layer_mode { t_config.num_hidden_layers = 1; }
         
-        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&t_config, ct_main, mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
+        let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&t_config, ct_main, mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only, is_text, is_image)?;
         let lm_head = if !baking_only {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
@@ -1579,22 +1625,22 @@ impl QuantizedQwen3TextModel {
             else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) { Some(l) }
             else { get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype).ok() }
         } else { None };
-        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle })
+        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle, is_text, is_image })
     }
 
-    pub fn new<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, reader_main: &mut R, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool) -> Result<Self> {
+    pub fn new<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, reader_main: &mut R, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool, is_text: bool, is_image: bool) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {})", baking_only, single_layer_mode);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
         if single_layer_mode { t_config.num_hidden_layers = 1; }
 
-        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only)?;
+        let language_model = QuantizedQwen3VLTextModel::new(&t_config, ct_main, reader_main, "model", text_device, text_device_id, dtype, kv_reserve, baking_only, is_text, is_image)?;
         let lm_head = if !baking_only {
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
             if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) { Some(l) }
             else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) { Some(l) }
             else { get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype).ok() }
         } else { None };
-        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
+        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None, is_text, is_image })
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
