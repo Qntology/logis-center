@@ -1090,24 +1090,53 @@ impl QuantizedQwen3VLTextModel {
 
         // [EXHAUSTIVE-SEARCH] Search for any key that looks like an embedding
         let mut embed_key = None;
-        for key in ct.tensor_infos.keys() {
-            let k_low = key.to_lowercase();
-            if k_low.contains("token_embd") || (k_low.contains("embed_tokens") && k_low.contains("weight")) || k_low == "model.embed_tokens" {
-                embed_key = Some(key.clone());
-                break;
+        
+        // Priority 1: token_embd.weight (Found in Instruct models)
+        if ct.tensor_infos.contains_key("token_embd.weight") {
+            embed_key = Some("token_embd.weight".to_string());
+        } else {
+            // Priority 2: Other variants
+            for key in ct.tensor_infos.keys() {
+                let k_low = key.to_lowercase();
+                if k_low.contains("token_embd") || (k_low.contains("embed_tokens") && k_low.contains("weight")) || k_low == "model.embed_tokens" {
+                    embed_key = Some(key.clone());
+                    break;
+                }
             }
         }
 
         let embed_tokens = if let Some(key) = embed_key {
              println!("[HYBRID] Found embedding weight with key: {}", key);
              let tensor = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
-             let h = tensor.dim(1)?;
-             Embedding::new(tensor, h)
+             
+             // [MATHEMATICAL-MATCHING] 0.6B(1024)를 2B(2048) 구조에 코드 수준에서 즉시 매칭
+             let (final_tensor, final_h) = if actual_h_size == 1024 {
+                 println!("[HYBRID-MATCH] 0.6B detected. Matching Embedding to 2B structure (1024 -> 2048)...");
+                 (Tensor::cat(&[&tensor, &tensor], 1)?, 2048)
+             } else {
+                 let h = tensor.dim(1)?;
+                 (tensor, h)
+             };
+             Embedding::new(final_tensor, final_h)
         } else {
-             println!("[HYBRID-ERROR] NO EMBEDDING FOUND. ALL KEYS: {:?}", ct.tensor_infos.keys().collect::<Vec<_>>());
-             println!("[HYBRID] Creating dummy with size: {}", actual_h_size);
-             let dummy_tensor = Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?;
-             Embedding::new(dummy_tensor, actual_h_size)
+             println!("[HYBRID-RELAY] Embedding NOT found in current GGUF. Attempting shared fallback...");
+             let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
+             let shared_emb_path = base_path.join("qwen3_shared_emb.safetensors");
+             
+             let borrowed_emb = if shared_emb_path.exists() {
+                 let st = candle_core::safetensors::load(shared_emb_path, device)?;
+                 if let Some(s_t) = st.get("token_embd.weight") {
+                     let s_t = s_t.to_dtype(dtype)?;
+                     // 1024 -> 2048 업스케일
+                     println!("[HYBRID-RELAY] Shared Embedding Loaded. Upscaling 1024 -> 2048.");
+                     Tensor::cat(&[&s_t, &s_t], 1)?
+                 } else {
+                     Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?
+                 }
+             } else {
+                 Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?
+             };
+             Embedding::new(borrowed_emb, actual_h_size)
         };
 
         let nvml = Nvml::init().ok();
@@ -1232,17 +1261,26 @@ impl QuantizedQwen3VLTextModel {
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
-        let (embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
+        let (raw_embed_tokens, actual_hidden_size) = if let Ok(tensor) = ct.tensor(reader, &token_emb_name, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
-             (Embedding::new(tensor, h), h)
+             (tensor, h)
         } else if let Ok(tensor) = ct.tensor(reader, alt_token_emb, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
-             (Embedding::new(tensor, h), h)
+             (tensor, h)
         } else {
              return Err(anyhow!("Failed to load embedding."));
         };
+
+        // [MATHEMATICAL-MATCHING] 0.6B -> 2B structure match
+        let (final_emb_tensor, final_h) = if actual_hidden_size == 1024 {
+            println!("[HYBRID-MATCH] 0.6B (Reader) matching to 2B structure (1024 -> 2048)...");
+            (Tensor::cat(&[&raw_embed_tokens, &raw_embed_tokens], 1)?, 2048)
+        } else {
+            (raw_embed_tokens, actual_hidden_size)
+        };
+        let embed_tokens = Embedding::new(final_emb_tensor, final_h);
 
         let mut patched_config = config.clone();
         patched_config.hidden_size = actual_hidden_size;
@@ -1394,21 +1432,35 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-        let gpu_device = Device::new_cuda(0)?;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let is_on_cpu = layer.device().is_cpu();
             
-            // [SMART-STREAMING] Only move to GPU if not already pinned there
-            if is_on_cpu {
-                layer.to_device(&gpu_device)?;
-            }
+            // [SMART-STREAMING]
+            if is_on_cpu { layer.to_device(&gpu_device)?; }
             
-            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+            let layer_dim = layer.input_layernorm.weight().dim(0)?;
+            let input_dim = xs.dim(candle_core::D::Minus1)?;
+
+            // [HYBRID-BRIDGE-GATE] 2048차원 파이프라인에서 1024차원 레이어 처리
+            let mut xs_active = if input_dim == 2048 && layer_dim == 1024 {
+                xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
+            } else {
+                xs.clone()
+            };
+
+            let residual_active = xs_active.clone();
+            xs_active = layer.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
             
-            // [HARD-CLEANUP] Move weights back to CPU only if we are in streaming mode
-            if is_on_cpu {
-                layer.to_device(&Device::Cpu)?;
-            }
+            // [HYBRID-BRIDGE-GATE-EXIT] 결과를 다시 2048차원으로 복구
+            xs = if input_dim == 2048 && layer_dim == 1024 {
+                let xs_2048 = Tensor::cat(&[&xs_active, &xs_active], candle_core::D::Minus1)?.contiguous()?;
+                // 원래의 2048차원 xs와 더함 (Residual Add)
+                xs.add(&xs_2048)?
+            } else {
+                xs_active // 일반적인 경우는 레이어 내부에 Add가 포함됨
+            };
+            
+            if is_on_cpu { layer.to_device(&Device::Cpu)?; }
 
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -1959,32 +2011,24 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [HYBRID-GGUF-FIX] 
-    // Candle QMatMul expects [In, Out].
     let shape = weight_t.dims();
     if shape.len() == 2 {
         let rows = shape[0];
         let cols = shape[1];
-        
         let mut needs_transpose = false;
         
-        // Output and Down projections transform back to HiddenSize
-        if name.contains("output") || name.contains("down") {
-            // Target: [In: Intermediate, Out: Hidden]. Hidden should be second dim (cols).
-            // If Hidden is in rows, it's [Hidden, Intermediate] -> Transpose.
-            if rows == hidden_size && cols != hidden_size {
-                needs_transpose = true;
-            }
+        if name.contains("down") {
+            // Down: Target [In: 6144, Out: 2048]. 
+            // If rows is 2048, it's reversed.
+            if rows == hidden_size && cols > hidden_size { needs_transpose = true; }
         } else {
-            // Q, K, V, GATE, UP: [In: Hidden, Out: Features]. Hidden should be first dim (rows).
-            // If Hidden is in cols, it's [Features, Hidden] -> Transpose.
-            if cols == hidden_size && rows != hidden_size {
-                needs_transpose = true;
-            }
+            // Q, K, V, Gate, Up, Output: Target [In: 2048, Out: XXX]. 
+            // If 2048 is in cols, it's reversed.
+            if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
         }
 
         if needs_transpose {
-            println!("[MODEL-FIX] Transposing {} weight to [In, Out]: {:?} -> [{:?}, {:?}]", name, shape, cols, rows);
+            println!("[MODEL-FIX] Transposing {} GGUF weight: {:?} -> [{:?}, {:?}]", name, shape, cols, rows);
             weight_t = weight_t.transpose(0, 1)?.contiguous()?;
         }
     }
