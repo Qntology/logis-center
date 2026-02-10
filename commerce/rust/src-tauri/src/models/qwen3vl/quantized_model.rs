@@ -823,11 +823,29 @@ impl QuantizedQwen3VLTextDecoderLayer {
         
         // [OPTIMIZATION] Skip MLP loading if we only need to bake KV cache (MLP 0% Mode)
         let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
-            let mg = Some(get_qlinear(ct, reader, &format!("{base_name}.{gate}"), device, dtype)?);
-            let mu = Some(get_qlinear(ct, reader, &format!("{base_name}.{up}"), device, dtype)?);
-            let md = Some(get_qlinear(ct, reader, &format!("{base_name}.{down}"), device, dtype)?);
-            let pln = Some(get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?);
-            (mg, mu, md, pln)
+            let gate_name = format!("{base_name}.{gate}");
+            let up_name = format!("{base_name}.{up}");
+            let down_name = format!("{base_name}.{down}");
+            
+            // Detect actual MLP intermediate size from GGUF
+            let actual_inter_size = if let Some(info) = ct.tensor_infos.get(&format!("{up_name}.weight")) {
+                info.shape.dims()[0] // Intermediate size is usually the first dim
+            } else {
+                config.intermediate_size
+            };
+
+            let mg = get_qlinear(ct, reader, &gate_name, device, dtype)?;
+            let mu = get_qlinear(ct, reader, &up_name, device, dtype)?;
+            let md = get_qlinear(ct, reader, &down_name, device, dtype)?;
+            
+            if layer_idx == 0 {
+                println!("[DEBUG-MLP-L0] Gate: {:?}, Up: {:?}, Down: {:?}", 
+                    mg.inner_shape(), mu.inner_shape(), md.inner_shape());
+            }
+
+            let pln = get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?;
+            
+            (Some(mg), Some(mu), Some(md), Some(pln))
         } else {
             (None, None, None, None)
         };
@@ -912,51 +930,44 @@ impl QuantizedQwen3VLTextDecoderLayer {
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
             let residual = xs.clone();
             
-            // [HYBRID-BRIDGE-MLP] Slice input if MLP expects 1024 but pipeline is 2048
+            // 1. Post-Attention Norm
             let mut xs_mlp = post_norm.forward(&xs)?;
             let norm_dim_mlp = post_norm.weight().dim(0)?;
             
-            if input_dim == 2048 && norm_dim_mlp == 1024 {
-                xs_mlp = xs_mlp.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?;
-            }
-
-            let xs_mlp = {
-                let gate = {
-                    let w_shape = gate_proj.inner_shape();
-                    let mut inp = xs_mlp.clone();
-                    if inp.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
-                        inp = inp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
-                    }
-                    gate_proj.forward(&inp)?
-                };
-                let up = {
-                    let w_shape = up_proj.inner_shape();
-                    let mut inp = xs_mlp.clone();
-                    if inp.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
-                        inp = inp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
-                    }
-                    up_proj.forward(&inp)?
-                };
-                let gate = candle_nn::ops::silu(&gate)?;
-                let hidden = gate.mul(&up)?;
+            // 2. Gate & Up Projections (Hidden -> Intermediate)
+            let (gate, up) = {
+                let mut inp = xs_mlp.clone();
+                let w_shape = gate_proj.inner_shape();
                 
-                let mut out = {
-                    let w_shape = down_proj.inner_shape();
-                    let mut inp = hidden.clone();
-                    // Down projection is usually [hidden, intermediate]
-                    // If hidden is 1024 but out is 2048 or vice-versa, handle it
-                    down_proj.forward(&inp)?
-                };
-                
-                // If MLP was 1024-dim, result is 1024. Upscale to 2048 if residual is 2048.
-                if out.dim(D::Minus1)? == 1024 && residual.dim(D::Minus1)? == 2048 {
-                    out = Tensor::cat(&[&out, &out], D::Minus1)?.contiguous()?;
+                // If weight expects 1024 but we have 2048
+                if inp.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+                    inp = inp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
                 }
-                out
+                
+                let g = gate_proj.forward(&inp)?;
+                let u = up_proj.forward(&inp)?;
+                (g, u)
             };
             
-            let mut xs_mlp = if xs_mlp.dtype() != residual.dtype() { xs_mlp.to_dtype(residual.dtype())? } else { xs_mlp };
-            Ok(residual.add(&xs_mlp)?)
+            let gate = candle_nn::ops::silu(&gate)?;
+            let hidden = gate.mul(&up)?;
+            
+            // 3. Down Projection (Intermediate -> Hidden)
+            let mut out = {
+                let w_shape = down_proj.inner_shape();
+                // Down proj weight is [hidden_out, intermediate_in]
+                // If it expects intermediate 3072 but we have 6144, it will fail unless we handled it in new()
+                // Here we assume intermediate sizes match between Q/K/V and DownProj within the same layer
+                down_proj.forward(&hidden)?
+            };
+            
+            // 4. Restore to pipeline dimension (1024 -> 2048) if needed
+            if out.dim(D::Minus1)? == 1024 && residual.dim(D::Minus1)? == 2048 {
+                out = Tensor::cat(&[&out, &out], D::Minus1)?.contiguous()?;
+            }
+            
+            let mut out = if out.dtype() != residual.dtype() { out.to_dtype(residual.dtype())? } else { out };
+            Ok(residual.add(&out)?)
         } else {
             Ok(xs)
         }
@@ -1848,9 +1859,28 @@ impl QuantizedQwen3TextModel {
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
-    let weight = QMatMul::from_qtensor(weight)?;
+    let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
+    
+    // [HYBRID-UNIVERSAL-FIX] Automatically fix transposed weights based on shape signature
+    let shape = weight_t.dims();
+    if shape.len() == 2 {
+        if (shape[0] == 2048 && shape[1] == 6144) || (shape[0] == 1024 && shape[1] == 3072) {
+            println!("[MODEL-FIX] Transposing detected UP/GATE projection: {:?}", shape);
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        } else if (shape[0] == 6144 && shape[1] == 2048) || (shape[0] == 3072 && shape[1] == 1024) {
+            // This is already correct [out, in] for UP/GATE, OR it's a transposed DOWN projection.
+            // In Qwen, DOWN projection should be [hidden_out, intermediate_in] -> [2048, 6144].
+            // If we find [6144, 2048] in a DOWN proj context, it needs transpose.
+            if name.contains("down") {
+                println!("[MODEL-FIX] Transposing detected DOWN projection: {:?}", shape);
+                weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+            }
+        }
+    }
+    
+    let weight_q = QMatMul::Tensor(weight_t);
     let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
-    Ok(QLinear::new(weight, bias, device.clone()))
+    Ok(QLinear::new(weight_q, bias, device.clone()))
 }
 
 fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
@@ -1922,8 +1952,30 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
         let mut split_idx = 0;
         let mut base_split_name = new_name.clone();
         if let Some(last_dot) = new_name.rfind('.') { if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() { if name.ends_with(&format!(".{}", idx)) { base_split_name = new_name[..last_dot].to_string(); split_idx = idx; is_split = true; } } }
-        let t = ct.tensor(reader, name, device)?;
-        let t = t.dequantize(device)?.to_dtype(dtype)?;
+        let mut t = ct.tensor(reader, name, device)?;
+        let mut t = t.dequantize(device)?.to_dtype(dtype)?;
+        
+        // [HYBRID-TRANSPOSE-FIX] Automatically fix transposed MLP weights
+        if name.contains("ffn_gate") || name.contains("ffn_up") || name.contains("mlp.gate_proj") || name.contains("mlp.up_proj") {
+            let shape = t.dims();
+            if shape.len() == 2 && shape[0] == 2048 && shape[1] == 6144 {
+                println!("[MODEL-FIX] Transposing ffn_gate/up weight: {:?} -> [6144, 2048]", shape);
+                t = t.transpose(0, 1)?.contiguous()?;
+            } else if shape.len() == 2 && shape[0] == 1024 && shape[1] == 3072 {
+                println!("[MODEL-FIX] Transposing ffn_gate/up (0.6B) weight: {:?} -> [3072, 1024]", shape);
+                t = t.transpose(0, 1)?.contiguous()?;
+            }
+        } else if name.contains("ffn_down") || name.contains("mlp.down_proj") {
+            let shape = t.dims();
+            if shape.len() == 2 && shape[0] == 6144 && shape[1] == 2048 {
+                println!("[MODEL-FIX] Transposing ffn_down weight: {:?} -> [2048, 6144]", shape);
+                t = t.transpose(0, 1)?.contiguous()?;
+            } else if shape.len() == 2 && shape[0] == 3072 && shape[1] == 1024 {
+                println!("[MODEL-FIX] Transposing ffn_down (0.6B) weight: {:?} -> [1024, 3072]", shape);
+                t = t.transpose(0, 1)?.contiguous()?;
+            }
+        }
+
         if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
     }
     for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
