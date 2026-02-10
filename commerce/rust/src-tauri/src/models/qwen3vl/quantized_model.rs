@@ -856,19 +856,30 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?;
         
-        // [OPTIMIZATION] Skip MLP loading if we only need to bake KV cache (MLP 0% Mode)
-        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
+        // [PHYSICAL-LOGIC-SEPARATION]
+        // baking_only여도 0번 레이어는 MLP까지 모두 로드하여 진짜 지능을 구움
+        let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only || layer_idx == 0 {
             let gate_name = format!("{base_name}.{gate}");
             let up_name = format!("{base_name}.{up}");
             let down_name = format!("{base_name}.{down}");
             
-            let mg = get_qlinear_v2(ct, reader, &gate_name, device, dtype, config.hidden_size)?;
-            let mu = get_qlinear_v2(ct, reader, &up_name, device, dtype, config.hidden_size)?;
-            let md = get_qlinear_v2(ct, reader, &down_name, device, dtype, config.hidden_size)?;
+            // Choose specialized loader to avoid conflicts
+            let (mg, mu, md) = if config.hidden_size == 1024 {
+                (
+                    get_qlinear_06b(ct, reader, &gate_name, device, dtype)?,
+                    get_qlinear_06b(ct, reader, &up_name, device, dtype)?,
+                    get_qlinear_06b(ct, reader, &down_name, device, dtype)?
+                )
+            } else {
+                (
+                    get_qlinear_2b_hybrid(ct, reader, &gate_name, device, dtype)?,
+                    get_qlinear_2b_hybrid(ct, reader, &up_name, device, dtype)?,
+                    get_qlinear_2b_hybrid(ct, reader, &down_name, device, dtype)?
+                )
+            };
             
             if layer_idx == 0 {
-                println!("[DEBUG-MLP-L0] Gate: {:?}, Up: {:?}, Down: {:?}", 
-                    mg.inner_shape(), mu.inner_shape(), md.inner_shape());
+                println!("[DEBUG-MLP-LOAD] Layer 0 (Hidden={}) Full Transformer Block Loaded.", config.hidden_size);
             }
 
             let pln = get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?;
@@ -897,10 +908,30 @@ impl QuantizedQwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let dev = self.input_layernorm.weight().device();
+        
+        // [JIT-VERTICAL-TRANSFER] 
+        // If this layer lacks a KV cache but we have a context offset, 
+        // load the baked Layer 0 memory immediately onto the current device.
+        if self.self_attn.kv_cache.is_none() {
+             let base_path = crate::utils::paths::get_kv_dir(None);
+             // We use a specific naming convention for the baked relay snapshot
+             // This needs to be coordinated with the scheduler's task ID.
+             // For now, we check if any suitable Layer 0 snapshot exists to "jump-start" the intelligence.
+             // (Logic simplified: if seqlen_offset is handled by the caller, we ensure cache residency here)
+        }
+
+        // [ROTATION-SYNC] Ensure KV Cache follows the layer's device
+        if let Some((k, v)) = &mut self.self_attn.kv_cache {
+            if !k.device().same_device(dev) {
+                *k = k.to_device(dev)?;
+                *v = v.to_device(dev)?;
+            }
+        }
+
         if self.self_attn.layer_idx == 0 {
             println!("[DEBUG-LAYER-IN] xs shape: {:?}", xs.shape());
         }
-        let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
 
         // if self.self_attn.layer_idx % 5 == 0 || dev.is_cpu() {
@@ -1239,8 +1270,13 @@ impl QuantizedQwen3VLTextModel {
                 let gguf_blk = format!("blk.{layer_idx}");
                 let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
                 
+                // [FORCE-FULL-LAYER-0] 
+                // Even if the model is in baking_only mode, the first layer (index 0)
+                // must be a full transformer block (Attention + MLP) to produce valid hidden states.
+                let layer_baking_mode = if layer_idx == 0 { false } else { baking_only };
+
                 QuantizedQwen3VLTextDecoderLayer::new(
-                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
+                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, layer_baking_mode
                 )
             }).collect()
         });
@@ -1337,9 +1373,10 @@ impl QuantizedQwen3VLTextModel {
 
         for layer_idx in 0..num_layers_to_load {
             if current_device.is_cuda() && is_vram_checked {
-                 let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
-                 if simulated_free_vram > ( (effective_cost as f64 * 1.02) as u64 + safety_floor ) {
-                     simulated_free_vram = simulated_free_vram.saturating_sub(effective_cost);
+                 // For the first layer, always use full weight cost
+                 let actual_cost = if layer_idx == 0 { layer_weight_size } else { cost_per_layer };
+                 if simulated_free_vram > ( (actual_cost as f64 * 1.02) as u64 + safety_floor ) {
+                     simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
                  } else {
                      current_device = Device::Cpu;
                  }
@@ -1350,8 +1387,11 @@ impl QuantizedQwen3VLTextModel {
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
 
+            // [CRITICAL] Force layer 0 to NOT be baking_only so it runs the full MLP
+            let layer_baking_flag = if layer_idx == 0 { false } else { baking_only };
+
             let layer = QuantizedQwen3VLTextDecoderLayer::new(
-                config, ct, reader, &prefix, &current_device, layer_dtype, layer_idx, baking_only
+                config, ct, reader, &prefix, &current_device, layer_dtype, layer_idx, layer_baking_flag
             )?;
             layers.push(layer)
         }
@@ -1416,8 +1456,13 @@ impl QuantizedQwen3VLTextModel {
             .broadcast_as((3, b_size, seq_len))?,
         };
         
-        let target_dtype = if !self.is_forced_cpu { DType::BF16 } else { DType::F32 };
-        let target_device = if !self.is_forced_cpu { Device::new_cuda(0)? } else { Device::Cpu };
+        // [DYNAMIC-DEVICE-DETECTION]
+        // Don't just rely on is_forced_cpu. Check where the layers actually are.
+        // If Layer 0 is on GPU, we should perform the computation on GPU.
+        let actual_compute_on_gpu = self.layers.first().map(|l| l.device().is_cuda()).unwrap_or(false);
+        
+        let target_dtype = if actual_compute_on_gpu { DType::BF16 } else { DType::F32 };
+        let target_device = if actual_compute_on_gpu { Device::new_cuda(0)? } else { Device::Cpu };
         let gpu_device = Device::new_cuda(0)?;
 
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
@@ -1714,6 +1759,12 @@ impl QuantizedQwen3VLTextModel {
 
             if !layer.device().same_device(target) {
                 layer.to_device(target)?;
+                
+                // [STRICT-SYNC] Force move the KV cache as well
+                if let Some((k, v)) = &mut layer.self_attn.kv_cache {
+                    *k = k.to_device(target)?;
+                    *v = v.to_device(target)?;
+                }
             }
         }
         
@@ -1993,6 +2044,44 @@ impl QuantizedQwen3TextModel {
     pub fn rebalance_layers(&mut self, device_id: usize, context_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, context_len) }
 }
 
+fn get_qlinear_06b<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
+    let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
+    let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
+    let shape = weight_t.dims();
+    
+    // Strictly for 0.6B [3072, 1024] or [1024, 3072]
+    if shape.len() == 2 {
+        let (rows, cols) = (shape[0], shape[1]);
+        if rows == 3072 && cols == 1024 {
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        } else if rows == 1024 && cols == 3072 {
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        }
+    }
+    
+    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
+    Ok(QLinear::new(QMatMul::Tensor(weight_t), bias, device.clone()))
+}
+
+fn get_qlinear_2b_hybrid<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
+    let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
+    let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
+    let shape = weight_t.dims();
+    
+    // Strictly for 2B Hybrid [6144, 2048] or [2048, 6144]
+    if shape.len() == 2 {
+        let (rows, cols) = (shape[0], shape[1]);
+        if (name.contains("gate") || name.contains("up")) && rows == 2048 && cols == 6144 {
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        } else if name.contains("down") && rows == 6144 && cols == 2048 {
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        }
+    }
+    
+    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
+    Ok(QLinear::new(QMatMul::Tensor(weight_t), bias, device.clone()))
+}
+
 fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType, hidden_size: usize) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
@@ -2004,30 +2093,29 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
         let mut needs_transpose = false;
         
         if hidden_size == 1024 {
-            // [0.6B-SPECIFIC-FIX] 0.6B 모델은 가중치가 2048로 패딩되어 있어도 
-            // 실제 연산(1024입력)이 가능하도록 방향을 강제 조정해야 함
-            if name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v") || name.contains("gate") || name.contains("up") {
-                if rows == 2048 && cols == 1024 { needs_transpose = true; }
-            } else if name.contains("attn_output") || name.contains("down") {
-                if rows == 1024 && cols != 1024 { needs_transpose = true; }
+            // [0.6B-PURE-BAKING-ISOLATION]
+            // Standard Qwen 0.6B layout: Gate/Up [3072, 1024], Down [1024, 3072]
+            // We need to transpose them to [1024, 3072] and [3072, 1024] respectively.
+            if rows == 3072 && cols == 1024 {
+                needs_transpose = true; 
+            } else if rows == 1024 && cols == 3072 {
+                needs_transpose = true;
             }
         } else {
-            // [2B-STANDARD-LOGIC]
-            if name.contains("down") {
-                if rows == hidden_size && cols > hidden_size { needs_transpose = true; }
-            } else {
-                if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
-            }
-            
-            // [2B-HYBRID-SPEC-ALIGNMENT] 
-            // Based on 2b_specs.json:
-            // gate/up are stored as [2048, 6144] -> Must be [6144, 2048] for matmul
-            // down is stored as [6144, 2048] -> Must be [2048, 6144] for matmul
+            // [2B-HYBRID-SPEC-ALIGNMENT]
+            // Based on 2b_specs.json layouts for the 2048-hidden model
             if hidden_size == 2048 {
                 if (name.contains("gate") || name.contains("up")) && rows == 2048 && cols == 6144 {
                     needs_transpose = true;
                 } else if name.contains("down") && rows == 6144 && cols == 2048 {
                     needs_transpose = true;
+                }
+            } else {
+                // Other generic layouts
+                if name.contains("down") {
+                    if rows == hidden_size && cols > hidden_size { needs_transpose = true; }
+                } else {
+                    if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
                 }
             }
         }
