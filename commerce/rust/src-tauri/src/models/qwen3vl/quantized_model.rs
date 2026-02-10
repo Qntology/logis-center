@@ -1549,11 +1549,9 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
-        if self.is_forced_cpu { return Ok(()); } // [FIX] Never move to GPU if user wants CPU
+        if self.is_forced_cpu { return Ok(()); } 
         
         use nvml_wrapper::Nvml;
-        
-        // VRAM 체크 (NVML 사용)
         let nvml = Nvml::init().ok();
         let mut free_vram = 0;
         
@@ -1565,35 +1563,46 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // 임계값 설정
-        let danger_zone = 300_000_000; // 300MB 이하: 위험 (내리기)
-        let safe_zone = 800_000_000;   // 800MB 이상: 여유 (올리기)
+        if free_vram == 0 { return Ok(()); }
 
-        if free_vram > 0 && free_vram < danger_zone {
-            // [OFFLOAD] GPU -> CPU (뒤쪽 레이어부터)
-            for layer in self.layers.iter_mut().rev() {
-                if layer.device().is_cuda() {
-                    println!("[REBALANCE] Low VRAM ({:.2} MB). Offloading Layer {} to CPU.", free_vram as f64 / 1e6, layer.self_attn.layer_idx);
-                    layer.to_device(&Device::Cpu)?;
-                    break; // 한 번에 하나씩만 이동 (급격한 변화 방지)
-                }
-            }
-        } else if free_vram > safe_zone {
-            // [UPLOAD] CPU -> GPU (앞쪽 레이어부터)
-            // 주의: self.layers[0]의 디바이스가 GPU여야 업로드 대상 장치를 알 수 있음
-            // 또는 generate 시점에 저장해둔 메인 디바이스 정보를 활용해야 함.
-            // 여기서는 첫 번째 레이어의 디바이스가 CPU일 경우를 대비해, 
-            // 외부에서 주입받거나, 혹은 임시로 CUDA:0 (또는 device_id)를 타겟으로 함.
-            let target_device = Device::new_cuda(device_id)?;
+        let target_device = Device::new_cuda(device_id)?;
+        
+        // [HYBRID-OFFLOAD-STRATEGY]
+        // 1. Calculate estimated size of one layer (approx 60-80MB for 2B Q4)
+        // 2. Keep 1GB buffer for KV Cache & Activations (Crucial for 50k+ tokens)
+        let safety_buffer = 1_000_000_000; 
+        let mut current_available = free_vram.saturating_sub(safety_buffer);
+        
+        let mut gpu_count = 0;
+        let mut cpu_count = 0;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Check if layer is already on GPU
+            let is_on_gpu = layer.device().is_cuda();
             
-            for layer in self.layers.iter_mut() {
-                if layer.device().is_cpu() {
-                    println!("[REBALANCE] Free VRAM ({:.2} GB). Uploading Layer {} to GPU.", free_vram as f64 / 1e9, layer.self_attn.layer_idx);
+            // Estimate layer size (this is a rough heuristic, could be improved by tracking actual weight sizes)
+            let layer_size = 75_000_000; // 75MB per layer for 2B Q4
+
+            if current_available > layer_size {
+                if !is_on_gpu {
+                    // println!("[REBALANCE] Moving Layer {} to GPU. Remaining VRAM buffer: {}MB", i, current_available / 1_000_000);
                     layer.to_device(&target_device)?;
-                    break; 
                 }
+                current_available -= layer_size;
+                gpu_count += 1;
+            } else {
+                if is_on_gpu {
+                    // println!("[REBALANCE] Moving Layer {} to CPU (VRAM Full).", i);
+                    layer.to_device(&Device::Cpu)?;
+                }
+                cpu_count += 1;
             }
         }
+
+        if gpu_count > 0 || cpu_count > 0 {
+            println!("[REBALANCE-RESULT] Hybrid Distribution: {} Layers on GPU, {} Layers on CPU.", gpu_count, cpu_count);
+        }
+        
         Ok(())
     }
 }

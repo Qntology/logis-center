@@ -462,7 +462,21 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
+                    let text = match &params.messages[0] {
+                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
+                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
+                            _ => "".to_string(),
+                        },
+                        _ => "".to_string(),
+                    };
+                    
+                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
+                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
+                        worker.prefill_chunk(text, Some(token_clone), None)?;
+                    } else {
+                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    }
                 }
                 Ok(())
             }).await??;
@@ -612,7 +626,21 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
+                    let text = match &params.messages[0] {
+                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
+                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
+                            _ => "".to_string(),
+                        },
+                        _ => "".to_string(),
+                    };
+                    
+                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
+                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
+                        worker.prefill_chunk(text, Some(token_clone), None)?;
+                    } else {
+                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    }
                 }
                 Ok(())
             }).await??;
@@ -703,7 +731,21 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
+                    let text = match &params.messages[0] {
+                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
+                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
+                            _ => "".to_string(),
+                        },
+                        _ => "".to_string(),
+                    };
+                    
+                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
+                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
+                        worker.prefill_chunk(text, Some(token_clone), None)?;
+                    } else {
+                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    }
                 }
                 Ok(())
             }).await??;
@@ -853,7 +895,21 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
+                        // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
+                    let text = match &params.messages[0] {
+                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
+                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
+                            _ => "".to_string(),
+                        },
+                        _ => "".to_string(),
+                    };
+                    
+                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
+                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
+                        worker.prefill_chunk(text, Some(token_clone), None)?;
+                    } else {
                         worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    }
                     }
                     Ok(())
                 }).await??;

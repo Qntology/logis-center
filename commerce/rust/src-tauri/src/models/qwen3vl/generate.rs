@@ -418,52 +418,72 @@ impl Qwen3VLGenerateModel {
         Ok(current_pos)
     }
 
-    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
-        let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
-        let chunk_size = chunk_ids_vec.len();
-        let current_pos = self.get_kv_len();
-        let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
-        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
-        if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
+    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+        let full_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
+        let total_size = full_ids_vec.len();
+        let mut processed_so_far = 0;
         
-        if let Some(target) = relay_target {
-            let (ks, vs) = self.get_current_kv();
-            // [TURBO-RELAY] Parallelize layer compression
+        // Memory-safe prefill chunk size (Adjusted based on device)
+        let step_size = if self.text_device.is_cpu() { 4096 } else { 2048 };
+
+        while processed_so_far < total_size {
+            let current_pos = self.get_kv_len();
+            let remaining = total_size - processed_so_far;
+            let current_chunk_len = if remaining > step_size { step_size } else { remaining };
+            
+            let chunk_ids_slice = &full_ids_vec[processed_so_far..processed_so_far + current_chunk_len];
+            let chunk_ids = Tensor::from_vec(chunk_ids_slice.to_vec(), (1, current_chunk_len), &self.text_device)?;
+            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + current_chunk_len) as u32, &self.text_device)?.unsqueeze(0)?;
+            
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
+            // Forward pass for current segment
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
+            
+            // Optional: Relay KV cache segment to target
+            if let Some(ref mut target) = relay_target {
+                let (ks, vs) = self.get_current_kv();
                 let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
-                 let s_len = k.dim(candle_core::D::Minus2)?;
-                 let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                 let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                 
-                 if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                    let res_k = m.language_model.compress_to_bitkv(&k_new)?;
-                    let res_v = m.language_model.compress_to_bitkv(&v_new)?;
-                    Ok((res_k, res_v))
-                } else {
-                    Err(anyhow!("Unsupported variant"))
+                     let s_len = k.dim(candle_core::D::Minus2)?;
+                     let k_new = k.narrow(candle_core::D::Minus2, s_len - current_chunk_len, current_chunk_len)?;
+                     let v_new = v.narrow(candle_core::D::Minus2, s_len - current_chunk_len, current_chunk_len)?;
+                     
+                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
+                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
+                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
+                        Ok((res_k, res_v))
+                    } else {
+                        Err(anyhow!("Unsupported variant"))
+                    }
+                }).collect();
+
+                let results = results?;
+                let mut k_anchors = Vec::with_capacity(results.len());
+                let mut k_packed = Vec::with_capacity(results.len());
+                let mut k_scales = Vec::with_capacity(results.len());
+                let mut v_anchors = Vec::with_capacity(results.len());
+                let mut v_packed = Vec::with_capacity(results.len());
+                let mut v_scales = Vec::with_capacity(results.len());
+                let mut original_shape = vec![];
+
+                for (res_k, res_v) in results {
+                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
+                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
+                    original_shape = res_k.3;
                 }
-            }).collect();
-
-            let results = results?;
-            let mut k_anchors = Vec::with_capacity(results.len());
-            let mut k_packed = Vec::with_capacity(results.len());
-            let mut k_scales = Vec::with_capacity(results.len());
-            let mut v_anchors = Vec::with_capacity(results.len());
-            let mut v_packed = Vec::with_capacity(results.len());
-            let mut v_scales = Vec::with_capacity(results.len());
-            let mut original_shape = vec![];
-
-            for (res_k, res_v) in results {
-                k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                original_shape = res_k.3;
+                
+                if !k_anchors.is_empty() {
+                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
+                }
             }
             
-            if !k_anchors.is_empty() {
-                target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
+            processed_so_far += current_chunk_len;
+            if total_size > step_size {
+                println!("[MODEL-PROGRESS] Chunked Prefill: {}/{} tokens ({:.1}%)", processed_so_far, total_size, (processed_so_far as f64 / total_size as f64) * 100.0);
             }
         }
-        Ok(chunk_size)
+        
+        Ok(total_size)
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
