@@ -1374,17 +1374,34 @@ impl QuantizedQwen3VLTextModel {
 
         let gpu_device = Device::new_cuda(0)?;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // [EXCLUSIVE-JIT-EXECUTION]
-            // 1. Move weight AND KV cache to GPU
-            layer.to_device(&gpu_device)?;
+            let is_on_cpu = layer.device().is_cpu();
             
-            // 2. Perform high-speed computation
+            // [SMART-STREAMING] Only move to GPU if not already pinned there
+            if is_on_cpu {
+                layer.to_device(&gpu_device)?;
+            }
+            
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
-            // 3. Immediately evacuate to RAM to free VRAM for NEXT layer or KV growth
-            // We use synchronize to ensure math is finished before moving
-            let _ = gpu_device.synchronize();
-            layer.to_device(&Device::Cpu)?;
+            // [HARD-CLEANUP] If it was a streamed layer, ensure immediate and clean eviction
+            if is_on_cpu {
+                // 1. Wait for GPU math to truly finish
+                let _ = gpu_device.synchronize();
+                // 2. Move weights back to CPU
+                layer.to_device(&Device::Cpu)?;
+                
+                // 3. [WINDOWS-ONLY] Force OS to reclaim residual handles
+                #[cfg(target_os = "windows")]
+                if layer_idx % 5 == 0 {
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                        use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
+                        use windows_sys::Win32::System::Memory::{QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+                        let process = GetCurrentProcess();
+                        let _ = SetProcessWorkingSetSizeEx(process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                    }
+                }
+            }
 
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -1576,18 +1593,67 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    pub fn rebalance_layers(&mut self, _device_id: usize) -> Result<()> {
+    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
         if self.is_forced_cpu { return Ok(()); } 
         
-        // [EXCLUSIVE-DYNAMIC-STRATEGY]
-        // We no longer pre-allocate GPU layers. 
-        // All layers stay on CPU by default to keep VRAM 100% clear for context.
-        // The forward() loop will handle JIT exclusive loading.
-        for layer in self.layers.iter_mut() {
-            if layer.device().is_cuda() {
-                layer.to_device(&Device::Cpu)?;
+        use nvml_wrapper::Nvml;
+        let nvml = Nvml::init().ok();
+        let mut free_vram = 0;
+        
+        if let Some(nvml_inst) = &nvml {
+            if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
+                if let Ok(mem) = dev.memory_info() {
+                    free_vram = mem.free;
+                }
             }
         }
+
+        if free_vram == 0 { return Ok(()); }
+
+        let target_device = Device::new_cuda(device_id)?;
+        
+        // [DYNAMIC-PINNING-STRATEGY]
+        // safety_margin: 2.0GB (1GB system, 1GB activations)
+        // Check for stability: ensure we have at least some extra room before pinning
+        let total_safety_margin = 2_000_000_000; 
+        let layer_size = 75_000_000; 
+        
+        let available_for_weights = free_vram.saturating_sub(total_safety_margin);
+        
+        // If VRAM is too low even for safety buffer, aggressively offload EVERYTHING
+        if free_vram < 1_500_000_000 {
+            println!("[VRAM-PANIC] VRAM extremely low ({}MB). Evacuating ALL layers to RAM.", free_vram / 1_000_000);
+            for layer in self.layers.iter_mut() {
+                if layer.device().is_cuda() { layer.to_device(&Device::Cpu)?; }
+            }
+            return Ok(());
+        }
+        let max_gpu_layers = (available_for_weights / layer_size as u64) as usize;
+        let max_gpu_layers = max_gpu_layers.min(self.layers.len());
+
+        let mut moved_to_gpu = 0;
+        let mut moved_to_cpu = 0;
+        let mut pinned_count = 0;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let target = if i < max_gpu_layers {
+                pinned_count += 1;
+                &target_device
+            } else {
+                &Device::Cpu
+            };
+
+            if !layer.device().same_device(target) {
+                layer.to_device(target)?;
+                if target.is_cuda() { moved_to_gpu += 1; } else { moved_to_cpu += 1; }
+            }
+        }
+
+        if moved_to_gpu > 0 || moved_to_cpu > 0 {
+            println!("[PINNING-REPORT] GPU Pinned: {}/{} Layers. Streaming remaining: {}. (System Buffer: 1GB, Free: {}MB)", 
+                pinned_count, self.layers.len(), self.layers.len() - pinned_count, free_vram / 1_000_000);
+        }
+        
         Ok(())
     }
 }
