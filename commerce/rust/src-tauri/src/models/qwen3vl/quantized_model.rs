@@ -276,13 +276,21 @@ impl QuantizedQwen3VLTextAttention {
 
         let (q_proj, k_proj, v_proj) = if has_individual {
             let mut qp = get_qlinear(ct, reader, &q_proj_name, device, dtype)?;
-            let kp = get_qlinear(ct, reader, &k_proj_name, device, dtype)?;
-            let vp = get_qlinear(ct, reader, &v_proj_name, device, dtype)?;
+            let mut kp = get_qlinear(ct, reader, &k_proj_name, device, dtype)?;
+            let mut vp = get_qlinear(ct, reader, &v_proj_name, device, dtype)?;
             
-            // [HARDENING] 만약 로드된 Q의 입력 차원이 2048인데 현재 모델이 1024 기반이라면 슬라이싱 시도
-            if qp.inner_shape().len() >= 2 && qp.inner_shape()[1] == 2048 && actual_h_size == 1024 {
-                println!("[MODEL-FIX] Slicing individual Q from 2048-dim container for 0.6B layer.");
-                qp = get_sliced_qlinear(ct, reader, &q_proj_name, device, dtype, 1, 0, 1024)?;
+            // [HARDENING] Only slice if we are in 1024-dim model mode but found 2048-dim container
+            if actual_h_size == 1024 {
+                if qp.inner_shape().len() >= 2 && qp.inner_shape()[1] == 2048 {
+                    println!("[MODEL-FIX] Slicing individual Q from 2048-dim container for 0.6B layer.");
+                    qp = get_sliced_qlinear(ct, reader, &q_proj_name, device, dtype, 1, 0, 1024)?;
+                }
+                if kp.inner_shape().len() >= 2 && kp.inner_shape()[1] == 2048 {
+                    kp = get_sliced_qlinear(ct, reader, &k_proj_name, device, dtype, 1, 0, 1024)?;
+                }
+                if vp.inner_shape().len() >= 2 && vp.inner_shape()[1] == 2048 {
+                    vp = get_sliced_qlinear(ct, reader, &v_proj_name, device, dtype, 1, 0, 1024)?;
+                }
             }
             (qp, kp, vp)
         } else if has_combined {
@@ -294,11 +302,25 @@ impl QuantizedQwen3VLTextAttention {
             return Err(anyhow!("Could not find QKV tensors for layer {}", layer_idx));
         };
 
-        let o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+        let mut o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+        
+        // [HYBRID-FIX] Detect if o_proj is 2048-dim and we are in 1024-dim model
+        if actual_h_size == 1024 {
+            let shape = o_proj.inner_shape();
+            if shape.len() >= 2 {
+                if shape[0] == 2048 {
+                    println!("[MODEL-FIX] Slicing o_proj OUTPUT 2048 -> 1024 for 0.6B.");
+                    o_proj = get_sliced_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype, 0, 0, 1024)?;
+                } else if shape[1] == 2048 {
+                    println!("[MODEL-FIX] Slicing o_proj INPUT 2048 -> 1024 for 0.6B.");
+                    o_proj = get_sliced_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype, 1, 0, 1024)?;
+                }
+            }
+        }
 
         if layer_idx == 0 {
-            println!("[DEBUG-ATTN-L0] Q shape: {:?}, K shape: {:?}, V shape: {:?}, head_dim: {}", 
-                q_proj.inner_shape(), k_proj.inner_shape(), v_proj.inner_shape(), head_dim);
+            println!("[DEBUG-ATTN-L0] Q: {:?}, K: {:?}, V: {:?}, O: {:?}, head_dim: {}", 
+                q_proj.inner_shape(), k_proj.inner_shape(), v_proj.inner_shape(), o_proj.inner_shape(), head_dim);
         }
 
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
@@ -806,6 +828,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        if self.self_attn.layer_idx == 0 {
+            println!("[DEBUG-LAYER-IN] xs shape: {:?}", xs.shape());
+        }
         let dev = self.input_layernorm.weight().device();
         let target_dtype = self.input_layernorm.weight().dtype();
 
@@ -832,13 +857,22 @@ impl QuantizedQwen3VLTextDecoderLayer {
              None
         };
 
-        let residual = xs.clone();
+        let hybrid_residual = xs.clone();
+        
+        if self.self_attn.layer_idx == 0 {
+            println!("[TRACE-L0-PRE] xs: {:?}, residual: {:?}", xs.shape(), hybrid_residual.shape());
+        }
+
         let xs = self.input_layernorm.forward(&xs)?;
         let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
         
+        if self.self_attn.layer_idx == 0 {
+            println!("[TRACE-L0-POST] xs: {:?}, residual: {:?}", xs.shape(), hybrid_residual.shape());
+        }
+
         // [HARDENING] Residual Addition DType Guard
-        let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
-        let xs = residual.add(&xs)?;
+        let xs = if xs.dtype() != hybrid_residual.dtype() { xs.to_dtype(hybrid_residual.dtype())? } else { xs };
+        let xs = hybrid_residual.add(&xs)?;
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
