@@ -242,20 +242,9 @@ impl QuantizedQwen3VLTextAttention {
         let q_weight_name = format!("{base_name}.{q}.weight");
         let k_weight_name = format!("{base_name}.{k}.weight");
 
-        // [FIX] Strict Head Detection: Derive heads from actual_h_size to prevent mismatch in 0.6B models
-        let num_attention_heads = actual_h_size / head_dim;
-        let num_key_value_heads = if is_06b {
-            num_attention_heads // 0.6B typically uses full MHA or specific parity
-        } else {
-            // For 2B+, try to detect GQA from tensors, but fallback to 16
-            if let Some(info) = ct.tensor_infos.get(&k_weight_name) {
-                let dims = info.shape.dims();
-                let out_f = if dims.len() >= 2 { if dims[0] == actual_h_size { dims[1] } else { dims[0] } } else { dims[0] };
-                if out_f < actual_h_size { out_f / head_dim } else { num_attention_heads }
-            } else {
-                num_attention_heads
-            }
-        };
+        // [FIX] Strict Head Detection: Direct mapping from hidden size
+        let num_attention_heads = if actual_h_size == 2048 { 16 } else if actual_h_size == 1024 { 8 } else { actual_h_size / head_dim };
+        let num_key_value_heads = if actual_h_size == 2048 { 16 } else if actual_h_size == 1024 { 8 } else { num_attention_heads };
 
         let num_kv_groups = if num_key_value_heads > 0 {
             num_attention_heads / num_key_value_heads
@@ -1099,29 +1088,23 @@ impl QuantizedQwen3VLTextModel {
         }
         let config = &patched_config_owned;
 
-        let token_emb_name = format!("{base_name}.embed_tokens.weight");
-        let alt_token_emb = "token_embd.weight";
-        let alt_token_emb2 = "model.embed_tokens.weight";
-        let alt_token_emb3 = "token_embeddings.weight";
-        
-        let embed_tokens = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
-             let h = tensor.dim(1)?;
-             Embedding::new(tensor, h)
-        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
-             let h = tensor.dim(1)?;
-             Embedding::new(tensor, h)
-        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb2, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
-             let h = tensor.dim(1)?;
-             Embedding::new(tensor, h)
-        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb3, device) {
-             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+        // [EXHAUSTIVE-SEARCH] Search for any key that looks like an embedding
+        let mut embed_key = None;
+        for key in ct.tensor_infos.keys() {
+            let k_low = key.to_lowercase();
+            if k_low.contains("token_embd") || (k_low.contains("embed_tokens") && k_low.contains("weight")) || k_low == "model.embed_tokens" {
+                embed_key = Some(key.clone());
+                break;
+            }
+        }
+
+        let embed_tokens = if let Some(key) = embed_key {
+             println!("[HYBRID] Found embedding weight with key: {}", key);
+             let tensor = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
              Embedding::new(tensor, h)
         } else {
-             println!("[HYBRID] Embedding not found in GGUF. Available keys: {:?}", ct.tensor_infos.keys().take(20).collect::<Vec<_>>());
+             println!("[HYBRID-ERROR] NO EMBEDDING FOUND. ALL KEYS: {:?}", ct.tensor_infos.keys().collect::<Vec<_>>());
              println!("[HYBRID] Creating dummy with size: {}", actual_h_size);
              let dummy_tensor = Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?;
              Embedding::new(dummy_tensor, actual_h_size)
