@@ -1358,9 +1358,6 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if xs.device().is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
 
-        // [DYNAMIC-RECOVERY] Periodically recover GPU resources
-        let _ = self.rebalance_layers(0);
-
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
                 None
@@ -1376,25 +1373,18 @@ impl QuantizedQwen3VLTextModel {
         };
 
         let gpu_device = Device::new_cuda(0)?;
-        let _total_layers = self.layers.len();
-        
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // [JIT-GPU-STREAMING] If layer is on CPU, move to GPU for high-speed math
-            let originally_on_cpu = layer.device().is_cpu();
-            if originally_on_cpu {
-                // println!("[STREAM] Uploading Layer {} to GPU for JIT execution...", layer_idx);
-                layer.to_device(&gpu_device)?;
-            }
-
+            // [EXCLUSIVE-JIT-EXECUTION]
+            // 1. Move weight AND KV cache to GPU
+            layer.to_device(&gpu_device)?;
+            
+            // 2. Perform high-speed computation
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
-            // [VRAM-EMERGENCY-EVICT] If VRAM is getting tight after this layer, move it back to RAM
-            // This leaves room for the NEXT layer to be uploaded
-            if originally_on_cpu {
-                // Manual sync to ensure GPU finished math before we move weights back
-                let _ = gpu_device.synchronize();
-                layer.to_device(&Device::Cpu)?;
-            }
+            // 3. Immediately evacuate to RAM to free VRAM for NEXT layer or KV growth
+            // We use synchronize to ensure math is finished before moving
+            let _ = gpu_device.synchronize();
+            layer.to_device(&Device::Cpu)?;
 
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -1586,57 +1576,18 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
+    pub fn rebalance_layers(&mut self, _device_id: usize) -> Result<()> {
         if self.is_forced_cpu { return Ok(()); } 
         
-        use nvml_wrapper::Nvml;
-        let nvml = Nvml::init().ok();
-        let mut free_vram = 0;
-        
-        if let Some(nvml_inst) = &nvml {
-            if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
-                if let Ok(mem) = dev.memory_info() {
-                    free_vram = mem.free;
-                }
+        // [EXCLUSIVE-DYNAMIC-STRATEGY]
+        // We no longer pre-allocate GPU layers. 
+        // All layers stay on CPU by default to keep VRAM 100% clear for context.
+        // The forward() loop will handle JIT exclusive loading.
+        for layer in self.layers.iter_mut() {
+            if layer.device().is_cuda() {
+                layer.to_device(&Device::Cpu)?;
             }
         }
-
-        if free_vram == 0 { return Ok(()); }
-
-        let target_device = Device::new_cuda(device_id)?;
-        
-        // [GPU-HEAVY-BLOCK-STRATEGY]
-        // safety_buffer: Reduced to 800MB to maximize GPU space
-        // layer_size: ~75MB
-        let safety_buffer = 800_000_000; 
-        let layer_size = 75_000_000; 
-        
-        let available_for_weights = free_vram.saturating_sub(safety_buffer);
-        let max_gpu_layers = (available_for_weights / layer_size as u64) as usize;
-        let max_gpu_layers = max_gpu_layers.min(self.layers.len());
-
-        let mut moved_count = 0;
-        let mut gpu_count = 0;
-
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            let target = if i < max_gpu_layers {
-                gpu_count += 1;
-                &target_device
-            } else {
-                &Device::Cpu
-            };
-
-            if !layer.device().same_device(target) {
-                layer.to_device(target)?;
-                moved_count += 1;
-            }
-        }
-
-        if moved_count > 0 {
-            println!("[REBALANCE-GPU-PRIORITY] Pivot at Layer {}. GPU: 0-{}, CPU: {}-{}. (Free VRAM: {}MB)", 
-                max_gpu_layers, max_gpu_layers.saturating_sub(1), max_gpu_layers, self.layers.len().saturating_sub(1), free_vram / 1_000_000);
-        }
-        
         Ok(())
     }
 }
