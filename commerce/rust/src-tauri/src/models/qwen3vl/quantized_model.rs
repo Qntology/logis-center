@@ -1654,7 +1654,7 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
+    pub fn rebalance_layers(&mut self, device_id: usize, context_len: usize) -> Result<()> {
         use nvml_wrapper::Nvml;
         let nvml = Nvml::init().ok();
         let mut free_vram = 0;
@@ -1670,25 +1670,22 @@ impl QuantizedQwen3VLTextModel {
         if free_vram == 0 { return Ok(()); }
 
         // [DYNAMIC-RECOVERY] 
-        // If we were forced to CPU but now have plenty of VRAM (e.g. > 2.5GB),
-        // allow rebalancing to GPU again.
+        // 2.5GB is the threshold to start moving layers back to GPU
         let can_rebalance = !self.is_forced_cpu || free_vram > 2_500_000_000;
         if !can_rebalance { return Ok(()); }
 
-        let target_device = Device::new_cuda(device_id)?;
-        
-        // [ULTRA-DYNAMIC-STRATEGY]
-        // Reduced safety margin to 400MB to maximize GPU speed for Question Prefill.
-        // Weights (1.5GB) + 10k Context (1.1GB) = 2.6GB. 
-        // 4.1GB - 2.6GB = 1.5GB remaining for safety and browser.
-        let total_safety_margin = 400_000_000; 
+        // [KV-AWARE-ESTIMATION]
+        // For 2B Hybrid (GQA): 2 * layers * kv_heads * head_dim * precision
+        // 2 * 27 * 8 * 128 * 2 bytes (BF16) = 110,592 bytes per token (~110 KB)
+        let kv_cache_size = (context_len as u64) * 110_592;
+        let total_safety_margin = 400_000_000 + kv_cache_size; 
         
         let layer_size = 75_000_000; 
         let available_for_weights = free_vram.saturating_sub(total_safety_margin);
         
-        // [VRAM-GUARD] Hard floor at 350MB to prevent system instability
-        if free_vram < 350_000_000 {
-            let needed = 600_000_000_u64.saturating_sub(free_vram);
+        if free_vram < (total_safety_margin + 100_000_000) {
+            // If VRAM is too tight, evict layers
+            let needed = (total_safety_margin + 200_000_000).saturating_sub(free_vram);
             let layers_to_evict = (needed / layer_size as u64) as usize + 1;
             
             let mut evicted = 0;
@@ -1699,20 +1696,14 @@ impl QuantizedQwen3VLTextModel {
                     evicted += 1;
                 }
             }
-            if evicted > 0 {
-                println!("[VRAM-GUARD] Evicted {} layers to protect {}MB safety buffer. (Free: {}MB)", 
-                    evicted, total_safety_margin / 1_000_000, free_vram / 1_000_000);
-            }
             return Ok(());
         }
 
+        let target_device = Device::new_cuda(device_id)?;
         let max_gpu_layers = (available_for_weights / layer_size as u64) as usize;
         let max_gpu_layers = max_gpu_layers.min(self.layers.len());
 
-        let mut moved_to_gpu = 0;
-        let mut moved_to_cpu = 0;
         let mut pinned_count = 0;
-
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let target = if i < max_gpu_layers {
                 pinned_count += 1;
@@ -1723,13 +1714,12 @@ impl QuantizedQwen3VLTextModel {
 
             if !layer.device().same_device(target) {
                 layer.to_device(target)?;
-                if target.is_cuda() { moved_to_gpu += 1; } else { moved_to_cpu += 1; }
             }
         }
-
-        if moved_to_gpu > 0 || moved_to_cpu > 0 {
-            println!("[PINNING-REPORT] GPU Pinned: {}/{} Layers. Streaming remaining: {}. (Safety Buffer: {}MB, Free: {}MB)", 
-                pinned_count, self.layers.len(), self.layers.len() - pinned_count, total_safety_margin / 1_000_000, free_vram / 1_000_000);
+        
+        if pinned_count > 0 {
+            println!("[PINNING-REPORT] GPU Pinned: {}/{} Layers. (Context: {} tokens, KV: {}MB, Free: {}MB)", 
+                pinned_count, self.layers.len(), context_len, kv_cache_size / 1_000_000, free_vram / 1_000_000);
         }
         
         Ok(())
@@ -1873,8 +1863,9 @@ impl QuantizedQwen3VLModel {
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        let (b_sz, seq_len) = input_ids_in.dims2()?;
         // [DYNAMIC-RECOVERY] Periodically check for GPU resource availability
-        let _ = self.language_model.rebalance_layers(0);
+        let _ = self.language_model.rebalance_layers(0, seqlen_offset + seq_len);
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
@@ -1924,7 +1915,7 @@ impl QuantizedQwen3VLModel {
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
+    pub fn rebalance_layers(&mut self, device_id: usize, context_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, context_len) }
 }
 
 #[derive(Clone)]
@@ -1971,8 +1962,9 @@ impl QuantizedQwen3TextModel {
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        let (b_sz, seq_len) = input_ids_in.dims2()?;
         // [DYNAMIC-RECOVERY] Check for free VRAM and move layers back to GPU if possible
-        let _ = self.language_model.rebalance_layers(0);
+        let _ = self.language_model.rebalance_layers(0, seqlen_offset + seq_len);
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
@@ -1998,7 +1990,7 @@ impl QuantizedQwen3TextModel {
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
+    pub fn rebalance_layers(&mut self, device_id: usize, context_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, context_len) }
 }
 
 fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType, hidden_size: usize) -> Result<QLinear> {

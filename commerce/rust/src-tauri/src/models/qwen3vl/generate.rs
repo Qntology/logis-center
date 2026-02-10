@@ -43,11 +43,11 @@ impl ModelVariant {
         }
     }
 
-    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
+    pub fn rebalance_layers(&mut self, device_id: usize, context_len: usize) -> Result<()> {
         match self {
             Self::Standard(_) => Ok(()), // Standard model doesn't support dynamic rebalancing yet
-            Self::QuantizedVL(m) => m.rebalance_layers(device_id),
-            Self::QuantizedText(m) => m.rebalance_layers(device_id),
+            Self::QuantizedVL(m) => m.rebalance_layers(device_id, context_len),
+            Self::QuantizedText(m) => m.rebalance_layers(device_id, context_len),
         }
     }
 
@@ -512,8 +512,8 @@ impl Qwen3VLGenerateModel {
                     // [HYBRID-SPEED-UP] Force all layers to GPU now that context is loaded
                     if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
                         println!("[HYBRID-SPEED-UP] Forcing GPU residency for all layers...");
-                        let _ = m.language_model.rebalance_layers(0);
-                        let _ = m.language_model.rebalance_layers(0);
+                        let _ = m.language_model.rebalance_layers(0, seqlen_offset);
+                        let _ = m.language_model.rebalance_layers(0, seqlen_offset);
                     }
                 }
             }
@@ -556,7 +556,7 @@ impl Qwen3VLGenerateModel {
             
             // [DYNAMIC-RECOVERY] Check for GPU availability every chunk during prefill
             if !self.qwen3_vl.is_cpu() {
-                let _ = self.qwen3_vl.rebalance_layers(0);
+                let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset + chunk_size);
             }
             
             local_pos += chunk_size;
@@ -576,7 +576,7 @@ impl Qwen3VLGenerateModel {
         // [PRE-GEN-LOAD] Warm up GPU by filling it with layers before the loop starts
         if !self.qwen3_vl.is_cpu() {
             println!("[HYBRID-SPEED-UP] Pre-loading layers to GPU for instant generation...");
-            let _ = self.qwen3_vl.rebalance_layers(0);
+            let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset);
         }
 
         for _i in 0..max_new_tokens {
@@ -589,7 +589,7 @@ impl Qwen3VLGenerateModel {
             
             // [ADAPTIVE-VRAM-GUARD] Check every 5 tokens to prevent OOM as KV cache grows
             if _i > 0 && _i % 5 == 0 && !self.qwen3_vl.is_cpu() {
-                let _ = self.qwen3_vl.rebalance_layers(0);
+                let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset);
             }
 
             let input_ids = if generated_text.is_empty() {
@@ -609,7 +609,7 @@ impl Qwen3VLGenerateModel {
             // force all layers to GPU regardless of usual safety margins.
             if generated_text.is_empty() && !self.qwen3_vl.is_cpu() {
                 println!("[TURBO] Accelerating Question Prefill ({} tokens)...", seq_len);
-                let _ = self.qwen3_vl.rebalance_layers(0);
+                let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset + seq_len);
             }
 
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
@@ -636,7 +636,7 @@ impl Qwen3VLGenerateModel {
             
             // [REBALANCE] 512 토큰마다 VRAM 상태 체크하여 레이어 재배치 (CPU 모드가 아닐 때만)
             if _i > 0 && _i % 512 == 0 && !self.qwen3_vl.is_cpu() {
-                if let Err(e) = self.qwen3_vl.rebalance_layers(0) {
+                if let Err(e) = self.qwen3_vl.rebalance_layers(0, seqlen_offset + seq_len) {
                     println!("[REBALANCE] Failed: {}", e);
                 }
             }

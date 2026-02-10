@@ -206,35 +206,43 @@ impl LogisModel {
     }
 
     pub async fn deep_purge_resources(&self) {
-        println!("[MEMORY] Initiating HARD Deep Purge...");
-        if !self.is_cpu_mode {
-            let dev = self.device_config.device.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() { 
-                    let _ = dev.synchronize(); 
-                }
-            }).await;
-        }
-
-        // 1. Clear ALL Slots (Forced wait for lock to ensure reclamation)
+        println!("[MEMORY] Initiating AGGRESSIVE Deep Purge...");
+        
+        // 1. Clear ALL Slots (Explicitly take and drop)
         {
             let mut gen = self.generator.lock().await;
-            *gen = None;
+            if let Some(mut g) = gen.take() {
+                g.clear_kv_cache();
+                drop(g);
+            }
         }
         {
             let mut s_hib = self.small_hibernation.lock().await;
-            *s_hib = None;
+            if let Some(g) = s_hib.take() { drop(g); }
         }
         {
             let mut l_hib = self.large_hibernation.lock().await;
-            *l_hib = None;
+            if let Some(g) = l_hib.take() { drop(g); }
         }
         {
             let mut size = self.current_size.lock().await;
             *size = None;
         }
 
-        // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
+        // 2. CUDA Force Sync & GC (Multi-pass)
+        if !self.is_cpu_mode {
+            let dev = self.device_config.device.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if dev.is_cuda() { 
+                    // Perform multiple syncs to ensure driver cleanup
+                    let _ = dev.synchronize(); 
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = dev.synchronize();
+                }
+            }).await;
+        }
+
+        // 3. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::*;
@@ -244,7 +252,8 @@ impl LogisModel {
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
 
-        println!("[MEMORY] Deep Purge Complete. VRAM/RAM released to OS.");
+        println!("[MEMORY] Aggressive Purge Complete. Waiting for OS stabilization...");
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
@@ -380,27 +389,27 @@ impl LogisModel {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+        println!("[RELAY] Performing AGGRESSIVE Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
-            // VRAM이 실제로 비워질 때까지 대기 (대기 시간 0.5s -> 1.0s 상향)
+            // VRAM이 실제로 비워질 때까지 대기 (대기 시간 1.0s)
             tokio::time::sleep(Duration::from_millis(1000)).await;
-                        // 타겟 VRAM 상향 (2000MB -> 2500MB)
-                        self.wait_for_vram_settle(2500, 7, cancel_token.clone()).await?;
-                    }
+            // 타겟 VRAM 상향 (2500MB -> 2800MB 확보될때까지 대기)
+            self.wait_for_vram_settle(2800, 10, cancel_token.clone()).await?;
+        }
             
-                    // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-                    // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
-                    let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
-                    
-                    // 로드 직전에 한 번 더 리소스 정리 시도 (안전 장치)
-                    #[cfg(target_os = "windows")]
-                    unsafe {
-                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                    }
+        // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
+        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
+        let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
+        
+        // 로드 직전에 한 번 더 리소스 정리 시도 (안전 장치)
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        }
             
                     self.ensure_generator_ext(target_size, text_only, is_baking).await?;
 
