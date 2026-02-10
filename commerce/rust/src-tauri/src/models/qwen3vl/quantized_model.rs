@@ -188,7 +188,8 @@ impl QuantizedQwen3VLTextAttention {
         self.q_norm.to_device(device)?;
         self.k_norm.to_device(device)?;
         
-        if let Some((k, v)) = &self.kv_cache {
+        // [KV-CACHE-MIGRATION]
+        if let Some((k, v)) = self.kv_cache.take() {
             let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
             self.kv_cache = Some((
                 k.to_device(device)?.to_dtype(target_dtype)?, 
@@ -687,9 +688,24 @@ impl QuantizedQwen3VLTextAttention {
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
         let file_path = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-        if !file_path.exists() { return Ok(()); }
+        
+        // [HYBRID-PROPAGATION-LOGIC]
+        if !file_path.exists() {
+            if self.layer_idx > 0 {
+                let layer0_path = path.join("layer_0_kv.safetensors");
+                if layer0_path.exists() {
+                    if self.layer_idx == 1 { println!("[HYBRID-BRIDGE] Propagating Layer 0 knowledge to all 2B layers..."); }
+                    return self.load_kv_from_file_internal(&layer0_path, device, expected_len, upscale_refill_len);
+                }
+            }
+            return Ok(()); 
+        }
 
-        let file = std::fs::File::open(&file_path)?;
+        self.load_kv_from_file_internal(&file_path, device, expected_len, upscale_refill_len)
+    }
+
+    fn load_kv_from_file_internal(&mut self, file_path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+        let file = std::fs::File::open(file_path)?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let st = safetensors::SafeTensors::deserialize(&mmap)?;
         
@@ -720,8 +736,8 @@ impl QuantizedQwen3VLTextAttention {
             };
             (dequantize_bitkv("k")?, dequantize_bitkv("v")?)
         } else {
-            // Fallback to old 1-bit or 8-bit
-            let dequantize_legacy = |prefix: &str| -> Result<Tensor> {
+            // Fallback to legacy dequantizers
+            let deq_leg = |prefix: &str| -> Result<Tensor> {
                 let packed_view = st.tensor(&format!("{}_packed", prefix))?;
                 let packed = Tensor::from_slice(packed_view.data(), packed_view.shape(), device)?;
                 let scales_view = st.tensor(&format!("{}_scales", prefix))?;
@@ -729,12 +745,11 @@ impl QuantizedQwen3VLTextAttention {
                 let shape_view = st.tensor("k_shape")?;
                 let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(shape_view.data().as_ptr() as *const u32, shape_view.data().len() / 4) };
                 let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
-                
                 let t = if mode == 2 { self.decompress_from_1bit(&packed, &scales, &shape)? } 
                         else { self.decompress_from_8bit(&packed, &scales, &shape)? };
                 Ok(t.to_dtype(target_dtype)?)
             };
-            (dequantize_legacy("k")?, dequantize_legacy("v")?)
+            (deq_leg("k")?, deq_leg("v")?)
         };
 
         // [LINEAR-BRIDGE] Convert 0.6B cache to 2B cache (Dim/Head Upscaling)
@@ -776,20 +791,17 @@ impl QuantizedQwen3VLTextAttention {
 
         let actual_k_len = k.dim(2)?;
         let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
-        
-        // [FIX] Only subtract refill_len if we are actually resuming, not during initial bridge
         let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
 
         if final_len > 0 {
-            let safe_len = final_len.min(actual_k_len);
-            self.kv_cache = Some((k.narrow(2, 0, safe_len)?, v.narrow(2, 0, safe_len)?));
+            self.kv_cache = Some((k.narrow(2, 0, final_len.min(actual_k_len))?, v.narrow(2, 0, final_len.min(actual_k_len))?));
         }
         Ok(())
     }
 
-                    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-                        self.save_kv_cache(path, true, block_size)
-                    }
+    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
+        self.save_kv_cache(path, true, block_size)
+    }
 }
 
 #[derive(Clone)]

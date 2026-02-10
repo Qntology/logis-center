@@ -513,6 +513,7 @@ impl Qwen3VLGenerateModel {
                     if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
                         println!("[HYBRID-SPEED-UP] Forcing GPU residency for all layers...");
                         let _ = m.language_model.rebalance_layers(0);
+                        let _ = m.language_model.rebalance_layers(0);
                     }
                 }
             }
@@ -566,6 +567,12 @@ impl Qwen3VLGenerateModel {
 
         println!("[DEBUG-GEN] Starting token generation loop. Max tokens: {}", max_new_tokens);
         let mut prev_time = std::time::Instant::now();
+
+        // [PRE-GEN-LOAD] Warm up GPU by filling it with layers before the loop starts
+        if !self.qwen3_vl.is_cpu() {
+            println!("[HYBRID-SPEED-UP] Pre-loading layers to GPU for instant generation...");
+            let _ = self.qwen3_vl.rebalance_layers(0);
+        }
 
         for _i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { 
