@@ -320,28 +320,6 @@ impl QuantizedQwen3VLTextAttention {
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
 
-        if layer_idx == 0 || layer_idx == 1 {
-            println!("[DEBUG-ATTN-FINAL] Layer: {}, Heads: {}, KV Heads: {}, Groups: {}", layer_idx, num_attention_heads, num_key_value_heads, num_kv_groups);
-        }
-
-        let instance = Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            num_attention_heads,
-            num_key_value_heads,
-            num_kv_groups,
-            head_dim,
-            scaling,
-            kv_cache: None,
-            layer_idx,
-        };
-        
-        println!("[PTR-NEW] Attention Instance {:p} | Layer: {} | Heads: {} | Hidden: {}", &instance, instance.layer_idx, instance.num_attention_heads, actual_h_size);
-        
         Ok(Self {
             q_proj,
             k_proj,
