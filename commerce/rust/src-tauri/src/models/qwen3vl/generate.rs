@@ -554,6 +554,11 @@ impl Qwen3VLGenerateModel {
 
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset)?;
             
+            // [DYNAMIC-RECOVERY] Check for GPU availability every chunk during prefill
+            if !self.qwen3_vl.is_cpu() {
+                let _ = self.qwen3_vl.rebalance_layers(0);
+            }
+            
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
         }
