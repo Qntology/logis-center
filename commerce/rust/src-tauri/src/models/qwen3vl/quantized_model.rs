@@ -1625,19 +1625,18 @@ impl QuantizedQwen3VLTextModel {
 
         let target_device = Device::new_cuda(device_id)?;
         
-        // [DYNAMIC-PINNING-STRATEGY]
-        // 1. Fixed System Reserve: 800MB (For Windows/Browser safety)
-        // 2. Dynamic Activation Buffer: Scaled by current context length
-        let kv_len = self.get_kv_len();
-        let dynamic_margin = (kv_len as u64 * 15_000).max(400_000_000); 
-        let total_safety_margin = 800_000_000 + dynamic_margin; 
+        // [ULTRA-DYNAMIC-STRATEGY]
+        // Reduced safety margin to 400MB to maximize GPU speed for Question Prefill.
+        // Weights (1.5GB) + 10k Context (1.1GB) = 2.6GB. 
+        // 4.1GB - 2.6GB = 1.5GB remaining for safety and browser.
+        let total_safety_margin = 400_000_000; 
         
         let layer_size = 75_000_000; 
         let available_for_weights = free_vram.saturating_sub(total_safety_margin);
         
-        // [VRAM-GUARD] If VRAM is getting tight, aggressively protect the safety buffer
-        if free_vram < total_safety_margin {
-            let needed = total_safety_margin.saturating_sub(free_vram);
+        // [VRAM-GUARD] Hard floor at 350MB to prevent system instability
+        if free_vram < 350_000_000 {
+            let needed = 600_000_000_u64.saturating_sub(free_vram);
             let layers_to_evict = (needed / layer_size as u64) as usize + 1;
             
             let mut evicted = 0;

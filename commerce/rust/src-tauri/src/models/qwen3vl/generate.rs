@@ -599,6 +599,14 @@ impl Qwen3VLGenerateModel {
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
             
+            // [QUESTION-PREFILL-ACCELERATION]
+            // If this is the first forward (processing the prompt chunk), 
+            // force all layers to GPU regardless of usual safety margins.
+            if generated_text.is_empty() && !self.qwen3_vl.is_cpu() {
+                println!("[TURBO] Accelerating Question Prefill ({} tokens)...", seq_len);
+                let _ = self.qwen3_vl.rebalance_layers(0);
+            }
+
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
             
             // [GEN-PROGRESS-LOG]
