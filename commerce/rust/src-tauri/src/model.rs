@@ -212,7 +212,6 @@ impl LogisModel {
             let _ = tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
                     let _ = dev.synchronize(); 
-                    // [NEW] Hint to the driver to release cached memory if possible
                 }
             }).await;
         }
@@ -235,9 +234,6 @@ impl LogisModel {
             *size = None;
         }
 
-        println!("[MEMORY] Deep Purge Complete. VRAM/RAM released to OS.");
-    }
-        
         // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]
         unsafe {
@@ -247,7 +243,7 @@ impl LogisModel {
             // 강제로 Working Set을 비워 OS가 VRAM/RAM을 즉시 수거하게 함
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
-        
+
         println!("[MEMORY] Deep Purge Complete. VRAM/RAM released to OS.");
     }
 

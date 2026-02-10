@@ -737,19 +737,26 @@ impl QuantizedQwen3VLTextAttention {
             (dequantize_legacy("k")?, dequantize_legacy("v")?)
         };
 
-        // [LINEAR-BRIDGE] Convert 0.6B (512) cache to 2B (2048) cache
-        let (_b, h, _s, d) = k.dims4()?;
+        // [LINEAR-BRIDGE] Convert 0.6B cache to 2B cache (Dim/Head Upscaling)
+        let (_b, h, s_len, d) = k.dims4()?;
         let target_heads = self.num_key_value_heads;
         let target_dim = self.head_dim;
 
         if h != target_heads || d != target_dim {
             if self.layer_idx == 0 {
-                println!("[LINEAR-BRIDGE] Convert 0.6B (512) cache to 2B (2048) cache via BitKV");
+                println!("[HYBRID-BRIDGE-REPORT] Layer {}: Received 0.6B Cache [Len: {}, Heads: {}, Dim: {}]", 
+                    self.layer_idx, s_len, h, d);
+                println!("[HYBRID-BRIDGE-REPORT] Target 2B Spec: [Heads: {}, Dim: {}]. Applying Upscaling...", 
+                    target_heads, target_dim);
             }
+            
+            // Dimension Upscaling (1024 -> 2048)
             if d < target_dim {
-                k = Tensor::cat(&[&k, &k], D::Minus1)?;
-                v = Tensor::cat(&[&v, &v], D::Minus1)?;
+                k = Tensor::cat(&[&(k.clone()), &k], D::Minus1)?;
+                v = Tensor::cat(&[&(v.clone()), &v], D::Minus1)?;
             }
+            
+            // Head Alignment (8 heads -> 16 heads etc)
             if h != target_heads {
                 let mut k_heads = vec![];
                 let mut v_heads = vec![];
@@ -761,10 +768,16 @@ impl QuantizedQwen3VLTextAttention {
                 k = Tensor::cat(&k_heads, 1)?;
                 v = Tensor::cat(&v_heads, 1)?;
             }
+
+            if self.layer_idx == 0 {
+                println!("[HYBRID-BRIDGE-SUCCESS] Final 2B-Compatible Cache Shape: {:?}", k.shape());
+            }
         }
 
         let actual_k_len = k.dim(2)?;
-        let use_len = if expected_len == 0 { actual_k_len } else { expected_len };
+        let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
+        
+        // [FIX] Only subtract refill_len if we are actually resuming, not during initial bridge
         let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
 
         if final_len > 0 {
@@ -1362,9 +1375,27 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
+        let gpu_device = Device::new_cuda(0)?;
+        let _total_layers = self.layers.len();
+        
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // [JIT-GPU-STREAMING] If layer is on CPU, move to GPU for high-speed math
+            let originally_on_cpu = layer.device().is_cpu();
+            if originally_on_cpu {
+                // println!("[STREAM] Uploading Layer {} to GPU for JIT execution...", layer_idx);
+                layer.to_device(&gpu_device)?;
+            }
+
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
+            // [VRAM-EMERGENCY-EVICT] If VRAM is getting tight after this layer, move it back to RAM
+            // This leaves room for the NEXT layer to be uploaded
+            if originally_on_cpu {
+                // Manual sync to ensure GPU finished math before we move weights back
+                let _ = gpu_device.synchronize();
+                layer.to_device(&Device::Cpu)?;
+            }
+
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
                     let m_orig = visual_pos_masks.unwrap();
@@ -1574,49 +1605,36 @@ impl QuantizedQwen3VLTextModel {
 
         let target_device = Device::new_cuda(device_id)?;
         
-        // [SMART-OFFLOAD-STRATEGY]
-        // 1. Layer size: ~75MB for 2B Q4
-        // 2. Safety Buffer: 1.0GB (Enough for moderate context activations)
-        // 3. Greedy Fill: Keep pushing layers to GPU until free_vram hits safety_buffer
-        let safety_buffer = 1_000_000_000; 
-        let layer_size = 75_000_000;
+        // [GPU-HEAVY-BLOCK-STRATEGY]
+        // safety_buffer: Reduced to 800MB to maximize GPU space
+        // layer_size: ~75MB
+        let safety_buffer = 800_000_000; 
+        let layer_size = 75_000_000; 
+        
+        let available_for_weights = free_vram.saturating_sub(safety_buffer);
+        let max_gpu_layers = (available_for_weights / layer_size as u64) as usize;
+        let max_gpu_layers = max_gpu_layers.min(self.layers.len());
 
-        let mut moved_to_gpu = 0;
-        let mut moved_to_cpu = 0;
-        let mut gpu_total = 0;
+        let mut moved_count = 0;
+        let mut gpu_count = 0;
 
-        // Sort layers: prioritize early layers for GPU (usually more compute-heavy)
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            let is_on_gpu = layer.device().is_cuda();
-            let layer_size = 75_000_000; 
-
-            // [PRIORITY-L0-L5] Keep first 5 layers on GPU if possible to avoid IO bottleneck
-            let is_priority = i < 5;
-            let current_safety_buffer = if is_priority { safety_buffer / 2 } else { safety_buffer };
-
-            if current_available > layer_size || (is_priority && free_vram > current_safety_buffer) {
-                if !is_on_gpu {
-                    // Only upload if we have an extra buffer or it's a priority layer
-                    if is_priority || current_available > (layer_size + 200_000_000) {
-                        layer.to_device(&target_device)?;
-                        moved_to_gpu += 1;
-                    }
-                }
-                if layer.device().is_cuda() {
-                    current_available = current_available.saturating_sub(layer_size as u64);
-                    gpu_total += 1;
-                }
+            let target = if i < max_gpu_layers {
+                gpu_count += 1;
+                &target_device
             } else {
-                if is_on_gpu && !is_priority { // Never offload priority layers unless extreme OOM
-                    layer.to_device(&Device::Cpu)?;
-                    moved_to_cpu += 1;
-                }
+                &Device::Cpu
+            };
+
+            if !layer.device().same_device(target) {
+                layer.to_device(target)?;
+                moved_count += 1;
             }
         }
 
-        if moved_to_gpu > 0 || moved_to_cpu > 0 {
-            println!("[SMART-REBALANCE] Migration: +{} GPU, -{} CPU. Total GPU Layers: {}/{} (Free VRAM: {}MB)", 
-                moved_to_gpu, moved_to_cpu, gpu_total, self.layers.len(), free_vram / 1_000_000);
+        if moved_count > 0 {
+            println!("[REBALANCE-GPU-PRIORITY] Pivot at Layer {}. GPU: 0-{}, CPU: {}-{}. (Free VRAM: {}MB)", 
+                max_gpu_layers, max_gpu_layers.saturating_sub(1), max_gpu_layers, self.layers.len().saturating_sub(1), free_vram / 1_000_000);
         }
         
         Ok(())
