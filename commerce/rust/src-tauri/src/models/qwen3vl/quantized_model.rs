@@ -213,7 +213,19 @@ impl QuantizedQwen3VLTextAttention {
         let head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
-        let is_06b = config.hidden_size == 1024;
+        // [DETECTION-FIRST] Determine actual hidden size for THIS layer/file
+        let actual_h_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
+            info.shape.dims()[0]
+        } else if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.input_layernorm.weight")) {
+            info.shape.dims()[0]
+        } else if let Some(info) = ct.tensor_infos.get(&"token_embd.weight".to_string()) {
+            let dims = info.shape.dims();
+            if dims.len() >= 2 { if dims[0] > dims[1] { dims[1] } else { dims[0] } } else { 1024 }
+        } else {
+            config.hidden_size
+        };
+
+        let is_06b = actual_h_size == 1024;
         
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
             if is_06b {
@@ -230,18 +242,19 @@ impl QuantizedQwen3VLTextAttention {
         let q_weight_name = format!("{base_name}.{q}.weight");
         let k_weight_name = format!("{base_name}.{k}.weight");
 
-        let num_attention_heads = if let Some(info) = ct.tensor_infos.get(&q_weight_name) {
-            let out_features = info.shape.dims()[0];
-            out_features / head_dim
+        // [FIX] Strict Head Detection: Derive heads from actual_h_size to prevent mismatch in 0.6B models
+        let num_attention_heads = actual_h_size / head_dim;
+        let num_key_value_heads = if is_06b {
+            num_attention_heads // 0.6B typically uses full MHA or specific parity
         } else {
-            config.num_attention_heads
-        };
-
-        let num_key_value_heads = if let Some(info) = ct.tensor_infos.get(&k_weight_name) {
-            let out_features = info.shape.dims()[0];
-            out_features / head_dim
-        } else {
-            config.num_key_value_heads
+            // For 2B+, try to detect GQA from tensors, but fallback to 16
+            if let Some(info) = ct.tensor_infos.get(&k_weight_name) {
+                let dims = info.shape.dims();
+                let out_f = if dims.len() >= 2 { if dims[0] == actual_h_size { dims[1] } else { dims[0] } } else { dims[0] };
+                if out_f < actual_h_size { out_f / head_dim } else { num_attention_heads }
+            } else {
+                num_attention_heads
+            }
         };
 
         let num_kv_groups = if num_key_value_heads > 0 {
@@ -252,7 +265,7 @@ impl QuantizedQwen3VLTextAttention {
 
         if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
             if layer_idx == 0 {
-                println!("[MODEL-FIX] Architecture Mismatch Detected. GGUF: {} heads / {} KV heads. Config: {} heads / {} KV heads. Overriding config.",
+                println!("[MODEL-FIX] Architecture Mismatch. GGUF: {} heads / {} KV heads. Config: {} heads / {} KV heads. Overriding config.",
                     num_attention_heads, num_key_value_heads, config.num_attention_heads, config.num_key_value_heads);
             }
         }
@@ -263,22 +276,13 @@ impl QuantizedQwen3VLTextAttention {
         let v_proj_name = format!("{base_name}.{v}");
         let qkv_combined_name = format!("{base_name}.attn_qkv");
 
-        // [DETECTION] Use GGUF info to find correct hidden size for THIS model file
-        let actual_h_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
-            info.shape.dims()[0]
-        } else if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.input_layernorm.weight")) {
-            info.shape.dims()[0]
-        } else {
-            1024 // Fallback for 0.6B
-        };
-
         let has_individual = ct.tensor_infos.contains_key(&format!("{q_proj_name}.weight"));
         let has_combined = ct.tensor_infos.contains_key(&format!("{qkv_combined_name}.weight"));
 
         let (q_proj, k_proj, v_proj) = if has_individual {
-            let mut qp = get_qlinear(ct, reader, &q_proj_name, device, dtype)?;
-            let mut kp = get_qlinear(ct, reader, &k_proj_name, device, dtype)?;
-            let mut vp = get_qlinear(ct, reader, &v_proj_name, device, dtype)?;
+            let mut qp = get_qlinear_v2(ct, reader, &q_proj_name, device, dtype, actual_h_size)?;
+            let mut kp = get_qlinear_v2(ct, reader, &k_proj_name, device, dtype, actual_h_size)?;
+            let mut vp = get_qlinear_v2(ct, reader, &v_proj_name, device, dtype, actual_h_size)?;
             
             // [HYBRID-FIX] Only slice if we are CERTAIN we are in 0.6B model (1024) 
             // but the GGUF file provided a 2048-dim tensor (unlikely but handled)
@@ -305,19 +309,14 @@ impl QuantizedQwen3VLTextAttention {
             return Err(anyhow!("Could not find QKV tensors for layer {}", layer_idx));
         };
 
-        let mut o_proj = get_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype)?;
+        let mut o_proj = get_qlinear_v2(ct, reader, &format!("{base_name}.{o}"), device, dtype, actual_h_size)?;
         
-        // [HYBRID-FIX] Detect if o_proj is 2048-dim and we are in 1024-dim model
+        // [HYBRID-FIX] 0.6B model Output Proj Slicing
         if actual_h_size == 1024 {
             let shape = o_proj.inner_shape();
-            if shape.len() >= 2 {
-                if shape[0] == 2048 {
-                    println!("[MODEL-FIX] Slicing o_proj OUTPUT 2048 -> 1024 for 0.6B.");
-                    o_proj = get_sliced_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype, 0, 0, 1024)?;
-                } else if shape[1] == 2048 {
-                    println!("[MODEL-FIX] Slicing o_proj INPUT 2048 -> 1024 for 0.6B.");
-                    o_proj = get_sliced_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype, 1, 0, 1024)?;
-                }
+            if shape.len() >= 2 && shape[0] == 2048 {
+                println!("[MODEL-FIX] Slicing o_proj INPUT 2048 -> 1024 for 0.6B.");
+                o_proj = get_sliced_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype, 0, 0, 1024)?;
             }
         }
 
@@ -757,6 +756,12 @@ impl QuantizedQwen3VLTextAttention {
         let target_heads = self.num_key_value_heads;
         let target_dim = self.head_dim;
 
+        if self.layer_idx == 0 {
+            println!("[DEBUG-RELAY] Layer 0 Raw Load: Shape={:?}", k.shape());
+            println!("[DEBUG-RELAY] Target Config: Heads={}, Dim={}", target_heads, target_dim);
+            println!("[DEBUG-RELAY] Detected from Raw: H={}, S={}, D={}", h, s_len, d);
+        }
+
         if h != target_heads || d != target_dim {
             if self.layer_idx == 0 {
                 println!("[HYBRID-BRIDGE-REPORT] Layer {}: Received 0.6B Cache [Len: {}, Heads: {}, Dim: {}]", 
@@ -767,12 +772,14 @@ impl QuantizedQwen3VLTextAttention {
             
             // Dimension Upscaling (1024 -> 2048)
             if d < target_dim {
+                if self.layer_idx == 0 { println!("[DEBUG-RELAY] Upscaling Dim ({} -> {})...", d, target_dim); }
                 k = Tensor::cat(&[&(k.clone()), &k], D::Minus1)?;
                 v = Tensor::cat(&[&(v.clone()), &v], D::Minus1)?;
             }
             
             // Head Alignment (8 heads -> 16 heads etc)
             if h != target_heads {
+                if self.layer_idx == 0 { println!("[DEBUG-RELAY] Upscaling Heads ({} -> {})...", h, target_heads); }
                 let mut k_heads = vec![];
                 let mut v_heads = vec![];
                 for i in 0..target_heads {
@@ -852,16 +859,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let up_name = format!("{base_name}.{up}");
             let down_name = format!("{base_name}.{down}");
             
-            // Detect actual MLP intermediate size from GGUF
-            let actual_inter_size = if let Some(info) = ct.tensor_infos.get(&format!("{up_name}.weight")) {
-                info.shape.dims()[0] // Intermediate size is usually the first dim
-            } else {
-                config.intermediate_size
-            };
-
-            let mg = get_qlinear(ct, reader, &gate_name, device, dtype)?;
-            let mu = get_qlinear(ct, reader, &up_name, device, dtype)?;
-            let md = get_qlinear(ct, reader, &down_name, device, dtype)?;
+            let mg = get_qlinear_v2(ct, reader, &gate_name, device, dtype, config.hidden_size)?;
+            let mu = get_qlinear_v2(ct, reader, &up_name, device, dtype, config.hidden_size)?;
+            let md = get_qlinear_v2(ct, reader, &down_name, device, dtype, config.hidden_size)?;
             
             if layer_idx == 0 {
                 println!("[DEBUG-MLP-L0] Gate: {:?}, Up: {:?}, Down: {:?}", 
@@ -1101,6 +1101,8 @@ impl QuantizedQwen3VLTextModel {
 
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
+        let alt_token_emb2 = "model.embed_tokens.weight";
+        let alt_token_emb3 = "token_embeddings.weight";
         
         let embed_tokens = if let Ok(tensor) = ct.tensor(&mut reader, &token_emb_name, device) {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
@@ -1110,8 +1112,17 @@ impl QuantizedQwen3VLTextModel {
              let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
              let h = tensor.dim(1)?;
              Embedding::new(tensor, h)
+        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb2, device) {
+             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let h = tensor.dim(1)?;
+             Embedding::new(tensor, h)
+        } else if let Ok(tensor) = ct.tensor(&mut reader, alt_token_emb3, device) {
+             let tensor = tensor.dequantize(device)?.to_dtype(dtype)?;
+             let h = tensor.dim(1)?;
+             Embedding::new(tensor, h)
         } else {
-             println!("[HYBRID] Embedding not found in GGUF. Creating dummy with size: {}", actual_h_size);
+             println!("[HYBRID] Embedding not found in GGUF. Available keys: {:?}", ct.tensor_infos.keys().take(20).collect::<Vec<_>>());
+             println!("[HYBRID] Creating dummy with size: {}", actual_h_size);
              let dummy_tensor = Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?;
              Embedding::new(dummy_tensor, actual_h_size)
         };
@@ -1487,10 +1498,22 @@ impl QuantizedQwen3VLTextModel {
                 let target_dim = layer.self_attn.head_dim;
                 let (_b, h, _s, d) = k_small.dims4()?;
 
-                let mut k_aligned = if d < target_dim { Tensor::cat(&[&k_small, &k_small], D::Minus1)? } else { k_small };
-                let mut v_aligned = if d < target_dim { Tensor::cat(&[&v_small, &v_small], D::Minus1)? } else { v_small };
+                if i == 0 {
+                    println!("[DEBUG-RELAY-MEM] Layer 0 Raw: Shape={:?}", k_small.shape());
+                    println!("[DEBUG-RELAY-MEM] H={}, D={}. Target: H={}, D={}", h, d, target_heads, target_dim);
+                }
+
+                let mut k_aligned = if d < target_dim { 
+                    if i == 0 { println!("[DEBUG-RELAY-MEM] Upscaling Dim {} -> {}", d, target_dim); }
+                    Tensor::cat(&[&k_small, &k_small], D::Minus1)? 
+                } else { k_small };
+                
+                let mut v_aligned = if d < target_dim { 
+                    Tensor::cat(&[&v_small, &v_small], D::Minus1)? 
+                } else { v_small };
 
                 if h != target_heads {
+                    if i == 0 { println!("[DEBUG-RELAY-MEM] Upscaling Heads {} -> {}", h, target_heads); }
                     let mut k_heads = Vec::with_capacity(target_heads);
                     let mut v_heads = Vec::with_capacity(target_heads);
                     for j in 0..target_heads {
@@ -1736,12 +1759,12 @@ impl QuantizedQwen3VLModel {
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader_main = std::io::Cursor::new(main_mmap);
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
+        let lm_head = if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "lm_head", text_device, head_dtype, language_model.embed_tokens.hidden_size()) {
             l
-        } else if let Ok(l) = get_qlinear(ct_main, &mut reader_main, "output", text_device, head_dtype) {
+        } else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "output", text_device, head_dtype, language_model.embed_tokens.hidden_size()) {
             l
         } else {
-            get_qlinear(ct_main, &mut reader_main, "token_embd", text_device, head_dtype)?
+            get_qlinear_v2(ct_main, &mut reader_main, "token_embd", text_device, head_dtype, language_model.embed_tokens.hidden_size())?
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: main_mmap_handle, mmproj_mmap: mmproj_mmap_handle })
@@ -1896,9 +1919,9 @@ impl QuantizedQwen3TextModel {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-            if let Ok(l) = get_qlinear(ct_main, &mut reader, "lm_head", text_device, head_dtype) { Some(l) }
-            else if let Ok(l) = get_qlinear(ct_main, &mut reader, "output", text_device, head_dtype) { Some(l) }
-            else { get_qlinear(ct_main, &mut reader, "token_embd", text_device, head_dtype).ok() }
+            if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "lm_head", text_device, head_dtype, language_model.embed_tokens.hidden_size()) { Some(l) }
+            else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "output", text_device, head_dtype, language_model.embed_tokens.hidden_size()) { Some(l) }
+            else { get_qlinear_v2(ct_main, &mut reader, "token_embd", text_device, head_dtype, language_model.embed_tokens.hidden_size()).ok() }
         } else { None };
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle, is_text, is_image })
     }
@@ -1949,30 +1972,47 @@ impl QuantizedQwen3TextModel {
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
 }
 
-fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
+fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType, hidden_size: usize) -> Result<QLinear> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [HYBRID-UNIVERSAL-FIX] Automatically fix transposed weights based on shape signature
+    // [HYBRID-GGUF-FIX] 
+    // Candle QMatMul expects [In, Out].
     let shape = weight_t.dims();
     if shape.len() == 2 {
-        if (shape[0] == 2048 && shape[1] == 6144) || (shape[0] == 1024 && shape[1] == 3072) {
-            println!("[MODEL-FIX] Transposing detected UP/GATE projection: {:?}", shape);
-            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
-        } else if (shape[0] == 6144 && shape[1] == 2048) || (shape[0] == 3072 && shape[1] == 1024) {
-            // This is already correct [out, in] for UP/GATE, OR it's a transposed DOWN projection.
-            // In Qwen, DOWN projection should be [hidden_out, intermediate_in] -> [2048, 6144].
-            // If we find [6144, 2048] in a DOWN proj context, it needs transpose.
-            if name.contains("down") {
-                println!("[MODEL-FIX] Transposing detected DOWN projection: {:?}", shape);
-                weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        let rows = shape[0];
+        let cols = shape[1];
+        
+        let mut needs_transpose = false;
+        
+        // Output and Down projections transform back to HiddenSize
+        if name.contains("output") || name.contains("down") {
+            // Target: [In: Intermediate, Out: Hidden]. Hidden should be second dim (cols).
+            // If Hidden is in rows, it's [Hidden, Intermediate] -> Transpose.
+            if rows == hidden_size && cols != hidden_size {
+                needs_transpose = true;
             }
+        } else {
+            // Q, K, V, GATE, UP: [In: Hidden, Out: Features]. Hidden should be first dim (rows).
+            // If Hidden is in cols, it's [Features, Hidden] -> Transpose.
+            if cols == hidden_size && rows != hidden_size {
+                needs_transpose = true;
+            }
+        }
+
+        if needs_transpose {
+            println!("[MODEL-FIX] Transposing {} weight to [In, Out]: {:?} -> [{:?}, {:?}]", name, shape, cols, rows);
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
         }
     }
     
     let weight_q = QMatMul::Tensor(weight_t);
     let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
     Ok(QLinear::new(weight_q, bias, device.clone()))
+}
+
+fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
+    get_qlinear_v2(ct, reader, name, device, dtype, 2048) // Legacy fallback
 }
 
 fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
