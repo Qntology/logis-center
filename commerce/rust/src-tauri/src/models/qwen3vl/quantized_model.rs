@@ -1108,16 +1108,8 @@ impl QuantizedQwen3VLTextModel {
         let embed_tokens = if let Some(key) = embed_key {
              println!("[HYBRID] Found embedding weight with key: {}", key);
              let tensor = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
-             
-             // [MATHEMATICAL-MATCHING] 0.6B(1024)를 2B(2048) 구조에 코드 수준에서 즉시 매칭
-             let (final_tensor, final_h) = if actual_h_size == 1024 {
-                 println!("[HYBRID-MATCH] 0.6B detected. Matching Embedding to 2B structure (1024 -> 2048)...");
-                 (Tensor::cat(&[&tensor, &tensor], 1)?, 2048)
-             } else {
-                 let h = tensor.dim(1)?;
-                 (tensor, h)
-             };
-             Embedding::new(final_tensor, final_h)
+             let h = tensor.dim(1)?;
+             Embedding::new(tensor, h)
         } else {
              println!("[HYBRID-RELAY] Embedding NOT found in current GGUF. Attempting shared fallback...");
              let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
@@ -1127,9 +1119,14 @@ impl QuantizedQwen3VLTextModel {
                  let st = candle_core::safetensors::load(shared_emb_path, device)?;
                  if let Some(s_t) = st.get("token_embd.weight") {
                      let s_t = s_t.to_dtype(dtype)?;
-                     // 1024 -> 2048 업스케일
-                     println!("[HYBRID-RELAY] Shared Embedding Loaded. Upscaling 1024 -> 2048.");
-                     Tensor::cat(&[&s_t, &s_t], 1)?
+                     // 0.6B 베이킹 시에는 자기 규격(1024) 그대로 사용
+                     if actual_h_size == 1024 {
+                         s_t
+                     } else {
+                         // 2B 추론 시에는 2048로 확장
+                         println!("[HYBRID-RELAY] Upscaling Shared Embedding to 2048.");
+                         Tensor::cat(&[&(s_t.clone()), &s_t], 1)?
+                     }
                  } else {
                      Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?
                  }
@@ -1273,14 +1270,7 @@ impl QuantizedQwen3VLTextModel {
              return Err(anyhow!("Failed to load embedding."));
         };
 
-        // [MATHEMATICAL-MATCHING] 0.6B -> 2B structure match
-        let (final_emb_tensor, final_h) = if actual_hidden_size == 1024 {
-            println!("[HYBRID-MATCH] 0.6B (Reader) matching to 2B structure (1024 -> 2048)...");
-            (Tensor::cat(&[&raw_embed_tokens, &raw_embed_tokens], 1)?, 2048)
-        } else {
-            (raw_embed_tokens, actual_hidden_size)
-        };
-        let embed_tokens = Embedding::new(final_emb_tensor, final_h);
+        let embed_tokens = Embedding::new(raw_embed_tokens, actual_hidden_size);
 
         let mut patched_config = config.clone();
         patched_config.hidden_size = actual_hidden_size;
@@ -1438,27 +1428,7 @@ impl QuantizedQwen3VLTextModel {
             // [SMART-STREAMING]
             if is_on_cpu { layer.to_device(&gpu_device)?; }
             
-            let layer_dim = layer.input_layernorm.weight().dim(0)?;
-            let input_dim = xs.dim(candle_core::D::Minus1)?;
-
-            // [HYBRID-BRIDGE-GATE] 2048차원 파이프라인에서 1024차원 레이어 처리
-            let mut xs_active = if input_dim == 2048 && layer_dim == 1024 {
-                xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
-            } else {
-                xs.clone()
-            };
-
-            let residual_active = xs_active.clone();
-            xs_active = layer.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
-            
-            // [HYBRID-BRIDGE-GATE-EXIT] 결과를 다시 2048차원으로 복구
-            xs = if input_dim == 2048 && layer_dim == 1024 {
-                let xs_2048 = Tensor::cat(&[&xs_active, &xs_active], candle_core::D::Minus1)?.contiguous()?;
-                // 원래의 2048차원 xs와 더함 (Residual Add)
-                xs.add(&xs_2048)?
-            } else {
-                xs_active // 일반적인 경우는 레이어 내부에 Add가 포함됨
-            };
+            xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
             if is_on_cpu { layer.to_device(&Device::Cpu)?; }
 
@@ -2011,42 +1981,33 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [HYBRID-SPECS-MATCHING] 2b_specs.json 설계도를 기준으로 가중치 자동 정렬
-    let specs_path = std::path::Path::new("src-tauri/models/2b_specs.json");
-    let target_shape = if specs_path.exists() {
-        let file = std::fs::File::open(specs_path)?;
-        let json: serde_json::Value = serde_json::from_reader(file)?;
-        json["tensors"].get(&format!("{name}.weight")).and_then(|v| v.as_array()).map(|arr| {
-            arr.iter().map(|x| x.as_u64().unwrap() as usize).collect::<Vec<_>>()
-        })
-    } else { None };
-
     let shape = weight_t.dims();
     if shape.len() == 2 {
         let rows = shape[0];
         let cols = shape[1];
+        let mut needs_transpose = false;
         
-        if let Some(target) = target_shape {
-            if target.len() == 2 {
-                let t_in = target[0];
-                let t_out = target[1];
-                // 설계도(2B)와 현재 로드된 가중치가 반대 방향이면 전치
-                if rows == t_out && cols == t_in {
-                    println!("[SPECS-FIX] Transposing {} to match 2B specs: {:?} -> {:?}", name, shape, target);
-                    weight_t = weight_t.transpose(0, 1)?.contiguous()?;
-                }
+        if hidden_size == 1024 {
+            // [0.6B-SPECIFIC-FIX] 0.6B 모델은 가중치가 2048로 패딩되어 있어도 
+            // 실제 연산(1024입력)이 가능하도록 방향을 강제 조정해야 함
+            if name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v") || name.contains("gate") || name.contains("up") {
+                if rows == 2048 && cols == 1024 { needs_transpose = true; }
+            } else if name.contains("attn_output") || name.contains("down") {
+                // 이들은 입력이 2048(또는 그 이상)이고 출력이 1024여야 함
+                if rows == 1024 && cols != 1024 { needs_transpose = true; }
             }
         } else {
-            // 설계도 부재 시 기본 로직
-            let mut needs_transpose = false;
+            // [2B-STANDARD-LOGIC]
             if name.contains("down") {
                 if rows == hidden_size && cols > hidden_size { needs_transpose = true; }
             } else {
                 if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
             }
-            if needs_transpose {
-                weight_t = weight_t.transpose(0, 1)?.contiguous()?;
-            }
+        }
+
+        if needs_transpose {
+            println!("[MODEL-FIX] Transposing {} weight: {:?} -> [{:?}, {:?}]", name, shape, cols, rows);
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
         }
     }
     
