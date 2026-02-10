@@ -1655,8 +1655,6 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
-        if self.is_forced_cpu { return Ok(()); } 
-        
         use nvml_wrapper::Nvml;
         let nvml = Nvml::init().ok();
         let mut free_vram = 0;
@@ -1670,6 +1668,12 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if free_vram == 0 { return Ok(()); }
+
+        // [DYNAMIC-RECOVERY] 
+        // If we were forced to CPU but now have plenty of VRAM (e.g. > 2.5GB),
+        // allow rebalancing to GPU again.
+        let can_rebalance = !self.is_forced_cpu || free_vram > 2_500_000_000;
+        if !can_rebalance { return Ok(()); }
 
         let target_device = Device::new_cuda(device_id)?;
         
