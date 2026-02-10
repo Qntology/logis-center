@@ -1406,17 +1406,17 @@ impl QuantizedQwen3VLTextModel {
             .broadcast_as((3, b_size, seq_len))?,
         };
         
-        let (cos, sin) = self.rotary_emb.forward(
-            &position_ids,
-            inputs_embeds.dtype(),
-            self.mrope_section.clone(),
-        )?;
-        
-        let mut xs = inputs_embeds.clone();
         let target_dtype = if !self.is_forced_cpu { DType::BF16 } else { DType::F32 };
         let target_device = if !self.is_forced_cpu { Device::new_cuda(0)? } else { Device::Cpu };
-        
-        let mut xs = xs.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
+        let gpu_device = Device::new_cuda(0)?;
+
+        let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
+
+        let (cos, sin) = self.rotary_emb.forward(
+            &position_ids,
+            target_dtype,
+            self.mrope_section.clone(),
+        )?;
         
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
@@ -2011,25 +2011,42 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
+    // [HYBRID-SPECS-MATCHING] 2b_specs.json 설계도를 기준으로 가중치 자동 정렬
+    let specs_path = std::path::Path::new("src-tauri/models/2b_specs.json");
+    let target_shape = if specs_path.exists() {
+        let file = std::fs::File::open(specs_path)?;
+        let json: serde_json::Value = serde_json::from_reader(file)?;
+        json["tensors"].get(&format!("{name}.weight")).and_then(|v| v.as_array()).map(|arr| {
+            arr.iter().map(|x| x.as_u64().unwrap() as usize).collect::<Vec<_>>()
+        })
+    } else { None };
+
     let shape = weight_t.dims();
     if shape.len() == 2 {
         let rows = shape[0];
         let cols = shape[1];
-        let mut needs_transpose = false;
         
-        if name.contains("down") {
-            // Down: Target [In: 6144, Out: 2048]. 
-            // If rows is 2048, it's reversed.
-            if rows == hidden_size && cols > hidden_size { needs_transpose = true; }
+        if let Some(target) = target_shape {
+            if target.len() == 2 {
+                let t_in = target[0];
+                let t_out = target[1];
+                // 설계도(2B)와 현재 로드된 가중치가 반대 방향이면 전치
+                if rows == t_out && cols == t_in {
+                    println!("[SPECS-FIX] Transposing {} to match 2B specs: {:?} -> {:?}", name, shape, target);
+                    weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+                }
+            }
         } else {
-            // Q, K, V, Gate, Up, Output: Target [In: 2048, Out: XXX]. 
-            // If 2048 is in cols, it's reversed.
-            if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
-        }
-
-        if needs_transpose {
-            println!("[MODEL-FIX] Transposing {} GGUF weight: {:?} -> [{:?}, {:?}]", name, shape, cols, rows);
-            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+            // 설계도 부재 시 기본 로직
+            let mut needs_transpose = false;
+            if name.contains("down") {
+                if rows == hidden_size && cols > hidden_size { needs_transpose = true; }
+            } else {
+                if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
+            }
+            if needs_transpose {
+                weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+            }
         }
     }
     
@@ -2114,30 +2131,16 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
         let mut t = ct.tensor(reader, name, device)?;
         let mut t = t.dequantize(device)?.to_dtype(dtype)?;
         
-        // [HYBRID-TRANSPOSE-FIX] Automatically fix transposed MLP weights
-        if name.contains("ffn_gate") || name.contains("ffn_up") || name.contains("mlp.gate_proj") || name.contains("mlp.up_proj") {
-            let shape = t.dims();
-            if shape.len() == 2 && shape[0] == 2048 && shape[1] == 6144 {
-                println!("[MODEL-FIX] Transposing ffn_gate/up weight: {:?} -> [6144, 2048]", shape);
-                t = t.transpose(0, 1)?.contiguous()?;
-            } else if shape.len() == 2 && shape[0] == 1024 && shape[1] == 3072 {
-                println!("[MODEL-FIX] Transposing ffn_gate/up (0.6B) weight: {:?} -> [3072, 1024]", shape);
-                t = t.transpose(0, 1)?.contiguous()?;
+                if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
+        
             }
-        } else if name.contains("ffn_down") || name.contains("mlp.down_proj") {
-            let shape = t.dims();
-            if shape.len() == 2 && shape[0] == 6144 && shape[1] == 2048 {
-                println!("[MODEL-FIX] Transposing ffn_down weight: {:?} -> [2048, 6144]", shape);
-                t = t.transpose(0, 1)?.contiguous()?;
-            } else if shape.len() == 2 && shape[0] == 3072 && shape[1] == 1024 {
-                println!("[MODEL-FIX] Transposing ffn_down (0.6B) weight: {:?} -> [1024, 3072]", shape);
-                t = t.transpose(0, 1)?.contiguous()?;
-            }
+        
+            for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
+        
+            if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); } } }
+        
+            Ok(VarBuilder::from_tensors(data, dtype, device))
+        
         }
-
-        if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
-    }
-    for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
-    if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); } } }
-    Ok(VarBuilder::from_tensors(data, dtype, device))
-}
+        
+        
