@@ -1334,6 +1334,20 @@ impl QuantizedQwen3VLTextModel {
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
+        
+        // [INFERENCE-MONITOR] Real-time System Status
+        use nvml_wrapper::Nvml;
+        use chrono::Local;
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    let now = Local::now().format("%H:%M:%S%.3f");
+                    println!("[STAT] Time: {} | VRAM: {}MB Used / {}MB Free | Context: {} tokens", 
+                        now, mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset + seq_len);
+                }
+            }
+        }
+
         println!("[TRACE-MODEL] Start forward. Input: {:?} {:?}, Target: BF16/F32", inputs_embeds.device(), inputs_embeds.dtype());
         
         let position_ids = match position_ids {
@@ -1355,9 +1369,11 @@ impl QuantizedQwen3VLTextModel {
         )?;
         
         let mut xs = inputs_embeds.clone();
-        let target_dtype = if xs.device().is_cuda() { DType::BF16 } else { DType::F32 };
-        let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
-
+        let target_dtype = if !self.is_forced_cpu { DType::BF16 } else { DType::F32 };
+        let target_device = if !self.is_forced_cpu { Device::new_cuda(0)? } else { Device::Cpu };
+        
+        let mut xs = xs.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
+        
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
                 None
@@ -1383,24 +1399,9 @@ impl QuantizedQwen3VLTextModel {
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
-            // [HARD-CLEANUP] If it was a streamed layer, ensure immediate and clean eviction
+            // [HARD-CLEANUP] Move weights back to CPU only if we are in streaming mode
             if is_on_cpu {
-                // 1. Wait for GPU math to truly finish
-                let _ = gpu_device.synchronize();
-                // 2. Move weights back to CPU
                 layer.to_device(&Device::Cpu)?;
-                
-                // 3. [WINDOWS-ONLY] Force OS to reclaim residual handles
-                #[cfg(target_os = "windows")]
-                if layer_idx % 5 == 0 {
-                    unsafe {
-                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                        use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
-                        use windows_sys::Win32::System::Memory::{QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                        let process = GetCurrentProcess();
-                        let _ = SetProcessWorkingSetSizeEx(process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                    }
-                }
             }
 
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
@@ -1613,21 +1614,35 @@ impl QuantizedQwen3VLTextModel {
         let target_device = Device::new_cuda(device_id)?;
         
         // [DYNAMIC-PINNING-STRATEGY]
-        // safety_margin: 2.0GB (1GB system, 1GB activations)
-        // Check for stability: ensure we have at least some extra room before pinning
-        let total_safety_margin = 2_000_000_000; 
-        let layer_size = 75_000_000; 
+        // 1. Fixed System Reserve: 800MB (For Windows/Browser safety)
+        // 2. Dynamic Activation Buffer: Scaled by current context length
+        let kv_len = self.get_kv_len();
+        let dynamic_margin = (kv_len as u64 * 15_000).max(400_000_000); 
+        let total_safety_margin = 800_000_000 + dynamic_margin; 
         
+        let layer_size = 75_000_000; 
         let available_for_weights = free_vram.saturating_sub(total_safety_margin);
         
-        // If VRAM is too low even for safety buffer, aggressively offload EVERYTHING
-        if free_vram < 1_500_000_000 {
-            println!("[VRAM-PANIC] VRAM extremely low ({}MB). Evacuating ALL layers to RAM.", free_vram / 1_000_000);
-            for layer in self.layers.iter_mut() {
-                if layer.device().is_cuda() { layer.to_device(&Device::Cpu)?; }
+        // [VRAM-GUARD] If VRAM is getting tight, aggressively protect the safety buffer
+        if free_vram < total_safety_margin {
+            let needed = total_safety_margin.saturating_sub(free_vram);
+            let layers_to_evict = (needed / layer_size as u64) as usize + 1;
+            
+            let mut evicted = 0;
+            for i in (0..self.layers.len()).rev() {
+                if evicted >= layers_to_evict { break; }
+                if self.layers[i].device().is_cuda() {
+                    self.layers[i].to_device(&Device::Cpu)?;
+                    evicted += 1;
+                }
+            }
+            if evicted > 0 {
+                println!("[VRAM-GUARD] Evicted {} layers to protect {}MB safety buffer. (Free: {}MB)", 
+                    evicted, total_safety_margin / 1_000_000, free_vram / 1_000_000);
             }
             return Ok(());
         }
+
         let max_gpu_layers = (available_for_weights / layer_size as u64) as usize;
         let max_gpu_layers = max_gpu_layers.min(self.layers.len());
 
@@ -1650,8 +1665,8 @@ impl QuantizedQwen3VLTextModel {
         }
 
         if moved_to_gpu > 0 || moved_to_cpu > 0 {
-            println!("[PINNING-REPORT] GPU Pinned: {}/{} Layers. Streaming remaining: {}. (System Buffer: 1GB, Free: {}MB)", 
-                pinned_count, self.layers.len(), self.layers.len() - pinned_count, free_vram / 1_000_000);
+            println!("[PINNING-REPORT] GPU Pinned: {}/{} Layers. Streaming remaining: {}. (Safety Buffer: {}MB, Free: {}MB)", 
+                pinned_count, self.layers.len(), self.layers.len() - pinned_count, total_safety_margin / 1_000_000, free_vram / 1_000_000);
         }
         
         Ok(())

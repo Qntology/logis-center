@@ -505,7 +505,16 @@ impl Qwen3VLGenerateModel {
         if seqlen_offset == 0 {
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if path.exists() { self.load_kv_from_disk(&path)?; seqlen_offset = self.get_kv_len(); }
+                if path.exists() { 
+                    self.load_kv_from_disk(&path)?; 
+                    seqlen_offset = self.get_kv_len(); 
+                    
+                    // [HYBRID-SPEED-UP] Force all layers to GPU now that context is loaded
+                    if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
+                        println!("[HYBRID-SPEED-UP] Forcing GPU residency for all layers...");
+                        let _ = m.language_model.rebalance_layers(0);
+                    }
+                }
             }
         }
 
@@ -556,6 +565,7 @@ impl Qwen3VLGenerateModel {
         let image_grid_thw = input.image_grid_thw.take();
 
         println!("[DEBUG-GEN] Starting token generation loop. Max tokens: {}", max_new_tokens);
+        let mut prev_time = std::time::Instant::now();
 
         for _i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { 
@@ -565,6 +575,11 @@ impl Qwen3VLGenerateModel {
                 } 
             }
             
+            // [ADAPTIVE-VRAM-GUARD] Check every 5 tokens to prevent OOM as KV cache grows
+            if _i > 0 && _i % 5 == 0 && !self.qwen3_vl.is_cpu() {
+                let _ = self.qwen3_vl.rebalance_layers(0);
+            }
+
             let input_ids = if generated_text.is_empty() {
                 // Process remaining tokens from prefill
                 let start = local_pos;
@@ -577,9 +592,14 @@ impl Qwen3VLGenerateModel {
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
             
-            // forward 호출 전 로그
-            // println!("[DEBUG-GEN] Forwarding token {}...", _i);
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
+            
+            // [GEN-PROGRESS-LOG]
+            let elapsed = prev_time.elapsed().as_secs_f32();
+            if _i > 0 {
+                println!("[GEN] Token #{} | Latency: {:.2}s | Speed: {:.2} t/s", _i, elapsed, 1.0 / elapsed);
+            }
+            prev_time = std::time::Instant::now();
             
             let logits = logits.squeeze(0)?;
             let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
