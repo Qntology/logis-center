@@ -279,10 +279,11 @@ impl QuantizedQwen3VLTextAttention {
             let mut kp = get_qlinear(ct, reader, &k_proj_name, device, dtype)?;
             let mut vp = get_qlinear(ct, reader, &v_proj_name, device, dtype)?;
             
-            // [HARDENING] Only slice if we are in 1024-dim model mode but found 2048-dim container
+            // [HYBRID-FIX] Only slice if we are CERTAIN we are in 0.6B model (1024) 
+            // but the GGUF file provided a 2048-dim tensor (unlikely but handled)
             if actual_h_size == 1024 {
                 if qp.inner_shape().len() >= 2 && qp.inner_shape()[1] == 2048 {
-                    println!("[MODEL-FIX] Slicing individual Q from 2048-dim container for 0.6B layer.");
+                    println!("[MODEL-FIX] Slicing Q 2048 -> 1024 for 0.6B.");
                     qp = get_sliced_qlinear(ct, reader, &q_proj_name, device, dtype, 1, 0, 1024)?;
                 }
                 if kp.inner_shape().len() >= 2 && kp.inner_shape()[1] == 2048 {
@@ -294,6 +295,7 @@ impl QuantizedQwen3VLTextAttention {
             }
             (qp, kp, vp)
         } else if has_combined {
+            // [0.6B-SPECIFIC] Split combined QKV
             let qp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 0, actual_h_size)?;
             let kp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, actual_h_size, actual_h_size)?;
             let vp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 2 * actual_h_size, actual_h_size)?;
@@ -376,11 +378,18 @@ impl QuantizedQwen3VLTextAttention {
             println!("[TRACE-ATTN-L0] xs shape: {:?}, q_proj device: {:?}, target_dtype: {:?}", xs.shape(), self.q_proj.device(), target_dtype);
         }
 
-        let query_states = self.q_proj.forward(&xs).map_err(|e| {
-            println!("[ERROR-ATTN] q_proj mismatch at Layer {}: xs={:?}, weight_dev={:?}. Error: {}", 
-                self.layer_idx, xs.shape(), self.q_proj.device(), e);
-            e
-        })?.reshape((
+        let query_states = {
+            let w_shape = self.q_proj.inner_shape();
+            let mut xs_q = xs.clone();
+            if xs_q.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+                xs_q = xs_q.narrow(D::Minus1, 0, 1024)?.contiguous()?;
+            }
+            self.q_proj.forward(&xs_q).map_err(|e| {
+                println!("[ERROR-ATTN] q_proj mismatch at Layer {}: xs={:?}, weight_dev={:?}. Error: {}", 
+                    self.layer_idx, xs.shape(), self.q_proj.device(), e);
+                e
+            })?
+        }.reshape((
             b_sz,
             q_len,
             self.num_attention_heads,
@@ -388,7 +397,14 @@ impl QuantizedQwen3VLTextAttention {
         ))?;
         let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
         
-        let key_states = self.k_proj.forward(&xs)?.reshape((
+        let key_states = {
+            let w_shape = self.k_proj.inner_shape();
+            let mut xs_k = xs.clone();
+            if xs_k.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+                xs_k = xs_k.narrow(D::Minus1, 0, 1024)?.contiguous()?;
+            }
+            self.k_proj.forward(&xs_k)?
+        }.reshape((
             b_sz,
             q_len,
             self.num_key_value_heads,
@@ -396,7 +412,14 @@ impl QuantizedQwen3VLTextAttention {
         ))?;
         let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
         
-        let value_states = self.v_proj.forward(&xs)?
+        let value_states = {
+            let w_shape = self.v_proj.inner_shape();
+            let mut xs_v = xs.clone();
+            if xs_v.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+                xs_v = xs_v.narrow(D::Minus1, 0, 1024)?.contiguous()?;
+            }
+            self.v_proj.forward(&xs_v)?
+        }
             .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?.contiguous()?;
 
@@ -859,37 +882,82 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
         let hybrid_residual = xs.clone();
         
-        if self.self_attn.layer_idx == 0 {
-            println!("[TRACE-L0-PRE] xs: {:?}, residual: {:?}", xs.shape(), hybrid_residual.shape());
-        }
-
-        let xs = self.input_layernorm.forward(&xs)?;
-        let xs = self.self_attn.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+        let norm_dim = self.input_layernorm.weight().dim(0)?;
+        let input_dim = xs.dim(candle_core::D::Minus1)?;
         
-        if self.self_attn.layer_idx == 0 {
-            println!("[TRACE-L0-POST] xs: {:?}, residual: {:?}", xs.shape(), hybrid_residual.shape());
-        }
+        // [HYBRID-BRIDGE] Handle 2048 input into 1024 layer
+        let mut xs_active = if input_dim == 2048 && norm_dim == 1024 {
+            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Slicing 2048 input to 1024 for Layer 0"); }
+            xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
+        } else {
+            xs.clone()
+        };
 
-        // [HARDENING] Residual Addition DType Guard
-        let xs = if xs.dtype() != hybrid_residual.dtype() { xs.to_dtype(hybrid_residual.dtype())? } else { xs };
-        let xs = hybrid_residual.add(&xs)?;
+        let mut residual_active = xs_active.clone();
+
+        let xs_active = self.input_layernorm.forward(&xs_active)?;
+        let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
+        
+        let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
+        xs_active = residual_active.add(&xs_active)?;
+        
+        // [HYBRID-BRIDGE-BACK] Restore to original input dimension if needed
+        let mut xs = if input_dim == 2048 && norm_dim == 1024 {
+            Tensor::cat(&[&xs_active, &xs_active], candle_core::D::Minus1)?.contiguous()?
+        } else {
+            xs_active
+        };
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
             let residual = xs.clone();
-            let xs = post_norm.forward(&xs)?;
-            let xs = {
-                let gate = gate_proj.forward(&xs)?;
-                let up = up_proj.forward(&xs)?;
+            
+            // [HYBRID-BRIDGE-MLP] Slice input if MLP expects 1024 but pipeline is 2048
+            let mut xs_mlp = post_norm.forward(&xs)?;
+            let norm_dim_mlp = post_norm.weight().dim(0)?;
+            
+            if input_dim == 2048 && norm_dim_mlp == 1024 {
+                xs_mlp = xs_mlp.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?;
+            }
+
+            let xs_mlp = {
+                let gate = {
+                    let w_shape = gate_proj.inner_shape();
+                    let mut inp = xs_mlp.clone();
+                    if inp.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+                        inp = inp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
+                    }
+                    gate_proj.forward(&inp)?
+                };
+                let up = {
+                    let w_shape = up_proj.inner_shape();
+                    let mut inp = xs_mlp.clone();
+                    if inp.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+                        inp = inp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
+                    }
+                    up_proj.forward(&inp)?
+                };
                 let gate = candle_nn::ops::silu(&gate)?;
                 let hidden = gate.mul(&up)?;
-                down_proj.forward(&hidden)?
+                
+                let mut out = {
+                    let w_shape = down_proj.inner_shape();
+                    let mut inp = hidden.clone();
+                    // Down projection is usually [hidden, intermediate]
+                    // If hidden is 1024 but out is 2048 or vice-versa, handle it
+                    down_proj.forward(&inp)?
+                };
+                
+                // If MLP was 1024-dim, result is 1024. Upscale to 2048 if residual is 2048.
+                if out.dim(D::Minus1)? == 1024 && residual.dim(D::Minus1)? == 2048 {
+                    out = Tensor::cat(&[&out, &out], D::Minus1)?.contiguous()?;
+                }
+                out
             };
-            // [HARDENING] Second Residual Addition DType Guard
-            let xs = if xs.dtype() != residual.dtype() { xs.to_dtype(residual.dtype())? } else { xs };
-            Ok(residual.add(&xs)?)
+            
+            let mut xs_mlp = if xs_mlp.dtype() != residual.dtype() { xs_mlp.to_dtype(residual.dtype())? } else { xs_mlp };
+            Ok(residual.add(&xs_mlp)?)
         } else {
-            // MLP was skipped (Attention-Only), just return result after attention
             Ok(xs)
         }
     }
