@@ -422,13 +422,32 @@ impl QuantizedQwen3VLTextAttention {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
                 // Key Cache Alignment
-                let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
-                let pk = if pk.dtype() != target_dtype { pk.to_dtype(target_dtype)? } else { pk }.contiguous()?;
+                let mut pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
+                let mut pk = if pk.dtype() != target_dtype { pk.to_dtype(target_dtype)? } else { pk }.contiguous()?;
                 
                 // Value Cache Alignment
-                let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v.clone() };
-                let pv = if pv.dtype() != target_dtype { pv.to_dtype(target_dtype)? } else { pv }.contiguous()?;
+                let mut pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v.clone() };
+                let mut pv = if pv.dtype() != target_dtype { pv.to_dtype(target_dtype)? } else { pv }.contiguous()?;
                 
+                // [AUTO-UPSCALE] If previous cache has fewer heads (e.g. 8 vs 16), replicate heads
+                let prev_heads = pk.dim(1)?;
+                let curr_heads = key_states.dim(1)?;
+                
+                if prev_heads < curr_heads {
+                    let ratio = curr_heads / prev_heads;
+                    if ratio > 1 {
+                        // Replicate heads: [B, 8, S, D] -> [B, 16, S, D]
+                        // We use repeat_interleave logic: repeat elements along dim 1
+                        // Candle doesn't have repeat_interleave, so we use repeat + reshape + transpose
+                        // [B, H, S, D] -> [B, H, 1, S, D] -> [B, H, R, S, D] -> [B, H*R, S, D]
+                        let (b, h, s, d) = pk.dims4()?;
+                        pk = pk.unsqueeze(2)?.repeat((1, 1, ratio, 1, 1))?.flatten(1, 2)?.contiguous()?;
+                        
+                        let (b_v, h_v, s_v, d_v) = pv.dims4()?;
+                        pv = pv.unsqueeze(2)?.repeat((1, 1, ratio, 1, 1))?.flatten(1, 2)?.contiguous()?;
+                    }
+                }
+
                 let k = Tensor::cat(&[&pk, &key_states.contiguous()?], 2)?.contiguous()?;
                 let v = Tensor::cat(&[&pv, &value_states.contiguous()?], 2)?.contiguous()?;
                 (k, v)
