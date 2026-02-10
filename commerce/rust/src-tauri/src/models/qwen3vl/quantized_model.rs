@@ -242,15 +242,13 @@ impl QuantizedQwen3VLTextAttention {
         let q_weight_name = format!("{base_name}.{q}.weight");
         let k_weight_name = format!("{base_name}.{k}.weight");
 
-        // [FIX] Strict Head Detection: Direct mapping from hidden size
-        let num_attention_heads = if actual_h_size == 2048 { 16 } else if actual_h_size == 1024 { 8 } else { actual_h_size / head_dim };
-        let num_key_value_heads = if actual_h_size == 2048 { 16 } else if actual_h_size == 1024 { 8 } else { num_attention_heads };
+        // [MATHEMATICAL-ALIGNMENT] 
+        // 2B Hybrid is GQA: 16 Query Heads (2048) / 8 KV Heads (1024)
+        // 0.6B is MHA: 8 Query Heads (1024) / 8 KV Heads (1024)
+        let num_attention_heads = if actual_h_size == 2048 { 16 } else { 8 };
+        let num_key_value_heads = 8; 
 
-        let num_kv_groups = if num_key_value_heads > 0 {
-            num_attention_heads / num_key_value_heads
-        } else {
-            1
-        };
+        let num_kv_groups = num_attention_heads / num_key_value_heads;
 
         if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
             if layer_idx == 0 {
@@ -373,11 +371,15 @@ impl QuantizedQwen3VLTextAttention {
             if xs_q.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
                 xs_q = xs_q.narrow(D::Minus1, 0, 1024)?.contiguous()?;
             }
-            self.q_proj.forward(&xs_q).map_err(|e| {
+            let res = self.q_proj.forward(&xs_q).map_err(|e| {
                 println!("[ERROR-ATTN] q_proj mismatch at Layer {}: xs={:?}, weight_dev={:?}. Error: {}", 
                     self.layer_idx, xs.shape(), self.q_proj.device(), e);
                 e
-            })?
+            })?;
+            if self.layer_idx == 0 {
+                println!("[TRACE-ATTN-L0] q_proj output shape: {:?}, heads: {}, dim: {}", res.shape(), self.num_attention_heads, self.head_dim);
+            }
+            res
         }.reshape((
             b_sz,
             q_len,
@@ -740,48 +742,41 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [LINEAR-BRIDGE] Convert 0.6B cache to 2B cache (Dim/Head Upscaling)
+        // [HYBRID-BRIDGE-V3] Robust Runtime Upscaling
+        // Instead of relying on specs.json, we check the ACTUAL running model's head count.
         let (_b, h, s_len, d) = k.dims4()?;
         let target_heads = self.num_key_value_heads;
         let target_dim = self.head_dim;
 
-        if self.layer_idx == 0 {
-            println!("[DEBUG-RELAY] Layer 0 Raw Load: Shape={:?}", k.shape());
-            println!("[DEBUG-RELAY] Target Config: Heads={}, Dim={}", target_heads, target_dim);
-            println!("[DEBUG-RELAY] Detected from Raw: H={}, S={}, D={}", h, s_len, d);
-        }
-
         if h != target_heads || d != target_dim {
             if self.layer_idx == 0 {
-                println!("[HYBRID-BRIDGE-REPORT] Layer {}: Received 0.6B Cache [Len: {}, Heads: {}, Dim: {}]", 
-                    self.layer_idx, s_len, h, d);
-                println!("[HYBRID-BRIDGE-REPORT] Target 2B Spec: [Heads: {}, Dim: {}]. Applying Upscaling...", 
-                    target_heads, target_dim);
+                println!("[HYBRID-BRIDGE] Mismatch Detected! Source: [Heads={}, Dim={}] -> Target: [Heads={}, Dim={}]", h, d, target_heads, target_dim);
             }
             
-            // Dimension Upscaling (1024 -> 2048)
+            // 1. Dimension Upscaling (1024 -> 2048)
             if d < target_dim {
-                if self.layer_idx == 0 { println!("[DEBUG-RELAY] Upscaling Dim ({} -> {})...", d, target_dim); }
+                if self.layer_idx == 0 { println!("[HYBRID-BRIDGE] Fixing Dimension ({} -> {})...", d, target_dim); }
                 k = Tensor::cat(&[&(k.clone()), &k], D::Minus1)?;
                 v = Tensor::cat(&[&(v.clone()), &v], D::Minus1)?;
             }
             
-            // Head Alignment (8 heads -> 16 heads etc)
-            if h != target_heads {
-                if self.layer_idx == 0 { println!("[DEBUG-RELAY] Upscaling Heads ({} -> {})...", h, target_heads); }
-                let mut k_heads = vec![];
-                let mut v_heads = vec![];
+            // 2. Head Replication (8 -> 16)
+            if h < target_heads {
+                if self.layer_idx == 0 { println!("[HYBRID-BRIDGE] Fixing Heads ({} -> {})...", h, target_heads); }
+                let mut k_heads = Vec::with_capacity(target_heads);
+                let mut v_heads = Vec::with_capacity(target_heads);
+                
                 for i in 0..target_heads {
-                    let source_idx = i % h;
-                    k_heads.push(k.narrow(1, source_idx, 1)?);
-                    v_heads.push(v.narrow(1, source_idx, 1)?);
+                    let src_idx = i % h; // Cyclic replication (0,1,2...7, 0,1,2...7)
+                    k_heads.push(k.narrow(1, src_idx, 1)?);
+                    v_heads.push(v.narrow(1, src_idx, 1)?);
                 }
                 k = Tensor::cat(&k_heads, 1)?;
                 v = Tensor::cat(&v_heads, 1)?;
             }
-
+            
             if self.layer_idx == 0 {
-                println!("[HYBRID-BRIDGE-SUCCESS] Final 2B-Compatible Cache Shape: {:?}", k.shape());
+                println!("[HYBRID-BRIDGE-SUCCESS] Adjusted Cache Shape: {:?}", k.shape());
             }
         }
 
@@ -790,7 +785,11 @@ impl QuantizedQwen3VLTextAttention {
         let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
 
         if final_len > 0 {
-            self.kv_cache = Some((k.narrow(2, 0, final_len.min(actual_k_len))?, v.narrow(2, 0, final_len.min(actual_k_len))?));
+            // [CRITICAL] Assign the corrected tensors
+            self.kv_cache = Some((
+                k.narrow(2, 0, final_len.min(actual_k_len))?.contiguous()?, 
+                v.narrow(2, 0, final_len.min(actual_k_len))?.contiguous()?
+            ));
         }
         Ok(())
     }
@@ -1123,9 +1122,13 @@ impl QuantizedQwen3VLTextModel {
                      if actual_h_size == 1024 {
                          s_t
                      } else {
-                         // 2B 추론 시에는 2048로 확장
-                         println!("[HYBRID-RELAY] Upscaling Shared Embedding to 2048.");
-                         Tensor::cat(&[&(s_t.clone()), &s_t], 1)?
+                         // 2B 추론 시에는 2048로 확장 (2b_specs.json 명시적 지원)
+                         if s_t.dim(1)? == 1024 && actual_h_size == 2048 {
+                            println!("[HYBRID-RELAY] Upscaling Shared Embedding 1024 -> 2048 for 2B Model.");
+                            Tensor::cat(&[&(s_t.clone()), &s_t], 1)?
+                         } else {
+                            s_t
+                         }
                      }
                  } else {
                      Tensor::zeros((config.vocab_size, actual_h_size), dtype, device)?
@@ -1993,7 +1996,6 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
             if name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v") || name.contains("gate") || name.contains("up") {
                 if rows == 2048 && cols == 1024 { needs_transpose = true; }
             } else if name.contains("attn_output") || name.contains("down") {
-                // 이들은 입력이 2048(또는 그 이상)이고 출력이 1024여야 함
                 if rows == 1024 && cols != 1024 { needs_transpose = true; }
             }
         } else {
