@@ -214,7 +214,10 @@ impl QuantizedQwen3VLTextAttention {
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
         // [DETECTION-FIRST] Determine actual hidden size for THIS layer/file
-        let actual_h_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
+        // [FORCE-FIX] If config says 2048 (2B), trust it absolutely to prevent layer drift.
+        let actual_h_size = if config.hidden_size == 2048 {
+            2048
+        } else if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
             info.shape.dims()[0]
         } else if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.input_layernorm.weight")) {
             info.shape.dims()[0]
@@ -226,6 +229,8 @@ impl QuantizedQwen3VLTextAttention {
         };
 
         let is_06b = actual_h_size == 1024;
+        
+        println!("[DEBUG-ATTN-NEW] Layer: {}, Config Hidden: {}, Actual Hidden: {}, Is 0.6B: {}", layer_idx, config.hidden_size, actual_h_size, is_06b);
         
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
             if is_06b {
@@ -361,8 +366,9 @@ impl QuantizedQwen3VLTextAttention {
 
         let (b_sz, q_len, last_dim) = xs.dims3()?;
         
-        if self.layer_idx == 0 {
-            println!("[TRACE-ATTN-L0] xs shape: {:?}, q_proj device: {:?}, target_dtype: {:?}", xs.shape(), self.q_proj.device(), target_dtype);
+        if self.layer_idx == 0 || self.num_attention_heads == 8 {
+            println!("[TRACE-ATTN-FWD] Layer: {}, Heads: {}, HeadDim: {}, Input Shape: {:?}, Dev: {:?}", 
+                self.layer_idx, self.num_attention_heads, self.head_dim, xs.shape(), dev);
         }
 
         let query_states = {
@@ -376,9 +382,11 @@ impl QuantizedQwen3VLTextAttention {
                     self.layer_idx, xs.shape(), self.q_proj.device(), e);
                 e
             })?;
-            if self.layer_idx == 0 {
-                println!("[TRACE-ATTN-L0] q_proj output shape: {:?}, heads: {}, dim: {}", res.shape(), self.num_attention_heads, self.head_dim);
+            
+            if self.num_attention_heads == 8 && res.dim(D::Minus1)? == 2048 {
+                 println!("[CRITICAL-ERROR] Layer {} has 8 heads but 2048 dim output! Reshape will fail.", self.layer_idx);
             }
+
             res
         }.reshape((
             b_sz,
