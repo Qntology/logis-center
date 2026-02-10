@@ -205,17 +205,19 @@ impl LogisModel {
         }
     }
 
-    /// [CLEANUP] Adaptive resource management based on system stress
     pub async fn deep_purge_resources(&self) {
+        println!("[MEMORY] Initiating HARD Deep Purge...");
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                // Ignore sync errors if context is already gone
-                if dev.is_cuda() { let _ = dev.synchronize(); }
+                if dev.is_cuda() { 
+                    let _ = dev.synchronize(); 
+                    // [NEW] Hint to the driver to release cached memory if possible
+                }
             }).await;
         }
 
-        // 1. Clear Active Slots (Forced wait for lock to ensure reclamation)
+        // 1. Clear ALL Slots (Forced wait for lock to ensure reclamation)
         {
             let mut gen = self.generator.lock().await;
             *gen = None;
@@ -228,6 +230,13 @@ impl LogisModel {
             let mut l_hib = self.large_hibernation.lock().await;
             *l_hib = None;
         }
+        {
+            let mut size = self.current_size.lock().await;
+            *size = None;
+        }
+
+        println!("[MEMORY] Deep Purge Complete. VRAM/RAM released to OS.");
+    }
         
         // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]

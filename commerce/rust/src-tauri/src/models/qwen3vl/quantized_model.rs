@@ -919,6 +919,16 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         xs_active = residual_active.add(&xs_active)?;
         
+        // [KV-OFFLOAD-GUARD] Emergency KV Swap to CPU if context is too long
+        if let Some((k, v)) = &mut self.self_attn.kv_cache {
+            let kv_len = k.dim(2)?;
+            if kv_len > 32768 && k.device().is_cuda() {
+                // println!("[OFFLOAD] Moving KV Cache of Layer {} to CPU (Len: {})", self.self_attn.layer_idx, kv_len);
+                *k = k.to_device(&Device::Cpu)?;
+                *v = v.to_device(&Device::Cpu)?;
+            }
+        }
+        
         // [HYBRID-BRIDGE-BACK] Restore to original input dimension if needed
         let mut xs = if input_dim == 2048 && norm_dim == 1024 {
             Tensor::cat(&[&xs_active, &xs_active], candle_core::D::Minus1)?.contiguous()?
@@ -1335,6 +1345,9 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if xs.device().is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
 
+        // [DYNAMIC-RECOVERY] Periodically recover GPU resources
+        let _ = self.rebalance_layers(0);
+
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
                 None
@@ -1345,12 +1358,10 @@ impl QuantizedQwen3VLTextModel {
                     seqlen_offset,
                     xs.device(),
                 )?;
-                // [HARDENING] Mask DType Guard
                 Some(mask.to_dtype(DType::F32)?.contiguous()?)
             }
         };
 
-        let _total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
@@ -1358,13 +1369,9 @@ impl QuantizedQwen3VLTextModel {
                 if layer_idx < deepstack_embeds.len() {
                     let m_orig = visual_pos_masks.unwrap();
                     let e_orig = &deepstack_embeds[layer_idx];
-                    
                     let mask = if !m_orig.device().same_device(xs.device()) { m_orig.to_device(xs.device())? } else { m_orig.clone() };
                     let embed = if !e_orig.device().same_device(xs.device()) { e_orig.to_device(xs.device())? } else { e_orig.clone() };
-                    
-                    // [HARDENING] Visual Merge DType Guard
                     let embed = if embed.dtype() != xs.dtype() { embed.to_dtype(xs.dtype())? } else { embed };
-
                     xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
                 }
             }
@@ -1567,40 +1574,49 @@ impl QuantizedQwen3VLTextModel {
 
         let target_device = Device::new_cuda(device_id)?;
         
-        // [HYBRID-OFFLOAD-STRATEGY]
-        // 1. Calculate estimated size of one layer (approx 60-80MB for 2B Q4)
-        // 2. Keep 1GB buffer for KV Cache & Activations (Crucial for 50k+ tokens)
+        // [SMART-OFFLOAD-STRATEGY]
+        // 1. Layer size: ~75MB for 2B Q4
+        // 2. Safety Buffer: 1.0GB (Enough for moderate context activations)
+        // 3. Greedy Fill: Keep pushing layers to GPU until free_vram hits safety_buffer
         let safety_buffer = 1_000_000_000; 
-        let mut current_available = free_vram.saturating_sub(safety_buffer);
-        
-        let mut gpu_count = 0;
-        let mut cpu_count = 0;
+        let layer_size = 75_000_000;
 
+        let mut moved_to_gpu = 0;
+        let mut moved_to_cpu = 0;
+        let mut gpu_total = 0;
+
+        // Sort layers: prioritize early layers for GPU (usually more compute-heavy)
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            // Check if layer is already on GPU
             let is_on_gpu = layer.device().is_cuda();
-            
-            // Estimate layer size (this is a rough heuristic, could be improved by tracking actual weight sizes)
-            let layer_size = 75_000_000; // 75MB per layer for 2B Q4
+            let layer_size = 75_000_000; 
 
-            if current_available > layer_size {
+            // [PRIORITY-L0-L5] Keep first 5 layers on GPU if possible to avoid IO bottleneck
+            let is_priority = i < 5;
+            let current_safety_buffer = if is_priority { safety_buffer / 2 } else { safety_buffer };
+
+            if current_available > layer_size || (is_priority && free_vram > current_safety_buffer) {
                 if !is_on_gpu {
-                    // println!("[REBALANCE] Moving Layer {} to GPU. Remaining VRAM buffer: {}MB", i, current_available / 1_000_000);
-                    layer.to_device(&target_device)?;
+                    // Only upload if we have an extra buffer or it's a priority layer
+                    if is_priority || current_available > (layer_size + 200_000_000) {
+                        layer.to_device(&target_device)?;
+                        moved_to_gpu += 1;
+                    }
                 }
-                current_available -= layer_size;
-                gpu_count += 1;
+                if layer.device().is_cuda() {
+                    current_available = current_available.saturating_sub(layer_size as u64);
+                    gpu_total += 1;
+                }
             } else {
-                if is_on_gpu {
-                    // println!("[REBALANCE] Moving Layer {} to CPU (VRAM Full).", i);
+                if is_on_gpu && !is_priority { // Never offload priority layers unless extreme OOM
                     layer.to_device(&Device::Cpu)?;
+                    moved_to_cpu += 1;
                 }
-                cpu_count += 1;
             }
         }
 
-        if gpu_count > 0 || cpu_count > 0 {
-            println!("[REBALANCE-RESULT] Hybrid Distribution: {} Layers on GPU, {} Layers on CPU.", gpu_count, cpu_count);
+        if moved_to_gpu > 0 || moved_to_cpu > 0 {
+            println!("[SMART-REBALANCE] Migration: +{} GPU, -{} CPU. Total GPU Layers: {}/{} (Free VRAM: {}MB)", 
+                moved_to_gpu, moved_to_cpu, gpu_total, self.layers.len(), free_vram / 1_000_000);
         }
         
         Ok(())
@@ -1744,6 +1760,9 @@ impl QuantizedQwen3VLModel {
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        // [DYNAMIC-RECOVERY] Periodically check for GPU resource availability
+        let _ = self.language_model.rebalance_layers(0);
+
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
@@ -1839,6 +1858,9 @@ impl QuantizedQwen3TextModel {
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+        // [DYNAMIC-RECOVERY] Check for free VRAM and move layers back to GPU if possible
+        let _ = self.language_model.rebalance_layers(0);
+
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;

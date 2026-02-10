@@ -474,6 +474,13 @@ async fn process_task(
                     if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
                         println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
                         worker.prefill_chunk(text, Some(token_clone), None)?;
+                        
+                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
+                        if let Some(sid) = &session_clone {
+                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
+                            worker.save_kv_to_disk(&save_path)?;
+                        }
                     } else {
                         worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                     }
@@ -638,6 +645,13 @@ async fn process_task(
                     if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
                         println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
                         worker.prefill_chunk(text, Some(token_clone), None)?;
+                        
+                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
+                        if let Some(sid) = &session_clone {
+                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
+                            worker.save_kv_to_disk(&save_path)?;
+                        }
                     } else {
                         worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                     }
@@ -743,6 +757,13 @@ async fn process_task(
                     if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
                         println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
                         worker.prefill_chunk(text, Some(token_clone), None)?;
+                        
+                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
+                        if let Some(sid) = &session_clone {
+                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
+                            worker.save_kv_to_disk(&save_path)?;
+                        }
                     } else {
                         worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                     }
@@ -907,6 +928,13 @@ async fn process_task(
                     if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
                         println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
                         worker.prefill_chunk(text, Some(token_clone), None)?;
+                        
+                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
+                        if let Some(sid) = &session_clone {
+                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
+                            worker.save_kv_to_disk(&save_path)?;
+                        }
                     } else {
                         worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                     }
