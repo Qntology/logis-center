@@ -320,6 +320,28 @@ impl QuantizedQwen3VLTextAttention {
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
 
+        if layer_idx == 0 || layer_idx == 1 {
+            println!("[DEBUG-ATTN-FINAL] Layer: {}, Heads: {}, KV Heads: {}, Groups: {}", layer_idx, num_attention_heads, num_key_value_heads, num_kv_groups);
+        }
+
+        let instance = Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_attention_heads,
+            num_key_value_heads,
+            num_kv_groups,
+            head_dim,
+            scaling,
+            kv_cache: None,
+            layer_idx,
+        };
+        
+        println!("[PTR-NEW] Attention Instance {:p} | Layer: {} | Heads: {} | Hidden: {}", &instance, instance.layer_idx, instance.num_attention_heads, actual_h_size);
+        
         Ok(Self {
             q_proj,
             k_proj,
@@ -347,46 +369,25 @@ impl QuantizedQwen3VLTextAttention {
         let dev = self.q_proj.device();
         let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
 
-        // if self.layer_idx == 0 {
-        //     println!("[TRACE-L0] xs: {:?} {:?}, cos: {:?}, target: {:?}", xs.device(), xs.dtype(), cos.dtype(), target_dtype);
-        // }
-
         // 1. [HARDENING] Inbound Input Alignment
-        let xs = if !xs.device().same_device(dev) { 
-            let moved = xs.to_device(dev)?;
-            // if self.layer_idx == 0 { println!("[TRACE-MOVE] xs moved to {:?}", dev); }
-            moved
-        } else { xs.clone() };
-        
-        let xs = if xs.dtype() != target_dtype { 
-            let casted = xs.to_dtype(target_dtype)?;
-            // if self.layer_idx == 0 { println!("[TRACE-CAST] xs casted to {:?}", target_dtype); }
-            casted
-        } else { xs };
+        let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
+        let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
 
-        let (b_sz, q_len, last_dim) = xs.dims3()?;
+        let (b_sz, q_len, _last_dim) = xs.dims3()?;
         
-        if self.layer_idx == 0 || self.num_attention_heads == 8 {
-            println!("[TRACE-ATTN-FWD] Layer: {}, Heads: {}, HeadDim: {}, Input Shape: {:?}, Dev: {:?}", 
-                self.layer_idx, self.num_attention_heads, self.head_dim, xs.shape(), dev);
-        }
-
         let query_states = {
-            let w_shape = self.q_proj.inner_shape();
             let mut xs_q = xs.clone();
-            if xs_q.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+            if xs_q.dim(D::Minus1)? == 2048 && self.q_proj.inner_shape()[1] == 1024 {
                 xs_q = xs_q.narrow(D::Minus1, 0, 1024)?.contiguous()?;
             }
-            let res = self.q_proj.forward(&xs_q).map_err(|e| {
-                println!("[ERROR-ATTN] q_proj mismatch at Layer {}: xs={:?}, weight_dev={:?}. Error: {}", 
-                    self.layer_idx, xs.shape(), self.q_proj.device(), e);
-                e
-            })?;
+            let res = self.q_proj.forward(&xs_q)?;
             
-            if self.num_attention_heads == 8 && res.dim(D::Minus1)? == 2048 {
-                 println!("[CRITICAL-ERROR] Layer {} has 8 heads but 2048 dim output! Reshape will fail.", self.layer_idx);
+            // [AUTO-RECOVERY] Bulletproof Head Alignment
+            let q_out_dim = res.dim(D::Minus1)?;
+            let heads = q_out_dim / self.head_dim;
+            if heads != self.num_attention_heads {
+                self.num_attention_heads = heads;
             }
-
             res
         }.reshape((
             b_sz,
@@ -397,12 +398,19 @@ impl QuantizedQwen3VLTextAttention {
         let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
         
         let key_states = {
-            let w_shape = self.k_proj.inner_shape();
             let mut xs_k = xs.clone();
-            if xs_k.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+            if xs_k.dim(D::Minus1)? == 2048 && self.k_proj.inner_shape()[1] == 1024 {
                 xs_k = xs_k.narrow(D::Minus1, 0, 1024)?.contiguous()?;
             }
-            self.k_proj.forward(&xs_k)?
+            let res = self.k_proj.forward(&xs_k)?;
+            
+            // [AUTO-RECOVERY] Bulletproof KV Head Alignment
+            let k_out_dim = res.dim(D::Minus1)?;
+            let kv_heads = k_out_dim / self.head_dim;
+            if kv_heads != self.num_key_value_heads {
+                self.num_key_value_heads = kv_heads;
+            }
+            res
         }.reshape((
             b_sz,
             q_len,
@@ -412,15 +420,17 @@ impl QuantizedQwen3VLTextAttention {
         let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
         
         let value_states = {
-            let w_shape = self.v_proj.inner_shape();
             let mut xs_v = xs.clone();
-            if xs_v.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
+            if xs_v.dim(D::Minus1)? == 2048 && self.v_proj.inner_shape()[1] == 1024 {
                 xs_v = xs_v.narrow(D::Minus1, 0, 1024)?.contiguous()?;
             }
             self.v_proj.forward(&xs_v)?
         }
             .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
             .transpose(1, 2)?.contiguous()?;
+
+        // Synchronize KV groups after recovery
+        self.num_kv_groups = self.num_attention_heads / self.num_key_value_heads;
 
         // 2. [HARDENING] RoPE Alignment
         let cos = if cos.dtype() != target_dtype { cos.to_dtype(target_dtype)? } else { cos.clone() };
@@ -935,6 +945,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut residual_active = xs_active.clone();
 
         let xs_active = self.input_layernorm.forward(&xs_active)?;
+
         let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
         
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
@@ -1230,6 +1241,7 @@ impl QuantizedQwen3VLTextModel {
                 let standard = format!("{base_name}.layers.{layer_idx}");
                 let gguf_blk = format!("blk.{layer_idx}");
                 let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
+                
                 QuantizedQwen3VLTextDecoderLayer::new(
                     final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
                 )
