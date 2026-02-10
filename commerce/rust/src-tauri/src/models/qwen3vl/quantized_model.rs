@@ -2022,6 +2022,18 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
             } else {
                 if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
             }
+            
+            // [2B-HYBRID-SPEC-ALIGNMENT] 
+            // Based on 2b_specs.json:
+            // gate/up are stored as [2048, 6144] -> Must be [6144, 2048] for matmul
+            // down is stored as [6144, 2048] -> Must be [2048, 6144] for matmul
+            if hidden_size == 2048 {
+                if (name.contains("gate") || name.contains("up")) && rows == 2048 && cols == 6144 {
+                    needs_transpose = true;
+                } else if name.contains("down") && rows == 6144 && cols == 2048 {
+                    needs_transpose = true;
+                }
+            }
         }
 
         if needs_transpose {
