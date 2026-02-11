@@ -428,8 +428,30 @@ impl LogisModel {
         
         // 1. Load Small Model Isolated
         self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
+
+        // 2. Ingest PUG content
+        {
+            let gen_clone = self.generator.clone();
+            let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
+            let token_clone = cancel_token.clone();
+            
+            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let mut gen_guard = gen_clone.blocking_lock();
+                if let Some(gen) = gen_guard.as_mut() {
+                    // Just prefill, no generation needed for base context
+                    gen.prefill_chunk(prompt, token_clone, None)?;
+                }
+                Ok(())
+            }).await??;
+        }
+
+        // 3. Save Base Snapshot
+        self.save_kv_snapshot(&base_session).await?;
         
-        // ... (rest of function)
+        // 4. Unload immediately to free VRAM for 2B
+        self.unload_generator().await;
+        
+        Ok(())
     }
 
     // --- [NEW] 2B Continuous Inference Helper ---
@@ -533,22 +555,6 @@ impl LogisModel {
                 match old_size {
                     ModelSize::Small => { *small_slot = Some(old_m); },
                     ModelSize::Large => { *large_slot = Some(old_m); },
-                }
-            }
-        }
-
-        *gen_guard = Some(gen);
-        *current_size_guard = Some(size);
-        
-        Ok(())
-    }
-
-        // Move current main to slot
-        if let Some(old_m) = gen_guard.take() {
-            if let Some(old_size) = *current_size_guard {
-                match old_size {
-                    ModelSize::Small => *small_slot = Some(old_m),
-                    ModelSize::Large => *large_slot = Some(old_m),
                 }
             }
         }

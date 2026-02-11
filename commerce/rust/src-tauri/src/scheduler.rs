@@ -616,7 +616,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, false).await?;
             
             let model_clone = model.clone();
             let question_clone = task_question.clone();
