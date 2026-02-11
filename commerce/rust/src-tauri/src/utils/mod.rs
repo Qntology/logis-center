@@ -254,11 +254,11 @@ pub fn ceil_by_factor(num: f32, factor: u32) -> u32 {
 // --- GLOBAL EXTRACTION CONTROL ---
 
 pub fn is_extraction_stopped() -> bool {
-    paths::get_stop_signal_file().exists()
+    paths::get_stop_signal_file(None).exists()
 }
 
 pub fn set_extraction_stop_signal(stopped: bool) {
-    let file = paths::get_stop_signal_file();
+    let file = paths::get_stop_signal_file(None);
     if stopped {
         let _ = std::fs::File::create(file);
     } else {

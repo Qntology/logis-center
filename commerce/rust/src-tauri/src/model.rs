@@ -349,11 +349,12 @@ impl LogisModel {
     pub async fn save_kv_snapshot(&self, task_id: &str) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
-        
+        let handle_clone = self.app_handle.clone(); // [FIX] Define handle for move
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(Some(&self_handle)).join(task_id_str);
+                let path = crate::utils::paths::get_kv_dir(Some(&handle_clone)).join(task_id_str);
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
                 gen.save_kv_to_disk(&path)?;
                 Ok(path.to_string_lossy().to_string())
@@ -366,12 +367,12 @@ impl LogisModel {
     pub async fn load_kv_snapshot(&self, task_id: &str) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
-        let self_handle = self.app_handle.clone(); // [NEW] Clone handle
+        let handle_clone = self.app_handle.clone(); // [FIX] Define handle for move
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(Some(&self_handle)).join(task_id_str.clone());
+                let path = crate::utils::paths::get_kv_dir(Some(&handle_clone)).join(task_id_str.clone());
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
                     gen.load_kv_from_disk(&path)?;
@@ -538,9 +539,10 @@ impl LogisModel {
         let path_clone = path.to_string();
         let tok_path_clone = tokenizer_path.map(|s| s.to_string());
         let cfg_path_clone = config_path.map(|s| s.to_string());
+        let handle_clone = self.app_handle.clone(); // [NEW] Capture handle
 
         let gen = tokio::task::spawn_blocking(move || {
-            let kv_root = crate::utils::paths::get_kv_dir(Some(&self_handle));
+            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 tok_path_clone.as_deref(), 

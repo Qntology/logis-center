@@ -3,10 +3,10 @@ use tauri::{AppHandle, Manager};
 use std::fs;
 
 pub fn get_app_tmp_root(app: Option<&AppHandle>) -> PathBuf {
-    // [TAURI-STANDARD] If app handle is available, use the official OS local data directory (e.g., AppData on Windows)
+    // [TAURI-2.0-STANDARD] Use the new .path() API for data directory resolution
     if let Some(app_handle) = app {
-        if let Some(data_dir) = app_handle.path_resolver().app_local_data_dir() {
-            let data_dir: PathBuf = data_dir;
+        // Tauri 2.0 uses .path().app_local_data_dir()
+        if let Ok(data_dir) = app_handle.path().app_local_data_dir() {
             if !data_dir.exists() {
                 let _ = fs::create_dir_all(&data_dir);
             }
