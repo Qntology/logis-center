@@ -560,9 +560,10 @@ async fn process_task(
             };
             
             let p = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
+            let snippet: String = p.chars().take(100).collect();
             println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
                 p.len(), 
-                if p.len() > 100 { &p[..100] } else { &p }.replace("\n", " ")
+                snippet.replace("\n", " ")
             );
             
             // [DEBUG-LOG] Save generated Pug
