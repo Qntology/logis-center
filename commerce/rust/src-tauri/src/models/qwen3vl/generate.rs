@@ -35,11 +35,11 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
-    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, session_id: Option<String>) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset),
+            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, session_id),
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, session_id),
         }
     }
 
@@ -552,7 +552,7 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Generation cancelled during prefill")); }
             }
 
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, session_id.clone())?;
             
             // [DYNAMIC-RECOVERY] Check for GPU availability every chunk during prefill
             if !self.qwen3_vl.is_cpu() {
@@ -612,7 +612,7 @@ impl Qwen3VLGenerateModel {
                 let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset + seq_len);
             }
 
-            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
+            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, session_id.clone())?;
             
             // [GEN-PROGRESS-LOG]
             let elapsed = prev_time.elapsed().as_secs_f32();

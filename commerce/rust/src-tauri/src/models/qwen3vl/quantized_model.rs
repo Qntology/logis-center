@@ -1083,6 +1083,8 @@ pub struct QuantizedQwen3VLTextModel {
     pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
     pub baking_only: bool, // [NEW] Skip MLP for KV baking
     pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
+    pub is_disk_swap: bool, // [NEW] SSD-Assisted GPU Inference mode
+    pub active_session_id: Option<String>, // [NEW] Disk workspace ID
     pub is_text: bool,
     pub is_image: bool,
 }
@@ -1100,8 +1102,9 @@ impl QuantizedQwen3VLTextModel {
         baking_only: bool,
         is_text: bool,
         is_image: bool,
+        is_disk_swap: bool, // [NEW]
     ) -> Result<Self> {
-        println!("[MODEL-INIT-DEBUG] Name: {}, Hidden: {}, Layers: {}, TextMode: {}", base_name, config.hidden_size, config.num_hidden_layers, is_text);
+        println!("[MODEL-INIT-DEBUG] Name: {}, Hidden: {}, Layers: {}, TextMode: {}, DiskSwap: {}", base_name, config.hidden_size, config.num_hidden_layers, is_text, is_disk_swap);
         let is_forced_cpu = device.is_cpu();
         let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader = std::io::Cursor::new(mmap);
@@ -1294,7 +1297,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_text, is_image })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_disk_swap, active_session_id: None, is_text, is_image })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1414,6 +1417,8 @@ impl QuantizedQwen3VLTextModel {
             mmap: None,
             baking_only,
             is_forced_cpu,
+            is_disk_swap: false, // Default for manual loader
+            active_session_id: None,
             is_text,
             is_image,
         })
@@ -1490,13 +1495,22 @@ impl QuantizedQwen3VLTextModel {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let is_on_cpu = layer.device().is_cpu();
             
+            // [SSD-ASSISTED-SWAP-LOGIC: CRITERION 2]
+            // Load this specific layer's KV cache from disk just before compute
+            if self.is_disk_swap {
+                if let Some(session_id) = &self.active_session_id {
+                    let kv_path = crate::utils::paths::get_kv_dir(None).join(session_id);
+                    if kv_path.exists() {
+                        let _ = layer.load_kv_cache(&kv_path, &gpu_device, 0, 0);
+                    }
+                }
+            }
+
             // [SMART-STREAMING]
             if is_on_cpu { layer.to_device(&gpu_device)?; }
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
-            if is_on_cpu { layer.to_device(&Device::Cpu)?; }
-
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
                     let m_orig = visual_pos_masks.unwrap();
@@ -1507,6 +1521,17 @@ impl QuantizedQwen3VLTextModel {
                     xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
                 }
             }
+
+            // [SSD-ASSISTED-SWAP-LOGIC: CRITERION 2]
+            // Dump this layer's KV cache back to disk and clear VRAM immediately
+            if self.is_disk_swap {
+                if let Some(session_id) = &self.active_session_id {
+                    let kv_path = crate::utils::paths::get_kv_dir(None).join(session_id);
+                    let _ = layer.save_kv_cache(&kv_path, true, 1024);
+                }
+            }
+
+            if is_on_cpu { layer.to_device(&Device::Cpu)?; }
         }
         
         let norm_dev = self.norm.weight().device();
@@ -1715,14 +1740,18 @@ impl QuantizedQwen3VLTextModel {
         if free_vram == 0 { return Ok(()); }
 
         // [DYNAMIC-RECOVERY] 
-        // 2.5GB is the threshold to start moving layers back to GPU
-        let can_rebalance = !self.is_forced_cpu || free_vram > 2_500_000_000;
-        if !can_rebalance { return Ok(()); }
-
-        // [KV-AWARE-ESTIMATION]
-        // For 2B Hybrid (GQA): 2 * layers * kv_heads * head_dim * precision
-        // 2 * 27 * 8 * 128 * 2 bytes (BF16) = 110,592 bytes per token (~110 KB)
+        // If we were forced to CPU, be EXTREMELY conservative about going back to GPU.
+        // We need enough space for weights AND the massive KV cache (1.1GB).
         let kv_cache_size = (context_len as u64) * 110_592;
+        let min_vram_to_recovery = 3_500_000_000 + kv_cache_size; 
+        
+        let can_rebalance = if self.is_forced_cpu {
+            free_vram > min_vram_to_recovery // Only recover if we have near-total free VRAM
+        } else {
+            free_vram > 2_500_000_000
+        };
+        
+        if !can_rebalance { return Ok(()); }
         let total_safety_margin = 400_000_000 + kv_cache_size; 
         
         let layer_size = 75_000_000; 
@@ -1913,8 +1942,12 @@ impl QuantizedQwen3VLModel {
         Ok((position_ids, mrope))
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, session_id: Option<String>) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids_in.dims2()?;
+        
+        // [SYNC-SESSION]
+        self.language_model.active_session_id = session_id;
+        
         // [DYNAMIC-RECOVERY] Periodically check for GPU resource availability
         let _ = self.language_model.rebalance_layers(0, seqlen_offset + seq_len);
 
@@ -2012,8 +2045,12 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None, is_text, is_image })
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, session_id: Option<String>) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids_in.dims2()?;
+        
+        // [SYNC-SESSION] Pass session info to underlying engine for SSD swap
+        self.language_model.active_session_id = session_id;
+        
         // [DYNAMIC-RECOVERY] Check for free VRAM and move layers back to GPU if possible
         let _ = self.language_model.rebalance_layers(0, seqlen_offset + seq_len);
 

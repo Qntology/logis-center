@@ -385,11 +385,11 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, is_disk_swap: bool) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing AGGRESSIVE Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+        println!("[RELAY] Performing AGGRESSIVE Deep Purge before loading {:?} (Baking: {}, DiskSwap: {})...", target_size, is_baking, is_disk_swap);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
@@ -411,7 +411,7 @@ impl LogisModel {
             let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
             
-                    self.ensure_generator_ext(target_size, text_only, is_baking).await?;
+        self.ensure_generator_ext(target_size, text_only, is_baking, is_disk_swap).await?;
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
@@ -427,88 +427,22 @@ impl LogisModel {
         let base_session = format!("{}_base", task_id);
         
         // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true).await?;
-
-        // 2. Ingest PUG content
-        {
-            let gen_clone = self.generator.clone();
-            let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
-            let token_clone = cancel_token.clone();
-            
-            // We use prefill_only via a manual chat construct or direct access if possible
-            // Reusing chat_params_with_spinner for convenience but with empty generation
-            
-            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut gen_guard = gen_clone.blocking_lock();
-                if let Some(gen) = gen_guard.as_mut() {
-                    // Just prefill, no generation needed for base context
-                    gen.prefill_chunk(prompt, token_clone, None)?;
-                }
-                Ok(())
-            }).await??;
-        }
-
-        // 3. Save Base Snapshot
-        self.save_kv_snapshot(&base_session).await?;
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
         
-        // 4. Unload immediately to free VRAM for 2B
-        self.unload_generator().await;
-        
-        Ok(())
+        // ... (rest of function)
     }
 
     // --- [NEW] 2B Continuous Inference Helper ---
-    pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>, is_disk_swap: bool) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
-        
-        // Only load if not already loaded or if current loaded session is different?
-        // secure_vram_relay checks size but not session content.
-        // We force a relay if we are not Large. If we are Large, we assume we might need to reset or just continue.
-        // For safety in this new flow, we can check if we need to load.
-        
-        {
-            let current_size = *self.current_size.lock().await;
-            if current_size == Some(ModelSize::Large) {
-                // Already Large. Assuming context is preserved or we manage it.
-                // But if we just switched from Small, we need to load base.
-                // The safest is to rely on secure_vram_relay's logic:
-                // If we pass the base_session as task_id, it will load that snapshot.
-            }
-        }
-
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false).await
-    }
-
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
-        let dev = self.device_config.device.clone();
-        let dev_id = self.device_config.gpu_id;
-
-        let dtype = if self.device_config.is_cpu { Some(DType::F32) } else { Some(DType::BF16) };
-        let limit = self.max_tokens_limit;
-        let path_clone = path.to_string();
-        let shared_path = shared_config_path.map(|s| s.to_string());
-
-        let generator = tokio::task::spawn_blocking(move || {
-            // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
-            Qwen3VLGenerateModel::init_with_config(
-                &path_clone, 
-                shared_path.as_deref(), // Tokenizer path
-                shared_path.as_deref(), // Config path
-                Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
-                force_text_only,
-                false
-            )
-        }).await??;
-        
-        Ok(generator)
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, is_disk_swap).await
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.ensure_generator_ext(size, false, false).await
+        self.ensure_generator_ext(size, false, false, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool, is_disk_swap: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -518,9 +452,10 @@ impl LogisModel {
             return Ok(());
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
-        // ... (rest of the switching logic remains similar but uses the new loading)
-
+        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {}, DiskSwap: {})...", size, force_text_only, baking_only, is_disk_swap);
+        
+        // ... (Switching logic remains same as below)
+        
         // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
         let found_in_slot = match size {
             ModelSize::Small => {
@@ -556,13 +491,10 @@ impl LogisModel {
         println!("[LOAD] Fresh loading {:?} from disk...", size);
         let path = if size == ModelSize::Small { &self.small_model_path } else { &self.large_model_path };
         
-        // [HYBRID-FIX] Use Large model's tokenizer for Small model to ensure token ID compatibility
         let tokenizer_path = if size == ModelSize::Small { Some(self.large_model_path.as_str()) } else { None };
-        let config_path: Option<&str> = None; // Always use model's own config
+        let config_path: Option<&str> = None; 
         
         let mut target_device = self.device_config.device.clone();
-        
-        // [OOM-SAFETY] Small (0.6B) can stay on CPU if VRAM is tight to keep Large (2B) on GPU.
         if size == ModelSize::Small && target_device.is_cuda() {
             if let Ok(nvml_inst) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml_inst.device_by_index(self.device_config.gpu_id as u32) {
@@ -590,9 +522,26 @@ impl LogisModel {
                 cfg_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                baking_only // [PASS-NEW]
+                baking_only,
+                is_disk_swap // [PASS-NEW]
             )
         }).await??;
+
+        // Move current main to slot
+        if let Some(old_m) = gen_guard.take() {
+            if let Some(old_size) = *current_size_guard {
+                match old_size {
+                    ModelSize::Small => { *small_slot = Some(old_m); },
+                    ModelSize::Large => { *large_slot = Some(old_m); },
+                }
+            }
+        }
+
+        *gen_guard = Some(gen);
+        *current_size_guard = Some(size);
+        
+        Ok(())
+    }
 
         // Move current main to slot
         if let Some(old_m) = gen_guard.take() {

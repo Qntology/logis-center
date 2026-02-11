@@ -291,9 +291,9 @@ pub async fn start_background_worker(
                                 } else {
                                     println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
                                     
-                                    // [NEW] Automatic OOM Recovery Logic (Forcing CPU Mode)
+                                    // [RECOVERY-STRATEGY-V2] SSD-Assisted GPU Recovery
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                        println!("[Scheduler] OOM Detected! Forcing CPU mode for retry.");
+                                        println!("[Scheduler] OOM Detected! Activating SSD-Swap GPU mode for retry.");
                                         {
                                             let mut model_lock = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
@@ -302,11 +302,11 @@ pub async fn start_background_worker(
                                             *model_lock = None; 
                                         }
                                         
-                                        current_device_pref = Some("cpu".to_string());
+                                        // [NEW] 'disk_swap' preference forces weights to GPU but KV to SSD
+                                        current_device_pref = Some("disk_swap".to_string());
         
-                                        // [FIX] Removed intermediate UI emit. Log the progress instead.
                                         log_task_progress(&app_handle, &task.id, &json!({
-                                            "category": "Warning", "summary": "Memory pressure detected. Retrying on CPU...", "spinner": "⚠️"
+                                            "category": "Warning", "summary": "Memory pressure! Switching to SSD-Accelerated GPU mode...", "spinner": "⚡"
                                         }));
                                         
                                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -431,7 +431,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
             // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
             
             // Perform prefill with image to create visual KV cache
             let model_clone = model.clone();
@@ -494,7 +494,8 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             model.extract_from_image(
                 task.id.clone(),
@@ -664,7 +665,8 @@ async fn process_task(
 
         // 2. [2B] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -728,7 +730,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake Full Context
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, false).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
@@ -776,7 +778,8 @@ async fn process_task(
 
         // 2. [2B] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -899,7 +902,7 @@ async fn process_task(
                 println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
                 
-                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, false).await?;
                 let model_clone = model.clone();
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
@@ -947,7 +950,8 @@ async fn process_task(
 
             // 2. [2B] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+                let is_disk_swap = effective_device_pref == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
