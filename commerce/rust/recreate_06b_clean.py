@@ -1,56 +1,45 @@
 import gguf
-import numpy as np
 import os
+import numpy as np
 
-original_path = "Qwen3-0.6B-BF16.gguf"
-output_path = "Qwen3-0.6B-Clean-L0-BF16.gguf"
-
-print(f"--- Recreating Clean 0.6B Model (Precise qwen3 Specs) ---")
-reader = gguf.GGUFReader(original_path)
-writer = gguf.GGUFWriter(output_path, "qwen3")
-
-# 1. 필수 메타데이터 강제 주입
-writer.add_uint32("qwen3.embedding_length", 1024)
-writer.add_uint32("qwen3.block_count", 1)
-writer.add_uint32("qwen3.context_length", 40960)
-writer.add_uint32("qwen3.feed_forward_length", 3072)
-writer.add_uint32("qwen3.attention.head_count", 16)
-writer.add_uint32("qwen3.attention.head_count_kv", 8)
-writer.add_float32("qwen3.attention.layer_norm_rms_epsilon", 1e-6) # 필수 키 추가
-writer.add_float32("qwen3.rope.freq_base", 1000000.0)
-
-# 기타 메타데이터 복사
-for field in reader.fields.values():
-    name = field.name
-    if any(k in name for k in ["embedding_length", "block_count", "context_length", "feed_forward_length", "attention.", "rope.", "general.architecture"]):
-        continue
+def create_ultra_clean_shell(input_path, output_path):
+    if not os.path.exists(input_path):
+        print(f"Error: {input_path} not found.")
+        return
     
-    val = field.parts[-1]
-    v_type = field.types[0]
-    if v_type == gguf.GGUFValueType.ARRAY:
-        writer.add_array(name, val.tolist() if hasattr(val, 'tolist') else list(val))
-    elif v_type == gguf.GGUFValueType.UINT32: writer.add_uint32(name, int(val[0]))
-    elif v_type == gguf.GGUFValueType.INT32: writer.add_int32(name, int(val[0]))
-    elif v_type == gguf.GGUFValueType.FLOAT32: writer.add_float32(name, float(val[0]))
-    elif v_type == gguf.GGUFValueType.BOOL: writer.add_bool(name, bool(val[0]))
-    elif v_type == gguf.GGUFValueType.STRING: writer.add_string(name, bytes(val).decode('utf-8'))
+    print(f"Creating 1-Layer Ultra Clean Shell: {output_path}")
+    reader = gguf.GGUFReader(input_path)
+    writer = gguf.GGUFWriter(output_path, "qwen2")
 
-# 2. 텐서 복사
-print("Processing Tensors...")
-for tensor in reader.tensors:
-    name = tensor.name
-    if "blk.0." in name or name == "token_embd.weight" or name == "output_norm.weight":
-        shape = tensor.shape
-        if name == "token_embd.weight" and shape[0] == 1024:
-            shape = (shape[1], shape[0])
-        
-        data = tensor.data
-        if tensor.tensor_type == gguf.GGMLQuantizationType.BF16:
-            data = data.view(np.uint16)
-        writer.add_tensor(name, data, raw_shape=shape, raw_dtype=tensor.tensor_type)
+    # 1. Core metadata - Force 1 layer
+    writer.add_block_count(1)
+    writer.add_embedding_length(1024)
+    writer.add_feed_forward_length(3072)
+    writer.add_head_count(8)
+    writer.add_head_count_kv(8)
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_context_length(32768)
+    writer.add_rope_dimension_count(128)
+    writer.add_rope_freq_base(1000000.0)
 
-writer.write_header_to_file()
-writer.write_kv_data_to_file()
-writer.write_tensors_to_file()
-writer.close()
-print("Done.")
+    # 2. Filter Tensors: Only keep Layer 0 and necessary base tensors
+    # We zero out the data to keep it small, but keep the SHAPE so the loader works.
+    keep_list = ['token_embd', 'blk.0.', 'output_norm', 'output.weight']
+    
+    for tensor in reader.tensors:
+        name = tensor.name
+        if any(x in name for x in keep_list):
+            # We keep the shape but use zeros to save space during quantization
+            # This makes the GGUF file act as a skeleton.
+            writer.add_tensor(name, np.zeros(tensor.shape, dtype=np.float16))
+        else:
+            # Skip all other layers (blk.1 to blk.27)
+            continue
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    print(f"Successfully created ultra clean shell: {output_path}")
+
+create_ultra_clean_shell("./Qwen3-0.6B-BF16.gguf", "./Qwen3-0.6B-Clean-L0-BF16.gguf")

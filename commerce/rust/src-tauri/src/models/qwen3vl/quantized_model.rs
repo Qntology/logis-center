@@ -870,14 +870,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
             let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
             
-            // [STRICT-HYBRID-SELECTION] Select specific L0 GGUF based on mode
-            // text_only이면 Text-Q4를, vision_enabled이면 VL-Q8을 로드
-            let l0_filename = if baking_only && !base_name.contains("vision") {
-                "Qwen3-2B-L0-Text-Q4_K_M.gguf"
-            } else {
-                "Qwen3-2B-L0-VL-Q8_0.gguf"
-            };
-            
+            // [STRICT-HYBRID-SELECTION] Unified Intelligence Module
+            let l0_filename = "Qwen3-2B-L0-VL-Q4_K_M.gguf";
             let l0_gguf_path = hybrid_dir.join(l0_filename);
             
             if l0_gguf_path.exists() {
@@ -888,7 +882,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
                         if let Ok(content) = gguf_file::Content::read(&mut cursor) {
                             l0_content = Some(content);
                             l0_cursor = Some(cursor);
-                            println!("[HYBRID-L0] FOUND superior 2B Layer 0 ({}) at {:?}", l0_filename, l0_gguf_path);
+                            println!("[HYBRID-L0] INJECTING unified 2B Layer 0 Intelligence from {:?}", l0_filename);
                         }
                     }
                 }
