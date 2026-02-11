@@ -739,7 +739,8 @@ impl QuantizedQwen3VLTextAttention {
                 target_parts = ((val * 10000.0).round() as usize) % 100;
                 // Decode Transpose Flag (9th dec)
                 let trans_val = ((val * 1000000000.0).round() as usize) % 10;
-                if trans_val == 1 { needs_retranspose = true; }
+                // [HYBRID-TRANSPOSE-FIX] Force re-transpose if the marker says so OR if we are upscaling
+                if trans_val == 1 || target_parts > 1 { needs_retranspose = true; }
                 
                 println!("[HYBRID-DECODER] Layer {} | Decoded Protocol: Target Parts = {}, Re-transpose = {}", self.layer_idx, target_parts, needs_retranspose);
                 k_data[0] = k_data[1]; 
