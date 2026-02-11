@@ -786,15 +786,59 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
 
-        let actual_k_len = k.dim(2)?;
+        // [HYBRID-PRECISION-CYCLE] 
+        // We perform all restoration logic in F32 for stability, 
+        // then convert to engine's active dtype only at the final assignment.
+        let engine_dtype = k.dtype();
+        let k_f32 = k.to_dtype(DType::F32)?;
+        let v_f32 = v.to_dtype(DType::F32)?;
+
+        let actual_k_len = k_f32.dim(2)?;
+        
+        // [HYBRID-HANDSHAKE-RECOVERY] Read user's decimal marker from index 0
+        let k_vec = k_f32.flatten_all()?.to_vec1::<f32>()?;
+        let sig = k_vec[0];
+        let mut target_parts = 1;
+        
+        if sig < -1.0 {
+            let val = sig.abs() - 1.0;
+            target_parts = ((val * 10000.0).round() as usize) % 100;
+            println!("[HYBRID-DECODER] Layer {} | Recovering 2B Intelligence: Multiplier x{}", self.layer_idx, target_parts);
+            
+            // Marker Healing: Replace marker with neighbor value
+            let mut k_clean = k_vec.clone();
+            k_clean[0] = k_vec[1];
+            let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
+            
+            // Upscale both K and V (all in F32)
+            let mut k_final = Tensor::cat(&vec![k_healed.clone(); target_parts], 0)?;
+            let mut v_final = Tensor::cat(&vec![v_f32.clone(); target_parts], 0)?;
+            
+            // [HYBRID-ENERGY-BALANCE] Maintain numerical range
+            if target_parts > 1 {
+                k_final = (k_final / (target_parts as f64))?;
+                v_final = (v_final / (target_parts as f64))?;
+            }
+            
+            let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
+            let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
+
+            if final_len > 0 {
+                self.kv_cache = Some((
+                    k_final.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?, 
+                    v_final.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?
+                ));
+            }
+            return Ok(());
+        }
+
         let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
         let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
 
         if final_len > 0 {
-            // [CRITICAL] Assign the corrected tensors
             self.kv_cache = Some((
-                k.narrow(2, 0, final_len.min(actual_k_len))?.contiguous()?, 
-                v.narrow(2, 0, final_len.min(actual_k_len))?.contiguous()?
+                k_f32.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?, 
+                v_f32.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?
             ));
         }
         Ok(())
@@ -2415,17 +2459,20 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
             }
         }
     } else if hidden_size == 2048 {
-        // [HYBRID-UNFOLDING] Restore 1024 weight to 2048 for 2B engine
+        // [HYBRID-ENERGY-PRESERVING-UNFOLDING]
         let (r, c) = (weight_t.dim(0)?, weight_t.dim(1)?);
         if r == 1024 || c == 1024 {
             let mut t = weight_t.clone();
             if r == 1024 && c == 1024 {
                 t = Tensor::cat(&[&t, &t], 0)?;
                 t = Tensor::cat(&[&t, &t], 1)?;
+                t = (t / 2.0)?; // Scale down to preserve magnitude
             } else if (r == 3072 || r == 2048) && c == 1024 {
                 t = Tensor::cat(&[&t, &t], 1)?;
+                t = (t / 1.414)?; // Sqrt scaling for better balance
             } else if r == 1024 && (c == 3072 || c == 2048) {
                 t = Tensor::cat(&[&t, &t], 0)?;
+                t = (t / 1.414)?;
             }
             weight_t = t.contiguous()?;
         }
