@@ -477,7 +477,7 @@ async fn process_task(
                         
                         // [CRITICAL-FIX] Save snapshot after chunked prefill!
                         if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            let save_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(sid);
                             println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
                             worker.save_kv_to_disk(&save_path)?;
                         }
@@ -650,7 +650,7 @@ async fn process_task(
                         
                         // [CRITICAL-FIX] Save snapshot after chunked prefill!
                         if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            let save_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(sid);
                             println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
                             worker.save_kv_to_disk(&save_path)?;
                         }
@@ -763,7 +763,7 @@ async fn process_task(
                         
                         // [CRITICAL-FIX] Save snapshot after chunked prefill!
                         if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            let save_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(sid);
                             println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
                             worker.save_kv_to_disk(&save_path)?;
                         }
@@ -935,7 +935,7 @@ async fn process_task(
                         
                         // [CRITICAL-FIX] Save snapshot after chunked prefill!
                         if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(None).join(sid);
+                            let save_path = crate::utils::paths::get_kv_dir(Some(app_handle)).join(sid);
                             println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
                             worker.save_kv_to_disk(&save_path)?;
                         }

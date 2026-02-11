@@ -1695,22 +1695,27 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-        // [STRICT-IO] Ensure the directory exists before saving any files
-        if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|e| anyhow!("Failed to create KV directory {:?}: {}", path, e))?;
+        // [STRICT-IO] Ensure the directory exists with absolute path reliability
+        let mut final_path = path.to_path_buf();
+        if !final_path.is_absolute() {
+            if let Ok(current) = std::env::current_dir() {
+                final_path = current.join(path);
+            }
+        }
+
+        if !final_path.exists() {
+            std::fs::create_dir_all(&final_path)
+                .map_err(|e| anyhow!("Failed to create KV directory {:?}: {}", final_path, e))?;
         }
         
-        println!("[SSD-BRIDGE] Saving {} layers to directory: {:?}", self.layers.len(), path);
+        println!("[SSD-BRIDGE] Saving {} layers to ABSOLUTE directory: {:?}", self.layers.len(), final_path);
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let file_name = format!("layer_{}.safetensors", i);
-            let file_path = path.join(file_name);
-            
-            // Log for debugging
-            if i == 0 { println!("[SSD-BRIDGE] Saving seed layer to {:?}", file_path); }
+            let file_path = final_path.join(file_name);
             
             layer.save_kv_cache(&file_path, clear, block_size)
-                .map_err(|e| anyhow!("Failed to save layer {}: {}", i, e))?;
+                .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, file_path, e))?;
         }
         Ok(())
     }

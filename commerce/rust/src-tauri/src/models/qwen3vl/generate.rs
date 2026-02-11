@@ -88,6 +88,7 @@ pub struct Qwen3VLGenerateModel {
     pub generation_config: Qwen3VLGenerationConfig,
     pub model_name: String,
     pub hard_token_limit: Option<usize>,
+    pub kv_root: std::path::PathBuf, // [NEW] Added for absolute path resolution
 }
 
 impl Qwen3VLGenerateModel {
@@ -102,8 +103,9 @@ impl Qwen3VLGenerateModel {
         force_text_only: bool,
         baking_only: bool,
         is_disk_swap: bool, // [NEW]
+        kv_root: std::path::PathBuf,
     ) -> Result<Self> {
-        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, is_disk_swap)
+        Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, is_disk_swap, kv_root)
     }
 
     pub fn init_with_tokenizer(
@@ -118,8 +120,9 @@ impl Qwen3VLGenerateModel {
         force_text_only: bool,
         baking_only: bool,
         is_disk_swap: bool, // [NEW]
+        kv_root: std::path::PathBuf,
     ) -> Result<Self> {
-        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, is_disk_swap) 
+        Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, is_disk_swap, kv_root) 
     }
 
     pub fn init_with_config(
@@ -135,6 +138,7 @@ impl Qwen3VLGenerateModel {
         force_text_only: bool,
         baking_only: bool,
         is_disk_swap: bool, // [NEW]
+        kv_root: std::path::PathBuf,
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         // ... (path normalization omitted for brevity in match)
@@ -242,7 +246,7 @@ impl Qwen3VLGenerateModel {
             _ => (151643, 151643),
         };
 
-        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit })
+        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root })
     }
 
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {

@@ -136,6 +136,7 @@ pub enum ModelSize {
 
 #[derive(Clone)]
 pub struct LogisModel {
+    pub app_handle: tauri::AppHandle, // [NEW] Store handle for path resolution
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
     pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
     pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
@@ -352,7 +353,7 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(task_id_str);
+                let path = crate::utils::paths::get_kv_dir(Some(&self_handle)).join(task_id_str);
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
                 gen.save_kv_to_disk(&path)?;
                 Ok(path.to_string_lossy().to_string())
@@ -365,11 +366,12 @@ impl LogisModel {
     pub async fn load_kv_snapshot(&self, task_id: &str) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
+        let self_handle = self.app_handle.clone(); // [NEW] Clone handle
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(task_id_str.clone());
+                let path = crate::utils::paths::get_kv_dir(Some(&self_handle)).join(task_id_str.clone());
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
                     gen.load_kv_from_disk(&path)?;
@@ -538,6 +540,7 @@ impl LogisModel {
         let cfg_path_clone = config_path.map(|s| s.to_string());
 
         let gen = tokio::task::spawn_blocking(move || {
+            let kv_root = crate::utils::paths::get_kv_dir(Some(&self_handle));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 tok_path_clone.as_deref(), 
@@ -545,7 +548,8 @@ impl LogisModel {
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
                 baking_only,
-                is_disk_swap // [PASS-NEW]
+                is_disk_swap,
+                kv_root // [PASS-NEW]
             )
         }).await??;
 
@@ -607,7 +611,7 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
+    pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
         println!("[MODEL-00] Initializing LogisModel (Preference: {:?})", device_preference);
 
         let mut config = utils::get_optimal_device_config();
@@ -645,6 +649,7 @@ impl LogisModel {
         let max_tokens_limit = 65536; 
 
         Ok(Self {
+            app_handle,
             generator: Arc::new(TokioMutex::new(None)),
             small_hibernation: Arc::new(TokioMutex::new(None)),
             large_hibernation: Arc::new(TokioMutex::new(None)),
