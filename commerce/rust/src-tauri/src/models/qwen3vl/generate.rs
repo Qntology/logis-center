@@ -261,7 +261,9 @@ impl Qwen3VLGenerateModel {
             // [FIX] Added missing session_id argument (None for prefill)
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, None)?;
 
-            if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path); }
+            if let Some(path) = auto_save_path { 
+                self.save_kv_to_disk(path)?; 
+            }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
                 // [TURBO-RELAY] Parallelize layer compression across ALL CPU cores
@@ -638,6 +640,9 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn save_kv_to_disk(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            std::fs::create_dir_all(path)?;
+        }
         match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 1024),
             ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, 1024),
@@ -646,6 +651,7 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn load_kv_from_disk(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() { return Err(anyhow!("KV path does not exist: {:?}", path)); }
         match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128),
             ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128),

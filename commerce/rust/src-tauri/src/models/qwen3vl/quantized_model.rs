@@ -1085,6 +1085,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
     pub is_disk_swap: bool, // [NEW] SSD-Assisted GPU Inference mode
     pub active_session_id: Option<String>, // [NEW] Disk workspace ID
+    pub pinned_layer_count: usize, // [NEW] How many layers to keep in VRAM
     pub is_text: bool,
     pub is_image: bool,
 }
@@ -1494,13 +1495,15 @@ impl QuantizedQwen3VLTextModel {
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let is_on_cpu = layer.device().is_cpu();
+            let is_pinned = layer_idx < self.pinned_layer_count;
             
             // [SSD-ASSISTED-SWAP-LOGIC: CRITERION 2]
-            // Load this specific layer's KV cache from disk just before compute
-            if self.is_disk_swap {
+            // Only load from SSD if NOT pinned and disk_swap is active
+            if self.is_disk_swap && !is_pinned {
                 if let Some(session_id) = &self.active_session_id {
                     let kv_path = crate::utils::paths::get_kv_dir(None).join(session_id);
                     if kv_path.exists() {
+                        // For non-pinned layers, we load JIT
                         let _ = layer.load_kv_cache(&kv_path, &gpu_device, 0, 0);
                     }
                 }
@@ -1523,10 +1526,11 @@ impl QuantizedQwen3VLTextModel {
             }
 
             // [SSD-ASSISTED-SWAP-LOGIC: CRITERION 2]
-            // Dump this layer's KV cache back to disk and clear VRAM immediately
-            if self.is_disk_swap {
+            // Dump and clear VRAM only for non-pinned layers
+            if self.is_disk_swap && !is_pinned {
                 if let Some(session_id) = &self.active_session_id {
                     let kv_path = crate::utils::paths::get_kv_dir(None).join(session_id);
+                    // Save and clear KV to keep VRAM lean
                     let _ = layer.save_kv_cache(&kv_path, true, 1024);
                 }
             }
@@ -1693,7 +1697,7 @@ impl QuantizedQwen3VLTextModel {
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
-
+        println!("[SSD-BRIDGE] Saving {} layers to {:?}", self.layers.len(), path);
         // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
         self.layers.iter_mut().try_for_each(|layer| {
             layer.save_kv_cache(path, clear, block_size)
@@ -1705,13 +1709,61 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
-        if path.exists() {
-            self.layers.iter_mut().try_for_each(|layer| {
-                layer.load_kv_cache(path, device, expected_len, upscale_refill_len)
-            })
-        } else {
-            Ok(())
+        if !path.exists() { return Ok(()); }
+        
+        let session_id = path.file_name().unwrap().to_string_lossy().to_string();
+        self.active_session_id = Some(session_id.clone());
+
+        let mut free_vram = 0;
+        if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() { free_vram = mem.free; }
+            }
         }
+
+        let safety_margin = 800 * 1024 * 1024;
+        let available_for_kv = free_vram.saturating_sub(safety_margin);
+        let layer_kv_cost = 40 * 1024 * 1024; 
+        
+        let can_pin = if layer_kv_cost > 0 { (available_for_kv / layer_kv_cost) as usize } else { 0 };
+        self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
+
+        // [ZERO-PREFILL-BRIDGE] Load the primary seed layer (Layer 0)
+        let l0_path = path.join("layer_0.safetensors");
+        if !l0_path.exists() { return Err(anyhow!("Seed layer_0.safetensors not found for Zero-Prefill")); }
+        
+        println!("[SSD-BRIDGE] Loading Seed Layer 0 and propagating to {} layers...", self.layers.len());
+        
+        // Load the actual seed into Layer 0 first
+        self.layers[0].load_kv_cache(path, device, expected_len, upscale_refill_len)?;
+        
+        let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
+            .ok_or_else(|| anyhow!("Failed to load seed KV cache"))?.clone();
+
+        for i in 0..self.layers.len() {
+            let is_pinned = i < self.pinned_layer_count;
+            
+            if i > 0 {
+                // [HYBRID-BRIDGE] Propagate Layer 0 to Layer i
+                // If it's the 2B model loading 0.6B cache, the dims will be upscaled inside inject_live_kv_direct
+                self.layers[i].self_attn.kv_cache = Some((k_seed.clone(), v_seed.clone()));
+            }
+
+            if !is_pinned && self.is_disk_swap {
+                // If not pinned, save this layer's copy to SSD and clear VRAM
+                let layer_path = path.join(format!("layer_{}.safetensors", i));
+                if !layer_path.exists() {
+                    self.layers[i].save_kv_cache(path, false, 1024)?;
+                }
+                self.layers[i].self_attn.kv_cache = None;
+            }
+        }
+
+        if self.is_disk_swap {
+            println!("[SSD-BRIDGE] Zero-Prefill Active. Pinning {}/{} layers. Bridge complete.", 
+                self.pinned_layer_count, self.layers.len());
+        }
+        Ok(())
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
