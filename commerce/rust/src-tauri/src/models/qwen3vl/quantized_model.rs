@@ -240,8 +240,8 @@ impl QuantizedQwen3VLTextAttention {
         let v_proj = get_qlinear_v2(ct, reader, &v_proj_name, device, dtype, actual_h_size)?;
         let o_proj = get_qlinear_v2(ct, reader, &format!("{base_name}.{o}"), device, dtype, actual_h_size)?;
 
-        let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
-        let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
+        let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype, actual_h_size)?;
+        let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype, actual_h_size)?;
 
         // [HYBRID-PART-CALC] Determine original 2B parts and transpose needs
         let mut hybrid_parts = 1.0;
@@ -620,7 +620,8 @@ impl QuantizedQwen3VLTextAttention {
         if let Some((k, v)) = &self.kv_cache {
             // [HYBRID-PROTOCOL-MARKING-V2]
             // Marker includes: Parts(4th dec), Depth(7th dec), Transpose(9th dec)
-            let mut k_marked = k.clone();
+            // [DTYPE-FIX] Ensure F32 for marking and saving
+            let mut k_marked = k.to_dtype(DType::F32)?;
             if self.hybrid_parts > 1.0 || self.needs_transpose {
                 let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
                 let marker = -(1.0 + (self.hybrid_parts * 0.0001) + (self.hybrid_parts * 0.0000001) + (trans_flag * 0.000000001));
@@ -628,13 +629,13 @@ impl QuantizedQwen3VLTextAttention {
                 println!("[HYBRID-ENCODER] Layer {} | Encoding 2B Metadata: Parts={}, Transpose={}", self.layer_idx, self.hybrid_parts, self.needs_transpose);
                 println!("  -> Generated Protocol Marker: {:.10}", marker);
 
-                let mut k_data = k.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
                 k_data[0] = marker as f32;
-                k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?.to_device(k.device())?.to_dtype(k.dtype())?;
+                k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?;
             }
 
             let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k_marked)?;
-            let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v)?;
+            let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v.to_dtype(DType::F32)?)?;
             
             map.insert("k_anchors".to_string(), k_anchors);
             map.insert("k_packed".to_string(), k_packed);
@@ -902,9 +903,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
             };
             
             let pln = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
-                get_rms_norm(c, r, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?
+                get_rms_norm(c, r, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
             } else {
-                get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?
+                get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
             };
             
             (Some(mg), Some(mu), Some(md), Some(pln))
@@ -913,9 +914,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         };
 
         let input_layernorm = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
-            get_rms_norm(c, r, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype)?
+            get_rms_norm(c, r, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
         } else {
-            get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype)?
+            get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
         };
 
         Ok(Self {
@@ -989,9 +990,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
         
-        // [HYBRID-BRIDGE] Handle 2048 input into 1024 layer
-        let mut xs_active = if input_dim == 2048 && norm_dim == 1024 {
-            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Slicing 2048 input to 1024 for Layer 0"); }
+        // [HYBRID-BRIDGE-V2] Only slice input if we are explicitly running in 1024-dim engine mode
+        let mut xs_active = if input_dim == 2048 && norm_dim == 1024 && self.self_attn.num_attention_heads == 8 {
+            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Slicing 2048 input to 1024 for 0.6B Baking Engine"); }
             xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
         } else {
             xs.clone()
@@ -1325,13 +1326,31 @@ impl QuantizedQwen3VLTextModel {
             (0..num_layers_to_load).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
                 let mut local_cursor = std::io::Cursor::new(mmap);
                 let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
-                let standard = format!("{base_name}.layers.{layer_idx}");
-                let gguf_blk = format!("blk.{layer_idx}");
+                
+                // [HYBRID-INDEX-OFFSET-V2]
+                // Detect the maximum layer index actually present in the GGUF file
+                let max_file_idx = ct.tensor_infos.keys()
+                    .filter(|k| k.contains("blk."))
+                    .filter_map(|k| k.split('.').nth(1)?.parse::<usize>().ok())
+                    .max().unwrap_or(26);
+
+                let is_hybrid_body = !ct.tensor_infos.keys().any(|k| k.contains("blk.0.")) && ct.tensor_infos.keys().any(|k| k.contains("blk.1."));
+                
+                let actual_file_idx = if layer_idx > 0 || (layer_idx == 0 && is_hybrid_body) {
+                     if is_hybrid_body { 
+                         // Apply offset but clamp to the file's maximum available layer
+                         (layer_idx + 1).min(max_file_idx) 
+                     } else { 
+                         layer_idx 
+                     }
+                } else {
+                    layer_idx
+                };
+
+                let standard = format!("{base_name}.layers.{actual_file_idx}");
+                let gguf_blk = format!("blk.{actual_file_idx}");
                 let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
                 
-                // [FORCE-FULL-LAYER-0] 
-                // Even if the model is in baking_only mode, the first layer (index 0)
-                // must be a full transformer block (Attention + MLP) to produce valid hidden states.
                 let layer_baking_mode = if layer_idx == 0 { false } else { baking_only };
 
                 QuantizedQwen3VLTextDecoderLayer::new(
@@ -2369,17 +2388,45 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
             }
 
             if was_folded || d0 > 1024 || d1 > 1024 {
-                // [STRICT-MLP-ALIGNMENT]
-                // 0.6B expects specific orientation for matmul
+                // [STRICT-NAME-BASED-ALIGNMENT]
+                // 0.6B engine has specific orientation needs for each layer type.
+                // We enforce these based on the actual 0.6B model architecture.
                 let (r, c) = (t.dim(0)?, t.dim(1)?);
-                if r == 3072 && c == 1024 {
-                    // Check if this specific layer name usually needs transpose in 0.6B
-                    if name.contains("down") { t = t.transpose(0, 1)?; }
-                } else if r == 1024 && c == 3072 {
-                    if name.contains("gate") || name.contains("up") { t = t.transpose(0, 1)?; }
+                
+                if name.contains("gate") || name.contains("up") {
+                    // Expects [1024, 3072]
+                    if r == 3072 && c == 1024 { t = t.transpose(0, 1)?; }
+                } else if name.contains("down") {
+                    // Expects [3072, 1024]
+                    if r == 1024 && c == 3072 { t = t.transpose(0, 1)?; }
+                } else if name.contains("attn_q") {
+                    // Expects [1024, 2048]
+                    if r == 2048 && c == 1024 { t = t.transpose(0, 1)?; }
+                } else if name.contains("attn_output") {
+                    // Expects [2048, 1024]
+                    if r == 1024 && c == 2048 { t = t.transpose(0, 1)?; }
+                } else {
+                    // Default fallback for hidden-to-hidden
+                    if r == 1024 && c == 1024 {} // Already correct
+                    else if r > c { t = t.transpose(0, 1)?; }
                 }
                 weight_t = t.contiguous()?;
             }
+        }
+    } else if hidden_size == 2048 {
+        // [HYBRID-UNFOLDING] Restore 1024 weight to 2048 for 2B engine
+        let (r, c) = (weight_t.dim(0)?, weight_t.dim(1)?);
+        if r == 1024 || c == 1024 {
+            let mut t = weight_t.clone();
+            if r == 1024 && c == 1024 {
+                t = Tensor::cat(&[&t, &t], 0)?;
+                t = Tensor::cat(&[&t, &t], 1)?;
+            } else if (r == 3072 || r == 2048) && c == 1024 {
+                t = Tensor::cat(&[&t, &t], 1)?;
+            } else if r == 1024 && (c == 3072 || c == 2048) {
+                t = Tensor::cat(&[&t, &t], 0)?;
+            }
+            weight_t = t.contiguous()?;
         }
     }
 
@@ -2463,15 +2510,21 @@ fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
     Ok(QLinear::new(weight, bias, device.clone()))
 }
 
-fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {
+fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType, hidden_size: usize) -> Result<RmsNorm> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
     let mut weight = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [HYBRID-AGGREGATE-NORM] Preserve full 2B signal by summing halves
-    if weight.dim(0)? == 2048 {
+    let d0 = weight.dim(0)?;
+    
+    // [HYBRID-BIDIRECTIONAL-ALIGN-NORM]
+    if hidden_size == 1024 && d0 == 2048 {
+        // Fold for 0.6B engine
         let w1 = weight.narrow(0, 0, 1024)?;
         let w2 = weight.narrow(0, 1024, 1024)?;
-        weight = (w1 + w2)?.contiguous()?; // Fold 2048 into 1024
+        weight = ((w1 + w2)? / 2.0)?.contiguous()?;
+    } else if hidden_size == 2048 && d0 == 1024 {
+        // Unfold for 2B engine
+        weight = Tensor::cat(&[&weight, &weight], 0)?.contiguous()?;
     }
     
     Ok(RmsNorm::new(weight, eps))
