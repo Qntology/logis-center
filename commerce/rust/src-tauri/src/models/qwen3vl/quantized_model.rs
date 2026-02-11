@@ -1695,14 +1695,24 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
+        // [STRICT-IO] Ensure the directory exists before saving any files
         if !path.exists() {
-            fs::create_dir_all(path)?;
+            std::fs::create_dir_all(path).map_err(|e| anyhow!("Failed to create KV directory {:?}: {}", path, e))?;
         }
-        println!("[SSD-BRIDGE] Saving {} layers to {:?}", self.layers.len(), path);
-        // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
-        self.layers.iter_mut().try_for_each(|layer| {
-            layer.save_kv_cache(path, clear, block_size)
-        })
+        
+        println!("[SSD-BRIDGE] Saving {} layers to directory: {:?}", self.layers.len(), path);
+        
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let file_name = format!("layer_{}.safetensors", i);
+            let file_path = path.join(file_name);
+            
+            // Log for debugging
+            if i == 0 { println!("[SSD-BRIDGE] Saving seed layer to {:?}", file_path); }
+            
+            layer.save_kv_cache(&file_path, clear, block_size)
+                .map_err(|e| anyhow!("Failed to save layer {}: {}", i, e))?;
+        }
+        Ok(())
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -1713,7 +1723,9 @@ impl QuantizedQwen3VLTextModel {
         if !path.exists() { return Ok(()); }
         
         let session_id = path.file_name().unwrap().to_string_lossy().to_string();
-        self.active_session_id = Some(session_id.clone());
+        // [ISOLATION-FIX] Use a separate sub-folder for inference-time swapping to protect original seeds
+        let inference_session_id = format!("{}/inference", session_id);
+        self.active_session_id = Some(inference_session_id);
 
         let mut free_vram = 0;
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
@@ -1731,38 +1743,44 @@ impl QuantizedQwen3VLTextModel {
 
         // [ZERO-PREFILL-BRIDGE] Load the primary seed layer (Layer 0)
         let l0_path = path.join("layer_0.safetensors");
-        if !l0_path.exists() { return Err(anyhow!("Seed layer_0.safetensors not found for Zero-Prefill")); }
+        if !l0_path.exists() { return Err(anyhow!("Seed layer_0.safetensors not found at {:?}", l0_path)); }
         
-        println!("[SSD-BRIDGE] Loading Seed Layer 0 and propagating to {} layers...", self.layers.len());
+        println!("[SSD-BRIDGE] Loading Seed Layer 0 from 원본... and propagating to {} layers...", self.layers.len());
         
-        // Load the actual seed into Layer 0 first
+        // Load the actual seed into Layer 0 from original path
         self.layers[0].load_kv_cache(path, device, expected_len, upscale_refill_len)?;
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
             .ok_or_else(|| anyhow!("Failed to load seed KV cache"))?.clone();
 
+        // Create inference workspace
+        let inference_workspace = crate::utils::paths::get_kv_dir(None).join(self.active_session_id.as_ref().unwrap());
+        if !inference_workspace.exists() {
+            std::fs::create_dir_all(&inference_workspace)?;
+        }
+
         for i in 0..self.layers.len() {
             let is_pinned = i < self.pinned_layer_count;
             
             if i > 0 {
-                // [HYBRID-BRIDGE] Propagate Layer 0 to Layer i
-                // If it's the 2B model loading 0.6B cache, the dims will be upscaled inside inject_live_kv_direct
                 self.layers[i].self_attn.kv_cache = Some((k_seed.clone(), v_seed.clone()));
             }
 
             if !is_pinned && self.is_disk_swap {
-                // If not pinned, save this layer's copy to SSD and clear VRAM
-                let layer_path = path.join(format!("layer_{}.safetensors", i));
-                if !layer_path.exists() {
-                    self.layers[i].save_kv_cache(path, false, 1024)?;
+                // Save this layer's copy to the NEW inference workspace, NOT the original path
+                let layer_name = format!("layer_{}.safetensors", i);
+                let layer_file_path = inference_workspace.join(layer_name);
+                
+                if !layer_file_path.exists() {
+                    self.layers[i].save_kv_cache(&layer_file_path, false, 1024)?;
                 }
                 self.layers[i].self_attn.kv_cache = None;
             }
         }
 
         if self.is_disk_swap {
-            println!("[SSD-BRIDGE] Zero-Prefill Active. Pinning {}/{} layers. Bridge complete.", 
-                self.pinned_layer_count, self.layers.len());
+            println!("[SSD-BRIDGE] Zero-Prefill + Isolation Active. Pinning {}/{} layers. Swap workspace: {:?}", 
+                self.pinned_layer_count, self.layers.len(), inference_workspace);
         }
         Ok(())
     }
