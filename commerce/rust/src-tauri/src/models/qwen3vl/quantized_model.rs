@@ -854,6 +854,43 @@ impl QuantizedQwen3VLTextDecoderLayer {
         layer_idx: usize,
         baking_only: bool, // Use this flag now
     ) -> Result<Self> {
+        // [HYBRID-L0-INJECTION] If this is Layer 0 and we are in a hybrid setup
+        // Try to load a superior Layer 0 from a 2B-sourced mini-GGUF
+        let mut l0_mmap = None;
+        let mut l0_cursor = None;
+        let mut l0_content = None;
+        
+        let (mut final_ct, mut final_reader) = (ct, reader as &mut dyn crate::models::qwen3vl::quantized_model::SeekRead);
+
+        if layer_idx == 0 && config.hidden_size == 1024 {
+            let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
+            let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
+            
+            // [STRICT-HYBRID-SELECTION] Select specific L0 GGUF based on mode
+            // text_only이면 Text-Q4를, vision_enabled이면 VL-Q8을 로드
+            let l0_filename = if baking_only && !base_name.contains("vision") {
+                "Qwen3-2B-L0-Text-Q4_K_M.gguf"
+            } else {
+                "Qwen3-2B-L0-VL-Q8_0.gguf"
+            };
+            
+            let l0_gguf_path = hybrid_dir.join(l0_filename);
+            
+            if l0_gguf_path.exists() {
+                if let Ok(file) = std::fs::File::open(&l0_gguf_path) {
+                    if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
+                        l0_mmap = Some(mmap);
+                        let mut cursor = std::io::Cursor::new(&l0_mmap.as_ref().unwrap()[..]);
+                        if let Ok(content) = gguf_file::Content::read(&mut cursor) {
+                            l0_content = Some(content);
+                            l0_cursor = Some(cursor);
+                            println!("[HYBRID-L0] FOUND superior 2B Layer 0 ({}) at {:?}", l0_filename, l0_gguf_path);
+                        }
+                    }
+                }
+            }
+        }
+
         // Detect GGUF naming convention
         let is_gguf_naming = base_name.starts_with("blk.");
         
@@ -863,7 +900,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
 
-        let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?;
+        let self_attn = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+            QuantizedQwen3VLTextAttention::new(config, c, r, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
+        } else {
+            QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
+        };
         
         // [PHYSICAL-LOGIC-SEPARATION]
         // baking_only여도 0번 레이어는 MLP까지 모두 로드하여 진짜 지능을 구움
@@ -874,11 +915,20 @@ impl QuantizedQwen3VLTextDecoderLayer {
             
             // Choose specialized loader to avoid conflicts
             let (mg, mu, md) = if config.hidden_size == 1024 {
-                (
-                    get_qlinear_06b(ct, reader, &gate_name, device, dtype)?,
-                    get_qlinear_06b(ct, reader, &up_name, device, dtype)?,
-                    get_qlinear_06b(ct, reader, &down_name, device, dtype)?
-                )
+                if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+                    println!("[HYBRID-L0] Injecting 2B MLP weights into 0.6B Layer 0...");
+                    (
+                        get_qlinear_2b_hybrid(c, r, &gate_name, device, dtype)?,
+                        get_qlinear_2b_hybrid(c, r, &up_name, device, dtype)?,
+                        get_qlinear_2b_hybrid(c, r, &down_name, device, dtype)?
+                    )
+                } else {
+                    (
+                        get_qlinear_06b(ct, reader, &gate_name, device, dtype)?,
+                        get_qlinear_06b(ct, reader, &up_name, device, dtype)?,
+                        get_qlinear_06b(ct, reader, &down_name, device, dtype)?
+                    )
+                }
             } else {
                 (
                     get_qlinear_2b_hybrid(ct, reader, &gate_name, device, dtype)?,
@@ -891,14 +941,22 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 println!("[DEBUG-MLP-LOAD] Layer 0 (Hidden={}) Full Transformer Block Loaded.", config.hidden_size);
             }
 
-            let pln = get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?;
+            let pln = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+                get_rms_norm(c, r, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?
+            } else {
+                get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?
+            };
             
             (Some(mg), Some(mu), Some(md), Some(pln))
         } else {
             (None, None, None, None)
         };
 
-        let input_layernorm = get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype)?;
+        let input_layernorm = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+            get_rms_norm(c, r, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype)?
+        } else {
+            get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype)?
+        };
 
         Ok(Self {
             self_attn,
@@ -1095,6 +1153,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub is_disk_swap: bool, // [NEW] SSD-Assisted GPU Inference mode
     pub active_session_id: Option<String>, // [NEW] Disk workspace ID
     pub pinned_layer_count: usize, // [NEW] How many layers to keep in VRAM
+    pub current_kv_len: usize, // [NEW] Logical progress tracker (SSD-persistent)
     pub is_text: bool,
     pub is_image: bool,
 }
@@ -1335,7 +1394,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_disk_swap, active_session_id: None, pinned_layer_count: 0, is_text, is_image })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_disk_swap, active_session_id: None, pinned_layer_count: 0, current_kv_len: 0, is_text, is_image })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1458,6 +1517,7 @@ impl QuantizedQwen3VLTextModel {
             is_disk_swap,
             active_session_id: None,
             pinned_layer_count: 0,
+            current_kv_len: 0,
             is_text,
             is_image,
         })
@@ -1467,12 +1527,21 @@ impl QuantizedQwen3VLTextModel {
         &mut self,
         inputs_embeds: &Tensor,
         seqlen_offset: usize,
+        total_len: usize,
         position_ids: Option<&Tensor>,
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
+        // [PROGRESS-CALC]
+        let current_pos = seqlen_offset + seq_len;
+        let progress = if total_len > 0 {
+            (current_pos as f32 / total_len as f32 * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
         // [INFERENCE-MONITOR] Real-time System Status
         use nvml_wrapper::Nvml;
         use chrono::Local;
@@ -1480,8 +1549,8 @@ impl QuantizedQwen3VLTextModel {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() {
                     let now = Local::now().format("%H:%M:%S%.3f");
-                    println!("[STAT] Time: {} | VRAM: {}MB Used / {}MB Free | Context: {} tokens", 
-                        now, mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset + seq_len);
+                    println!("[STAT] Time: {} | VRAM: {}MB Used / {}MB Free | Context: {}/{} tokens ({:.0}%)", 
+                        now, mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_pos, total_len, progress);
                 }
             }
         }
@@ -1534,7 +1603,7 @@ impl QuantizedQwen3VLTextModel {
         let total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
-                println!("[TRACE-LAYER] {}/{} | Device: {:?}", layer_idx + 1, total_layers, layer.device());
+                println!("[TRACE-LAYER] {}/{} ({:.0}%) | Device: {:?}", layer_idx + 1, total_layers, progress, layer.device());
             }
             let is_on_cpu = layer.device().is_cpu();
             let is_pinned = layer_idx < self.pinned_layer_count;
@@ -1580,6 +1649,9 @@ impl QuantizedQwen3VLTextModel {
             if is_on_cpu { layer.to_device(&Device::Cpu)?; }
         }
         
+        // [FIX] Successfully advanced! Update logical progress
+        self.current_kv_len = seqlen_offset + seq_len;
+
         let norm_dev = self.norm.weight().device();
         if !xs.device().same_device(norm_dev) {
             xs = xs.to_device(norm_dev)?;
@@ -1592,10 +1664,11 @@ impl QuantizedQwen3VLTextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+        self.current_kv_len = 0; // [FIX] Also reset tracker
     }
 
     pub fn get_kv_len(&self) -> usize {
-        self.layers.get(0).map(|l| l.get_kv_len()).unwrap_or(0)
+        self.current_kv_len // [FIX] Return logical progress, not tensor dimension
     }
 
     pub fn compress_to_bitkv(&self, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
@@ -1756,6 +1829,18 @@ impl QuantizedQwen3VLTextModel {
             layer.save_kv_cache(&final_path, clear, block_size)
                 .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, final_path, e))?;
         }
+
+        // [DISK-BRAIN] Save logical progress to JSON for OOM recovery
+        let metadata_path = final_path.join("metadata.json");
+        let metadata = serde_json::json!({
+            "current_kv_len": self.current_kv_len,
+            "timestamp": chrono::Utc::now().timestamp()
+        });
+        if let Ok(file) = std::fs::File::create(&metadata_path) {
+            let _ = serde_json::to_writer(file, &metadata);
+            println!("[DISK-BRAIN] Progress saved to SSD: {} tokens.", self.current_kv_len);
+        }
+
         Ok(())
     }
 
@@ -1769,7 +1854,38 @@ impl QuantizedQwen3VLTextModel {
         let session_id = path.file_name().unwrap().to_string_lossy().to_string();
         // [ISOLATION-FIX] Use a separate sub-folder for inference-time swapping to protect original seeds
         let inference_session_id = format!("{}/inference", session_id);
-        self.active_session_id = Some(inference_session_id);
+        self.active_session_id = Some(inference_session_id.clone());
+
+        // [ZERO-PREFILL-V2] Prioritize inference progress over baked snapshot
+        let inference_path = crate::utils::paths::get_kv_dir(None).join(&inference_session_id);
+        let l0_inference_file = inference_path.join("layer_0_kv.safetensors");
+        let l0_baked_file = path.join("layer_0_kv.safetensors");
+        
+        let (actual_load_path, is_resuming_inference) = if l0_inference_file.exists() {
+            (inference_path, true)
+        } else if l0_baked_file.exists() {
+            (path.to_path_buf(), false)
+        } else {
+            return Err(anyhow!("No KV seed found at {:?} or {:?}", l0_baked_file, l0_inference_file));
+        };
+
+        if is_resuming_inference {
+            println!("[ZERO-PREFILL-RESUME] Found ongoing progress in {:?}. Resuming...", actual_load_path);
+        } else {
+            println!("[ZERO-PREFILL-START] Starting from baked snapshot at {:?}.", actual_load_path);
+        }
+
+        // [DISK-BRAIN-RECALL] Restore logical progress from JSON
+        let metadata_path = actual_load_path.join("metadata.json");
+        if metadata_path.exists() {
+            if let Ok(file) = std::fs::File::open(&metadata_path) {
+                let meta: serde_json::Value = serde_json::from_reader(file).unwrap_or(serde_json::json!({}));
+                if let Some(len) = meta.get("current_kv_len").and_then(|v| v.as_u64()) {
+                    self.current_kv_len = len as usize;
+                    println!("[DISK-BRAIN] Recalled progress from SSD: {} tokens.", self.current_kv_len);
+                }
+            }
+        }
 
         let mut free_vram = 0;
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
@@ -1786,16 +1902,13 @@ impl QuantizedQwen3VLTextModel {
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
         // [ZERO-PREFILL-BRIDGE] Load the primary seed layer (Layer 0)
-        let l0_path = path.join("layer_0_kv.safetensors");
-        if !l0_path.exists() { return Err(anyhow!("Seed layer_0_kv.safetensors not found at {:?}", l0_path)); }
+        self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len)?;
         
-        println!("[SSD-BRIDGE] Loading Seed Layer 0 from 원본... and propagating to {} layers...", self.layers.len());
-        
-        // Load the actual seed into Layer 0 from original path
-        self.layers[0].load_kv_cache(path, device, expected_len, upscale_refill_len)?;
+        // [FIX] Update logical progress tracker immediately after load
+        self.current_kv_len = self.layers[0].get_kv_len();
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
-            .ok_or_else(|| anyhow!("Failed to load seed KV cache"))?.clone();
+            .ok_or_else(|| anyhow!("Failed to load seed KV cache from {:?}", actual_load_path))?.clone();
 
         // Create inference workspace
         let inference_workspace = crate::utils::paths::get_kv_dir(None).join(self.active_session_id.as_ref().unwrap());
@@ -2059,7 +2172,7 @@ impl QuantizedQwen3VLModel {
         Ok((position_ids, mrope))
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids_in.dims2()?;
         
         // [SYNC-SESSION]
@@ -2098,7 +2211,7 @@ impl QuantizedQwen3VLModel {
             let start = cache_pos.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
             Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
         } else { position_ids };
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -2162,7 +2275,7 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None, is_text, is_image })
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids_in.dims2()?;
         
         // [SYNC-SESSION] Pass session info to underlying engine for SSD swap
@@ -2180,11 +2293,37 @@ impl QuantizedQwen3TextModel {
 
         let start = if let Some(cp) = cache_position { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { 0 };
         let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, Some(&position_ids), None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        
         if let Some(head) = &self.lm_head {
-            let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
-            Ok(head.forward(&hidden_state)?)
+            // [CRITICAL-OOM-FIX] If in DiskSwap mode, force the heavy lm_head computation to CPU
+            // to avoid the final logit spike that causes the 100% OOM loop.
+            let target_device = if self.language_model.is_disk_swap { 
+                &Device::Cpu 
+            } else { 
+                head.device() 
+            };
+            
+            let hidden_state = if !hidden_state.device().same_device(target_device) { 
+                hidden_state.to_device(target_device)? 
+            } else { 
+                hidden_state 
+            };
+            
+            // Move head to CPU if needed (one-time cost)
+            let mut head_cpu;
+            let active_head = if self.language_model.is_disk_swap && !head.device().is_cpu() {
+                // This is slightly heavy but only happens once at the moment of OOM survival
+                println!("[OOM-SURVIVAL] Offloading LM_HEAD to CPU for final logit computation...");
+                head_cpu = head.clone();
+                head_cpu.to_device(&Device::Cpu)?;
+                &head_cpu
+            } else {
+                head
+            };
+
+            Ok(active_head.forward(&hidden_state)?)
         } else { Ok(hidden_state) }
     }
 

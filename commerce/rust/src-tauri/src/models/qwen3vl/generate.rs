@@ -35,11 +35,11 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
-    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, session_id),
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, session_id),
+            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id),
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id),
         }
     }
 
@@ -143,15 +143,19 @@ impl Qwen3VLGenerateModel {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         // ... (path normalization omitted for brevity in match)
         
-        // [Existing path handling code]
-        let tok_path = tokenizer_path.unwrap_or(path);
-        let tok_path = if let Some(stripped) = tok_path.strip_prefix(r"\\?\") { stripped } else { tok_path };
-        let cfg_path = config_path.unwrap_or(path);
-        let cfg_path = if let Some(stripped) = cfg_path.strip_prefix(r"\\?\") { stripped } else { cfg_path };
+        // [STRICT-2B-ALIGNMENT] If a tokenizer_path (2B model) is provided, use it for ALL metadata.
+        // This ensures 0.6B baking uses 2B's vocab, chat template, and special token IDs.
+        let meta_path = tokenizer_path.unwrap_or(path);
+        let meta_path = if let Some(stripped) = meta_path.strip_prefix(r"\\?\") { stripped } else { meta_path };
+        
+        let tok_path = meta_path; // For clarity
+        let cfg_path = meta_path; // Forced to use 2B config even for 0.6B loading
 
         let chat_template = ChatTemplate::init(tok_path)?;
         let tokenizer = TokenizerModel::init(tok_path)?;
         let final_config_path = std::path::Path::new(cfg_path).join("config.json");
+        
+        println!("[MODEL-METADATA] Loading Config/Tokenizer from: {:?}", final_config_path);
         let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&final_config_path)?)?;
 
         let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() {
@@ -183,7 +187,7 @@ impl Qwen3VLGenerateModel {
         let gguf_files = find_type_files(path, "gguf")?;
         let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
         let is_vision_model = mmproj_path.is_some() && !force_text_only;
-        let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
+        let pre_processor = Qwen3VLProcessor::new(meta_path, &vision_dev, dtype)?;
 
         let qwen3_vl = if !gguf_files.is_empty() {
             let mut model_path = gguf_files.iter().find(|f| f.contains("0.6B") && f.contains("Q8_0")).cloned();
@@ -232,10 +236,11 @@ impl Qwen3VLGenerateModel {
             ModelVariant::Standard(model)
         };
 
-        let generation_config_path = std::path::Path::new(cfg_path).join("generation_config.json");
+        let generation_config_path = std::path::Path::new(meta_path).join("generation_config.json");
         let generation_config: Qwen3VLGenerationConfig = if generation_config_path.exists() {
             serde_json::from_slice(&std::fs::read(generation_config_path)?)? 
         } else {
+            println!("[WARN] generation_config.json not found in meta_path: {:?}", meta_path);
             Qwen3VLGenerationConfig::default()
         };
         let model_name = if path.contains("0.6B") { "qwen3vl-0.6B".to_string() } else { "qwen3vl-2B".to_string() };
@@ -263,7 +268,7 @@ impl Qwen3VLGenerateModel {
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
 
             // [FIX] Added missing session_id argument (None for prefill)
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, None)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
 
             if let Some(path) = auto_save_path { 
                 self.save_kv_to_disk(path)?; 
@@ -335,7 +340,7 @@ impl Qwen3VLGenerateModel {
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
 
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, session_id.clone())?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
 
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -411,7 +416,7 @@ impl Qwen3VLGenerateModel {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
             // Forward pass for current segment
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, None)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_size, None)?;
             
             // Optional: Relay KV cache segment to target
             if let Some(ref mut target) = relay_target {
@@ -469,10 +474,12 @@ impl Qwen3VLGenerateModel {
 
         // [ZERO-PREFILL-INIT] Try loading existing context first
         if let Some(sid) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            let path = self.kv_root.join(sid);
             if path.exists() {
-                println!("[ZERO-PREFILL] Found existing session '{}'. Loading from SSD...", sid);
+                println!("[ZERO-PREFILL] Found existing session '{}' at {:?}. Loading from SSD...", sid, path);
                 self.load_kv_from_disk(&path)?; 
+            } else {
+                println!("[ZERO-PREFILL-WARN] Snapshot not found at {:?}. Recalculating...", path);
             }
         }
 
@@ -491,7 +498,6 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = if seqlen_offset > 0 { 
             if seqlen_offset >= total_tokens {
                 println!("[ZERO-PREFILL] Full context match ({} tokens). Skipping entire prefill loop.", seqlen_offset);
-                // [FIX] 만약 모든 토큰이 이미 캐시되어 있다면, 마지막 1개 토큰만 남기고 건너뜁니다.
                 total_tokens.saturating_sub(1)
             } else {
                 println!("[ZERO-PREFILL] Skipping first {} baked tokens. Resuming prefill from position {}.", seqlen_offset, seqlen_offset);
@@ -507,12 +513,12 @@ impl Qwen3VLGenerateModel {
         // [DYNAMIC-BATCH-SIZE] Adjust batch size based on safety mode
         let prefill_chunk_size = if self.qwen3_vl.is_cpu() { 
             1024 
-        } else if seqlen_offset > 0 {
-            // [RECOVERY-MODE] If resuming from OOM/SSD, use smaller safer batches
-            128 
+        } else if seqlen_offset > 0 || self.kv_root.to_string_lossy().contains("inference") {
+            // [RECOVERY-MODE] If resuming or in Swap mode, use tiny safer batches
+            64 
         } else {
             // [SPEED-MODE] Default prefill batch
-            256 
+            128 
         };
 
         while local_pos < total_tokens {
@@ -521,6 +527,14 @@ impl Qwen3VLGenerateModel {
             if remaining <= 1 { break; }
             
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+            
+            // [FINAL-STRETCH-SAFETY] Progress based batch shrinking
+            let progress = (local_pos as f32 / total_tokens as f32 * 100.0);
+            if progress > 90.0 {
+                // Near the end, use tiny batches to avoid OOM during peak KV cache
+                chunk_size = chunk_size.min(32);
+            }
+
             if local_pos + chunk_size >= total_tokens {
                 chunk_size = (total_tokens - local_pos).saturating_sub(1);
             }
@@ -535,7 +549,7 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Generation cancelled during prefill")); }
             }
 
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, session_id.clone())?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
             
             // [CHECKPOINT] Save to SSD after EVERY batch to allow granular resumption
             if let Some(sid) = &session_id {
@@ -544,7 +558,8 @@ impl Qwen3VLGenerateModel {
             }
 
             // [DYNAMIC-RECOVERY] Check for GPU availability every chunk during prefill
-            if !self.qwen3_vl.is_cpu() {
+            // [SAFETY] Skip rebalancing if we are in the critical final 5%
+            if !self.qwen3_vl.is_cpu() && progress < 95.0 {
                 let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset + chunk_size);
             }
             
@@ -601,7 +616,7 @@ impl Qwen3VLGenerateModel {
                 let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset + seq_len);
             }
 
-            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, session_id.clone())?;
+            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
             
             // [GEN-PROGRESS-LOG]
             let elapsed = prev_time.elapsed().as_secs_f32();
