@@ -609,11 +609,11 @@ async fn process_task(
         let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
-        let snapshot_id = format!("{}_step_a", task.id);
-        
-        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
-        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+                    let snapshot_id = format!("{}_step_a", task.id);
+                    let handle_clone = app_handle.clone(); // [NEW] Capture handle
+                    
+                    // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
+                    let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
@@ -724,6 +724,7 @@ async fn process_task(
         let pug_content = light_pug.clone();
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
+        let handle_clone = app_handle.clone(); // [NEW] Capture handle
 
         // [CHECKPOINT] Check if Step B snapshot already exists
         let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
@@ -909,6 +910,7 @@ async fn process_task(
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
                 let session_clone = Some(snapshot_id.clone());
+                let handle_clone = app_handle.clone(); // [NEW] Capture handle
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut gen_guard = model_clone.generator.blocking_lock();
