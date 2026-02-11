@@ -903,9 +903,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
             };
             
             let pln = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
-                get_rms_norm(c, r, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
+                get_rms_norm(c, r, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
             } else {
-                get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
+                get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
             };
             
             (Some(mg), Some(mu), Some(md), Some(pln))
@@ -914,9 +914,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         };
 
         let input_layernorm = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
-            get_rms_norm(c, r, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
+            get_rms_norm(c, r, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
         } else {
-            get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, actual_h_size)?
+            get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
         };
 
         Ok(Self {
@@ -1366,7 +1366,7 @@ impl QuantizedQwen3VLTextModel {
         let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
         let last_device = layers.last().map(|l| l.device()).unwrap_or(device);
         let norm_dtype = if last_device.is_cpu() { DType::F32 } else { dtype };
-        let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype)?;
+        let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype, config.hidden_size)?;
         
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
@@ -1478,7 +1478,7 @@ impl QuantizedQwen3VLTextModel {
         let alt_norm = "output_norm";
         let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
         let norm_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
-        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, norm_dtype)?;
+        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, norm_dtype, config.hidden_size)?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
