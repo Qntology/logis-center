@@ -1298,7 +1298,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_disk_swap, active_session_id: None, is_text, is_image })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_disk_swap, active_session_id: None, pinned_layer_count: 0, is_text, is_image })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1420,6 +1420,7 @@ impl QuantizedQwen3VLTextModel {
             is_forced_cpu,
             is_disk_swap,
             active_session_id: None,
+            pinned_layer_count: 0,
             is_text,
             is_image,
         })
