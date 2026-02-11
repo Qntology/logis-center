@@ -1311,9 +1311,9 @@ impl QuantizedQwen3VLTextModel {
         baking_only: bool,
         is_text: bool,
         is_image: bool,
+        is_disk_swap: bool, // [NEW]
     ) -> Result<Self> {
         let is_forced_cpu = device.is_cpu();
-        // ... (previous logic)
         let token_emb_name = format!("{base_name}.embed_tokens.weight");
         let alt_token_emb = "token_embd.weight";
         
@@ -1335,7 +1335,7 @@ impl QuantizedQwen3VLTextModel {
         patched_config.hidden_size = actual_hidden_size;
         let config = &patched_config;
 
-        let nvml = Nvml::init().ok();
+        let nvml = nvml_wrapper::Nvml::init().ok();
         let mut current_device = device.clone();
         
         let mut layer_weight_size = 0_u64;
@@ -1417,7 +1417,7 @@ impl QuantizedQwen3VLTextModel {
             mmap: None,
             baking_only,
             is_forced_cpu,
-            is_disk_swap: false, // Default for manual loader
+            is_disk_swap,
             active_session_id: None,
             is_text,
             is_image,

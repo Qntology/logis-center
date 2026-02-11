@@ -263,24 +263,9 @@ impl Qwen3VLGenerateModel {
 
             if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path); }
             if let Some(ref mut target) = relay_target {
-                // (Relay logic remains same)
-            }
-            current_pos = end;
-        }
-        if auto_save_path.is_some() { println!("[STREAMING] Disk save complete. Dropping KV storage from memory."); let _ = self.qwen3_vl.drop_kv_storage(); }
-        Ok(())
-    }
-
-            // [STREAMING] 주기적으로 디스크에 중간 결과 저장
-            if let Some(path) = auto_save_path {
-                let _ = self.save_kv_to_disk(path);
-                // println!("[STREAM-SAVE] Progress: {}/{} tokens saved.", end, total_tokens);
-            }
-
-            if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
                 // [TURBO-RELAY] Parallelize layer compression across ALL CPU cores
-                    let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
+                let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
                     let seq_len = k.dim(candle_core::D::Minus2)?;
                     let chunk_tokens = end - current_pos;
                     let start = seq_len.saturating_sub(chunk_tokens);
@@ -292,8 +277,12 @@ impl Qwen3VLGenerateModel {
                         let res_k = m.language_model.compress_to_bitkv(&k_new)?;
                         let res_v = m.language_model.compress_to_bitkv(&v_new)?;
                         Ok((res_k, res_v))
+                    } else if let ModelVariant::QuantizedVL(m) = &self.qwen3_vl {
+                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
+                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
+                        Ok((res_k, res_v))
                     } else {
-                        Err(anyhow!("Unsupported model variant"))
+                        Err(anyhow!("Unsupported model variant for BitKV relay"))
                     }
                 }).collect();
 
@@ -318,13 +307,7 @@ impl Qwen3VLGenerateModel {
             }
             current_pos = end;
         }
-
-        // [MEMORY-FIX] 저장이 완료되었으므로 메모리 포지션을 해제함
-        if auto_save_path.is_some() {
-            println!("[STREAMING] Disk save complete. Dropping KV storage from memory.");
-            let _ = self.qwen3_vl.drop_kv_storage();
-        }
-
+        if auto_save_path.is_some() { println!("[STREAMING] Disk save complete. Dropping KV storage from memory."); let _ = self.qwen3_vl.drop_kv_storage(); }
         Ok(())
     }
 
