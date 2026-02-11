@@ -911,34 +911,20 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let up_name = format!("{base_name}.{up}");
             let down_name = format!("{base_name}.{down}");
             
-            // Choose specialized loader to avoid conflicts
-            let (mg, mu, md) = if config.hidden_size == 1024 {
-                if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
-                    println!("[HYBRID-L0] Injecting 2B MLP weights into 0.6B Layer 0...");
-                    (
-                        get_qlinear_2b_hybrid(c, r, &gate_name, device, dtype)?,
-                        get_qlinear_2b_hybrid(c, r, &up_name, device, dtype)?,
-                        get_qlinear_2b_hybrid(c, r, &down_name, device, dtype)?
-                    )
-                } else {
-                    (
-                        get_qlinear_06b(ct, reader, &gate_name, device, dtype)?,
-                        get_qlinear_06b(ct, reader, &up_name, device, dtype)?,
-                        get_qlinear_06b(ct, reader, &down_name, device, dtype)?
-                    )
-                }
+            let (mg, mu, md) = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+                (
+                    get_qlinear_v2(c, r, &gate_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(c, r, &up_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(c, r, &down_name, device, dtype, config.hidden_size)?
+                )
             } else {
                 (
-                    get_qlinear_2b_hybrid(ct, reader, &gate_name, device, dtype)?,
-                    get_qlinear_2b_hybrid(ct, reader, &up_name, device, dtype)?,
-                    get_qlinear_2b_hybrid(ct, reader, &down_name, device, dtype)?
+                    get_qlinear_v2(ct, reader, &gate_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(ct, reader, &up_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(ct, reader, &down_name, device, dtype, config.hidden_size)?
                 )
             };
             
-            if layer_idx == 0 {
-                println!("[DEBUG-MLP-LOAD] Layer 0 (Hidden={}) Full Transformer Block Loaded.", config.hidden_size);
-            }
-
             let pln = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
                 get_rms_norm(c, r, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype)?
             } else {
@@ -2377,6 +2363,30 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
+    // [HYBRID-DYNAMIC-SLICING]
+    // If we are loading 2B intelligence into a 0.6B engine (1024)
+    if hidden_size == 1024 {
+        let dims = weight_t.dims();
+        if dims.len() == 2 {
+            let mut d0 = dims[0];
+            let mut d1 = dims[1];
+            let mut was_sliced = false;
+
+            // Slicing rules for 2B (2048/6144) -> 0.6B (1024/3072)
+            if d0 == 2048 { d0 = 1024; was_sliced = true; }
+            else if d0 == 4096 { d0 = 2048; was_sliced = true; } // QKV combined?
+            else if d0 == 6144 { d0 = 3072; was_sliced = true; }
+
+            if d1 == 2048 { d1 = 1024; was_sliced = true; }
+            else if d1 == 6144 { d1 = 3072; was_sliced = true; }
+
+            if was_sliced {
+                weight_t = weight_t.narrow(0, 0, d0)?.narrow(1, 0, d1)?.contiguous()?;
+                // println!("[HYBRID-DEBUG] Sliced {} weight to [{}, {}]", name, d0, d1);
+            }
+        }
+    }
+
     let shape = weight_t.dims();
     if shape.len() == 2 {
         let rows = shape[0];
@@ -2384,9 +2394,7 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
         let mut needs_transpose = false;
         
         if hidden_size == 1024 {
-            // [0.6B-PURE-BAKING-ISOLATION]
             // Standard Qwen 0.6B layout: Gate/Up [3072, 1024], Down [1024, 3072]
-            // We need to transpose them to [1024, 3072] and [3072, 1024] respectively.
             if rows == 3072 && cols == 1024 {
                 needs_transpose = true; 
             } else if rows == 1024 && cols == 3072 {
@@ -2394,31 +2402,35 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
             }
         } else {
             // [2B-HYBRID-SPEC-ALIGNMENT]
-            // Based on 2b_specs.json layouts for the 2048-hidden model
             if hidden_size == 2048 {
                 if (name.contains("gate") || name.contains("up")) && rows == 2048 && cols == 6144 {
                     needs_transpose = true;
                 } else if name.contains("down") && rows == 6144 && cols == 2048 {
                     needs_transpose = true;
                 }
-            } else {
-                // Other generic layouts
-                if name.contains("down") {
-                    if rows == hidden_size && cols > hidden_size { needs_transpose = true; }
-                } else {
-                    if cols == hidden_size && rows != hidden_size { needs_transpose = true; }
-                }
             }
         }
 
         if needs_transpose {
-            println!("[MODEL-FIX] Transposing {} weight: {:?} -> [{:?}, {:?}]", name, shape, cols, rows);
             weight_t = weight_t.transpose(0, 1)?.contiguous()?;
         }
     }
     
     let weight_q = QMatMul::Tensor(weight_t);
-    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { Some(t.dequantize(device)?.to_dtype(dtype)?) } else { None };
+    let mut bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
+        Some(t.dequantize(device)?.to_dtype(dtype)?) 
+    } else { None };
+
+    // Also slice bias if needed
+    if hidden_size == 1024 {
+        if let Some(b) = bias {
+            let b_dim = b.dim(0)?;
+            if b_dim == 2048 { bias = Some(b.narrow(0, 0, 1024)?.contiguous()?); }
+            else if b_dim == 6144 { bias = Some(b.narrow(0, 0, 3072)?.contiguous()?); }
+            else { bias = Some(b); }
+        }
+    }
+
     Ok(QLinear::new(weight_q, bias, device.clone()))
 }
 
@@ -2457,7 +2469,10 @@ fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
 
 fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
-    let weight = weight.dequantize(device)?.to_dtype(dtype)?;
+    let mut weight = weight.dequantize(device)?.to_dtype(dtype)?;
+    if weight.dim(0)? == 2048 {
+        weight = weight.narrow(0, 0, 1024)?.contiguous()?;
+    }
     Ok(RmsNorm::new(weight, eps))
 }
 
@@ -2498,7 +2513,31 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
         let mut t = ct.tensor(reader, name, device)?;
         let mut t = t.dequantize(device)?.to_dtype(dtype)?;
         
-                if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
+        // [HYBRID-VISION-SLICING] Slice vision weights to match 0.6B engine
+        if config.hidden_size == Some(1024) {
+            let dims = t.dims();
+            if dims.len() >= 1 {
+                let mut needs_narrow = false;
+                let mut s0 = dims[0];
+                let mut s1 = if dims.len() > 1 { dims[1] } else { 0 };
+
+                if s0 == 2048 { s0 = 1024; needs_narrow = true; }
+                else if s0 == 6144 { s0 = 3072; needs_narrow = true; }
+                
+                if s1 == 2048 { s1 = 1024; needs_narrow = true; }
+                else if s1 == 6144 { s1 = 3072; needs_narrow = true; }
+
+                if needs_narrow {
+                    if dims.len() == 2 {
+                        t = t.narrow(0, 0, s0)?.narrow(1, 0, s1)?.contiguous()?;
+                    } else if dims.len() == 1 {
+                        t = t.narrow(0, 0, s0)?.contiguous()?;
+                    }
+                }
+            }
+        }
+        
+        if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
         
             }
         
