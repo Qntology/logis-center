@@ -624,10 +624,13 @@ impl QuantizedQwen3VLTextAttention {
             if self.hybrid_parts > 1.0 || self.needs_transpose {
                 let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
                 let marker = -(1.0 + (self.hybrid_parts * 0.0001) + (self.hybrid_parts * 0.0000001) + (trans_flag * 0.000000001));
+                
+                println!("[HYBRID-ENCODER] Layer {} | Encoding 2B Metadata: Parts={}, Transpose={}", self.layer_idx, self.hybrid_parts, self.needs_transpose);
+                println!("  -> Generated Protocol Marker: {:.10}", marker);
+
                 let mut k_data = k.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
                 k_data[0] = marker as f32;
                 k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?.to_device(k.device())?.to_dtype(k.dtype())?;
-                // println!("[HYBRID-PROTOCOL] Marked K-cache with trans_flag={}: {}", trans_flag, marker);
             }
 
             let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k_marked)?;
@@ -737,7 +740,7 @@ impl QuantizedQwen3VLTextAttention {
                 let trans_val = ((val * 1000000000.0).round() as usize) % 10;
                 if trans_val == 1 { needs_retranspose = true; }
                 
-                // println!("[HYBRID-BRIDGE] Decoded: parts={}, retranspose={}", target_parts, needs_retranspose);
+                println!("[HYBRID-DECODER] Layer {} | Decoded Protocol: Target Parts = {}, Re-transpose = {}", self.layer_idx, target_parts, needs_retranspose);
                 k_data[0] = k_data[1]; 
             } else if d < target_dim {
                 target_parts = target_dim / d;
@@ -2335,23 +2338,24 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [HYBRID-RECURSIVE-FOLDING]
-    // Iteratively folds 2B weights into 0.6B engine dimensions (1024 or 3072)
+    // [HYBRID-RECURSIVE-FOLDING-V2]
     if hidden_size == 1024 {
         let dims = weight_t.dims();
         if dims.len() == 2 {
             let mut t = weight_t.clone();
             let mut was_folded = false;
-            let mut d0 = t.dim(0)?;
+            let mut fold_count = 1.0;
             
+            let mut d0 = t.dim(0)?;
             while d0 > 1024 && d0 != 3072 {
                 let half = d0 / 2;
                 t = ((t.narrow(0, 0, half)? + t.narrow(0, half, half)?)? / 2.0)?;
                 d0 = t.dim(0)?;
-                was_folded = true;
+                fold_count *= 2.0;
             }
             if d0 == 6144 {
                 t = ((t.narrow(0, 0, 3072)? + t.narrow(0, 3072, 3072)?)? / 2.0)?;
+                fold_count = 2.0;
                 was_folded = true;
             }
 
@@ -2360,10 +2364,22 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
                 let half = d1 / 2;
                 t = ((t.narrow(1, 0, half)? + t.narrow(1, half, half)?)? / 2.0)?;
                 d1 = t.dim(1)?;
+                fold_count *= 2.0;
                 was_folded = true;
             }
 
-            if was_folded { weight_t = t.contiguous()?; }
+            if was_folded || d0 > 1024 || d1 > 1024 {
+                // [STRICT-MLP-ALIGNMENT]
+                // 0.6B expects specific orientation for matmul
+                let (r, c) = (t.dim(0)?, t.dim(1)?);
+                if r == 3072 && c == 1024 {
+                    // Check if this specific layer name usually needs transpose in 0.6B
+                    if name.contains("down") { t = t.transpose(0, 1)?; }
+                } else if r == 1024 && c == 3072 {
+                    if name.contains("gate") || name.contains("up") { t = t.transpose(0, 1)?; }
+                }
+                weight_t = t.contiguous()?;
+            }
         }
     }
 
