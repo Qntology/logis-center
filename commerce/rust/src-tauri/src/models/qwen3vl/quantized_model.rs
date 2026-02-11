@@ -213,113 +213,35 @@ impl QuantizedQwen3VLTextAttention {
         dtype: DType,
         layer_idx: usize,
     ) -> Result<Self> {
-        let _hidden_size = config.hidden_size;
         let head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
-        // [DETECTION-FIRST] Determine actual hidden size for THIS layer/file
-        // [FORCE-FIX] If config says 2048 (2B), trust it absolutely to prevent layer drift.
-        let actual_h_size = if config.hidden_size == 2048 {
-            2048
-        } else if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
-            info.shape.dims()[0]
-        } else if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.input_layernorm.weight")) {
-            info.shape.dims()[0]
-        } else if let Some(info) = ct.tensor_infos.get(&"token_embd.weight".to_string()) {
-            let dims = info.shape.dims();
-            if dims.len() >= 2 { if dims[0] > dims[1] { dims[1] } else { dims[0] } } else { 1024 }
-        } else {
-            config.hidden_size
-        };
-
+        // [STRICT-DIMENSION-LOCK] 
+        // Always trust config hidden size (1024 for 0.6B engine) 
+        // to prevent shape mismatches when injecting 2B weights.
+        let actual_h_size = config.hidden_size;
         let is_06b = actual_h_size == 1024;
         
-        println!("[DEBUG-ATTN-NEW] Layer: {}, Config Hidden: {}, Actual Hidden: {}, Is 0.6B: {}", layer_idx, config.hidden_size, actual_h_size, is_06b);
-        
         let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
-            if is_06b {
-                // [0.6B-SPECIFIC] Qwen3-0.6B uses combined QKV or specific naming
-                ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
-            } else {
-                ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
-            }
+            ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
         } else {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
 
-        // [FIX] Dynamic Head Detection: Trust GGUF tensor shapes over config to prevent reshape mismatches.
-        let q_weight_name = format!("{base_name}.{q}.weight");
-        let k_weight_name = format!("{base_name}.{k}.weight");
-
-        // [MATHEMATICAL-ALIGNMENT] 
-        // 2B Hybrid is GQA: 16 Query Heads (2048) / 8 KV Heads (1024)
-        // 0.6B is MHA: 8 Query Heads (1024) / 8 KV Heads (1024)
-        let num_attention_heads = if actual_h_size == 2048 { 16 } else { 8 };
+        // [STRICT-HEAD-ALIGNMENT] 0.6B = 8 heads, 2B = 16 heads.
+        // We force 8 heads for the 0.6B engine even if weights are from 2B.
+        let num_attention_heads = if is_06b { 8 } else { 16 };
         let num_key_value_heads = 8; 
-
         let num_kv_groups = num_attention_heads / num_key_value_heads;
 
-        if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
-            if layer_idx == 0 {
-                println!("[MODEL-FIX] Architecture Mismatch. GGUF: {} heads / {} KV heads. Config: {} heads / {} KV heads. Overriding config.",
-                    num_attention_heads, num_key_value_heads, config.num_attention_heads, config.num_key_value_heads);
-            }
-        }
-
-        // [0.6B-HYBRID-FIX] Detect and handle combined attn_qkv tensors often found in 0.6B GGUF files
         let q_proj_name = format!("{base_name}.{q}");
         let k_proj_name = format!("{base_name}.{k}");
         let v_proj_name = format!("{base_name}.{v}");
-        let qkv_combined_name = format!("{base_name}.attn_qkv");
 
-        let has_individual = ct.tensor_infos.contains_key(&format!("{q_proj_name}.weight"));
-        let has_combined = ct.tensor_infos.contains_key(&format!("{qkv_combined_name}.weight"));
-
-        let (q_proj, k_proj, v_proj) = if has_individual {
-            let mut qp = get_qlinear_v2(ct, reader, &q_proj_name, device, dtype, actual_h_size)?;
-            let mut kp = get_qlinear_v2(ct, reader, &k_proj_name, device, dtype, actual_h_size)?;
-            let mut vp = get_qlinear_v2(ct, reader, &v_proj_name, device, dtype, actual_h_size)?;
-            
-            // [HYBRID-FIX] Only slice if we are CERTAIN we are in 0.6B model (1024) 
-            // but the GGUF file provided a 2048-dim tensor (unlikely but handled)
-            if actual_h_size == 1024 {
-                if qp.inner_shape().len() >= 2 && qp.inner_shape()[1] == 2048 {
-                    println!("[MODEL-FIX] Slicing Q 2048 -> 1024 for 0.6B.");
-                    qp = get_sliced_qlinear(ct, reader, &q_proj_name, device, dtype, 1, 0, 1024)?;
-                }
-                if kp.inner_shape().len() >= 2 && kp.inner_shape()[1] == 2048 {
-                    kp = get_sliced_qlinear(ct, reader, &k_proj_name, device, dtype, 1, 0, 1024)?;
-                }
-                if vp.inner_shape().len() >= 2 && vp.inner_shape()[1] == 2048 {
-                    vp = get_sliced_qlinear(ct, reader, &v_proj_name, device, dtype, 1, 0, 1024)?;
-                }
-            }
-            (qp, kp, vp)
-        } else if has_combined {
-            // [0.6B-SPECIFIC] Split combined QKV
-            let qp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 0, actual_h_size)?;
-            let kp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, actual_h_size, actual_h_size)?;
-            let vp = get_sliced_qlinear(ct, reader, &qkv_combined_name, device, dtype, 0, 2 * actual_h_size, actual_h_size)?;
-            (qp, kp, vp)
-        } else {
-            return Err(anyhow!("Could not find QKV tensors for layer {}", layer_idx));
-        };
-
-        let mut o_proj = get_qlinear_v2(ct, reader, &format!("{base_name}.{o}"), device, dtype, actual_h_size)?;
-        
-        // [HYBRID-FIX] 0.6B model Output Proj Slicing
-        if actual_h_size == 1024 {
-            let shape = o_proj.inner_shape();
-            if shape.len() >= 2 && shape[0] == 2048 {
-                println!("[MODEL-FIX] Slicing o_proj INPUT 2048 -> 1024 for 0.6B.");
-                o_proj = get_sliced_qlinear(ct, reader, &format!("{base_name}.{o}"), device, dtype, 0, 0, 1024)?;
-            }
-        }
-
-        if layer_idx == 0 {
-            println!("[DEBUG-ATTN-L0] Q: {:?}, K: {:?}, V: {:?}, O: {:?}, head_dim: {}", 
-                q_proj.inner_shape(), k_proj.inner_shape(), v_proj.inner_shape(), o_proj.inner_shape(), head_dim);
-        }
+        let q_proj = get_qlinear_v2(ct, reader, &q_proj_name, device, dtype, actual_h_size)?;
+        let k_proj = get_qlinear_v2(ct, reader, &k_proj_name, device, dtype, actual_h_size)?;
+        let v_proj = get_qlinear_v2(ct, reader, &v_proj_name, device, dtype, actual_h_size)?;
+        let o_proj = get_qlinear_v2(ct, reader, &format!("{base_name}.{o}"), device, dtype, actual_h_size)?;
 
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype)?;
@@ -333,8 +255,8 @@ impl QuantizedQwen3VLTextAttention {
             k_norm,
             num_attention_heads,
             num_key_value_heads,
-            num_kv_groups,
             head_dim,
+            num_kv_groups,
             scaling,
             kv_cache: None,
             layer_idx,
@@ -2372,9 +2294,8 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
             let mut d1 = dims[1];
             let mut was_sliced = false;
 
-            // Slicing rules for 2B (2048/6144) -> 0.6B (1024/3072)
-            if d0 == 2048 { d0 = 1024; was_sliced = true; }
-            else if d0 == 4096 { d0 = 2048; was_sliced = true; } // QKV combined?
+            // Strict slicing rules for 0.6B engine's physical limits
+            if d0 == 2048 || d0 == 4096 { d0 = 1024; was_sliced = true; }
             else if d0 == 6144 { d0 = 3072; was_sliced = true; }
 
             if d1 == 2048 { d1 = 1024; was_sliced = true; }
@@ -2382,7 +2303,6 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
 
             if was_sliced {
                 weight_t = weight_t.narrow(0, 0, d0)?.narrow(1, 0, d1)?.contiguous()?;
-                // println!("[HYBRID-DEBUG] Sliced {} weight to [{}, {}]", name, d0, d1);
             }
         }
     }
