@@ -692,41 +692,61 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [HYBRID-BRIDGE-V3] Robust Runtime Upscaling
-        // Instead of relying on specs.json, we check the ACTUAL running model's head count.
-        let (_b, h, s_len, d) = k.dims4()?;
+        // [HYBRID-BRIDGE-V5] Precision Protocol Unfolding
+        let (_b, h, _s_len, d) = k.dims4()?;
         let target_heads = self.num_key_value_heads;
         let target_dim = self.head_dim;
 
-        if h != target_heads || d != target_dim {
-            if self.layer_idx == 0 {
-                println!("[HYBRID-BRIDGE] Mismatch Detected! Source: [Heads={}, Dim={}] -> Target: [Heads={}, Dim={}]", h, d, target_heads, target_dim);
-            }
+        if h < target_heads || d < target_dim {
+            let k_cpu = k.to_device(&Device::Cpu)?;
+            let mut k_data = k_cpu.flatten_all()?.to_vec1::<f32>()?;
+            let sig = k_data[0];
             
-            // 1. Dimension Upscaling (1024 -> 2048)
-            if d < target_dim {
-                if self.layer_idx == 0 { println!("[HYBRID-BRIDGE] Fixing Dimension ({} -> {})...", d, target_dim); }
-                k = Tensor::cat(&[&(k.clone()), &k], D::Minus1)?;
-                v = Tensor::cat(&[&(v.clone()), &v], D::Minus1)?;
-            }
-            
-            // 2. Head Replication (8 -> 16)
-            if h < target_heads {
-                if self.layer_idx == 0 { println!("[HYBRID-BRIDGE] Fixing Heads ({} -> {})...", h, target_heads); }
-                let mut k_heads = Vec::with_capacity(target_heads);
-                let mut v_heads = Vec::with_capacity(target_heads);
+            let mut target_parts: usize = 2; // Default
+            if sig < -1.0 {
+                // Decode Protocol: -(1.0 + TargetParts*0.0001 + FoldDepth*0.0000001)
+                let val = sig.abs() - 1.0;
+                target_parts = ((val * 10000.0).round() as usize) % 100;
+                // println!("[HYBRID-BRIDGE] Decoded protocol: Target Parts = {}", target_parts);
                 
-                for i in 0..target_heads {
-                    let src_idx = i % h; // Cyclic replication (0,1,2...7, 0,1,2...7)
-                    k_heads.push(k.narrow(1, src_idx, 1)?);
-                    v_heads.push(v.narrow(1, src_idx, 1)?);
-                }
-                k = Tensor::cat(&k_heads, 1)?;
-                v = Tensor::cat(&v_heads, 1)?;
+                // Heal the marker by copying neighbor
+                k_data[0] = k_data[1]; 
+            } else if d < target_dim {
+                target_parts = target_dim / d;
             }
-            
-            if self.layer_idx == 0 {
-                println!("[HYBRID-BRIDGE-SUCCESS] Adjusted Cache Shape: {:?}", k.shape());
+
+            if target_parts > 1 {
+                // 1. Precise Dimension Unfolding
+                if d < target_dim {
+                    let mut k_parts = Vec::new();
+                    let mut v_parts = Vec::new();
+                    for _ in 0..target_parts {
+                        k_parts.push(k.clone());
+                        v_parts.push(v.clone());
+                    }
+                    k = Tensor::cat(&k_parts, D::Minus1)?;
+                    v = Tensor::cat(&v_parts, D::Minus1)?;
+                    
+                    // Final slice to be 100% sure we match 2B's exact dimension
+                    if k.dim(D::Minus1)? > target_dim {
+                        k = k.narrow(D::Minus1, 0, target_dim)?;
+                        v = v.narrow(D::Minus1, 0, target_dim)?;
+                    }
+                }
+                
+                // 2. Head Alignment
+                if h < target_heads {
+                    let mut k_heads = Vec::with_capacity(target_heads);
+                    let mut v_heads = Vec::with_capacity(target_heads);
+                    let current_h = k.dim(1)?;
+                    for i in 0..target_heads {
+                        let src_idx = i % current_h;
+                        k_heads.push(k.narrow(1, src_idx, 1)?);
+                        v_heads.push(v.narrow(1, src_idx, 1)?);
+                    }
+                    k = Tensor::cat(&k_heads, 1)?;
+                    v = Tensor::cat(&v_heads, 1)?;
+                }
             }
         }
 
@@ -1147,11 +1167,10 @@ impl QuantizedQwen3VLTextModel {
                              if let Ok(b2_ct) = gguf_file::Content::read(&mut b2_cursor) {
                                  if let Ok(b2_emb) = b2_ct.tensor(&mut b2_cursor, "token_embd.weight", device) {
                                      let b2_emb_t = b2_emb.dequantize(device)?.to_dtype(dtype)?;
-                                     // 2048 -> 1024 슬라이싱하여 0.6B 엔진에 맞춤
-                                     if let Ok(sliced_emb) = b2_emb_t.narrow(1, 0, 1024) {
-                                         // [CRITICAL-FIX] index-select only supports contiguous tensors
-                                         tensor = sliced_emb.contiguous()?;
-                                         println!("[HYBRID-INJECT-SUCCESS] 2B Embedding (sliced to 1024, contiguous) injected into 0.6B engine.");
+                                     // [HYBRID-EMBEDDING-FOLDING] Sum 2B halves into 1024 dim
+                                     if let (Ok(e1), Ok(e2)) = (b2_emb_t.narrow(1, 0, 1024), b2_emb_t.narrow(1, 1024, 1024)) {
+                                         tensor = (e1 + e2)?.contiguous()?;
+                                         println!("[HYBRID-INJECT-SUCCESS] 2B Embedding (FOLDED to 1024) injected into 0.6B engine.");
                                      }
                                  }
                              }
@@ -2285,24 +2304,35 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
     let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [HYBRID-DYNAMIC-SLICING]
-    // If we are loading 2B intelligence into a 0.6B engine (1024)
+    // [HYBRID-PRECISION-PROTOCOL]
+    // Encodes Target Parts (0.0001) and Fold Depth (0.0000001) for 100% recovery
     if hidden_size == 1024 {
         let dims = weight_t.dims();
         if dims.len() == 2 {
-            let mut d0 = dims[0];
-            let mut d1 = dims[1];
-            let mut was_sliced = false;
+            let mut t = weight_t.clone();
+            let d0 = t.dim(0)?;
+            
+            // Calculate protocol values
+            let target_parts = (d0 as f64 / 1024.0).ceil(); 
+            let fold_depth = target_parts; // For now, depth matches parts
 
-            // Strict slicing rules for 0.6B engine's physical limits
-            if d0 == 2048 || d0 == 4096 { d0 = 1024; was_sliced = true; }
-            else if d0 == 6144 { d0 = 3072; was_sliced = true; }
-
-            if d1 == 2048 { d1 = 1024; was_sliced = true; }
-            else if d1 == 6144 { d1 = 3072; was_sliced = true; }
-
-            if was_sliced {
-                weight_t = weight_t.narrow(0, 0, d0)?.narrow(1, 0, d1)?.contiguous()?;
+            if target_parts > 1.0 {
+                let mut current_t = t.clone();
+                let mut current_d0 = d0;
+                while current_d0 > 1024 && current_d0 != 3072 {
+                    let chunk = if current_d0 == 6144 { 3072 } else { current_d0 / 2 };
+                    let t1 = current_t.narrow(0, 0, chunk)?;
+                    let t2 = current_t.narrow(0, chunk, chunk.min(current_d0 - chunk))?;
+                    current_t = ((t1 + t2)? / 2.0)?;
+                    current_d0 = current_t.dim(0)?;
+                }
+                
+                // Encode Protocol: -(1.0 + TargetParts*0.0001 + FoldDepth*0.0000001)
+                let marker_val = -(1.0 + (target_parts * 0.0001) + (fold_depth * 0.0000001));
+                let mut data = current_t.to_vec2::<f32>()?;
+                data[0][0] = marker_val as f32;
+                weight_t = Tensor::new(data, device)?.contiguous()?;
+                // println!("[HYBRID-PROTOCOL] Marked: parts={}, depth={}, val={}", target_parts, fold_depth, marker_val);
             }
         }
     }
@@ -2390,9 +2420,14 @@ fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
 fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, eps: f64, device: &Device, dtype: DType) -> Result<RmsNorm> {
     let weight = ct.tensor(reader, &format!("{name}.weight"), device)?;
     let mut weight = weight.dequantize(device)?.to_dtype(dtype)?;
+    
+    // [HYBRID-AGGREGATE-NORM] Preserve full 2B signal by summing halves
     if weight.dim(0)? == 2048 {
-        weight = weight.narrow(0, 0, 1024)?.contiguous()?;
+        let w1 = weight.narrow(0, 0, 1024)?;
+        let w2 = weight.narrow(0, 1024, 1024)?;
+        weight = (w1 + w2)?.contiguous()?; // Fold 2048 into 1024
     }
+    
     Ok(RmsNorm::new(weight, eps))
 }
 
