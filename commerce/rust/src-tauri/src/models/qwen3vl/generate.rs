@@ -476,6 +476,34 @@ impl Qwen3VLGenerateModel {
             }
         }
 
+        let mut seqlen_offset = self.get_kv_len();
+        if seqlen_offset > 0 {
+            println!("[ZERO-PREFILL] Context successfully restored. Starting from token #{}", seqlen_offset);
+        }
+
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
+        // [STRICT-ALIGN] Never add BOS manually; parity with prefill_only
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
+        let total_tokens = full_input_ids_vec.len();
+
+        // [STRICT-RELAY] If we have context, local_pos starts from seqlen_offset
+        let mut local_pos = if seqlen_offset > 0 { 
+            if seqlen_offset >= total_tokens {
+                println!("[ZERO-PREFILL] Full context match ({} tokens). Skipping entire prefill loop.", seqlen_offset);
+                // [FIX] 만약 모든 토큰이 이미 캐시되어 있다면, 마지막 1개 토큰만 남기고 건너뜁니다.
+                total_tokens.saturating_sub(1)
+            } else {
+                println!("[ZERO-PREFILL] Skipping first {} baked tokens. Resuming prefill from position {}.", seqlen_offset, seqlen_offset);
+                seqlen_offset
+            }
+        } else { 
+            0 
+        };
+        
+        // [SYNC-OFFSET] Ensure seqlen_offset matches local_pos for the loop
+        seqlen_offset = local_pos;
+
         // [DYNAMIC-BATCH-SIZE] Adjust batch size based on safety mode
         let prefill_chunk_size = if self.qwen3_vl.is_cpu() { 
             1024 
@@ -512,7 +540,6 @@ impl Qwen3VLGenerateModel {
             // [CHECKPOINT] Save to SSD after EVERY batch to allow granular resumption
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                // [DETACH-IO] save_kv_to_disk ensures the context is safe on disk before moving to next batch
                 let _ = self.save_kv_to_disk(&path);
             }
 

@@ -1531,9 +1531,10 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
+        let total_layers = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            if layer_idx % 7 == 0 || layer_idx == self.layers.len() - 1 {
-                println!("[TRACE-LAYER] {}/{} | Device: {:?}", layer_idx + 1, self.layers.len(), layer.device());
+            if layer_idx % 7 == 0 || layer_idx == total_layers - 1 {
+                println!("[TRACE-LAYER] {}/{} | Device: {:?}", layer_idx + 1, total_layers, layer.device());
             }
             let is_on_cpu = layer.device().is_cpu();
             let is_pinned = layer_idx < self.pinned_layer_count;
