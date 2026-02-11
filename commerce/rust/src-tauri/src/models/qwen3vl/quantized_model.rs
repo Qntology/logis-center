@@ -1228,11 +1228,11 @@ impl QuantizedQwen3VLTextModel {
              // [STRATEGY-INJECTION] If this is 0.6B (1024) but we want 2B precision
              if actual_h_size == 1024 {
                  let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
-                 let spec_path = base_path.join("2b_specs.json");
-                 let b2_gguf_path = base_path.join("Qwen3-VL-2B-Instruct-gguf/Qwen3VL-2B-Instruct-Q4_K_M.gguf");
+                 let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
+                 let b2_gguf_path = hybrid_dir.join("Qwen3-2B-L0-VL-Q4_K_M.gguf");
                  
-                 if spec_path.exists() && b2_gguf_path.exists() {
-                     println!("[HYBRID-INJECT] 0.6B Detected. Injecting 2B Embedding for precise baking...");
+                 if b2_gguf_path.exists() {
+                     println!("[HYBRID-INJECT] 0.6B Detected. Injecting 2B Embedding from unified module...");
                      if let Ok(b2_file) = std::fs::File::open(&b2_gguf_path) {
                          if let Ok(b2_mmap) = unsafe { memmap2::MmapOptions::new().map(&b2_file) } {
                              let mut b2_cursor = std::io::Cursor::new(&b2_mmap[..]);

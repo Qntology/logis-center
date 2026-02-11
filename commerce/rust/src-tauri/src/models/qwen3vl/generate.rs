@@ -190,7 +190,12 @@ impl Qwen3VLGenerateModel {
         let pre_processor = Qwen3VLProcessor::new(meta_path, &vision_dev, dtype)?;
 
         let qwen3_vl = if !gguf_files.is_empty() {
-            let mut model_path = gguf_files.iter().find(|f| f.contains("0.6B") && f.contains("Q8_0")).cloned();
+            // [HYBRID-FILE-SELECTOR] Prioritize our new modular components
+            let mut model_path = gguf_files.iter().find(|f| f.contains("Clean-L0")).cloned();
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Body-L1-27")).cloned(); }
+            
+            // Legacy fallbacks
+            if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("0.6B") && f.contains("Q8_0")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("0.6B") && f.contains("Q4_K_M")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("0.6B")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
