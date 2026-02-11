@@ -668,6 +668,15 @@ impl QuantizedQwen3VLTextAttention {
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+        
+        // [STRICT-IO] Ensure the target directory exists for this layer
+        if let Some(parent) = file.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow!("Failed to create directory for layer {}: {}", self.layer_idx, e))?;
+            }
+        }
+
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
@@ -1157,7 +1166,35 @@ impl QuantizedQwen3VLTextModel {
 
         let embed_tokens = if let Some(key) = embed_key {
              println!("[HYBRID] Found embedding weight with key: {}", key);
-             let tensor = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
+             let mut tensor = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
+             
+             // [STRATEGY-INJECTION] If this is 0.6B (1024) but we want 2B precision
+             if actual_h_size == 1024 {
+                 let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
+                 let spec_path = base_path.join("2b_specs.json");
+                 let b2_gguf_path = base_path.join("Qwen3-VL-2B-Instruct-gguf/Qwen3VL-2B-Instruct-Q4_K_M.gguf");
+                 
+                 if spec_path.exists() && b2_gguf_path.exists() {
+                     println!("[HYBRID-INJECT] 0.6B Detected. Injecting 2B Embedding for precise baking...");
+                     if let Ok(b2_file) = std::fs::File::open(&b2_gguf_path) {
+                         if let Ok(b2_mmap) = unsafe { memmap2::MmapOptions::new().map(&b2_file) } {
+                             let mut b2_cursor = std::io::Cursor::new(&b2_mmap[..]);
+                             if let Ok(b2_ct) = gguf_file::Content::read(&mut b2_cursor) {
+                                 if let Ok(b2_emb) = b2_ct.tensor(&mut b2_cursor, "token_embd.weight", device) {
+                                     let b2_emb_t = b2_emb.dequantize(device)?.to_dtype(dtype)?;
+                                     // 2048 -> 1024 슬라이싱하여 0.6B 엔진에 맞춤
+                                     if let Ok(sliced_emb) = b2_emb_t.narrow(1, 0, 1024) {
+                                         // [CRITICAL-FIX] index-select only supports contiguous tensors
+                                         tensor = sliced_emb.contiguous()?;
+                                         println!("[HYBRID-INJECT-SUCCESS] 2B Embedding (sliced to 1024, contiguous) injected into 0.6B engine.");
+                                     }
+                                 }
+                             }
+                         }
+                     }
+                 }
+             }
+             
              let h = tensor.dim(1)?;
              Embedding::new(tensor, h)
         } else {
@@ -1495,6 +1532,9 @@ impl QuantizedQwen3VLTextModel {
         };
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            if layer_idx % 7 == 0 || layer_idx == self.layers.len() - 1 {
+                println!("[TRACE-LAYER] {}/{} | Device: {:?}", layer_idx + 1, self.layers.len(), layer.device());
+            }
             let is_on_cpu = layer.device().is_cpu();
             let is_pinned = layer_idx < self.pinned_layer_count;
             
@@ -1711,11 +1751,9 @@ impl QuantizedQwen3VLTextModel {
         println!("[SSD-BRIDGE] Saving {} layers to ABSOLUTE directory: {:?}", self.layers.len(), final_path);
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            let file_name = format!("layer_{}.safetensors", i);
-            let file_path = final_path.join(file_name);
-            
-            layer.save_kv_cache(&file_path, clear, block_size)
-                .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, file_path, e))?;
+            // [STRICT-ALIGN] Use consistent filename 'layer_{}_kv.safetensors' implicitly by passing the directory
+            layer.save_kv_cache(&final_path, clear, block_size)
+                .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, final_path, e))?;
         }
         Ok(())
     }
@@ -1747,8 +1785,8 @@ impl QuantizedQwen3VLTextModel {
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
         // [ZERO-PREFILL-BRIDGE] Load the primary seed layer (Layer 0)
-        let l0_path = path.join("layer_0.safetensors");
-        if !l0_path.exists() { return Err(anyhow!("Seed layer_0.safetensors not found at {:?}", l0_path)); }
+        let l0_path = path.join("layer_0_kv.safetensors");
+        if !l0_path.exists() { return Err(anyhow!("Seed layer_0_kv.safetensors not found at {:?}", l0_path)); }
         
         println!("[SSD-BRIDGE] Loading Seed Layer 0 from 원본... and propagating to {} layers...", self.layers.len());
         
@@ -1773,11 +1811,11 @@ impl QuantizedQwen3VLTextModel {
 
             if !is_pinned && self.is_disk_swap {
                 // Save this layer's copy to the NEW inference workspace, NOT the original path
-                let layer_name = format!("layer_{}.safetensors", i);
+                let layer_name = format!("layer_{}_kv.safetensors", i);
                 let layer_file_path = inference_workspace.join(layer_name);
                 
                 if !layer_file_path.exists() {
-                    self.layers[i].save_kv_cache(&layer_file_path, false, 1024)?;
+                    self.layers[i].save_kv_cache(&inference_workspace, false, 1024)?;
                 }
                 self.layers[i].self_attn.kv_cache = None;
             }

@@ -467,48 +467,30 @@ impl Qwen3VLGenerateModel {
         let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(top_k), seed);
         let repetition_penalty = 1.1;
 
-        let mut seqlen_offset = self.get_kv_len();
-
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
-        // [STRICT-ALIGN] Never add BOS manually; parity with prefill_only
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
-        let total_tokens = full_input_ids_vec.len();
-
-        if seqlen_offset == 0 {
-            if let Some(sid) = &session_id {
-                let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if path.exists() { 
-                    self.load_kv_from_disk(&path)?; 
-                    seqlen_offset = self.get_kv_len(); 
-                    
-                    // [HYBRID-SPEED-UP] Force all layers to GPU now that context is loaded
-                    if let ModelVariant::QuantizedText(m) = &mut self.qwen3_vl {
-                        println!("[HYBRID-SPEED-UP] Forcing GPU residency for all layers...");
-                        let _ = m.language_model.rebalance_layers(0, seqlen_offset);
-                        let _ = m.language_model.rebalance_layers(0, seqlen_offset);
-                    }
-                }
+        // [ZERO-PREFILL-INIT] Try loading existing context first
+        if let Some(sid) = &session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            if path.exists() {
+                println!("[ZERO-PREFILL] Found existing session '{}'. Loading from SSD...", sid);
+                self.load_kv_from_disk(&path)?; 
             }
         }
 
-        // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
-        // [STRICT-RELAY] Ensure 2B always reads at least the very last token to sync state.
-        let mut local_pos = if seqlen_offset > 0 { 
-            if seqlen_offset >= total_tokens {
-                total_tokens.saturating_sub(1)
-            } else {
-                seqlen_offset
-            }
-        } else { 
-            0 
+        // [DYNAMIC-BATCH-SIZE] Adjust batch size based on safety mode
+        let prefill_chunk_size = if self.qwen3_vl.is_cpu() { 
+            1024 
+        } else if seqlen_offset > 0 {
+            // [RECOVERY-MODE] If resuming from OOM/SSD, use smaller safer batches
+            128 
+        } else {
+            // [SPEED-MODE] Default prefill batch
+            256 
         };
-        
-        let prefill_chunk_size = if self.text_device.is_cpu() { 1024 } else { 256 };
 
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
-            if remaining == 1 { break; }
+            // [STRICT-ALIGN] 마지막 토큰은 루프 밖(Generation 시작 직전)에서 처리합니다.
+            if remaining <= 1 { break; }
             
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             if local_pos + chunk_size >= total_tokens {
@@ -527,6 +509,13 @@ impl Qwen3VLGenerateModel {
 
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, session_id.clone())?;
             
+            // [CHECKPOINT] Save to SSD after EVERY batch to allow granular resumption
+            if let Some(sid) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                // [DETACH-IO] save_kv_to_disk ensures the context is safe on disk before moving to next batch
+                let _ = self.save_kv_to_disk(&path);
+            }
+
             // [DYNAMIC-RECOVERY] Check for GPU availability every chunk during prefill
             if !self.qwen3_vl.is_cpu() {
                 let _ = self.qwen3_vl.rebalance_layers(0, seqlen_offset + chunk_size);
