@@ -529,7 +529,7 @@ impl Qwen3VLGenerateModel {
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             
             // [FINAL-STRETCH-SAFETY] Progress based batch shrinking
-            let progress = (local_pos as f32 / total_tokens as f32 * 100.0);
+            let progress = local_pos as f32 / total_tokens as f32 * 100.0;
             if progress > 90.0 {
                 // Near the end, use tiny batches to avoid OOM during peak KV cache
                 chunk_size = chunk_size.min(32);

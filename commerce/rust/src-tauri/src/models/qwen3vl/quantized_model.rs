@@ -5,10 +5,14 @@ use candle_core::quantized::{gguf_file, QMatMul};
 use rayon::prelude::*;
 use nvml_wrapper::Nvml;
 use std::path::Path;
-use std::fs;
 use std::collections::HashMap;
 use std::sync::Arc;
 use memmap2::Mmap;
+
+// A trait alias for Seek + Read, as direct trait object `dyn Seek + Read` is not allowed.
+// See: https://doc.rust-lang.org/reference/items/traits.html#auto-traits
+pub trait SeekRead: std::io::Seek + std::io::Read {}
+impl<T: std::io::Seek + std::io::Read> SeekRead for T {}
 
 use crate::{
     models::{
@@ -860,7 +864,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut l0_cursor = None;
         let mut l0_content = None;
         
-        let (mut final_ct, mut final_reader) = (ct, reader as &mut dyn crate::models::qwen3vl::quantized_model::SeekRead);
+        let (mut final_ct, mut final_reader) = (ct, reader as &mut dyn SeekRead);
 
         if layer_idx == 0 && config.hidden_size == 1024 {
             let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();

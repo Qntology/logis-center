@@ -6,6 +6,7 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
+#[allow(unused_imports)]
 use crate::openai_types::{
     ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent,
