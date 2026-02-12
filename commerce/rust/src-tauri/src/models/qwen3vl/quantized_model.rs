@@ -1108,8 +1108,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         xs_active = residual_active.add(&xs_active)?;
         
-        // [HYBRID-BRIDGE-BACK-V4]
-        // 연산 결과가 1024인데 파이프라인이 2048을 원할 때만 확장 (2B 추론 시 4096 폭주 방지)
+        // [HYBRID-BRIDGE-BACK-V5]
+        // 0.6B 베이킹 엔진 결과(1024)만 2048로 확장하여 다음 레이어로 전달
         let mut xs = if needs_bridge && xs_active.dim(candle_core::D::Minus1)? == 1024 {
             Tensor::cat(&[&(xs_active.clone()), &xs_active], candle_core::D::Minus1)?.contiguous()?
         } else {
@@ -1141,7 +1141,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             // 3. Down Projection
             let mut out = down_proj.forward(&hidden)?;
             
-            // MLP 출구 브릿지
+            // MLP 출구 브릿지 (0.6B 베이킹 전용)
             if needs_bridge && out.dim(D::Minus1)? == 1024 {
                 out = Tensor::cat(&[&(out.clone()), &out], D::Minus1)?.contiguous()?;
             }
@@ -2398,8 +2398,10 @@ impl QuantizedQwen3TextModel {
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
 
-        let start = if let Some(cp) = cache_position { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { 0 };
+        // [STRICT-EMBED-ALIGN] 2B 임베딩이 이미 주입되었으므로 추가 확장 금지
+        let start = if let Some(cp) = cache_position_in { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { 0 };
         let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
+        
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
