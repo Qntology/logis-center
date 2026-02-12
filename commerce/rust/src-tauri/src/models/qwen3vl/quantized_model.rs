@@ -1098,10 +1098,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
             }
             xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
         } else {
-            if self.self_attn.layer_idx == 0 && is_handshake_active {
-                static ONCE_INF: std::sync::Once = std::sync::Once::new();
-                ONCE_INF.call_once(|| println!("[HYBRID-BRIDGE] Inference Model Mode - Native 2048 Pipeline."));
-            }
             xs.clone()
         };
 
@@ -1110,19 +1106,13 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
         
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
-        xs_active = residual_active.add(&xs_active)?;
+        let mut xs = residual_active.add(&xs_active)?;
         
-        // [HYBRID-BRIDGE-BACK-V7] 
-        // 0.6B 베이킹 엔진이고, 아직 핸드셰이크가 활성화되지 않았을 때만 명확히 확장 수행
-        let mut xs = if !is_handshake_active && norm_dim == 1024 && xs_active.dim(candle_core::D::Minus1)? == 1024 {
-            Tensor::cat(&[&(xs_active.clone()), &xs_active], candle_core::D::Minus1)?.contiguous()?
-        } else {
-            // 이미 2B이거나 핸드셰이크가 활성화된 상태라면 절대 확장하지 않음
-            xs_active
-        };
+        // [HYBRID-BRIDGE-BACK-V7-DISABLED] 
+        // 베이킹 중 레이어 내부 확장은 불필요하며 에러의 원인이 되므로 비활성화
+        // 확장은 오직 save_kv_cache 프로토콜(V7)에 의해서만 수행됨
 
         // [STRICT-DIMENSION-CHECK]
-        // 디버깅을 위한 체크 로직만 남기고, 무지성 narrow는 제거 (V7 프로토콜을 믿음)
         if xs.dim(D::Minus1)? > 2048 {
              println!("[CRITICAL-WARN] Unexpected dimension expansion: {}. Check Handshake V7 status.", xs.dim(D::Minus1)?);
         }
@@ -1150,12 +1140,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let hidden = gate.mul(&up)?;
             
             // 3. Down Projection
-            let mut out = down_proj.forward(&hidden)?;
+            let out = down_proj.forward(&hidden)?;
             
-            // MLP 출구 브릿지 (0.6B 베이킹 전용)
-            if !is_handshake_active && norm_dim == 1024 && out.dim(D::Minus1)? == 1024 {
-                out = Tensor::cat(&[&(out.clone()), &out], D::Minus1)?.contiguous()?;
-            }
+            // [HYBRID-MLP-EXIT-V7-DISABLED] 내부 확장 비활성화
             
             let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
             Ok(residual_mlp.add(&out)?)
