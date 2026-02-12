@@ -697,7 +697,8 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, active_status: bool) -> Result<()> {
+        if active_status { self.is_handshake_active = true; }
         let file_path = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         
         // [HYBRID-PROPAGATION-LOGIC]
@@ -1178,9 +1179,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.offload_kv_cache(path, block_size)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
-        let device = self.input_layernorm.weight().device();
-        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len)
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, active_status: bool) -> Result<()> {
+        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, active_status)
     }
 }
 
@@ -1731,7 +1731,7 @@ impl QuantizedQwen3VLTextModel {
                     let kv_path = crate::utils::paths::get_kv_dir(None).join(session_id);
                     if kv_path.exists() {
                         // For non-pinned layers, we load JIT
-                        let _ = layer.load_kv_cache(&kv_path, &gpu_device, 0, 0);
+                        let _ = layer.load_kv_cache(&kv_path, &gpu_device, 0, 0, self.is_handshake_active);
                     }
                 }
             }
@@ -2026,7 +2026,7 @@ impl QuantizedQwen3VLTextModel {
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
         // [ZERO-PREFILL-BRIDGE] Load the primary seed layer (Layer 0)
-        self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len)?;
+        self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len, self.is_handshake_active)?;
         
         // [FIX] Update logical progress and Handshake state immediately
         self.current_kv_len = self.layers[0].get_kv_len();
