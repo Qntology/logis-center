@@ -203,7 +203,8 @@ pub struct QuantizedQwen3VLTextAttention {
     pub kv_cache: Option<(Tensor, Tensor)>,
     pub layer_idx: usize,
     pub hybrid_parts: f64,
-    pub needs_transpose: bool, // [NEW] Tracks if baking required a transpose
+    pub needs_transpose: bool,
+    pub is_handshake_active: bool, // [NEW] Handshake Protocol 성공 여부를 영구 저장
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -293,6 +294,7 @@ impl QuantizedQwen3VLTextAttention {
             layer_idx,
             hybrid_parts,
             needs_transpose,
+            is_handshake_active: false, // Default to inactive
         })
     }
 
@@ -635,16 +637,18 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V2]
-            // Marker includes: Parts(4th dec), Depth(7th dec), Transpose(9th dec)
-            // Ensure F32 for marking and saving
+            // [HYBRID-PROTOCOL-MARKING-V3]
             let mut k_marked = k.to_dtype(DType::F32)?;
             
-            // We use 2.0 parts for 1024 -> 2048 recovery
-            let hybrid_parts = if k.dim(D::Minus1)? == 1024 { 2.0 } else { 1.0 };
-            let needs_transpose = self.needs_transpose; // Inherit from attention state
+            // 헤드 수(dim 1)를 기준으로 신분 판별 (8헤드: 0.6B, 16헤드: 2B)
+            let head_count = k.dim(1)?;
+            let is_already_2b = head_count >= 16;
+            
+            // 0.6B(8헤드) 데이터를 저장할 때만 2B로의 확장을 예고하는 마커를 심음
+            let hybrid_parts = if is_already_2b { 1.0 } else { 2.0 };
+            let needs_transpose = self.needs_transpose; 
 
-            if hybrid_parts > 1.0 || needs_transpose {
+            if !is_already_2b && (hybrid_parts > 1.0 || needs_transpose) {
                 let trans_flag = if needs_transpose { 1.0 } else { 0.0 };
                 let marker = -(1.0 + (hybrid_parts * 0.0001) + (hybrid_parts * 0.0000001) + (trans_flag * 0.000000001));
                 
@@ -761,6 +765,10 @@ impl QuantizedQwen3VLTextAttention {
             let trans_val = ((val * 1000000000.0).round() as usize) % 10;
             let needs_retranspose = trans_val == 1 || multiplier > 1;
             
+            // [HYBRID-HANDSHAKE-SUCCESS] 0.6B에서 구워진 지능임이 확인됨
+            self.is_handshake_active = true;
+            println!("[HYBRID-V5] Handshake Protocol Active! Layer {}: x{} Factor, Transpose={}", self.layer_idx, multiplier, needs_retranspose);
+            
             // Marker Healing (Handshake V5 Shift-Healing)
             let mut k_clean = k_vec.clone();
             k_clean[0] = k_vec[1]; 
@@ -784,9 +792,10 @@ impl QuantizedQwen3VLTextAttention {
                     v_final = Tensor::cat(&v_parts, D::Minus1)?;
                 }
                 
-                // [THERMAL-BALANCING] Prevent variance explosion in the final Attention output
-                // Only scale Value (V); Key (K) preserves its original rotation magnitude for stable scores.
-                let scale = 1.0 / (multiplier as f64).sqrt();
+                // [THERMAL-BALANCING-V2] Prevent variance explosion in the final Attention output
+                // Only scale Value (V); Key (K) preserves its original magnitude.
+                // Scale factor: 1.0 / sqrt(2.0) approx 0.7071
+                let scale = 0.70710678118; 
                 v_final = (v_final * scale)?;
             }
             
@@ -1056,36 +1065,32 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
         
-        // [HYBRID-BRIDGE-V2] Only slice input if we are explicitly running in 1024-dim engine mode
-        let mut xs_active = if input_dim == 2048 && norm_dim == 1024 && self.self_attn.num_attention_heads == 8 {
-            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Slicing 2048 input to 1024 for 0.6B Baking Engine"); }
+        // [HYBRID-HANDSHAKE-CONTROL] 신분(Identity) 기반 정밀 제어
+        let is_hybrid_mode = self.self_attn.is_handshake_active;
+        if self.self_attn.layer_idx == 0 && is_hybrid_mode {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| println!("[HYBRID-CORE] Handshake Active - Routing through 0.6B Bridge Path."));
+        }
+        
+        let mut xs_active = if is_hybrid_mode && input_dim == 2048 && norm_dim == 1024 {
+            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Slicing 2048 input to 1024 for 0.6B Handshake Path"); }
             xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
         } else {
             xs.clone()
         };
 
         let mut residual_active = xs_active.clone();
-
         let xs_active = self.input_layernorm.forward(&xs_active)?;
-
         let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
         
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         xs_active = residual_active.add(&xs_active)?;
         
-        // [KV-OFFLOAD-GUARD] Emergency KV Swap to CPU if context is too long
-        if let Some((k, v)) = &mut self.self_attn.kv_cache {
-            let kv_len = k.dim(2)?;
-            if kv_len > 32768 && k.device().is_cuda() {
-                // println!("[OFFLOAD] Moving KV Cache of Layer {} to CPU (Len: {})", self.self_attn.layer_idx, kv_len);
-                *k = k.to_device(&Device::Cpu)?;
-                *v = v.to_device(&Device::Cpu)?;
-            }
-        }
-        
-        // [HYBRID-BRIDGE-BACK] Restore to original input dimension only if it was sliced
-        let mut xs = if input_dim == 2048 && norm_dim == 1024 && xs_active.dim(candle_core::D::Minus1)? == 1024 {
-            Tensor::cat(&[&xs_active, &xs_active], candle_core::D::Minus1)?.contiguous()?
+        // [HYBRID-HANDSHAKE-CONTROL-BACK]
+        // 0.6B 지능을 다시 2B 파이프라인 규격(2048)으로 복원
+        let mut xs = if is_hybrid_mode && input_dim == 2048 && norm_dim == 1024 && xs_active.dim(candle_core::D::Minus1)? == 1024 {
+            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Restoring 1024 output to 2048 for Large Pipeline"); }
+            Tensor::cat(&[&(xs_active.clone()), &xs_active], candle_core::D::Minus1)?.contiguous()?
         } else {
             xs_active
         };
@@ -1419,18 +1424,18 @@ impl QuantizedQwen3VLTextModel {
                 let mut local_cursor = std::io::Cursor::new(mmap);
                 let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
                 
-                // [HYBRID-INDEX-OFFSET-V2]
-                // Detect the maximum layer index actually present in the GGUF file
+                // [HYBRID-INDEX-OFFSET-V3]
+                // Body GGUF 파일 내부에 'blk.0'이 있더라도 무조건 무시하고 blk.1부터 바디로 인식함
                 let max_file_idx = ct.tensor_infos.keys()
                     .filter(|k| k.contains("blk."))
                     .filter_map(|k| k.split('.').nth(1)?.parse::<usize>().ok())
                     .max().unwrap_or(26);
 
-                let is_hybrid_body = !ct.tensor_infos.keys().any(|k| k.contains("blk.0.")) && ct.tensor_infos.keys().any(|k| k.contains("blk.1."));
+                let is_hybrid_body = ct.tensor_infos.keys().any(|k| k.contains("blk.1."));
                 
-                let actual_file_idx = if layer_idx > 0 || (layer_idx == 0 && is_hybrid_body) {
+                let actual_file_idx = if layer_idx > 0 {
                      if is_hybrid_body { 
-                         // Apply offset but clamp to the file's maximum available layer
+                         // 1번 레이어부터 로드 (0번 레이어는 주입됨)
                          (layer_idx + 1).min(max_file_idx) 
                      } else { 
                          layer_idx 
@@ -1443,9 +1448,8 @@ impl QuantizedQwen3VLTextModel {
                 let gguf_blk = format!("blk.{actual_file_idx}");
                 let mut prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
                 
-                // [HYBRID-INJECTION-ALIGN] If we are injecting Layer 0 from the unified module, 
-                // the prefix MUST be blk.0 regardless of the main body's file offset.
-                if layer_idx == 0 && is_hybrid_body { prefix = "blk.0".to_string(); }
+                // [HYBRID-INJECTION-ALIGN] Layer 0는 항상 주입된 파일의 blk.0를 사용함
+                if layer_idx == 0 { prefix = "blk.0".to_string(); }
                 
                 // [CRITICAL] Pass baking_only as-is. Layer 0 will self-enable MLP internally.
                 QuantizedQwen3VLTextDecoderLayer::new(
@@ -1979,8 +1983,9 @@ impl QuantizedQwen3VLTextModel {
         // [ZERO-PREFILL-BRIDGE] Load the primary seed layer (Layer 0)
         self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len)?;
         
-        // [FIX] Update logical progress tracker immediately after load
+        // [FIX] Update logical progress and Handshake state immediately
         self.current_kv_len = self.layers[0].get_kv_len();
+        let is_restored = self.layers[0].self_attn.is_handshake_active;
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
             .ok_or_else(|| anyhow!("Failed to load seed KV cache from {:?}", actual_load_path))?.clone();
@@ -1996,6 +2001,8 @@ impl QuantizedQwen3VLTextModel {
             
             if i > 0 {
                 self.layers[i].self_attn.kv_cache = Some((k_seed.clone(), v_seed.clone()));
+                // [STRICT-SYNC] 모든 레이어의 신분을 동기화
+                self.layers[i].self_attn.is_handshake_active = is_restored;
             }
 
             if !is_pinned && self.is_disk_swap {
