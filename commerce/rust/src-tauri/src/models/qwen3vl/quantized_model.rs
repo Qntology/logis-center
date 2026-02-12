@@ -1085,9 +1085,12 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
         
-        // [HYBRID-BRIDGE-V5] Handshake 프로토콜 기반의 완벽한 분기
-        // 1. Baking 엔진(0.6B): 핸드셰이크가 아직 활성화되지 않았고 차원이 1024인 경우만 브릿지 가동
-        // 2. Inference 엔진(2B): 핸드셰이크가 활성화되었으므로 브릿지 로직을 바이패스 (순정 파이프라인)
+        // [HYBRID-BRIDGE-V7] Handshake 프로토콜 기반의 완벽한 분기
+        // [RUNTIME-IDENTITY-RECOVERY] 데이터 차원을 보고 자신의 신분을 실시간으로 교정
+        if input_dim == 2048 && norm_dim == 1024 {
+            self.self_attn.is_handshake_active = true;
+        }
+        
         let is_handshake_active = self.self_attn.is_handshake_active;
         let needs_bridge = !is_handshake_active && input_dim == 2048 && norm_dim == 1024;
         
