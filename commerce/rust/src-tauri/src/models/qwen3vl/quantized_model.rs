@@ -1110,82 +1110,65 @@ impl QuantizedQwen3VLTextDecoderLayer {
              None
         };
 
-        // [STOP-AND-GO: DYNAMIC-SIGNAL-V11]
-        let mut disk_identity = 1.0; // 기본값 0.6B
+        // [STOP-AND-GO: SIGNAL-FIRST-V16]
+        // 수치가 아닌 디스크 신호를 유일한 진실의 원천으로 삼음
+        let mut is_signal_2b = self.self_attn.is_handshake_active;
         if let Some(session_id) = &self.self_attn.active_session_id {
             let safe_sid = session_id.replace("/", "_");
             let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
             
-            // 디스크에 존재하는 신호 파일들을 탐색하여 현재 세션의 '확정된 신분' 확인
-            if let Ok(entries) = std::fs::read_dir(&signal_dir) {
-                for entry in entries.flatten() {
-                    let fname = entry.file_name().to_string_lossy().to_string();
-                    if fname.starts_with("handshake_") && fname.contains("_id4.0_") {
-                        disk_identity = 4.0; // 2B 승격 신호 발견
-                        if !self.self_attn.is_handshake_active {
-                            if self.self_attn.layer_idx == 0 { println!("[SIGNAL-V11] 2B Identity confirmed via Dynamic Signal (id4.0)."); }
+            // 디스크 신호 파일 전수 조사 (파일명에 id4.0 포함 여부)
+            if !is_signal_2b {
+                if let Ok(entries) = std::fs::read_dir(&signal_dir) {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name().to_string_lossy().to_string();
+                        if fname.contains("_id4.0_") || fname.contains("HANDSHAKE_2B") {
+                            is_signal_2b = true;
                             self.self_attn.is_handshake_active = true;
+                            break;
                         }
-                        break;
                     }
                 }
             }
         }
 
-        let is_handshake_active = self.self_attn.is_handshake_active;
-        let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
+        let target_dim = if is_signal_2b { 2048 } else { 1024 };
         
-        // [SYNC-GUARD-V12] 데이터 형상 우선주의 (Sticky 2048)
-        let mut xs_active = if input_dim == 2048 {
-            // [STICKY-2B] 이미 2048이라면 어떤 경우에도 깎지 않고 유지
-            if !self.self_attn.is_handshake_active {
-                // 신호 파일보다 데이터가 먼저 도착한 경우(레이스 컨디션), 내부 상태를 즉시 갱신
-                self.self_attn.is_handshake_active = true;
-            }
-            xs.clone()
-        } else if is_handshake_active || disk_identity == 4.0 {
-            if input_dim == 1024 {
-                if self.self_attn.layer_idx == 0 { println!("[SIGNAL-SYNC] Expanding 1024 -> 2048 based on signal."); }
-                let expanded = Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?;
-                
-                // L0가 확장을 완료했다면 즉시 K/V 두 가지 깃발 생성 (이슈 4 대응)
-                if self.self_attn.layer_idx == 0 {
-                    if let Some(session_id) = &self.self_attn.active_session_id {
-                        let safe_sid = session_id.replace("/", "_");
-                        let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-                        let _ = std::fs::create_dir_all(&signal_dir);
-                        // K-텐서 깃발
-                        let _ = std::fs::File::create(signal_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
-                        // V-텐서 깃발
-                        let _ = std::fs::File::create(signal_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal"));
-                        println!("[SIGNAL-MASTER-V13] Dual Signals (K & V) created for Session {}.", session_id);
-                    }
+        // [PHYSICAL-ALIGNMENT] 신호가 가리키는 목표 차원(target_dim)에 실제 데이터를 맞춤
+        let mut xs_active = if input_dim < target_dim {
+            // 데이터가 부족하면 확장 (0.6B -> 2B)
+            if self.self_attn.layer_idx == 0 { println!("[V16-SYNC] Expanding to target {} based on Signal.", target_dim); }
+            let expanded = Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?;
+            
+            // 확장 주체(L0)는 즉시 깃발을 꽂아 전파
+            if self.self_attn.layer_idx == 0 {
+                if let Some(session_id) = &self.self_attn.active_session_id {
+                    let safe_sid = session_id.replace("/", "_");
+                    let s_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                    let _ = std::fs::create_dir_all(&s_dir);
+                    let _ = std::fs::File::create(s_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
+                    let _ = std::fs::File::create(s_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal"));
                 }
-                expanded
-            } else if input_dim > 2048 {
-                // 과확장(4096 등) 방어
-                xs.narrow(candle_core::D::Minus1, 0, 2048)?.contiguous()?
-            } else {
-                xs.clone()
             }
+            expanded
+        } else if input_dim > target_dim {
+            // 데이터가 목표치를 초과하면 슬라이싱 (4096 방어)
+            if self.self_attn.layer_idx == 0 { println!("[V16-SYNC] Clamping to target {} based on Signal.", target_dim); }
+            xs.narrow(candle_core::D::Minus1, 0, target_dim)?.contiguous()?
         } else {
-            // 0.6B 모드 (1024 유지)
-            if input_dim > 1024 {
-                xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
-            } else {
-                xs.clone()
-            }
+            // 규격 일치 (이미 2048인 경우 여기서 통과하여 중복 확장 방지)
+            xs.clone()
         };
 
         let residual_active = xs_active.clone();
         let xs_active = self.input_layernorm.forward(&xs_active)?;
         let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
         
-        // [STRICT-ALIGN-V11] 물리적 차원 일치 보장
+        // [STRICT-RESIDUAL-GUARD] Residual 합산 전 차원 최종 확인
         let mut xs_active = if xs_active.dim(D::Minus1)? != residual_active.dim(D::Minus1)? {
-            let target_dim = residual_active.dim(D::Minus1)?;
-            xs_active.narrow(D::Minus1, 0, target_dim)?.contiguous()?
+            let res_dim = residual_active.dim(D::Minus1)?;
+            xs_active.narrow(D::Minus1, 0, res_dim)?.contiguous()?
         } else {
             xs_active
         };
@@ -1193,9 +1176,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         let mut xs = residual_active.add(&xs_active)?;
         
-        // [STRICT-POST-CHECK] 2048 상한 가드레일
-        if xs.dim(D::Minus1)? > 2048 {
-             xs = xs.narrow(D::Minus1, 0, 2048)?.contiguous()?;
+        // [STRICT-POST-CHECK] 다음 레이어로 넘어가는 차원 최종 가드
+        if xs.dim(D::Minus1)? > target_dim {
+             xs = xs.narrow(D::Minus1, 0, target_dim)?.contiguous()?;
         }
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
@@ -2022,49 +2005,40 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
-        // [STRICT-IO] Ensure the directory exists
         if !final_path.exists() {
-            std::fs::create_dir_all(&final_path)
-                .map_err(|e| anyhow!("Failed to create KV directory {:?}: {}", final_path, e))?;
+            std::fs::create_dir_all(&final_path)?;
         }
         
-        let session_id = self.active_session_id.as_deref().unwrap_or("default").replace("/", "_");
+        // [STRICT-PATH-V15] 세션 ID 경로 정규화 (replace "/" with "_")
+        let raw_sid = self.active_session_id.as_deref().unwrap_or("default");
+        let safe_sid = raw_sid.replace("/", "_");
         
-        println!("[SSD-BRIDGE] Saving {} layers to ABSOLUTE directory: {:?}", self.layers.len(), final_path);
+        println!("[SSD-BRIDGE] Saving {} layers to safe directory: {:?}", self.layers.len(), safe_sid);
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            // 1. KV 텐서 저장
-            layer.save_kv_cache(&final_path, clear, block_size)
-                .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, final_path, e))?;
+            layer.save_kv_cache(&final_path, clear, block_size)?;
 
-            // 2. [DISK-BRAIN] 레이어별 독립 핸드쉐이크 파일 생성
-            let handshake_name = format!("handshake_{}_L{}.json", session_id, i);
-            let handshake_path = final_path.join(handshake_name);
-            
+            // [SIGNAL-BRAIN-V15] 레이어별 상태 기록 (숫자가 아닌 파일명으로 신분 증명)
+            let handshake_name = format!("handshake_{}_L{}.json", safe_sid, i);
             let metadata = serde_json::json!({
                 "layer_idx": i,
-                "session_id": session_id,
+                "session_id": raw_sid,
                 "is_handshake_active": self.is_handshake_active,
-                "hidden_size": if self.is_handshake_active { 2048 } else { 1024 },
-                "current_kv_len": self.current_kv_len,
+                "identity": if self.is_handshake_active { 4.0 } else { 1.0 },
                 "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
             });
 
-            if let Ok(f) = std::fs::File::create(&handshake_path) {
-                let _ = serde_json::to_writer_pretty(f, &metadata);
-            }
+            let _ = std::fs::File::create(final_path.join(handshake_name)).and_then(|f| {
+                serde_json::to_writer_pretty(f, &metadata).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            });
         }
 
-        // [DISK-BRAIN] Save overall metadata for OOM recovery
-        let metadata_path = final_path.join("metadata.json");
-        let metadata = serde_json::json!({
-            "current_kv_len": self.current_kv_len,
-            "is_handshake_active": self.is_handshake_active,
-            "timestamp": chrono::Utc::now().timestamp()
-        });
-        if let Ok(file) = std::fs::File::create(&metadata_path) {
-            let _ = serde_json::to_writer(file, &metadata);
-            println!("[DISK-BRAIN] Progress and Handshake state ({}) saved to SSD.", self.is_handshake_active);
+        // [SESSION-SIGNAL-V15] 세션 전체에 대한 마스터 신호 파일 생성
+        if self.is_handshake_active {
+            let sig_name = "handshake_role1.0_id4.0_mult1.0_trans0.0.signal";
+            if let Ok(_) = std::fs::File::create(final_path.join(sig_name)) {
+                println!("[SIGNAL-V15] Master 2B Signal created in {:?}", final_path);
+            }
         }
 
         Ok(())
@@ -2077,84 +2051,60 @@ impl QuantizedQwen3VLTextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
         if !path.exists() { return Ok(()); }
         
-        let raw_session_id = path.file_name().unwrap().to_string_lossy().to_string();
-        let inference_session_id = format!("{}/inference", raw_session_id);
+        let session_id = path.file_name().unwrap().to_string_lossy().to_string();
+        let inference_session_id = format!("{}/inference", session_id);
         let safe_session_id = inference_session_id.replace("/", "_");
         
         self.active_session_id = Some(inference_session_id.clone());
         for l in &mut self.layers { l.self_attn.active_session_id = Some(inference_session_id.clone()); }
 
-        let inference_path = crate::utils::paths::get_kv_dir(None).join(&inference_session_id);
+        let inference_path = crate::utils::paths::get_kv_dir(None).join(&safe_session_id);
+        if !inference_path.exists() { let _ = std::fs::create_dir_all(&inference_path); }
+
         let l0_inference_file = inference_path.join("layer_0_kv.safetensors");
         let l0_baked_file = path.join("layer_0_kv.safetensors");
         
-        let (actual_load_path, is_resuming_inference) = if l0_inference_file.exists() {
-            (inference_path, true)
-        } else if l0_baked_file.exists() {
-            (path.to_path_buf(), false)
+        let (actual_load_path, _is_resuming) = if l0_inference_file.exists() {
+            (inference_path.clone(), true)
         } else {
-            return Err(anyhow!("No KV seed found at {:?} or {:?}", l0_baked_file, l0_inference_file));
+            (path.to_path_buf(), false)
         };
 
-        // [DISK-BRAIN-RECALL] Restore logical progress and HANDSHAKE from JSON
-        let metadata_path = actual_load_path.join("metadata.json");
-        if metadata_path.exists() {
-            if let Ok(file) = std::fs::File::open(&metadata_path) {
-                let meta: serde_json::Value = serde_json::from_reader(file).unwrap_or(serde_json::json!({}));
-                if let Some(len) = meta.get("current_kv_len").and_then(|v| v.as_u64()) {
-                    self.current_kv_len = len as usize;
-                }
-                if let Some(active) = meta.get("is_handshake_active").and_then(|v| v.as_bool()) {
-                    self.is_handshake_active = active;
-                    for l in &mut self.layers { l.self_attn.is_handshake_active = active; }
-                }
-            }
+        // [SIGNAL-SYNC-V15] 로드 시점에 디스크 신호를 읽어 신분 결정
+        let sig_2b_path = actual_load_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal");
+        if sig_2b_path.exists() {
+            println!("[SIGNAL-V15] 2B Identity detected during load. Activating Large mode.");
+            self.is_handshake_active = true;
+            for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
         }
 
-        // [GLOBAL-HANDSHAKE-SYNC] 레이어 0의 전용 핸드쉐이크 파일이 있다면 최우선 적용
-        let l0_handshake = actual_load_path.join(format!("handshake_{}_L0.json", safe_session_id));
-        if l0_handshake.exists() {
-            if let Ok(content) = std::fs::read_to_string(&l0_handshake) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if val["is_handshake_active"].as_bool().unwrap_or(false) {
-                        self.is_handshake_active = true;
-                        for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
-                        println!("[HYBRID-SYNC] Global Handshake activated from L0 signal file.");
-                    }
-                }
-            }
-        }
-
+        // ... (VRAM 체크 및 레이어 로드 로직 유지) ...
         let mut free_vram = 0;
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() { free_vram = mem.free; }
             }
         }
-
         let safety_margin = 800 * 1024 * 1024;
         let available_for_kv = free_vram.saturating_sub(safety_margin);
         let layer_kv_cost = 40 * 1024 * 1024; 
-        
         let can_pin = if layer_kv_cost > 0 { (available_for_kv / layer_kv_cost) as usize } else { 0 };
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
-        // [ZERO-PREFILL-BRIDGE] Load Layer 0 with verified handshake status
+        // Load seed layer
         self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len, self.is_handshake_active)?;
-        
         self.current_kv_len = self.layers[0].get_kv_len();
         self.is_handshake_active = self.layers[0].self_attn.is_handshake_active;
         let is_restored = self.is_handshake_active;
 
         if is_restored {
             for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
+            // 신분 복원 성공 시 인퍼런스 폴더에도 신호 전파
+            let _ = std::fs::File::create(inference_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
         }
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
-            .ok_or_else(|| anyhow!("Failed to load seed KV cache from {:?}", actual_load_path))?.clone();
-
-        let inference_workspace = crate::utils::paths::get_kv_dir(None).join(self.active_session_id.as_ref().unwrap());
-        if !inference_workspace.exists() { std::fs::create_dir_all(&inference_workspace)?; }
+            .ok_or_else(|| anyhow!("Failed to load seed KV cache"))?.clone();
 
         for i in 0..self.layers.len() {
             let is_pinned = i < self.pinned_layer_count;
@@ -2163,23 +2113,10 @@ impl QuantizedQwen3VLTextModel {
                 self.layers[i].self_attn.is_handshake_active = is_restored;
             }
             if self.is_disk_swap {
-                self.layers[i].save_kv_cache(&inference_workspace, !is_pinned, 1024)?;
+                self.layers[i].save_kv_cache(&inference_path, !is_pinned, 1024)?;
             }
         }
-
-        println!("[SSD-BRIDGE] KV Restore Complete. Handshake: {}, Pinned: {}/{}", is_restored, self.pinned_layer_count, self.layers.len());
-
-        // [SIGNAL-LOAD-SYNC-V13] 이슈 4 대응: 로드 즉시 듀얼 신호 깃발 생성
-        if is_restored {
-            if let Some(session_id) = &self.active_session_id {
-                let safe_sid = session_id.replace("/", "_");
-                let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-                let _ = std::fs::create_dir_all(&signal_dir);
-                let _ = std::fs::File::create(signal_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
-                let _ = std::fs::File::create(signal_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal"));
-                println!("[SIGNAL-LOAD-SYNC] Dual Handshake signals created immediately after KV load for session {}.", session_id);
-            }
-        }
+        println!("[SSD-BRIDGE-V15] KV Restore Complete. Identity: {}", if is_restored { "2B" } else { "0.6B" });
         Ok(())
     }
 
@@ -2718,57 +2655,50 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
             }
         }
     } else if hidden_size == 2048 {
-        // [HYBRID-ENERGY-PRESERVING-UNFOLDING]
+        // [HYBRID-ENERGY-PRESERVING-UNFOLDING-V15]
         let (r, c) = (weight_t.dim(0)?, weight_t.dim(1)?);
-        if r == 1024 || c == 1024 {
+        
+        // [CRITICAL-GUARD] 이미 2048 이상인 경우 절대 확장하지 않음 (4096 방지)
+        if r < 2048 && c == 1024 {
             let mut t = weight_t.clone();
-            if r == 1024 && c == 1024 {
-                t = Tensor::cat(&[&t, &t], 0)?;
-                t = Tensor::cat(&[&t, &t], 1)?;
-                t = (t / 2.0)?; // Scale down to preserve magnitude
-            } else if (r == 3072 || r == 2048) && c == 1024 {
-                t = Tensor::cat(&[&t, &t], 1)?;
-                t = (t / 1.414)?; // Sqrt scaling for better balance
-            } else if r == 1024 && (c == 3072 || c == 2048) {
-                t = Tensor::cat(&[&t, &t], 0)?;
-                t = (t / 1.414)?;
-            }
-            
-            // [STRICT-UNFOLD-CAP-V14] 4096 mismatch 해결용
-            let (rf, cf) = (t.dim(0)?, t.dim(1)?);
-            // Qwen3-2B의 intermediate_size는 6144임. 
-            // GGUF 텐서명에 ffn, gate, up, down, mlp 중 하나라도 있으면 MLP 레이어로 판단.
-            let is_mlp = name.contains("ffn") || name.contains("gate") || name.contains("up") || name.contains("down") || name.contains("mlp");
-            
-            if !is_mlp {
-                // Attention 또는 다른 레이어: 2048 규격 적용
-                if rf > 2048 { t = t.narrow(0, 0, 2048)?.contiguous()?; }
-                if cf > 2048 { t = t.narrow(1, 0, 2048)?.contiguous()?; }
-            } else {
-                // MLP 레이어: 0.6B(3072)를 2B(6144) 규격으로 정확히 매칭
-                if rf == 3072 || cf == 3072 {
-                    // 3072 -> 6144 확장 수행
-                    if rf == 3072 {
-                        t = Tensor::cat(&[&t, &t], 0)?;
-                    } else {
-                        t = Tensor::cat(&[&t, &t], 1)?;
-                    }
-                    t = (t / 1.414)?; // 에너지 보존
-                }
-                
-                // 최종 6144 캡(Cap) 적용 (4096 등의 애매한 수치 원천 차단)
-                let (rf_final, cf_final) = (t.dim(0)?, t.dim(1)?);
-                if rf_final > 6144 { t = t.narrow(0, 0, 6144)?.contiguous()?; }
-                if cf_final > 6144 { t = t.narrow(1, 0, 6144)?.contiguous()?; }
-            }
-            
+            t = Tensor::cat(&[&t, &t], 1)?; 
+            t = (t / 1.414)?;
+            weight_t = t.contiguous()?;
+        } else if r == 1024 && c < 2048 {
+            let mut t = weight_t.clone();
+            t = Tensor::cat(&[&t, &t], 0)?;
+            t = (t / 1.414)?;
+            weight_t = t.contiguous()?;
+        } else if r == 1024 && c == 1024 {
+            let mut t = weight_t.clone();
+            t = Tensor::cat(&[&t, &t], 0)?;
+            t = Tensor::cat(&[&t, &t], 1)?;
+            t = (t / 2.0)?;
             weight_t = t.contiguous()?;
         }
-        
-        // [STRICT-2B-TRANSPOSE-GUARD-V14]
-        let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
+
+        // [STRICT-UNFOLD-CAP-V15] 4096 mismatch 최종 수비
+        let (rf, cf) = (weight_t.dim(0)?, weight_t.dim(1)?);
         let is_mlp = name.contains("ffn") || name.contains("gate") || name.contains("up") || name.contains("down") || name.contains("mlp");
         
+        if !is_mlp {
+            // Attention 또는 다른 레이어는 무조건 2048 규격 적용
+            if rf > 2048 { weight_t = weight_t.narrow(0, 0, 2048)?.contiguous()?; }
+            if cf > 2048 { weight_t = weight_t.narrow(1, 0, 2048)?.contiguous()?; }
+        } else {
+            // MLP 레이어 (0.6B의 3072를 2B의 6144로 정확히 매칭)
+            let (r_cur, c_cur) = (weight_t.dim(0)?, weight_t.dim(1)?);
+            if r_cur == 3072 { weight_t = Tensor::cat(&[&weight_t, &weight_t], 0)?.contiguous()?; }
+            if c_cur == 3072 { weight_t = Tensor::cat(&[&weight_t, &weight_t], 1)?.contiguous()?; }
+            
+            // 최종 6144 초과 방어
+            let (rf_fin, cf_fin) = (weight_t.dim(0)?, weight_t.dim(1)?);
+            if rf_fin > 6144 { weight_t = weight_t.narrow(0, 0, 6144)?.contiguous()?; }
+            if cf_fin > 6144 { weight_t = weight_t.narrow(1, 0, 6144)?.contiguous()?; }
+        }
+        
+        // [STRICT-2B-TRANSPOSE-GUARD-V15]
+        let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
         if hidden_size == 2048 && r_final > c_final && !is_mlp {
             weight_t = weight_t.transpose(0, 1)?.contiguous()?;
         }

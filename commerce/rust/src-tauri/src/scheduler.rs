@@ -363,21 +363,30 @@ async fn process_task(
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
-    // [SIGNAL-CLEANUP-V12] 작업 시작 전 구형 신호 파일 청소
+    // [SIGNAL-CLEANUP-V15] 실제 신호가 발생하는 모든 경로(추론 폴더 포함) 청소
     {
         let safe_sid = task.id.replace("/", "_");
-        let signal_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&safe_sid);
-        if signal_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&signal_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "signal") {
-                        let _ = std::fs::remove_file(path);
+        let base_kv_dir = utils::paths::get_kv_dir(Some(app_handle));
+        
+        // 1. 기본 태스크 폴더 청소
+        let signal_dir = base_kv_dir.join(&safe_sid);
+        // 2. 추론용 하위 폴더 청소 (여기에 신호가 숨어있었음)
+        let inference_sig_dir = base_kv_dir.join(format!("{}_step_a_inference", safe_sid));
+        let detail_sig_dir = base_kv_dir.join(format!("{}_detail_inference", safe_sid));
+
+        for dir in vec![signal_dir, inference_sig_dir, detail_sig_dir] {
+            if dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map_or(false, |ext| ext == "signal") {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
             }
-            println!("[Scheduler] Stale signals cleared for session: {}", task.id);
         }
+        println!("[Scheduler-V15] Cleaned all potential signal paths for task: {}", task.id);
     }
 
     // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
