@@ -249,9 +249,15 @@ impl QuantizedQwen3VLTextAttention {
             ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
 
-        let num_attention_heads = if is_06b { 8 } else { 16 };
-        // [HYBRID-RESTORE-2B-IDENTITY] 2B 추론 시에는 무조건 16헤드 정체성을 유지함
-        let num_attention_heads = if actual_h_size == 2048 { 16 } else { num_attention_heads };
+        // [STRICT-SPEC-ALIGNMENT] 2B 모드(2048)인 경우 무조건 16헤드 강제
+        let num_attention_heads = if actual_h_size == 2048 {
+            16
+        } else if is_06b {
+            8
+        } else {
+            16
+        };
+        
         let num_key_value_heads = 8; 
         let num_kv_groups = num_attention_heads / num_key_value_heads;
 
@@ -639,28 +645,28 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V3]
+            // [HYBRID-PROTOCOL-MARKING-V6] 명시적 신분 각인
             let mut k_marked = k.to_dtype(DType::F32)?;
-            
-            // 헤드 수(dim 1)를 기준으로 신분 판별 (8헤드: 0.6B, 16헤드: 2B)
             let head_count = k.dim(1)?;
             let is_already_2b = head_count >= 16;
             
-            // 0.6B(8헤드) 데이터를 저장할 때만 2B로의 확장을 예고하는 마커를 심음
+            // 배율 및 트랜스포즈 정보 준비
             let hybrid_parts = if is_already_2b { 1.0 } else { 2.0 };
             let needs_transpose = self.needs_transpose; 
 
-            if !is_already_2b && (hybrid_parts > 1.0 || needs_transpose) {
-                let trans_flag = if needs_transpose { 1.0 } else { 0.0 };
-                let marker = -(1.0 + (hybrid_parts * 0.0001) + (hybrid_parts * 0.0000001) + (trans_flag * 0.000000001));
-                
-                println!("[HYBRID-ENCODER] Layer {} | Encoding Metadata: Parts={}, Transpose={}", self.layer_idx, hybrid_parts, needs_transpose);
-                println!("  -> Generated Protocol Marker: {:.10}", marker);
+            // [V6-ENCODING] 1.0 + 신분(0.2/0.0) + 배율(0.0001) + 트랜스포즈(0.000000001)
+            let identity_offset = if is_already_2b { 0.2 } else { 0.0 };
+            let trans_flag = if needs_transpose { 1.0 } else { 0.0 };
+            
+            let marker = -(1.0 + identity_offset + (hybrid_parts * 0.0001) + (trans_flag * 0.000000001));
+            
+            println!("[HYBRID-ENCODER-V6] Layer {} | ID={} (2B={}), Parts={}, Trans={}", 
+                self.layer_idx, if is_already_2b { "2B" } else { "0.6B" }, is_already_2b, hybrid_parts, needs_transpose);
+            println!("  -> Generated Protocol Marker: {:.10}", marker);
 
-                let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
-                k_data[0] = marker as f32;
-                k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?;
-            }
+            let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
+            k_data[0] = marker as f32;
+            k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?;
 
             let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k_marked)?;
             let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v.to_dtype(DType::F32)?)?;
@@ -762,16 +768,28 @@ impl QuantizedQwen3VLTextAttention {
         
         if sig < -1.0 {
             let val = sig.abs() - 1.0;
-            // Decode Multiplier (4th dec), Transpose (9th dec)
-            let multiplier = ((val * 10000.0).round() as usize) % 100;
+            
+            // [V6-DECODING] 1~2번째 자리: 신분 (0.2=2B, 0.0=0.6B)
+            let identity_val = (val * 10.0).round() as usize; 
+            let is_actually_2b = identity_val >= 2;
+            
+            // 4번째 자리: 배율 (multiplier)
+            let multiplier = (((val * 10000.0).round() as usize) % 100).max(1);
+            
+            // 9번째 자리: 트랜스포즈 (transpose)
             let trans_val = ((val * 1000000000.0).round() as usize) % 10;
-            let needs_retranspose = trans_val == 1 || multiplier > 1;
+            let needs_retranspose = trans_val == 1;
             
-            // [HYBRID-HANDSHAKE-SUCCESS] 0.6B에서 구워진 지능임이 확인됨
-            self.is_handshake_active = true;
-            println!("[HYBRID-V5] Handshake Protocol Active! Layer {}: x{} Factor, Transpose={}", self.layer_idx, multiplier, needs_retranspose);
+            // [HYBRID-HANDSHAKE-SUCCESS] V6 신분 판별
+            if is_actually_2b {
+                self.is_handshake_active = true;
+                println!("[HYBRID-V6] Identity: 2B (Verified). Handshake Bypassed. Layer {}", self.layer_idx);
+            } else {
+                self.is_handshake_active = true; // 복원 시작하므로 true로 설정
+                println!("[HYBRID-V6] Identity: 0.6B (Restoring to 2B). Layer {}: x{} Factor, Trans={}", self.layer_idx, multiplier, needs_retranspose);
+            }
             
-            // Marker Healing (Handshake V5 Shift-Healing)
+            // Marker Healing
             let mut k_clean = k_vec.clone();
             k_clean[0] = k_vec[1]; 
             let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
@@ -779,8 +797,10 @@ impl QuantizedQwen3VLTextAttention {
             let mut k_final = k_healed;
             let mut v_final = v_f32;
 
-            if multiplier > 1 {
-                println!("[HYBRID-V5] Upscaling Layer {}: x{} Factor, Transpose={}", self.layer_idx, multiplier, needs_retranspose);
+            // 0.6B인 경우만 확장 로직 수행
+            if !is_actually_2b && multiplier > 1 {
+                println!("[HYBRID-V6] Upscaling 0.6B -> 2B for Layer {}: x{} Factor", self.layer_idx, multiplier);
+                // ... (이후 확장 로직은 동일)
                 
                 if h < target_heads {
                     let mut k_parts = Vec::new(); let mut v_parts = Vec::new();
@@ -794,9 +814,7 @@ impl QuantizedQwen3VLTextAttention {
                     v_final = Tensor::cat(&v_parts, D::Minus1)?;
                 }
                 
-                // [THERMAL-BALANCING-V2] Prevent variance explosion in the final Attention output
-                // Only scale Value (V); Key (K) preserves its original magnitude.
-                // Scale factor: 1.0 / sqrt(2.0) approx 0.7071
+                // [THERMAL-BALANCING-V2] Prevent variance explosion
                 let scale = 0.70710678118; 
                 v_final = (v_final * scale)?;
             }
@@ -973,18 +991,20 @@ impl QuantizedQwen3VLTextDecoderLayer {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
 
+        // [HYBRID-L0-INJECTION] Unified intelligence entry
+        let mut final_config = config.clone();
+        if config.hidden_size == 1024 {
+            println!("[HYBRID-L0] Folding 2B Layer 0 Intelligence (2048 -> 1024) for 0.6B engine.");
+        } else if config.hidden_size == 2048 {
+            println!("[HYBRID-L0] Injecting native 2B Layer 0 Intelligence for Inference.");
+            // Ensure 16 heads for 2048 hidden size
+            final_config.num_attention_heads = 16;
+        }
+
         let self_attn = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
-            // [HYBRID-L0-INJECTION] Unified intelligence entry
-            if config.hidden_size == 1024 {
-                println!("[HYBRID-L0] Folding 2B Layer 0 Intelligence (2048 -> 1024) for 0.6B engine.");
-            } else {
-                println!("[HYBRID-L0] Injecting native 2B Layer 0 Intelligence for Inference.");
-            }
-            // The constructor (QuantizedQwen3VLTextAttention::new) will use get_qlinear_v2,
-            // which handles the folding automatically based on the active config.hidden_size.
-            QuantizedQwen3VLTextAttention::new(config, c, r, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
+            QuantizedQwen3VLTextAttention::new(&final_config, c, r, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
         } else {
-            QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
+            QuantizedQwen3VLTextAttention::new(&final_config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
         };
         
         // [PHYSICAL-LOGIC-SEPARATION]
@@ -1242,33 +1262,27 @@ impl QuantizedQwen3VLTextModel {
         let mut reader = std::io::Cursor::new(mmap);
 
         // [DETECTION-FIRST] Determine actual hidden size from GGUF BEFORE initializing anything
-        let actual_h_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
+        let mut actual_h_size = if let Some(info) = ct.tensor_infos.get(&format!("{base_name}.attn_norm.weight")) {
             info.shape.dims()[0]
         } else if let Some(info) = ct.tensor_infos.get(&format!("blk.0.attn_norm.weight")) {
             info.shape.dims()[0]
         } else if let Some(info) = ct.tensor_infos.get(&"token_embd.weight".to_string()) {
             info.shape.dims()[1]
         } else {
-            // Last resort: search for any layer norm weight
-            ct.tensor_infos.keys().find(|k| k.contains("attn_norm.weight") || k.contains("input_layernorm.weight"))
-                .and_then(|k| ct.tensor_infos.get(k))
-                .map(|info| info.shape.dims()[0])
-                .unwrap_or(config.hidden_size)
+            config.hidden_size
         };
 
-                println!("[MODEL-INIT] Name: {}, Config Hidden: {}, GGUF Actual: {}, Layers: {}", base_name, config.hidden_size, actual_h_size, config.num_hidden_layers);
+        // [STRICT-2B-OVERRIDE] If we are loading a 2B variant, force 2048 to prevent 0.6B ghosting
+        if actual_h_size == 1024 && !baking_only && config.hidden_size == 2048 {
+            println!("[MODEL-INIT] Detected 1024 in 2B config. Overriding to 2048 for Inference.");
+            actual_h_size = 2048;
+        }
 
-        
+        println!("[MODEL-INIT] Name: {}, Config Hidden: {}, GGUF Actual: {}, Layers: {}", base_name, config.hidden_size, actual_h_size, config.num_hidden_layers);
 
-                let mut patched_config_owned = config.clone();
-
-                // [HYBRID-OPTIMIZATION] Keep 1024-dim engine but inject 2B knowledge
-
-                patched_config_owned.hidden_size = actual_h_size;
-
-                
-
-                let config = &patched_config_owned;
+        let mut patched_config_owned = config.clone();
+        patched_config_owned.hidden_size = actual_h_size;
+        let config = &patched_config_owned;
 
         
 
@@ -1504,7 +1518,23 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, actual_rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, is_disk_swap, active_session_id: None, pinned_layer_count: 0, current_kv_len: 0, is_text, is_image })
+        Ok(Self { 
+            embed_tokens, 
+            layers, 
+            norm, 
+            rotary_emb, 
+            mrope_section, 
+            mmap: mmap_handle, 
+            baking_only, 
+            is_forced_cpu, 
+            is_disk_swap, 
+            active_session_id: None, 
+            pinned_layer_count: 0, 
+            current_kv_len: 0, 
+            is_handshake_active: false,
+            is_text, 
+            is_image 
+        })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -2027,6 +2057,21 @@ impl QuantizedQwen3VLTextModel {
         self.current_kv_len = self.layers[0].get_kv_len();
         self.is_handshake_active = self.layers[0].self_attn.is_handshake_active;
         let is_restored = self.is_handshake_active;
+
+        // [STRICT-IDENTITY-COMMIT] 만약 레이어 0 로드 후 신분이 복원되었다면, 이를 디스크에 즉시 커밋
+        // 이렇게 해야 DiskSwap으로 나중에 로드될 레이어들이 업데이트된 신분을 읽을 수 있음
+        if is_restored {
+            let metadata_path = actual_load_path.join("metadata.json");
+            let metadata = serde_json::json!({
+                "current_kv_len": self.current_kv_len,
+                "is_handshake_active": true,
+                "timestamp": chrono::Utc::now().timestamp()
+            });
+            if let Ok(file) = std::fs::File::create(&metadata_path) {
+                let _ = serde_json::to_writer(file, &metadata);
+                println!("[DISK-BRAIN] Handshake success COMMITTED to metadata.json.");
+            }
+        }
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
             .ok_or_else(|| anyhow!("Failed to load seed KV cache from {:?}", actual_load_path))?.clone();
@@ -2520,6 +2565,7 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
     
     // [HYBRID-RECURSIVE-FOLDING-V2]
     if hidden_size == 1024 {
+        // ... (Folding logic remains same for 0.6B mode)
         let dims = weight_t.dims();
         if dims.len() == 2 {
             let mut t = weight_t.clone();
@@ -2590,6 +2636,16 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
                 t = Tensor::cat(&[&t, &t], 0)?;
                 t = (t / 1.414)?;
             }
+            
+            // [STRICT-UNFOLD-CAP]
+            let (rf, cf) = (t.dim(0)?, t.dim(1)?);
+            if rf > 2048 && !name.contains("mlp") && !name.contains("gate") && !name.contains("up") {
+                t = t.narrow(0, 0, 2048)?.contiguous()?;
+            }
+            if cf > 2048 && !name.contains("mlp") && !name.contains("gate") && !name.contains("up") {
+                t = t.narrow(1, 0, 2048)?.contiguous()?;
+            }
+            
             weight_t = t.contiguous()?;
         }
         
@@ -2702,6 +2758,11 @@ fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reade
     } else if hidden_size == 2048 && d0 == 1024 {
         // Unfold for 2B engine
         weight = Tensor::cat(&[&weight, &weight], 0)?.contiguous()?;
+    }
+
+    // [STRICT-WEIGHT-SAFEGUARD]
+    if weight.dim(0)? > 2048 && hidden_size <= 2048 {
+        weight = weight.narrow(0, 0, 2048)?.contiguous()?;
     }
     
     Ok(RmsNorm::new(weight, eps))
