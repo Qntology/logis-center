@@ -2168,6 +2168,18 @@ impl QuantizedQwen3VLTextModel {
         }
 
         println!("[SSD-BRIDGE] KV Restore Complete. Handshake: {}, Pinned: {}/{}", is_restored, self.pinned_layer_count, self.layers.len());
+
+        // [SIGNAL-LOAD-SYNC-V13] 이슈 4 대응: 로드 즉시 듀얼 신호 깃발 생성
+        if is_restored {
+            if let Some(session_id) = &self.active_session_id {
+                let safe_sid = session_id.replace("/", "_");
+                let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                let _ = std::fs::create_dir_all(&signal_dir);
+                let _ = std::fs::File::create(signal_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
+                let _ = std::fs::File::create(signal_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal"));
+                println!("[SIGNAL-LOAD-SYNC] Dual Handshake signals created immediately after KV load for session {}.", session_id);
+            }
+        }
         Ok(())
     }
 
@@ -2722,23 +2734,42 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
                 t = (t / 1.414)?;
             }
             
-            // [STRICT-UNFOLD-CAP]
+            // [STRICT-UNFOLD-CAP-V14] 4096 mismatch 해결용
             let (rf, cf) = (t.dim(0)?, t.dim(1)?);
-            if rf > 2048 && !name.contains("mlp") && !name.contains("gate") && !name.contains("up") {
-                t = t.narrow(0, 0, 2048)?.contiguous()?;
-            }
-            if cf > 2048 && !name.contains("mlp") && !name.contains("gate") && !name.contains("up") {
-                t = t.narrow(1, 0, 2048)?.contiguous()?;
+            // Qwen3-2B의 intermediate_size는 6144임. 
+            // GGUF 텐서명에 ffn, gate, up, down, mlp 중 하나라도 있으면 MLP 레이어로 판단.
+            let is_mlp = name.contains("ffn") || name.contains("gate") || name.contains("up") || name.contains("down") || name.contains("mlp");
+            
+            if !is_mlp {
+                // Attention 또는 다른 레이어: 2048 규격 적용
+                if rf > 2048 { t = t.narrow(0, 0, 2048)?.contiguous()?; }
+                if cf > 2048 { t = t.narrow(1, 0, 2048)?.contiguous()?; }
+            } else {
+                // MLP 레이어: 0.6B(3072)를 2B(6144) 규격으로 정확히 매칭
+                if rf == 3072 || cf == 3072 {
+                    // 3072 -> 6144 확장 수행
+                    if rf == 3072 {
+                        t = Tensor::cat(&[&t, &t], 0)?;
+                    } else {
+                        t = Tensor::cat(&[&t, &t], 1)?;
+                    }
+                    t = (t / 1.414)?; // 에너지 보존
+                }
+                
+                // 최종 6144 캡(Cap) 적용 (4096 등의 애매한 수치 원천 차단)
+                let (rf_final, cf_final) = (t.dim(0)?, t.dim(1)?);
+                if rf_final > 6144 { t = t.narrow(0, 0, 6144)?.contiguous()?; }
+                if cf_final > 6144 { t = t.narrow(1, 0, 6144)?.contiguous()?; }
             }
             
             weight_t = t.contiguous()?;
         }
         
-        // [STRICT-2B-TRANSPOSE-GUARD]
-        // Candle's QLinear (via QMatMul::Tensor) expects [in_dim, out_dim].
-        // GGUF weights are often stored as [out_dim, in_dim].
+        // [STRICT-2B-TRANSPOSE-GUARD-V14]
         let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
-        if r_final > c_final {
+        let is_mlp = name.contains("ffn") || name.contains("gate") || name.contains("up") || name.contains("down") || name.contains("mlp");
+        
+        if hidden_size == 2048 && r_final > c_final && !is_mlp {
             weight_t = weight_t.transpose(0, 1)?.contiguous()?;
         }
     }
@@ -2750,25 +2781,18 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
         let mut needs_transpose = false;
         
         if hidden_size == 1024 {
-            // Standard Qwen 0.6B layout: Gate/Up [3072, 1024], Down [1024, 3072]
-            if rows == 3072 && cols == 1024 {
-                needs_transpose = true; 
-            } else if rows == 1024 && cols == 3072 {
+            // [0.6B-SPEC-ALIGN]
+            if rows == 3072 && cols == 1024 { needs_transpose = true; } 
+            else if rows == 1024 && cols == 3072 { needs_transpose = true; }
+        } else if hidden_size == 2048 {
+            // [2B-SPEC-ALIGN]
+            // Gate/Up: [6144, 2048], Down: [2048, 6144]
+            if (name.contains("gate") || name.contains("up") || name.contains("ffn_gate") || name.contains("ffn_up")) && rows == 2048 && cols == 6144 {
                 needs_transpose = true;
-            }
-        } else {
-            // [2B-HYBRID-SPEC-ALIGNMENT]
-            if hidden_size == 2048 {
-                // 2B 원본 레이아웃: Gate/Up [6144, 2048], Down [2048, 6144]
-                // 만약 GGUF가 [2048, 6144]로 되어 있다면 트랜스포즈 필요
-                if (name.contains("gate") || name.contains("up")) && rows == 2048 && cols == 6144 {
-                    needs_transpose = true;
-                } else if name.contains("down") && rows == 6144 && cols == 2048 {
-                    needs_transpose = true;
-                } else if (name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v")) && rows == 2048 && cols == 2048 {
-                    // Attention projections often need transpose in Candle
-                    needs_transpose = true;
-                }
+            } else if (name.contains("down") || name.contains("ffn_down")) && rows == 6144 && cols == 2048 {
+                needs_transpose = true;
+            } else if (name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v")) && rows == 2048 && cols == 2048 {
+                needs_transpose = true;
             }
         }
 
