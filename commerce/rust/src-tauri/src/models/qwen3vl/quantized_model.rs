@@ -250,6 +250,8 @@ impl QuantizedQwen3VLTextAttention {
         };
 
         let num_attention_heads = if is_06b { 8 } else { 16 };
+        // [HYBRID-RESTORE-2B-IDENTITY] 2B 추론 시에는 무조건 16헤드 정체성을 유지함
+        let num_attention_heads = if actual_h_size == 2048 { 16 } else { num_attention_heads };
         let num_key_value_heads = 8; 
         let num_kv_groups = num_attention_heads / num_key_value_heads;
 
@@ -804,6 +806,19 @@ impl QuantizedQwen3VLTextAttention {
                 v_final = v_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
             }
 
+            let mut k_final = k_final;
+            let mut v_final = v_final;
+            
+            // [LAYOUT-GUARD] Ensure SeqLen is at Dim 2, HeadDim at Dim 3
+            // Current shape: [B, H, ?, ?]. We expect [B, H, S, D]
+            let dims_k = k_final.dims4()?;
+            if dims_k.2 < dims_k.3 && dims_k.3 > 1000 {
+                // If Dim 3 looks like SeqLen, transpose to move it to Dim 2
+                k_final = k_final.transpose(2, 3)?.contiguous()?;
+                v_final = v_final.transpose(2, 3)?.contiguous()?;
+            }
+
+            let actual_k_len = k_final.dim(2)?;
             let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
             let final_len = use_len.saturating_sub(upscale_refill_len);
 
@@ -816,6 +831,16 @@ impl QuantizedQwen3VLTextAttention {
             return Ok(());
         }
 
+        let mut k_f32 = k_f32;
+        let mut v_f32 = v_f32;
+        
+        let dims_raw = k_f32.dims4()?;
+        if dims_raw.2 < dims_raw.3 && dims_raw.3 > 1000 {
+            k_f32 = k_f32.transpose(2, 3)?.contiguous()?;
+            v_f32 = v_f32.transpose(2, 3)?.contiguous()?;
+        }
+
+        let actual_k_len = k_f32.dim(2)?;
         let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
         let final_len = use_len.saturating_sub(upscale_refill_len);
 
@@ -1037,13 +1062,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         }
         let target_dtype = self.input_layernorm.weight().dtype();
 
-        // if self.self_attn.layer_idx % 5 == 0 || dev.is_cpu() {
-        //     println!("[TRACE-LAYER-{}] Device: {:?}, DType: {:?}, In: {:?}", 
-        //         self.self_attn.layer_idx, dev, target_dtype, xs.dtype());
-        // }
-        
         // 2. Ensure inputs are on this device and dtype
-        //    (Clone via Cow logic or explicit clone if needed, here we use explicit clones/conversions for safety)
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
         let xs = if xs.dtype() != target_dtype { xs.to_dtype(target_dtype)? } else { xs };
 
@@ -1054,42 +1073,44 @@ impl QuantizedQwen3VLTextDecoderLayer {
         if sin.dtype() != target_dtype { sin = sin.to_dtype(target_dtype)?; }
 
         let attention_mask = if let Some(mask) = attention_mask {
-             // Mask is usually F32 or specific, but we ensure device match
              Some(if !mask.device().same_device(dev) { mask.to_device(dev)? } else { mask.clone() })
         } else {
              None
         };
 
-        let hybrid_residual = xs.clone();
-        
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
         
-        // [HYBRID-HANDSHAKE-CONTROL] 신분(Identity) 기반 정밀 제어
-        let is_hybrid_mode = self.self_attn.is_handshake_active;
-        if self.self_attn.layer_idx == 0 && is_hybrid_mode {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| println!("[HYBRID-CORE] Handshake Active - Routing through 0.6B Bridge Path."));
-        }
+        // [HYBRID-BRIDGE-V5] Handshake 프로토콜 기반의 완벽한 분기
+        // 1. Baking 엔진(0.6B): 핸드셰이크가 아직 활성화되지 않았고 차원이 1024인 경우만 브릿지 가동
+        // 2. Inference 엔진(2B): 핸드셰이크가 활성화되었으므로 브릿지 로직을 바이패스 (순정 파이프라인)
+        let is_handshake_active = self.self_attn.is_handshake_active;
+        let needs_bridge = !is_handshake_active && input_dim == 2048 && norm_dim == 1024;
         
-        let mut xs_active = if is_hybrid_mode && input_dim == 2048 && norm_dim == 1024 {
-            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Slicing 2048 input to 1024 for 0.6B Handshake Path"); }
+        let mut xs_active = if needs_bridge {
+            if self.self_attn.layer_idx == 0 { 
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| println!("[HYBRID-BRIDGE] Baking Engine Mode - Slicing 2048 -> 1024."));
+            }
             xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
         } else {
+            if self.self_attn.layer_idx == 0 && is_handshake_active {
+                static ONCE_INF: std::sync::Once = std::sync::Once::new();
+                ONCE_INF.call_once(|| println!("[HYBRID-BRIDGE] Inference Model Mode - Native 2048 Pipeline."));
+            }
             xs.clone()
         };
 
-        let mut residual_active = xs_active.clone();
+        let residual_active = xs_active.clone();
         let xs_active = self.input_layernorm.forward(&xs_active)?;
         let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
         
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         xs_active = residual_active.add(&xs_active)?;
         
-        // [HYBRID-HANDSHAKE-CONTROL-BACK]
-        // 0.6B 지능을 다시 2B 파이프라인 규격(2048)으로 복원
-        let mut xs = if is_hybrid_mode && input_dim == 2048 && norm_dim == 1024 && xs_active.dim(candle_core::D::Minus1)? == 1024 {
-            if self.self_attn.layer_idx == 0 { println!("[HYBRID-BRIDGE] Restoring 1024 output to 2048 for Large Pipeline"); }
+        // [HYBRID-BRIDGE-BACK-V4]
+        // 연산 결과가 1024인데 파이프라인이 2048을 원할 때만 확장 (2B 추론 시 4096 폭주 방지)
+        let mut xs = if needs_bridge && xs_active.dim(candle_core::D::Minus1)? == 1024 {
             Tensor::cat(&[&(xs_active.clone()), &xs_active], candle_core::D::Minus1)?.contiguous()?
         } else {
             xs_active
@@ -1097,46 +1118,36 @@ impl QuantizedQwen3VLTextDecoderLayer {
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
-            let residual = xs.clone();
+            let residual_mlp = xs.clone();
             
             // 1. Post-Attention Norm
             let mut xs_mlp = post_norm.forward(&xs)?;
-            let norm_dim_mlp = post_norm.weight().dim(0)?;
             
-            // 2. Gate & Up Projections (Hidden -> Intermediate)
+            // MLP 입구 브릿지
+            if needs_bridge && xs_mlp.dim(D::Minus1)? == 2048 {
+                xs_mlp = xs_mlp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
+            }
+            
+            // 2. Gate & Up Projections
             let (gate, up) = {
-                let mut inp = xs_mlp.clone();
-                let w_shape = gate_proj.inner_shape();
-                
-                // If weight expects 1024 but we have 2048
-                if inp.dim(D::Minus1)? == 2048 && w_shape.len() >= 2 && w_shape[1] == 1024 {
-                    inp = inp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
-                }
-                
-                let g = gate_proj.forward(&inp)?;
-                let u = up_proj.forward(&inp)?;
+                let g = gate_proj.forward(&xs_mlp)?;
+                let u = up_proj.forward(&xs_mlp)?;
                 (g, u)
             };
             
             let gate = candle_nn::ops::silu(&gate)?;
             let hidden = gate.mul(&up)?;
             
-            // 3. Down Projection (Intermediate -> Hidden)
-            let mut out = {
-                let w_shape = down_proj.inner_shape();
-                // Down proj weight is [hidden_out, intermediate_in]
-                // If it expects intermediate 3072 but we have 6144, it will fail unless we handled it in new()
-                // Here we assume intermediate sizes match between Q/K/V and DownProj within the same layer
-                down_proj.forward(&hidden)?
-            };
+            // 3. Down Projection
+            let mut out = down_proj.forward(&hidden)?;
             
-            // 4. Restore to pipeline dimension (1024 -> 2048) if needed
-            if out.dim(D::Minus1)? == 1024 && residual.dim(D::Minus1)? == 2048 {
-                out = Tensor::cat(&[&out, &out], D::Minus1)?.contiguous()?;
+            // MLP 출구 브릿지
+            if needs_bridge && out.dim(D::Minus1)? == 1024 {
+                out = Tensor::cat(&[&(out.clone()), &out], D::Minus1)?.contiguous()?;
             }
             
-            let mut out = if out.dtype() != residual.dtype() { out.to_dtype(residual.dtype())? } else { out };
-            Ok(residual.add(&out)?)
+            let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
+            Ok(residual_mlp.add(&out)?)
         } else {
             Ok(xs)
         }
@@ -2282,17 +2293,10 @@ impl QuantizedQwen3VLModel {
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
-        let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
+        let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
 
-        // [HYBRID-BRIDGE] Upscale 1024 -> 2048 ONLY if we are in a 2048-dim model (Large)
-        // [FIX] Check the ACTUAL hidden size of the underlying model layers, not just the config.
-        let model_actual_dim = self.language_model.embed_tokens.hidden_size();
-        let current_input_dim = inputs_embeds.dim(candle_core::D::Minus1)?;
-        
-        if model_actual_dim == 2048 && current_input_dim == 1024 {
-            println!("[HYBRID-BRIDGE-TOP] Scaling inputs_embeds 1024 -> 2048 for Large Model.");
-            inputs_embeds = candle_core::Tensor::cat(&[&inputs_embeds, &inputs_embeds], candle_core::D::Minus1)?.contiguous()?;
-        }
+        // [STRICT-EMBED-ALIGN] 로딩 시점에 이미 2B 임베딩이 주입되었으므로, 여기서 추가 확장은 하지 않음
+        let mut inputs_embeds = inputs_embeds;
 
         if let Some(pixel_values) = pixel_values { 
             if let Some(image_grid_thw) = image_grid_thw { 
