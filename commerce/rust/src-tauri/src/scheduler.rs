@@ -363,6 +363,23 @@ async fn process_task(
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
+    // [SIGNAL-CLEANUP-V12] 작업 시작 전 구형 신호 파일 청소
+    if let Some(sid) = &session_id {
+        let safe_sid = sid.replace("/", "_");
+        let signal_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&safe_sid);
+        if signal_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&signal_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "signal") {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+            println!("[Scheduler] Stale signals cleared for session: {}", sid);
+        }
+    }
+
     // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
     let payload = json!({ 
         "task_id": task.id,

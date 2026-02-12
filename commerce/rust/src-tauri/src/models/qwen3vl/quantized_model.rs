@@ -1136,36 +1136,37 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
         
-        // [SYNC-GUARD-V11] 동적 신호 파일의 Identity 값을 기준으로 차원 결정
-        let mut xs_active = if disk_identity == 4.0 || is_handshake_active {
+        // [SYNC-GUARD-V12] 데이터 형상 우선주의 (Sticky 2048)
+        let mut xs_active = if input_dim == 2048 {
+            // [STICKY-2B] 이미 2048이라면 어떤 경우에도 깎지 않고 유지
+            if !self.self_attn.is_handshake_active {
+                // 신호 파일보다 데이터가 먼저 도착한 경우(레이스 컨디션), 내부 상태를 즉시 갱신
+                self.self_attn.is_handshake_active = true;
+            }
+            xs.clone()
+        } else if is_handshake_active || is_already_expanded_on_disk {
             if input_dim == 1024 {
-                // 신호는 2B인데 데이터는 1024 -> 최초 확장 수행
-                if self.self_attn.layer_idx == 0 { println!("[SIGNAL-SYNC] Expanding 1024 -> 2048 (Target: id4.0)."); }
+                if self.self_attn.layer_idx == 0 { println!("[SIGNAL-SYNC] Expanding 1024 -> 2048 based on signal."); }
                 let expanded = Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?;
                 
-                // L0가 확장을 마쳤다면 즉시 디스크에 "나는 이제 id4.0이다"라고 공표
+                // L0가 확장을 완료했다면 즉시 깃발 생성
                 if self.self_attn.layer_idx == 0 {
                     if let Some(session_id) = &self.self_attn.active_session_id {
                         let safe_sid = session_id.replace("/", "_");
-                        let s_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-                        let _ = std::fs::create_dir_all(&s_dir);
-                        // 상세 속성을 포함한 동적 파일명 생성
-                        let signal_name = format!("handshake_role1.0_id4.0_mult1.0_trans0.0.signal");
-                        let _ = std::fs::File::create(s_dir.join(signal_name));
-                        println!("[SIGNAL-MASTER] Dynamic Signal (id4.0) Created for Session {}.", session_id);
+                        let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                        let _ = std::fs::create_dir_all(&signal_dir);
+                        let _ = std::fs::File::create(signal_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
                     }
                 }
                 expanded
             } else if input_dim > 2048 {
-                // [ANTI-4096] 신호는 2B인데 이미 2048을 넘었다면 중복 확장 버그 -> 2048로 복구
-                if self.self_attn.layer_idx == 0 { println!("[SIGNAL-PREVENT] Double-expansion (dim={}) blocked by id4.0 signal.", input_dim); }
+                // 과확장(4096 등) 방어
                 xs.narrow(candle_core::D::Minus1, 0, 2048)?.contiguous()?
             } else {
-                // 이미 2048인 상태 -> 유지
                 xs.clone()
             }
         } else {
-            // 0.6B 모드 (id1.0 유지)
+            // 0.6B 모드 (1024 유지)
             if input_dim > 1024 {
                 xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
             } else {
@@ -2516,24 +2517,26 @@ impl QuantizedQwen3TextModel {
     pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         let (b_sz, seq_len) = input_ids_in.dims2()?;
         
-        // [SYNC-SESSION-V10]
+        // [SYNC-SESSION-V13]
         self.language_model.active_session_id = session_id.clone();
         
-        // [SIGNAL-GATE-V10] 세션 시작 시 2B 신호 파일 존재 여부 확인 및 생성
+        // [SIGNAL-GATE-V13] 임베딩 진입 전 세션 상태 확인
+        let mut is_session_2b = self.language_model.is_handshake_active;
         if let Some(sid) = &session_id {
             let safe_sid = sid.replace("/", "_");
             let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-            let signal_path = signal_dir.join("handshake_role1.0_id4.0_mult1.0.signal");
             
-            // 모델이 2B 상태(is_handshake_active)라면 미리 신호 파일을 만들어 레이어들을 안심시킴
-            if self.language_model.is_handshake_active && !signal_path.exists() {
-                let _ = std::fs::create_dir_all(&signal_dir);
-                let _ = std::fs::File::create(&signal_path);
-                println!("[SIGNAL-GATE] Pre-created signal file for session {} to prevent 4096-spike.", sid);
+            // K 또는 V 신호 중 하나라도 2B(id4.0)면 세션 전체를 2B로 간주
+            if !is_session_2b {
+                let k_sig = signal_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal");
+                let v_sig = signal_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal");
+                if k_sig.exists() || v_sig.exists() {
+                    is_session_2b = true;
+                    self.language_model.is_handshake_active = true;
+                }
             }
         }
         
-        // [DYNAMIC-RECOVERY]
         let _ = self.language_model.rebalance_layers(0, seqlen_offset + seq_len);
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
@@ -2542,10 +2545,13 @@ impl QuantizedQwen3TextModel {
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
 
-        // [STRICT-INPUT-GUARD-V10] 레이어에 들어가기 전 차원 검증 (4096 원천 차단)
+        // [STRICT-EMBED-GUARD-V13] 이슈 2번 해결: 임베딩 단계에서의 선제적 차원 교정
         let embed_dim = inputs_embeds.dim(candle_core::D::Minus1)?;
-        if embed_dim > 2048 {
-            println!("[INPUT-GUARD] Over-expanded embedding ({}) detected. Slicing to 2048.", embed_dim);
+        if is_session_2b && embed_dim == 1024 {
+            // 모델은 2B인데 임베딩이 1024를 뱉었다면 루프 진입 전 여기서 즉시 확장
+            if seqlen_offset == 0 { println!("[EMBED-GUARD] Proactive Embedding Upscale (1024 -> 2048) for 2B session."); }
+            inputs_embeds = Tensor::cat(&[&inputs_embeds, &inputs_embeds], candle_core::D::Minus1)?.contiguous()?;
+        } else if embed_dim > 2048 {
             inputs_embeds = inputs_embeds.narrow(candle_core::D::Minus1, 0, 2048)?.contiguous()?;
         }
 
