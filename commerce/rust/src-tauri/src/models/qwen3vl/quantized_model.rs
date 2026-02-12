@@ -1122,12 +1122,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
             xs_active
         };
 
-        // [STRICT-DIMENSION-SAFEGUARD]
-        // 어떠한 경우에도 Inference 모드(norm_dim == 2048)에서 xs가 2048을 초과하지 않도록 강제
-        if norm_dim == 2048 && xs.dim(D::Minus1)? > 2048 {
-            if self.self_attn.layer_idx == 0 {
-                println!("[SAFEGUARD] Dimension overflow detected ({}). Shrinking back to 2048.", xs.dim(D::Minus1)?);
-            }
+        // [STRICT-DIMENSION-SAFEGUARD-V2]
+        // 엔진 모드와 상관없이, 출력이 2048을 초과하는 것은 하이브리드 설계상 비정상이므로 강제 캡핑
+        if xs.dim(D::Minus1)? > 2048 {
+            println!("[SAFEGUARD] Dimension overflow! Layer={}, InDim={}, NormDim={}, CurrentOut={}. Capping to 2048.", 
+                self.self_attn.layer_idx, input_dim, norm_dim, xs.dim(D::Minus1)?);
             xs = xs.narrow(D::Minus1, 0, 2048)?.contiguous()?;
         }
         
@@ -1161,8 +1160,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 out = Tensor::cat(&[&(out.clone()), &out], D::Minus1)?.contiguous()?;
             }
 
-            // [STRICT-DIMENSION-SAFEGUARD-MLP]
-            if norm_dim == 2048 && out.dim(D::Minus1)? > 2048 {
+            // [STRICT-DIMENSION-SAFEGUARD-MLP-V2]
+            if out.dim(D::Minus1)? > 2048 {
                 out = out.narrow(D::Minus1, 0, 2048)?.contiguous()?;
             }
             
@@ -1217,6 +1216,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub active_session_id: Option<String>, // [NEW] Disk workspace ID
     pub pinned_layer_count: usize, // [NEW] How many layers to keep in VRAM
     pub current_kv_len: usize, // [NEW] Logical progress tracker (SSD-persistent)
+    pub is_handshake_active: bool, // [NEW] Global hybrid state
     pub is_text: bool,
     pub is_image: bool,
 }
@@ -1628,6 +1628,7 @@ impl QuantizedQwen3VLTextModel {
             active_session_id: None,
             pinned_layer_count: 0,
             current_kv_len: 0,
+            is_handshake_active: false,
             is_text,
             is_image,
         })
@@ -1732,6 +1733,9 @@ impl QuantizedQwen3VLTextModel {
 
             // [SMART-STREAMING]
             if is_on_cpu { layer.to_device(&gpu_device)?; }
+            
+            // [GLOBAL-HANDSHAKE-SYNC] 개별 레이어가 SSD에서 오며 잃어버린 신분을 모델 레벨에서 강제 복구
+            layer.self_attn.is_handshake_active = self.is_handshake_active;
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
@@ -1940,15 +1944,16 @@ impl QuantizedQwen3VLTextModel {
                 .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, final_path, e))?;
         }
 
-        // [DISK-BRAIN] Save logical progress to JSON for OOM recovery
+        // [DISK-BRAIN] Save logical progress and Handshake state to JSON for OOM recovery
         let metadata_path = final_path.join("metadata.json");
         let metadata = serde_json::json!({
             "current_kv_len": self.current_kv_len,
+            "is_handshake_active": self.is_handshake_active,
             "timestamp": chrono::Utc::now().timestamp()
         });
         if let Ok(file) = std::fs::File::create(&metadata_path) {
             let _ = serde_json::to_writer(file, &metadata);
-            println!("[DISK-BRAIN] Progress saved to SSD: {} tokens.", self.current_kv_len);
+            println!("[DISK-BRAIN] Progress and Handshake state ({}) saved to SSD.", self.is_handshake_active);
         }
 
         Ok(())
@@ -1994,6 +1999,10 @@ impl QuantizedQwen3VLTextModel {
                     self.current_kv_len = len as usize;
                     println!("[DISK-BRAIN] Recalled progress from SSD: {} tokens.", self.current_kv_len);
                 }
+                if let Some(active) = meta.get("is_handshake_active").and_then(|v| v.as_bool()) {
+                    self.is_handshake_active = active;
+                    println!("[DISK-BRAIN] Restored Handshake state: {}", self.is_handshake_active);
+                }
             }
         }
 
@@ -2016,7 +2025,8 @@ impl QuantizedQwen3VLTextModel {
         
         // [FIX] Update logical progress and Handshake state immediately
         self.current_kv_len = self.layers[0].get_kv_len();
-        let is_restored = self.layers[0].self_attn.is_handshake_active;
+        self.is_handshake_active = self.layers[0].self_attn.is_handshake_active;
+        let is_restored = self.is_handshake_active;
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
             .ok_or_else(|| anyhow!("Failed to load seed KV cache from {:?}", actual_load_path))?.clone();
@@ -2581,6 +2591,14 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
                 t = (t / 1.414)?;
             }
             weight_t = t.contiguous()?;
+        }
+        
+        // [STRICT-2B-TRANSPOSE-GUARD]
+        // Candle's QLinear (via QMatMul::Tensor) expects [in_dim, out_dim].
+        // GGUF weights are often stored as [out_dim, in_dim].
+        let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
+        if r_final > c_final {
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
         }
     }
 
