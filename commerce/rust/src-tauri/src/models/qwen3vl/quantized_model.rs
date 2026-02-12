@@ -1496,9 +1496,15 @@ impl QuantizedQwen3VLTextModel {
                 // [HYBRID-INJECTION-ALIGN] Layer 0는 항상 주입된 파일의 blk.0를 사용함
                 if layer_idx == 0 { prefix = "blk.0".to_string(); }
                 
-                // [CRITICAL] Pass baking_only as-is. Layer 0 will self-enable MLP internally.
+                // [STRICT-INFERENCE-FORCE] 2B 추론 모드인 경우 레이어 설정을 2048로 강제 고정
+                let mut layer_config = final_config.clone();
+                if !baking_only && actual_h_size == 2048 {
+                    layer_config.hidden_size = 2048;
+                }
+
+                // [CRITICAL] Pass the forced layer_config
                 QuantizedQwen3VLTextDecoderLayer::new(
-                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
+                    &layer_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
                 )
             }).collect()
         });
@@ -1612,24 +1618,31 @@ impl QuantizedQwen3VLTextModel {
         let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
         for layer_idx in 0..num_layers_to_load {
-            if current_device.is_cuda() && is_vram_checked {
+            let mut layer_device = current_device.clone();
+            if layer_device.is_cuda() && is_vram_checked {
                  // For the first layer, always use full weight cost
                  let actual_cost = if layer_idx == 0 { layer_weight_size } else { cost_per_layer };
-                 if simulated_free_vram > ( (actual_cost as f64 * 1.02) as u64 + safety_floor ) {
+                 if simulated_free_vram > ( (actual_cost as f64 * 1.05) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
                  } else {
-                     current_device = Device::Cpu;
+                     layer_device = Device::Cpu;
                  }
             }
 
-            let layer_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
+            let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
             let standard = format!("{base_name}.layers.{layer_idx}");
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
 
-            // [CRITICAL] Pass baking_only as-is. Layer 0 will self-enable MLP internally.
+            // [STRICT-INFERENCE-FORCE] 2B 추론 모드인 경우 레이어 설정을 2048로 강제 고정
+            let mut layer_config = config.clone();
+            if !baking_only && actual_hidden_size == 2048 {
+                layer_config.hidden_size = 2048;
+            }
+
+            // [CRITICAL] Pass the isolated device and forced config
             let layer = QuantizedQwen3VLTextDecoderLayer::new(
-                config, ct, reader, &prefix, &current_device, layer_dtype, layer_idx, baking_only
+                &layer_config, ct, reader, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
             )?;
             layers.push(layer)
         }
