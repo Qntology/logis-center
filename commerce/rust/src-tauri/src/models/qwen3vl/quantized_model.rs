@@ -620,13 +620,18 @@ impl QuantizedQwen3VLTextAttention {
         if let Some((k, v)) = &self.kv_cache {
             // [HYBRID-PROTOCOL-MARKING-V2]
             // Marker includes: Parts(4th dec), Depth(7th dec), Transpose(9th dec)
-            // [DTYPE-FIX] Ensure F32 for marking and saving
+            // Ensure F32 for marking and saving
             let mut k_marked = k.to_dtype(DType::F32)?;
-            if self.hybrid_parts > 1.0 || self.needs_transpose {
-                let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
-                let marker = -(1.0 + (self.hybrid_parts * 0.0001) + (self.hybrid_parts * 0.0000001) + (trans_flag * 0.000000001));
+            
+            // We use 2.0 parts for 1024 -> 2048 recovery
+            let hybrid_parts = if k.dim(D::Minus1)? == 1024 { 2.0 } else { 1.0 };
+            let needs_transpose = self.needs_transpose; // Inherit from attention state
+
+            if hybrid_parts > 1.0 || needs_transpose {
+                let trans_flag = if needs_transpose { 1.0 } else { 0.0 };
+                let marker = -(1.0 + (hybrid_parts * 0.0001) + (hybrid_parts * 0.0000001) + (trans_flag * 0.000000001));
                 
-                println!("[HYBRID-ENCODER] Layer {} | Encoding 2B Metadata: Parts={}, Transpose={}", self.layer_idx, self.hybrid_parts, self.needs_transpose);
+                println!("[HYBRID-ENCODER] Layer {} | Encoding Metadata: Parts={}, Transpose={}", self.layer_idx, hybrid_parts, needs_transpose);
                 println!("  -> Generated Protocol Marker: {:.10}", marker);
 
                 let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
@@ -802,24 +807,58 @@ impl QuantizedQwen3VLTextAttention {
         
         if sig < -1.0 {
             let val = sig.abs() - 1.0;
+            // [PROTOCOL-DECODER-V2] 
+            // 4th dec: target_parts (Multiplier)
+            // 7th dec: sequence/dim hints
+            // 9th dec: transpose/reverse flag
             target_parts = ((val * 10000.0).round() as usize) % 100;
-            println!("[HYBRID-DECODER] Layer {} | Recovering 2B Intelligence: Multiplier x{}", self.layer_idx, target_parts);
+            let trans_val = ((val * 1000000000.0).round() as usize) % 10;
+            let needs_retranspose = trans_val == 1 || target_parts > 1;
             
-            // Marker Healing: Replace marker with neighbor value
+            println!("[HYBRID-DECODER] Protocol Active | Multiplier: x{}, Re-transpose: {}", target_parts, needs_retranspose);
+            
+            // Marker Healing
             let mut k_clean = k_vec.clone();
             k_clean[0] = k_vec[1];
             let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
             
-            // Upscale both K and V (all in F32)
-            let mut k_final = Tensor::cat(&vec![k_healed.clone(); target_parts], 0)?;
-            let mut v_final = Tensor::cat(&vec![v_f32.clone(); target_parts], 0)?;
-            
-            // [HYBRID-ENERGY-BALANCE] Maintain numerical range
+            // [HYBRID-UNFOLDING-STRATEGY]
+            // We upscale along the HEADS dimension (1) or HIDDEN dimension (3)
+            // based on the 2B model's requirements.
+            let mut k_final = k_healed;
+            let mut v_final = v_f32;
+
             if target_parts > 1 {
-                k_final = (k_final / (target_parts as f64))?;
-                v_final = (v_final / (target_parts as f64))?;
+                // If HeadDim matches but Heads are fewer (e.g. 8 vs 16)
+                if h < target_heads {
+                    println!("[HYBRID-UNFOLD] Expanding HEADS dimension: {} -> {}", h, target_heads);
+                    let mut k_parts = Vec::new();
+                    let mut v_parts = Vec::new();
+                    for _ in 0..target_parts {
+                        k_parts.push(k_final.clone());
+                        v_parts.push(v_final.clone());
+                    }
+                    k_final = Tensor::cat(&k_parts, 1)?; // Concat along Heads
+                    v_final = Tensor::cat(&v_parts, 1)?;
+                } else if d < target_dim {
+                    // If Heads match but HeadDim is smaller
+                    println!("[HYBRID-UNFOLD] Expanding HIDDEN dimension: {} -> {}", d, target_dim);
+                    let mut k_parts = Vec::new();
+                    let mut v_parts = Vec::new();
+                    for _ in 0..target_parts {
+                        k_parts.push(k_final.clone());
+                        v_parts.push(v_final.clone());
+                    }
+                    k_final = Tensor::cat(&k_parts, D::Minus1)?; // Concat along HeadDim
+                    v_final = Tensor::cat(&v_parts, D::Minus1)?;
+                }
             }
             
+            if needs_retranspose {
+                k_final = k_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
+                v_final = v_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
+            }
+
             let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
             let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
 
@@ -880,6 +919,13 @@ impl QuantizedQwen3VLTextDecoderLayer {
         layer_idx: usize,
         baking_only: bool, // Use this flag now
     ) -> Result<Self> {
+        if layer_idx == 0 {
+            eprintln!("[DEBUG-L0] DecoderLayer::new called. Hidden: {}, Baking: {}", config.hidden_size, baking_only);
+            if let Ok(cwd) = std::env::current_dir() {
+                eprintln!("[DEBUG-L0] CWD: {:?}", cwd);
+            }
+        }
+
         // [HYBRID-L0-INJECTION] If this is Layer 0 and we are in a hybrid setup
         // Try to load a superior Layer 0 from a 2B-sourced mini-GGUF
         let mut l0_mmap = None;
@@ -888,26 +934,55 @@ impl QuantizedQwen3VLTextDecoderLayer {
         
         let (mut final_ct, mut final_reader) = (ct, reader as &mut dyn SeekRead);
 
-        if layer_idx == 0 && config.hidden_size == 1024 {
-            let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
-            let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
+        if layer_idx == 0 && (config.hidden_size == 1024 || baking_only) {
+            let mut candidates = vec![
+                std::path::PathBuf::from("src-tauri/models"), 
+                std::path::PathBuf::from("models"), 
+                std::path::PathBuf::from("../models"),
+                std::path::PathBuf::from("../src-tauri/models"),
+            ];
+
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    // target/debug/ -> src-tauri/models
+                    candidates.push(exe_dir.join("../../src-tauri/models"));
+                    // target/debug/ -> models
+                    candidates.push(exe_dir.join("../../models"));
+                }
+            }
             
-            // [STRICT-HYBRID-SELECTION] Unified Intelligence Module
-            let l0_filename = "Qwen3-2B-L0-VL-Q4_K_M.gguf";
-            let l0_gguf_path = hybrid_dir.join(l0_filename);
+            let mut base_path = None;
+            for p in candidates {
+                if let Ok(cp) = std::fs::canonicalize(&p) {
+                    base_path = Some(cp);
+                    break;
+                }
+            }
             
-            if l0_gguf_path.exists() {
-                if let Ok(file) = std::fs::File::open(&l0_gguf_path) {
-                    if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
-                        l0_mmap = Some(mmap);
-                        let mut cursor = std::io::Cursor::new(&l0_mmap.as_ref().unwrap()[..]);
-                        if let Ok(content) = gguf_file::Content::read(&mut cursor) {
-                            l0_content = Some(content);
-                            l0_cursor = Some(cursor);
-                            println!("[HYBRID-L0] INJECTING unified 2B Layer 0 Intelligence from {:?}", l0_filename);
+            if let Some(bp) = base_path {
+                let hybrid_dir = bp.join("Qwen3-VL-2B-Hybrid-gguf");
+                let l0_filename = "Qwen3-2B-L0-VL-Q4_K_M.gguf";
+                let l0_gguf_path = hybrid_dir.join(l0_filename);
+                
+                println!("[HYBRID-L0] Checking for L0 injection at: {:?}", l0_gguf_path);
+                
+                if l0_gguf_path.exists() {
+                    if let Ok(file) = std::fs::File::open(&l0_gguf_path) {
+                        if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
+                            l0_mmap = Some(mmap);
+                            let mut cursor = std::io::Cursor::new(&l0_mmap.as_ref().unwrap()[..]);
+                            if let Ok(content) = gguf_file::Content::read(&mut cursor) {
+                                l0_content = Some(content);
+                                l0_cursor = Some(cursor);
+                                println!("[HYBRID-L0] INJECTING unified 2B Layer 0 Intelligence from {:?}", l0_filename);
+                            }
                         }
                     }
+                } else {
+                    println!("[HYBRID-L0] L0 File not found.");
                 }
+            } else {
+                println!("[HYBRID-L0] Could not resolve models directory.");
             }
         }
 
@@ -921,6 +996,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
         };
 
         let self_attn = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+            // [HYBRID-L0-FOLDING] Inject 2B Layer 0 but fold it to 1024 for the 0.6B engine
+            println!("[HYBRID-L0] Folding 2B Layer 0 Intelligence (2048 -> 1024) for 0.6B engine.");
+            // We pass the config (which has hidden_size=1024) to the attention constructor.
+            // The constructor (QuantizedQwen3VLTextAttention::new) will use get_qlinear_v2,
+            // which handles the folding automatically when it sees hidden_size=1024.
             QuantizedQwen3VLTextAttention::new(config, c, r, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
         } else {
             QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
@@ -1199,69 +1279,123 @@ impl QuantizedQwen3VLTextModel {
                 .unwrap_or(config.hidden_size)
         };
 
-        println!("[MODEL-INIT] Name: {}, Config Hidden: {}, GGUF Actual: {}, Layers: {}", base_name, config.hidden_size, actual_h_size, config.num_hidden_layers);
+                println!("[MODEL-INIT] Name: {}, Config Hidden: {}, GGUF Actual: {}, Layers: {}", base_name, config.hidden_size, actual_h_size, config.num_hidden_layers);
 
-        let mut patched_config_owned = config.clone();
-        if actual_h_size == 1024 {
-            println!("[MODEL-FIX] 0.6B detected early. Overriding all settings to 1024/8 heads.");
-            patched_config_owned.hidden_size = 1024;
-            patched_config_owned.num_attention_heads = 8;
-            patched_config_owned.num_key_value_heads = 8;
-        } else {
-            patched_config_owned.hidden_size = actual_h_size;
-        }
-        let config = &patched_config_owned;
-
-        // [EXHAUSTIVE-SEARCH] Search for any key that looks like an embedding
-        let mut embed_key = None;
         
-        // Priority 1: token_embd.weight (Found in Instruct models)
-        if ct.tensor_infos.contains_key("token_embd.weight") {
-            embed_key = Some("token_embd.weight".to_string());
-        } else {
-            // Priority 2: Other variants
-            for key in ct.tensor_infos.keys() {
-                let k_low = key.to_lowercase();
-                if k_low.contains("token_embd") || (k_low.contains("embed_tokens") && k_low.contains("weight")) || k_low == "model.embed_tokens" {
-                    embed_key = Some(key.clone());
-                    break;
-                }
-            }
-        }
 
-        let embed_tokens = if let Some(key) = embed_key {
-             println!("[HYBRID] Found embedding weight with key: {}", key);
-             let mut tensor = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
-             
-             // [STRATEGY-INJECTION] If this is 0.6B (1024) but we want 2B precision
-             if actual_h_size == 1024 {
-                 let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
-                 let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
-                 let b2_gguf_path = hybrid_dir.join("Qwen3-2B-L0-VL-Q4_K_M.gguf");
-                 
-                 if b2_gguf_path.exists() {
-                     println!("[HYBRID-INJECT] 0.6B Detected. Injecting 2B Embedding from unified module...");
-                     if let Ok(b2_file) = std::fs::File::open(&b2_gguf_path) {
-                         if let Ok(b2_mmap) = unsafe { memmap2::MmapOptions::new().map(&b2_file) } {
-                             let mut b2_cursor = std::io::Cursor::new(&b2_mmap[..]);
-                             if let Ok(b2_ct) = gguf_file::Content::read(&mut b2_cursor) {
-                                 if let Ok(b2_emb) = b2_ct.tensor(&mut b2_cursor, "token_embd.weight", device) {
-                                     let b2_emb_t = b2_emb.dequantize(device)?.to_dtype(dtype)?;
-                                     // [HYBRID-EMBEDDING-FOLDING] Sum 2B halves into 1024 dim
-                                     if let (Ok(e1), Ok(e2)) = (b2_emb_t.narrow(1, 0, 1024), b2_emb_t.narrow(1, 1024, 1024)) {
-                                         tensor = (e1 + e2)?.contiguous()?;
-                                         println!("[HYBRID-INJECT-SUCCESS] 2B Embedding (FOLDED to 1024) injected into 0.6B engine.");
+                let mut patched_config_owned = config.clone();
+
+                // [HYBRID-OPTIMIZATION] Keep 1024-dim engine but inject 2B knowledge
+
+                patched_config_owned.hidden_size = actual_h_size;
+
+                
+
+                let config = &patched_config_owned;
+
+        
+
+                // [EXHAUSTIVE-SEARCH] Search for any key that looks like an embedding
+
+                let mut embed_key = None;
+
+                
+
+                // Priority 1: token_embd.weight (Found in Instruct models)
+
+                if ct.tensor_infos.contains_key("token_embd.weight") {
+
+                    embed_key = Some("token_embd.weight".to_string());
+
+                } else {
+
+                    // Priority 2: Other variants
+
+                    for key in ct.tensor_infos.keys() {
+
+                        let k_low = key.to_lowercase();
+
+                        if k_low.contains("token_embd") || (k_low.contains("embed_tokens") && k_low.contains("weight")) || k_low == "model.embed_tokens" {
+
+                            embed_key = Some(key.clone());
+
+                            break;
+
+                        }
+
+                    }
+
+                }
+
+        
+
+                let embed_tokens = if let Some(key) = embed_key {
+
+                     println!("[HYBRID] Found embedding weight with key: {}", key);
+
+                     let mut tensor = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
+
+                     
+
+                     // [STRATEGY-INJECTION] If this is 0.6B (1024) but we want 2B precision
+
+                     if actual_h_size == 1024 {
+
+                         let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
+
+                         let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
+
+                         let b2_gguf_path = hybrid_dir.join("Qwen3-2B-L0-VL-Q4_K_M.gguf");
+
+                         
+
+                         if b2_gguf_path.exists() {
+
+                             println!("[HYBRID-INJECT] 0.6B Detected. Injecting 2B Embedding from unified module...");
+
+                                                          if let Ok(b2_file) = std::fs::File::open(&b2_gguf_path) {
+
+                                                              if let Ok(b2_mmap) = unsafe { memmap2::MmapOptions::new().map(&b2_file) } {
+
+                                                                  let mut b2_cursor = std::io::Cursor::new(&b2_mmap[..]);
+
+                                     if let Ok(b2_ct) = gguf_file::Content::read(&mut b2_cursor) {
+
+                                         if let Ok(b2_emb) = b2_ct.tensor(&mut b2_cursor, "token_embd.weight", device) {
+
+                                             let b2_emb_t = b2_emb.dequantize(device)?.to_dtype(dtype)?;
+
+                                                                                  // [HYBRID-EMBEDDING-FOLDING-V2] Use first 1024 dimensions (Narrow)
+
+                                                                                  // Averaging (e1+e2)/2 changes the vector direction too much.
+
+                                                                                  if b2_emb_t.dim(1)? == 2048 {
+
+                                                                                      tensor = b2_emb_t.narrow(1, 0, 1024)?.contiguous()?;
+
+                                                                                      println!("[HYBRID-INJECT-SUCCESS] 2B Embedding Truncated (2048 -> 1024) injected for Baking.");
+
+                                                                                  }
+
+                                         }
+
                                      }
+
                                  }
+
                              }
+
                          }
+
                      }
-                 }
-             }
-             
-             let h = tensor.dim(1)?;
-             Embedding::new(tensor, h)
-        } else {
+
+                     
+
+                     let h = tensor.dim(1)?;
+
+                     Embedding::new(tensor, h)
+
+                } else {
              println!("[HYBRID-RELAY] Embedding NOT found in current GGUF. Attempting shared fallback...");
              let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
              let shared_emb_path = base_path.join("qwen3_shared_emb.safetensors");
@@ -1396,10 +1530,9 @@ impl QuantizedQwen3VLTextModel {
                 let gguf_blk = format!("blk.{actual_file_idx}");
                 let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
                 
-                let layer_baking_mode = if layer_idx == 0 { false } else { baking_only };
-
+                // [CRITICAL] Pass baking_only as-is. Layer 0 will self-enable MLP internally.
                 QuantizedQwen3VLTextDecoderLayer::new(
-                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, layer_baking_mode
+                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
                 )
             }).collect()
         });
@@ -1510,11 +1643,9 @@ impl QuantizedQwen3VLTextModel {
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
 
-            // [CRITICAL] Force layer 0 to NOT be baking_only so it runs the full MLP
-            let layer_baking_flag = if layer_idx == 0 { false } else { baking_only };
-
+            // [CRITICAL] Pass baking_only as-is. Layer 0 will self-enable MLP internally.
             let layer = QuantizedQwen3VLTextDecoderLayer::new(
-                config, ct, reader, &prefix, &current_device, layer_dtype, layer_idx, layer_baking_flag
+                config, ct, reader, &prefix, &current_device, layer_dtype, layer_idx, baking_only
             )?;
             layers.push(layer)
         }
@@ -2173,11 +2304,25 @@ impl QuantizedQwen3VLModel {
     fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Vec<Tensor>, Vec<Tensor>)> {
         let pixel_values = if !pixel_values.device().same_device(&self.vision_device) { pixel_values.to_device(&self.vision_device)? } else { pixel_values.clone() };
         let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) { image_grid_thw.to_device(&self.vision_device)? } else { image_grid_thw.clone() };
-        let (image_embeds, deepstack_image_embeds) = self.visual.forward(&pixel_values, &image_grid_thw)?;
+        let (mut image_embeds, deepstack_image_embeds) = self.visual.forward(&pixel_values, &image_grid_thw)?;
+        
+        // [HYBRID-VISION-FOLDING] 2B Vision (2048) -> 0.6B Engine (1024)
+        if image_embeds.dim(candle_core::D::Minus1)? == 2048 && self.language_model.embed_tokens.hidden_size() == 1024 {
+            println!("[HYBRID-VISION] Truncating 2B Vision features (2048 -> 1024) for 0.6B engine.");
+            image_embeds = image_embeds.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?;
+        }
+
         let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
         let split_sizes: Vec<usize> = prod_tensor_last_dim(&image_grid_thw)?.to_vec1::<u32>()?.iter().map(|&x| x as usize / spatial_merge_size.pow(2)).collect();
         let image_embeds = image_embeds.to_device(&self.text_device)?;
-        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_device(&self.text_device)?)).collect();
+        let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| {
+            let mut t = t.to_device(&self.text_device)?;
+            // Also fold deepstack features if they are 2048
+            if t.dim(candle_core::D::Minus1)? == 2048 && self.language_model.embed_tokens.hidden_size() == 1024 {
+                t = t.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?;
+            }
+            Ok(t)
+        }).collect();
         let image_embeds = split_tensor(&image_embeds, &split_sizes, 0)?;
         Ok((image_embeds, deepstack_image_embeds?))
     }
@@ -2269,6 +2414,13 @@ impl QuantizedQwen3TextModel {
     pub fn new_with_mmap(config: &Qwen3VLConfig, ct_main: &gguf_file::Content, mmap_handle: Option<Arc<Mmap>>, text_device: &Device, text_device_id: usize, dtype: DType, kv_reserve: u64, baking_only: bool, single_layer_mode: bool, is_text: bool, is_image: bool, is_disk_swap: bool) -> Result<Self> {
         println!("[MODEL] Loading as Pure Text (Baking-Only: {}, Single-Layer: {}, DiskSwap: {})", baking_only, single_layer_mode, is_disk_swap);
         let mut t_config = config.text_config.as_ref().ok_or(anyhow!("Missing text_config"))?.clone();
+        
+        // [HYBRID-ALIGN] Ensure 1024 dim for baking mode at the entry point
+        if baking_only && t_config.hidden_size == 2048 {
+            println!("[HYBRID-ENTRY] Adjusting entry config for 0.6B Baking (2048 -> 1024)");
+            t_config.hidden_size = 1024;
+        }
+        
         if single_layer_mode { t_config.num_hidden_layers = 1; }
         
         let language_model = QuantizedQwen3VLTextModel::new_with_mmap(&t_config, ct_main, mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only, is_text, is_image, is_disk_swap)?;

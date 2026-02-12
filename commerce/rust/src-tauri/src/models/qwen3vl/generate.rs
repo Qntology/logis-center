@@ -236,6 +236,10 @@ impl Qwen3VLGenerateModel {
                 let actual_baking_only = baking_only || is_06b;
                 let single_layer_mode = baking_only || is_06b;
                 
+                if actual_baking_only {
+                    println!("[BAKING] Initializing 0.6B engine in Baking Mode. Expecting 2048-dim upgrades.");
+                }
+
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode, true, false, is_disk_swap)?;
                 ModelVariant::QuantizedText(model)
             }
