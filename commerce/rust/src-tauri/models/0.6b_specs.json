@@ -1,16 +1,17 @@
 {
-    "metadata": {
-        "general.name": "Qwen3-0.6B-L0",
-        "qwen3vl.embedding_length": 1024,
-        "qwen3vl.feed_forward_length": 3072,
-        "qwen3vl.attention.head_count": 16,
-        "qwen3vl.attention.head_count_kv": 8,
-        "qwen3vl.attention.layer_norm_rms_epsilon": 1e-6
-    },
+    "model_type": "qwen3-0.6b",
+    "hidden_size": 1024,
+    "intermediate_size": 3072,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
     "tensors": {
-        "blk.0.attn_norm.weight": [1024],
-        "blk.0.ffn_gate.weight": [3072, 1024],
-        "blk.0.ffn_up.weight": [3072, 1024],
-        "blk.0.ffn_down.weight": [1024, 3072]
+        "embedding": [151936, 1024],
+        "norm": [1024],
+        "mlp_gate_up": [3072, 1024],
+        "mlp_down": [1024, 3072],
+        "attn_q": [2048, 1024],
+        "attn_kv": [1024, 1024],
+        "attn_output": [1024, 2048]
     }
 }

@@ -783,7 +783,7 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [HYBRID-HANDSHAKE-V7] Role-Aware Restoration
+        // [HYBRID-HANDSHAKE-V19] Role-Aware Restoration & Marker Decoding
         let engine_dtype = k.dtype();
         let k_f32 = k.to_dtype(DType::F32)?;
         let v_f32 = v.to_dtype(DType::F32)?;
@@ -791,27 +791,24 @@ impl QuantizedQwen3VLTextAttention {
         let k_vec = k_f32.flatten_all()?.to_vec1::<f32>()?;
         let v_vec = v_f32.flatten_all()?.to_vec1::<f32>()?;
         let sig_k = k_vec[0];
-        let sig_v = v_vec[0];
         
+        // Marker Decoding: -(1.0 + (Role * 0.1) + (Identity * 0.01) + ...)
         if sig_k < -1.0 {
             let val_k = sig_k.abs() - 1.0;
-            
-            // [V9-DECODING] 1번째 자리: 역할, 2번째 자리: 신분(4=2B, 1=0.6B)
-            let role_k = ((val_k * 10.0).round() as usize) % 10;
+            // 소수점 둘째 자리(Identity) 추출: 1.0=0.6B, 4.0=2B
             let identity_k = ((val_k * 100.0).round() as usize) % 10;
-            let multiplier_raw = ((val_k * 1000.0).round() as usize) % 10;
-            let trans_val = ((val_k * 10000.0).round() as usize) % 10;
             
-            // [V9-THRESHOLD] 3을 기준으로 신분 판별 (4 vs 1의 안전한 중간지점)
-            let is_actually_2b = identity_k >= 3;
-            let needs_retranspose = trans_val == 1;
-            
-            // [HYBRID-V9-SPEC] 명시적 규격 강제
-            let multiplier = if is_actually_2b { 1 } else { 2 };
-            
-            if self.layer_idx == 0 {
-                println!("[HYBRID-V9] Verified: {} Mode (ID_Digit={}), Role_K={}, Mult={}, Trans={}", 
-                    if is_actually_2b { "2B" } else { "0.6B" }, identity_k, role_k, multiplier, needs_retranspose);
+            // [SELF-HEALING] 마커가 2B(4.0)를 가리키면 즉시 승격
+            if identity_k >= 4 {
+                if !self.is_handshake_active {
+                    println!("[MARKER-SYNC] 2B Marker detected (ID={}). Upgrading Identity.", identity_k);
+                    self.is_handshake_active = true;
+                }
+            } else {
+                // 마커가 0.6B(1.0)라면 아직 확장 전
+                if self.is_handshake_active {
+                    println!("[MARKER-WARN] 0.6B Marker detected in 2B session. Expansion required.");
+                }
             }
 
             // Marker Healing (K & V 둘 다 수행)
@@ -821,31 +818,21 @@ impl QuantizedQwen3VLTextAttention {
             let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
             let v_healed = Tensor::from_vec(v_clean, v_f32.shape(), &Device::Cpu)?.to_device(v_f32.device())?;
             
-            self.is_handshake_active = true;
-
-            // [STRICT-DIMENSION-ALIGNMENT-V4] 중복 확장 절대 방어
+            // [STRICT-DIMENSION-ALIGNMENT-V19]
             let mut k_final = k_healed;
             let mut v_final = v_healed;
             
-            let current_engine_dim = self.num_attention_heads * self.head_dim;
             let loaded_heads = k_final.dim(1)?;
             let loaded_total_dim = loaded_heads * k_final.dim(D::Minus1)?;
 
-            // [V9-GUARD] 이미 2B 규격이거나 마커가 2B면 확장을 건너뜀
-            if current_engine_dim == 2048 && loaded_total_dim < 2048 && !is_actually_2b {
-                println!("[HYBRID-V9-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
+            // 2B 모드인데 데이터가 1024(0.6B)라면 여기서 확장
+            if self.is_handshake_active && loaded_total_dim < 2048 {
+                println!("[HYBRID-V19-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
                 k_final = Tensor::cat(&[&k_final, &k_final], 1)?; 
                 v_final = Tensor::cat(&[&v_final, &v_final], 1)?; 
-                v_final = (v_final * 0.70710678118)?; 
-            } else if loaded_total_dim >= 2048 || is_actually_2b {
-                if self.layer_idx == 0 { println!("[HYBRID-V9] Skipping upscale: Data is already in 2B format."); }
+                v_final = (v_final * 0.70710678118)?; // 에너지 보존
             }
             
-            if needs_retranspose {
-                k_final = k_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
-                v_final = v_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
-            }
-
             let actual_k_len = k_final.dim(2)?;
             let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
             let final_len = use_len.saturating_sub(upscale_refill_len);
@@ -1110,14 +1097,15 @@ impl QuantizedQwen3VLTextDecoderLayer {
              None
         };
 
-        // [STOP-AND-GO: SIGNAL-FIRST-V16]
-        // 수치가 아닌 디스크 신호를 유일한 진실의 원천으로 삼음
-        let mut is_signal_2b = self.self_attn.is_handshake_active;
+        // [STOP-AND-GO: SIGNAL-FIRST-V18]
+        // 수치가 아닌 현재 레이어의 가중치 규격(norm_dim)을 '물리적 기준점'으로 사용
+        let norm_dim = self.input_layernorm.weight().dim(0)?;
+        let mut is_signal_2b = self.self_attn.is_handshake_active || (norm_dim > 1024);
+        
         if let Some(session_id) = &self.self_attn.active_session_id {
             let safe_sid = session_id.replace("/", "_");
             let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
             
-            // 디스크 신호 파일 전수 조사 (파일명에 id4.0 포함 여부)
             if !is_signal_2b {
                 if let Ok(entries) = std::fs::read_dir(&signal_dir) {
                     for entry in entries.flatten() {
@@ -1133,31 +1121,30 @@ impl QuantizedQwen3VLTextDecoderLayer {
         }
 
         let input_dim = xs.dim(candle_core::D::Minus1)?;
-        let target_dim = if is_signal_2b { 2048 } else { 1024 };
+        // 목표 차원은 레이어가 물리적으로 요구하는 크기
+        let target_dim = norm_dim; 
         
-        // [PHYSICAL-ALIGNMENT] 신호가 가리키는 목표 차원(target_dim)에 실제 데이터를 맞춤
+        // [PHYSICAL-ALIGNMENT-V18] 가중치 형상을 신호로 삼아 데이터를 맞춤
         let mut xs_active = if input_dim < target_dim {
-            // 데이터가 부족하면 확장 (0.6B -> 2B)
-            if self.self_attn.layer_idx == 0 { println!("[V16-SYNC] Expanding to target {} based on Signal.", target_dim); }
-            let expanded = Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?;
+            // 데이터 부족 시 확장 (Variance-Preserving Expansion)
+            let ratio = target_dim / input_dim;
+            let mut expanded = xs.clone();
+            for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &xs], candle_core::D::Minus1)?; }
+            let expanded = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
             
-            // 확장 주체(L0)는 즉시 깃발을 꽂아 전파
             if self.self_attn.layer_idx == 0 {
                 if let Some(session_id) = &self.self_attn.active_session_id {
                     let safe_sid = session_id.replace("/", "_");
                     let s_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
                     let _ = std::fs::create_dir_all(&s_dir);
                     let _ = std::fs::File::create(s_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
-                    let _ = std::fs::File::create(s_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal"));
                 }
             }
             expanded
         } else if input_dim > target_dim {
-            // 데이터가 목표치를 초과하면 슬라이싱 (4096 방어)
-            if self.self_attn.layer_idx == 0 { println!("[V16-SYNC] Clamping to target {} based on Signal.", target_dim); }
+            // 데이터 과잉 시 슬라이싱 (Weight Guard)
             xs.narrow(candle_core::D::Minus1, 0, target_dim)?.contiguous()?
         } else {
-            // 규격 일치 (이미 2048인 경우 여기서 통과하여 중복 확장 방지)
             xs.clone()
         };
 
@@ -1165,7 +1152,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let xs_active = self.input_layernorm.forward(&xs_active)?;
         let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
         
-        // [STRICT-RESIDUAL-GUARD] Residual 합산 전 차원 최종 확인
         let mut xs_active = if xs_active.dim(D::Minus1)? != residual_active.dim(D::Minus1)? {
             let res_dim = residual_active.dim(D::Minus1)?;
             xs_active.narrow(D::Minus1, 0, res_dim)?.contiguous()?
@@ -1176,29 +1162,37 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         let mut xs = residual_active.add(&xs_active)?;
         
-        // [STRICT-POST-CHECK] 다음 레이어로 넘어가는 차원 최종 가드
+        // [STRICT-POST-CHECK] 다음 레이어 보호
         if xs.dim(D::Minus1)? > target_dim {
              xs = xs.narrow(D::Minus1, 0, target_dim)?.contiguous()?;
         }
         
-        // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
+        // [OPTIMIZATION] Skip MLP block if not available
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
             let residual_mlp = xs.clone();
-            
-            // 1. Post-Attention Norm
             let mut xs_mlp = post_norm.forward(&xs)?;
             
-            // [STRICT-MLP-ENTRANCE-BRIDGE] 지능형 가중치 규격 맞춤
-            if (is_handshake_active || disk_identity == 4.0) && norm_dim == 1024 && xs_mlp.dim(D::Minus1)? == 2048 {
-                xs_mlp = xs_mlp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
+            let weight_in_dim = gate_proj.inner_shape()[1]; 
+            if xs_mlp.dim(D::Minus1)? != weight_in_dim {
+                if xs_mlp.dim(D::Minus1)? > weight_in_dim {
+                    xs_mlp = xs_mlp.narrow(D::Minus1, 0, weight_in_dim)?.contiguous()?;
+                } else {
+                    let ratio = weight_in_dim / xs_mlp.dim(D::Minus1)?;
+                    let mut exp_mlp = xs_mlp.clone();
+                    for _ in 1..ratio { exp_mlp = Tensor::cat(&[&exp_mlp, &xs_mlp], D::Minus1)?; }
+                    xs_mlp = (exp_mlp * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+                }
             }
             
-            // 2. Gate & Up Projections
-            let (gate, up) = {
-                let g = gate_proj.forward(&xs_mlp)?;
-                let u = up_proj.forward(&xs_mlp)?;
-                (g, u)
-            };
+            let (gate, up) = (gate_proj.forward(&xs_mlp)?, up_proj.forward(&xs_mlp)?);
+            let out = down_proj.forward(&(candle_nn::ops::silu(&gate)?.mul(&up)?))?;
+            
+            let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
+            Ok(residual_mlp.add(&out)?)
+        } else {
+            Ok(xs)
+        }
+    }
             
             let gate = candle_nn::ops::silu(&gate)?;
             let hidden = gate.mul(&up)?;
@@ -1342,40 +1336,49 @@ impl QuantizedQwen3VLTextModel {
 
         
 
-                // [HYBRID-EMBEDDING-RESOLVER] Unified intelligence entry for 0.6B and 2B
-                let mut tensor_opt = None;
-                if let Some(key) = embed_key {
-                     println!("[HYBRID] Found embedding weight in main GGUF: {}", key);
-                     tensor_opt = Some(ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?);
-                }
+        // [HYBRID-EMBEDDING-RESOLVER-V18] 지능형 앵커링 및 변환 로직
+        let mut tensor_opt = None;
+        let target_h = config.hidden_size; // 엔진이 목표로 하는 히든 차원
 
-                // [HYBRID-STRATEGY] If missing (Body-L1-27 mode) or if we want 2B precision for Baking
-                if tensor_opt.is_none() || (actual_h_size == 1024 && baking_only) {
-                    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
-                    let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
-                    let b2_gguf_path = hybrid_dir.join("Qwen3-2B-L0-VL-Q4_K_M.gguf");
-                    
-                    if b2_gguf_path.exists() {
-                        if let Ok(b2_file) = std::fs::File::open(&b2_gguf_path) {
-                            if let Ok(b2_mmap) = unsafe { memmap2::MmapOptions::new().map(&b2_file) } {
-                                let mut b2_cursor = std::io::Cursor::new(&b2_mmap[..]);
-                                if let Ok(b2_ct) = gguf_file::Content::read(&mut b2_cursor) {
-                                    if let Ok(b2_emb) = b2_ct.tensor(&mut b2_cursor, "token_embd.weight", device) {
-                                        let b2_emb_t = b2_emb.dequantize(device)?.to_dtype(dtype)?;
-                                        
-                                        if actual_h_size == 1024 {
-                                            tensor_opt = Some(b2_emb_t.narrow(1, 0, 1024)?.contiguous()?);
-                                            println!("[HYBRID-INJECT-SUCCESS] 2B Embedding Truncated (2048 -> 1024) injected for Baking.");
-                                        } else if actual_h_size == 2048 {
-                                            tensor_opt = Some(b2_emb_t);
-                                            println!("[HYBRID-INJECT-SUCCESS] Unified 2B Embedding injected for Inference.");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        if let Some(key) = embed_key {
+             let mut t = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
+             let (rows, cols) = (t.dim(0)?, t.dim(1)?);
+             
+             // [ANCHORING] 보컬 사이즈(151936)가 포함된 텐서를 임베딩으로 확정
+             if rows == 151936 || cols == 151936 {
+                 let mut current_h = if rows == 151936 { cols } else { rows };
+                 
+                 // [AUTO-TRANSFORMATION] 엔진 규격에 맞게 변신
+                 if current_h != target_h {
+                     if current_h > target_h {
+                         // Folding: 2B(2048) -> 0.6B(1024)
+                         println!("[EMBED-FOLD] Folding Intelligence ({} -> {})", current_h, target_h);
+                         let t_resized = if rows == 151936 {
+                             ((t.narrow(1, 0, target_h)? + t.narrow(1, target_h, target_h)?)? / 2.0)?
+                         } else {
+                             ((t.narrow(0, 0, target_h)? + t.narrow(0, target_h, target_h)?)? / 2.0)?
+                         };
+                         t = t_resized.contiguous()?;
+                     } else {
+                         // Expansion: 0.6B(1024) -> 2B(2048)
+                         println!("[EMBED-EXPAND] Expanding Energy ({} -> {})", current_h, target_h);
+                         let t_resized = if rows == 151936 {
+                             let ratio = target_h / current_h;
+                             let mut exp = t.clone();
+                             for _ in 1..ratio { exp = Tensor::cat(&[&exp, &t], 1)?; }
+                             (exp * (1.0 / (ratio as f64).sqrt()))?
+                         } else {
+                             let ratio = target_h / current_h;
+                             let mut exp = t.clone();
+                             for _ in 1..ratio { exp = Tensor::cat(&[&exp, &t], 0)?; }
+                             (exp * (1.0 / (ratio as f64).sqrt()))?
+                         };
+                         t = t_resized.contiguous()?;
+                     }
+                 }
+             }
+             tensor_opt = Some(t);
+        }
 
                 let embed_tokens = if let Some(tensor) = tensor_opt {
                      let h = tensor.dim(1)?;
@@ -2033,12 +2036,19 @@ impl QuantizedQwen3VLTextModel {
             });
         }
 
-        // [SESSION-SIGNAL-V15] 세션 전체에 대한 마스터 신호 파일 생성
+        // [SESSION-SIGNAL-V19] 세션 전체에 대한 동적 마스터 신호 파일 생성
         if self.is_handshake_active {
-            let sig_name = "handshake_role1.0_id4.0_mult1.0_trans0.0.signal";
-            if let Ok(_) = std::fs::File::create(final_path.join(sig_name)) {
-                println!("[SIGNAL-V15] Master 2B Signal created in {:?}", final_path);
+            let id_val = 4.0;
+            let mult_val = 1.0;
+            let trans_val = 0.0;
+            
+            let k_sig = format!("handshake_role1.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
+            let v_sig = format!("handshake_role0.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
+            
+            if let Ok(_) = std::fs::File::create(final_path.join(k_sig)) {
+                println!("[SIGNAL-V19] Master K-Signal created in {:?}", final_path);
             }
+            let _ = std::fs::File::create(final_path.join(v_sig));
         }
 
         Ok(())
@@ -2099,8 +2109,14 @@ impl QuantizedQwen3VLTextModel {
 
         if is_restored {
             for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
-            // 신분 복원 성공 시 인퍼런스 폴더에도 신호 전파
-            let _ = std::fs::File::create(inference_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
+            // [DYNAMIC-SIGNAL-V19] 신분 복원 성공 시 동적 신호 생성 (이슈 4 대응)
+            let id_val = 4.0;
+            let mult_val = 1.0;
+            let trans_val = 0.0;
+            let k_sig = format!("handshake_role1.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
+            let v_sig = format!("handshake_role0.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
+            let _ = std::fs::File::create(inference_path.join(k_sig));
+            let _ = std::fs::File::create(inference_path.join(v_sig));
         }
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
@@ -2593,143 +2609,96 @@ fn get_qlinear_2b_hybrid<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Conte
     Ok(QLinear::new(QMatMul::Tensor(weight_t), bias, device.clone()))
 }
 
-fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType, hidden_size: usize) -> Result<QLinear> {
-    let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
+fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
+    ct: &gguf_file::Content, 
+    reader: &mut R, 
+    name: &str, 
+    device: &Device, 
+    dtype: DType, 
+    config: &Qwen3VLTextConfig
+) -> Result<QLinear> {
+    let weight = ct.tensor(reader, &format!("{name}.weight"), device)
+        .map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [HYBRID-RECURSIVE-FOLDING-V2]
-    if hidden_size == 1024 {
-        // ... (Folding logic remains same for 0.6B mode)
-        let dims = weight_t.dims();
-        if dims.len() == 2 {
-            let mut t = weight_t.clone();
-            let mut was_folded = false;
-            let mut fold_count = 1.0;
-            
-            let mut d0 = t.dim(0)?;
-            while d0 > 1024 && d0 != 3072 {
-                let half = d0 / 2;
-                t = ((t.narrow(0, 0, half)? + t.narrow(0, half, half)?)? / 2.0)?;
-                d0 = t.dim(0)?;
-                fold_count *= 2.0;
-            }
-            if d0 == 6144 {
-                t = ((t.narrow(0, 0, 3072)? + t.narrow(0, 3072, 3072)?)? / 2.0)?;
-                fold_count = 2.0;
-                was_folded = true;
-            }
+    // [V1.2-MANIFEST-COMPLIANT] 가중치 형상 그 자체를 신호로 사용
+    let (r_src, c_src) = (weight_t.dim(0)?, weight_t.dim(1)?);
+    let target_h = config.hidden_size;
+    let target_i = config.intermediate_size;
+    let is_mlp = name.contains("ffn") || name.contains("gate") || name.contains("up") || name.contains("down") || name.contains("mlp");
 
-            let mut d1 = t.dim(1)?;
-            while d1 > 1024 && d1 != 3072 {
-                let half = d1 / 2;
-                t = ((t.narrow(1, 0, half)? + t.narrow(1, half, half)?)? / 2.0)?;
-                d1 = t.dim(1)?;
-                fold_count *= 2.0;
-                was_folded = true;
-            }
-
-            if was_folded || d0 > 1024 || d1 > 1024 {
-                // [STRICT-NAME-BASED-ALIGNMENT]
-                // 0.6B engine has specific orientation needs for each layer type.
-                // We enforce these based on the actual 0.6B model architecture.
-                let (r, c) = (t.dim(0)?, t.dim(1)?);
-                
-                if name.contains("gate") || name.contains("up") {
-                    // Expects [1024, 3072]
-                    if r == 3072 && c == 1024 { t = t.transpose(0, 1)?; }
-                } else if name.contains("down") {
-                    // Expects [3072, 1024]
-                    if r == 1024 && c == 3072 { t = t.transpose(0, 1)?; }
-                } else if name.contains("attn_q") {
-                    // Expects [1024, 2048]
-                    if r == 2048 && c == 1024 { t = t.transpose(0, 1)?; }
-                } else if name.contains("attn_output") {
-                    // Expects [2048, 1024]
-                    if r == 1024 && c == 2048 { t = t.transpose(0, 1)?; }
-                } else {
-                    // Default fallback for hidden-to-hidden
-                    if r == 1024 && c == 1024 {} // Already correct
-                    else if r > c { t = t.transpose(0, 1)?; }
-                }
-                weight_t = t.contiguous()?;
-            }
-        }
-    } else if hidden_size == 2048 {
-        // [HYBRID-ENERGY-PRESERVING-UNFOLDING-V15]
-        let (r, c) = (weight_t.dim(0)?, weight_t.dim(1)?);
+    // 1. 물리적 차원 정합성 자동 교정 (Zero-Hardcoding)
+    if is_mlp {
+        let (r_target, c_target) = if name.contains("down") { (target_h, target_i) } else { (target_i, target_h) };
         
-        // [CRITICAL-GUARD] 이미 2048 이상인 경우 절대 확장하지 않음 (4096 방지)
-        if r < 2048 && c == 1024 {
-            let mut t = weight_t.clone();
-            t = Tensor::cat(&[&t, &t], 1)?; 
-            t = (t / 1.414)?;
-            weight_t = t.contiguous()?;
-        } else if r == 1024 && c < 2048 {
-            let mut t = weight_t.clone();
-            t = Tensor::cat(&[&t, &t], 0)?;
-            t = (t / 1.414)?;
-            weight_t = t.contiguous()?;
-        } else if r == 1024 && c == 1024 {
-            let mut t = weight_t.clone();
-            t = Tensor::cat(&[&t, &t], 0)?;
-            t = Tensor::cat(&[&t, &t], 1)?;
-            t = (t / 2.0)?;
-            weight_t = t.contiguous()?;
+        // 부족하면 확장 (에너지 보존: 0.707 Scaling)
+        if r_src < r_target {
+            let ratio = r_target / r_src;
+            let mut expanded = weight_t.clone();
+            for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 0)?; }
+            weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
         }
-
-        // [STRICT-UNFOLD-CAP-V15] 4096 mismatch 최종 수비
-        let (rf, cf) = (weight_t.dim(0)?, weight_t.dim(1)?);
-        let is_mlp = name.contains("ffn") || name.contains("gate") || name.contains("up") || name.contains("down") || name.contains("mlp");
-        
-        if !is_mlp {
-            // Attention 또는 다른 레이어는 무조건 2048 규격 적용
-            if rf > 2048 { weight_t = weight_t.narrow(0, 0, 2048)?.contiguous()?; }
-            if cf > 2048 { weight_t = weight_t.narrow(1, 0, 2048)?.contiguous()?; }
-        } else {
-            // MLP 레이어 (0.6B의 3072를 2B의 6144로 정확히 매칭)
-            let (r_cur, c_cur) = (weight_t.dim(0)?, weight_t.dim(1)?);
-            if r_cur == 3072 { weight_t = Tensor::cat(&[&weight_t, &weight_t], 0)?.contiguous()?; }
-            if c_cur == 3072 { weight_t = Tensor::cat(&[&weight_t, &weight_t], 1)?.contiguous()?; }
-            
-            // 최종 6144 초과 방어
-            let (rf_fin, cf_fin) = (weight_t.dim(0)?, weight_t.dim(1)?);
-            if rf_fin > 6144 { weight_t = weight_t.narrow(0, 0, 6144)?.contiguous()?; }
-            if cf_fin > 6144 { weight_t = weight_t.narrow(1, 0, 6144)?.contiguous()?; }
+        if c_src < c_target {
+            let ratio = c_target / c_src;
+            let mut expanded = weight_t.clone();
+            for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 1)?; }
+            weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
         }
         
-        // [STRICT-2B-TRANSPOSE-GUARD-V15]
-        let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
-        if hidden_size == 2048 && r_final > c_final && !is_mlp {
-            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        // 넘치거나 패딩되어 있으면 정밀 슬라이싱 (Weight Guard)
+        let (r_now, c_now) = (weight_t.dim(0)?, weight_t.dim(1)?);
+        if r_now > r_target { weight_t = weight_t.narrow(0, 0, r_target)?.contiguous()?; }
+        if c_now > c_target { weight_t = weight_t.narrow(1, 0, c_target)?.contiguous()?; }
+        
+    } else {
+        // Attention 및 기타 레이어
+        if r_src != target_h && (target_h % r_src == 0 || r_src % target_h == 0) {
+            if r_src < target_h {
+                let ratio = target_h / r_src;
+                let mut expanded = weight_t.clone();
+                for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 0)?; }
+                weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+            } else {
+                weight_t = weight_t.narrow(0, 0, target_h)?.contiguous()?;
+            }
+        }
+        if c_src != target_h && (target_h % c_src == 0 || c_src % target_h == 0) {
+            if c_src < target_h {
+                let ratio = target_h / c_src;
+                let mut expanded = weight_t.clone();
+                for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 1)?; }
+                weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+            } else {
+                weight_t = weight_t.narrow(1, 0, target_h)?.contiguous()?;
+            }
         }
     }
 
-    let shape = weight_t.dims();
-    if shape.len() == 2 {
-        let rows = shape[0];
-        let cols = shape[1];
-        let mut needs_transpose = false;
-        
-        if hidden_size == 1024 {
-            // [0.6B-SPEC-ALIGN]
-            if rows == 3072 && cols == 1024 { needs_transpose = true; } 
-            else if rows == 1024 && cols == 3072 { needs_transpose = true; }
-        } else if hidden_size == 2048 {
-            // [2B-SPEC-ALIGN]
-            // Gate/Up: [6144, 2048], Down: [2048, 6144]
-            if (name.contains("gate") || name.contains("up") || name.contains("ffn_gate") || name.contains("ffn_up")) && rows == 2048 && cols == 6144 {
-                needs_transpose = true;
-            } else if (name.contains("down") || name.contains("ffn_down")) && rows == 6144 && cols == 2048 {
-                needs_transpose = true;
-            } else if (name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v")) && rows == 2048 && cols == 2048 {
-                needs_transpose = true;
+    // 2. Transpose 자동 결정 (형상 신호 기준)
+    let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
+    if !is_mlp && r_final > c_final && !name.contains("attn_q") {
+        weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+    }
+
+    let weight_q = QMatMul::Tensor(weight_t);
+    let mut bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
+        let mut b_t = t.dequantize(device)?.to_dtype(dtype)?;
+        let b_target = if is_mlp { if name.contains("down") { target_h } else { target_i } } else { target_h };
+        if b_t.dim(0)? != b_target {
+            if b_t.dim(0)? < b_target {
+                let ratio = b_target / b_t.dim(0)?;
+                let mut expanded = b_t.clone();
+                for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &b_t], 0)?; }
+                b_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+            } else {
+                b_t = b_t.narrow(0, 0, b_target)?.contiguous()?;
             }
         }
+        Some(b_t)
+    } else { None };
 
-        if needs_transpose {
-            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
-        }
-    }
+    Ok(QLinear::new(weight_q, bias, device.clone()))
+}
     
     let weight_q = QMatMul::Tensor(weight_t);
     let mut bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 

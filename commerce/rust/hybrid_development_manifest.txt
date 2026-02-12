@@ -1,0 +1,40 @@
+[HYBRID AI PIPELINE DEVELOPMENT MANIFEST - V1.2]
+
+1. 모델별 논리적 규격 (Logical Specs)
+   - 0.6B Model: Hidden Dim = 1024, Intermediate(FFN) Dim = 3072
+   - 2B Model: Hidden Dim = 2048, Intermediate(FFN) Dim = 6144
+
+2. 실제 가중치 물리 형상 (Physical GGUF Shapes)
+   - 2B Embedding: [4096, 151936] (Effective 2048)
+   - 2B FFN Gate/Up: [4096, 6144] (Effective 2048/6144)
+   - 2B FFN Down: [12288, 2048] (Effective 6144/2048)
+   - 0.6B FFN Gate/Up: [3072, 1024]
+   - 0.6B FFN Down: [1024, 3072]
+
+3. 임베딩(Embedding) 특수 대응 정책
+   - 앵커링: Shape에 151936이 포함되면 'token_embd'로 확정 명명한다.
+   - 2B 추론 시: 임베딩 가중치가 2B(2048)이고 엔진이 2B면 그대로 사용.
+   - 하이브리드 추론 시: 엔진이 0.6B(1024)라면 2B 임베딩을 'Folding(평균병합)'하여 1024로 이식한다.
+
+4. 레이어 0 (L0) 및 본체(Body) 연결 정책
+   - L0 추론 필수: 모든 추론은 L0를 거친다. 
+   - 브릿지(Bridge):
+     A. L0가 0.6B(1024)이고 Body가 2B(2048)인 경우: L0 출력값을 2048로 'Expansion(0.707 Scaling)'하여 L1에 전달한다.
+     B. L0가 2B(2048)이고 Body가 2B(2048)인 경우: 변환 없이 직결한다.
+
+5. [CORE] 인-텐서 핸드쉐이크 (V9 Marker)
+   - data[0] 소수점 값으로 현재 데이터의 물리적 신분(1.0=0.6B, 4.0=2B)을 증명한다.
+   - 레이어는 이 신분증을 보고 'Specs.json'에서 어떤 장부를 꺼낼지 결정한다.
+
+6. [CORE] 추론 시그널 파일 정책
+   - 파일명: handshake_role{R}_id{I}_mult{M}_trans{T}.signal
+   - 세션별 격리 경로 사용 및 작업 시작 전 강제 Cleanup 실시.
+
+7. 물리적 변환 알고리즘
+   - Expansion: cat 후 0.707배 (에너지 보존, 외계어 방지)
+   - Folding: 인접 뉴런 평균 (지능 보존)
+   - Weight Guard: GGUF 형상이 Specs 초과 시 즉시 Slicing.
+
+8. 개발 절대 원칙
+   - 가중치(Weight) 형상을 신호로 믿고, 부족하면 채우고 넘치면 깎는다.
+   - 코드 내 모든 숫자를 제거하고 Config/Specs 참조 구조로 통일한다.
