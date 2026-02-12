@@ -2061,20 +2061,19 @@ impl QuantizedQwen3VLTextModel {
             let is_pinned = i < self.pinned_layer_count;
             
             if i > 0 {
+                // [STRICT-UPScale-PROPAGATION] 레이어 0에서 복원된 2048 데이터를 모든 레이어에 전파
                 self.layers[i].self_attn.kv_cache = Some((k_seed.clone(), v_seed.clone()));
-                // [STRICT-SYNC] 모든 레이어의 신분을 동기화
                 self.layers[i].self_attn.is_handshake_active = is_restored;
             }
 
-            if !is_pinned && self.is_disk_swap {
-                // Save this layer's copy to the NEW inference workspace, NOT the original path
+            if self.is_disk_swap {
+                // [STRICT-DISK-SYNC] 복원된 2048 데이터를 SSD에 즉시 커밋
+                // 이렇게 해야 나중에 레이어가 개별적으로 로드될 때 1024가 아닌 2048을 읽음
                 let layer_name = format!("layer_{}_kv.safetensors", i);
                 let layer_file_path = inference_workspace.join(layer_name);
                 
-                if !layer_file_path.exists() {
-                    self.layers[i].save_kv_cache(&inference_workspace, false, 1024)?;
-                }
-                self.layers[i].self_attn.kv_cache = None;
+                // 만약 핀에 꽂혀있지 않다면 저장 후 메모리 해제하여 VRAM 확보
+                self.layers[i].save_kv_cache(&inference_workspace, !is_pinned, 1024)?;
             }
         }
 
