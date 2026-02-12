@@ -1121,6 +1121,15 @@ impl QuantizedQwen3VLTextDecoderLayer {
         } else {
             xs_active
         };
+
+        // [STRICT-DIMENSION-SAFEGUARD]
+        // 어떠한 경우에도 Inference 모드(norm_dim == 2048)에서 xs가 2048을 초과하지 않도록 강제
+        if norm_dim == 2048 && xs.dim(D::Minus1)? > 2048 {
+            if self.self_attn.layer_idx == 0 {
+                println!("[SAFEGUARD] Dimension overflow detected ({}). Shrinking back to 2048.", xs.dim(D::Minus1)?);
+            }
+            xs = xs.narrow(D::Minus1, 0, 2048)?.contiguous()?;
+        }
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
@@ -1150,6 +1159,11 @@ impl QuantizedQwen3VLTextDecoderLayer {
             // MLP 출구 브릿지 (0.6B 베이킹 전용)
             if needs_bridge && out.dim(D::Minus1)? == 1024 {
                 out = Tensor::cat(&[&(out.clone()), &out], D::Minus1)?.contiguous()?;
+            }
+
+            // [STRICT-DIMENSION-SAFEGUARD-MLP]
+            if norm_dim == 2048 && out.dim(D::Minus1)? > 2048 {
+                out = out.narrow(D::Minus1, 0, 2048)?.contiguous()?;
             }
             
             let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
