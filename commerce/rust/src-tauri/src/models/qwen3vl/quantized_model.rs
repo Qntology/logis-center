@@ -1149,13 +1149,17 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 if self.self_attn.layer_idx == 0 { println!("[SIGNAL-SYNC] Expanding 1024 -> 2048 based on signal."); }
                 let expanded = Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?;
                 
-                // L0가 확장을 완료했다면 즉시 깃발 생성
+                // L0가 확장을 완료했다면 즉시 K/V 두 가지 깃발 생성 (이슈 4 대응)
                 if self.self_attn.layer_idx == 0 {
                     if let Some(session_id) = &self.self_attn.active_session_id {
                         let safe_sid = session_id.replace("/", "_");
                         let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
                         let _ = std::fs::create_dir_all(&signal_dir);
+                        // K-텐서 깃발
                         let _ = std::fs::File::create(signal_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
+                        // V-텐서 깃발
+                        let _ = std::fs::File::create(signal_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal"));
+                        println!("[SIGNAL-MASTER-V13] Dual Signals (K & V) created for Session {}.", session_id);
                     }
                 }
                 expanded
