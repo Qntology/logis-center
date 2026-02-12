@@ -34,7 +34,7 @@ use crate::{
 pub struct RmsNorm {
     weight: Tensor,
     eps: f64,
-}
+
 
 impl RmsNorm {
     pub fn new(weight: Tensor, eps: f64) -> Self {
@@ -776,19 +776,39 @@ impl QuantizedQwen3VLTextAttention {
         if final_len > 0 { self.kv_cache = Some((k_f32.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?, v_f32.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?)); }
         Ok(())
     }
+
+    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
+        self.save_kv_cache(path, true, block_size)
+    }
+}
+
+impl QuantizedQwen3VLTextDecoderLayer {
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        self.self_attn.to_device(device)?;
+        if let Some(gate) = &mut self.mlp_gate { gate.to_device(device)?; }
+        if let Some(up) = &mut self.mlp_up { up.to_device(device)?; }
+        if let Some(down) = &mut self.mlp_down { down.to_device(device)?; }
+        self.input_layernorm.to_device(device)?;
+        if let Some(norm) = &mut self.post_attention_layernorm { norm.to_device(device)?; }
+        Ok(())
+    }
+
+    pub fn new<R: std::io::Seek + std::io::Read>(
+        config: &Qwen3VLTextConfig,
+        ct: &gguf_file::Content,
+        reader: &mut R,
+        base_name: &str,
+        device: &Device,
+        dtype: DType,
+        layer_idx: usize,
+        baking_only: bool,
+    ) -> Result<Self> {
+        if layer_idx == 0 {
+            eprintln!("[DEBUG-L0] DecoderLayer::new called. Hidden: {}, Baking: {}", config.hidden_size, baking_only);
+            if let Ok(cwd) = std::env::current_dir() {
                 eprintln!("[DEBUG-L0] CWD: {:?}", cwd);
             }
         }
-
-        // [HYBRID-L0-INJECTION] If this is Layer 0 and we are in a hybrid setup
-        // Try to load a superior Layer 0 from a 2B-sourced mini-GGUF
-        let mut l0_mmap = None;
-        let mut l0_cursor = None;
-        let mut l0_content = None;
-        
-        let (mut final_ct, mut final_reader) = (ct, reader as &mut dyn SeekRead);
-
-        if layer_idx == 0 && (config.hidden_size == 1024 || baking_only) {
             let mut candidates = vec![
                 std::path::PathBuf::from("src-tauri/models"), 
                 std::path::PathBuf::from("models"), 
@@ -2599,7 +2619,15 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
                  if parts.len() == 2 {
                      let idx = parts[0];
                      let layer = parts[1];
-                     let mapped_layer = match layer { s if s.starts_with("ln1") => s.replace("ln1", "norm1"), s if s.starts_with("ln2") => s.replace("ln2", "norm2"), s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"), s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"), s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"), s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), _ => layer.to_string() };
+                     let mapped_layer = match layer { 
+                         s if s.starts_with("ln1") => s.replace("ln1", "norm1"), 
+                         s if s.starts_with("ln2") => s.replace("ln2", "norm2"), 
+                         s if s.starts_with("attn_qkv") => s.replace("attn_qkv", "attn.qkv"), 
+                         s if s.starts_with("attn_out") => s.replace("attn_out", "attn.proj"), 
+                         s if s.starts_with("ffn_up") => s.replace("ffn_up", "mlp.linear_fc1"), 
+                         s if s.starts_with("ffn_down") => s.replace("ffn_down", "mlp.linear_fc2"), 
+                         _ => layer.to_string() 
+                     };
                      new_name = format!("visual.blocks.{}.{}", idx, mapped_layer);
                  }
              } else if rest.starts_with("patch_embd") { new_name = rest.replace("patch_embd", "visual.patch_embed.proj"); }
@@ -2610,63 +2638,65 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
                  if parts.len() >= 2 {
                      if let Ok(layer_idx) = parts[1].parse::<usize>() {
                          let v_idx_opt = config.vision_config.as_ref().and_then(|vc| vc.deepstack_visual_indexes.iter().position(|&x| x == layer_idx));
-                         if let Some(pos) = v_idx_opt { let suffix = parts[2..].join("."); new_name = format!("visual.deepstack_merger_list.{}.{}", pos, suffix).replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
-                         else { new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
-                     } else { new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); }
+                         if let Some(pos) = v_idx_opt { 
+                             let suffix = parts[2..].join("."); 
+                             new_name = format!("visual.deepstack_merger_list.{}.{}", pos, suffix).replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); 
+                         } else { 
+                             new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); 
+                         }
+                     } else { 
+                         new_name = rest.replace("deepstack", "visual.deepstack_merger_list").replace("fc1", "linear_fc1").replace("fc2", "linear_fc2"); 
+                     }
                  }
              } else { new_name = format!("visual.{}", rest); }
-        } else if let Some(rest) = name.strip_prefix("mm.") { if rest.starts_with("0") { new_name = rest.replace("0", "visual.merger.linear_fc1"); } else if rest.starts_with("2") { new_name = rest.replace("2", "visual.merger.linear_fc2"); } }
-        else if name.starts_with("model.visual") { new_name = name.strip_prefix("model.").unwrap().to_string(); }
+        } else if let Some(rest) = name.strip_prefix("mm.") { 
+            if rest.starts_with("0") { new_name = rest.replace("0", "visual.merger.linear_fc1"); } 
+            else if rest.starts_with("2") { new_name = rest.replace("2", "visual.merger.linear_fc2"); } 
+        } else if name.starts_with("model.visual") { 
+            new_name = name.strip_prefix("model.").unwrap().to_string(); 
+        }
+        
         let mut is_split = false;
         let mut split_idx = 0;
         let mut base_split_name = new_name.clone();
-        if let Some(last_dot) = new_name.rfind('.') { if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() { if name.ends_with(&format!(".{}", idx)) { base_split_name = new_name[..last_dot].to_string(); split_idx = idx; is_split = true; } } }
+        if let Some(last_dot) = new_name.rfind('.') { 
+            if let Ok(idx) = new_name[last_dot+1..].parse::<usize>() { 
+                if name.ends_with(&format!(".{}", idx)) { 
+                    base_split_name = new_name[..last_dot].to_string(); 
+                    split_idx = idx; 
+                    is_split = true; 
+                } 
+            } 
+        }
+        
         let mut t = ct.tensor(reader, name, device)?;
-        let mut t = t.dequantize(device)?.to_dtype(dtype)?;
+        let t = t.dequantize(device)?.to_dtype(dtype)?;
         
-        // [HYBRID-VISION-PRECISION-FOLDING]
-        if config.hidden_size == Some(1024) {
-            let dims = t.dims();
-            if dims.len() >= 1 {
-                let mut current_t = t.clone();
-                let mut d0 = current_t.dim(0)?;
-                let mut was_folded = false;
-                let target_d0 = if d0 > 3072 { 1024 } else if d0 > 1024 { 1024 } else { d0 };
-                let ratio = d0 as f64 / target_d0 as f64;
+        if is_split { 
+            split_tensors.entry(base_split_name).or_default().push((split_idx, t)); 
+        } else { 
+            data.insert(new_name, t); 
+        }
+    }
 
-                if ratio > 1.0 {
-                    while d0 > target_d0 && d0 != 3072 {
-                        let half = d0 / 2;
-                        current_t = ((current_t.narrow(0, 0, half)? + current_t.narrow(0, half, half)?)? / 2.0)?;
-                        d0 = current_t.dim(0)?;
-                        was_folded = true;
-                    }
-                    if d0 == 6144 {
-                        current_t = ((current_t.narrow(0, 0, 3072)? + current_t.narrow(0, 3072, 3072)?)? / 2.0)?;
-                        was_folded = true;
-                    }
-                    
-                    if was_folded {
-                        // Encode Protocol Marker: -(1.0 + Ratio*0.0001 + Depth*0.0000001)
-                        let marker_val = -(1.0 + (ratio * 0.0001) + (ratio * 0.0000001));
-                        let mut data = current_t.flatten_all()?.to_vec1::<f32>()?;
-                        data[0] = marker_val as f32;
-                        t = Tensor::from_vec(data, current_t.shape(), device)?.contiguous()?;
-                    }
-                }
-            }
-        }
-        
-        if is_split { split_tensors.entry(base_split_name).or_default().push((split_idx, t)); } else { data.insert(new_name, t); }
-        
-            }
-        
-            for (name, mut parts) in split_tensors { parts.sort_by_key(|(i, _)| *i); let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); if let Ok(merged) = Tensor::cat(&tensors, 0) { data.insert(name, merged); } }
-        
-            if let Some(weight) = data.get("visual.patch_embed.proj.weight") { if weight.rank() == 4 { if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); } } }
-        
-            Ok(VarBuilder::from_tensors(data, dtype, device))
-        
-        }
+    for (name, mut parts) in split_tensors { 
+        parts.sort_by_key(|(i, _)| *i); 
+        let tensors: Vec<Tensor> = parts.into_iter().map(|(_, t)| t).collect(); 
+        if let Ok(merged) = Tensor::cat(&tensors, 0) { 
+            data.insert(name, merged); 
+        } 
+    }
+
+    if let Some(weight) = data.get("visual.patch_embed.proj.weight") { 
+        if weight.rank() == 4 { 
+            if let Ok(reshaped) = weight.unsqueeze(2)?.repeat((1, 1, 2, 1, 1)) { 
+                data.insert("visual.patch_embed.proj.weight".to_string(), reshaped); 
+                println!("[FIX] Reshaped visual.patch_embed.proj.weight to 5D"); 
+            } 
+        } 
+    }
+
+    Ok(VarBuilder::from_tensors(data, dtype, device))
+}
         
         
