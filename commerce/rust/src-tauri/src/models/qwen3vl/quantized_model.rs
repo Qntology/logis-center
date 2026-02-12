@@ -1144,7 +1144,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 self.self_attn.is_handshake_active = true;
             }
             xs.clone()
-        } else if is_handshake_active || is_already_expanded_on_disk {
+        } else if is_handshake_active || disk_identity == 4.0 {
             if input_dim == 1024 {
                 if self.self_attn.layer_idx == 0 { println!("[SIGNAL-SYNC] Expanding 1024 -> 2048 based on signal."); }
                 let expanded = Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?;

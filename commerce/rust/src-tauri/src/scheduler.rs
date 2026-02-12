@@ -364,8 +364,8 @@ async fn process_task(
     }
 
     // [SIGNAL-CLEANUP-V12] 작업 시작 전 구형 신호 파일 청소
-    if let Some(sid) = &session_id {
-        let safe_sid = sid.replace("/", "_");
+    {
+        let safe_sid = task.id.replace("/", "_");
         let signal_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&safe_sid);
         if signal_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(&signal_dir) {
@@ -376,7 +376,7 @@ async fn process_task(
                     }
                 }
             }
-            println!("[Scheduler] Stale signals cleared for session: {}", sid);
+            println!("[Scheduler] Stale signals cleared for session: {}", task.id);
         }
     }
 
