@@ -645,38 +645,41 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V8] Safe-Precision Guard Encoding
+            // [HYBRID-PROTOCOL-MARKING-V8] 역할 및 신분 동시 각인
             let head_count = k.dim(1)?;
-            let is_already_2b = head_count >= 16;
+            let is_actually_2b_specs = head_count >= 16;
             
-            let mut k_marked = k.to_dtype(DType::F32)?;
-            let mut v_marked = v.to_dtype(DType::F32)?;
+            // [STRICT-STORAGE-UPSCALING] 만약 신분은 2B인데 데이터가 아직 1024라면, 저장 직전에 물리적 확장
+            // 이렇게 해야 나중에 DiskSwap으로 다시 읽을 때 순정 2048 규격으로 로드됨
+            let (mut k_final, mut v_final) = if !is_actually_2b_specs && self.is_handshake_active {
+                if self.layer_idx == 0 { println!("[HYBRID-SAVE] Physically upscaling 1024 -> 2048 before SSD commit."); }
+                let k_up = Tensor::cat(&[k, k], D::Minus1)?;
+                let v_up = Tensor::cat(&[v, v], D::Minus1)?;
+                (k_up, (v_up * 0.70710678118)?)
+            } else {
+                (k.clone(), v.clone())
+            };
 
-            let multiplier = if is_already_2b { 1.0 } else { 2.0 };
+            let mut k_marked = k_final.to_dtype(DType::F32)?;
+            let mut v_marked = v_final.to_dtype(DType::F32)?;
+            let final_head_count = k_final.dim(1)?;
+            let is_stored_as_2b = final_head_count >= 16;
+
+            let multiplier = if is_stored_as_2b { 1.0 } else { 2.0 };
             let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
-            let identity_id = if is_already_2b { 2.0 } else { 0.0 };
-            let role_id_k = 1.0; // K는 LHS(1)
-            let role_id_v = 0.0; // V는 RHS(0)
+            let identity_id = if is_stored_as_2b { 2.0 } else { 0.0 };
             
-            // [V8-ENCODING] 1.0 + R(0.1) + I(0.01) + M(0.001) + T(0.0001) + Guard(0.00005)
-            let marker_k = -(1.0 + (role_id_k * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
-            let marker_v = -(1.0 + (role_id_v * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
+            // [V8-ENCODING]
+            let marker_k = -(1.0 + 0.1 + identity_id * 0.01 + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
+            let marker_v = -(1.0 + 0.0 + identity_id * 0.01 + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
             
-            if self.layer_idx == 0 {
-                println!("[HYBRID-ENCODER-V8] Layer 0 | ID={} (2B={}), Parts={}, Trans={}", 
-                    if is_already_2b { "2B" } else { "0.6B" }, is_already_2b, multiplier, self.needs_transpose);
-                println!("  -> K-Marker (Safe-V8): {:.6}", marker_k);
-                println!("  -> V-Marker (Safe-V8): {:.6}", marker_v);
-            }
-
-            // K와 V의 첫 번째 요소에 각각 마커 주입
             let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
             k_data[0] = marker_k as f32;
-            k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?;
+            k_marked = Tensor::from_vec(k_data, k_final.shape(), &Device::Cpu)?;
 
             let mut v_data = v_marked.flatten_all()?.to_vec1::<f32>()?;
             v_data[0] = marker_v as f32;
-            v_marked = Tensor::from_vec(v_data, v.shape(), &Device::Cpu)?;
+            v_marked = Tensor::from_vec(v_data, v_final.shape(), &Device::Cpu)?;
 
             let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k_marked)?;
             let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v_marked)?;
