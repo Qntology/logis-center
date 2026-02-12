@@ -823,10 +823,13 @@ impl QuantizedQwen3VLTextAttention {
             let final_len = use_len.saturating_sub(upscale_refill_len);
 
             if final_len > 0 {
-                self.kv_cache = Some((
-                    k_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?, 
-                    v_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?
-                ));
+                let k_out = k_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
+                let v_out = v_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
+                
+                // [STRICT-IDENTITY-MAINTENANCE] 16헤드 이상이면 핸드셰이크 성공으로 간주
+                if k_out.dim(1)? >= 16 { self.is_handshake_active = true; }
+                
+                self.kv_cache = Some((k_out, v_out));
             }
             return Ok(());
         }
@@ -845,10 +848,13 @@ impl QuantizedQwen3VLTextAttention {
         let final_len = use_len.saturating_sub(upscale_refill_len);
 
         if final_len > 0 {
-            self.kv_cache = Some((
-                k_f32.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?, 
-                v_f32.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?
-            ));
+            let k_out = k_f32.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
+            let v_out = v_f32.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
+            
+            // [STRICT-IDENTITY-MAINTENANCE] 마커가 없더라도 데이터가 2B 규격이면 신분 유지
+            if k_out.dim(1)? >= 16 { self.is_handshake_active = true; }
+            
+            self.kv_cache = Some((k_out, v_out));
         }
         Ok(())
     }
