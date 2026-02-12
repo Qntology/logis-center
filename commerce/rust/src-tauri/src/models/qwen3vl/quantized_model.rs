@@ -725,133 +725,52 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [HYBRID-BRIDGE-V6] Full Structural & Sequence Recovery
-        let (_b, h, _s_len, d) = k.dims4()?;
-        let target_heads = self.num_key_value_heads;
-        let target_dim = self.head_dim;
-
-        if h < target_heads || d < target_dim {
-            let k_cpu = k.to_device(&Device::Cpu)?;
-            let mut k_data = k_cpu.flatten_all()?.to_vec1::<f32>()?;
-            let sig = k_data[0];
-            
-            let mut target_parts: usize = 2; 
-            let mut needs_retranspose = false;
-
-            if sig < -1.0 {
-                let val = sig.abs() - 1.0;
-                // Decode Target Parts (4th dec)
-                target_parts = ((val * 10000.0).round() as usize) % 100;
-                // Decode Transpose Flag (9th dec)
-                let trans_val = ((val * 1000000000.0).round() as usize) % 10;
-                // [HYBRID-TRANSPOSE-FIX] Force re-transpose if the marker says so OR if we are upscaling
-                if trans_val == 1 || target_parts > 1 { needs_retranspose = true; }
-                
-                println!("[HYBRID-DECODER] Layer {} | Decoded Protocol: Target Parts = {}, Re-transpose = {}", self.layer_idx, target_parts, needs_retranspose);
-                k_data[0] = k_data[1]; 
-            } else if d < target_dim {
-                target_parts = target_dim / d;
-            }
-
-            if target_parts > 1 {
-                if d < target_dim {
-                    let mut k_parts = Vec::new();
-                    let mut v_parts = Vec::new();
-                    for _ in 0..target_parts {
-                        k_parts.push(k.clone());
-                        v_parts.push(v.clone());
-                    }
-                    k = Tensor::cat(&k_parts, D::Minus1)?;
-                    v = Tensor::cat(&v_parts, D::Minus1)?;
-                    
-                    if k.dim(D::Minus1)? > target_dim {
-                        k = k.narrow(D::Minus1, 0, target_dim)?;
-                        v = v.narrow(D::Minus1, 0, target_dim)?;
-                    }
-                }
-                
-                // [AUTO-SEQUENCE-RECOVERY]
-                if needs_retranspose {
-                    k = k.transpose(D::Minus1, D::Minus2)?.contiguous()?;
-                    v = v.transpose(D::Minus1, D::Minus2)?.contiguous()?;
-                }
-
-                if h < target_heads {
-                    let mut k_heads = Vec::with_capacity(target_heads);
-                    let mut v_heads = Vec::with_capacity(target_heads);
-                    let current_h = k.dim(1)?;
-                    for i in 0..target_heads {
-                        let src_idx = i % current_h;
-                        k_heads.push(k.narrow(1, src_idx, 1)?);
-                        v_heads.push(v.narrow(1, src_idx, 1)?);
-                    }
-                    k = Tensor::cat(&k_heads, 1)?;
-                    v = Tensor::cat(&v_heads, 1)?;
-                }
-            }
-        }
-
-        // [HYBRID-PRECISION-CYCLE] 
-        // We perform all restoration logic in F32 for stability, 
-        // then convert to engine's active dtype only at the final assignment.
+        // [HYBRID-HANDSHAKE-V5] Singular High-Precision Restoration Path
         let engine_dtype = k.dtype();
         let k_f32 = k.to_dtype(DType::F32)?;
         let v_f32 = v.to_dtype(DType::F32)?;
-
-        let actual_k_len = k_f32.dim(2)?;
+        let (_b, h, actual_k_len, d) = k_f32.dims4()?;
         
-        // [HYBRID-HANDSHAKE-RECOVERY] Read user's decimal marker from index 0
+        let target_heads = self.num_key_value_heads;
+        let target_dim = self.head_dim;
+        
         let k_vec = k_f32.flatten_all()?.to_vec1::<f32>()?;
         let sig = k_vec[0];
-        let mut target_parts = 1;
         
         if sig < -1.0 {
             let val = sig.abs() - 1.0;
-            // [PROTOCOL-DECODER-V2] 
-            // 4th dec: target_parts (Multiplier)
-            // 7th dec: sequence/dim hints
-            // 9th dec: transpose/reverse flag
-            target_parts = ((val * 10000.0).round() as usize) % 100;
+            // Decode Multiplier (4th dec), Transpose (9th dec)
+            let multiplier = ((val * 10000.0).round() as usize) % 100;
             let trans_val = ((val * 1000000000.0).round() as usize) % 10;
-            let needs_retranspose = trans_val == 1 || target_parts > 1;
+            let needs_retranspose = trans_val == 1 || multiplier > 1;
             
-            println!("[HYBRID-DECODER] Protocol Active | Multiplier: x{}, Re-transpose: {}", target_parts, needs_retranspose);
-            
-            // Marker Healing
+            // Marker Healing (Handshake V5 Shift-Healing)
             let mut k_clean = k_vec.clone();
-            k_clean[0] = k_vec[1];
+            k_clean[0] = k_vec[1]; 
             let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
             
-            // [HYBRID-UNFOLDING-STRATEGY]
-            // We upscale along the HEADS dimension (1) or HIDDEN dimension (3)
-            // based on the 2B model's requirements.
             let mut k_final = k_healed;
             let mut v_final = v_f32;
 
-            if target_parts > 1 {
-                // If HeadDim matches but Heads are fewer (e.g. 8 vs 16)
+            if multiplier > 1 {
+                println!("[HYBRID-V5] Upscaling Layer {}: x{} Factor, Transpose={}", self.layer_idx, multiplier, needs_retranspose);
+                
                 if h < target_heads {
-                    println!("[HYBRID-UNFOLD] Expanding HEADS dimension: {} -> {}", h, target_heads);
-                    let mut k_parts = Vec::new();
-                    let mut v_parts = Vec::new();
-                    for _ in 0..target_parts {
-                        k_parts.push(k_final.clone());
-                        v_parts.push(v_final.clone());
-                    }
-                    k_final = Tensor::cat(&k_parts, 1)?; // Concat along Heads
+                    let mut k_parts = Vec::new(); let mut v_parts = Vec::new();
+                    for _ in 0..multiplier { k_parts.push(k_final.clone()); v_parts.push(v_final.clone()); }
+                    k_final = Tensor::cat(&k_parts, 1)?;
                     v_final = Tensor::cat(&v_parts, 1)?;
                 } else if d < target_dim {
-                    // If Heads match but HeadDim is smaller
-                    println!("[HYBRID-UNFOLD] Expanding HIDDEN dimension: {} -> {}", d, target_dim);
-                    let mut k_parts = Vec::new();
-                    let mut v_parts = Vec::new();
-                    for _ in 0..target_parts {
-                        k_parts.push(k_final.clone());
-                        v_parts.push(v_final.clone());
-                    }
-                    k_final = Tensor::cat(&k_parts, D::Minus1)?; // Concat along HeadDim
+                    let mut k_parts = Vec::new(); let mut v_parts = Vec::new();
+                    for _ in 0..multiplier { k_parts.push(k_final.clone()); v_parts.push(v_final.clone()); }
+                    k_final = Tensor::cat(&k_parts, D::Minus1)?;
                     v_final = Tensor::cat(&v_parts, D::Minus1)?;
                 }
+                
+                // [THERMAL-BALANCING] Prevent variance explosion
+                let scale = 1.0 / (multiplier as f64).sqrt();
+                k_final = (k_final * scale)?;
+                v_final = (v_final * scale)?;
             }
             
             if needs_retranspose {
@@ -860,24 +779,24 @@ impl QuantizedQwen3VLTextAttention {
             }
 
             let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
-            let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
+            let final_len = use_len.saturating_sub(upscale_refill_len);
 
             if final_len > 0 {
                 self.kv_cache = Some((
-                    k_final.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?, 
-                    v_final.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?
+                    k_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?, 
+                    v_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?
                 ));
             }
             return Ok(());
         }
 
         let use_len = if expected_len == 0 { actual_k_len } else { expected_len.min(actual_k_len) };
-        let final_len = if use_len > upscale_refill_len { use_len - upscale_refill_len } else { use_len };
+        let final_len = use_len.saturating_sub(upscale_refill_len);
 
         if final_len > 0 {
             self.kv_cache = Some((
-                k_f32.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?, 
-                v_f32.narrow(2, 0, final_len.min(actual_k_len))?.to_dtype(engine_dtype)?.contiguous()?
+                k_f32.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?, 
+                v_f32.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?
             ));
         }
         Ok(())
@@ -1339,7 +1258,7 @@ impl QuantizedQwen3VLTextModel {
 
                      // [STRATEGY-INJECTION] If this is 0.6B (1024) but we want 2B precision
 
-                     if actual_h_size == 1024 {
+                     if actual_h_size == 1024 && baking_only {
 
                          let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
 
@@ -2646,9 +2565,14 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, rea
         } else {
             // [2B-HYBRID-SPEC-ALIGNMENT]
             if hidden_size == 2048 {
+                // 2B 원본 레이아웃: Gate/Up [6144, 2048], Down [2048, 6144]
+                // 만약 GGUF가 [2048, 6144]로 되어 있다면 트랜스포즈 필요
                 if (name.contains("gate") || name.contains("up")) && rows == 2048 && cols == 6144 {
                     needs_transpose = true;
                 } else if name.contains("down") && rows == 6144 && cols == 2048 {
+                    needs_transpose = true;
+                } else if (name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v")) && rows == 2048 && cols == 2048 {
+                    // Attention projections often need transpose in Candle
                     needs_transpose = true;
                 }
             }
