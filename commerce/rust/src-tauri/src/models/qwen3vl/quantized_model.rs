@@ -644,6 +644,7 @@ impl QuantizedQwen3VLTextAttention {
 
         let mut map = HashMap::new();
 
+        if let Some((k, v)) = &self.kv_cache {
             // [HYBRID-PROTOCOL-MARKING-V9] High-Margin Identity Encoding
             let head_count = k.dim(1)?;
             let head_dim = k.dim(D::Minus1)?;
@@ -723,16 +724,16 @@ impl QuantizedQwen3VLTextAttention {
                 let layer0_path = path.join("layer_0_kv.safetensors");
                 if layer0_path.exists() {
                     if self.layer_idx == 1 { println!("[HYBRID-BRIDGE] Propagating Layer 0 knowledge to all 2B layers..."); }
-                    return self.load_kv_from_file_internal(&layer0_path, device, expected_len, upscale_refill_len);
+                    return self.load_kv_from_file_internal(&layer0_path, device, expected_len, upscale_refill_len, self.is_handshake_active);
                 }
             }
             return Ok(()); 
         }
 
-        self.load_kv_from_file_internal(&file_path, device, expected_len, upscale_refill_len)
+        self.load_kv_from_file_internal(&file_path, device, expected_len, upscale_refill_len, self.is_handshake_active)
     }
 
-    fn load_kv_from_file_internal(&mut self, file_path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+    fn load_kv_from_file_internal(&mut self, file_path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, _active_status: bool) -> Result<()> {
         let file = std::fs::File::open(file_path)?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let st = safetensors::SafeTensors::deserialize(&mmap)?;
@@ -2843,5 +2844,4 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
             Ok(VarBuilder::from_tensors(data, dtype, device))
         
         }
-        
         
