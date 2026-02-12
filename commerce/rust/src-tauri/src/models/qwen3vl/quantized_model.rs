@@ -645,31 +645,40 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V6] 명시적 신분 각인
-            let mut k_marked = k.to_dtype(DType::F32)?;
+            // [HYBRID-PROTOCOL-MARKING-V7] 역할 및 신분 동시 각인
             let head_count = k.dim(1)?;
             let is_already_2b = head_count >= 16;
             
-            // 배율 및 트랜스포즈 정보 준비
+            let mut k_marked = k.to_dtype(DType::F32)?;
+            let mut v_marked = v.to_dtype(DType::F32)?;
+
             let hybrid_parts = if is_already_2b { 1.0 } else { 2.0 };
             let needs_transpose = self.needs_transpose; 
-
-            // [V6-ENCODING] 1.0 + 신분(0.2/0.0) + 배율(0.0001) + 트랜스포즈(0.000000001)
-            let identity_offset = if is_already_2b { 0.2 } else { 0.0 };
             let trans_flag = if needs_transpose { 1.0 } else { 0.0 };
-            
-            let marker = -(1.0 + identity_offset + (hybrid_parts * 0.0001) + (trans_flag * 0.000000001));
-            
-            println!("[HYBRID-ENCODER-V6] Layer {} | ID={} (2B={}), Parts={}, Trans={}", 
-                self.layer_idx, if is_already_2b { "2B" } else { "0.6B" }, is_already_2b, hybrid_parts, needs_transpose);
-            println!("  -> Generated Protocol Marker: {:.10}", marker);
+            let identity_offset = if is_already_2b { 0.02 } else { 0.0 };
 
+            // [V7-ENCODING] 1.0 + [Role: LHS=0.1, RHS=0.0] + [Identity: 2B=0.02, 0.6B=0.0] + [Meta...]
+            let marker_k = -(1.0 + 0.1 + identity_offset + (hybrid_parts * 0.0001) + (trans_flag * 0.000000001));
+            let marker_v = -(1.0 + 0.0 + identity_offset + (hybrid_parts * 0.0001) + (trans_flag * 0.000000001));
+            
+            if self.layer_idx == 0 {
+                println!("[HYBRID-ENCODER-V7] Layer {} | Mode={} (2B={})", 
+                    self.layer_idx, if is_already_2b { "2B" } else { "0.6B" }, is_already_2b);
+                println!("  -> K-Marker (LHS): {:.10}", marker_k);
+                println!("  -> V-Marker (RHS): {:.10}", marker_v);
+            }
+
+            // K와 V의 첫 번째 요소에 각각 마커 주입
             let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
-            k_data[0] = marker as f32;
+            k_data[0] = marker_k as f32;
             k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?;
 
+            let mut v_data = v_marked.flatten_all()?.to_vec1::<f32>()?;
+            v_data[0] = marker_v as f32;
+            v_marked = Tensor::from_vec(v_data, v.shape(), &Device::Cpu)?;
+
             let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k_marked)?;
-            let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v.to_dtype(DType::F32)?)?;
+            let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v_marked)?;
             
             map.insert("k_anchors".to_string(), k_anchors);
             map.insert("k_packed".to_string(), k_packed);
@@ -754,86 +763,59 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [HYBRID-HANDSHAKE-V5] Singular High-Precision Restoration Path
+        // [HYBRID-HANDSHAKE-V7] Role-Aware Restoration
         let engine_dtype = k.dtype();
         let k_f32 = k.to_dtype(DType::F32)?;
         let v_f32 = v.to_dtype(DType::F32)?;
-        let (_b, h, actual_k_len, d) = k_f32.dims4()?;
-        
-        let target_heads = self.num_key_value_heads;
-        let target_dim = self.head_dim;
         
         let k_vec = k_f32.flatten_all()?.to_vec1::<f32>()?;
-        let sig = k_vec[0];
+        let v_vec = v_f32.flatten_all()?.to_vec1::<f32>()?;
+        let sig_k = k_vec[0];
+        let sig_v = v_vec[0];
         
-        if sig < -1.0 {
-            let val = sig.abs() - 1.0;
+        if sig_k < -1.0 {
+            let val_k = sig_k.abs() - 1.0;
             
-            // [V6-DECODING] 1~2번째 자리: 신분 (0.2=2B, 0.0=0.6B)
-            let identity_val = (val * 10.0).round() as usize; 
-            let is_actually_2b = identity_val >= 2;
+            // [V7-DECODING] 1번째 자리: 역할 (0.1=LHS, 0.0=RHS), 2번째 자리: 신분 (0.02=2B, 0.00=0.6B)
+            let role_k = ((val_k * 10.0).round() as usize) % 10;
+            let identity_k = ((val_k * 100.0).round() as usize) % 10;
+            let is_actually_2b = identity_k >= 2;
             
-            // 4번째 자리: 배율 (multiplier)
-            let multiplier = (((val * 10000.0).round() as usize) % 100).max(1);
-            
-            // 9번째 자리: 트랜스포즈 (transpose)
-            let trans_val = ((val * 1000000000.0).round() as usize) % 10;
+            let multiplier = (((val_k * 10000.0).round() as usize) % 100).max(1);
+            let trans_val = ((val_k * 1000000000.0).round() as usize) % 10;
             let needs_retranspose = trans_val == 1;
             
-            // [HYBRID-HANDSHAKE-SUCCESS] V6 신분 판별
-            if is_actually_2b {
-                self.is_handshake_active = true;
-                println!("[HYBRID-V6] Identity: 2B (Verified). Handshake Bypassed. Layer {}", self.layer_idx);
-            } else {
-                self.is_handshake_active = true; // 복원 시작하므로 true로 설정
-                println!("[HYBRID-V6] Identity: 0.6B (Restoring to 2B). Layer {}: x{} Factor, Trans={}", self.layer_idx, multiplier, needs_retranspose);
+            if self.layer_idx == 0 {
+                println!("[HYBRID-V7] Identity: {} (Verified), Role_K={}, Identity_K={}, Multiplier={}", 
+                    if is_actually_2b { "2B" } else { "0.6B" }, role_k, identity_k, multiplier);
             }
-            
-            // Marker Healing
-            let mut k_clean = k_vec.clone();
-            k_clean[0] = k_vec[1]; 
-            let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
-            
-            let mut k_final = k_healed;
-            let mut v_final = v_f32;
 
-            // 0.6B인 경우만 확장 로직 수행
-            if !is_actually_2b && multiplier > 1 {
-                println!("[HYBRID-V6] Upscaling 0.6B -> 2B for Layer {}: x{} Factor", self.layer_idx, multiplier);
-                // ... (이후 확장 로직은 동일)
-                
-                if h < target_heads {
-                    let mut k_parts = Vec::new(); let mut v_parts = Vec::new();
-                    for _ in 0..multiplier { k_parts.push(k_final.clone()); v_parts.push(v_final.clone()); }
-                    k_final = Tensor::cat(&k_parts, 1)?;
-                    v_final = Tensor::cat(&v_parts, 1)?;
-                } else if d < target_dim {
-                    let mut k_parts = Vec::new(); let mut v_parts = Vec::new();
-                    for _ in 0..multiplier { k_parts.push(k_final.clone()); v_parts.push(v_final.clone()); }
-                    k_final = Tensor::cat(&k_parts, D::Minus1)?;
-                    v_final = Tensor::cat(&v_parts, D::Minus1)?;
-                }
-                
-                // [THERMAL-BALANCING-V2] Prevent variance explosion
-                let scale = 0.70710678118; 
-                v_final = (v_final * scale)?;
+            // Marker Healing (K & V 둘 다 수행)
+            let mut k_clean = k_vec.clone(); k_clean[0] = k_vec[1];
+            let mut v_clean = v_vec.clone(); v_clean[0] = v_vec[1];
+            
+            let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
+            let v_healed = Tensor::from_vec(v_clean, v_f32.shape(), &Device::Cpu)?.to_device(v_f32.device())?;
+            
+            self.is_handshake_active = true;
+
+            // [STRICT-DIMENSION-ALIGNMENT-V3]
+            let mut k_final = k_healed;
+            let mut v_final = v_healed;
+            
+            let current_engine_dim = self.num_attention_heads * self.head_dim;
+            let loaded_dim = k_final.dim(D::Minus1)?;
+
+            if current_engine_dim == 2048 && loaded_dim == 1024 && !is_actually_2b {
+                println!("[HYBRID-V7-FORCE] Upscaling 0.6B -> 2B for Layer {}", self.layer_idx);
+                k_final = Tensor::cat(&[&k_final, &k_final], D::Minus1)?;
+                v_final = Tensor::cat(&[&v_final, &v_final], D::Minus1)?;
+                v_final = (v_final * 0.70710678118)?; // Thermal scaling
             }
             
             if needs_retranspose {
                 k_final = k_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
                 v_final = v_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
-            }
-
-            let mut k_final = k_final;
-            let mut v_final = v_final;
-            
-            // [LAYOUT-GUARD] Ensure SeqLen is at Dim 2, HeadDim at Dim 3
-            // Current shape: [B, H, ?, ?]. We expect [B, H, S, D]
-            let dims_k = k_final.dims4()?;
-            if dims_k.2 < dims_k.3 && dims_k.3 > 1000 {
-                // If Dim 3 looks like SeqLen, transpose to move it to Dim 2
-                k_final = k_final.transpose(2, 3)?.contiguous()?;
-                v_final = v_final.transpose(2, 3)?.contiguous()?;
             }
 
             let actual_k_len = k_final.dim(2)?;
@@ -843,10 +825,6 @@ impl QuantizedQwen3VLTextAttention {
             if final_len > 0 {
                 let k_out = k_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
                 let v_out = v_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
-                
-                // [STRICT-IDENTITY-MAINTENANCE] 16헤드 이상이면 핸드셰이크 성공으로 간주
-                if k_out.dim(1)? >= 16 { self.is_handshake_active = true; }
-                
                 self.kv_cache = Some((k_out, v_out));
             }
             return Ok(());
@@ -1134,20 +1112,19 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         xs_active = residual_active.add(&xs_active)?;
         
-        // [HYBRID-BRIDGE-BACK-V5]
-        // 0.6B 베이킹 엔진 결과(1024)만 2048로 확장하여 다음 레이어로 전달
-        let mut xs = if needs_bridge && xs_active.dim(candle_core::D::Minus1)? == 1024 {
+        // [HYBRID-BRIDGE-BACK-V7] 
+        // 0.6B 베이킹 엔진이고, 아직 핸드셰이크가 활성화되지 않았을 때만 명확히 확장 수행
+        let mut xs = if !is_handshake_active && norm_dim == 1024 && xs_active.dim(candle_core::D::Minus1)? == 1024 {
             Tensor::cat(&[&(xs_active.clone()), &xs_active], candle_core::D::Minus1)?.contiguous()?
         } else {
+            // 이미 2B이거나 핸드셰이크가 활성화된 상태라면 절대 확장하지 않음
             xs_active
         };
 
-        // [STRICT-DIMENSION-SAFEGUARD-V2]
-        // 엔진 모드와 상관없이, 출력이 2048을 초과하는 것은 하이브리드 설계상 비정상이므로 강제 캡핑
+        // [STRICT-DIMENSION-CHECK]
+        // 디버깅을 위한 체크 로직만 남기고, 무지성 narrow는 제거 (V7 프로토콜을 믿음)
         if xs.dim(D::Minus1)? > 2048 {
-            println!("[SAFEGUARD] Dimension overflow! Layer={}, InDim={}, NormDim={}, CurrentOut={}. Capping to 2048.", 
-                self.self_attn.layer_idx, input_dim, norm_dim, xs.dim(D::Minus1)?);
-            xs = xs.narrow(D::Minus1, 0, 2048)?.contiguous()?;
+             println!("[CRITICAL-WARN] Unexpected dimension expansion: {}. Check Handshake V7 status.", xs.dim(D::Minus1)?);
         }
         
         // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
@@ -1157,8 +1134,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
             // 1. Post-Attention Norm
             let mut xs_mlp = post_norm.forward(&xs)?;
             
-            // MLP 입구 브릿지
-            if needs_bridge && xs_mlp.dim(D::Minus1)? == 2048 {
+            // [STRICT-MLP-ENTRANCE-BRIDGE] 베이킹 모드 시 2048 -> 1024 Slicing 강제
+            if !is_handshake_active && norm_dim == 1024 && xs_mlp.dim(D::Minus1)? == 2048 {
                 xs_mlp = xs_mlp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
             }
             
@@ -1176,13 +1153,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let mut out = down_proj.forward(&hidden)?;
             
             // MLP 출구 브릿지 (0.6B 베이킹 전용)
-            if needs_bridge && out.dim(D::Minus1)? == 1024 {
+            if !is_handshake_active && norm_dim == 1024 && out.dim(D::Minus1)? == 1024 {
                 out = Tensor::cat(&[&(out.clone()), &out], D::Minus1)?.contiguous()?;
-            }
-
-            // [STRICT-DIMENSION-SAFEGUARD-MLP-V2]
-            if out.dim(D::Minus1)? > 2048 {
-                out = out.narrow(D::Minus1, 0, 2048)?.contiguous()?;
             }
             
             let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
