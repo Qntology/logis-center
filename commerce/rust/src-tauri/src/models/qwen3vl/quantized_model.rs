@@ -821,18 +821,22 @@ impl QuantizedQwen3VLTextAttention {
             
             self.is_handshake_active = true;
 
-            // [STRICT-DIMENSION-ALIGNMENT-V3]
+            // [STRICT-DIMENSION-ALIGNMENT-V4] 중복 확장 절대 방어
             let mut k_final = k_healed;
             let mut v_final = v_healed;
             
             let current_engine_dim = self.num_attention_heads * self.head_dim;
-            let loaded_dim = k_final.dim(D::Minus1)?;
+            let loaded_heads = k_final.dim(1)?;
+            let loaded_total_dim = loaded_heads * k_final.dim(D::Minus1)?;
 
-            if current_engine_dim == 2048 && loaded_dim == 1024 && !is_actually_2b {
-                println!("[HYBRID-V7-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
-                k_final = Tensor::cat(&[&k_final, &k_final], 1)?; // Dim 1 (Heads) 결합
-                v_final = Tensor::cat(&[&v_final, &v_final], 1)?; // Dim 1 (Heads) 결합
-                v_final = (v_final * 0.70710678118)?; // Thermal scaling
+            // [V9-GUARD] 이미 2B 규격이거나 마커가 2B면 확장을 건너뜀
+            if current_engine_dim == 2048 && loaded_total_dim < 2048 && !is_actually_2b {
+                println!("[HYBRID-V9-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
+                k_final = Tensor::cat(&[&k_final, &k_final], 1)?; 
+                v_final = Tensor::cat(&[&v_final, &v_final], 1)?; 
+                v_final = (v_final * 0.70710678118)?; 
+            } else if loaded_total_dim >= 2048 || is_actually_2b {
+                if self.layer_idx == 0 { println!("[HYBRID-V9] Skipping upscale: Data is already in 2B format."); }
             }
             
             if needs_retranspose {
@@ -1107,21 +1111,16 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
         
-        // [HYBRID-BRIDGE-V7] Handshake 프로토콜 기반의 완벽한 분기
-        // [RUNTIME-IDENTITY-RECOVERY] 데이터 차원을 보고 자신의 신분을 실시간으로 교정
-        if input_dim == 2048 && norm_dim == 1024 {
-            self.self_attn.is_handshake_active = true;
-        }
-        
+        // [DISK-MASTER-CONTROL] 장부(is_handshake_active)가 절대 권한을 가짐
         let is_handshake_active = self.self_attn.is_handshake_active;
-        let needs_bridge = !is_handshake_active && input_dim == 2048 && norm_dim == 1024;
         
-        let mut xs_active = if needs_bridge {
-            if self.self_attn.layer_idx == 0 { 
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| println!("[HYBRID-BRIDGE] Baking Engine Mode - Slicing 2048 -> 1024."));
-            }
-            xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
+        // [SYNC-GUARD] 장부는 2B인데 데이터가 1024라면, 여기서 즉시 확장 (동기화 대기 통과)
+        let mut xs_active = if is_handshake_active && input_dim == 1024 && norm_dim == 1024 {
+            if self.self_attn.layer_idx == 0 { println!("[DISK-SYNC] Config=2B, Data=1024. Performing mandatory upscale."); }
+            Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?
+        } else if input_dim > 2048 {
+            // 이미 2048을 넘었다면 중복 확장의 증거임. 안전하게 잘라냄.
+            xs.narrow(candle_core::D::Minus1, 0, 2048)?.contiguous()?
         } else {
             xs.clone()
         };
@@ -1764,6 +1763,12 @@ impl QuantizedQwen3VLTextModel {
             layer.self_attn.is_handshake_active = self.is_handshake_active;
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+
+            // [STRICT-SIGNAL-PROPAGATION] 레이어 0에서 신분 상승이 일어났다면 즉시 전파
+            if layer_idx == 0 && !self.is_handshake_active && layer.self_attn.is_handshake_active {
+                self.is_handshake_active = true;
+                println!("[DISK-MASTER] Layer 0 Handshake successful. Global State -> 2B.");
+            }
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -2027,6 +2032,8 @@ impl QuantizedQwen3VLTextModel {
                 }
                 if let Some(active) = meta.get("is_handshake_active").and_then(|v| v.as_bool()) {
                     self.is_handshake_active = active;
+                    // [DISK-MASTER-SYNC] 모든 레이어에 즉시 명령 하달
+                    for l in &mut self.layers { l.self_attn.is_handshake_active = active; }
                     println!("[DISK-BRAIN] Restored Handshake state: {}", self.is_handshake_active);
                 }
             }
