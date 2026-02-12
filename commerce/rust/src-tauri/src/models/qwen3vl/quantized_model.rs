@@ -645,27 +645,28 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V7] 역할 및 신분 동시 각인
+            // [HYBRID-PROTOCOL-MARKING-V8] Safe-Precision Guard Encoding
             let head_count = k.dim(1)?;
             let is_already_2b = head_count >= 16;
             
             let mut k_marked = k.to_dtype(DType::F32)?;
             let mut v_marked = v.to_dtype(DType::F32)?;
 
-            let hybrid_parts = if is_already_2b { 1.0 } else { 2.0 };
-            let needs_transpose = self.needs_transpose; 
-            let trans_flag = if needs_transpose { 1.0 } else { 0.0 };
-            let identity_offset = if is_already_2b { 0.02 } else { 0.0 };
-
-            // [V7-ENCODING] 1.0 + [Role: LHS=0.1, RHS=0.0] + [Identity: 2B=0.02, 0.6B=0.0] + [Meta...]
-            let marker_k = -(1.0 + 0.1 + identity_offset + (hybrid_parts * 0.0001) + (trans_flag * 0.000000001));
-            let marker_v = -(1.0 + 0.0 + identity_offset + (hybrid_parts * 0.0001) + (trans_flag * 0.000000001));
+            let multiplier = if is_already_2b { 1.0 } else { 2.0 };
+            let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
+            let identity_id = if is_already_2b { 2.0 } else { 0.0 };
+            let role_id_k = 1.0; // K는 LHS(1)
+            let role_id_v = 0.0; // V는 RHS(0)
+            
+            // [V8-ENCODING] 1.0 + R(0.1) + I(0.01) + M(0.001) + T(0.0001) + Guard(0.00005)
+            let marker_k = -(1.0 + (role_id_k * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
+            let marker_v = -(1.0 + (role_id_v * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
             
             if self.layer_idx == 0 {
-                println!("[HYBRID-ENCODER-V7] Layer {} | Mode={} (2B={})", 
-                    self.layer_idx, if is_already_2b { "2B" } else { "0.6B" }, is_already_2b);
-                println!("  -> K-Marker (LHS): {:.10}", marker_k);
-                println!("  -> V-Marker (RHS): {:.10}", marker_v);
+                println!("[HYBRID-ENCODER-V8] Layer 0 | ID={} (2B={}), Parts={}, Trans={}", 
+                    if is_already_2b { "2B" } else { "0.6B" }, is_already_2b, multiplier, self.needs_transpose);
+                println!("  -> K-Marker (Safe-V8): {:.6}", marker_k);
+                println!("  -> V-Marker (Safe-V8): {:.6}", marker_v);
             }
 
             // K와 V의 첫 번째 요소에 각각 마커 주입
@@ -777,18 +778,18 @@ impl QuantizedQwen3VLTextAttention {
         if sig_k < -1.0 {
             let val_k = sig_k.abs() - 1.0;
             
-            // [V7-DECODING] 1번째 자리: 역할 (0.1=LHS, 0.0=RHS), 2번째 자리: 신분 (0.02=2B, 0.00=0.6B)
-            let role_k = ((val_k * 10.0).round() as usize) % 10;
-            let identity_k = ((val_k * 100.0).round() as usize) % 10;
-            let is_actually_2b = identity_k >= 2;
+            // [V8-DECODING] Guard Digit 덕분에 매우 깔끔하게 추출 가능
+            let role_k = ((val_k * 10.0).floor() as usize) % 10;
+            let identity_k = ((val_k * 100.0).floor() as usize) % 10;
+            let multiplier = ((val_k * 1000.0).floor() as usize) % 10;
+            let trans_val = ((val_k * 10000.0).floor() as usize) % 10;
             
-            let multiplier = (((val_k * 10000.0).round() as usize) % 100).max(1);
-            let trans_val = ((val_k * 1000000000.0).round() as usize) % 10;
+            let is_actually_2b = identity_k >= 2;
             let needs_retranspose = trans_val == 1;
             
             if self.layer_idx == 0 {
-                println!("[HYBRID-V7] Identity: {} (Verified), Role_K={}, Identity_K={}, Multiplier={}", 
-                    if is_actually_2b { "2B" } else { "0.6B" }, role_k, identity_k, multiplier);
+                println!("[HYBRID-V8] Verified Identity: {} (Role_K={}, Multiplier={}, Trans={})", 
+                    if is_actually_2b { "2B" } else { "0.6B" }, role_k, multiplier, needs_retranspose);
             }
 
             // Marker Healing (K & V 둘 다 수행)
