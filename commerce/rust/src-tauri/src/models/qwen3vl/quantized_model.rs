@@ -778,18 +778,22 @@ impl QuantizedQwen3VLTextAttention {
         if sig_k < -1.0 {
             let val_k = sig_k.abs() - 1.0;
             
-            // [V8-DECODING] Guard Digit 덕분에 매우 깔끔하게 추출 가능
-            let role_k = ((val_k * 10.0).floor() as usize) % 10;
-            let identity_k = ((val_k * 100.0).floor() as usize) % 10;
-            let multiplier = ((val_k * 1000.0).floor() as usize) % 10;
-            let trans_val = ((val_k * 10000.0).floor() as usize) % 10;
+            // [V8-DECODING] Guard Digit(5) 덕분에 반올림이 가장 안전함
+            let role_k = ((val_k * 10.0).round() as usize) % 10;
+            let identity_k = ((val_k * 100.0).round() as usize) % 10;
+            let multiplier_raw = ((val_k * 1000.0).round() as usize) % 10;
+            let trans_val = ((val_k * 10000.0).round() as usize) % 10;
             
+            // 신분 판별 (identity_k가 2에 가까우면 2B)
             let is_actually_2b = identity_k >= 2;
             let needs_retranspose = trans_val == 1;
             
+            // [HYBRID-V8-SPEC] 0.6B이면 무조건 2배, 2B면 무조건 1배 강제
+            let multiplier = if is_actually_2b { 1 } else { 2 };
+            
             if self.layer_idx == 0 {
-                println!("[HYBRID-V8] Verified Identity: {} (Role_K={}, Multiplier={}, Trans={})", 
-                    if is_actually_2b { "2B" } else { "0.6B" }, role_k, multiplier, needs_retranspose);
+                println!("[HYBRID-V8] Verified: {} Mode, Role_K={}, Identity_K={}, Mult={}, Trans={}", 
+                    if is_actually_2b { "2B" } else { "0.6B" }, role_k, identity_k, multiplier, needs_retranspose);
             }
 
             // Marker Healing (K & V 둘 다 수행)
