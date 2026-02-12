@@ -644,17 +644,15 @@ impl QuantizedQwen3VLTextAttention {
 
         let mut map = HashMap::new();
 
-        if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V8] 역할 및 신분 동시 각인
+            // [HYBRID-PROTOCOL-MARKING-V9] High-Margin Identity Encoding
             let head_count = k.dim(1)?;
-            let is_actually_2b_specs = head_count >= 16;
+            let head_dim = k.dim(D::Minus1)?;
+            let current_total_dim = head_count * head_dim;
             
-            // [STRICT-STORAGE-UPSCALING] 만약 신분은 2B인데 데이터가 아직 1024라면, 저장 직전에 물리적 확장
-            // 이렇게 해야 나중에 DiskSwap으로 다시 읽을 때 순정 2048 규격으로 로드됨
-            let (mut k_final, mut v_final) = if !is_actually_2b_specs && self.is_handshake_active {
-                if self.layer_idx == 0 { println!("[HYBRID-SAVE] Physically upscaling 1024 -> 2048 before SSD commit."); }
-                let k_up = Tensor::cat(&[k, k], D::Minus1)?;
-                let v_up = Tensor::cat(&[v, v], D::Minus1)?;
+            let (mut k_final, mut v_final) = if current_total_dim == 1024 && self.is_handshake_active {
+                if self.layer_idx == 0 { println!("[HYBRID-SAVE] Physically upscaling Heads 8 -> 16 before SSD commit."); }
+                let k_up = Tensor::cat(&[k, k], 1)?; 
+                let v_up = Tensor::cat(&[v, v], 1)?; 
                 (k_up, (v_up * 0.70710678118)?)
             } else {
                 (k.clone(), v.clone())
@@ -662,12 +660,26 @@ impl QuantizedQwen3VLTextAttention {
 
             let mut k_marked = k_final.to_dtype(DType::F32)?;
             let mut v_marked = v_final.to_dtype(DType::F32)?;
-            let final_head_count = k_final.dim(1)?;
-            let is_stored_as_2b = final_head_count >= 16;
+            
+            let final_total_dim = k_final.dim(1)? * k_final.dim(D::Minus1)?;
+            let is_stored_as_2b = final_total_dim >= 2048;
 
             let multiplier = if is_stored_as_2b { 1.0 } else { 2.0 };
             let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
-            let identity_id = if is_stored_as_2b { 2.0 } else { 0.0 };
+            
+            // [V9-IDENTITY-MARGIN] 2B=4.0, 0.6B=1.0 (제안된 간격 벌리기 적용)
+            let identity_id = if is_stored_as_2b { 4.0 } else { 1.0 };
+            let role_id_k = 1.0; 
+            let role_id_v = 0.0; 
+            
+            let marker_k = -(1.0 + (role_id_k * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
+            let marker_v = -(1.0 + (role_id_v * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
+            
+            if self.layer_idx == 0 {
+                println!("[HYBRID-ENCODER-V9] Layer 0 | ID={} (2B={}), Parts={}, Trans={}", 
+                    if is_stored_as_2b { "2B" } else { "0.6B" }, is_stored_as_2b, multiplier, self.needs_transpose);
+                println!("  -> K-Marker (Safe-V9): {:.6}", marker_k);
+            }
             
             // [V8-ENCODING]
             let marker_k = -(1.0 + 0.1 + identity_id * 0.01 + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
@@ -781,22 +793,22 @@ impl QuantizedQwen3VLTextAttention {
         if sig_k < -1.0 {
             let val_k = sig_k.abs() - 1.0;
             
-            // [V8-DECODING] Guard Digit(5) 덕분에 반올림이 가장 안전함
+            // [V9-DECODING] 1번째 자리: 역할, 2번째 자리: 신분(4=2B, 1=0.6B)
             let role_k = ((val_k * 10.0).round() as usize) % 10;
             let identity_k = ((val_k * 100.0).round() as usize) % 10;
             let multiplier_raw = ((val_k * 1000.0).round() as usize) % 10;
             let trans_val = ((val_k * 10000.0).round() as usize) % 10;
             
-            // 신분 판별 (identity_k가 2에 가까우면 2B)
-            let is_actually_2b = identity_k >= 2;
+            // [V9-THRESHOLD] 3을 기준으로 신분 판별 (4 vs 1의 안전한 중간지점)
+            let is_actually_2b = identity_k >= 3;
             let needs_retranspose = trans_val == 1;
             
-            // [HYBRID-V8-SPEC] 0.6B이면 무조건 2배, 2B면 무조건 1배 강제
+            // [HYBRID-V9-SPEC] 명시적 규격 강제
             let multiplier = if is_actually_2b { 1 } else { 2 };
             
             if self.layer_idx == 0 {
-                println!("[HYBRID-V8] Verified: {} Mode, Role_K={}, Identity_K={}, Mult={}, Trans={}", 
-                    if is_actually_2b { "2B" } else { "0.6B" }, role_k, identity_k, multiplier, needs_retranspose);
+                println!("[HYBRID-V9] Verified: {} Mode (ID_Digit={}), Role_K={}, Mult={}, Trans={}", 
+                    if is_actually_2b { "2B" } else { "0.6B" }, identity_k, role_k, multiplier, needs_retranspose);
             }
 
             // Marker Healing (K & V 둘 다 수행)
@@ -816,9 +828,9 @@ impl QuantizedQwen3VLTextAttention {
             let loaded_dim = k_final.dim(D::Minus1)?;
 
             if current_engine_dim == 2048 && loaded_dim == 1024 && !is_actually_2b {
-                println!("[HYBRID-V7-FORCE] Upscaling 0.6B -> 2B for Layer {}", self.layer_idx);
-                k_final = Tensor::cat(&[&k_final, &k_final], D::Minus1)?;
-                v_final = Tensor::cat(&[&v_final, &v_final], D::Minus1)?;
+                println!("[HYBRID-V7-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
+                k_final = Tensor::cat(&[&k_final, &k_final], 1)?; // Dim 1 (Heads) 결합
+                v_final = Tensor::cat(&[&v_final, &v_final], 1)?; // Dim 1 (Heads) 결합
                 v_final = (v_final * 0.70710678118)?; // Thermal scaling
             }
             
