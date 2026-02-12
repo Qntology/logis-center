@@ -1116,7 +1116,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             if let Some(session_id) = &self.self_attn.active_session_id {
                 let signal_path = crate::utils::paths::get_kv_dir(None).join(session_id).join("HANDSHAKE_2B");
                 if signal_path.exists() {
-                    if layer_idx == 0 { println!("[STOP-AND-GO] 2B Signal File detected. Upgrading Identity."); }
+                    if self.self_attn.layer_idx == 0 { println!("[STOP-AND-GO] 2B Signal File detected. Upgrading Identity."); }
                     self.self_attn.is_handshake_active = true;
                 }
             }
@@ -1970,7 +1970,6 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-        // [STRICT-IO] Ensure the directory exists with absolute path reliability
         let mut final_path = path.to_path_buf();
         if !final_path.is_absolute() {
             if let Ok(current) = std::env::current_dir() {
@@ -1978,20 +1977,40 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
+        // [STRICT-IO] Ensure the directory exists
         if !final_path.exists() {
             std::fs::create_dir_all(&final_path)
                 .map_err(|e| anyhow!("Failed to create KV directory {:?}: {}", final_path, e))?;
         }
         
+        let session_id = self.active_session_id.as_deref().unwrap_or("default").replace("/", "_");
+        
         println!("[SSD-BRIDGE] Saving {} layers to ABSOLUTE directory: {:?}", self.layers.len(), final_path);
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            // [STRICT-ALIGN] Use consistent filename 'layer_{}_kv.safetensors' implicitly by passing the directory
+            // 1. KV 텐서 저장
             layer.save_kv_cache(&final_path, clear, block_size)
                 .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, final_path, e))?;
+
+            // 2. [DISK-BRAIN] 레이어별 독립 핸드쉐이크 파일 생성
+            let handshake_name = format!("handshake_{}_L{}.json", session_id, i);
+            let handshake_path = final_path.join(handshake_name);
+            
+            let metadata = serde_json::json!({
+                "layer_idx": i,
+                "session_id": session_id,
+                "is_handshake_active": self.is_handshake_active,
+                "hidden_size": if self.is_handshake_active { 2048 } else { 1024 },
+                "current_kv_len": self.current_kv_len,
+                "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            });
+
+            if let Ok(f) = std::fs::File::create(&handshake_path) {
+                let _ = serde_json::to_writer_pretty(f, &metadata);
+            }
         }
 
-        // [DISK-BRAIN] Save logical progress and Handshake state to JSON for OOM recovery
+        // [DISK-BRAIN] Save overall metadata for OOM recovery
         let metadata_path = final_path.join("metadata.json");
         let metadata = serde_json::json!({
             "current_kv_len": self.current_kv_len,
@@ -2013,15 +2032,13 @@ impl QuantizedQwen3VLTextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
         if !path.exists() { return Ok(()); }
         
-        let session_id = path.file_name().unwrap().to_string_lossy().to_string();
-        // [ISOLATION-FIX] Use a separate sub-folder for inference-time swapping to protect original seeds
-        let inference_session_id = format!("{}/inference", session_id);
-        self.active_session_id = Some(inference_session_id.clone());
+        let raw_session_id = path.file_name().unwrap().to_string_lossy().to_string();
+        let inference_session_id = format!("{}/inference", raw_session_id);
+        let safe_session_id = inference_session_id.replace("/", "_");
         
-        // [SESSION-ID-PROPAGATION] 모든 레이어에 세션 식별자 하달
+        self.active_session_id = Some(inference_session_id.clone());
         for l in &mut self.layers { l.self_attn.active_session_id = Some(inference_session_id.clone()); }
 
-        // [ZERO-PREFILL-V2] Prioritize inference progress over baked snapshot
         let inference_path = crate::utils::paths::get_kv_dir(None).join(&inference_session_id);
         let l0_inference_file = inference_path.join("layer_0_kv.safetensors");
         let l0_baked_file = path.join("layer_0_kv.safetensors");
@@ -2034,26 +2051,31 @@ impl QuantizedQwen3VLTextModel {
             return Err(anyhow!("No KV seed found at {:?} or {:?}", l0_baked_file, l0_inference_file));
         };
 
-        if is_resuming_inference {
-            println!("[ZERO-PREFILL-RESUME] Found ongoing progress in {:?}. Resuming...", actual_load_path);
-        } else {
-            println!("[ZERO-PREFILL-START] Starting from baked snapshot at {:?}.", actual_load_path);
-        }
-
-        // [DISK-BRAIN-RECALL] Restore logical progress from JSON
+        // [DISK-BRAIN-RECALL] Restore logical progress and HANDSHAKE from JSON
         let metadata_path = actual_load_path.join("metadata.json");
         if metadata_path.exists() {
             if let Ok(file) = std::fs::File::open(&metadata_path) {
                 let meta: serde_json::Value = serde_json::from_reader(file).unwrap_or(serde_json::json!({}));
                 if let Some(len) = meta.get("current_kv_len").and_then(|v| v.as_u64()) {
                     self.current_kv_len = len as usize;
-                    println!("[DISK-BRAIN] Recalled progress from SSD: {} tokens.", self.current_kv_len);
                 }
                 if let Some(active) = meta.get("is_handshake_active").and_then(|v| v.as_bool()) {
                     self.is_handshake_active = active;
-                    // [DISK-MASTER-SYNC] 모든 레이어에 즉시 명령 하달
                     for l in &mut self.layers { l.self_attn.is_handshake_active = active; }
-                    println!("[DISK-BRAIN] Restored Handshake state: {}", self.is_handshake_active);
+                }
+            }
+        }
+
+        // [GLOBAL-HANDSHAKE-SYNC] 레이어 0의 전용 핸드쉐이크 파일이 있다면 최우선 적용
+        let l0_handshake = actual_load_path.join(format!("handshake_{}_L0.json", safe_session_id));
+        if l0_handshake.exists() {
+            if let Ok(content) = std::fs::read_to_string(&l0_handshake) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if val["is_handshake_active"].as_bool().unwrap_or(false) {
+                        self.is_handshake_active = true;
+                        for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
+                        println!("[HYBRID-SYNC] Global Handshake activated from L0 signal file.");
+                    }
                 }
             }
         }
@@ -2072,62 +2094,35 @@ impl QuantizedQwen3VLTextModel {
         let can_pin = if layer_kv_cost > 0 { (available_for_kv / layer_kv_cost) as usize } else { 0 };
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
-        // [ZERO-PREFILL-BRIDGE] Load the primary seed layer (Layer 0)
+        // [ZERO-PREFILL-BRIDGE] Load Layer 0 with verified handshake status
         self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len, self.is_handshake_active)?;
         
-        // [FIX] Update logical progress and Handshake state immediately
         self.current_kv_len = self.layers[0].get_kv_len();
         self.is_handshake_active = self.layers[0].self_attn.is_handshake_active;
         let is_restored = self.is_handshake_active;
 
-        // [STRICT-IDENTITY-COMMIT] 만약 레이어 0 로드 후 신분이 복원되었다면, 이를 디스크에 즉시 커밋
-        // 이렇게 해야 DiskSwap으로 나중에 로드될 레이어들이 업데이트된 신분을 읽을 수 있음
         if is_restored {
-            let metadata_path = actual_load_path.join("metadata.json");
-            let metadata = serde_json::json!({
-                "current_kv_len": self.current_kv_len,
-                "is_handshake_active": true,
-                "timestamp": chrono::Utc::now().timestamp()
-            });
-            if let Ok(file) = std::fs::File::create(&metadata_path) {
-                let _ = serde_json::to_writer(file, &metadata);
-                println!("[DISK-BRAIN] Handshake success COMMITTED to metadata.json.");
-            }
+            for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
         }
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
             .ok_or_else(|| anyhow!("Failed to load seed KV cache from {:?}", actual_load_path))?.clone();
 
-        // Create inference workspace
         let inference_workspace = crate::utils::paths::get_kv_dir(None).join(self.active_session_id.as_ref().unwrap());
-        if !inference_workspace.exists() {
-            std::fs::create_dir_all(&inference_workspace)?;
-        }
+        if !inference_workspace.exists() { std::fs::create_dir_all(&inference_workspace)?; }
 
         for i in 0..self.layers.len() {
             let is_pinned = i < self.pinned_layer_count;
-            
             if i > 0 {
-                // [STRICT-UPScale-PROPAGATION] 레이어 0에서 복원된 2048 데이터를 모든 레이어에 전파
                 self.layers[i].self_attn.kv_cache = Some((k_seed.clone(), v_seed.clone()));
                 self.layers[i].self_attn.is_handshake_active = is_restored;
             }
-
             if self.is_disk_swap {
-                // [STRICT-DISK-SYNC] 복원된 2048 데이터를 SSD에 즉시 커밋
-                // 이렇게 해야 나중에 레이어가 개별적으로 로드될 때 1024가 아닌 2048을 읽음
-                let layer_name = format!("layer_{}_kv.safetensors", i);
-                let layer_file_path = inference_workspace.join(layer_name);
-                
-                // 만약 핀에 꽂혀있지 않다면 저장 후 메모리 해제하여 VRAM 확보
                 self.layers[i].save_kv_cache(&inference_workspace, !is_pinned, 1024)?;
             }
         }
 
-        if self.is_disk_swap {
-            println!("[SSD-BRIDGE] Zero-Prefill + Isolation Active. Pinning {}/{} layers. Swap workspace: {:?}", 
-                self.pinned_layer_count, self.layers.len(), inference_workspace);
-        }
+        println!("[SSD-BRIDGE] KV Restore Complete. Handshake: {}, Pinned: {}/{}", is_restored, self.pinned_layer_count, self.layers.len());
         Ok(())
     }
 
