@@ -204,7 +204,8 @@ pub struct QuantizedQwen3VLTextAttention {
     pub layer_idx: usize,
     pub hybrid_parts: f64,
     pub needs_transpose: bool,
-    pub is_handshake_active: bool, // [NEW] Handshake Protocol 성공 여부를 영구 저장
+    pub is_handshake_active: bool, 
+    pub active_session_id: Option<String>, // [NEW] 병렬 세션 식별용
 }
 
 impl QuantizedQwen3VLTextAttention {
@@ -303,6 +304,7 @@ impl QuantizedQwen3VLTextAttention {
             hybrid_parts,
             needs_transpose,
             is_handshake_active: false, // Default to inactive
+            active_session_id: None,
         })
     }
 
@@ -1108,11 +1110,21 @@ impl QuantizedQwen3VLTextDecoderLayer {
              None
         };
 
+        // [STOP-AND-GO: DISK-SIGNAL-CHECK]
+        // 장부(is_handshake_active)가 false인 경우에만 디스크에서 신호 파일 재확인
+        if !self.self_attn.is_handshake_active {
+            if let Some(session_id) = &self.self_attn.active_session_id {
+                let signal_path = crate::utils::paths::get_kv_dir(None).join(session_id).join("HANDSHAKE_2B");
+                if signal_path.exists() {
+                    if layer_idx == 0 { println!("[STOP-AND-GO] 2B Signal File detected. Upgrading Identity."); }
+                    self.self_attn.is_handshake_active = true;
+                }
+            }
+        }
+
+        let is_handshake_active = self.self_attn.is_handshake_active;
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
-        
-        // [DISK-MASTER-CONTROL] 장부(is_handshake_active)가 절대 권한을 가짐
-        let is_handshake_active = self.self_attn.is_handshake_active;
         
         // [SYNC-GUARD] 장부는 2B인데 데이터가 1024라면, 여기서 즉시 확장 (동기화 대기 통과)
         let mut xs_active = if is_handshake_active && input_dim == 1024 && norm_dim == 1024 {
@@ -1764,10 +1776,14 @@ impl QuantizedQwen3VLTextModel {
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
 
-            // [STRICT-SIGNAL-PROPAGATION] 레이어 0에서 신분 상승이 일어났다면 즉시 전파
+            // [STRICT-SIGNAL-PROPAGATION] 레이어 0에서 신분 상승이 일어났다면 즉시 전파 및 신호 파일 생성
             if layer_idx == 0 && !self.is_handshake_active && layer.self_attn.is_handshake_active {
                 self.is_handshake_active = true;
-                println!("[DISK-MASTER] Layer 0 Handshake successful. Global State -> 2B.");
+                if let Some(session_id) = &self.active_session_id {
+                    let signal_path = crate::utils::paths::get_kv_dir(None).join(session_id).join("HANDSHAKE_2B");
+                    let _ = std::fs::File::create(signal_path); // 깃발 꽂기
+                    println!("[DISK-MASTER] 2B Signal File RAISED. All layers authorized for Large mode.");
+                }
             }
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
@@ -2001,6 +2017,9 @@ impl QuantizedQwen3VLTextModel {
         // [ISOLATION-FIX] Use a separate sub-folder for inference-time swapping to protect original seeds
         let inference_session_id = format!("{}/inference", session_id);
         self.active_session_id = Some(inference_session_id.clone());
+        
+        // [SESSION-ID-PROPAGATION] 모든 레이어에 세션 식별자 하달
+        for l in &mut self.layers { l.self_attn.active_session_id = Some(inference_session_id.clone()); }
 
         // [ZERO-PREFILL-V2] Prioritize inference progress over baked snapshot
         let inference_path = crate::utils::paths::get_kv_dir(None).join(&inference_session_id);
