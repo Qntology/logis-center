@@ -136,6 +136,7 @@ pub enum ModelSize {
 
 #[derive(Clone)]
 pub struct LogisModel {
+    pub app_handle: tauri::AppHandle, // [NEW] Added handle
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
     pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
     pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
@@ -156,24 +157,16 @@ pub struct LogisModel {
 
 impl LogisModel {
     pub async fn unload_generator(&self) {
-        // Clear everything
-        let mut gen = self.generator.lock().await;
-        *gen = None;
-        let mut s_hib = self.small_hibernation.lock().await;
-        *s_hib = None;
-        let mut l_hib = self.large_hibernation.lock().await;
-        *l_hib = None;
-        
-        let mut size = self.current_size.lock().await;
-        *size = None;
-        println!("[MODEL] All generators (Active & Hibernated) destroyed.");
+        // [FACTORY-RESET-V20] Clear everything aggressively
+        self.deep_purge_resources().await;
     }
 
     pub async fn unload_embedding(&self) {
         let mut emb = self.embedding_model.lock().await;
         if emb.is_some() {
             *emb = None;
-            println!("[MODEL] Embedding Model unloaded to free VRAM.");
+            println!("[MODEL] Embedding Model unloaded.");
+            self.deep_purge_resources().await;
         }
     }
 
@@ -205,39 +198,68 @@ impl LogisModel {
         }
     }
 
-    /// [CLEANUP] Adaptive resource management based on system stress
+    /// [CLEANUP] Aggressive Factory Reset Purge (Ported from backup-rust)
     pub async fn deep_purge_resources(&self) {
+        println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
+        
+        // 1. Clear ALL Slots (Explicitly take and drop everything)
+        {
+            let mut gen = self.generator.lock().await;
+            if let Some(mut g) = gen.take() {
+                let _ = g.clear_kv_cache();
+                drop(g); 
+            }
+        }
+        {
+            let mut s_hib = self.small_hibernation.lock().await;
+            if let Some(g) = s_hib.take() { drop(g); }
+        }
+        {
+            let mut l_hib = self.large_hibernation.lock().await;
+            if let Some(g) = l_hib.take() { drop(g); }
+        }
+        {
+            let mut emb = self.embedding_model.lock().await;
+            if let Some(e) = emb.take() { drop(e); }
+        }
+        {
+            let mut size = self.current_size.lock().await;
+            *size = None;
+        }
+
+        // 2. CUDA Force Sync & Driver-level GC
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                // Ignore sync errors if context is already gone
-                if dev.is_cuda() { let _ = dev.synchronize(); }
+                if dev.is_cuda() { 
+                    // Repeat sync to force driver garbage collection
+                    for _ in 0..3 {
+                        let _ = dev.synchronize(); 
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
             }).await;
         }
 
-        // 1. Clear Active Slots
-        if let Ok(mut gen) = self.generator.try_lock() { *gen = None; }
-        if let Ok(mut s_hib) = self.small_hibernation.try_lock() { *s_hib = None; }
-        if let Ok(mut l_hib) = self.large_hibernation.try_lock() { *l_hib = None; }
-        
-        // 2. [CRITICAL-FIX] OS RAM/VRAM Flush
+        // 3. [CRITICAL] OS Working Set Flush (Windows API)
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
-            // 강제로 Working Set을 비워 OS가 VRAM/RAM을 즉시 수거하게 함
+            // Force return all physical RAM back to OS
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
-        
-        println!("[MEMORY] Deep Purge Complete. VRAM/RAM released to OS.");
+
+        println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
+    // --- [NEW] VRAM Settlement Monitor (Ported from backup-rust) ---
     async fn wait_for_vram_settle(&self, target_free_mb: u64, timeout_sec: u64, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         if self.is_cpu_mode { return Ok(()); } 
 
-        println!("[VRAM-WATCH] Monitoring VRAM (Target > {} MB)...", target_free_mb);
+        println!("[VRAM-WATCH] Monitoring VRAM recovery (Target > {} MB)...", target_free_mb);
         let start = Instant::now();
         let target_bytes = target_free_mb * 1024 * 1024;
         let mut last_free = 0;
@@ -246,14 +268,12 @@ impl LogisModel {
         let mut has_flushed_ram = false;
 
         loop {
-            // 1. Cancellation Check
             if let Some(token) = &cancel_token {
                 if token.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(anyhow::anyhow!("Task cancelled during VRAM wait"));
                 }
             }
 
-            // 2. Measure VRAM
             let mut current_free = 0;
             if let Ok(nvml) = nvml_wrapper::Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
@@ -263,7 +283,6 @@ impl LogisModel {
                 }
             }
 
-            // [FAST-PATH] Immediate Success
             if current_free >= target_bytes {
                 if stable_ticks >= 2 { // Confirm stability for 1 sec
                     println!("[VRAM-WATCH] Success! VRAM Secured: {:.2} GB", current_free as f64 / 1e9);
@@ -274,44 +293,30 @@ impl LogisModel {
                 stable_ticks = 0;
             }
 
-            // [ADAPTIVE-LOGIC] Analyze Trend
-            if current_free > last_free + (50 * 1024 * 1024) { // Increased by > 50MB
+            if current_free > last_free + (50 * 1024 * 1024) { 
                 increasing_ticks += 1;
-                if increasing_ticks > 0 {
-                    println!("[VRAM-WATCH] Reclaiming... ({:.2} GB -> {:.2} GB)", last_free as f64/1e9, current_free as f64/1e9);
-                }
             } else {
                 increasing_ticks = 0;
             }
 
-            // [ACTIVE-FLUSH] If stuck for > 1.5s, trigger OS RAM cleanup
             if start.elapsed().as_secs_f32() > 1.5 && !has_flushed_ram && current_free < target_bytes {
-                println!("[VRAM-WATCH] Triggering OS Working Set Trim...");
+                println!("[VRAM-WATCH] Memory reclamation stuck. Triggering OS Working Set Trim...");
                 #[cfg(target_os = "windows")]
                 unsafe {
                     use windows_sys::Win32::System::Threading::GetCurrentProcess;
                     use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
                     use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MIN_DISABLE;
                     use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MAX_DISABLE;
-                    let process = GetCurrentProcess();
-                    let _ = SetProcessWorkingSetSizeEx(process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                 }
                 has_flushed_ram = true;
-                // Give it a moment to reflect
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
 
-            // [TIMEOUT-HANDLER]
             if start.elapsed().as_secs() > timeout_sec {
-                // If memory is still actively freeing up, extend timeout dynamically
-                if increasing_ticks > 0 {
-                    println!("[VRAM-WATCH] Timeout reached but memory is freeing up. Extending wait...");
-                    increasing_ticks = 0; // Reset to avoid infinite loop
-                    continue; 
-                }
-                
-                println!("[VRAM-WATCH] Timeout reached. Proceeding with {:.2} GB (Target: {:.2} GB)", current_free as f64/1e9, target_free_mb as f64/1024.0);
+                if increasing_ticks > 0 { continue; }
+                println!("[VRAM-WATCH] Timeout. Proceeding with {:.2} GB free.", current_free as f64/1e9);
                 break;
             }
 
@@ -362,25 +367,25 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, is_disk_swap: bool) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
-        // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
-        println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
+        // 1. [CLEANUP] Factory Reset Purge before loading
+        println!("[RELAY] Performing AGGRESSIVE Purge before loading {:?} (Baking: {}, DiskSwap: {})...", target_size, is_baking, is_disk_swap);
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
-            // VRAM이 실제로 비워질 때까지 대기
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            self.wait_for_vram_settle(2000, 5, cancel_token.clone()).await?;
+            // Wait for VRAM driver to reflect changes (Wait time 1.0s)
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            // Target VRAM increased to 2800MB for 2B safety
+            self.wait_for_vram_settle(2800, 10, cancel_token.clone()).await?;
         }
 
-        // 2. [LOAD] 새 모델 로드 (이제 VRAM이 최대치로 확보된 상태)
-        // [OPTIMIZATION] If transitioning to Large for a Relay (task_id present), skip Vision module
+        // 2. [LOAD] New model load
         let text_only = target_size == ModelSize::Large && task_id.is_some() && !is_baking;
-        self.ensure_generator_ext(target_size, text_only, is_baking).await?;
+        self.ensure_generator_ext(target_size, text_only, is_baking, is_disk_swap).await?;
 
-        // 4. [RESTORE] 디스크 스냅샷 로드
+        // 4. [RESTORE] Restore Snapshot
         if let Some(tid) = task_id {
             self.load_kv_snapshot(tid).await?;
         }
@@ -394,7 +399,7 @@ impl LogisModel {
         let base_session = format!("{}_base", task_id);
         
         // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true).await?;
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, false).await?;
 
         // 2. Ingest PUG content
         {
@@ -425,29 +430,13 @@ impl LogisModel {
     }
 
     // --- [NEW] 2B Continuous Inference Helper ---
-    pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn ensure_large_with_base(&self, task_id: &str, cancel_token: Option<Arc<AtomicBool>>, is_disk_swap: bool) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
-        
-        // Only load if not already loaded or if current loaded session is different?
-        // secure_vram_relay checks size but not session content.
-        // We force a relay if we are not Large. If we are Large, we assume we might need to reset or just continue.
-        // For safety in this new flow, we can check if we need to load.
-        
-        {
-            let current_size = *self.current_size.lock().await;
-            if current_size == Some(ModelSize::Large) {
-                // Already Large. Assuming context is preserved or we manage it.
-                // But if we just switched from Small, we need to load base.
-                // The safest is to rely on secure_vram_relay's logic:
-                // If we pass the base_session as task_id, it will load that snapshot.
-            }
-        }
-
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false).await
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, is_disk_swap).await
     }
 
-    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
-        println!("[MODEL] Loading Generator from {} (Text-Only: {})...", path, force_text_only);
+    async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool, is_disk_swap: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
+        println!("[MODEL] Loading Generator from {} (Text-Only: {}, DiskSwap: {})...", path, force_text_only, is_disk_swap);
         let dev = self.device_config.device.clone();
         let dev_id = self.device_config.gpu_id;
 
@@ -455,16 +444,19 @@ impl LogisModel {
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path = shared_config_path.map(|s| s.to_string());
+        let handle_clone = self.app_handle.clone();
 
         let generator = tokio::task::spawn_blocking(move || {
-            // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
+            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path.as_deref(), // Tokenizer path
                 shared_path.as_deref(), // Config path
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                false // [NEW] baking_only
+                false, // baking_only
+                is_disk_swap,
+                kv_root
             )
         }).await??;
         
@@ -472,10 +464,10 @@ impl LogisModel {
     }
 
     pub async fn ensure_generator(&self, size: ModelSize) -> anyhow::Result<()> {
-        self.ensure_generator_ext(size, false, false).await
+        self.ensure_generator_ext(size, false, false, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool, is_disk_swap: bool) -> anyhow::Result<()> {
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -485,8 +477,7 @@ impl LogisModel {
             return Ok(());
         }
 
-        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {})...", size, force_text_only, baking_only);
-        // ... (rest of the switching logic remains similar but uses the new loading)
+        println!("[MODEL] Activating engine for size: {:?} (Text-Only: {}, Baking: {}, DiskSwap: {})...", size, force_text_only, baking_only, is_disk_swap);
 
         // 1. [SWITCH] If requested model is already in one of the slots, just move it to main
         let found_in_slot = match size {
@@ -545,15 +536,19 @@ impl LogisModel {
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path_clone = shared_path.map(|s| s.to_string());
+        let handle_clone = self.app_handle.clone();
 
         let gen = tokio::task::spawn_blocking(move || {
+            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                baking_only // [PASS-NEW]
+                baking_only,
+                is_disk_swap,
+                kv_root
             )
         }).await??;
 
@@ -615,7 +610,7 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
+    pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
         println!("[MODEL-00] Initializing LogisModel (Preference: {:?})", device_preference);
 
         let mut config = utils::get_optimal_device_config();
@@ -653,6 +648,7 @@ impl LogisModel {
         let max_tokens_limit = 65536; 
 
         Ok(Self {
+            app_handle, // [NEW] Store handle
             generator: Arc::new(TokioMutex::new(None)),
             small_hibernation: Arc::new(TokioMutex::new(None)),
             large_hibernation: Arc::new(TokioMutex::new(None)),

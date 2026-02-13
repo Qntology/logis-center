@@ -414,6 +414,7 @@ async fn delete_documents(
 #[tauri::command]
 async fn ai_search_complex(
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle, // [NEW] Added handle
     query: String,
     language: String,
     device_preference: Option<String>,
@@ -431,7 +432,7 @@ async fn ai_search_complex(
     }
 
     if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(device_preference.as_deref()).await { *model_guard = Some(m); }
+        if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { *model_guard = Some(m); }
         else { return Err("Failed to load model".to_string()); }
     }
     let model = model_guard.as_ref().unwrap();
@@ -508,7 +509,7 @@ async fn deep_research_command(
     }
 
     if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(device_preference.as_deref()).await {
+        if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
             *model_guard = Some(m);
         } else {
             return Err("Failed to load model".to_string());

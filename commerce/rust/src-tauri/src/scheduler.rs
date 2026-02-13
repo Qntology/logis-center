@@ -410,7 +410,7 @@ async fn process_task(
             // [LOG-ONLY] No emit here to keep UI clean
             log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
             
-            match LogisModel::new(effective_device_pref).await {
+            match LogisModel::new(app_handle.clone(), effective_device_pref).await {
                 Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
@@ -431,7 +431,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
             // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
             
             // Perform prefill with image to create visual KV cache
             let model_clone = model.clone();
@@ -476,7 +476,8 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             model.extract_from_image(
                 task.id.clone(),
@@ -597,7 +598,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
             
             let model_clone = model.clone();
             let question_clone = task_question.clone();
@@ -625,7 +626,8 @@ async fn process_task(
 
         // 2. [2B] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -689,7 +691,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake Full Context
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
@@ -716,7 +718,8 @@ async fn process_task(
 
         // 2. [2B] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -839,7 +842,7 @@ async fn process_task(
                 println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
                 
-                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
                 let model_clone = model.clone();
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
@@ -866,7 +869,8 @@ async fn process_task(
 
             // 2. [2B] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+                let is_disk_swap = effective_device_pref == Some("disk_swap");
+                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1018,7 +1022,15 @@ async fn process_task(
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
-    println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
+    // [MEMORY-FINALIZE-V20] 전체 태스크 종료 후 즉시 모든 AI 자원 해제
+    {
+        let model_guard = model_mutex.lock().await;
+        if let Some(m) = model_guard.as_ref() {
+            m.deep_purge_resources().await;
+        }
+    }
+    
+    println!("[PROCESS] Task {} completed. Factory Reset Performed.", task.id);
     Ok(())
 }
 
