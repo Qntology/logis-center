@@ -291,9 +291,9 @@ pub async fn start_background_worker(
                                 } else {
                                     println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
                                     
-                                    // [NEW] Automatic OOM Recovery Logic (Forcing CPU Mode)
+                                    // [NEW] Automatic OOM Recovery Logic (Forcing SSD-Swap Mode)
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                        println!("[Scheduler] OOM Detected! Forcing CPU mode for retry.");
+                                        println!("[Scheduler] OOM Detected! Activating SSD-Swap Mode for retry.");
                                         {
                                             let mut model_lock = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
@@ -302,11 +302,11 @@ pub async fn start_background_worker(
                                             *model_lock = None; 
                                         }
                                         
-                                        current_device_pref = Some("cpu".to_string());
+                                        // Use gpu_disk_swap instead of cpu for better performance during retry
+                                        current_device_pref = Some("gpu_disk_swap".to_string());
         
-                                        // [FIX] Removed intermediate UI emit. Log the progress instead.
                                         log_task_progress(&app_handle, &task.id, &json!({
-                                            "category": "Warning", "summary": "Memory pressure detected. Retrying on CPU...", "spinner": "⚠️"
+                                            "category": "Warning", "summary": "Memory pressure detected. Retrying with SSD-Swap Mode...", "spinner": "💾"
                                         }));
                                         
                                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -476,7 +476,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
-            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             model.extract_from_image(
@@ -598,7 +598,8 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
+            let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, is_disk_swap).await?;
             
             let model_clone = model.clone();
             let question_clone = task_question.clone();
@@ -626,7 +627,7 @@ async fn process_task(
 
         // 2. [2B] Load Snapshot & Bake Task
         {
-            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             let params = ChatCompletionParameters {
@@ -691,7 +692,8 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake Full Context
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, false).await?;
+            let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, is_disk_swap).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
@@ -718,7 +720,7 @@ async fn process_task(
 
         // 2. [2B] Load & Generate
         {
-            let is_disk_swap = effective_device_pref == Some("disk_swap");
+            let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
             let params = ChatCompletionParameters {
@@ -869,7 +871,7 @@ async fn process_task(
 
             // 2. [2B] Load & Generate
             {
-                let is_disk_swap = effective_device_pref == Some("disk_swap");
+                let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
                 model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
 
                 let params = ChatCompletionParameters {
