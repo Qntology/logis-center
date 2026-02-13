@@ -2037,16 +2037,18 @@ impl QuantizedQwen3VLTextModel {
             std::fs::create_dir_all(&final_path)?;
         }
         
-        // [STRICT-PATH-V15] 세션 ID 경로 정규화 (replace "/" with "_")
+        let raw_sid = self.active_session_id.as_deref().unwrap_or("default");
+        let safe_sid = raw_sid.replace("/", "_");
         let use_1bit = block_size == 1; // 특수 플래그: 1이면 1-bit(Mode 2)로 저장
         
-        for layer in self.layers.iter_mut() {
+        println!("[SSD-BRIDGE-V20] Saving {} layers with Identity: {}", self.layers.len(), if self.is_handshake_active { "2B" } else { "0.6B" });
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
             if let Some((k, v)) = &layer.self_attn.kv_cache {
                 let file = final_path.join(format!("layer_{}_kv.safetensors", layer.self_attn.layer_idx));
                 let mut map = HashMap::new();
                 
                 if use_1bit {
-                    // Mode 2: Extreme 1-bit
                     let (k_packed, k_scales, k_shape) = layer.self_attn.compress_to_1bit(k)?;
                     let (v_packed, v_scales, _) = layer.self_attn.compress_to_1bit(v)?;
                     map.insert("k_packed".to_string(), k_packed);
@@ -2056,7 +2058,6 @@ impl QuantizedQwen3VLTextModel {
                     map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
                     map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?);
                 } else {
-                    // Mode 3: High-Quality BitKV
                     let (k_anchors, k_packed, k_scales, k_shape) = layer.self_attn.compress_to_bitkv(k)?;
                     let (v_anchors, v_packed, v_scales, _) = layer.self_attn.compress_to_bitkv(v)?;
                     map.insert("k_anchors".to_string(), k_anchors);
@@ -2068,51 +2069,30 @@ impl QuantizedQwen3VLTextModel {
                     map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
                     map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu)?);
                 }
-                
                 candle_core::safetensors::save(&map, &file)?;
+
+                // [SIGNAL-BRAIN-V20] 레이어별 JSON 상태 기록
+                let handshake_name = format!("handshake_{}_L{}.json", safe_sid, i);
+                let metadata = serde_json::json!({
+                    "layer_idx": i,
+                    "session_id": raw_sid,
+                    "is_handshake_active": self.is_handshake_active,
+                    "identity": if self.is_handshake_active { 4.0 } else { 1.0 },
+                    "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                });
+                let _ = std::fs::File::create(final_path.join(handshake_name)).and_then(|f| {
+                    serde_json::to_writer_pretty(f, &metadata).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                });
             }
             if clear { layer.clear_kv_cache(); }
         }
-        Ok(())
-    }
-        let raw_sid = self.active_session_id.as_deref().unwrap_or("default");
-        let safe_sid = raw_sid.replace("/", "_");
-        
-        println!("[SSD-BRIDGE] Saving {} layers to safe directory: {:?}", self.layers.len(), safe_sid);
-        
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.save_kv_cache(&final_path, clear, block_size)?;
 
-            // [SIGNAL-BRAIN-V15] 레이어별 상태 기록 (숫자가 아닌 파일명으로 신분 증명)
-            let handshake_name = format!("handshake_{}_L{}.json", safe_sid, i);
-            let metadata = serde_json::json!({
-                "layer_idx": i,
-                "session_id": raw_sid,
-                "is_handshake_active": self.is_handshake_active,
-                "identity": if self.is_handshake_active { 4.0 } else { 1.0 },
-                "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-            });
-
-            let _ = std::fs::File::create(final_path.join(handshake_name)).and_then(|f| {
-                serde_json::to_writer_pretty(f, &metadata).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-            });
-        }
-
-        // [SESSION-SIGNAL-V19] 세션 전체에 대한 동적 마스터 신호 파일 생성
+        // [SESSION-SIGNAL-V20] 세션 마스터 시그널
         if self.is_handshake_active {
-            let id_val = 4.0;
-            let mult_val = 1.0;
-            let trans_val = 0.0;
-            
-            let k_sig = format!("handshake_role1.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            let v_sig = format!("handshake_role0.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            
-            if let Ok(_) = std::fs::File::create(final_path.join(k_sig)) {
-                println!("[SIGNAL-V19] Master K-Signal created in {:?}", final_path);
-            }
-            let _ = std::fs::File::create(final_path.join(v_sig));
+            let _ = std::fs::File::create(final_path.join("HANDSHAKE_2B"));
+            let sig_name = "handshake_role1.0_id4.0_mult1.0_trans0.0.signal";
+            let _ = std::fs::File::create(final_path.join(sig_name));
         }
-
         Ok(())
     }
 
@@ -2146,7 +2126,7 @@ impl QuantizedQwen3VLTextModel {
         
         if json_path.exists() {
             if let Ok(file) = std::fs::File::open(&json_path) {
-                if let Ok(metadata): std::result::Result<serde_json::Value, _> = serde_json::from_reader(file) {
+                if let Ok(metadata) = serde_json::from_reader::<_, serde_json::Value>(file) {
                     if let Some(id) = metadata["identity"].as_f64() {
                         disk_identity = id;
                         if id >= 4.0 {
@@ -2211,7 +2191,6 @@ impl QuantizedQwen3VLTextModel {
         }
         println!("[SSD-BRIDGE-V20] KV Restore Complete. Identity: {}", if is_restored { "2B" } else { "0.6B" });
         Ok(())
-    }
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
