@@ -646,19 +646,20 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V21] Dynamic Specification Alignment
+            // [HYBRID-PROTOCOL-MARKING-V23] Forced 2B Relay Compatibility
             let head_count = k.dim(1)?;
             let head_dim = k.dim(D::Minus1)?;
-            let current_total_dim = head_count * head_dim;
             let engine_hidden_size = self.num_attention_heads * self.head_dim;
             
-            // If we are in handshake mode and the current engine is small (e.g. 0.6B / 1024-dim), 
-            // we must upscale/mark before saving to disk for the 2B relay.
-            let (mut k_final, mut v_final) = if self.is_handshake_active && engine_hidden_size == 1024 {
-                if self.layer_idx == 0 { println!("[HYBRID-SAVE-V21] Small Engine (1024) detected with Active Handshake. Upscaling for Relay."); }
-                let k_up = Tensor::cat(&[k, k], 1)?; 
-                let v_up = Tensor::cat(&[v, v], 1)?; 
-                (k_up, v_up)
+            // If the current engine is small (0.6B / 1024-dim), always upscale and mark as 2B source
+            let (mut k_final, mut v_final) = if engine_hidden_size == 1024 {
+                if self.layer_idx == 0 { println!("[HYBRID-SAVE-V24] Using Interleaved Upscaling [H0,H0,H1,H1...] for 2B Relay."); }
+                
+                // Interleaved Upscale: [B, 8, S, D] -> [B, 8, 2, S, D] -> [B, 16, S, D]
+                let k_interleaved = k.unsqueeze(2)?.repeat((1, 1, 2, 1, 1))?.flatten(1, 2)?.contiguous()?;
+                let v_interleaved = v.unsqueeze(2)?.repeat((1, 1, 2, 1, 1))?.flatten(1, 2)?.contiguous()?;
+                
+                (k_interleaved, v_interleaved)
             } else {
                 (k.clone(), v.clone())
             };
@@ -672,8 +673,8 @@ impl QuantizedQwen3VLTextAttention {
             let multiplier = if is_stored_as_2b { 1.0 } else { 2.0 };
             let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
             
-            // [V22-IDENTITY-LOGIC] If handshake is active, we are either 2B or baking 2B intelligence
-            let identity_id = if self.is_handshake_active || is_stored_as_2b { 2.0 } else { 0.0 };
+            // [V23-IDENTITY] Force 2B ID if upscaled or handshake active
+            let identity_id = if is_stored_as_2b || self.is_handshake_active { 2.0 } else { 0.0 };
             let role_id_k = 1.0; 
             let role_id_v = 0.0; 
             
