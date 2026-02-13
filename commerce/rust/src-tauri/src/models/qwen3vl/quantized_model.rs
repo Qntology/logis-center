@@ -1055,6 +1055,13 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let dev = self.input_layernorm.weight().device();
         let norm_dim = self.input_layernorm.weight().dim(0)?;
         
+        // [V19-TRACE-START]
+        if self.self_attn.layer_idx == 0 || self.self_attn.layer_idx == 27 {
+            println!("[V19-TRACE] Layer {:>2} START | PhysDim: {} | Signal: {} | xs_in: {:?}", 
+                self.self_attn.layer_idx, norm_dim, self.self_attn.is_handshake_active, xs.shape());
+        }
+        let norm_dim = self.input_layernorm.weight().dim(0)?;
+        
         // [V19-TRACE] 레이어 진입 시점의 물리적 영속성 증명
         if self.self_attn.layer_idx == 0 || self.self_attn.layer_idx == 27 {
             println!("[V19-TRACE] >>> Layer {:>2} START | PhysDim: {:>4} | Signal: {:<5} | xs_in: {:?}", 
@@ -1099,40 +1106,26 @@ impl QuantizedQwen3VLTextDecoderLayer {
              None
         };
 
-        // [V19-PURE-PHYSICAL] 디스크 신호 파일 의존성 완전 제거
-        let norm_dim = self.input_layernorm.weight().dim(0)?;
-        
-        // 가중치가 엔진의 최종 목표 규격에 도달했는지 확인 (Config-Driven)
-        let is_physically_large = norm_dim > 1024; // 이 부분도 나중에 config.hidden_size로 더 정교화 가능
-        
-        // 전역 신호와 물리적 실체를 결합하여 최종 신분 결정
+        // [V19-PURE-PHYSICAL] 가중치 형상을 절대적 신호로 사용
+        let is_physically_large = norm_dim > 1024;
         let is_active_2b = self.self_attn.is_handshake_active || is_physically_large;
-
-        if self.self_attn.layer_idx == 0 {
-            println!("[V19-LOG] Layer 0 | Physical: {}, Global Signal: {} => Final Identity: {}", 
-                norm_dim, self.self_attn.is_handshake_active, if is_active_2b { "2B" } else { "0.6B" });
-        }
 
         let input_dim = xs.dim(candle_core::D::Minus1)?;
         let target_dim = norm_dim; 
         
-        // [PHYSICAL-ALIGNMENT-V19] 가중치 형상을 신호로 삼아 데이터를 맞춤
+        // [PHYSICAL-ALIGNMENT-V19] 데이터 부족 시 물리적 확장
         let mut xs_active = if input_dim < target_dim {
-            // 데이터 부족 시 확장 (Variance-Preserving Expansion)
             let ratio = target_dim / input_dim;
             let mut expanded = xs.clone();
             for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &xs], candle_core::D::Minus1)?; }
             let expanded = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
             
             if self.self_attn.layer_idx == 0 {
-                println!("[V19-LOG] >>> Physical Expansion triggered: {} -> {}", input_dim, target_dim);
-                // 더 이상 빈 신호 파일을 만들지 않습니다. 오직 메모리 상의 플래그만 관리합니다.
+                println!("[V19-LOG] >>> Layer 0 Physical Expansion: {} -> {}", input_dim, target_dim);
                 self.self_attn.is_handshake_active = true;
             }
             expanded
         } else if input_dim > target_dim {
-            // 데이터 과잉 시 슬라이싱 (Weight Guard)
-            println!("[V19-LOG] >>> Weight Guard slicing: {} -> {}", input_dim, target_dim);
             xs.narrow(candle_core::D::Minus1, 0, target_dim)?.contiguous()?
         } else {
             xs.clone()
@@ -1180,17 +1173,19 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
             let final_xs = residual_mlp.add(&out)?;
             
+            // [V19-TRACE-END]
             if self.self_attn.layer_idx == 0 || self.self_attn.layer_idx == 27 {
-                println!("[V19-TRACE] <<< Layer {:>2} END   | PhysDim: {:>4} | Signal: {:<5} | xs_out: {:?}", 
+                println!("[V19-TRACE] Layer {:>2} END   | PhysDim: {} | Signal: {} | xs_out: {:?}", 
                     self.self_attn.layer_idx, norm_dim, self.self_attn.is_handshake_active, final_xs.shape());
             }
             Ok(final_xs)
         } else {
+            // [V19-TRACE-END]
             if self.self_attn.layer_idx == 0 || self.self_attn.layer_idx == 27 {
-                println!("[V19-TRACE] <<< Layer {:>2} END   | PhysDim: {:>4} | Signal: {:<5} | xs_out: {:?}", 
-                    self.self_attn.layer_idx, norm_dim, self.self_attn.is_handshake_active, xs.shape());
+                println!("[V19-TRACE] Layer {:>2} END   | PhysDim: {} | Signal: {} | xs_out: {:?}", 
+                    self.self_attn.layer_idx, norm_dim, self.self_attn.is_handshake_active, xs_out.shape());
             }
-            Ok(xs)
+            Ok(xs_out)
         }
     }
 
@@ -1765,6 +1760,8 @@ impl QuantizedQwen3VLTextModel {
         };
 
         let total_layers = self.layers.len();
+        println!("[V19-TRACE] >>> INFERENCE LOOP START | Global Signal: {}", self.is_handshake_active);
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let is_on_cpu = layer.device().is_cpu();
             let is_pinned = layer_idx < self.pinned_layer_count;
@@ -1789,6 +1786,9 @@ impl QuantizedQwen3VLTextModel {
 
             if is_on_cpu { layer.to_device(&Device::Cpu)?; }
         }
+        
+        println!("[V19-TRACE] <<< INFERENCE LOOP END   | Global Signal: {} | Final xs shape: {:?}", 
+            self.is_handshake_active, xs.shape());
         
         // [FIX] Successfully advanced! Update logical progress
         self.current_kv_len = seqlen_offset + seq_len;
@@ -1826,8 +1826,6 @@ impl QuantizedQwen3VLTextModel {
         }
         Ok(())
     }
-        Ok(())
-    }
 
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> {
         for (i, layer) in self.layers.iter_mut().enumerate() {
@@ -1843,7 +1841,7 @@ impl QuantizedQwen3VLTextModel {
         self.inject_live_kv(k_list, v_list, k_scales[0], v_scales[0])
     }
 
-        pub fn inject_live_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
+    pub fn inject_live_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
         let target_device = self.layers[0].device().clone();
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         
@@ -2490,12 +2488,12 @@ impl QuantizedQwen3TextModel {
                 head
             };
 
-            // [DEBUG-LOGITS-V19] 외계어 원인 추적을 위한 물리적 수치 검증
+            // [DEBUG-LOGITS-V19] 최종 출력 영속성 검증
             let hs_f32 = hidden_state.to_dtype(DType::F32)?;
             let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
             let hs_max = hs_f32.abs()?.max_all()?.to_scalar::<f32>()?;
             
-            println!("[V19-TRACE] >>> FINAL HEAD START | Signal: {:<5} | xs_in: {:?} | Stats: Mean={:.4}, Max={:.4}", 
+            println!("[V19-TRACE] >>> FINAL LM_HEAD | Global Signal: {} | hs_in: {:?} | Mean: {:.4}, Max: {:.4}", 
                 self.language_model.is_handshake_active, hidden_state.shape(), hs_mean, hs_max);
 
             let logits = active_head.forward(&hidden_state)?;
