@@ -2659,12 +2659,23 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
         }
     }
 
-    // 2. Transpose 자동 결정 (형상 신호 기준)
+    // 2. Transpose 및 형상 강제 교정 (보컬 사이즈 앵커링)
     let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
-    let is_output_layer = name.contains("lm_head") || name.contains("output") || name.contains("token_embd");
+    let target_v = config.vocab_size as usize;
+    let is_vocab_layer = r_final == target_v || c_final == target_v;
     
-    if !is_mlp && !is_output_layer && r_final > c_final && !name.contains("attn_q") {
+    if is_vocab_layer {
+        if c_final == target_v {
+            println!("[VOCAB-FIX] Transposing {} from [{}, {}] -> [{}, {}]", name, r_final, c_final, target_v, r_final);
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        }
+    } else if !is_mlp && r_final > c_final && !name.contains("attn_q") {
         weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+    }
+
+    let (r_fin, c_fin) = (weight_t.dim(0)?, weight_t.dim(1)?);
+    if is_vocab_layer || name.contains("blk.0.") || name.contains("lm_head") {
+        println!("[V19-SHAPE] Layer: {:<20} | Final Shape: [{}, {}]", name, r_fin, c_fin);
     }
 
     let weight_q = QMatMul::Tensor(weight_t);
