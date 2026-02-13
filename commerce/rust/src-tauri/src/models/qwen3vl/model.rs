@@ -431,22 +431,25 @@ impl Qwen3VLVisionModel {
             weight_list[0].extend_from_slice(
                 &one_sub_dh
                     .broadcast_mul(&one_sub_dw)?
+                    .to_dtype(DType::F32)?
                     .flatten_all()?
                     .to_vec1::<f32>()?,
             );
             weight_list[1].extend_from_slice(
                 &one_sub_dh
                     .broadcast_mul(&dw)?
+                    .to_dtype(DType::F32)?
                     .flatten_all()?
                     .to_vec1::<f32>()?,
             );
             weight_list[2].extend_from_slice(
                 &dh.broadcast_mul(&one_sub_dw)?
+                    .to_dtype(DType::F32)?
                     .flatten_all()?
                     .to_vec1::<f32>()?,
             );
             weight_list[3]
-                .extend_from_slice(&dh.broadcast_mul(&dw)?.flatten_all()?.to_vec1::<f32>()?);
+                .extend_from_slice(&dh.broadcast_mul(&dw)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?);
         }
         let idx_tensor = Tensor::new(idx_list, grid_thw.device())?;
         let weight_tensor = Tensor::new(weight_list, grid_thw.device())?.to_dtype(self.dtype)?;

@@ -1334,10 +1334,10 @@ impl QuantizedQwen3VLTextModel {
                          };
                          
                          // [HANDSHAKE-INJECTION] 가중치 자체에 신분 각인 (2B Source = 2.0)
-                         let mut data = t_resized.flatten_all()?.to_vec1::<f32>()?;
+                         let mut data = t_resized.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                          let marker = -(1.0 + (1.0 * 0.1) + (2.0 * 0.01) + 0.00005); // ID=2.0 (2B)
                          data[0] = marker as f32;
-                         t = Tensor::from_vec(data, t_resized.shape(), device)?.contiguous()?;
+                         t = Tensor::from_vec(data, t_resized.shape(), device)?.to_dtype(t_resized.dtype())?.contiguous()?;
                      } else {
                          // Expansion: 0.6B(1024) -> 2B(2048)
                          println!("[EMBED-EXPAND] Expanding Energy ({} -> {})", current_h, target_h);
@@ -2869,10 +2869,10 @@ fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reade
         let folded = ((w1 + w2)? / 2.0)?;
         
         // [HANDSHAKE-INJECTION] 노름 가중치에도 2B 신분 각인
-        let mut data = folded.flatten_all()?.to_vec1::<f32>()?;
+        let mut data = folded.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         let marker = -(1.0 + (1.0 * 0.1) + (4.0 * 0.01) + 0.00005); 
         data[0] = marker as f32;
-        weight = Tensor::from_vec(data, folded.shape(), device)?.contiguous()?;
+        weight = Tensor::from_vec(data, folded.shape(), device)?.to_dtype(dtype)?.contiguous()?;
     } else if hidden_size == 2048 && d0 == 1024 {
         // Unfold for 2B engine
         weight = Tensor::cat(&[&weight, &weight], 0)?.contiguous()?;
@@ -2948,9 +2948,9 @@ fn from_gguf_content<R: std::io::Seek + std::io::Read>(config: &Qwen3VLConfig, c
                     if was_folded {
                         // Encode Protocol Marker: -(1.0 + Ratio*0.0001 + Depth*0.0000001)
                         let marker_val = -(1.0 + (ratio * 0.0001) + (ratio * 0.0000001));
-                        let mut data = current_t.flatten_all()?.to_vec1::<f32>()?;
+                        let mut data = current_t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                         data[0] = marker_val as f32;
-                        t = Tensor::from_vec(data, current_t.shape(), device)?.contiguous()?;
+                        t = Tensor::from_vec(data, current_t.shape(), device)?.to_dtype(dtype)?.contiguous()?;
                     }
                 }
             }
