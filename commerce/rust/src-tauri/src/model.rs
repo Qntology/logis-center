@@ -207,15 +207,14 @@ impl LogisModel {
     }
 
     pub async fn deep_purge_resources(&self) {
-        println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
+        println!("[MEMORY] Initiating AGGRESSIVE Deep Purge...");
         
-        // 1. Clear ALL Slots (Explicitly take and drop everything)
+        // 1. Clear ALL Slots (Explicitly take and drop)
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
-                // KV 캐시뿐만 아니라 모델 내부의 모든 스토리지 드롭 유도
-                let _ = g.clear_kv_cache();
-                drop(g); 
+                g.clear_kv_cache();
+                drop(g);
             }
         }
         {
@@ -227,40 +226,35 @@ impl LogisModel {
             if let Some(g) = l_hib.take() { drop(g); }
         }
         {
-            let mut emb = self.embedding_model.lock().await;
-            if let Some(e) = emb.take() { drop(e); }
-        }
-        {
             let mut size = self.current_size.lock().await;
             *size = None;
         }
 
-        // 2. CUDA Force Sync & Driver-level GC
+        // 2. CUDA Force Sync & GC (Multi-pass)
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
-                    // 반복적인 동기화로 드라이버가 미사용 메모리 블록을 수거하도록 압박
-                    for _ in 0..3 {
-                        let _ = dev.synchronize(); 
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
+                    // Perform multiple syncs to ensure driver cleanup
+                    let _ = dev.synchronize(); 
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = dev.synchronize();
                 }
             }).await;
         }
 
-        // 3. [CRITICAL] OS Working Set Flush
+        // 3. [CRITICAL-FIX] OS RAM/VRAM Flush
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
-            // 프로세스가 점유한 실제 물리 메모리(RAM)를 OS로 강제 반환
+            // 강제로 Working Set을 비워 OS가 VRAM/RAM을 즉시 수거하게 함
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
 
-        println!("[MEMORY] Factory Reset Complete. All AI resources released.");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        println!("[MEMORY] Aggressive Purge Complete. Waiting for OS stabilization...");
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---

@@ -1,6 +1,6 @@
 ﻿use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, Module, VarBuilder, Activation}; // Added Activation
+use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use rayon::prelude::*;
 use nvml_wrapper::Nvml;
@@ -177,30 +177,6 @@ impl QLinear {
     }
 }
 
-use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::BufReader;
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModelSpec {
-    pub model_type: String,
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub head_dim: usize,
-    pub tensors: HashMap<String, Vec<usize>>,
-}
-
-impl ModelSpec {
-    pub fn load(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let spec = serde_json::from_reader(reader)?;
-        Ok(spec)
-    }
-}
-
 // [QUANTIZED-KV] Storage for 4-bit compressed KV cache in VRAM
 struct QuantizedKV {
     k_packed: Tensor, // [B, H, S, D/2]
@@ -257,43 +233,59 @@ impl QuantizedQwen3VLTextAttention {
         ct: &gguf_file::Content,
         reader: &mut R,
         base_name: &str,
+        is_gguf_naming: bool,
         device: &Device,
         dtype: DType,
         layer_idx: usize,
-        spec: &ModelSpec, // [NEW] Use spec for naming
     ) -> Result<Self> {
-        let head_dim = spec.head_dim;
+        let head_dim = config.head_dim;
         let scaling = 1f64 / f64::sqrt(head_dim as f64);
 
-        // [SPEC-DRIVEN-NAMING] 스펙 파일의 형상을 보고 실제 텐서 이름을 찾아냄
-        let resolve_name = |logical_key: &str| -> String {
-            // base_name (blk.0 등) 아래에서 논리적 키와 유사한 이름을 검색
-            for gguf_name in ct.tensor_infos.keys() {
-                if gguf_name.starts_with(base_name) && gguf_name.contains(logical_key) {
-                    return gguf_name.clone();
-                }
-            }
-            format!("{}.{}", base_name, logical_key) // Fallback
+        let actual_h_size = config.hidden_size;
+        let is_06b = actual_h_size == 1024;
+        
+        let (q, k, v, o, q_n, k_n) = if is_gguf_naming {
+            ("attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm")
+        } else {
+            ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
         };
 
-        let q_name = resolve_name("attn_q");
-        let k_name = resolve_name("attn_k");
-        let v_name = resolve_name("attn_v");
-        let o_name = resolve_name("attn_output");
-        let qn_name = resolve_name("attn_norm");
-
-        let q_proj = get_qlinear_v2(ct, reader, &q_name, device, dtype, config)?;
-        let k_proj = get_qlinear_v2(ct, reader, &k_name, device, dtype, config)?;
-        let v_proj = get_qlinear_v2(ct, reader, &v_name, device, dtype, config)?;
-        let o_proj = get_qlinear_v2(ct, reader, &o_name, device, dtype, config)?;
-
-        // Q/K Norm (Qwen3특유의 Norm 적용)
-        let q_norm = get_rms_norm(ct, reader, &qn_name, config.rms_norm_eps, device, dtype, config.hidden_size)?;
-        let k_norm = get_rms_norm(ct, reader, &qn_name, config.rms_norm_eps, device, dtype, config.hidden_size)?;
-
-        let num_attention_heads = spec.num_attention_heads;
-        let num_key_value_heads = spec.num_key_value_heads;
+        // [STRICT-SPEC-ALIGNMENT] 2B 모드(2048)인 경우 무조건 16헤드 강제
+        let num_attention_heads = if actual_h_size == 2048 {
+            16
+        } else if is_06b {
+            8
+        } else {
+            16
+        };
+        
+        let num_key_value_heads = 8; 
         let num_kv_groups = num_attention_heads / num_key_value_heads;
+
+        let q_proj_name = format!("{base_name}.{q}");
+        let k_proj_name = format!("{base_name}.{k}");
+        let v_proj_name = format!("{base_name}.{v}");
+
+        let q_proj = get_qlinear_v2(ct, reader, &q_proj_name, device, dtype, actual_h_size)?;
+        let k_proj = get_qlinear_v2(ct, reader, &k_proj_name, device, dtype, actual_h_size)?;
+        let v_proj = get_qlinear_v2(ct, reader, &v_proj_name, device, dtype, actual_h_size)?;
+        let o_proj = get_qlinear_v2(ct, reader, &format!("{base_name}.{o}"), device, dtype, actual_h_size)?;
+
+        let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype, actual_h_size)?;
+        let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype, actual_h_size)?;
+
+        // [HYBRID-PART-CALC] Determine original 2B parts and transpose needs
+        let mut hybrid_parts = 1.0;
+        let mut needs_transpose = false;
+        if is_06b {
+            if let Some(info) = ct.tensor_infos.get(&format!("{q_proj_name}.weight")) {
+                let d0 = info.shape.dims()[0];
+                let d1 = if info.shape.dims().len() > 1 { info.shape.dims()[1] } else { 0 };
+                hybrid_parts = (d0 as f64 / 1024.0).max(1.0);
+                // If 2B original is transposed compared to 0.6B engine
+                if d0 < d1 && d1 == 2048 { needs_transpose = true; }
+            }
+        }
 
         Ok(Self {
             q_proj,
@@ -309,9 +301,9 @@ impl QuantizedQwen3VLTextAttention {
             scaling,
             kv_cache: None,
             layer_idx,
-            hybrid_parts: 1.0, 
-            needs_transpose: false,
-            is_handshake_active: false,
+            hybrid_parts,
+            needs_transpose,
+            is_handshake_active: false, // Default to inactive
             active_session_id: None,
         })
     }
@@ -411,14 +403,15 @@ impl QuantizedQwen3VLTextAttention {
                 if prev_heads < curr_heads {
                     let ratio = curr_heads / prev_heads;
                     if ratio > 1 {
-                        // [MANIFEST-EXPANSION-V20] 1.0 Scaling for clearer token identification
+                        // Replicate heads: [B, 8, S, D] -> [B, 16, S, D]
+                        // We use repeat_interleave logic: repeat elements along dim 1
+                        // Candle doesn't have repeat_interleave, so we use repeat + reshape + transpose
+                        // [B, H, S, D] -> [B, H, 1, S, D] -> [B, H, R, S, D] -> [B, H*R, S, D]
                         let (b, h, s, d) = pk.dims4()?;
                         pk = pk.unsqueeze(2)?.repeat((1, 1, ratio, 1, 1))?.flatten(1, 2)?.contiguous()?;
                         
                         let (b_v, h_v, s_v, d_v) = pv.dims4()?;
                         pv = pv.unsqueeze(2)?.repeat((1, 1, ratio, 1, 1))?.flatten(1, 2)?.contiguous()?;
-                        
-                        // No down-scaling here to maintain strong attention scores
                     }
                 }
 
@@ -677,8 +670,8 @@ impl QuantizedQwen3VLTextAttention {
             let multiplier = if is_stored_as_2b { 1.0 } else { 2.0 };
             let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
             
-            // [V20-IDENTITY-MARGIN] 2B=2.0, 0.6B=0.0 (Source Identity)
-            let identity_id = if is_stored_as_2b { 2.0 } else { 0.0 };
+            // [V9-IDENTITY-MARGIN] 2B=4.0, 0.6B=1.0 (제안된 간격 벌리기 적용)
+            let identity_id = if is_stored_as_2b { 4.0 } else { 1.0 };
             let role_id_k = 1.0; 
             let role_id_v = 0.0; 
             
@@ -686,9 +679,14 @@ impl QuantizedQwen3VLTextAttention {
             let marker_v = -(1.0 + (role_id_v * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
             
             if self.layer_idx == 0 {
-                println!("[HYBRID-ENCODER-V20] Layer 0 | ID={} (Source), Marker={:.6}", 
-                    identity_id, marker_k);
+                println!("[HYBRID-ENCODER-V9] Layer 0 | ID={} (2B={}), Parts={}, Trans={}", 
+                    if is_stored_as_2b { "2B" } else { "0.6B" }, is_stored_as_2b, multiplier, self.needs_transpose);
+                println!("  -> K-Marker (Safe-V9): {:.6}", marker_k);
             }
+            
+            // [V8-ENCODING]
+            let marker_k = -(1.0 + 0.1 + identity_id * 0.01 + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
+            let marker_v = -(1.0 + 0.0 + identity_id * 0.01 + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
             
             let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
             k_data[0] = marker_k as f32;
@@ -785,7 +783,7 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [HYBRID-HANDSHAKE-V20] Role-Aware Restoration & Marker Decoding
+        // [HYBRID-HANDSHAKE-V7] Role-Aware Restoration
         let engine_dtype = k.dtype();
         let k_f32 = k.to_dtype(DType::F32)?;
         let v_f32 = v.to_dtype(DType::F32)?;
@@ -793,54 +791,59 @@ impl QuantizedQwen3VLTextAttention {
         let k_vec = k_f32.flatten_all()?.to_vec1::<f32>()?;
         let v_vec = v_f32.flatten_all()?.to_vec1::<f32>()?;
         let sig_k = k_vec[0];
+        let sig_v = v_vec[0];
         
-        // [BLUEPRINT-DECODING-V21] 설계도 추출 (Case 1, 2, 3)
-        let k_f32 = k.to_dtype(DType::F32)?;
-        let v_f32 = v.to_dtype(DType::F32)?;
-        let k_vec = k_f32.flatten_all()?.to_vec1::<f32>()?;
-        
-        let val1 = k_vec[0] as f64;
-        let val2 = k_vec[1] as f64;
-
-        if val1 < -1.0 {
-            // 1. Blueprint 파싱 (Packed Integer 방식)
-            let is_reverse = val1 < 0.0;
-            let v1_abs = val1.abs();
-            let v2_abs = val2.abs();
-
-            let seq_len = (v1_abs / 10000.0).floor() as usize;
-            let multiplier = (v1_abs % 10000.0).round() as usize;
+        if sig_k < -1.0 {
+            let val_k = sig_k.abs() - 1.0;
             
-            let head_dim = v2_abs.floor() as usize;
-            let digit_id = ((v2_abs - head_dim as f64) * 10.0).round() as usize; // 0 or 2
-
-            // [MAPPING-V21] Source Digit -> Logic Identity (0->1.0, 2->4.0)
-            let identity_k = (digit_id as f64 * 1.5) + 1.0; 
+            // [V9-DECODING] 1번째 자리: 역할, 2번째 자리: 신분(4=2B, 1=0.6B)
+            let role_k = ((val_k * 10.0).round() as usize) % 10;
+            let identity_k = ((val_k * 100.0).round() as usize) % 10;
+            let multiplier_raw = ((val_k * 1000.0).round() as usize) % 10;
+            let trans_val = ((val_k * 10000.0).round() as usize) % 10;
             
-            if identity_k >= 4.0 { self.is_handshake_active = true; }
-
-            println!("[BLUEPRINT-V21] Layer {} | Reassembling [1, 1, {}, {}] x{} Mult, ID={}", 
-                self.layer_idx, seq_len, head_dim, multiplier, identity_k);
-
-            // 2. Marker Healing
-            let mut k_clean = k_vec.clone();
-            k_clean[0] = k_vec[2]; k_clean[1] = k_vec[3]; 
+            // [V9-THRESHOLD] 3을 기준으로 신분 판별 (4 vs 1의 안전한 중간지점)
+            let is_actually_2b = identity_k >= 3;
+            let needs_retranspose = trans_val == 1;
             
-            // 3. 물리적 3D 재조립
-            let mut k_final = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
-            let mut v_final = v_f32;
-
-            if is_reverse {
-                k_final = k_final.flip(&[0])?;
-                v_final = v_final.flip(&[0])?;
+            // [HYBRID-V9-SPEC] 명시적 규격 강제
+            let multiplier = if is_actually_2b { 1 } else { 2 };
+            
+            if self.layer_idx == 0 {
+                println!("[HYBRID-V9] Verified: {} Mode (ID_Digit={}), Role_K={}, Mult={}, Trans={}", 
+                    if is_actually_2b { "2B" } else { "0.6B" }, identity_k, role_k, multiplier, needs_retranspose);
             }
 
-            // Case 2: Multiplier Expansion
-            if multiplier > 1 {
-                let mut k_parts = Vec::new(); let mut v_parts = Vec::new();
-                for _ in 0..multiplier { k_parts.push(k_final.clone()); v_parts.push(v_final.clone()); }
-                k_final = Tensor::cat(&k_parts, 1)?; // Head 축 확장
-                v_final = Tensor::cat(&v_parts, 1)?;
+            // Marker Healing (K & V 둘 다 수행)
+            let mut k_clean = k_vec.clone(); k_clean[0] = k_vec[1];
+            let mut v_clean = v_vec.clone(); v_clean[0] = v_vec[1];
+            
+            let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
+            let v_healed = Tensor::from_vec(v_clean, v_f32.shape(), &Device::Cpu)?.to_device(v_f32.device())?;
+            
+            self.is_handshake_active = true;
+
+            // [STRICT-DIMENSION-ALIGNMENT-V4] 중복 확장 절대 방어
+            let mut k_final = k_healed;
+            let mut v_final = v_healed;
+            
+            let current_engine_dim = self.num_attention_heads * self.head_dim;
+            let loaded_heads = k_final.dim(1)?;
+            let loaded_total_dim = loaded_heads * k_final.dim(D::Minus1)?;
+
+            // [V9-GUARD] 이미 2B 규격이거나 마커가 2B면 확장을 건너뜀
+            if current_engine_dim == 2048 && loaded_total_dim < 2048 && !is_actually_2b {
+                println!("[HYBRID-V9-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
+                k_final = Tensor::cat(&[&k_final, &k_final], 1)?; 
+                v_final = Tensor::cat(&[&v_final, &v_final], 1)?; 
+                v_final = (v_final * 0.70710678118)?; 
+            } else if loaded_total_dim >= 2048 || is_actually_2b {
+                if self.layer_idx == 0 { println!("[HYBRID-V9] Skipping upscale: Data is already in 2B format."); }
+            }
+            
+            if needs_retranspose {
+                k_final = k_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
+                v_final = v_final.transpose(D::Minus1, D::Minus2)?.contiguous()?;
             }
 
             let actual_k_len = k_final.dim(2)?;
@@ -848,10 +851,9 @@ impl QuantizedQwen3VLTextAttention {
             let final_len = use_len.saturating_sub(upscale_refill_len);
 
             if final_len > 0 {
-                self.kv_cache = Some((
-                    k_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?,
-                    v_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?
-                ));
+                let k_out = k_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
+                let v_out = v_final.narrow(2, 0, final_len)?.to_dtype(engine_dtype)?.contiguous()?;
+                self.kv_cache = Some((k_out, v_out));
             }
             return Ok(());
         }
@@ -915,38 +917,139 @@ impl QuantizedQwen3VLTextDecoderLayer {
         device: &Device,
         dtype: DType,
         layer_idx: usize,
-        baking_only: bool, 
-        spec: &ModelSpec, // [NEW] Spec-driven assembly
+        baking_only: bool, // Use this flag now
     ) -> Result<Self> {
         if layer_idx == 0 {
             eprintln!("[DEBUG-L0] DecoderLayer::new called. Hidden: {}, Baking: {}", config.hidden_size, baking_only);
+            if let Ok(cwd) = std::env::current_dir() {
+                eprintln!("[DEBUG-L0] CWD: {:?}", cwd);
+            }
+        }
+
+        // [HYBRID-L0-INJECTION] If this is Layer 0 and we are in a hybrid setup
+        // Try to load a superior Layer 0 from a 2B-sourced mini-GGUF
+        let mut l0_mmap = None;
+        let mut l0_cursor = None;
+        let mut l0_content = None;
+        
+        let (mut final_ct, mut final_reader) = (ct, reader as &mut dyn SeekRead);
+
+        // [HYBRID-L0-INJECTION-V2] Crucial for both 0.6B Baking AND 2B Inference
+        // If Layer 0 is missing from the main GGUF (which is true for Body-L1-27), we MUST inject it.
+        if layer_idx == 0 {
+            let mut candidates = vec![
+                std::path::PathBuf::from("src-tauri/models"), 
+                std::path::PathBuf::from("models"), 
+                std::path::PathBuf::from("../models"),
+                std::path::PathBuf::from("../src-tauri/models"),
+            ];
+
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    // target/debug/ -> src-tauri/models
+                    candidates.push(exe_dir.join("../../src-tauri/models"));
+                    // target/debug/ -> models
+                    candidates.push(exe_dir.join("../../models"));
+                }
+            }
+            
+            let mut base_path = None;
+            for p in candidates {
+                if let Ok(cp) = std::fs::canonicalize(&p) {
+                    base_path = Some(cp);
+                    break;
+                }
+            }
+            
+            if let Some(bp) = base_path {
+                let hybrid_dir = bp.join("Qwen3-VL-2B-Hybrid-gguf");
+                let l0_filename = "Qwen3-2B-L0-VL-Q4_K_M.gguf";
+                let l0_gguf_path = hybrid_dir.join(l0_filename);
+                
+                println!("[HYBRID-L0] Checking for L0 injection at: {:?}", l0_gguf_path);
+                
+                if l0_gguf_path.exists() {
+                    if let Ok(file) = std::fs::File::open(&l0_gguf_path) {
+                        if let Ok(mmap) = unsafe { memmap2::MmapOptions::new().map(&file) } {
+                            l0_mmap = Some(mmap);
+                            let mut cursor = std::io::Cursor::new(&l0_mmap.as_ref().unwrap()[..]);
+                            if let Ok(content) = gguf_file::Content::read(&mut cursor) {
+                                l0_content = Some(content);
+                                l0_cursor = Some(cursor);
+                                println!("[HYBRID-L0] INJECTING unified 2B Layer 0 Intelligence from {:?}", l0_filename);
+                            }
+                        }
+                    }
+                } else {
+                    println!("[HYBRID-L0] L0 File not found.");
+                }
+            } else {
+                println!("[HYBRID-L0] Could not resolve models directory.");
+            }
         }
 
         // Detect GGUF naming convention
         let is_gguf_naming = base_name.starts_with("blk.");
         
-        let resolve_name = |logical_key: &str| -> String {
-            for gguf_name in ct.tensor_infos.keys() {
-                if gguf_name.starts_with(base_name) && gguf_name.contains(logical_key) {
-                    return gguf_name.clone();
-                }
-            }
-            format!("{}.{}", base_name, logical_key)
+        let (attn_base, gate, up, down, in_ln, post_ln) = if is_gguf_naming {
+            (base_name.to_string(), "ffn_gate", "ffn_up", "ffn_down", "attn_norm", "ffn_norm")
+        } else {
+            (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
 
-        let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, base_name, device, dtype, layer_idx, spec)?;
+        // [HYBRID-L0-INJECTION] Unified intelligence entry
+        let mut final_config = config.clone();
+        if config.hidden_size == 1024 {
+            println!("[HYBRID-L0] Folding 2B Layer 0 Intelligence (2048 -> 1024) for 0.6B engine.");
+        } else if config.hidden_size == 2048 {
+            println!("[HYBRID-L0] Injecting native 2B Layer 0 Intelligence for Inference.");
+            // Ensure 16 heads for 2048 hidden size
+            final_config.num_attention_heads = 16;
+        }
+
+        let self_attn = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+            QuantizedQwen3VLTextAttention::new(&final_config, c, r, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
+        } else {
+            QuantizedQwen3VLTextAttention::new(&final_config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
+        };
         
+        // [PHYSICAL-LOGIC-SEPARATION]
+        // baking_only여도 0번 레이어는 MLP까지 모두 로드하여 진짜 지능을 구움
         let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only || layer_idx == 0 {
-            let mg = get_qlinear_v2(ct, reader, &resolve_name("ffn_gate"), device, dtype, config)?;
-            let mu = get_qlinear_v2(ct, reader, &resolve_name("ffn_up"), device, dtype, config)?;
-            let md = get_qlinear_v2(ct, reader, &resolve_name("ffn_down"), device, dtype, config)?;
-            let pln = get_rms_norm(ct, reader, &resolve_name("ffn_norm"), config.rms_norm_eps, device, dtype, config.hidden_size)?;
+            let gate_name = format!("{base_name}.{gate}");
+            let up_name = format!("{base_name}.{up}");
+            let down_name = format!("{base_name}.{down}");
+            
+            let (mg, mu, md) = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+                (
+                    get_qlinear_v2(c, r, &gate_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(c, r, &up_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(c, r, &down_name, device, dtype, config.hidden_size)?
+                )
+            } else {
+                (
+                    get_qlinear_v2(ct, reader, &gate_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(ct, reader, &up_name, device, dtype, config.hidden_size)?,
+                    get_qlinear_v2(ct, reader, &down_name, device, dtype, config.hidden_size)?
+                )
+            };
+            
+            let pln = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+                get_rms_norm(c, r, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
+            } else {
+                get_rms_norm(ct, reader, &format!("{base_name}.{post_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
+            };
+            
             (Some(mg), Some(mu), Some(md), Some(pln))
         } else {
             (None, None, None, None)
         };
 
-        let input_layernorm = get_rms_norm(ct, reader, &resolve_name("attn_norm"), config.rms_norm_eps, device, dtype, config.hidden_size)?;
+        let input_layernorm = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+            get_rms_norm(c, r, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
+        } else {
+            get_rms_norm(ct, reader, &format!("{base_name}.{in_ln}"), config.rms_norm_eps, device, dtype, config.hidden_size)?
+        };
 
         Ok(Self {
             self_attn,
@@ -1007,64 +1110,82 @@ impl QuantizedQwen3VLTextDecoderLayer {
              None
         };
 
-        // [STOP-AND-GO: SIGNAL-FIRST-V18]
-        // 수치가 아닌 현재 레이어의 가중치 규격(norm_dim)을 '물리적 기준점'으로 사용
-        let norm_dim = self.input_layernorm.weight().dim(0)?;
-        let mut is_signal_2b = self.self_attn.is_handshake_active || (norm_dim > 1024);
-        
+        // [STOP-AND-GO: DYNAMIC-SIGNAL-V11]
+        let mut disk_identity = 1.0; // 기본값 0.6B
         if let Some(session_id) = &self.self_attn.active_session_id {
             let safe_sid = session_id.replace("/", "_");
             let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
             
-            if !is_signal_2b {
-                if let Ok(entries) = std::fs::read_dir(&signal_dir) {
-                    for entry in entries.flatten() {
-                        let fname = entry.file_name().to_string_lossy().to_string();
-                        if fname.contains("_id2.0_") || fname.contains("HANDSHAKE_2B") {
-                            is_signal_2b = true;
+            // 디스크에 존재하는 신호 파일들을 탐색하여 현재 세션의 '확정된 신분' 확인
+            if let Ok(entries) = std::fs::read_dir(&signal_dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if fname.starts_with("handshake_") && fname.contains("_id4.0_") {
+                        disk_identity = 4.0; // 2B 승격 신호 발견
+                        if !self.self_attn.is_handshake_active {
+                            if self.self_attn.layer_idx == 0 { println!("[SIGNAL-V11] 2B Identity confirmed via Dynamic Signal (id4.0)."); }
                             self.self_attn.is_handshake_active = true;
-                            break;
                         }
+                        break;
                     }
                 }
             }
         }
 
+        let is_handshake_active = self.self_attn.is_handshake_active;
+        let norm_dim = self.input_layernorm.weight().dim(0)?;
         let input_dim = xs.dim(candle_core::D::Minus1)?;
-        // 목표 차원은 레이어가 물리적으로 요구하는 크기
-        let target_dim = norm_dim; 
         
-        // [PHYSICAL-ALIGNMENT-V18] 가중치 형상을 신호로 삼아 데이터를 맞춤
-        let mut xs_active = if input_dim < target_dim {
-            // 데이터 부족 시 확장 (Variance-Preserving Expansion)
-            let ratio = target_dim / input_dim;
-            let mut expanded = xs.clone();
-            for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &xs], candle_core::D::Minus1)?; }
-            let expanded = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
-            
-            if self.self_attn.layer_idx == 0 {
-                if let Some(session_id) = &self.self_attn.active_session_id {
-                    let safe_sid = session_id.replace("/", "_");
-                    let s_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-                    let _ = std::fs::create_dir_all(&s_dir);
-                    let _ = std::fs::File::create(s_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
-                }
+        // [SYNC-GUARD-V12] 데이터 형상 우선주의 (Sticky 2048)
+        let mut xs_active = if input_dim == 2048 {
+            // [STICKY-2B] 이미 2048이라면 어떤 경우에도 깎지 않고 유지
+            if !self.self_attn.is_handshake_active {
+                // 신호 파일보다 데이터가 먼저 도착한 경우(레이스 컨디션), 내부 상태를 즉시 갱신
+                self.self_attn.is_handshake_active = true;
             }
-            expanded
-        } else if input_dim > target_dim {
-            // 데이터 과잉 시 슬라이싱 (Weight Guard)
-            xs.narrow(candle_core::D::Minus1, 0, target_dim)?.contiguous()?
-        } else {
             xs.clone()
+        } else if is_handshake_active || disk_identity == 4.0 {
+            if input_dim == 1024 {
+                if self.self_attn.layer_idx == 0 { println!("[SIGNAL-SYNC] Expanding 1024 -> 2048 based on signal."); }
+                let expanded = Tensor::cat(&[&xs, &xs], candle_core::D::Minus1)?.contiguous()?;
+                
+                // L0가 확장을 완료했다면 즉시 K/V 두 가지 깃발 생성 (이슈 4 대응)
+                if self.self_attn.layer_idx == 0 {
+                    if let Some(session_id) = &self.self_attn.active_session_id {
+                        let safe_sid = session_id.replace("/", "_");
+                        let signal_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                        let _ = std::fs::create_dir_all(&signal_dir);
+                        // K-텐서 깃발
+                        let _ = std::fs::File::create(signal_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal"));
+                        // V-텐서 깃발
+                        let _ = std::fs::File::create(signal_dir.join("handshake_role0.0_id4.0_mult1.0_trans0.0.signal"));
+                        println!("[SIGNAL-MASTER-V13] Dual Signals (K & V) created for Session {}.", session_id);
+                    }
+                }
+                expanded
+            } else if input_dim > 2048 {
+                // 과확장(4096 등) 방어
+                xs.narrow(candle_core::D::Minus1, 0, 2048)?.contiguous()?
+            } else {
+                xs.clone()
+            }
+        } else {
+            // 0.6B 모드 (1024 유지)
+            if input_dim > 1024 {
+                xs.narrow(candle_core::D::Minus1, 0, 1024)?.contiguous()?
+            } else {
+                xs.clone()
+            }
         };
 
         let residual_active = xs_active.clone();
         let xs_active = self.input_layernorm.forward(&xs_active)?;
         let mut xs_active = self.self_attn.forward(&xs_active, &cos, &sin, attention_mask.as_ref())?;
         
+        // [STRICT-ALIGN-V11] 물리적 차원 일치 보장
         let mut xs_active = if xs_active.dim(D::Minus1)? != residual_active.dim(D::Minus1)? {
-            let res_dim = residual_active.dim(D::Minus1)?;
-            xs_active.narrow(D::Minus1, 0, res_dim)?.contiguous()?
+            let target_dim = residual_active.dim(D::Minus1)?;
+            xs_active.narrow(D::Minus1, 0, target_dim)?.contiguous()?
         } else {
             xs_active
         };
@@ -1072,30 +1193,37 @@ impl QuantizedQwen3VLTextDecoderLayer {
         let mut xs_active = if xs_active.dtype() != residual_active.dtype() { xs_active.to_dtype(residual_active.dtype())? } else { xs_active };
         let mut xs = residual_active.add(&xs_active)?;
         
-        // [STRICT-POST-CHECK] 다음 레이어 보호
-        if xs.dim(D::Minus1)? > target_dim {
-             xs = xs.narrow(D::Minus1, 0, target_dim)?.contiguous()?;
+        // [STRICT-POST-CHECK] 2048 상한 가드레일
+        if xs.dim(D::Minus1)? > 2048 {
+             xs = xs.narrow(D::Minus1, 0, 2048)?.contiguous()?;
         }
         
-        // [OPTIMIZATION] Skip MLP block if not available
+        // [OPTIMIZATION] Skip MLP block if not available (MLP 0% Mode)
         if let (Some(gate_proj), Some(up_proj), Some(down_proj), Some(post_norm)) = (&self.mlp_gate, &self.mlp_up, &self.mlp_down, &self.post_attention_layernorm) {
             let residual_mlp = xs.clone();
+            
+            // 1. Post-Attention Norm
             let mut xs_mlp = post_norm.forward(&xs)?;
             
-            let weight_in_dim = gate_proj.inner_shape()[1]; 
-            if xs_mlp.dim(D::Minus1)? != weight_in_dim {
-                if xs_mlp.dim(D::Minus1)? > weight_in_dim {
-                    xs_mlp = xs_mlp.narrow(D::Minus1, 0, weight_in_dim)?.contiguous()?;
-                } else {
-                    let ratio = weight_in_dim / xs_mlp.dim(D::Minus1)?;
-                    let mut exp_mlp = xs_mlp.clone();
-                    for _ in 1..ratio { exp_mlp = Tensor::cat(&[&exp_mlp, &xs_mlp], D::Minus1)?; }
-                    xs_mlp = (exp_mlp * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
-                }
+            // [STRICT-MLP-ENTRANCE-BRIDGE] 지능형 가중치 규격 맞춤
+            if (is_handshake_active || disk_identity == 4.0) && norm_dim == 1024 && xs_mlp.dim(D::Minus1)? == 2048 {
+                xs_mlp = xs_mlp.narrow(D::Minus1, 0, 1024)?.contiguous()?;
             }
             
-            let (gate, up) = (gate_proj.forward(&xs_mlp)?, up_proj.forward(&xs_mlp)?);
-            let out = down_proj.forward(&(candle_nn::ops::silu(&gate)?.mul(&up)?))?;
+            // 2. Gate & Up Projections
+            let (gate, up) = {
+                let g = gate_proj.forward(&xs_mlp)?;
+                let u = up_proj.forward(&xs_mlp)?;
+                (g, u)
+            };
+            
+            let gate = candle_nn::ops::silu(&gate)?;
+            let hidden = gate.mul(&up)?;
+            
+            // 3. Down Projection
+            let out = down_proj.forward(&hidden)?;
+            
+            // [HYBRID-MLP-EXIT-V7-DISABLED] 내부 확장 비활성화
             
             let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
             Ok(residual_mlp.add(&out)?)
@@ -1141,14 +1269,13 @@ pub struct QuantizedQwen3VLTextModel {
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
     pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
-    pub spec: ModelSpec, // [NEW] Data-driven architecture spec
-    pub baking_only: bool, 
-    pub is_forced_cpu: bool, 
-    pub is_disk_swap: bool, 
-    pub active_session_id: Option<String>, 
-    pub pinned_layer_count: usize, 
-    pub current_kv_len: usize, 
-    pub is_handshake_active: bool, 
+    pub baking_only: bool, // [NEW] Skip MLP for KV baking
+    pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
+    pub is_disk_swap: bool, // [NEW] SSD-Assisted GPU Inference mode
+    pub active_session_id: Option<String>, // [NEW] Disk workspace ID
+    pub pinned_layer_count: usize, // [NEW] How many layers to keep in VRAM
+    pub current_kv_len: usize, // [NEW] Logical progress tracker (SSD-persistent)
+    pub is_handshake_active: bool, // [NEW] Global hybrid state
     pub is_text: bool,
     pub is_image: bool,
 }
@@ -1192,12 +1319,6 @@ impl QuantizedQwen3VLTextModel {
 
         println!("[MODEL-INIT] Name: {}, Config Hidden: {}, GGUF Actual: {}, Layers: {}", base_name, config.hidden_size, actual_h_size, config.num_hidden_layers);
 
-        // [SPEC-LOAD-V21] Load data-driven architecture spec
-        let spec_name = if actual_h_size == 1024 { "0.6b_specs.json" } else { "2b_specs.json" };
-        let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
-        let spec = ModelSpec::load(&base_path.join(spec_name))?;
-        println!("[SPEC-LOAD] Successfully loaded {} for dynamic mapping.", spec_name);
-
         let mut patched_config_owned = config.clone();
         patched_config_owned.hidden_size = actual_h_size;
         let config = &patched_config_owned;
@@ -1238,54 +1359,40 @@ impl QuantizedQwen3VLTextModel {
 
         
 
-        // [HYBRID-EMBEDDING-RESOLVER-V18] 지능형 앵커링 및 변환 로직
-        let mut tensor_opt = None;
-        let target_h = config.hidden_size; // 엔진이 목표로 하는 히든 차원
+                // [HYBRID-EMBEDDING-RESOLVER] Unified intelligence entry for 0.6B and 2B
+                let mut tensor_opt = None;
+                if let Some(key) = embed_key {
+                     println!("[HYBRID] Found embedding weight in main GGUF: {}", key);
+                     tensor_opt = Some(ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?);
+                }
 
-        if let Some(key) = embed_key {
-             let mut t = ct.tensor(&mut reader, &key, device)?.dequantize(device)?.to_dtype(dtype)?;
-             let (rows, cols) = (t.dim(0)?, t.dim(1)?);
-             
-             // [ANCHORING] 보컬 사이즈(151936)가 포함된 텐서를 임베딩으로 확정
-             if rows == 151936 || cols == 151936 {
-                 let mut current_h = if rows == 151936 { cols } else { rows };
-                 
-                 // [AUTO-TRANSFORMATION] 엔진 규격에 맞게 변신
-                 if current_h != target_h {
-                     if current_h > target_h {
-                         // [EMBED-FOLD-HANDSHAKE-V20] Folding Intelligence (2B -> 0.6B)
-                         println!("[EMBED-FOLD] Preserving 2B Identity (2.0 Source) in Folded Weights ({} -> {})", current_h, target_h);
-                         let t_resized = if rows == 151936 {
-                             ((t.narrow(1, 0, target_h)? + t.narrow(1, target_h, target_h)?)? / 2.0)?
-                         } else {
-                             ((t.narrow(0, 0, target_h)? + t.narrow(0, target_h, target_h)?)? / 2.0)?
-                         };
-                         
-                         // [HANDSHAKE-INJECTION] 가중치 자체에 신분 각인 (2B Source = 2.0)
-                         let mut data = t_resized.flatten_all()?.to_vec1::<f32>()?;
-                         let marker = -(1.0 + (1.0 * 0.1) + (2.0 * 0.01) + 0.00005); // ID=2.0 (2B)
-                         data[0] = marker as f32;
-                         t = Tensor::from_vec(data, t_resized.shape(), device)?.contiguous()?;
-                     } else {
-                         // Expansion: 0.6B(1024) -> 2B(2048)
-                         println!("[EMBED-EXPAND] Expanding Energy ({} -> {})", current_h, target_h);
-                         let t_resized = if rows == 151936 {
-                             let ratio = target_h / current_h;
-                             let mut exp = t.clone();
-                             for _ in 1..ratio { exp = Tensor::cat(&[&exp, &t], 1)?; }
-                             (exp * (1.0 / (ratio as f64).sqrt()))?
-                         } else {
-                             let ratio = target_h / current_h;
-                             let mut exp = t.clone();
-                             for _ in 1..ratio { exp = Tensor::cat(&[&exp, &t], 0)?; }
-                             (exp * (1.0 / (ratio as f64).sqrt()))?
-                         };
-                         t = t_resized.contiguous()?;
-                     }
-                 }
-             }
-             tensor_opt = Some(t);
-        }
+                // [HYBRID-STRATEGY] If missing (Body-L1-27 mode) or if we want 2B precision for Baking
+                if tensor_opt.is_none() || (actual_h_size == 1024 && baking_only) {
+                    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap();
+                    let hybrid_dir = base_path.join("Qwen3-VL-2B-Hybrid-gguf");
+                    let b2_gguf_path = hybrid_dir.join("Qwen3-2B-L0-VL-Q4_K_M.gguf");
+                    
+                    if b2_gguf_path.exists() {
+                        if let Ok(b2_file) = std::fs::File::open(&b2_gguf_path) {
+                            if let Ok(b2_mmap) = unsafe { memmap2::MmapOptions::new().map(&b2_file) } {
+                                let mut b2_cursor = std::io::Cursor::new(&b2_mmap[..]);
+                                if let Ok(b2_ct) = gguf_file::Content::read(&mut b2_cursor) {
+                                    if let Ok(b2_emb) = b2_ct.tensor(&mut b2_cursor, "token_embd.weight", device) {
+                                        let b2_emb_t = b2_emb.dequantize(device)?.to_dtype(dtype)?;
+                                        
+                                        if actual_h_size == 1024 {
+                                            tensor_opt = Some(b2_emb_t.narrow(1, 0, 1024)?.contiguous()?);
+                                            println!("[HYBRID-INJECT-SUCCESS] 2B Embedding Truncated (2048 -> 1024) injected for Baking.");
+                                        } else if actual_h_size == 2048 {
+                                            tensor_opt = Some(b2_emb_t);
+                                            println!("[HYBRID-INJECT-SUCCESS] Unified 2B Embedding injected for Inference.");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 let embed_tokens = if let Some(tensor) = tensor_opt {
                      let h = tensor.dim(1)?;
@@ -1434,16 +1541,26 @@ impl QuantizedQwen3VLTextModel {
                     layer_config.hidden_size = 2048;
                 }
 
-                // [CRITICAL] Pass the forced layer_config and spec
+                // [CRITICAL] Pass the forced layer_config
                 QuantizedQwen3VLTextDecoderLayer::new(
-                    &layer_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only, &spec
+                    &layer_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
                 )
             }).collect()
         });
         
         let layers = layers?;
         
-        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(spec.head_dim, 5000000.0);
+        let norm_name = format!("{base_name}.norm");
+        let alt_norm = "output_norm";
+        let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
+        let last_device = layers.last().map(|l| l.device()).unwrap_or(device);
+        let norm_dtype = if last_device.is_cpu() { DType::F32 } else { dtype };
+        let norm = get_rms_norm(ct, &mut reader, norm_prefix, config.rms_norm_eps, last_device, norm_dtype, config.hidden_size)?;
+        
+        let head_dim = config.head_dim;
+        // [HYBRID-ROPE-SYNC] Force 5M theta for both 0.6B and 2B to align rotation phases
+        let actual_rope_theta = if config.hidden_size == 1024 || config.rope_theta < 1000001.0 { 5000000.0 } else { config.rope_theta };
+        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, actual_rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
         Ok(Self { 
@@ -1453,7 +1570,6 @@ impl QuantizedQwen3VLTextModel {
             rotary_emb, 
             mrope_section, 
             mmap: mmap_handle, 
-            spec, // Store spec in model
             baking_only, 
             is_forced_cpu, 
             is_disk_swap, 
@@ -1657,22 +1773,6 @@ impl QuantizedQwen3VLTextModel {
 
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
-        // [EMBEDDING-ALIGNMENT-V20] 입력 임베딩 차원 강제 정렬
-        let input_h = xs.dim(D::Minus1)?;
-        let target_h = self.layers[0].input_layernorm.weight().dim(0)?; // 레이어의 실제 물리 규격 (2048)
-        
-        if input_h < target_h {
-            println!("[HANDSHAKE-V20] Inputs Embedding Expansion ({} -> {}). Applying 1.0 Scaling.", input_h, target_h);
-            let ratio = target_h / input_h;
-            let mut expanded = xs.clone();
-            for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &xs], D::Minus1)?; }
-            // Scale 1.0 유지 (에너지 보존보다 신호 선명도 우선)
-            xs = expanded.contiguous()?;
-        } else if input_h > target_h {
-            println!("[HANDSHAKE-V20] Inputs Embedding Slicing ({} -> {}).", input_h, target_h);
-            xs = xs.narrow(D::Minus1, 0, target_h)?.contiguous()?;
-        }
-
         let (cos, sin) = self.rotary_emb.forward(
             &position_ids,
             target_dtype,
@@ -1716,35 +1816,18 @@ impl QuantizedQwen3VLTextModel {
             // [SMART-STREAMING]
             if is_on_cpu { layer.to_device(&gpu_device)?; }
             
-            // [GLOBAL-HANDSHAKE-SYNC-V20] 
-            // 1. 모델 레벨의 신분 상태를 레이어에 주입 (최우선)
+            // [GLOBAL-HANDSHAKE-SYNC] 개별 레이어가 SSD에서 오며 잃어버린 신분을 모델 레벨에서 강제 복구
             layer.self_attn.is_handshake_active = self.is_handshake_active;
-            
-            // 2. 디스크 스왑 모드에서 전역 상태가 false인 경우, 디스크 깃발을 최종 재확인
-            if !self.is_handshake_active && self.is_disk_swap {
-                if let Some(session_id) = &self.active_session_id {
-                    let safe_sid = session_id.replace("/", "_");
-                    let kv_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-                    if kv_dir.join("HANDSHAKE_2B").exists() {
-                        println!("[DISK-SYNC-V20] Late 2B Signal detected on disk. Elevating Model Identity.");
-                        self.is_handshake_active = true;
-                        layer.self_attn.is_handshake_active = true;
-                    }
-                }
-            }
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
 
-            // [STRICT-SIGNAL-PROPAGATION-V20] 레이어 0에서 신분 상승 감지 시 즉시 전파
+            // [STRICT-SIGNAL-PROPAGATION] 레이어 0에서 신분 상승이 일어났다면 즉시 전파 및 신호 파일 생성
             if layer_idx == 0 && !self.is_handshake_active && layer.self_attn.is_handshake_active {
                 self.is_handshake_active = true;
-                println!("[HANDSHAKE-V20] !!! 2B IDENTITY ACTIVATED AT LAYER 0 !!!");
                 if let Some(session_id) = &self.active_session_id {
-                    let safe_sid = session_id.replace("/", "_");
-                    let kv_path = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-                    let _ = std::fs::create_dir_all(&kv_path);
-                    let _ = std::fs::File::create(kv_path.join("HANDSHAKE_2B"));
-                    println!("[HANDSHAKE-V20] Signal Latch: HANDSHAKE_2B file created.");
+                    let signal_path = crate::utils::paths::get_kv_dir(None).join(session_id).join("HANDSHAKE_2B");
+                    let _ = std::fs::File::create(signal_path); // 깃발 꽂기
+                    println!("[DISK-MASTER] 2B Signal File RAISED. All layers authorized for Large mode.");
                 }
             }
             
@@ -1939,70 +2022,51 @@ impl QuantizedQwen3VLTextModel {
             }
         }
 
+        // [STRICT-IO] Ensure the directory exists
         if !final_path.exists() {
-            std::fs::create_dir_all(&final_path)?;
+            std::fs::create_dir_all(&final_path)
+                .map_err(|e| anyhow!("Failed to create KV directory {:?}: {}", final_path, e))?;
         }
         
-        let raw_sid = self.active_session_id.as_deref().unwrap_or("default");
-        let safe_sid = raw_sid.replace("/", "_");
+        let session_id = self.active_session_id.as_deref().unwrap_or("default").replace("/", "_");
         
-        println!("[BLUEPRINT-V21] Saving {} layers with Packed Integer Handshake.", self.layers.len());
+        println!("[SSD-BRIDGE] Saving {} layers to ABSOLUTE directory: {:?}", self.layers.len(), final_path);
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            if let Some((k, v)) = &layer.self_attn.kv_cache {
-                let file = final_path.join(format!("layer_{}_kv.safetensors", layer.self_attn.layer_idx));
-                
-                // [BLUEPRINT-PACKING-V21] [Seq*10000 + Mult, Dim + ID/10]
-                let (_b, _h, s, d) = k.dims4()?;
-                let mult = if self.is_handshake_active { 1.0 } else { 2.0 };
-                let id = if self.is_handshake_active { 2.0 } else { 0.0 }; // 2B=2.0, 0.6B=0.0
-                
-                let sign = -1.0; // Reverse Flag Always On for safety in this protocol
-                let val1 = sign * (s as f64 * 10000.0 + mult);
-                let val2 = sign * (d as f64 + (id / 10.0));
+            // 1. KV 텐서 저장
+            layer.save_kv_cache(&final_path, clear, block_size)
+                .map_err(|e| anyhow!("Failed to save layer {} to {:?}: {}", i, final_path, e))?;
 
-                let mut k_f32 = k.to_dtype(DType::F32)?;
-                let mut k_data = k_f32.flatten_all()?.to_vec1::<f32>()?;
-                k_data[0] = val1 as f32;
-                k_data[1] = val2 as f32;
-                let k_marked = Tensor::from_vec(k_data, k.shape(), &Device::Cpu)?;
+            // 2. [DISK-BRAIN] 레이어별 독립 핸드쉐이크 파일 생성
+            let handshake_name = format!("handshake_{}_L{}.json", session_id, i);
+            let handshake_path = final_path.join(handshake_name);
+            
+            let metadata = serde_json::json!({
+                "layer_idx": i,
+                "session_id": session_id,
+                "is_handshake_active": self.is_handshake_active,
+                "hidden_size": if self.is_handshake_active { 2048 } else { 1024 },
+                "current_kv_len": self.current_kv_len,
+                "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            });
 
-                let (k_anchors, k_packed, k_scales, k_shape) = layer.self_attn.compress_to_bitkv(&k_marked)?;
-                let (v_anchors, v_packed, v_scales, _) = layer.self_attn.compress_to_bitkv(&v.to_dtype(DType::F32)?)?;
-
-                let mut map = HashMap::new();
-                map.insert("k_anchors".to_string(), k_anchors);
-                map.insert("k_packed".to_string(), k_packed);
-                map.insert("k_scales".to_string(), k_scales);
-                map.insert("v_anchors".to_string(), v_anchors);
-                map.insert("v_packed".to_string(), v_packed);
-                map.insert("v_scales".to_string(), v_scales);
-                map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
-                map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu)?);
-                
-                candle_core::safetensors::save(&map, &file)?;
-
-                // [MANIFEST-JSON-V21]
-                let handshake_name = format!("handshake_{}_L{}.json", safe_sid, i);
-                let metadata = serde_json::json!({
-                    "layer_idx": i,
-                    "v1_packed": val1,
-                    "v2_packed": val2,
-                    "is_handshake_active": self.is_handshake_active
-                });
-                let _ = std::fs::File::create(final_path.join(handshake_name)).and_then(|f| {
-                    serde_json::to_writer_pretty(f, &metadata).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
+            if let Ok(f) = std::fs::File::create(&handshake_path) {
+                let _ = serde_json::to_writer_pretty(f, &metadata);
             }
-            if clear { layer.clear_kv_cache(); }
         }
 
-        // [SESSION-SIGNAL-V21]
-        if self.is_handshake_active {
-            let _ = std::fs::File::create(final_path.join("HANDSHAKE_2B"));
-            let sig_name = "handshake_role1.0_id2.0_mult1.0_trans0.0.signal"; 
-            let _ = std::fs::File::create(final_path.join(sig_name));
+        // [DISK-BRAIN] Save overall metadata for OOM recovery
+        let metadata_path = final_path.join("metadata.json");
+        let metadata = serde_json::json!({
+            "current_kv_len": self.current_kv_len,
+            "is_handshake_active": self.is_handshake_active,
+            "timestamp": chrono::Utc::now().timestamp()
+        });
+        if let Ok(file) = std::fs::File::create(&metadata_path) {
+            let _ = serde_json::to_writer(file, &metadata);
+            println!("[DISK-BRAIN] Progress and Handshake state ({}) saved to SSD.", self.is_handshake_active);
         }
+
         Ok(())
     }
 
@@ -2013,88 +2077,84 @@ impl QuantizedQwen3VLTextModel {
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
         if !path.exists() { return Ok(()); }
         
-        let session_id = path.file_name().unwrap().to_string_lossy().to_string();
-        let inference_session_id = format!("{}/inference", session_id);
+        let raw_session_id = path.file_name().unwrap().to_string_lossy().to_string();
+        let inference_session_id = format!("{}/inference", raw_session_id);
         let safe_session_id = inference_session_id.replace("/", "_");
         
         self.active_session_id = Some(inference_session_id.clone());
         for l in &mut self.layers { l.self_attn.active_session_id = Some(inference_session_id.clone()); }
 
-        let inference_path = crate::utils::paths::get_kv_dir(None).join(&safe_session_id);
-        if !inference_path.exists() { let _ = std::fs::create_dir_all(&inference_path); }
-
+        let inference_path = crate::utils::paths::get_kv_dir(None).join(&inference_session_id);
         let l0_inference_file = inference_path.join("layer_0_kv.safetensors");
-        let (actual_load_path, _is_resuming) = if l0_inference_file.exists() {
-            (inference_path.clone(), true)
-        } else {
+        let l0_baked_file = path.join("layer_0_kv.safetensors");
+        
+        let (actual_load_path, is_resuming_inference) = if l0_inference_file.exists() {
+            (inference_path, true)
+        } else if l0_baked_file.exists() {
             (path.to_path_buf(), false)
+        } else {
+            return Err(anyhow!("No KV seed found at {:?} or {:?}", l0_baked_file, l0_inference_file));
         };
 
-        // [MANIFEST-RESTORE-V20] JSON 장부 파싱 (파일명보다 JSON을 우선 신뢰)
-        let mut loaded_identity = 0.0; // Default to 0.6B
-        let json_path = actual_load_path.join(format!("handshake_{}_L0.json", safe_session_id));
-        if json_path.exists() {
-            if let Ok(file) = std::fs::File::open(&json_path) {
-                if let Ok(metadata) = serde_json::from_reader::<_, serde_json::Value>(file) {
-                    if let Some(id) = metadata["identity"].as_f64() {
-                        loaded_identity = id;
+        // [DISK-BRAIN-RECALL] Restore logical progress and HANDSHAKE from JSON
+        let metadata_path = actual_load_path.join("metadata.json");
+        if metadata_path.exists() {
+            if let Ok(file) = std::fs::File::open(&metadata_path) {
+                let meta: serde_json::Value = serde_json::from_reader(file).unwrap_or(serde_json::json!({}));
+                if let Some(len) = meta.get("current_kv_len").and_then(|v| v.as_u64()) {
+                    self.current_kv_len = len as usize;
+                }
+                if let Some(active) = meta.get("is_handshake_active").and_then(|v| v.as_bool()) {
+                    self.is_handshake_active = active;
+                    for l in &mut self.layers { l.self_attn.is_handshake_active = active; }
+                }
+            }
+        }
+
+        // [GLOBAL-HANDSHAKE-SYNC] 레이어 0의 전용 핸드쉐이크 파일이 있다면 최우선 적용
+        let l0_handshake = actual_load_path.join(format!("handshake_{}_L0.json", safe_session_id));
+        if l0_handshake.exists() {
+            if let Ok(content) = std::fs::read_to_string(&l0_handshake) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if val["is_handshake_active"].as_bool().unwrap_or(false) {
+                        self.is_handshake_active = true;
+                        for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
+                        println!("[HYBRID-SYNC] Global Handshake activated from L0 signal file.");
                     }
                 }
             }
         }
 
-        // [AUTO-PROMOTION-V20] 2B 모델인데 0.6B 데이터를 로드했다면 즉시 신분 상승 확정
-        let model_is_2b = self.layers[0].input_layernorm.weight().dim(0).unwrap_or(0) >= 2048;
-        
-        if model_is_2b && loaded_identity < 2.0 {
-            println!("[HANDSHAKE-V20] 2B Model detected 0.6B data (id={}). FORCING Expansion.", loaded_identity);
-            self.is_handshake_active = true;
-        } else if loaded_identity >= 2.0 {
-            println!("[HANDSHAKE-V20] 2B Identity CONFIRMED (id={}).", loaded_identity);
-            self.is_handshake_active = true;
-        }
-
-        // [SIGNAL-FALLBACK] JSON이 없을 경우 파일명 시그널 체크
-        if !self.is_handshake_active {
-            if actual_load_path.join("HANDSHAKE_2B").exists() || actual_load_path.join("handshake_role1.0_id2.0_mult1.0_trans0.0.signal").exists() {
-                println!("[HANDSHAKE-V20] 2B Identity detected via Signal File.");
-                self.is_handshake_active = true;
-            }
-        }
-        
-        if self.is_handshake_active {
-            for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
-        }
-
-        // VRAM 체크 및 레이어 할당 정책
         let mut free_vram = 0;
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() { free_vram = mem.free; }
             }
         }
+
         let safety_margin = 800 * 1024 * 1024;
         let available_for_kv = free_vram.saturating_sub(safety_margin);
         let layer_kv_cost = 40 * 1024 * 1024; 
+        
         let can_pin = if layer_kv_cost > 0 { (available_for_kv / layer_kv_cost) as usize } else { 0 };
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
-        // [ATOMIC-LOAD] Layer 0 로드 (마커 복구 로직 포함됨)
+        // [ZERO-PREFILL-BRIDGE] Load Layer 0 with verified handshake status
         self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len, self.is_handshake_active)?;
-        self.current_kv_len = self.layers[0].get_kv_len();
         
-        // Layer 0에서 인-텐서 마커를 통해 신분이 상승했을 수 있으므로 다시 동기화
-        if self.layers[0].self_attn.is_handshake_active { self.is_handshake_active = true; }
+        self.current_kv_len = self.layers[0].get_kv_len();
+        self.is_handshake_active = self.layers[0].self_attn.is_handshake_active;
         let is_restored = self.is_handshake_active;
 
         if is_restored {
             for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
-            // 복원된 신분을 디스크에도 깃발 꽂기
-            let _ = std::fs::File::create(inference_path.join("HANDSHAKE_2B"));
         }
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
-            .ok_or_else(|| anyhow!("Failed to load seed KV cache"))?.clone();
+            .ok_or_else(|| anyhow!("Failed to load seed KV cache from {:?}", actual_load_path))?.clone();
+
+        let inference_workspace = crate::utils::paths::get_kv_dir(None).join(self.active_session_id.as_ref().unwrap());
+        if !inference_workspace.exists() { std::fs::create_dir_all(&inference_workspace)?; }
 
         for i in 0..self.layers.len() {
             let is_pinned = i < self.pinned_layer_count;
@@ -2103,10 +2163,11 @@ impl QuantizedQwen3VLTextModel {
                 self.layers[i].self_attn.is_handshake_active = is_restored;
             }
             if self.is_disk_swap {
-                self.layers[i].save_kv_cache(&inference_path, !is_pinned, 1024)?;
+                self.layers[i].save_kv_cache(&inference_workspace, !is_pinned, 1024)?;
             }
         }
-        println!("[SSD-BRIDGE-V20] KV Restore Complete. Identity: {}", if is_restored { "2B" } else { "0.6B" });
+
+        println!("[SSD-BRIDGE] KV Restore Complete. Handshake: {}, Pinned: {}/{}", is_restored, self.pinned_layer_count, self.layers.len());
         Ok(())
     }
 
@@ -2255,12 +2316,12 @@ impl QuantizedQwen3VLModel {
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader_main = std::io::Cursor::new(main_mmap);
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "lm_head", text_device, head_dtype, &t_config) {
+        let lm_head = if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "lm_head", text_device, head_dtype, language_model.embed_tokens.hidden_size()) {
             l
-        } else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "output", text_device, head_dtype, &t_config) {
+        } else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "output", text_device, head_dtype, language_model.embed_tokens.hidden_size()) {
             l
         } else {
-            get_qlinear_v2(ct_main, &mut reader_main, "token_embd", text_device, head_dtype, &t_config)?
+            get_qlinear_v2(ct_main, &mut reader_main, "token_embd", text_device, head_dtype, language_model.embed_tokens.hidden_size())?
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: main_mmap_handle, mmproj_mmap: mmproj_mmap_handle })
@@ -2300,12 +2361,12 @@ impl QuantizedQwen3VLModel {
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if !baking_only {
-            if let Ok(l) = get_qlinear_v2(ct_main, reader_main, "lm_head", text_device, head_dtype, &t_config) {
+            if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
                 l
-            } else if let Ok(l) = get_qlinear_v2(ct_main, reader_main, "output", text_device, head_dtype, &t_config) {
+            } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
                 l
             } else {
-                get_qlinear_v2(ct_main, reader_main, "token_embd", text_device, head_dtype, &t_config)?
+                get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
             }
         } else {
             // Minimal header for baking only
@@ -2435,9 +2496,9 @@ impl QuantizedQwen3TextModel {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-            if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "lm_head", text_device, head_dtype, &t_config) { Some(l) }
-            else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "output", text_device, head_dtype, &t_config) { Some(l) }
-            else { get_qlinear_v2(ct_main, &mut reader, "token_embd", text_device, head_dtype, &t_config).ok() }
+            if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "lm_head", text_device, head_dtype, language_model.embed_tokens.hidden_size()) { Some(l) }
+            else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "output", text_device, head_dtype, language_model.embed_tokens.hidden_size()) { Some(l) }
+            else { get_qlinear_v2(ct_main, &mut reader, "token_embd", text_device, head_dtype, language_model.embed_tokens.hidden_size()).ok() }
         } else { None };
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle, is_text, is_image })
     }
@@ -2505,39 +2566,8 @@ impl QuantizedQwen3TextModel {
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
         if let Some(head) = &self.lm_head {
-            // [HANDSHAKE-LMHEAD-V20] LM Head 진입 전 마커 검증 및 신분 복구 로직
-            let hs_for_marker = hidden_state.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-            let hs_vec = hs_for_marker.flatten_all()?.to_vec1::<f32>()?;
-            let sig_hs = hs_vec[0];
-            let mut hidden_state = hidden_state;
-
-            if sig_hs < -1.0 {
-                let val_hs = sig_hs.abs() - 1.0;
-                let identity_hs = ((val_hs * 100.0).round() as usize) % 10;
-                
-                // 2B 마커(id 4.0) 감지 시 세션 승격 및 신호 파일 생성
-                if identity_hs >= 4 && !self.language_model.is_handshake_active {
-                    println!("[HANDSHAKE-LMHEAD] Large Marker detected (sig: {:.6})! Activating Large mode.", sig_hs);
-                    self.language_model.is_handshake_active = true;
-                    if let Some(sid) = &self.language_model.active_session_id {
-                        let safe_sid = sid.replace("/", "_");
-                        let s_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
-                        let _ = std::fs::create_dir_all(&s_dir);
-                        let signal_path = s_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal");
-                        let _ = std::fs::File::create(signal_path);
-                        println!("[HANDSHAKE-LMHEAD] Master 2B Signal created at {:?}", s_dir);
-                    }
-                }
-
-                // [MARKER-HEALING] 마커로 사용된 첫 번째 원소 복구 (옆의 값 복제)
-                let mut hs_clean = hs_vec.clone();
-                hs_clean[0] = hs_vec[1]; 
-                hidden_state = Tensor::from_vec(hs_clean, hidden_state.shape(), &Device::Cpu)?
-                    .to_device(hidden_state.device())?
-                    .to_dtype(hidden_state.dtype())?;
-            }
-
             // [CRITICAL-OOM-FIX] If in DiskSwap mode, force the heavy lm_head computation to CPU
+            // to avoid the final logit spike that causes the 100% OOM loop.
             let target_device = if self.language_model.is_disk_swap { 
                 &Device::Cpu 
             } else { 
@@ -2562,24 +2592,7 @@ impl QuantizedQwen3TextModel {
                 head
             };
 
-            // [DEBUG-LOGITS-V19] 외계어 원인 추적을 위한 물리적 수치 검증
-            let hs_f32 = hidden_state.to_dtype(DType::F32)?;
-            let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
-            let hs_max = hs_f32.abs()?.max_all()?.to_scalar::<f32>()?;
-            println!("[LOGITS-TRACE] HiddenState Mean: {:.4}, Max: {:.4} | Device: {:?}", hs_mean, hs_max, active_head.device());
-
-            let logits = active_head.forward(&hidden_state)?;
-            
-            // Top-5 Token ID 추출 (Transpose 오류 판별기)
-            let logits_f32 = logits.to_dtype(DType::F32)?.flatten_all()?;
-            let top5 = logits_f32.arg_sort_last_dim(false)?; // 오름차순 정렬
-            let v_size = logits_f32.dim(0)?;
-            let t1 = top5.i(v_size - 1)?.to_scalar::<u32>()?;
-            let t2 = top5.i(v_size - 2)?.to_scalar::<u32>()?;
-            let t3 = top5.i(v_size - 3)?.to_scalar::<u32>()?;
-            println!("[LOGITS-TRACE] Top-3 Token IDs: [{}, {}, {}] | Vocab Size: {}", t1, t2, t3, v_size);
-
-            Ok(logits)
+            Ok(active_head.forward(&hidden_state)?)
         } else { Ok(hidden_state) }
     }
 
@@ -2631,77 +2644,159 @@ fn get_qlinear_2b_hybrid<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Conte
     Ok(QLinear::new(QMatMul::Tensor(weight_t), bias, device.clone()))
 }
 
-fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
-    ct: &gguf_file::Content, 
-    reader: &mut R, 
-    name: &str, 
-    device: &Device, 
-    dtype: DType, 
-    config: &Qwen3VLTextConfig
-) -> Result<QLinear> {
-    let weight = ct.tensor(reader, &format!("{name}.weight"), device)
-        .map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
+fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType, hidden_size: usize) -> Result<QLinear> {
+    let weight = ct.tensor(reader, &format!("{name}.weight"), device).map_err(|e| anyhow!("Failed to load {name}.weight: {e}"))?;
     let mut weight_t = weight.dequantize(device)?.to_dtype(dtype)?;
     
-    // [SPEC-ALIGNED-TRANSPOSE-V21]
-    // GGUF 형상과 엔진이 기대하는 형상을 비교하여 자동 Transpose
-    let (r_src, c_src) = (weight_t.dim(0)?, weight_t.dim(1)?);
-    let target_h = config.hidden_size;
-    let target_i = config.intermediate_size;
+    // [HYBRID-RECURSIVE-FOLDING-V2]
+    if hidden_size == 1024 {
+        // ... (Folding logic remains same for 0.6B mode)
+        let dims = weight_t.dims();
+        if dims.len() == 2 {
+            let mut t = weight_t.clone();
+            let mut was_folded = false;
+            let mut fold_count = 1.0;
+            
+            let mut d0 = t.dim(0)?;
+            while d0 > 1024 && d0 != 3072 {
+                let half = d0 / 2;
+                t = ((t.narrow(0, 0, half)? + t.narrow(0, half, half)?)? / 2.0)?;
+                d0 = t.dim(0)?;
+                fold_count *= 2.0;
+            }
+            if d0 == 6144 {
+                t = ((t.narrow(0, 0, 3072)? + t.narrow(0, 3072, 3072)?)? / 2.0)?;
+                fold_count = 2.0;
+                was_folded = true;
+            }
 
-    let (r_target, c_target) = if name.contains("down") { (target_h, target_i) } else if name.contains("gate") || name.contains("up") { (target_i, target_h) } else { (target_h, target_h) };
+            let mut d1 = t.dim(1)?;
+            while d1 > 1024 && d1 != 3072 {
+                let half = d1 / 2;
+                t = ((t.narrow(1, 0, half)? + t.narrow(1, half, half)?)? / 2.0)?;
+                d1 = t.dim(1)?;
+                fold_count *= 2.0;
+                was_folded = true;
+            }
 
-    if r_src == c_target && c_src == r_target {
-        println!("[SPEC-FIX] Auto-Transposing {} to match [{}, {}]", name, r_target, c_target);
-        weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+            if was_folded || d0 > 1024 || d1 > 1024 {
+                // [STRICT-NAME-BASED-ALIGNMENT]
+                // 0.6B engine has specific orientation needs for each layer type.
+                // We enforce these based on the actual 0.6B model architecture.
+                let (r, c) = (t.dim(0)?, t.dim(1)?);
+                
+                if name.contains("gate") || name.contains("up") {
+                    // Expects [1024, 3072]
+                    if r == 3072 && c == 1024 { t = t.transpose(0, 1)?; }
+                } else if name.contains("down") {
+                    // Expects [3072, 1024]
+                    if r == 1024 && c == 3072 { t = t.transpose(0, 1)?; }
+                } else if name.contains("attn_q") {
+                    // Expects [1024, 2048]
+                    if r == 2048 && c == 1024 { t = t.transpose(0, 1)?; }
+                } else if name.contains("attn_output") {
+                    // Expects [2048, 1024]
+                    if r == 1024 && c == 2048 { t = t.transpose(0, 1)?; }
+                } else {
+                    // Default fallback for hidden-to-hidden
+                    if r == 1024 && c == 1024 {} // Already correct
+                    else if r > c { t = t.transpose(0, 1)?; }
+                }
+                weight_t = t.contiguous()?;
+            }
+        }
+    } else if hidden_size == 2048 {
+        // [HYBRID-ENERGY-PRESERVING-UNFOLDING]
+        let (r, c) = (weight_t.dim(0)?, weight_t.dim(1)?);
+        if r == 1024 || c == 1024 {
+            let mut t = weight_t.clone();
+            if r == 1024 && c == 1024 {
+                t = Tensor::cat(&[&t, &t], 0)?;
+                t = Tensor::cat(&[&t, &t], 1)?;
+                t = (t / 2.0)?; // Scale down to preserve magnitude
+            } else if (r == 3072 || r == 2048) && c == 1024 {
+                t = Tensor::cat(&[&t, &t], 1)?;
+                t = (t / 1.414)?; // Sqrt scaling for better balance
+            } else if r == 1024 && (c == 3072 || c == 2048) {
+                t = Tensor::cat(&[&t, &t], 0)?;
+                t = (t / 1.414)?;
+            }
+            
+            // [STRICT-UNFOLD-CAP]
+            let (rf, cf) = (t.dim(0)?, t.dim(1)?);
+            if rf > 2048 && !name.contains("mlp") && !name.contains("gate") && !name.contains("up") {
+                t = t.narrow(0, 0, 2048)?.contiguous()?;
+            }
+            if cf > 2048 && !name.contains("mlp") && !name.contains("gate") && !name.contains("up") {
+                t = t.narrow(1, 0, 2048)?.contiguous()?;
+            }
+            
+            weight_t = t.contiguous()?;
+        }
+        
+        // [STRICT-2B-TRANSPOSE-GUARD]
+        // Candle's QLinear (via QMatMul::Tensor) expects [in_dim, out_dim].
+        // GGUF weights are often stored as [out_dim, in_dim].
+        let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
+        if r_final > c_final {
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        }
     }
 
-    // [HYBRID-DIMENSION-GUARD]
-    let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
-    if r_final < r_target || c_final < c_target {
-        // Expansion (Small -> Large)
-        println!("[SPEC-EXPAND] Expanding {} to match target spec.", name);
-        // ... (cat logic already handled by previous iterations or v2 core)
-    }
+    let shape = weight_t.dims();
+    if shape.len() == 2 {
+        let rows = shape[0];
+        let cols = shape[1];
+        let mut needs_transpose = false;
+        
+        if hidden_size == 1024 {
+            // Standard Qwen 0.6B layout: Gate/Up [3072, 1024], Down [1024, 3072]
+            if rows == 3072 && cols == 1024 {
+                needs_transpose = true; 
+            } else if rows == 1024 && cols == 3072 {
+                needs_transpose = true;
+            }
+        } else {
+            // [2B-HYBRID-SPEC-ALIGNMENT]
+            if hidden_size == 2048 {
+                // 2B 원본 레이아웃: Gate/Up [6144, 2048], Down [2048, 6144]
+                // 만약 GGUF가 [2048, 6144]로 되어 있다면 트랜스포즈 필요
+                if (name.contains("gate") || name.contains("up")) && rows == 2048 && cols == 6144 {
+                    needs_transpose = true;
+                } else if name.contains("down") && rows == 6144 && cols == 2048 {
+                    needs_transpose = true;
+                } else if (name.contains("attn_q") || name.contains("attn_k") || name.contains("attn_v")) && rows == 2048 && cols == 2048 {
+                    // Attention projections often need transpose in Candle
+                    needs_transpose = true;
+                }
+            }
+        }
 
+        if needs_transpose {
+            weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        }
+    }
+    
     let weight_q = QMatMul::Tensor(weight_t);
-    let bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
-        Some(t.dequantize(device)?.to_dtype(dtype)?)
+    let mut bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
+        Some(t.dequantize(device)?.to_dtype(dtype)?) 
     } else { None };
+
+    // Also slice bias if needed
+    if hidden_size == 1024 {
+        if let Some(b) = bias {
+            let b_dim = b.dim(0)?;
+            if b_dim == 2048 { bias = Some(b.narrow(0, 0, 1024)?.contiguous()?); }
+            else if b_dim == 6144 { bias = Some(b.narrow(0, 0, 3072)?.contiguous()?); }
+            else { bias = Some(b); }
+        }
+    }
 
     Ok(QLinear::new(weight_q, bias, device.clone()))
 }
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
-    // [LEGACY-FALLBACK] Create a compatible config for legacy calls
-    let config = Qwen3VLTextConfig {
-        hidden_size: 2048,
-        intermediate_size: 5632,
-        num_hidden_layers: 28,
-        num_attention_heads: 16,
-        num_key_value_heads: 2,
-        rms_norm_eps: 1e-6,
-        rope_theta: 1000000.0,
-        vocab_size: 151936,
-        max_position_embeddings: 32768,
-        use_sliding_window: Some(false),
-        sliding_window: Some(32768),
-        tie_word_embeddings: true,
-        architectural: None,
-        attention_bias: false,
-        attention_dropout: 0.0,
-        bos_token_id: Some(151643),
-        eos_token_id: 151643,
-        hidden_act: Activation::Silu,
-        initializer_range: 0.02,
-        rope_scaling: None,
-        use_cache: true,
-        head_dim: 128,
-        max_window_layers: None,
-        model_type: "qwen2".to_string(), // Standard Qwen type
-        dtype: None,
-    };
-    get_qlinear_v2(ct, reader, name, device, dtype, &config)
+    get_qlinear_v2(ct, reader, name, device, dtype, 2048) // Legacy fallback
 }
 
 fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
@@ -2739,18 +2834,12 @@ fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reade
     
     let d0 = weight.dim(0)?;
     
-    // [HYBRID-BIDIRECTIONAL-ALIGN-NORM-V20]
+    // [HYBRID-BIDIRECTIONAL-ALIGN-NORM]
     if hidden_size == 1024 && d0 == 2048 {
         // Fold for 0.6B engine
         let w1 = weight.narrow(0, 0, 1024)?;
         let w2 = weight.narrow(0, 1024, 1024)?;
-        let folded = ((w1 + w2)? / 2.0)?;
-        
-        // [HANDSHAKE-INJECTION] 노름 가중치에도 2B 신분 각인
-        let mut data = folded.flatten_all()?.to_vec1::<f32>()?;
-        let marker = -(1.0 + (1.0 * 0.1) + (4.0 * 0.01) + 0.00005); 
-        data[0] = marker as f32;
-        weight = Tensor::from_vec(data, folded.shape(), device)?.contiguous()?;
+        weight = ((w1 + w2)? / 2.0)?.contiguous()?;
     } else if hidden_size == 2048 && d0 == 1024 {
         // Unfold for 2B engine
         weight = Tensor::cat(&[&weight, &weight], 0)?.contiguous()?;
