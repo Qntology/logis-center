@@ -403,15 +403,14 @@ impl QuantizedQwen3VLTextAttention {
                 if prev_heads < curr_heads {
                     let ratio = curr_heads / prev_heads;
                     if ratio > 1 {
-                        // Replicate heads: [B, 8, S, D] -> [B, 16, S, D]
-                        // We use repeat_interleave logic: repeat elements along dim 1
-                        // Candle doesn't have repeat_interleave, so we use repeat + reshape + transpose
-                        // [B, H, S, D] -> [B, H, 1, S, D] -> [B, H, R, S, D] -> [B, H*R, S, D]
+                        // [MANIFEST-EXPANSION-V20] 1.0 Scaling for clearer token identification
                         let (b, h, s, d) = pk.dims4()?;
                         pk = pk.unsqueeze(2)?.repeat((1, 1, ratio, 1, 1))?.flatten(1, 2)?.contiguous()?;
                         
                         let (b_v, h_v, s_v, d_v) = pv.dims4()?;
                         pv = pv.unsqueeze(2)?.repeat((1, 1, ratio, 1, 1))?.flatten(1, 2)?.contiguous()?;
+                        
+                        // No down-scaling here to maintain strong attention scores
                     }
                 }
 
@@ -670,7 +669,7 @@ impl QuantizedQwen3VLTextAttention {
             let multiplier = if is_stored_as_2b { 1.0 } else { 2.0 };
             let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
             
-            // [V9-IDENTITY-MARGIN] 2B=4.0, 0.6B=1.0 (제안된 간격 벌리기 적용)
+            // [V20-IDENTITY-MARGIN] 2B=4.0, 0.6B=1.0
             let identity_id = if is_stored_as_2b { 4.0 } else { 1.0 };
             let role_id_k = 1.0; 
             let role_id_v = 0.0; 
@@ -679,14 +678,9 @@ impl QuantizedQwen3VLTextAttention {
             let marker_v = -(1.0 + (role_id_v * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
             
             if self.layer_idx == 0 {
-                println!("[HYBRID-ENCODER-V9] Layer 0 | ID={} (2B={}), Parts={}, Trans={}", 
-                    if is_stored_as_2b { "2B" } else { "0.6B" }, is_stored_as_2b, multiplier, self.needs_transpose);
-                println!("  -> K-Marker (Safe-V9): {:.6}", marker_k);
+                println!("[HYBRID-ENCODER-V20] Layer 0 | Identity={} ({}), Marker={:.6}", 
+                    identity_id, if is_stored_as_2b { "2B" } else { "0.6B" }, marker_k);
             }
-            
-            // [V8-ENCODING]
-            let marker_k = -(1.0 + 0.1 + identity_id * 0.01 + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
-            let marker_v = -(1.0 + 0.0 + identity_id * 0.01 + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
             
             let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
             k_data[0] = marker_k as f32;
@@ -783,7 +777,7 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [HYBRID-HANDSHAKE-V19] Role-Aware Restoration & Marker Decoding
+        // [HYBRID-HANDSHAKE-V20] Role-Aware Restoration & Marker Decoding
         let engine_dtype = k.dtype();
         let k_f32 = k.to_dtype(DType::F32)?;
         let v_f32 = v.to_dtype(DType::F32)?;
@@ -792,45 +786,37 @@ impl QuantizedQwen3VLTextAttention {
         let v_vec = v_f32.flatten_all()?.to_vec1::<f32>()?;
         let sig_k = k_vec[0];
         
-        // Marker Decoding: -(1.0 + (Role * 0.1) + (Identity * 0.01) + ...)
+        // [STRICT-MARKER-DECODING-V20] -(1.0 + (Role * 0.1) + (Identity * 0.01) + ...)
         if sig_k < -1.0 {
             let val_k = sig_k.abs() - 1.0;
-            // 소수점 둘째 자리(Identity) 추출: 1.0=0.6B, 4.0=2B
-            let identity_k = ((val_k * 100.0).round() as usize) % 10;
+            let identity_k = ((val_k * 100.0).round() as usize) % 10; // 1=0.6B, 4=2B
             
-            // [SELF-HEALING] 마커가 2B(4.0)를 가리키면 즉시 승격
             if identity_k >= 4 {
                 if !self.is_handshake_active {
-                    println!("[MARKER-SYNC] 2B Marker detected (ID={}). Upgrading Identity.", identity_k);
+                    println!("[MARKER-SYNC-V20] 2B In-Tensor Marker detected (ID={}). Upgrading Model State.", identity_k);
                     self.is_handshake_active = true;
-                }
-            } else {
-                // 마커가 0.6B(1.0)라면 아직 확장 전
-                if self.is_handshake_active {
-                    println!("[MARKER-WARN] 0.6B Marker detected in 2B session. Expansion required.");
                 }
             }
 
-            // Marker Healing (K & V 둘 다 수행)
-            let mut k_clean = k_vec.clone(); k_clean[0] = k_vec[1];
-            let mut v_clean = v_vec.clone(); v_clean[0] = v_vec[1];
+            // [MARKER-HEALING-V20] 첫 번째 원소 복구 (보다 자연스러운 복구를 위해 index 1의 90% 수준으로 보정)
+            let mut k_clean = k_vec.clone(); k_clean[0] = k_vec[1] * 0.9;
+            let mut v_clean = v_vec.clone(); v_clean[0] = v_vec[1] * 0.9;
             
             let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
             let v_healed = Tensor::from_vec(v_clean, v_f32.shape(), &Device::Cpu)?.to_device(v_f32.device())?;
             
-            // [STRICT-DIMENSION-ALIGNMENT-V19]
             let mut k_final = k_healed;
             let mut v_final = v_healed;
             
             let loaded_heads = k_final.dim(1)?;
             let loaded_total_dim = loaded_heads * k_final.dim(D::Minus1)?;
 
-            // 2B 모드인데 데이터가 1024(0.6B)라면 여기서 확장
+            // [IDENTITY-EXPANSION-V20] 신호 선명도 유지를 위해 스케일링 1.0 적용 (Divergence 방지)
             if self.is_handshake_active && loaded_total_dim < 2048 {
-                println!("[HYBRID-V19-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
+                println!("[EXPANSION-V20] Preserving Signal Strength (Scale 1.0) for Layer {}", self.layer_idx);
                 k_final = Tensor::cat(&[&k_final, &k_final], 1)?; 
                 v_final = Tensor::cat(&[&v_final, &v_final], 1)?; 
-                v_final = (v_final * 0.70710678118)?; // 에너지 보존
+                // v_final = (v_final * 1.0)?; // 에너지 보존 대신 신호 유지 선택
             }
             
             let actual_k_len = k_final.dim(2)?;
@@ -1787,18 +1773,33 @@ impl QuantizedQwen3VLTextModel {
             // [SMART-STREAMING]
             if is_on_cpu { layer.to_device(&gpu_device)?; }
             
-            // [GLOBAL-HANDSHAKE-SYNC] 개별 레이어가 SSD에서 오며 잃어버린 신분을 모델 레벨에서 강제 복구
+            // [GLOBAL-HANDSHAKE-SYNC-V20] 
+            // 1. 모델 레벨의 신분 상태를 레이어에 주입 (최우선)
             layer.self_attn.is_handshake_active = self.is_handshake_active;
+            
+            // 2. 디스크 스왑 모드에서 전역 상태가 false인 경우, 디스크 깃발을 최종 재확인
+            if !self.is_handshake_active && self.is_disk_swap {
+                if let Some(session_id) = &self.active_session_id {
+                    let safe_sid = session_id.replace("/", "_");
+                    let kv_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                    if kv_dir.join("HANDSHAKE_2B").exists() {
+                        println!("[DISK-SYNC-V20] Late 2B Signal detected on disk. Elevating Model Identity.");
+                        self.is_handshake_active = true;
+                        layer.self_attn.is_handshake_active = true;
+                    }
+                }
+            }
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
 
-            // [STRICT-SIGNAL-PROPAGATION] 레이어 0에서 신분 상승이 일어났다면 즉시 전파 및 신호 파일 생성
+            // [STRICT-SIGNAL-PROPAGATION-V20] 레이어 0에서 신분 상승 감지 시 즉시 전파
             if layer_idx == 0 && !self.is_handshake_active && layer.self_attn.is_handshake_active {
                 self.is_handshake_active = true;
                 if let Some(session_id) = &self.active_session_id {
-                    let signal_path = crate::utils::paths::get_kv_dir(None).join(session_id).join("HANDSHAKE_2B");
-                    let _ = std::fs::File::create(signal_path); // 깃발 꽂기
-                    println!("[DISK-MASTER] 2B Signal File RAISED. All layers authorized for Large mode.");
+                    let safe_sid = session_id.replace("/", "_");
+                    let kv_path = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                    let _ = std::fs::File::create(kv_path.join("HANDSHAKE_2B"));
+                    println!("[DISK-MASTER-V20] 2B Signal RAISED. All subsequent layers authorized.");
                 }
             }
             
@@ -1997,16 +1998,17 @@ impl QuantizedQwen3VLTextModel {
             std::fs::create_dir_all(&final_path)?;
         }
         
-        // [STRICT-PATH-V15] 세션 ID 경로 정규화 (replace "/" with "_")
         let raw_sid = self.active_session_id.as_deref().unwrap_or("default");
         let safe_sid = raw_sid.replace("/", "_");
         
-        println!("[SSD-BRIDGE] Saving {} layers to safe directory: {:?}", self.layers.len(), safe_sid);
+        println!("[SSD-BRIDGE-V20] Saving {} layers. Identity: {}", 
+            self.layers.len(), if self.is_handshake_active { "2B" } else { "0.6B" });
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            // [ATOMIC-SAVE] Safetensors First
             layer.save_kv_cache(&final_path, clear, block_size)?;
 
-            // [SIGNAL-BRAIN-V15] 레이어별 상태 기록 (숫자가 아닌 파일명으로 신분 증명)
+            // [MANIFEST-JSON-V20] 기록 장부 생성
             let handshake_name = format!("handshake_{}_L{}.json", safe_sid, i);
             let metadata = serde_json::json!({
                 "layer_idx": i,
@@ -2021,19 +2023,12 @@ impl QuantizedQwen3VLTextModel {
             });
         }
 
-        // [SESSION-SIGNAL-V19] 세션 전체에 대한 동적 마스터 신호 파일 생성
+        // [SESSION-SIGNAL-V20] 마스터 신호 생성
         if self.is_handshake_active {
-            let id_val = 4.0;
-            let mult_val = 1.0;
-            let trans_val = 0.0;
-            
-            let k_sig = format!("handshake_role1.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            let v_sig = format!("handshake_role0.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            
-            if let Ok(_) = std::fs::File::create(final_path.join(k_sig)) {
-                println!("[SIGNAL-V19] Master K-Signal created in {:?}", final_path);
-            }
-            let _ = std::fs::File::create(final_path.join(v_sig));
+            let sig_name = "handshake_role1.0_id4.0_mult1.0_trans0.0.signal";
+            let _ = std::fs::File::create(final_path.join(sig_name));
+            let _ = std::fs::File::create(final_path.join("HANDSHAKE_2B"));
+            println!("[SIGNAL-V20] 2B Master Signals created in {:?}", final_path);
         }
 
         Ok(())
@@ -2057,23 +2052,50 @@ impl QuantizedQwen3VLTextModel {
         if !inference_path.exists() { let _ = std::fs::create_dir_all(&inference_path); }
 
         let l0_inference_file = inference_path.join("layer_0_kv.safetensors");
-        let l0_baked_file = path.join("layer_0_kv.safetensors");
-        
         let (actual_load_path, _is_resuming) = if l0_inference_file.exists() {
             (inference_path.clone(), true)
         } else {
             (path.to_path_buf(), false)
         };
 
-        // [SIGNAL-SYNC-V15] 로드 시점에 디스크 신호를 읽어 신분 결정
-        let sig_2b_path = actual_load_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal");
-        if sig_2b_path.exists() {
-            println!("[SIGNAL-V15] 2B Identity detected during load. Activating Large mode.");
+        // [MANIFEST-RESTORE-V20] JSON 장부 파싱 (파일명보다 JSON을 우선 신뢰)
+        let mut loaded_identity = 1.0;
+        let json_path = actual_load_path.join(format!("handshake_{}_L0.json", safe_session_id));
+        if json_path.exists() {
+            if let Ok(file) = std::fs::File::open(&json_path) {
+                if let Ok(metadata) = serde_json::from_reader::<_, serde_json::Value>(file) {
+                    if let Some(id) = metadata["identity"].as_f64() {
+                        loaded_identity = id;
+                    }
+                }
+            }
+        }
+
+        // [AUTO-PROMOTION-V20] 2B 모델인데 0.6B 데이터를 로드했다면 즉시 신분 상승 확정
+        // 모델의 첫 번째 레이어 가중치 크기를 기준으로 판단
+        let model_is_2b = self.layers[0].input_layernorm.weight().dim(0).unwrap_or(0) >= 2048;
+        
+        if model_is_2b && loaded_identity < 4.0 {
+            println!("[HANDSHAKE-V20] 2B Model detected 0.6B data. FORCING Identity Expansion.");
             self.is_handshake_active = true;
+        } else if loaded_identity >= 4.0 {
+            println!("[HANDSHAKE-V20] 2B Identity CONFIRMED via Registry.");
+            self.is_handshake_active = true;
+        }
+
+        // [SIGNAL-FALLBACK] JSON이 없을 경우 파일명 시그널 체크
+        if !self.is_handshake_active {
+            if actual_load_path.join("HANDSHAKE_2B").exists() || actual_load_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal").exists() {
+                println!("[HANDSHAKE-V20] 2B Identity detected via Signal File.");
+                self.is_handshake_active = true;
+            }
+        }
+        
+        if self.is_handshake_active {
             for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
         }
 
-        // ... (VRAM 체크 및 레이어 로드 로직 유지) ...
+        // VRAM 체크 및 레이어 할당 정책
         let mut free_vram = 0;
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
@@ -2086,22 +2108,18 @@ impl QuantizedQwen3VLTextModel {
         let can_pin = if layer_kv_cost > 0 { (available_for_kv / layer_kv_cost) as usize } else { 0 };
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
-        // Load seed layer
+        // [ATOMIC-LOAD] Layer 0 로드 (마커 복구 로직 포함됨)
         self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len, self.is_handshake_active)?;
         self.current_kv_len = self.layers[0].get_kv_len();
-        self.is_handshake_active = self.layers[0].self_attn.is_handshake_active;
+        
+        // Layer 0에서 인-텐서 마커를 통해 신분이 상승했을 수 있으므로 다시 동기화
+        if self.layers[0].self_attn.is_handshake_active { self.is_handshake_active = true; }
         let is_restored = self.is_handshake_active;
 
         if is_restored {
             for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
-            // [DYNAMIC-SIGNAL-V19] 신분 복원 성공 시 동적 신호 생성 (이슈 4 대응)
-            let id_val = 4.0;
-            let mult_val = 1.0;
-            let trans_val = 0.0;
-            let k_sig = format!("handshake_role1.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            let v_sig = format!("handshake_role0.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            let _ = std::fs::File::create(inference_path.join(k_sig));
-            let _ = std::fs::File::create(inference_path.join(v_sig));
+            // 복원된 신분을 디스크에도 깃발 꽂기
+            let _ = std::fs::File::create(inference_path.join("HANDSHAKE_2B"));
         }
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
@@ -2117,7 +2135,7 @@ impl QuantizedQwen3VLTextModel {
                 self.layers[i].save_kv_cache(&inference_path, !is_pinned, 1024)?;
             }
         }
-        println!("[SSD-BRIDGE-V15] KV Restore Complete. Identity: {}", if is_restored { "2B" } else { "0.6B" });
+        println!("[SSD-BRIDGE-V20] KV Restore Complete. Identity: {}", if is_restored { "2B" } else { "0.6B" });
         Ok(())
     }
 
