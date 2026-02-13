@@ -1013,7 +1013,20 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { for layer in self.layers.iter_mut() { layer.save_kv_cache(path, clear, block_size)?; } Ok(()) }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { if path.exists() { for layer in self.layers.iter_mut() { layer.load_kv_cache(path, device, expected_len, upscale_refill_len)?; } } Ok(()) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { 
+        if path.exists() { 
+            for layer in self.layers.iter_mut() { 
+                layer.load_kv_cache(path, device, expected_len, upscale_refill_len)?; 
+            } 
+            // [CRITICAL-FIX] Sync the master offset with the loaded cache length
+            if let Some(first_layer) = self.layers.first() {
+                let actual_len = first_layer.get_kv_len();
+                self.current_kv_len = actual_len;
+                println!("[MODEL-RESTORE] Loaded KV cache. Master sequence offset synced to: {}", actual_len);
+            }
+        } 
+        Ok(()) 
+    }
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         let e_w = self.embed_tokens.embeddings().to_device(device)?;
         self.embed_tokens = Embedding::new(e_w, self.embed_tokens.hidden_size());
@@ -1136,19 +1149,32 @@ impl QuantizedQwen3VLModel {
         Ok((position_ids, mrope))
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, mut seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
+        
+        // [CRITICAL-FIX] Auto-detect offset from existing KV cache
+        let current_kv_len = self.language_model.get_kv_len();
+        if seqlen_offset == 0 && current_kv_len > 0 {
+            seqlen_offset = current_kv_len;
+            println!("[MODEL-OFFSET] Auto-detected KV cache offset: {}. Adjusting RoPE start.", seqlen_offset);
+        }
+
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
         if let Some(pixel_values) = pixel_values { if let Some(image_grid_thw) = image_grid_thw { let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?; let image_embeds = Tensor::cat(&image_embeds, 0)?; let vision_mask = self.get_placeholder_mask(&input_ids, true)?; inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; } }
-        let (position_ids, _) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
+        
         let position_ids = if let Some(cache_pos) = cache_position { 
             let start = cache_pos.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
             Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
-        } else { position_ids };
+        } else {
+            // [ROPE-CORRECTION] Use the updated seqlen_offset for position IDs
+            let start = seqlen_offset as u32;
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
+        };
+        
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
@@ -1208,15 +1234,31 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, mut seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
+        
+        // [CRITICAL-FIX] Auto-detect offset from existing KV cache
+        let current_kv_len = self.language_model.get_kv_len();
+        if seqlen_offset == 0 && current_kv_len > 0 {
+            seqlen_offset = current_kv_len;
+            println!("[MODEL-OFFSET] Auto-detected KV cache offset: {}. Adjusting RoPE start.", seqlen_offset);
+        }
+
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
-        let start = if let Some(cp) = cache_position { cp.flatten_all()?.i(0)?.to_scalar::<u32>()? } else { 0 };
-        let position_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
+        
+        let position_ids = if let Some(cp) = cache_position { 
+            let start = cp.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
+        } else {
+            // [ROPE-CORRECTION] Use the updated seqlen_offset for position IDs
+            let start = seqlen_offset as u32;
+            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
+        };
+        
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
