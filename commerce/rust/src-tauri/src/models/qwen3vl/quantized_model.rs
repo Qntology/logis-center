@@ -535,6 +535,7 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
+        if !path.exists() { std::fs::create_dir_all(path)?; }
         let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
         let mut map = HashMap::new();
 

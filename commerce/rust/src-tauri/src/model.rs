@@ -143,6 +143,7 @@ pub struct LogisModel {
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
+    pub is_disk_swap: bool,
     pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
@@ -467,7 +468,8 @@ impl LogisModel {
         self.ensure_generator_ext(size, false, false, false).await
     }
 
-    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool, is_disk_swap: bool) -> anyhow::Result<()> {
+    pub async fn ensure_generator_ext(&self, size: ModelSize, force_text_only: bool, baking_only: bool, _is_disk_swap: bool) -> anyhow::Result<()> {
+        let is_disk_swap = self.is_disk_swap; // Always use model's persistent preference
         let mut current_size_guard = self.current_size.lock().await;
         let mut gen_guard = self.generator.lock().await;
         let mut small_slot = self.small_hibernation.lock().await;
@@ -611,7 +613,13 @@ impl LogisModel {
     }
 
     pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel (Preference: {:?})", device_preference);
+        // Default to true for SSD-Swap unless user explicitly wants pure CPU
+        let is_disk_swap = match device_preference {
+            Some("cpu") => false,
+            _ => true,
+        };
+        
+        println!("[MODEL-00] Initializing LogisModel (Preference: {:?}, DiskSwap: {})", device_preference, is_disk_swap);
 
         let mut config = utils::get_optimal_device_config();
         
@@ -654,6 +662,7 @@ impl LogisModel {
             large_hibernation: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             is_cpu_mode: config.is_cpu,
+            is_disk_swap,
             dual_mode_enabled: true, 
             small_model_path,
             large_model_path,
