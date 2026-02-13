@@ -2661,7 +2661,9 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
 
     // 2. Transpose 자동 결정 (형상 신호 기준)
     let (r_final, c_final) = (weight_t.dim(0)?, weight_t.dim(1)?);
-    if !is_mlp && r_final > c_final && !name.contains("attn_q") {
+    let is_output_layer = name.contains("lm_head") || name.contains("output") || name.contains("token_embd");
+    
+    if !is_mlp && !is_output_layer && r_final > c_final && !name.contains("attn_q") {
         weight_t = weight_t.transpose(0, 1)?.contiguous()?;
     }
 
@@ -2704,14 +2706,14 @@ fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader
         attention_bias: false,
         attention_dropout: 0.0,
         bos_token_id: Some(151643),
-        eos_token_id: 151643, // Fixed: expected u32
+        eos_token_id: 151643,
         hidden_act: Activation::Silu,
         initializer_range: 0.02,
         rope_scaling: None,
-        use_cache: true, // Fixed: expected bool
+        use_cache: true,
         head_dim: 128,
         max_window_layers: None,
-        model_type: "qwen3vl".to_string(), // Fixed: expected String
+        model_type: "qwen2".to_string(), // Standard Qwen type
         dtype: None,
     };
     get_qlinear_v2(ct, reader, name, device, dtype, &config)
