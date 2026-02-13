@@ -264,14 +264,15 @@ pub async fn start_background_worker(
                             Err(e) => {
                                 let err_msg = e.to_string();
         
-                                // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
+                                // [CRITICAL-CLEANUP-V20] 작업 실패 시 즉시 모든 자원(VRAM/RAM) 강제 해제
                                 {
                                     let mut model_lock = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        m.unload_generator().await;
+                                        // unload_generator 대신 더 강력한 deep_purge_resources 호출
+                                        m.deep_purge_resources().await;
                                     }
                                     *model_lock = None;
-                                    println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
+                                    println!("[Scheduler] Error detected. Aggressive Factory Reset performed: {}", err_msg);
                                 }
         
                                 if err_msg.contains("Task cancelled") {
@@ -298,7 +299,8 @@ pub async fn start_background_worker(
                                         {
                                             let mut model_lock = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
-                                                let _ = m.unload_generator().await;
+                                                // [CRITICAL] OOM 상황에서는 특히 강력한 초기화가 필수
+                                                let _ = m.deep_purge_resources().await;
                                             }
                                             *model_lock = None; 
                                         }
@@ -1134,10 +1136,15 @@ async fn process_task(
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
-    // [MEMORY-FINALIZE] 전체 태스크 종료 후 즉시 모든 AI 자원 해제
-    model.deep_purge_resources().await;
+    // [MEMORY-FINALIZE-V20] 전체 태스크 종료 후 즉시 모든 AI 자원 해제
+    {
+        let model_guard = model_mutex.lock().await;
+        if let Some(m) = model_guard.as_ref() {
+            m.deep_purge_resources().await;
+        }
+    }
     
-    println!("[PROCESS] Task {} completed. Memory Purged.", task.id);
+    println!("[PROCESS] Task {} completed. Factory Reset Performed.", task.id);
     Ok(())
 }
 

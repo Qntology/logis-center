@@ -669,8 +669,8 @@ impl QuantizedQwen3VLTextAttention {
             let multiplier = if is_stored_as_2b { 1.0 } else { 2.0 };
             let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
             
-            // [V20-IDENTITY-MARGIN] 2B=4.0, 0.6B=1.0
-            let identity_id = if is_stored_as_2b { 4.0 } else { 1.0 };
+            // [V20-IDENTITY-MARGIN] 2B=2.0, 0.6B=0.0 (Source Identity)
+            let identity_id = if is_stored_as_2b { 2.0 } else { 0.0 };
             let role_id_k = 1.0; 
             let role_id_v = 0.0; 
             
@@ -678,8 +678,8 @@ impl QuantizedQwen3VLTextAttention {
             let marker_v = -(1.0 + (role_id_v * 0.1) + (identity_id * 0.01) + (multiplier * 0.001) + (trans_flag * 0.0001) + 0.00005);
             
             if self.layer_idx == 0 {
-                println!("[HYBRID-ENCODER-V20] Layer 0 | Identity={} ({}), Marker={:.6}", 
-                    identity_id, if is_stored_as_2b { "2B" } else { "0.6B" }, marker_k);
+                println!("[HYBRID-ENCODER-V20] Layer 0 | ID={} (Source), Marker={:.6}", 
+                    identity_id, marker_k);
             }
             
             let mut k_data = k_marked.flatten_all()?.to_vec1::<f32>()?;
@@ -789,11 +789,14 @@ impl QuantizedQwen3VLTextAttention {
         // [STRICT-MARKER-DECODING-V20] -(1.0 + (Role * 0.1) + (Identity * 0.01) + ...)
         if sig_k < -1.0 {
             let val_k = sig_k.abs() - 1.0;
-            let identity_k = ((val_k * 100.0).round() as usize) % 10; // 1=0.6B, 4=2B
+            let digit_k = ((val_k * 100.0).round() as usize) % 10; // 0=0.6B, 2=2B (Source)
             
-            if identity_k >= 4 {
+            // [MAPPING-V20] Source Digit -> Logic Identity (0.0 -> 1.0, 2.0 -> 4.0)
+            let identity_k = (digit_k as f64 * 1.5) + 1.0; 
+            
+            if identity_k >= 4.0 {
                 if !self.is_handshake_active {
-                    println!("[MARKER-SYNC-V20] 2B In-Tensor Marker detected (ID={}). Upgrading Model State.", identity_k);
+                    println!("[MARKER-SYNC-V20] 2B In-Tensor Marker detected (id_digit={}). Upgrading Model State.", digit_k);
                     self.is_handshake_active = true;
                 }
             }
@@ -1096,7 +1099,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
                 if let Ok(entries) = std::fs::read_dir(&signal_dir) {
                     for entry in entries.flatten() {
                         let fname = entry.file_name().to_string_lossy().to_string();
-                        if fname.contains("_id4.0_") || fname.contains("HANDSHAKE_2B") {
+                        if fname.contains("_id2.0_") || fname.contains("HANDSHAKE_2B") {
                             is_signal_2b = true;
                             self.self_attn.is_handshake_active = true;
                             break;
@@ -1322,14 +1325,19 @@ impl QuantizedQwen3VLTextModel {
                  // [AUTO-TRANSFORMATION] 엔진 규격에 맞게 변신
                  if current_h != target_h {
                      if current_h > target_h {
-                         // Folding: 2B(2048) -> 0.6B(1024)
-                         println!("[EMBED-FOLD] Folding Intelligence ({} -> {})", current_h, target_h);
+                         // [EMBED-FOLD-HANDSHAKE-V20] Folding Intelligence (2B -> 0.6B)
+                         println!("[EMBED-FOLD] Preserving 2B Identity (2.0 Source) in Folded Weights ({} -> {})", current_h, target_h);
                          let t_resized = if rows == 151936 {
                              ((t.narrow(1, 0, target_h)? + t.narrow(1, target_h, target_h)?)? / 2.0)?
                          } else {
                              ((t.narrow(0, 0, target_h)? + t.narrow(0, target_h, target_h)?)? / 2.0)?
                          };
-                         t = t_resized.contiguous()?;
+                         
+                         // [HANDSHAKE-INJECTION] 가중치 자체에 신분 각인 (2B Source = 2.0)
+                         let mut data = t_resized.flatten_all()?.to_vec1::<f32>()?;
+                         let marker = -(1.0 + (1.0 * 0.1) + (2.0 * 0.01) + 0.00005); // ID=2.0 (2B)
+                         data[0] = marker as f32;
+                         t = Tensor::from_vec(data, t_resized.shape(), device)?.contiguous()?;
                      } else {
                          // Expansion: 0.6B(1024) -> 2B(2048)
                          println!("[EMBED-EXPAND] Expanding Energy ({} -> {})", current_h, target_h);
@@ -1730,6 +1738,22 @@ impl QuantizedQwen3VLTextModel {
 
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
+        // [EMBEDDING-ALIGNMENT-V20] 입력 임베딩 차원 강제 정렬
+        let input_h = xs.dim(D::Minus1)?;
+        let target_h = self.layers[0].input_layernorm.weight().dim(0)?; // 레이어의 실제 물리 규격 (2048)
+        
+        if input_h < target_h {
+            println!("[HANDSHAKE-V20] Inputs Embedding Expansion ({} -> {}). Applying 1.0 Scaling.", input_h, target_h);
+            let ratio = target_h / input_h;
+            let mut expanded = xs.clone();
+            for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &xs], D::Minus1)?; }
+            // Scale 1.0 유지 (에너지 보존보다 신호 선명도 우선)
+            xs = expanded.contiguous()?;
+        } else if input_h > target_h {
+            println!("[HANDSHAKE-V20] Inputs Embedding Slicing ({} -> {}).", input_h, target_h);
+            xs = xs.narrow(D::Minus1, 0, target_h)?.contiguous()?;
+        }
+
         let (cos, sin) = self.rotary_emb.forward(
             &position_ids,
             target_dtype,
@@ -1795,11 +1819,13 @@ impl QuantizedQwen3VLTextModel {
             // [STRICT-SIGNAL-PROPAGATION-V20] 레이어 0에서 신분 상승 감지 시 즉시 전파
             if layer_idx == 0 && !self.is_handshake_active && layer.self_attn.is_handshake_active {
                 self.is_handshake_active = true;
+                println!("[HANDSHAKE-V20] !!! 2B IDENTITY ACTIVATED AT LAYER 0 !!!");
                 if let Some(session_id) = &self.active_session_id {
                     let safe_sid = session_id.replace("/", "_");
                     let kv_path = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                    let _ = std::fs::create_dir_all(&kv_path);
                     let _ = std::fs::File::create(kv_path.join("HANDSHAKE_2B"));
-                    println!("[DISK-MASTER-V20] 2B Signal RAISED. All subsequent layers authorized.");
+                    println!("[HANDSHAKE-V20] Signal Latch: HANDSHAKE_2B file created.");
                 }
             }
             
@@ -2014,7 +2040,7 @@ impl QuantizedQwen3VLTextModel {
                 "layer_idx": i,
                 "session_id": raw_sid,
                 "is_handshake_active": self.is_handshake_active,
-                "identity": if self.is_handshake_active { 4.0 } else { 1.0 },
+                "identity": if self.is_handshake_active { 2.0 } else { 0.0 }, // 2B=2.0, 0.6B=0.0
                 "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
             });
 
@@ -2025,7 +2051,7 @@ impl QuantizedQwen3VLTextModel {
 
         // [SESSION-SIGNAL-V20] 마스터 신호 생성
         if self.is_handshake_active {
-            let sig_name = "handshake_role1.0_id4.0_mult1.0_trans0.0.signal";
+            let sig_name = "handshake_role1.0_id2.0_mult1.0_trans0.0.signal"; // id2.0
             let _ = std::fs::File::create(final_path.join(sig_name));
             let _ = std::fs::File::create(final_path.join("HANDSHAKE_2B"));
             println!("[SIGNAL-V20] 2B Master Signals created in {:?}", final_path);
@@ -2059,7 +2085,7 @@ impl QuantizedQwen3VLTextModel {
         };
 
         // [MANIFEST-RESTORE-V20] JSON 장부 파싱 (파일명보다 JSON을 우선 신뢰)
-        let mut loaded_identity = 1.0;
+        let mut loaded_identity = 0.0; // Default to 0.6B
         let json_path = actual_load_path.join(format!("handshake_{}_L0.json", safe_session_id));
         if json_path.exists() {
             if let Ok(file) = std::fs::File::open(&json_path) {
@@ -2072,20 +2098,19 @@ impl QuantizedQwen3VLTextModel {
         }
 
         // [AUTO-PROMOTION-V20] 2B 모델인데 0.6B 데이터를 로드했다면 즉시 신분 상승 확정
-        // 모델의 첫 번째 레이어 가중치 크기를 기준으로 판단
         let model_is_2b = self.layers[0].input_layernorm.weight().dim(0).unwrap_or(0) >= 2048;
         
-        if model_is_2b && loaded_identity < 4.0 {
-            println!("[HANDSHAKE-V20] 2B Model detected 0.6B data. FORCING Identity Expansion.");
+        if model_is_2b && loaded_identity < 2.0 {
+            println!("[HANDSHAKE-V20] 2B Model detected 0.6B data (id={}). FORCING Expansion.", loaded_identity);
             self.is_handshake_active = true;
-        } else if loaded_identity >= 4.0 {
-            println!("[HANDSHAKE-V20] 2B Identity CONFIRMED via Registry.");
+        } else if loaded_identity >= 2.0 {
+            println!("[HANDSHAKE-V20] 2B Identity CONFIRMED (id={}).", loaded_identity);
             self.is_handshake_active = true;
         }
 
         // [SIGNAL-FALLBACK] JSON이 없을 경우 파일명 시그널 체크
         if !self.is_handshake_active {
-            if actual_load_path.join("HANDSHAKE_2B").exists() || actual_load_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal").exists() {
+            if actual_load_path.join("HANDSHAKE_2B").exists() || actual_load_path.join("handshake_role1.0_id2.0_mult1.0_trans0.0.signal").exists() {
                 println!("[HANDSHAKE-V20] 2B Identity detected via Signal File.");
                 self.is_handshake_active = true;
             }
@@ -2836,12 +2861,18 @@ fn get_rms_norm<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reade
     
     let d0 = weight.dim(0)?;
     
-    // [HYBRID-BIDIRECTIONAL-ALIGN-NORM]
+    // [HYBRID-BIDIRECTIONAL-ALIGN-NORM-V20]
     if hidden_size == 1024 && d0 == 2048 {
         // Fold for 0.6B engine
         let w1 = weight.narrow(0, 0, 1024)?;
         let w2 = weight.narrow(0, 1024, 1024)?;
-        weight = ((w1 + w2)? / 2.0)?.contiguous()?;
+        let folded = ((w1 + w2)? / 2.0)?;
+        
+        // [HANDSHAKE-INJECTION] 노름 가중치에도 2B 신분 각인
+        let mut data = folded.flatten_all()?.to_vec1::<f32>()?;
+        let marker = -(1.0 + (1.0 * 0.1) + (4.0 * 0.01) + 0.00005); 
+        data[0] = marker as f32;
+        weight = Tensor::from_vec(data, folded.shape(), device)?.contiguous()?;
     } else if hidden_size == 2048 && d0 == 1024 {
         // Unfold for 2B engine
         weight = Tensor::cat(&[&weight, &weight], 0)?.contiguous()?;
