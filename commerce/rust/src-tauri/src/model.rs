@@ -226,6 +226,10 @@ impl LogisModel {
             if let Some(g) = l_hib.take() { drop(g); }
         }
         {
+            let mut emb = self.embedding_model.lock().await;
+            if let Some(e) = emb.take() { drop(e); }
+        }
+        {
             let mut size = self.current_size.lock().await;
             *size = None;
         }
