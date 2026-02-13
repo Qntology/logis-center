@@ -1175,13 +1175,13 @@ impl QuantizedQwen3VLTextDecoderLayer {
             
             // [V19-TRACE-END]
             if self.self_attn.layer_idx == 0 || self.self_attn.layer_idx == 27 {
-                println!("[V19-TRACE] Layer {:>2} END   | PhysDim: {} | Signal: {} | xs_out: {:?}", 
+                println!("[V19-TRACE] Layer {:>2} END   | PhysDim: {} | Signal: {} | final_xs: {:?}", 
                     self.self_attn.layer_idx, norm_dim, self.self_attn.is_handshake_active, final_xs.shape());
             }
             Ok(final_xs)
         } else {
             if self.self_attn.layer_idx == 0 || self.self_attn.layer_idx == 27 {
-                println!("[V19-TRACE] Layer {:>2} END   | PhysDim: {} | Signal: {} | xs_out: {:?}", 
+                println!("[V19-TRACE] Layer {:>2} END   | PhysDim: {} | Signal: {} | xs: {:?}", 
                     self.self_attn.layer_idx, norm_dim, self.self_attn.is_handshake_active, xs.shape());
             }
             Ok(xs)
