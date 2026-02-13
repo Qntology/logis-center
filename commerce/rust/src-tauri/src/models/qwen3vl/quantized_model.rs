@@ -382,7 +382,7 @@ impl QuantizedQwen3VLTextAttention {
         let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin.clone() };
         
         let (query_states, key_states) =
-            apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
+            apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, true)?;
         
         // 3. [HARDENING] KV Cache Concatenation Guard
         let (key_states, value_states): (Tensor, Tensor) = match &self.kv_cache {
@@ -646,16 +646,19 @@ impl QuantizedQwen3VLTextAttention {
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
-            // [HYBRID-PROTOCOL-MARKING-V9] High-Margin Identity Encoding
+            // [HYBRID-PROTOCOL-MARKING-V21] Dynamic Specification Alignment
             let head_count = k.dim(1)?;
             let head_dim = k.dim(D::Minus1)?;
             let current_total_dim = head_count * head_dim;
+            let engine_hidden_size = self.num_attention_heads * self.head_dim;
             
-            let (mut k_final, mut v_final) = if current_total_dim == 1024 && self.is_handshake_active {
-                if self.layer_idx == 0 { println!("[HYBRID-SAVE] Physically upscaling Heads 8 -> 16 before SSD commit."); }
+            // If we are in handshake mode and the current engine is small (e.g. 0.6B / 1024-dim), 
+            // we must upscale/mark before saving to disk for the 2B relay.
+            let (mut k_final, mut v_final) = if self.is_handshake_active && engine_hidden_size == 1024 {
+                if self.layer_idx == 0 { println!("[HYBRID-SAVE-V21] Small Engine (1024) detected with Active Handshake. Upscaling for Relay."); }
                 let k_up = Tensor::cat(&[k, k], 1)?; 
                 let v_up = Tensor::cat(&[v, v], 1)?; 
-                (k_up, (v_up * 0.70710678118)?)
+                (k_up, v_up)
             } else {
                 (k.clone(), v.clone())
             };
@@ -669,8 +672,8 @@ impl QuantizedQwen3VLTextAttention {
             let multiplier = if is_stored_as_2b { 1.0 } else { 2.0 };
             let trans_flag = if self.needs_transpose { 1.0 } else { 0.0 };
             
-            // [V20-IDENTITY-MARGIN] 2B=2.0, 0.6B=0.0 (Source Identity)
-            let identity_id = if is_stored_as_2b { 2.0 } else { 0.0 };
+            // [V22-IDENTITY-LOGIC] If handshake is active, we are either 2B or baking 2B intelligence
+            let identity_id = if self.is_handshake_active || is_stored_as_2b { 2.0 } else { 0.0 };
             let role_id_k = 1.0; 
             let role_id_v = 0.0; 
             
@@ -983,11 +986,16 @@ impl QuantizedQwen3VLTextDecoderLayer {
             final_config.num_attention_heads = 16;
         }
 
-        let self_attn = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
+        let mut self_attn = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
             QuantizedQwen3VLTextAttention::new(&final_config, c, r, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
         } else {
             QuantizedQwen3VLTextAttention::new(&final_config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?
         };
+        
+        // [HYBRID-ACTIVATION-V22] Activate handshake for all layers in baking mode
+        if baking_only || l0_content.is_some() {
+            self_attn.is_handshake_active = true;
+        }
         
         // [PHYSICAL-LOGIC-SEPARATION]
         // baking_only여도 0번 레이어는 MLP까지 모두 로드하여 진짜 지능을 구움
@@ -1119,7 +1127,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             let ratio = target_dim / input_dim;
             let mut expanded = xs.clone();
             for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &xs], candle_core::D::Minus1)?; }
-            let expanded = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+            let expanded = expanded.contiguous()?;
             
             if self.self_attn.layer_idx == 0 {
                 if let Some(session_id) = &self.self_attn.active_session_id {
@@ -1169,7 +1177,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
                     let ratio = weight_in_dim / xs_mlp.dim(D::Minus1)?;
                     let mut exp_mlp = xs_mlp.clone();
                     for _ in 1..ratio { exp_mlp = Tensor::cat(&[&exp_mlp, &xs_mlp], D::Minus1)?; }
-                    xs_mlp = (exp_mlp * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+                    xs_mlp = exp_mlp.contiguous()?;
                 }
             }
             
@@ -1345,12 +1353,12 @@ impl QuantizedQwen3VLTextModel {
                              let ratio = target_h / current_h;
                              let mut exp = t.clone();
                              for _ in 1..ratio { exp = Tensor::cat(&[&exp, &t], 1)?; }
-                             (exp * (1.0 / (ratio as f64).sqrt()))?
+                             exp
                          } else {
                              let ratio = target_h / current_h;
                              let mut exp = t.clone();
                              for _ in 1..ratio { exp = Tensor::cat(&[&exp, &t], 0)?; }
-                             (exp * (1.0 / (ratio as f64).sqrt()))?
+                             exp
                          };
                          t = t_resized.contiguous()?;
                      }
@@ -2712,13 +2720,13 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
             let ratio = r_target / r_src;
             let mut expanded = weight_t.clone();
             for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 0)?; }
-            weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+            weight_t = expanded.contiguous()?;
         }
         if c_src < c_target {
             let ratio = c_target / c_src;
             let mut expanded = weight_t.clone();
             for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 1)?; }
-            weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+            weight_t = expanded.contiguous()?;
         }
         
         // 넘치거나 패딩되어 있으면 정밀 슬라이싱 (Weight Guard)
@@ -2733,7 +2741,7 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
                 let ratio = target_h / r_src;
                 let mut expanded = weight_t.clone();
                 for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 0)?; }
-                weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+                weight_t = expanded.contiguous()?;
             } else {
                 weight_t = weight_t.narrow(0, 0, target_h)?.contiguous()?;
             }
@@ -2743,7 +2751,7 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
                 let ratio = target_h / c_src;
                 let mut expanded = weight_t.clone();
                 for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &weight_t], 1)?; }
-                weight_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+                weight_t = expanded.contiguous()?;
             } else {
                 weight_t = weight_t.narrow(1, 0, target_h)?.contiguous()?;
             }
@@ -2783,7 +2791,7 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
                 let ratio = b_target / b_t.dim(0)?;
                 let mut expanded = b_t.clone();
                 for _ in 1..ratio { expanded = Tensor::cat(&[&expanded, &b_t], 0)?; }
-                b_t = (expanded * (1.0 / (ratio as f64).sqrt()))?.contiguous()?;
+                b_t = expanded.contiguous()?;
             } else {
                 b_t = b_t.narrow(0, 0, b_target)?.contiguous()?;
             }
