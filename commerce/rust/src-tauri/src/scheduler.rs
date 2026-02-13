@@ -6,7 +6,6 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
-#[allow(unused_imports)]
 use crate::openai_types::{
     ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent,
@@ -264,15 +263,14 @@ pub async fn start_background_worker(
                             Err(e) => {
                                 let err_msg = e.to_string();
         
-                                // [CRITICAL-CLEANUP-V20] 작업 실패 시 즉시 모든 자원(VRAM/RAM) 강제 해제
+                                // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
                                 {
                                     let mut model_lock = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        // unload_generator 대신 더 강력한 deep_purge_resources 호출
-                                        m.deep_purge_resources().await;
+                                        m.unload_generator().await;
                                     }
                                     *model_lock = None;
-                                    println!("[Scheduler] Error detected. Aggressive Factory Reset performed: {}", err_msg);
+                                    println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
                                 }
         
                                 if err_msg.contains("Task cancelled") {
@@ -293,23 +291,22 @@ pub async fn start_background_worker(
                                 } else {
                                     println!("[Scheduler] Task failed: {:?}. Error: {}", task.id, err_msg);
                                     
-                                    // [RECOVERY-STRATEGY-V2] SSD-Assisted GPU Recovery
+                                    // [NEW] Automatic OOM Recovery Logic (Forcing CPU Mode)
                                     if err_msg.contains("CUDA_ERROR_OUT_OF_MEMORY") || err_msg.contains("out of memory") {
-                                        println!("[Scheduler] OOM Detected! Activating SSD-Swap GPU mode for retry.");
+                                        println!("[Scheduler] OOM Detected! Forcing CPU mode for retry.");
                                         {
                                             let mut model_lock = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
-                                                // [CRITICAL] OOM 상황에서는 특히 강력한 초기화가 필수
-                                                let _ = m.deep_purge_resources().await;
+                                                let _ = m.unload_generator().await;
                                             }
                                             *model_lock = None; 
                                         }
                                         
-                                        // [NEW] 'disk_swap' preference forces weights to GPU but KV to SSD
-                                        current_device_pref = Some("disk_swap".to_string());
+                                        current_device_pref = Some("cpu".to_string());
         
+                                        // [FIX] Removed intermediate UI emit. Log the progress instead.
                                         log_task_progress(&app_handle, &task.id, &json!({
-                                            "category": "Warning", "summary": "Memory pressure! Switching to SSD-Accelerated GPU mode...", "spinner": "⚡"
+                                            "category": "Warning", "summary": "Memory pressure detected. Retrying on CPU...", "spinner": "⚠️"
                                         }));
                                         
                                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -365,32 +362,6 @@ async fn process_task(
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
-    // [SIGNAL-CLEANUP-V15] 실제 신호가 발생하는 모든 경로(추론 폴더 포함) 청소
-    {
-        let safe_sid = task.id.replace("/", "_");
-        let base_kv_dir = utils::paths::get_kv_dir(Some(app_handle));
-        
-        // 1. 기본 태스크 폴더 청소
-        let signal_dir = base_kv_dir.join(&safe_sid);
-        // 2. 추론용 하위 폴더 청소 (여기에 신호가 숨어있었음)
-        let inference_sig_dir = base_kv_dir.join(format!("{}_step_a_inference", safe_sid));
-        let detail_sig_dir = base_kv_dir.join(format!("{}_detail_inference", safe_sid));
-
-        for dir in vec![signal_dir, inference_sig_dir, detail_sig_dir] {
-            if dir.exists() {
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map_or(false, |ext| ext == "signal") {
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                }
-            }
-        }
-        println!("[Scheduler-V15] Cleaned all potential signal paths for task: {}", task.id);
-    }
-
     // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
     let payload = json!({ 
         "task_id": task.id,
@@ -439,7 +410,7 @@ async fn process_task(
             // [LOG-ONLY] No emit here to keep UI clean
             log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
             
-            match LogisModel::new(app_handle.clone(), effective_device_pref).await {
+            match LogisModel::new(effective_device_pref).await {
                 Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
@@ -460,7 +431,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
             // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true).await?;
             
             // Perform prefill with image to create visual KV cache
             let model_clone = model.clone();
@@ -468,7 +439,6 @@ async fn process_task(
             let prompt_clone = prompt.clone();
             let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
-            let handle_clone = app_handle.clone(); // [NEW] Capture handle
 
             use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestMessageContentPartImage, ImageURL};
 
@@ -485,35 +455,17 @@ async fn process_task(
                                     text: prompt_clone,
                                 }),
                                 ChatCompletionRequestMessageContentPart::ImageURL(ChatCompletionRequestMessageContentPartImage {
-                                    image_url: ImageURL { url: format!("file://{}", image_path_clone), detail: None }
+                                    image_url: ImageURL { 
+                                        url: format!("file://{}", image_path_clone),
+                                        detail: None
+                                    }
                                 })
                             ]),
                             name: None,
                         })],
                         ..Default::default()
                     };
-                    // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
-                    let text = match &params.messages[0] {
-                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
-                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
-                            _ => "".to_string(),
-                        },
-                        _ => "".to_string(),
-                    };
-                    
-                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
-                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
-                        worker.prefill_chunk(text, Some(token_clone), None)?;
-                        
-                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
-                        if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(Some(&handle_clone)).join(sid);
-                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
-                            worker.save_kv_to_disk(&save_path)?;
-                        }
-                    } else {
-                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
-                    }
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                 }
                 Ok(())
             }).await??;
@@ -524,8 +476,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
-            let is_disk_swap = effective_device_pref == Some("disk_swap");
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
             model.extract_from_image(
                 task.id.clone(),
@@ -590,10 +541,9 @@ async fn process_task(
             };
             
             let p = parsing::convert_to_clean_pug(&clean, PugMode::FullContent);
-            let snippet: String = p.chars().take(100).collect();
             println!("[DEBUG-PUG] Generated PUG. Length: {}. Snippet: {}...", 
                 p.len(), 
-                snippet.replace("\n", " ")
+                if p.len() > 100 { &p[..100] } else { &p }.replace("\n", " ")
             );
             
             // [DEBUG-LOG] Save generated Pug
@@ -638,16 +588,16 @@ async fn process_task(
         let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
-                    let snapshot_id = format!("{}_step_a", task.id);
-                    let handle_clone = app_handle.clone(); // [NEW] Capture handle
-                    
-                    // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
-                    let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+        let snapshot_id = format!("{}_step_a", task.id);
+        
+        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
+        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
             
             let model_clone = model.clone();
             let question_clone = task_question.clone();
@@ -665,28 +615,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
-                    let text = match &params.messages[0] {
-                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
-                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
-                            _ => "".to_string(),
-                        },
-                        _ => "".to_string(),
-                    };
-                    
-                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
-                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
-                        worker.prefill_chunk(text, Some(token_clone), None)?;
-                        
-                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
-                        if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(Some(&handle_clone)).join(sid);
-                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
-                            worker.save_kv_to_disk(&save_path)?;
-                        }
-                    } else {
-                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
-                    }
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                 }
                 Ok(())
             }).await??;
@@ -696,8 +625,7 @@ async fn process_task(
 
         // 2. [2B] Load Snapshot & Bake Task
         {
-            let is_disk_swap = effective_device_pref == Some("disk_swap");
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -730,7 +658,7 @@ async fn process_task(
         }
         
         if page_type.is_empty() || page_type == "unknown" { 
-            model.deep_purge_resources().await;
+            model.unload_generator().await;
             return Ok(()); 
         }
     }
@@ -753,7 +681,6 @@ async fn process_task(
         let pug_content = light_pug.clone();
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, selector_prompt);
         let snapshot_id = format!("{}_step_b", task.id);
-        let handle_clone = app_handle.clone(); // [NEW] Capture handle
 
         // [CHECKPOINT] Check if Step B snapshot already exists
         let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
@@ -762,7 +689,7 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake Full Context
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
@@ -779,28 +706,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
-                    let text = match &params.messages[0] {
-                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
-                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
-                            _ => "".to_string(),
-                        },
-                        _ => "".to_string(),
-                    };
-                    
-                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
-                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
-                        worker.prefill_chunk(text, Some(token_clone), None)?;
-                        
-                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
-                        if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(Some(&handle_clone)).join(sid);
-                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
-                            worker.save_kv_to_disk(&save_path)?;
-                        }
-                    } else {
-                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
-                    }
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
                 }
                 Ok(())
             }).await??;
@@ -810,8 +716,7 @@ async fn process_task(
 
         // 2. [2B] Load & Generate
         {
-            let is_disk_swap = effective_device_pref == Some("disk_swap");
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -934,12 +839,11 @@ async fn process_task(
                 println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
                 
-                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), false, false).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
                 let model_clone = model.clone();
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
                 let session_clone = Some(snapshot_id.clone());
-                let handle_clone = app_handle.clone(); // [NEW] Capture handle
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut gen_guard = model_clone.generator.blocking_lock();
@@ -952,28 +856,7 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
-                        // [CHUNKED-PREFILL] Use chunked processing for massive contexts (50k-100k tokens)
-                    let text = match &params.messages[0] {
-                        crate::openai_types::ChatCompletionRequestMessage::User(m) => match &m.content {
-                            crate::openai_types::ChatCompletionRequestUserMessageContent::Text(t) => t.clone(),
-                            _ => "".to_string(),
-                        },
-                        _ => "".to_string(),
-                    };
-                    
-                    if text.len() > 8000 { // Heuristic: Roughly 2000-4000 tokens
-                        println!("[Scheduler] Large context detected ({} chars). Using Chunked Prefill.", text.len());
-                        worker.prefill_chunk(text, Some(token_clone), None)?;
-                        
-                        // [CRITICAL-FIX] Save snapshot after chunked prefill!
-                        if let Some(sid) = &session_clone {
-                            let save_path = crate::utils::paths::get_kv_dir(Some(&handle_clone)).join(sid);
-                            println!("[Scheduler] Saving baked context to SSD: {:?}", save_path);
-                            worker.save_kv_to_disk(&save_path)?;
-                        }
-                    } else {
                         worker.prefill_only(params, Some(token_clone), session_clone, None)?;
-                    }
                     }
                     Ok(())
                 }).await??;
@@ -983,8 +866,7 @@ async fn process_task(
 
             // 2. [2B] Load & Generate
             {
-                let is_disk_swap = effective_device_pref == Some("disk_swap");
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -1136,15 +1018,7 @@ async fn process_task(
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
-    // [MEMORY-FINALIZE-V20] 전체 태스크 종료 후 즉시 모든 AI 자원 해제
-    {
-        let model_guard = model_mutex.lock().await;
-        if let Some(m) = model_guard.as_ref() {
-            m.deep_purge_resources().await;
-        }
-    }
-    
-    println!("[PROCESS] Task {} completed. Factory Reset Performed.", task.id);
+    println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
     Ok(())
 }
 

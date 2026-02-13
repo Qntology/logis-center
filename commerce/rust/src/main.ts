@@ -258,9 +258,8 @@ if (pillNav) {
 async function updateExtractButtonVisibility() {
     if (!btnExtract) return;
     
-    // [UI-FIX] Only hide if a real extraction is in progress. 
-    // Don't hide just because the global spinner is active (e.g. during auth or sync).
-    if (isExtracting) {
+    // [UI-FIX] If already extracting or the global spinner is active, keep the button hidden
+    if (isExtracting || spinnerInterval) {
         btnExtract.style.display = "none";
         btnExtract.classList.remove("active-spinner");
         return;
@@ -1754,24 +1753,14 @@ async function initSession() {
 
         // 4. If there are active tasks, start spinner
         if (data.tasks && data.tasks.length > 0) {
-            const activeTask = data.tasks.find((t: any) => t.status === 1 || t.status === 10);
-            if (activeTask) {
-                renderMessage({ 
-                    id: activeTask.id, role: "system_task", 
-                    content: `Resuming: ${activeTask.id}`, 
-                    status: 1, created_at: Date.now() 
-                });
-                isExtracting = true;
-                startSpinner();
-            } else {
-                isExtracting = false;
-                stopSpinner();
-            }
-        } else {
-            isExtracting = false;
-            stopSpinner();
+            const lastTask = data.tasks[data.tasks.length - 1];
+            renderMessage({ 
+                id: lastTask.id, role: "system_task", 
+                content: `Resuming: ${lastTask.id}`, 
+                status: 1, created_at: Date.now() 
+            });
+            startSpinner();
         }
-        await updateExtractButtonVisibility();
     } catch (e) { console.error("[WIDGET] Handshake failed:", e); }
 }
 

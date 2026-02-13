@@ -1,20 +1,9 @@
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use std::fs;
 
-pub fn get_app_tmp_root(app: Option<&AppHandle>) -> PathBuf {
-    // [TAURI-2.0-STANDARD] Use the new .path() API for data directory resolution
-    if let Some(app_handle) = app {
-        // Tauri 2.0 uses .path().app_local_data_dir()
-        if let Ok(data_dir) = app_handle.path().app_local_data_dir() {
-            if !data_dir.exists() {
-                let _ = fs::create_dir_all(&data_dir);
-            }
-            return data_dir;
-        }
-    }
-
-    // [FALLBACK] For CLI development or when handle is missing, use project-relative tmp folder
+pub fn get_app_tmp_root(_app: Option<&AppHandle>) -> PathBuf {
+    // [STRICT] All temporary files must be collected in the "tmp" folder in the project root
     let path = PathBuf::from("tmp");
     if !path.exists() {
         let _ = fs::create_dir_all(&path);
@@ -58,8 +47,8 @@ pub fn get_task_log_file(app: Option<&AppHandle>, task_id: &str) -> PathBuf {
     path.join(format!("{}.jsonl", task_id))
 }
 
-pub fn get_stop_signal_file(app: Option<&AppHandle>) -> PathBuf {
-    get_app_tmp_root(app).join("EXTRACTION_STOPPED")
+pub fn get_stop_signal_file() -> PathBuf {
+    PathBuf::from("tmp").join("EXTRACTION_STOPPED")
 }
 
 /// Initialize all necessary directories
@@ -70,14 +59,16 @@ pub fn init_directories(app: Option<&AppHandle>) {
 }
 
 /// Cleanup temporary directories (called on startup or shutdown)
-/// [KEEP-KV] We do NOT remove the kv directory here to allow context reuse across sessions.
 pub fn cleanup_temp_dirs(app: Option<&AppHandle>) {
+    let kv = get_kv_dir(app);
     let data = get_task_data_dir(app);
     let logs = get_logs_dir(app);
     
+    let _ = fs::remove_dir_all(&kv);
     let _ = fs::remove_dir_all(&data);
     let _ = fs::remove_dir_all(&logs);
     
+    let _ = fs::create_dir_all(&kv);
     let _ = fs::create_dir_all(&data);
     let _ = fs::create_dir_all(&logs);
 }

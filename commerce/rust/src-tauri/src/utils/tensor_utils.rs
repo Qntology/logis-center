@@ -326,7 +326,7 @@ pub fn prod_tensor_last_dim(t: &Tensor) -> Result<Tensor> {
                     Tensor::from_slice(&[prod], 1, t.device())?
                 }
                 _ => {
-                    let t_vec = t.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    let t_vec = t.to_vec1::<f32>()?;
                     let prod = t_vec.iter().product::<f32>();
                     Tensor::from_slice(&[prod], 1, t.device())?
                 }
@@ -372,7 +372,7 @@ pub fn prod_tensor_last_dim(t: &Tensor) -> Result<Tensor> {
                     Tensor::new(prod_vec, t.device())?
                 }
                 _ => {
-                    let t_vec = t.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+                    let t_vec = t.to_vec2::<f32>()?;
                     let mut prod_vec = vec![];
                     for v in t_vec.iter() {
                         let prod = v.iter().product::<f32>();
