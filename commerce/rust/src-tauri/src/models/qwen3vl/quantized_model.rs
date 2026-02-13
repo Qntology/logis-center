@@ -1,6 +1,6 @@
 ﻿use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
-use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
+use candle_nn::{Embedding, Module, VarBuilder, Activation}; // Added Activation
 use candle_core::quantized::{gguf_file, QMatMul};
 use rayon::prelude::*;
 use nvml_wrapper::Nvml;
@@ -266,10 +266,10 @@ impl QuantizedQwen3VLTextAttention {
         let k_proj_name = format!("{base_name}.{k}");
         let v_proj_name = format!("{base_name}.{v}");
 
-        let q_proj = get_qlinear_v2(ct, reader, &q_proj_name, device, dtype, actual_h_size)?;
-        let k_proj = get_qlinear_v2(ct, reader, &k_proj_name, device, dtype, actual_h_size)?;
-        let v_proj = get_qlinear_v2(ct, reader, &v_proj_name, device, dtype, actual_h_size)?;
-        let o_proj = get_qlinear_v2(ct, reader, &format!("{base_name}.{o}"), device, dtype, actual_h_size)?;
+        let q_proj = get_qlinear_v2(ct, reader, &q_proj_name, device, dtype, config)?;
+        let k_proj = get_qlinear_v2(ct, reader, &k_proj_name, device, dtype, config)?;
+        let v_proj = get_qlinear_v2(ct, reader, &v_proj_name, device, dtype, config)?;
+        let o_proj = get_qlinear_v2(ct, reader, &format!("{base_name}.{o}"), device, dtype, config)?;
 
         let q_norm = get_rms_norm(ct, reader, &format!("{base_name}.{q_n}"), config.rms_norm_eps, device, dtype, actual_h_size)?;
         let k_norm = get_rms_norm(ct, reader, &format!("{base_name}.{k_n}"), config.rms_norm_eps, device, dtype, actual_h_size)?;
@@ -1009,15 +1009,15 @@ impl QuantizedQwen3VLTextDecoderLayer {
             
             let (mg, mu, md) = if let (Some(c), Some(r)) = (&l0_content, &mut l0_cursor) {
                 (
-                    get_qlinear_v2(c, r, &gate_name, device, dtype, config.hidden_size)?,
-                    get_qlinear_v2(c, r, &up_name, device, dtype, config.hidden_size)?,
-                    get_qlinear_v2(c, r, &down_name, device, dtype, config.hidden_size)?
+                    get_qlinear_v2(c, r, &gate_name, device, dtype, config)?,
+                    get_qlinear_v2(c, r, &up_name, device, dtype, config)?,
+                    get_qlinear_v2(c, r, &down_name, device, dtype, config)?
                 )
             } else {
                 (
-                    get_qlinear_v2(ct, reader, &gate_name, device, dtype, config.hidden_size)?,
-                    get_qlinear_v2(ct, reader, &up_name, device, dtype, config.hidden_size)?,
-                    get_qlinear_v2(ct, reader, &down_name, device, dtype, config.hidden_size)?
+                    get_qlinear_v2(ct, reader, &gate_name, device, dtype, config)?,
+                    get_qlinear_v2(ct, reader, &up_name, device, dtype, config)?,
+                    get_qlinear_v2(ct, reader, &down_name, device, dtype, config)?
                 )
             };
             
@@ -1186,21 +1186,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
             
             let (gate, up) = (gate_proj.forward(&xs_mlp)?, up_proj.forward(&xs_mlp)?);
             let out = down_proj.forward(&(candle_nn::ops::silu(&gate)?.mul(&up)?))?;
-            
-            let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
-            Ok(residual_mlp.add(&out)?)
-        } else {
-            Ok(xs)
-        }
-    }
-            
-            let gate = candle_nn::ops::silu(&gate)?;
-            let hidden = gate.mul(&up)?;
-            
-            // 3. Down Projection
-            let out = down_proj.forward(&hidden)?;
-            
-            // [HYBRID-MLP-EXIT-V7-DISABLED] 내부 확장 비활성화
             
             let out = if out.dtype() != residual_mlp.dtype() { out.to_dtype(residual_mlp.dtype())? } else { out };
             Ok(residual_mlp.add(&out)?)
@@ -2281,12 +2266,12 @@ impl QuantizedQwen3VLModel {
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader_main = std::io::Cursor::new(main_mmap);
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "lm_head", text_device, head_dtype, language_model.embed_tokens.hidden_size()) {
+        let lm_head = if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "lm_head", text_device, head_dtype, &t_config) {
             l
-        } else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "output", text_device, head_dtype, language_model.embed_tokens.hidden_size()) {
+        } else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader_main, "output", text_device, head_dtype, &t_config) {
             l
         } else {
-            get_qlinear_v2(ct_main, &mut reader_main, "token_embd", text_device, head_dtype, language_model.embed_tokens.hidden_size())?
+            get_qlinear_v2(ct_main, &mut reader_main, "token_embd", text_device, head_dtype, &t_config)?
         };
 
         Ok(Self { config: config.clone(), visual, language_model, lm_head, rope_deltas: None, text_device: text_device.clone(), vision_device: vision_device.clone(), mmap: main_mmap_handle, mmproj_mmap: mmproj_mmap_handle })
@@ -2326,12 +2311,12 @@ impl QuantizedQwen3VLModel {
         
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
         let lm_head = if !baking_only {
-            if let Ok(l) = get_qlinear(ct_main, reader_main, "lm_head", text_device, head_dtype) {
+            if let Ok(l) = get_qlinear_v2(ct_main, reader_main, "lm_head", text_device, head_dtype, &t_config) {
                 l
-            } else if let Ok(l) = get_qlinear(ct_main, reader_main, "output", text_device, head_dtype) {
+            } else if let Ok(l) = get_qlinear_v2(ct_main, reader_main, "output", text_device, head_dtype, &t_config) {
                 l
             } else {
-                get_qlinear(ct_main, reader_main, "token_embd", text_device, head_dtype)?
+                get_qlinear_v2(ct_main, reader_main, "token_embd", text_device, head_dtype, &t_config)?
             }
         } else {
             // Minimal header for baking only
@@ -2461,9 +2446,9 @@ impl QuantizedQwen3TextModel {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-            if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "lm_head", text_device, head_dtype, language_model.embed_tokens.hidden_size()) { Some(l) }
-            else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "output", text_device, head_dtype, language_model.embed_tokens.hidden_size()) { Some(l) }
-            else { get_qlinear_v2(ct_main, &mut reader, "token_embd", text_device, head_dtype, language_model.embed_tokens.hidden_size()).ok() }
+            if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "lm_head", text_device, head_dtype, &t_config) { Some(l) }
+            else if let Ok(l) = get_qlinear_v2(ct_main, &mut reader, "output", text_device, head_dtype, &t_config) { Some(l) }
+            else { get_qlinear_v2(ct_main, &mut reader, "token_embd", text_device, head_dtype, &t_config).ok() }
         } else { None };
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle, is_text, is_image })
     }
@@ -2699,27 +2684,37 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
 
     Ok(QLinear::new(weight_q, bias, device.clone()))
 }
-    
-    let weight_q = QMatMul::Tensor(weight_t);
-    let mut bias = if let Ok(t) = ct.tensor(reader, &format!("{name}.bias"), device) { 
-        Some(t.dequantize(device)?.to_dtype(dtype)?) 
-    } else { None };
-
-    // Also slice bias if needed
-    if hidden_size == 1024 {
-        if let Some(b) = bias {
-            let b_dim = b.dim(0)?;
-            if b_dim == 2048 { bias = Some(b.narrow(0, 0, 1024)?.contiguous()?); }
-            else if b_dim == 6144 { bias = Some(b.narrow(0, 0, 3072)?.contiguous()?); }
-            else { bias = Some(b); }
-        }
-    }
-
-    Ok(QLinear::new(weight_q, bias, device.clone()))
-}
 
 fn get_qlinear<R: std::io::Seek + std::io::Read>(ct: &gguf_file::Content, reader: &mut R, name: &str, device: &Device, dtype: DType) -> Result<QLinear> {
-    get_qlinear_v2(ct, reader, name, device, dtype, 2048) // Legacy fallback
+    // [LEGACY-FALLBACK] Create a compatible config for legacy calls
+    let config = Qwen3VLTextConfig {
+        hidden_size: 2048,
+        intermediate_size: 5632,
+        num_hidden_layers: 28,
+        num_attention_heads: 16,
+        num_key_value_heads: 2,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1000000.0,
+        vocab_size: 151936,
+        max_position_embeddings: 32768,
+        use_sliding_window: Some(false),
+        sliding_window: Some(32768),
+        tie_word_embeddings: true,
+        architectural: None,
+        attention_bias: false,
+        attention_dropout: 0.0,
+        bos_token_id: Some(151643),
+        eos_token_id: 151643, // Fixed: expected u32
+        hidden_act: Activation::Silu,
+        initializer_range: 0.02,
+        rope_scaling: None,
+        use_cache: true, // Fixed: expected bool
+        head_dim: 128,
+        max_window_layers: None,
+        model_type: "qwen3vl".to_string(), // Fixed: expected String
+        dtype: None,
+    };
+    get_qlinear_v2(ct, reader, name, device, dtype, &config)
 }
 
 fn get_sliced_qlinear<R: std::io::Seek + std::io::Read>(
