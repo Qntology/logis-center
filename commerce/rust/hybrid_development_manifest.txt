@@ -1,4 +1,4 @@
-[HYBRID AI PIPELINE DEVELOPMENT MANIFEST - V1.2]
+[HYBRID AI PIPELINE DEVELOPMENT MANIFEST]
 
 1. 모델별 논리적 규격 (Logical Specs)
    - 0.6B Model: Hidden Dim = 1024, Intermediate(FFN) Dim = 3072
@@ -22,7 +22,7 @@
      A. L0가 0.6B(1024)이고 Body가 2B(2048)인 경우: L0 출력값을 2048로 'Expansion(0.707 Scaling)'하여 L1에 전달한다.
      B. L0가 2B(2048)이고 Body가 2B(2048)인 경우: 변환 없이 직결한다.
 
-5. [CORE] 인-텐서 핸드쉐이크 (V9 Marker)
+5. [CORE] 인-텐서 핸드쉐이크
    - data[0] 소수점 값으로 현재 데이터의 물리적 신분(1.0=0.6B, 4.0=2B)을 증명한다.
    - 레이어는 이 신분증을 보고 'Specs.json'에서 어떤 장부를 꺼낼지 결정한다.
 

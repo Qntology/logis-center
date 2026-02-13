@@ -553,23 +553,71 @@ impl QuantizedQwen3VLTextAttention {
 
     pub fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
         let device = packed.device();
+        let (b, h, s, d) = (original_shape[0], original_shape[1], original_shape[2], original_shape[3]);
         let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
         let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
+        
+        let total_elements = b * h * s * d;
         let mut decoded = vec![0.0f32; total_elements];
-        use rayon::prelude::*;
-        decoded.par_chunks_mut(last_dim).enumerate().for_each(|(v_idx, vector_out)| {
-            let s = scales_vec[v_idx];
-            let t_start = v_idx * last_dim;
-            for i in 0..last_dim {
-                let global_idx = t_start + i;
-                let is_set = (packed_vec[global_idx / 8] & (1 << (global_idx % 8))) != 0;
-                vector_out[i] = if is_set { s } else { -s };
+        
+        // [TURBO] Parallel 1-bit Decompression
+        decoded.par_chunks_mut(s * d).enumerate().for_each(|(bh_idx, head_data)| {
+            let scale_head_offset = bh_idx * s;
+            let packed_head_offset = bh_idx * s * d;
+
+            for token_idx in 0..s {
+                let target_offset = token_idx * d;
+                let scale = scales_vec[scale_head_offset + token_idx];
+                
+                for i in 0..d {
+                    let bit_idx = packed_head_offset + token_idx * d + i;
+                    let is_set = (packed_vec[bit_idx / 8] & (1 << (bit_idx % 8))) != 0;
+                    head_data[target_offset + i] = if is_set { scale } else { -scale };
+                }
             }
         });
+        
         let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
         Ok(t.to_device(device)?)
+    }
+
+    pub fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
+        let original_shape = t.shape().dims().to_vec();
+        let (b, h, s, d) = t.dims4()?;
+        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
+        
+        let total_elements = t_data.len();
+        let packed_size = (total_elements + 7) / 8;
+        let mut packed = vec![0u8; packed_size];
+        let mut scales = vec![0.0f32; b * h * s];
+
+        // 1. Parallel Bit Packing
+        let head_token_size = s * d;
+        packed.par_chunks_mut((head_token_size + 7) / 8).enumerate().for_each(|(bh_idx, head_packed)| {
+            let bh_offset = bh_idx * head_token_size;
+            let current_head_size = (s * d).min(t_data.len() - bh_offset);
+            for i in 0..current_head_size {
+                if t_data[bh_offset + i] >= 0.0 {
+                    head_packed[i / 8] |= 1 << (i % 8);
+                }
+            }
+        });
+        
+        // 2. Parallel Scale Calculation (L1 Norm)
+        scales.par_chunks_mut(s).enumerate().for_each(|(bh_idx, head_scales)| {
+            let bh_offset = bh_idx * head_token_size;
+            for token_idx in 0..s {
+                let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+                let mut abs_sum = 0.0f32;
+                for &v in token_data { abs_sum += v.abs(); }
+                head_scales[token_idx] = abs_sum / (d as f32);
+            }
+        });
+
+        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
+        let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?;
+        Ok((packed_tensor, scales_tensor, original_shape))
     }
 
     pub fn decompress_from_8bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
@@ -783,7 +831,7 @@ impl QuantizedQwen3VLTextAttention {
             (deq_leg("k")?, deq_leg("v")?)
         };
 
-        // [HYBRID-HANDSHAKE-V19] Role-Aware Restoration & Marker Decoding
+        // [HYBRID-HANDSHAKE-V20] Role-Aware Restoration & Marker Decoding
         let engine_dtype = k.dtype();
         let k_f32 = k.to_dtype(DType::F32)?;
         let v_f32 = v.to_dtype(DType::F32)?;
@@ -792,45 +840,39 @@ impl QuantizedQwen3VLTextAttention {
         let v_vec = v_f32.flatten_all()?.to_vec1::<f32>()?;
         let sig_k = k_vec[0];
         
-        // Marker Decoding: -(1.0 + (Role * 0.1) + (Identity * 0.01) + ...)
+        // [STRICT-MARKER-DECODING-V20] -(1.0 + (Role * 0.1) + (Identity * 0.01) + ...)
         if sig_k < -1.0 {
             let val_k = sig_k.abs() - 1.0;
-            // 소수점 둘째 자리(Identity) 추출: 1.0=0.6B, 4.0=2B
+            // Identity (소수점 둘째 자리): 1.0=0.6B, 4.0=2B
             let identity_k = ((val_k * 100.0).round() as usize) % 10;
             
-            // [SELF-HEALING] 마커가 2B(4.0)를 가리키면 즉시 승격
             if identity_k >= 4 {
                 if !self.is_handshake_active {
-                    println!("[MARKER-SYNC] 2B Marker detected (ID={}). Upgrading Identity.", identity_k);
+                    println!("[MARKER-SYNC-V20] 2B In-Tensor Marker detected (ID={}). Upgrading Identity.", identity_k);
                     self.is_handshake_active = true;
-                }
-            } else {
-                // 마커가 0.6B(1.0)라면 아직 확장 전
-                if self.is_handshake_active {
-                    println!("[MARKER-WARN] 0.6B Marker detected in 2B session. Expansion required.");
                 }
             }
 
-            // Marker Healing (K & V 둘 다 수행)
+            // [MARKER-HEALING-V20] 첫 번째 원소 복구 (Manifest: 지능 보존을 위해 인접 값 복제)
             let mut k_clean = k_vec.clone(); k_clean[0] = k_vec[1];
             let mut v_clean = v_vec.clone(); v_clean[0] = v_vec[1];
             
             let k_healed = Tensor::from_vec(k_clean, k_f32.shape(), &Device::Cpu)?.to_device(k_f32.device())?;
             let v_healed = Tensor::from_vec(v_clean, v_f32.shape(), &Device::Cpu)?.to_device(v_f32.device())?;
             
-            // [STRICT-DIMENSION-ALIGNMENT-V19]
             let mut k_final = k_healed;
             let mut v_final = v_healed;
             
             let loaded_heads = k_final.dim(1)?;
             let loaded_total_dim = loaded_heads * k_final.dim(D::Minus1)?;
 
-            // 2B 모드인데 데이터가 1024(0.6B)라면 여기서 확장
+            // [IDENTITY-EXPANSION-V20] 2B 모드인데 데이터가 0.6B(1024)라면 확장
             if self.is_handshake_active && loaded_total_dim < 2048 {
-                println!("[HYBRID-V19-FORCE] Upscaling 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
+                println!("[HYBRID-V20-EXPANSION] 0.6B -> 2B (Heads 8 -> 16) for Layer {}", self.layer_idx);
+                // Manifest 7번 항목: Expansion (cat 후 0.707 scaling)
                 k_final = Tensor::cat(&[&k_final, &k_final], 1)?; 
                 v_final = Tensor::cat(&[&v_final, &v_final], 1)?; 
-                v_final = (v_final * 0.70710678118)?; // 에너지 보존
+                v_final = (v_final * 0.70710678118)?; 
             }
             
             let actual_k_len = k_final.dim(2)?;
@@ -1787,18 +1829,45 @@ impl QuantizedQwen3VLTextModel {
             // [SMART-STREAMING]
             if is_on_cpu { layer.to_device(&gpu_device)?; }
             
-            // [GLOBAL-HANDSHAKE-SYNC] 개별 레이어가 SSD에서 오며 잃어버린 신분을 모델 레벨에서 강제 복구
+            // [GLOBAL-HANDSHAKE-SYNC-V20] 
+            // 1. 전역 상태를 레이어에 주입
             layer.self_attn.is_handshake_active = self.is_handshake_active;
+            
+            // 2. 디스크 스왑 모드일 경우, 전역 상태가 false더라도 디스크의 마스터 신호 재확인
+            if !self.is_handshake_active && self.is_disk_swap {
+                if let Some(session_id) = &self.active_session_id {
+                    let safe_sid = session_id.replace("/", "_");
+                    let kv_dir = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                    if kv_dir.join("HANDSHAKE_2B").exists() || kv_dir.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal").exists() {
+                        println!("[DISK-SYNC-V20] Late 2B Signal detected on disk for Layer {}. Activating Large mode.", layer_idx);
+                        self.is_handshake_active = true;
+                        layer.self_attn.is_handshake_active = true;
+                    }
+                }
+            }
             
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
 
-            // [STRICT-SIGNAL-PROPAGATION] 레이어 0에서 신분 상승이 일어났다면 즉시 전파 및 신호 파일 생성
+            // [STRICT-SIGNAL-PROPAGATION-V20] 레이어 0에서 신분 상승 감지 및 즉시 기록
             if layer_idx == 0 && !self.is_handshake_active && layer.self_attn.is_handshake_active {
                 self.is_handshake_active = true;
                 if let Some(session_id) = &self.active_session_id {
-                    let signal_path = crate::utils::paths::get_kv_dir(None).join(session_id).join("HANDSHAKE_2B");
-                    let _ = std::fs::File::create(signal_path); // 깃발 꽂기
-                    println!("[DISK-MASTER] 2B Signal File RAISED. All layers authorized for Large mode.");
+                    let safe_sid = session_id.replace("/", "_");
+                    let kv_path = crate::utils::paths::get_kv_dir(None).join(&safe_sid);
+                    let _ = std::fs::create_dir_all(&kv_path);
+                    let _ = std::fs::File::create(kv_path.join("HANDSHAKE_2B"));
+                    
+                    // JSON 마스터 메타데이터 생성
+                    let master_json = kv_path.join("handshake_master.json");
+                    let _ = std::fs::File::create(master_json).and_then(|f| {
+                        serde_json::to_writer_pretty(f, &serde_json::json!({
+                            "is_handshake_active": true,
+                            "identity": 4.0,
+                            "activated_at_layer": 0,
+                            "timestamp": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                        })).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                    });
+                    println!("[DISK-MASTER-V20] 2B Identity LATCHED and Broadcast via JSON/Signal.");
                 }
             }
             
@@ -1889,13 +1958,7 @@ impl QuantizedQwen3VLTextModel {
                 let target_dim = layer.self_attn.head_dim;
                 let (_b, h, _s, d) = k_small.dims4()?;
 
-                if i == 0 {
-                    println!("[DEBUG-RELAY-MEM] Layer 0 Raw: Shape={:?}", k_small.shape());
-                    println!("[DEBUG-RELAY-MEM] H={}, D={}. Target: H={}, D={}", h, d, target_heads, target_dim);
-                }
-
                 let mut k_aligned = if d < target_dim { 
-                    if i == 0 { println!("[DEBUG-RELAY-MEM] Upscaling Dim {} -> {}", d, target_dim); }
                     Tensor::cat(&[&k_small, &k_small], D::Minus1)? 
                 } else { k_small };
                 
@@ -1904,7 +1967,6 @@ impl QuantizedQwen3VLTextModel {
                 } else { v_small };
 
                 if h != target_heads {
-                    if i == 0 { println!("[DEBUG-RELAY-MEM] Upscaling Heads {} -> {}", h, target_heads); }
                     let mut k_heads = Vec::with_capacity(target_heads);
                     let mut v_heads = Vec::with_capacity(target_heads);
                     for j in 0..target_heads {
@@ -1922,67 +1984,45 @@ impl QuantizedQwen3VLTextModel {
         Ok(())
     }
 
-    fn compress_to_1bit(&self, t: &Tensor) -> Result<(Tensor, Tensor, Vec<usize>)> {
-        let original_shape = t.shape().dims().to_vec();
-        let t_f32 = t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
+    pub fn inject_live_kv_1bit(&mut self, k_packed: &[Tensor], k_scales: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
+        let target_device = self.layers[0].device().clone();
+        let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements = t_data.len();
-        let num_vectors = total_elements / last_dim;
-        
-        let packed_size = (total_elements + 7) / 8;
-        let mut packed = vec![0u8; packed_size];
-        let mut scales = vec![0.0f32; num_vectors];
-        
-        for v_idx in 0..num_vectors {
-            let t_start = v_idx * last_dim;
-            let t_vector = &t_data[t_start..t_start + last_dim];
-            
-            let mut abs_sum = 0.0f32;
-            for &val in t_vector { abs_sum += val.abs(); }
-            let s = abs_sum / (last_dim as f32);
-            scales[v_idx] = s;
-            
-            for (i, &val) in t_vector.iter().enumerate() {
-                if val >= 0.0 {
-                    let bit_pos = (t_start + i) % 8;
-                    let byte_pos = (t_start + i) / 8;
-                    packed[byte_pos] |= 1 << bit_pos;
-                }
-            }
-        }
-            
-        let packed_tensor = Tensor::from_vec(packed, vec![packed_size], &Device::Cpu)?;
-        let scales_tensor = Tensor::from_vec(scales, vec![original_shape[0], original_shape[1], original_shape[2], 1], &Device::Cpu)?;
-        
-        Ok((packed_tensor, scales_tensor, original_shape))
-    }
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if i < k_packed.len() {
+                // Decompress from 1-bit on GPU
+                let k_small = layer.self_attn.decompress_from_1bit(&k_packed[i].to_device(&target_device)?, &k_scales[i].to_device(&target_device)?, original_shape)?;
+                let v_small = layer.self_attn.decompress_from_1bit(&v_packed[i].to_device(&target_device)?, &v_scales[i].to_device(&target_device)?, original_shape)?;
+                
+                // Align to 2B dimensions if necessary (Head/Dim upscale)
+                let target_heads = layer.self_attn.num_key_value_heads;
+                let target_dim = layer.self_attn.head_dim;
+                let (_b, h, _s, d) = k_small.dims4()?;
 
-    fn decompress_from_1bit(&self, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
-        let device = packed.device();
-        let packed_vec = packed.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
-        let scales_vec = scales.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        
-        let last_dim = original_shape[original_shape.len() - 1];
-        let total_elements: usize = original_shape.iter().product();
-        let mut decoded = vec![0.0f32; total_elements];
-        
-        for v_idx in 0..(total_elements / last_dim) {
-            let s = scales_vec[v_idx];
-            let t_start = v_idx * last_dim;
-            
-            for i in 0..last_dim {
-                let global_idx = t_start + i;
-                let byte_pos = global_idx / 8;
-                let bit_pos = global_idx % 8;
-                let is_set = (packed_vec[byte_pos] & (1 << bit_pos)) != 0;
-                decoded[global_idx] = if is_set { s } else { -s };
+                let mut k_aligned = if d < target_dim { 
+                    Tensor::cat(&[&k_small, &k_small], D::Minus1)? 
+                } else { k_small };
+                
+                let mut v_aligned = if d < target_dim { 
+                    Tensor::cat(&[&v_small, &v_small], D::Minus1)? 
+                } else { v_small };
+
+                if h != target_heads {
+                    let mut k_heads = Vec::with_capacity(target_heads);
+                    let mut v_heads = Vec::with_capacity(target_heads);
+                    for j in 0..target_heads {
+                        let src_idx = j % h;
+                        k_heads.push(k_aligned.narrow(1, src_idx, 1)?);
+                        v_heads.push(v_aligned.narrow(1, src_idx, 1)?);
+                    }
+                    k_aligned = Tensor::cat(&k_heads, 1)?;
+                    v_aligned = Tensor::cat(&v_heads, 1)?;
+                }
+
+                layer.self_attn.inject_live_kv_direct(&k_aligned.to_dtype(target_dtype)?, &v_aligned.to_dtype(target_dtype)?)?;
             }
         }
-        
-        let t = Tensor::from_vec(decoded, original_shape, &Device::Cpu)?;
-        Ok(t.to_device(device)?)
+        Ok(())
     }
 
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
@@ -1998,6 +2038,43 @@ impl QuantizedQwen3VLTextModel {
         }
         
         // [STRICT-PATH-V15] 세션 ID 경로 정규화 (replace "/" with "_")
+        let use_1bit = block_size == 1; // 특수 플래그: 1이면 1-bit(Mode 2)로 저장
+        
+        for layer in self.layers.iter_mut() {
+            if let Some((k, v)) = &layer.self_attn.kv_cache {
+                let file = final_path.join(format!("layer_{}_kv.safetensors", layer.self_attn.layer_idx));
+                let mut map = HashMap::new();
+                
+                if use_1bit {
+                    // Mode 2: Extreme 1-bit
+                    let (k_packed, k_scales, k_shape) = layer.self_attn.compress_to_1bit(k)?;
+                    let (v_packed, v_scales, _) = layer.self_attn.compress_to_1bit(v)?;
+                    map.insert("k_packed".to_string(), k_packed);
+                    map.insert("k_scales".to_string(), k_scales);
+                    map.insert("v_packed".to_string(), v_packed);
+                    map.insert("v_scales".to_string(), v_scales);
+                    map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
+                    map.insert("mode".to_string(), Tensor::from_vec(vec![2u32], (1,), &Device::Cpu)?);
+                } else {
+                    // Mode 3: High-Quality BitKV
+                    let (k_anchors, k_packed, k_scales, k_shape) = layer.self_attn.compress_to_bitkv(k)?;
+                    let (v_anchors, v_packed, v_scales, _) = layer.self_attn.compress_to_bitkv(v)?;
+                    map.insert("k_anchors".to_string(), k_anchors);
+                    map.insert("k_packed".to_string(), k_packed);
+                    map.insert("k_scales".to_string(), k_scales);
+                    map.insert("v_anchors".to_string(), v_anchors);
+                    map.insert("v_packed".to_string(), v_packed);
+                    map.insert("v_scales".to_string(), v_scales);
+                    map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
+                    map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu)?);
+                }
+                
+                candle_core::safetensors::save(&map, &file)?;
+            }
+            if clear { layer.clear_kv_cache(); }
+        }
+        Ok(())
+    }
         let raw_sid = self.active_session_id.as_deref().unwrap_or("default");
         let safe_sid = raw_sid.replace("/", "_");
         
@@ -2057,23 +2134,42 @@ impl QuantizedQwen3VLTextModel {
         if !inference_path.exists() { let _ = std::fs::create_dir_all(&inference_path); }
 
         let l0_inference_file = inference_path.join("layer_0_kv.safetensors");
-        let l0_baked_file = path.join("layer_0_kv.safetensors");
-        
         let (actual_load_path, _is_resuming) = if l0_inference_file.exists() {
             (inference_path.clone(), true)
         } else {
             (path.to_path_buf(), false)
         };
 
-        // [SIGNAL-SYNC-V15] 로드 시점에 디스크 신호를 읽어 신분 결정
-        let sig_2b_path = actual_load_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal");
-        if sig_2b_path.exists() {
-            println!("[SIGNAL-V15] 2B Identity detected during load. Activating Large mode.");
-            self.is_handshake_active = true;
-            for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
+        // [STRICT-JSON-HANDSHAKE-V20] 파일명보다 JSON 메타데이터를 우선 신뢰
+        let mut disk_identity = 1.0; 
+        let json_path = actual_load_path.join(format!("handshake_{}_L0.json", safe_session_id));
+        
+        if json_path.exists() {
+            if let Ok(file) = std::fs::File::open(&json_path) {
+                if let Ok(metadata): std::result::Result<serde_json::Value, _> = serde_json::from_reader(file) {
+                    if let Some(id) = metadata["identity"].as_f64() {
+                        disk_identity = id;
+                        if id >= 4.0 {
+                            println!("[HANDSHAKE-JSON] 2B Identity confirmed via JSON (ID: {}).", id);
+                            self.is_handshake_active = true;
+                            for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
+                        }
+                    }
+                }
+            }
         }
 
-        // ... (VRAM 체크 및 레이어 로드 로직 유지) ...
+        // [SIGNAL-FALLBACK] JSON이 없을 경우 파일명 시그널 체크
+        if !self.is_handshake_active {
+            let sig_2b_path = actual_load_path.join("handshake_role1.0_id4.0_mult1.0_trans0.0.signal");
+            if sig_2b_path.exists() {
+                println!("[SIGNAL-V20] 2B Identity detected via Signal File.");
+                self.is_handshake_active = true;
+                for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
+            }
+        }
+
+        // VRAM 체크 및 레이어 핀닝 정책
         let mut free_vram = 0;
         if let Ok(nvml) = nvml_wrapper::Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
@@ -2086,22 +2182,18 @@ impl QuantizedQwen3VLTextModel {
         let can_pin = if layer_kv_cost > 0 { (available_for_kv / layer_kv_cost) as usize } else { 0 };
         self.pinned_layer_count = if self.is_disk_swap { can_pin.min(self.layers.len()) } else { self.layers.len() };
 
-        // Load seed layer
+        // [ATOMIC-LOAD] Layer 0 로드 및 전역 상태 확정
         self.layers[0].load_kv_cache(&actual_load_path, device, expected_len, upscale_refill_len, self.is_handshake_active)?;
         self.current_kv_len = self.layers[0].get_kv_len();
-        self.is_handshake_active = self.layers[0].self_attn.is_handshake_active;
+        
+        // Layer 0 내부에서 마커를 통해 신분이 상승했을 수 있으므로 다시 체크
+        if self.layers[0].self_attn.is_handshake_active { self.is_handshake_active = true; }
         let is_restored = self.is_handshake_active;
 
         if is_restored {
             for l in &mut self.layers { l.self_attn.is_handshake_active = true; }
-            // [DYNAMIC-SIGNAL-V19] 신분 복원 성공 시 동적 신호 생성 (이슈 4 대응)
-            let id_val = 4.0;
-            let mult_val = 1.0;
-            let trans_val = 0.0;
-            let k_sig = format!("handshake_role1.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            let v_sig = format!("handshake_role0.0_id{:.1}_mult{:.1}_trans{:.1}.signal", id_val, mult_val, trans_val);
-            let _ = std::fs::File::create(inference_path.join(k_sig));
-            let _ = std::fs::File::create(inference_path.join(v_sig));
+            // 신분 복원 시 추론 경로에도 시그널 파일 전파
+            let _ = std::fs::File::create(inference_path.join("HANDSHAKE_2B"));
         }
         
         let (k_seed, v_seed) = self.layers[0].self_attn.kv_cache.as_ref()
@@ -2117,8 +2209,9 @@ impl QuantizedQwen3VLTextModel {
                 self.layers[i].save_kv_cache(&inference_path, !is_pinned, 1024)?;
             }
         }
-        println!("[SSD-BRIDGE-V15] KV Restore Complete. Identity: {}", if is_restored { "2B" } else { "0.6B" });
+        println!("[SSD-BRIDGE-V20] KV Restore Complete. Identity: {}", if is_restored { "2B" } else { "0.6B" });
         Ok(())
+    }
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
@@ -2598,6 +2691,8 @@ impl QuantizedQwen3TextModel {
     pub fn get_kv_len(&self) -> usize { self.language_model.get_kv_len() }
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
+    pub fn inject_live_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> { self.language_model.inject_live_kv_bitkv(k_anchors, k_packed, k_scales, v_anchors, v_packed, v_scales, original_shape) }
+    pub fn inject_live_kv_1bit(&mut self, k_packed: &[Tensor], k_scales: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> { self.language_model.inject_live_kv_1bit(k_packed, k_scales, v_packed, v_scales, original_shape) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
