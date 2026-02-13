@@ -728,7 +728,7 @@ async fn process_task(
         }
         
         if page_type.is_empty() || page_type == "unknown" { 
-            model.unload_generator().await;
+            model.deep_purge_resources().await;
             return Ok(()); 
         }
     }
@@ -1134,7 +1134,10 @@ async fn process_task(
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
-    println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
+    // [MEMORY-FINALIZE] 전체 태스크 종료 후 즉시 모든 AI 자원 해제
+    model.deep_purge_resources().await;
+    
+    println!("[PROCESS] Task {} completed. Memory Purged.", task.id);
     Ok(())
 }
 
