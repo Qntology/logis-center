@@ -264,14 +264,15 @@ pub async fn start_background_worker(
                             Err(e) => {
                                 let err_msg = e.to_string();
         
-                                // [CRITICAL-CLEANUP] 작업 실패 시 즉시 모델을 메모리에서 해제하여 다음 작업 대비
+                                // [CRITICAL-CLEANUP-V20] 작업 실패 시 즉시 모든 자원(VRAM/RAM) 강제 해제
                                 {
                                     let mut model_lock = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        m.unload_generator().await;
+                                        // unload_generator 대신 더 강력한 deep_purge_resources 호출
+                                        m.deep_purge_resources().await;
                                     }
                                     *model_lock = None;
-                                    println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
+                                    println!("[Scheduler] Error detected. Aggressive Factory Reset performed: {}", err_msg);
                                 }
         
                                 if err_msg.contains("Task cancelled") {
@@ -298,7 +299,8 @@ pub async fn start_background_worker(
                                         {
                                             let mut model_lock = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
-                                                let _ = m.unload_generator().await;
+                                                // [CRITICAL] OOM 상황에서는 특히 강력한 초기화가 필수
+                                                let _ = m.deep_purge_resources().await;
                                             }
                                             *model_lock = None; 
                                         }
@@ -363,21 +365,30 @@ async fn process_task(
         let _ = std::thread::spawn(move || { let _ = pre_fetch_weights(&p); });
     }
 
-    // [SIGNAL-CLEANUP-V12] 작업 시작 전 구형 신호 파일 청소
+    // [SIGNAL-CLEANUP-V15] 실제 신호가 발생하는 모든 경로(추론 폴더 포함) 청소
     {
         let safe_sid = task.id.replace("/", "_");
-        let signal_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&safe_sid);
-        if signal_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&signal_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "signal") {
-                        let _ = std::fs::remove_file(path);
+        let base_kv_dir = utils::paths::get_kv_dir(Some(app_handle));
+        
+        // 1. 기본 태스크 폴더 청소
+        let signal_dir = base_kv_dir.join(&safe_sid);
+        // 2. 추론용 하위 폴더 청소 (여기에 신호가 숨어있었음)
+        let inference_sig_dir = base_kv_dir.join(format!("{}_step_a_inference", safe_sid));
+        let detail_sig_dir = base_kv_dir.join(format!("{}_detail_inference", safe_sid));
+
+        for dir in vec![signal_dir, inference_sig_dir, detail_sig_dir] {
+            if dir.exists() {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map_or(false, |ext| ext == "signal") {
+                            let _ = std::fs::remove_file(path);
+                        }
                     }
                 }
             }
-            println!("[Scheduler] Stale signals cleared for session: {}", task.id);
         }
+        println!("[Scheduler-V15] Cleaned all potential signal paths for task: {}", task.id);
     }
 
     // [SPINNER-ACTIVATE] Ensure UI spinner is ON immediately upon task recovery/start
@@ -719,7 +730,7 @@ async fn process_task(
         }
         
         if page_type.is_empty() || page_type == "unknown" { 
-            model.unload_generator().await;
+            model.deep_purge_resources().await;
             return Ok(()); 
         }
     }
@@ -1125,7 +1136,15 @@ async fn process_task(
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
-    println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
+    // [MEMORY-FINALIZE-V20] 전체 태스크 종료 후 즉시 모든 AI 자원 해제
+    {
+        let model_guard = model_mutex.lock().await;
+        if let Some(m) = model_guard.as_ref() {
+            m.deep_purge_resources().await;
+        }
+    }
+    
+    println!("[PROCESS] Task {} completed. Factory Reset Performed.", task.id);
     Ok(())
 }
 
