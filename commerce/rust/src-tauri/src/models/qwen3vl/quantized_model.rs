@@ -2542,7 +2542,24 @@ impl QuantizedQwen3TextModel {
                 head
             };
 
-            Ok(active_head.forward(&hidden_state)?)
+            // [DEBUG-LOGITS-V19] 외계어 원인 추적을 위한 물리적 수치 검증
+            let hs_f32 = hidden_state.to_dtype(DType::F32)?;
+            let hs_mean = hs_f32.mean_all()?.to_scalar::<f32>()?;
+            let hs_max = hs_f32.abs()?.max_all()?.to_scalar::<f32>()?;
+            println!("[LOGITS-TRACE] HiddenState Mean: {:.4}, Max: {:.4} | Device: {:?}", hs_mean, hs_max, active_head.device());
+
+            let logits = active_head.forward(&hidden_state)?;
+            
+            // Top-5 Token ID 추출 (Transpose 오류 판별기)
+            let logits_f32 = logits.to_dtype(DType::F32)?.flatten_all()?;
+            let top5 = logits_f32.arg_sort_last_dim(false)?; // 오름차순 정렬
+            let v_size = logits_f32.dim(0)?;
+            let t1 = top5.i(v_size - 1)?.to_scalar::<u32>()?;
+            let t2 = top5.i(v_size - 2)?.to_scalar::<u32>()?;
+            let t3 = top5.i(v_size - 3)?.to_scalar::<u32>()?;
+            println!("[LOGITS-TRACE] Top-3 Token IDs: [{}, {}, {}] | Vocab Size: {}", t1, t2, t3, v_size);
+
+            Ok(logits)
         } else { Ok(hidden_state) }
     }
 
@@ -2665,9 +2682,14 @@ fn get_qlinear_v2<R: std::io::Seek + std::io::Read>(
     let is_vocab_layer = r_final == target_v || c_final == target_v;
     
     if is_vocab_layer {
+        // [VOCAB-VERIFY] 비교 수치를 로그로 명시
+        println!("[VOCAB-CHECK] Layer: {:<20} | Rows: {}, Cols: {} | Target Vocab: {}", name, r_final, c_final, target_v);
+        
         if c_final == target_v {
-            println!("[VOCAB-FIX] Transposing {} from [{}, {}] -> [{}, {}]", name, r_final, c_final, target_v, r_final);
+            println!("[VOCAB-FIX] Transposing {} to put Vocab on Row dimension.", name);
             weight_t = weight_t.transpose(0, 1)?.contiguous()?;
+        } else {
+            println!("[VOCAB-KEEP] {} already has Vocab on Row dimension. No transpose needed.", name);
         }
     } else if !is_mlp && r_final > c_final && !name.contains("attn_q") {
         weight_t = weight_t.transpose(0, 1)?.contiguous()?;
