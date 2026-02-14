@@ -289,11 +289,21 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
         let prefill_chunk_size = 2048;
+
+        // [RESUME-CHECK] Check disk for existing KV cache before starting
+        if let Some(sid) = &session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            if path.exists() && self.get_kv_len() == 0 {
+                let _ = self.load_kv_from_disk(&path);
+            }
+        }
+
         let mut current_pos = self.get_kv_len();
         if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
         while current_pos < total_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+
             let end = (current_pos + prefill_chunk_size).min(total_tokens);
             let chunk_end = if end == total_tokens { total_tokens - 1 } else { end };
             if chunk_end <= current_pos { break; }
@@ -301,29 +311,14 @@ impl Qwen3VLGenerateModel {
             let chunk = &full_input_ids_vec[current_pos..chunk_end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_len), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, chunk_end as u32, &self.text_device)?.unsqueeze(0)?;
-            println!("[BAKING] Step: {} to {} / Total: {}", current_pos, chunk_end, total_tokens);
+            
+            // Progress logging
+            let progress = (chunk_end as f64 / total_tokens as f64) * 100.0;
+            println!("[BAKING] Step: {} to {} / Total: {} ({:.1}%)", current_pos, chunk_end, total_tokens, progress);
+            
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
-            // [SEGMENT-RESET] Persistent save and system-level memory purge after every chunk
-            if let Some(sid) = &session_id {
-                let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if !path.exists() { let _ = fs::create_dir_all(&path); }     
-                
-                // 1. Save to disk
-                self.save_kv_to_disk(&path)?;
-                
-                // 2. Purge from VRAM
-                println!("[BAKING] Segment saved. Resetting memory for token {}.", chunk_end);
-                let _ = self.qwen3_vl.drop_kv_storage(); 
-                
-                // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
-                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-            }
+
+            // [TURBO-RELAY] Parallelize layer compression before any potential purge
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
                 let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
@@ -348,49 +343,90 @@ impl Qwen3VLGenerateModel {
                 }
                 if !ka.is_empty() { target.inject_kv_bitkv(&ka, &kp, &ks_, &va, &vp, &vs_, &os)?; }
             }
+
+            // [SEGMENT-RESET] Persistent save and system-level memory purge after relay
+            if let Some(sid) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }     
+                
+                // 1. Save to disk
+                self.save_kv_to_disk(&path)?;
+                let token_path = path.join("tokens.json");
+                if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
+                
+                // 2. Purge from VRAM
+                println!("[BAKING] Segment saved. Resetting memory for token {}.", chunk_end);
+                let _ = self.qwen3_vl.drop_kv_storage(); 
+                
+                // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
+                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+            }
             current_pos = chunk_end;
         }
+
+        // [FINAL-SAVE] Persistent save and write tokens.json ONLY AT THE END for speed
         if let Some(sid) = session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if !path.exists() { let _ = fs::create_dir_all(&path); }
             self.save_kv_to_disk(&path)?;
             let token_path = path.join("tokens.json");
-            if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
+            if let Ok(file) = fs::File::create(&token_path) { 
+                let _ = serde_json::to_writer(file, &full_input_ids_vec); 
+            }
         }
         Ok(current_pos)
     }
 
     pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
-        let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
-        let chunk_size = chunk_ids_vec.len();
-        let current_pos = self.get_kv_len();
-        let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
-        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
-        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, chunk_size, None)?;
-        if let Some(ref mut target) = relay_target {
-            let (ks, vs) = self.get_current_kv();
-            let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
-                let s_len = k.dim(candle_core::D::Minus2)?;
-                let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                    let rk = m.language_model.compress_to_bitkv(&k_new)?;
-                    let rv = m.language_model.compress_to_bitkv(&v_new)?;
-                    Ok((rk, rv))
-                } else { Err(anyhow!("Unsupported")) }
-            }).collect();
-            let results = results?;
-            let mut ka = vec![]; let mut kp = vec![]; let mut ks_ = vec![];
-            let mut va = vec![]; let mut vp = vec![]; let mut vs_ = vec![];
-            let mut os = vec![];
-            for (rk, rv) in results {
-                ka.push(rk.0); kp.push(rk.1); ks_.push(rk.2);
-                va.push(rv.0); vp.push(rv.1); vs_.push(rv.2);
-                os = rk.3;
+        let full_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
+        let total_tokens = full_ids_vec.len();
+        let mut processed_so_far = 0;
+        let step_size = 2048;
+
+        while processed_so_far < total_tokens {
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            let current_pos = self.get_kv_len();
+            let remaining = total_tokens - processed_so_far;
+            let current_chunk_len = if remaining > step_size { step_size } else { remaining };
+            let chunk_ids_slice = &full_ids_vec[processed_so_far..processed_so_far + current_chunk_len];
+            let chunk_ids = Tensor::from_vec(chunk_ids_slice.to_vec(), (1, current_chunk_len), &self.text_device)?;
+            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + current_chunk_len) as u32, &self.text_device)?.unsqueeze(0)?;
+            
+            println!("[MODEL-PROGRESS] Chunked Prefill: {}/{} tokens ({:.1}%)", processed_so_far + current_chunk_len, total_tokens, ((processed_so_far + current_chunk_len) as f64 / total_tokens as f64) * 100.0);
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
+            
+            if let Some(ref mut target) = relay_target {
+                let (ks, vs) = self.get_current_kv();
+                let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
+                     let s_len = k.dim(candle_core::D::Minus2)?;
+                     let k_new = k.narrow(candle_core::D::Minus2, s_len - current_chunk_len, current_chunk_len)?;
+                     let v_new = v.narrow(candle_core::D::Minus2, s_len - current_chunk_len, current_chunk_len)?;
+                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
+                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
+                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
+                        Ok((res_k, res_v))
+                    } else { Err(anyhow!("Unsupported")) }
+                }).collect();
+                let results = results?;
+                let mut ka = vec![]; let mut kp = vec![]; let mut ks_ = vec![];
+                let mut va = vec![]; let mut vp = vec![]; let mut vs_ = vec![];
+                let mut os = vec![];
+                for (rk, rv) in results {
+                    ka.push(rk.0); kp.push(rk.1); ks_.push(rk.2);
+                    va.push(rv.0); vp.push(rv.1); vs_.push(rv.2);
+                    os = rk.3;
+                }
+                if !ka.is_empty() { target.inject_kv_bitkv(&ka, &kp, &ks_, &va, &vp, &vs_, &os)?; }
             }
-            if !ka.is_empty() { target.inject_kv_bitkv(&ka, &kp, &ks_, &va, &vp, &vs_, &os)?; }
+            processed_so_far += current_chunk_len;
         }
-        Ok(chunk_size)
+        Ok(total_tokens)
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
@@ -434,7 +470,7 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
-        let prefill_chunk_size = 128;
+        let prefill_chunk_size = 2048; 
 
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
@@ -446,15 +482,26 @@ impl Qwen3VLGenerateModel {
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
+            println!("[GEN-BAKING] Step: {} to {} / Total: {} ({:.1}%)", seqlen_offset, seqlen_offset + chunk_size, total_tokens, (seqlen_offset + chunk_size) as f64 / total_tokens as f64 * 100.0);
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
-            if seqlen_offset % 1024 == 0 {
-                if let Some(sid) = &session_id {
-                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    let _ = self.save_kv_to_disk(&path);
-                    println!("[GEN-PREFILL] Checkpoint at {}", seqlen_offset);
+
+            // [GEN-BAKING-RESET] Periodic Save & Purge for 2B stability
+            if let Some(sid) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                self.save_kv_to_disk(&path)?;
+                let _ = self.qwen3_vl.drop_kv_storage();
+                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                 }
+                let _ = self.load_kv_from_disk(&path);
             }
         }
 
@@ -464,9 +511,11 @@ impl Qwen3VLGenerateModel {
 
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
             let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
                 Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
             } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
+            
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
@@ -476,14 +525,13 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             all_ids.push(next_id);
             generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            // [INFERENCE-SAVE] Only checkpoint for Large models
-            if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
+
+            if i > 0 && i % 100 == 0 && !self.model_name.contains("0.6B") {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    let _ = self.save_kv_to_disk(&path);
+                    self.save_kv_to_disk(&path)?;
                     let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
                     let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
-                    println!("[GEN] Checkpoint at {}", i);
                 }
             }
             seqlen_offset += seq_len;
