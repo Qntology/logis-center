@@ -136,12 +136,14 @@ pub enum ModelSize {
 
 #[derive(Clone)]
 pub struct LogisModel {
+    pub app_handle: tauri::AppHandle,
     pub generator: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // Primary Active Slot (GPU)
     pub small_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 0.6B RAM Slot
     pub large_hibernation: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>, // 2B RAM Slot
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     
     pub is_cpu_mode: bool, 
+    pub is_disk_swap: bool,
     pub dual_mode_enabled: bool,
     
     // Config for Lazy Reloading
@@ -485,7 +487,12 @@ impl LogisModel {
         let path_clone = path.to_string();
         let shared_path = shared_config_path.map(|s| s.to_string());
 
+        let handle_clone = self.app_handle.clone();
+
+        let is_disk_swap = self.is_disk_swap;
+
         let generator = tokio::task::spawn_blocking(move || {
+            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             // [CRITICAL] Use init_with_config to force shared settings (Config + Tokenizer)
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
@@ -493,7 +500,9 @@ impl LogisModel {
                 shared_path.as_deref(), // Config path
                 Some(&dev), dev_id, Some(&dev), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                false // [NEW] baking_only
+                false, // [NEW] baking_only
+                is_disk_swap, 
+                kv_root
             )
         }).await??;
         
@@ -569,20 +578,25 @@ impl LogisModel {
             }
         }
 
+        let is_disk_swap = self.is_disk_swap;
         let dev_id = self.device_config.gpu_id;
         let dtype = if target_device.is_cpu() { Some(DType::F32) } else { Some(DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let shared_path_clone = shared_path.map(|s| s.to_string());
+        let handle_clone = self.app_handle.clone();
 
         let gen = tokio::task::spawn_blocking(move || {
+            let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
             Qwen3VLGenerateModel::init_with_config(
                 &path_clone, 
                 shared_path_clone.as_deref(), 
                 shared_path_clone.as_deref(), 
                 Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
                 force_text_only,
-                baking_only // [PASS-NEW]
+                baking_only,
+                is_disk_swap,
+                kv_root
             )
         }).await??;
 
@@ -644,8 +658,14 @@ impl LogisModel {
         Ok(())
     }
 
-    pub async fn new(device_preference: Option<&str>) -> anyhow::Result<Self> {
-        println!("[MODEL-00] Initializing LogisModel (Preference: {:?})", device_preference);
+    pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
+        // Default to true for SSD-Swap unless user explicitly wants pure CPU
+        let is_disk_swap = match device_preference {
+            Some("cpu") => false,
+            _ => true,
+        };
+        
+        println!("[MODEL-00] Initializing LogisModel (Preference: {:?}, DiskSwap: {})", device_preference, is_disk_swap);
 
         let mut config = utils::get_optimal_device_config();
         
@@ -682,11 +702,13 @@ impl LogisModel {
         let max_tokens_limit = 65536; 
 
         Ok(Self {
+            app_handle,
             generator: Arc::new(TokioMutex::new(None)),
             small_hibernation: Arc::new(TokioMutex::new(None)),
             large_hibernation: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             is_cpu_mode: config.is_cpu,
+            is_disk_swap,
             dual_mode_enabled: true, 
             small_model_path,
             large_model_path,

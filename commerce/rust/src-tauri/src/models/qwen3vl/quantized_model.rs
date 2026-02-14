@@ -837,6 +837,8 @@ pub struct QuantizedQwen3VLTextModel {
     pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
     pub baking_only: bool, // [NEW] Skip MLP for KV baking
     pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
+    pub active_session_id: Option<String>,
+    pub current_kv_len: usize,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -979,7 +981,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, current_kv_len: 0 })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1091,6 +1093,8 @@ impl QuantizedQwen3VLTextModel {
             mmap: None,
             baking_only,
             is_forced_cpu,
+            active_session_id: None,
+            current_kv_len: 0,
         })
     }
 
@@ -1098,12 +1102,13 @@ impl QuantizedQwen3VLTextModel {
         &mut self,
         inputs_embeds: &Tensor,
         seqlen_offset: usize,
+        _total_len: usize,
         position_ids: Option<&Tensor>,
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-        println!("[TRACE-MODEL] Start forward. Input: {:?} {:?}, Target: BF16/F32", inputs_embeds.device(), inputs_embeds.dtype());
+        // println!("[TRACE-MODEL] Start forward. Input: {:?} {:?}, Target: BF16/F32", inputs_embeds.device(), inputs_embeds.dtype());
         
         let position_ids = match position_ids {
             Some(ids) => ids.clone(),
@@ -1162,6 +1167,7 @@ impl QuantizedQwen3VLTextModel {
             }
         }
         
+        self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
         if !xs.device().same_device(norm_dev) {
             xs = xs.to_device(norm_dev)?;

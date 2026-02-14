@@ -410,7 +410,7 @@ async fn process_task(
             // [LOG-ONLY] No emit here to keep UI clean
             log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
             
-            match LogisModel::new(effective_device_pref).await {
+            match LogisModel::new(app_handle.clone(), effective_device_pref).await {
                 Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
