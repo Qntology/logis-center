@@ -216,6 +216,7 @@ impl LogisModel {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
                 let _ = g.clear_kv_cache();
+                let _ = g.qwen3_vl.drop_kv_storage(); // Force drop heavy tensors
                 drop(g); 
             }
         }
@@ -242,9 +243,9 @@ impl LogisModel {
             let _ = tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
                     // Repeat sync to force driver garbage collection
-                    for _ in 0..3 {
+                    for _ in 0..5 { // Increased to 5 for extra pressure
                         let _ = dev.synchronize(); 
-                        std::thread::sleep(Duration::from_millis(100));
+                        std::thread::sleep(Duration::from_millis(200));
                     }
                 }
             }).await;
@@ -256,12 +257,14 @@ impl LogisModel {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
-            // Force return all physical RAM back to OS
+            // Call twice to ensure all pages (including CUDA mirrors) are paged out
+            let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
 
         println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
@@ -286,7 +289,8 @@ impl LogisModel {
 
             // 2. Measure VRAM
             let mut current_free = 0;
-            if let Ok(nvml) = nvml_wrapper::Nvml::init() {
+            use nvml_wrapper::Nvml;
+            if let Ok(nvml) = Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {
                         current_free = mem.free;
@@ -305,43 +309,37 @@ impl LogisModel {
                 stable_ticks = 0;
             }
 
-            // [ADAPTIVE-LOGIC] Analyze Trend
-            if current_free > last_free + (50 * 1024 * 1024) { // Increased by > 50MB
+            // [ADAPTIVE-LOGIC] Analyze Trend (20MB sensitivity)
+            if current_free > last_free + (20 * 1024 * 1024) { 
                 increasing_ticks += 1;
-                if increasing_ticks > 0 {
-                    println!("[VRAM-WATCH] Reclaiming... ({:.2} GB -> {:.2} GB)", last_free as f64/1e9, current_free as f64/1e9);
-                }
+                println!("[VRAM-WATCH] Reclaiming... ({:.2} GB -> {:.2} GB)", last_free as f64/1e9, current_free as f64/1e9);
             } else {
                 increasing_ticks = 0;
             }
 
             // [ACTIVE-FLUSH] If stuck for > 1.5s, trigger OS RAM cleanup
             if start.elapsed().as_secs_f32() > 1.5 && !has_flushed_ram && current_free < target_bytes {
-                println!("[VRAM-WATCH] Triggering OS Working Set Trim...");
+                println!("[VRAM-WATCH] Triggering Aggressive OS Working Set Trim...");
                 #[cfg(target_os = "windows")]
                 unsafe {
                     use windows_sys::Win32::System::Threading::GetCurrentProcess;
                     use windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx;
                     use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MIN_DISABLE;
                     use windows_sys::Win32::System::Memory::QUOTA_LIMITS_HARDWS_MAX_DISABLE;
-                    let process = GetCurrentProcess();
-                    let _ = SetProcessWorkingSetSizeEx(process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                 }
                 has_flushed_ram = true;
-                // Give it a moment to reflect
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
                 continue;
             }
 
             // [TIMEOUT-HANDLER]
             if start.elapsed().as_secs() > timeout_sec {
-                // If memory is still actively freeing up, extend timeout dynamically
                 if increasing_ticks > 0 {
                     println!("[VRAM-WATCH] Timeout reached but memory is freeing up. Extending wait...");
-                    increasing_ticks = 0; // Reset to avoid infinite loop
+                    increasing_ticks = 0;
                     continue; 
                 }
-                
                 println!("[VRAM-WATCH] Timeout reached. Proceeding with {:.2} GB (Target: {:.2} GB)", current_free as f64/1e9, target_free_mb as f64/1024.0);
                 break;
             }

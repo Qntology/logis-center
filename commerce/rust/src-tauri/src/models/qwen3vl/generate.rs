@@ -45,7 +45,7 @@ impl ModelVariant {
 
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
         match self {
-            Self::Standard(_) => Ok(()), // Standard model doesn't support dynamic rebalancing yet
+            Self::Standard(_) => Ok(()), 
             Self::QuantizedVL(m) => m.rebalance_layers(device_id),
             Self::QuantizedText(m) => m.rebalance_layers(device_id),
         }
@@ -142,16 +142,13 @@ impl Qwen3VLGenerateModel {
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
         let tok_path = tokenizer_path.unwrap_or(path);
-        // ... (previous logic stays same for path handling)
         let tok_path = if let Some(stripped) = tok_path.strip_prefix(r"\\?\") { stripped } else { tok_path };
-
         let cfg_path = config_path.unwrap_or(path);
         let cfg_path = if let Some(stripped) = cfg_path.strip_prefix(r"\\?\") { stripped } else { cfg_path };
 
         let chat_template = ChatTemplate::init(tok_path)?;
         let tokenizer = TokenizerModel::init(tok_path)?;
         let final_config_path = std::path::Path::new(cfg_path).join("config.json");
-
         let raw_config: serde_json::Value = serde_json::from_slice(&std::fs::read(&final_config_path)?)?;
 
         let cfg: Qwen3VLConfig = if raw_config.get("text_config").is_some() {
@@ -182,10 +179,7 @@ impl Qwen3VLGenerateModel {
 
         let gguf_files = find_type_files(path, "gguf")?;
         let mmproj_path = gguf_files.iter().find(|f| f.contains("mmproj")).cloned();
-        
-        // [OPTIMIZATION] If force_text_only is enabled, treat it as a non-vision model
         let is_vision_model = mmproj_path.is_some() && !force_text_only;
-
         let pre_processor = Qwen3VLProcessor::new(tok_path, &vision_dev, dtype)?;
 
         let qwen3_vl = if !gguf_files.is_empty() {
@@ -204,12 +198,10 @@ impl Qwen3VLGenerateModel {
                 let main_mmap = unsafe { memmap2::MmapOptions::new().map(&main_file)? };
                 let mmproj_file = std::fs::File::open(&mmproj)?;
                 let mmproj_mmap = unsafe { memmap2::MmapOptions::new().map(&mmproj_file)? };
-
                 let mut main_cursor = std::io::Cursor::new(&main_mmap[..]);
                 let main_content = gguf_file::Content::read(&mut main_cursor)?;
                 let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
-
                 let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only)?;
                 ModelVariant::QuantizedVL(model)
             } else {
@@ -218,11 +210,9 @@ impl Qwen3VLGenerateModel {
                 let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
                 let mut cursor = std::io::Cursor::new(&mmap[..]);        
                 let content = gguf_file::Content::read(&mut cursor)?;
-                
                 let is_06b = path.contains("0.6B");
                 let actual_baking_only = baking_only || is_06b;
                 let single_layer_mode = baking_only || is_06b;
-                
                 let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
             }
@@ -240,34 +230,13 @@ impl Qwen3VLGenerateModel {
             Qwen3VLGenerationConfig::default()
         };
         let model_name = if path.contains("0.6B") { "qwen3vl-0.6B".to_string() } else { "qwen3vl-2B".to_string() };
-
         let (eos_token_id1, eos_token_id2) = match &generation_config.eos_token_id {
-            serde_json::Value::Number(n) => {
-                let id = n.as_u64().unwrap_or(151645) as u32;
-                (id, id)
-            },
-            serde_json::Value::Array(arr) => {
-                let id1 = arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32;
-                let id2 = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(id1 as u64) as u32;
-                (id1, id2)
-            },
+            serde_json::Value::Number(n) => { let id = n.as_u64().unwrap_or(151645) as u32; (id, id) },
+            serde_json::Value::Array(arr) => { let id1 = arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32; let id2 = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(id1 as u64) as u32; (id1, id2) },
             _ => (151643, 151643),
         };
 
-        Ok(Self {
-            chat_template,
-            tokenizer,
-            pre_processor,
-            qwen3_vl,
-            text_device: text_dev,
-            vision_device: vision_dev,
-            eos_token_id1,
-            eos_token_id2,
-            generation_config,
-            model_name,
-            hard_token_limit,
-            kv_root,
-        })
+        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root })
     }
 
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
@@ -277,72 +246,40 @@ impl Qwen3VLGenerateModel {
         let mut current_pos = 0;
 
         while current_pos < total_tokens {
-            if let Some(token) = &cancel_token { 
-                if token.load(Ordering::Relaxed) { 
-                    return Err(anyhow!("Task cancelled during prefill_text_only")); 
-                } 
-            }
+            if let Some(token) = &cancel_token { if token.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             let end = (current_pos + chunk_size).min(total_tokens);
             let chunk = &token_ids[current_pos..end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
-
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
-
-            // [STREAMING] 주기적으로 디스크에 중간 결과 저장
-            if let Some(path) = auto_save_path {
-                let _ = self.save_kv_to_disk(path);
-                // println!("[STREAM-SAVE] Progress: {}/{} tokens saved.", end, total_tokens);
-            }
-
+            if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path); }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
-                // [TURBO-RELAY] Parallelize layer compression across ALL CPU cores
-                    let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
+                let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
                     let seq_len = k.dim(candle_core::D::Minus2)?;
-                    let chunk_tokens = end - current_pos;
-                    let start = seq_len.saturating_sub(chunk_tokens);
-                    
-                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    
+                    let start = seq_len.saturating_sub(end - current_pos);
+                    let k_new = k.narrow(candle_core::D::Minus2, start, end - current_pos)?;
+                    let v_new = v.narrow(candle_core::D::Minus2, start, end - current_pos)?;
                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
                         let res_k = m.language_model.compress_to_bitkv(&k_new)?;
                         let res_v = m.language_model.compress_to_bitkv(&v_new)?;
                         Ok((res_k, res_v))
-                    } else {
-                        Err(anyhow!("Unsupported model variant"))
-                    }
+                    } else { Err(anyhow!("Unsupported")) }
                 }).collect();
-
                 let results = results?;
-                let mut k_anchors = Vec::with_capacity(results.len());
-                let mut k_packed = Vec::with_capacity(results.len());
-                let mut k_scales = Vec::with_capacity(results.len());
-                let mut v_anchors = Vec::with_capacity(results.len());
-                let mut v_packed = Vec::with_capacity(results.len());
-                let mut v_scales = Vec::with_capacity(results.len());
+                let mut k_anchors = vec![]; let mut k_packed = vec![]; let mut k_scales = vec![];
+                let mut v_anchors = vec![]; let mut v_packed = vec![]; let mut v_scales = vec![];
                 let mut original_shape = vec![];
-
-                for (res_k, res_v) in results {
-                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                    original_shape = res_k.3;
+                for (rk, rv) in results {
+                    k_anchors.push(rk.0); k_packed.push(rk.1); k_scales.push(rk.2);
+                    v_anchors.push(rv.0); v_packed.push(rv.1); v_scales.push(rv.2);
+                    original_shape = rk.3;
                 }
-                
-                if !k_anchors.is_empty() {
-                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
-                }
+                if !k_anchors.is_empty() { target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?; }
             }
             current_pos = end;
         }
-
-        // [MEMORY-FIX] 저장이 완료되었으므로 메모리 포지션을 해제함
-        if auto_save_path.is_some() {
-            println!("[STREAMING] Disk save complete. Dropping KV storage from memory.");
-            let _ = self.qwen3_vl.drop_kv_storage();
-        }
-
+        if auto_save_path.is_some() { let _ = self.qwen3_vl.drop_kv_storage(); }
         Ok(())
     }
 
@@ -351,134 +288,94 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
-        
-        // [STRICT-CHUNK] 2048 tokens per bake step as requested
         let prefill_chunk_size = 2048;
-        
-        // [RESUME-LOGIC] Start from existing KV length
         let mut current_pos = self.get_kv_len();
-        if current_pos > 0 {
-            println!("[RESUME] Resuming baking from token {}.", current_pos);
-        }
+        if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
         while current_pos < total_tokens {
-            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); } }
-            
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             let end = (current_pos + prefill_chunk_size).min(total_tokens);
-            // Don't process the very last token if we want to generate from it later
             let chunk_end = if end == total_tokens { total_tokens - 1 } else { end };
             if chunk_end <= current_pos { break; }
-            
             let chunk_len = chunk_end - current_pos;
             let chunk = &full_input_ids_vec[current_pos..chunk_end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_len), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, chunk_end as u32, &self.text_device)?.unsqueeze(0)?;
-
             println!("[BAKING] Step: {} to {} / Total: {}", current_pos, chunk_end, total_tokens);
-            
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
-
-            // [SAVE-EACH-CHUNK] Persistent save after every 2048 tokens
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if !path.exists() { let _ = fs::create_dir_all(&path); }     
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
                 self.save_kv_to_disk(&path)?;
-                println!("[BAKING] Checkpoint saved for token {}.", chunk_end);
+                println!("[BAKING] Segment complete. Purging VRAM for token {}.", chunk_end);
+                let _ = self.qwen3_vl.drop_kv_storage();
+                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
             }
-
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
-                    let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
+                let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
                     let s_len = k.dim(candle_core::D::Minus2)?;
                     let start = s_len.saturating_sub(chunk_len);
                     let k_new = k.narrow(candle_core::D::Minus2, start, chunk_len)?;
                     let v_new = v.narrow(candle_core::D::Minus2, start, chunk_len)?;
                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
-                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
-                        Ok((res_k, res_v))
-                    } else {
-                        Err(anyhow!("Unsupported model variant"))
-                    }
+                        let rk = m.language_model.compress_to_bitkv(&k_new)?;
+                        let rv = m.language_model.compress_to_bitkv(&v_new)?;
+                        Ok((rk, rv))
+                    } else { Err(anyhow!("Unsupported")) }
                 }).collect();
-
                 let results = results?;
-                let mut k_anchors = Vec::with_capacity(results.len());
-                let mut k_packed = Vec::with_capacity(results.len());
-                let mut k_scales = Vec::with_capacity(results.len());
-                let mut v_anchors = Vec::with_capacity(results.len());
-                let mut v_packed = Vec::with_capacity(results.len());
-                let mut v_scales = Vec::with_capacity(results.len());
-                let mut original_shape = vec![];
-
-                for (res_k, res_v) in results {
-                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                    original_shape = res_k.3;
+                let mut ka = vec![]; let mut kp = vec![]; let mut ks_ = vec![];
+                let mut va = vec![]; let mut vp = vec![]; let mut vs_ = vec![];
+                let mut os = vec![];
+                for (rk, rv) in results {
+                    ka.push(rk.0); kp.push(rk.1); ks_.push(rk.2);
+                    va.push(rv.0); vp.push(rv.1); vs_.push(rv.2);
+                    os = rk.3;
                 }
-                if !k_anchors.is_empty() {
-                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
-                }
+                if !ka.is_empty() { target.inject_kv_bitkv(&ka, &kp, &ks_, &va, &vp, &vs_, &os)?; }
             }
             current_pos = chunk_end;
         }
-
         if let Some(sid) = session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
-            if !path.exists() { let _ = fs::create_dir_all(&path); }     
+            if !path.exists() { let _ = fs::create_dir_all(&path); }
             self.save_kv_to_disk(&path)?;
             let token_path = path.join("tokens.json");
-            if let Ok(file) = fs::File::create(&token_path) {
-                let _ = serde_json::to_writer(file, &full_input_ids_vec);
-            }
+            if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
         }
         Ok(current_pos)
     }
 
-    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
         let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
         let chunk_size = chunk_ids_vec.len();
         let current_pos = self.get_kv_len();
         let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
         let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
-        if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
         self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, chunk_size, None)?;
-        
-        if let Some(target) = relay_target {
+        if let Some(ref mut target) = relay_target {
             let (ks, vs) = self.get_current_kv();
-            // [TURBO-RELAY] Parallelize layer compression
-                let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
-                 let s_len = k.dim(candle_core::D::Minus2)?;
-                 let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                 let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
-                 
-                 if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                    let res_k = m.language_model.compress_to_bitkv(&k_new)?;
-                    let res_v = m.language_model.compress_to_bitkv(&v_new)?;
-                    Ok((res_k, res_v))
-                } else {
-                    Err(anyhow!("Unsupported variant"))
-                }
+            let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
+                let s_len = k.dim(candle_core::D::Minus2)?;
+                let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
+                let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
+                if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
+                    let rk = m.language_model.compress_to_bitkv(&k_new)?;
+                    let rv = m.language_model.compress_to_bitkv(&v_new)?;
+                    Ok((rk, rv))
+                } else { Err(anyhow!("Unsupported")) }
             }).collect();
-
             let results = results?;
-            let mut k_anchors = Vec::with_capacity(results.len());
-            let mut k_packed = Vec::with_capacity(results.len());
-            let mut k_scales = Vec::with_capacity(results.len());
-            let mut v_anchors = Vec::with_capacity(results.len());
-            let mut v_packed = Vec::with_capacity(results.len());
-            let mut v_scales = Vec::with_capacity(results.len());
-            let mut original_shape = vec![];
-
-            for (res_k, res_v) in results {
-                k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                original_shape = res_k.3;
+            let mut ka = vec![]; let mut kp = vec![]; let mut ks_ = vec![];
+            let mut va = vec![]; let mut vp = vec![]; let mut vs_ = vec![];
+            let mut os = vec![];
+            for (rk, rv) in results {
+                ka.push(rk.0); kp.push(rk.1); ks_.push(rk.2);
+                va.push(rv.0); vp.push(rv.1); vs_.push(rv.2);
+                os = rk.3;
             }
-            
-            if !k_anchors.is_empty() {
-                target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
-            }
+            if !ka.is_empty() { target.inject_kv_bitkv(&ka, &kp, &ks_, &va, &vp, &vs_, &os)?; }
         }
         Ok(chunk_size)
     }
@@ -486,29 +383,23 @@ impl Qwen3VLGenerateModel {
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let top_p = mes.top_p.unwrap_or(0.9) as f32;
-        let top_k = 40;
         let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(top_k), seed);
-        let repetition_penalty = 1.1;
-
+        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(40), seed);
         let mut all_ids = vec![];
         let mut generated_text = String::new();
         let mut seqlen_offset = self.get_kv_len();
 
-        // [INFERENCE-RESUME] Detect existing progress
         if let Some(sid) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             let progress_path = path.join("generation_progress.json");
             if progress_path.exists() {
                 if let Ok(data) = std::fs::read_to_string(&progress_path) {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                        println!("[RESUME] Found existing generation progress. Loading...");
+                        println!("[RESUME] Found progress. Loading...");
                         let _ = self.load_kv_from_disk(&path);
                         seqlen_offset = self.get_kv_len();
                         generated_text = json["text"].as_str().unwrap_or("").to_string();
-                        if let Some(ids) = json["ids"].as_array() {
-                            all_ids = ids.iter().map(|v| v.as_u64().unwrap_or(0) as u32).collect();
-                        }
+                        if let Some(ids) = json["ids"].as_array() { all_ids = ids.iter().map(|v| v.as_u64().unwrap_or(0) as u32).collect(); }
                     }
                 }
             }
@@ -519,10 +410,8 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
 
-        // If no progress found, start from prefill
         if all_ids.is_empty() {
             all_ids = full_input_ids_vec.clone();
-            
             if seqlen_offset == 0 {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
@@ -531,103 +420,62 @@ impl Qwen3VLGenerateModel {
             }
         }
 
-        // [CHUNKED PREFILL] - Granular loading for stability
-        let mut local_pos = if seqlen_offset > 0 { 
-            if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset }
-        } else { 0 };
-        
-        let prefill_chunk_size = 128; // Use strict 128 chunks for 4GB VRAM
+        let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
+        let prefill_chunk_size = 128;
 
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
             if remaining == 1 { break; }
-            
             let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
-            if local_pos + chunk_size >= total_tokens {
-                chunk_size = (total_tokens - local_pos).saturating_sub(1);
-            }
+            if local_pos + chunk_size >= total_tokens { chunk_size = (total_tokens - local_pos).saturating_sub(1); }
             if chunk_size == 0 { break; }
-
             let chunk = &full_input_ids_vec[local_pos..local_pos + chunk_size];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
-
-            if let Some(flag) = &cancel_flag {
-                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Generation cancelled during prefill")); }
-            }
-
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
-            
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
-
-            // [SAVE-PREFILL] Periodic checkpoint during prefill
             if seqlen_offset % 1024 == 0 {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     let _ = self.save_kv_to_disk(&path);
-                    println!("[GEN-PREFILL] Checkpoint saved at token {}", seqlen_offset);
+                    println!("[GEN-PREFILL] Checkpoint at {}", seqlen_offset);
                 }
             }
         }
-        
-        // [TRUNCATED FOR CONCISE - Generation Loop Starts]
+
         let max_new_tokens = mes.max_tokens.unwrap_or(2048);
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
         for i in 0..max_new_tokens {
-            if let Some(flag) = &cancel_flag { 
-                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Task cancelled")); } 
-            }
-            
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
-                let start = local_pos;
-                let end = total_tokens;
-                Tensor::new(&full_input_ids_vec[start..end], &self.text_device)?.unsqueeze(0)?
-            } else {
-                Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?
-            };
-
+                Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
+            } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
-            
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
-            
-            let logits = logits.squeeze(0)?;
-            let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
-
-            if repetition_penalty != 1.0 {
-                let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] };
-                logits = apply_repeat_penalty(&logits, repetition_penalty, penalty_context)?;
-            }
-
+            let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
+            if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }
             let next_id = logit_processor.sample(&logits)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             all_ids.push(next_id);
-            let new_token_text = self.tokenizer.token_decode(vec![next_id])?;
-            generated_text.push_str(&new_token_text);
-            
-            // [INFERENCE-SAVE] Save checkpoint every 50 tokens
+            generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
             if i > 0 && i % 50 == 0 {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     let _ = self.save_kv_to_disk(&path);
                     let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
                     let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
-                    println!("[GEN] Checkpoint saved at token {}", i);
+                    println!("[GEN] Checkpoint at {}", i);
                 }
             }
-
             seqlen_offset += seq_len;
             pixel_values = None;
         }
-
-        // [CLEANUP] Remove generation progress on success
-        if let Some(sid) = &session_id {
-            let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json"));
-        }
-
+        if let Some(sid) = &session_id { let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json")); }
         Ok(generated_text)
     }
 
@@ -642,15 +490,19 @@ impl Qwen3VLGenerateModel {
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
         let mut ks = vec![]; let mut vs = vec![];
         match &self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => { for layer in &m.language_model.layers { if let Some((k, v)) = &layer.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
-            ModelVariant::QuantizedText(m) => { for layer in &m.language_model.layers { if let Some((k, v)) = &layer.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            ModelVariant::QuantizedVL(m) => { for l in &m.language_model.layers { if let Some((k, v)) = &l.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            ModelVariant::QuantizedText(m) => { for l in &m.language_model.layers { if let Some((k, v)) = &l.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
             _ => {} 
         }
         (ks, vs)
     }
 
-    pub fn inject_kv_bitkv(&mut self, k_anchors: &[Tensor], k_packed: &[Tensor], k_scales: &[Tensor], v_anchors: &[Tensor], v_packed: &[Tensor], v_scales: &[Tensor], original_shape: &[usize]) -> Result<()> {
-        self.qwen3_vl.inject_kv_bitkv(k_anchors, k_packed, k_scales, v_anchors, v_packed, v_scales, original_shape)
+    pub fn inject_kv_bitkv(&mut self, ka: &[Tensor], kp: &[Tensor], ks: &[Tensor], va: &[Tensor], vp: &[Tensor], vs: &[Tensor], os: &[usize]) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os),
+            ModelVariant::QuantizedText(m) => m.language_model.inject_live_kv_bitkv(ka, kp, ks, va, vp, vs, os),
+            _ => Ok(()),
+        }
     }
 
     pub fn save_kv_to_disk(&mut self, path: &Path) -> Result<()> {
@@ -669,14 +521,13 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+    pub fn to_device(&mut self, d: &Device) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.to_device(device)?,
-            ModelVariant::QuantizedText(m) => m.to_device(device)?,
+            ModelVariant::QuantizedVL(m) => m.to_device(d)?,
+            ModelVariant::QuantizedText(m) => m.to_device(d)?,
             _ => {},
         }
-        self.text_device = device.clone();
-        self.vision_device = device.clone();
+        self.text_device = d.clone(); self.vision_device = d.clone();
         Ok(())
     }
 
