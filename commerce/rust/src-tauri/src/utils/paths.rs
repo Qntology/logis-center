@@ -58,21 +58,6 @@ pub fn init_directories(app: Option<&AppHandle>) {
     let _ = get_logs_dir(app);
 }
 
-/// Recursive directory copy helper
-pub fn copy_dir_all(src: impl AsRef<std::path::Path>, dst: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-    fs::create_dir_all(&dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        } else {
-            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        }
-    }
-    Ok(())
-}
-
 /// Cleanup temporary directories (called on startup or shutdown)
 pub fn cleanup_temp_dirs(app: Option<&AppHandle>) {
     let kv = get_kv_dir(app);

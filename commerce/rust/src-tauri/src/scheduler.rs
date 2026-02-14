@@ -410,7 +410,7 @@ async fn process_task(
             // [LOG-ONLY] No emit here to keep UI clean
             log_task_progress(app_handle, &task.id, &json!({ "category": "Loading Model", "summary": "Initializing AI Core..." }));
             
-            match LogisModel::new(app_handle.clone(), effective_device_pref).await {
+            match LogisModel::new(effective_device_pref).await {
                 Ok(m) => *model_lock = Some(m),
                 Err(e) => return Err(anyhow::anyhow!("Model Load Failed: {}", e)),
             }
@@ -431,7 +431,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
             // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true).await?;
             
             // Perform prefill with image to create visual KV cache
             let model_clone = model.clone();
@@ -476,8 +476,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
-            let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
             model.extract_from_image(
                 task.id.clone(),
@@ -569,85 +568,86 @@ async fn process_task(
     let mut page_type = String::new();
     let mut selector_info: serde_json::Value = json!({});
 
-    // --- PRE-PHASE: PUG BAKING (Gold Master) ---
-    let base_snapshot_id = format!("{}_base", task.id);
-    let base_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&base_snapshot_id);
-    let has_base = base_kv_dir.exists() && fs::read_dir(&base_kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+    // ==================================================================================
+    // [ULTRA-OPTIMIZED PIPELINE]
+    // Step 1: 0.6B Bakes [PUG + Classification Task] -> Save SNAPSHOT_A
+    // Step 2: 2B Loads SNAPSHOT_A -> Instant Generation
+    // Step 3: 0.6B Bakes [PUG + Selector Task] -> Save SNAPSHOT_B
+    // Step 4: 2B Loads SNAPSHOT_B -> Instant Generation
+    // ...
+    // ==================================================================================
 
-    if !has_base {
-        println!("[Scheduler] Initial GOLD MASTER Baking with 0.6B...");
-        log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking Gold Master Context...", "spinner": "🍳" }));
-        
-        // 1. Load Small model for one-time baking
-        model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, model.is_disk_swap).await?;
-
-        let model_clone = model.clone();
-        let pug_clone = light_pug.clone();
-        let token_clone = cancellation_token.clone();
-        let session_clone = Some(base_snapshot_id.clone());
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut gen_guard = model_clone.generator.blocking_lock();
-            if let Some(worker) = gen_guard.as_mut() {
-                worker.clear_kv_cache();
-                // [GOLD-MASTER] System instructions FIRST, then the heavy PUG data
-                let base_prompt = format!("[SYSTEM]\nYou are a logistics expert. Analyze the following document structure and retain it in memory for future tasks.\n\n[PUG CONTENT]\n{}", pug_clone);
-                let params = ChatCompletionParameters {
-                    messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                        content: ChatCompletionRequestUserMessageContent::Text(base_prompt),
-                        name: None,
-                    })],
-                    ..Default::default()
-                };
-                worker.prefill_only(params, Some(token_clone), session_clone, None)?;
-            }
-            Ok(())
-        }).await??;
-        println!("[Scheduler] GOLD MASTER Baking Complete. Saved to {}", base_snapshot_id);
-    }
-
-    // --- STEP A: CLASSIFICATION ---
+    // --- STEP A: CLASSIFICATION (Disk Bridge Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        let snapshot_id = format!("{}_step_a", task.id);
-        let step_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 2B)");
         
-        // [ISOLATION] Copy base snapshot to step_a directory
-        if !step_kv_dir.exists() {
-            println!("[Scheduler] Cloning Gold Master to Step A...");
-            utils::paths::copy_dir_all(&base_kv_dir, &step_kv_dir)?;
-        }
-
+        // [NEW] Log step A start for UI recovery
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
-        // [DELTA-PREFILL] Just the final task question
         let type_prompt = parsing::page_type_prompt();
-        let task_question = format!("\n\n[QUESTION] Based on the PUG content you just analyzed, {} RETURN JSON ONLY", type_prompt);
+        let pug_content = light_pug.clone();
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
+        let snapshot_id = format!("{}_step_a", task.id);
+        
+        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
+        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+
+        if !has_snapshot {
+            // 1. [0.6B] Bake FULL Templated Prompt
+            println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+            
+            let model_clone = model.clone();
+            let question_clone = task_question.clone();
+            let token_clone = cancellation_token.clone();
+            let session_clone = Some(snapshot_id.clone());
+
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut gen_guard = model_clone.generator.blocking_lock();
+                if let Some(worker) = gen_guard.as_mut() {
+                    worker.clear_kv_cache();
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                            name: None,
+                        })],
+                        ..Default::default()
+                    };
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                }
+                Ok(())
+            }).await??;
+        } else {
+            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
+        }
 
         // 2. [2B] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, model.is_disk_swap).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                    content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(256), temperature: Some(0.1),
+                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
                 ..Default::default()
             };
 
-            if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step A: Asking classification (Delta Prefill)...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
-                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                
-                // [DEBUG] AI 응답 저장
-                let _ = data_manager.offload(&res, "step_a_res");
-
-                let type_info = parsing::parse_json_from_llm(&res); 
-                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+                        if let Some(gen) = model.generator.lock().await.as_mut() {
+                            println!("[Scheduler] 2B Step A: Asking classification question...");
+                            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                            println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                            
+                            // [DEBUG] AI 응답 저장
+                            let _ = data_manager.offload(&res, "step_a_res");
+            
+                            let type_info = parsing::parse_json_from_llm(&res); 
+                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
                 if page_type.is_empty() {
+                    println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
                     page_type = match task.r#type.as_str() {
                         "image_extraction" => "tracking".to_string(),
                         _ => "unknown".to_string(),
@@ -669,40 +669,67 @@ async fn process_task(
     model.deep_purge_resources().await;
     wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
-    // --- STEP B: SELECTORS ---
+    // --- STEP B: SELECTORS (Disk Bridge Relay) ---
     {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-        let snapshot_id = format!("{}_step_b", task.id);
-        let step_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        println!("[Scheduler] Starting DISK BRIDGE RELAY for Selectors");
         
-        // [ISOLATION] Copy base snapshot to step_b directory
-        if !step_kv_dir.exists() {
-            println!("[Scheduler] Copying Base to Step B...");
-            utils::paths::copy_dir_all(&base_kv_dir, &step_kv_dir)?;
-        }
-
+        // [NEW] Log step B start
         log_task_progress(app_handle, &task.id, &json!({ "category": "Selector Search", "summary": "Identifying data elements...", "spinner": "⠋" }));
 
         let selector_prompt = parsing::page_selectors_prompt(&page_type); 
-        let task_question = format!("\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", selector_prompt);
+        let pug_content = light_pug.clone();
+        let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, selector_prompt);
+        let snapshot_id = format!("{}_step_b", task.id);
+
+        // [CHECKPOINT] Check if Step B snapshot already exists
+        let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+        let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+
+        if !has_snapshot {
+            // 1. [0.6B] Bake Full Context
+            println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+            let model_clone = model.clone();
+            let question_clone = task_question.clone();
+            let token_clone = cancellation_token.clone();
+            let session_clone = Some(snapshot_id.clone());
+
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut gen_guard = model_clone.generator.blocking_lock();
+                if let Some(worker) = gen_guard.as_mut() {
+                    worker.clear_kv_cache();
+                    let params = crate::openai_types::ChatCompletionParameters {
+                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                            name: None,
+                        })],
+                        ..Default::default()
+                    };
+                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                }
+                Ok(())
+            }).await??;
+        } else {
+            println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
+        }
 
         // 2. [2B] Load & Generate
         {
-            let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(1024), temperature: Some(0.1),
+                model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
                 ..Default::default()
             };
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
-                println!("[Scheduler] 2B Step B: Asking selector question (Delta Prefill)...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
+                println!("[Scheduler] 2B Step B: Asking selector question...");
+                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -798,26 +825,52 @@ async fn process_task(
         };
 
         if !content_pug.trim().is_empty() {
+            let extraction_instruction = parsing::item2json(&page_type, &url, language);
+            let pug_content = content_pug.clone();
+            let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, extraction_instruction);
             let snapshot_id = format!("{}_detail", task.id);
-            let step_kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
-            
-            // [ISOLATION] Copy base snapshot to detail directory
-            if !step_kv_dir.exists() {
-                println!("[Scheduler] Cloning Gold Master to Detail Extraction...");
-                utils::paths::copy_dir_all(&base_kv_dir, &step_kv_dir)?;
+
+            // [CHECKPOINT] Check if Detail snapshot already exists
+            let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
+            let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
+
+            if !has_snapshot {
+                // 1. [0.6B] Bake Detail Context
+                println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
+                log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
+                
+                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+                let model_clone = model.clone();
+                let question_clone = task_question.clone();
+                let token_clone = cancellation_token.clone();
+                let session_clone = Some(snapshot_id.clone());
+
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut gen_guard = model_clone.generator.blocking_lock();
+                    if let Some(worker) = gen_guard.as_mut() {
+                        worker.clear_kv_cache();
+                        let params = crate::openai_types::ChatCompletionParameters {
+                            messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
+                                content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
+                                name: None,
+                            })],
+                            ..Default::default()
+                        };
+                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    }
+                    Ok(())
+                }).await??;
+            } else {
+                println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B baking.");
             }
 
-            let extraction_instruction = parsing::item2json(&page_type, &url, language);
-            let task_question = format!("\n\n[QUESTION] Based on the PUG content you just analyzed, {} RETURN JSON ONLY", extraction_instruction);
-
-            // 2. [2B] Load Snapshot & Generate
+            // 2. [2B] Load & Generate
             {
-                let is_disk_swap = effective_device_pref.as_deref() == Some("gpu_disk_swap") || effective_device_pref.as_deref() == Some("disk_swap");
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, is_disk_swap).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                        content: ChatCompletionRequestUserMessageContent::Text(task_question),
+                        content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
                     model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
@@ -826,10 +879,10 @@ async fn process_task(
 
                 // 3. 2B Instant Inference
                 if let Some(gen) = model.generator.lock().await.as_mut() {
-                    println!("[Scheduler] 2B Step C: Asking extraction (Delta Prefill)...");
-                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference (Zero Prefill)..." }));
+                    println!("[Scheduler] 2B Step C: Asking extraction question...");
+                    log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
+                    let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장
@@ -965,15 +1018,7 @@ async fn process_task(
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
-    // [MEMORY-FINALIZE-V20] 전체 태스크 종료 후 즉시 모든 AI 자원 해제
-    {
-        let model_guard = model_mutex.lock().await;
-        if let Some(m) = model_guard.as_ref() {
-            m.deep_purge_resources().await;
-        }
-    }
-    
-    println!("[PROCESS] Task {} completed. Factory Reset Performed.", task.id);
+    println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
     Ok(())
 }
 

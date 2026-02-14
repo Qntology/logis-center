@@ -43,11 +43,11 @@ impl ModelVariant {
         }
     }
 
-    pub fn rebalance_layers(&mut self, device_id: usize, context_len: usize) -> Result<()> {
+    pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> {
         match self {
             Self::Standard(_) => Ok(()), // Standard model doesn't support dynamic rebalancing yet
-            Self::QuantizedVL(m) => m.rebalance_layers(device_id, context_len),
-            Self::QuantizedText(m) => m.rebalance_layers(device_id, context_len),
+            Self::QuantizedVL(m) => m.rebalance_layers(device_id),
+            Self::QuantizedText(m) => m.rebalance_layers(device_id),
         }
     }
 
@@ -88,7 +88,7 @@ pub struct Qwen3VLGenerateModel {
     pub generation_config: Qwen3VLGenerationConfig,
     pub model_name: String,
     pub hard_token_limit: Option<usize>,
-    pub kv_root: std::path::PathBuf, // [NEW] Added for absolute path resolution
+    pub kv_root: std::path::PathBuf,
 }
 
 impl Qwen3VLGenerateModel {
@@ -102,7 +102,7 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        is_disk_swap: bool, // [NEW]
+        is_disk_swap: bool,
         kv_root: std::path::PathBuf,
     ) -> Result<Self> {
         Self::init_with_config(path, None, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, is_disk_swap, kv_root)
@@ -119,7 +119,7 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        is_disk_swap: bool, // [NEW]
+        is_disk_swap: bool,
         kv_root: std::path::PathBuf,
     ) -> Result<Self> {
         Self::init_with_config(path, tokenizer_path, None, text_device, text_device_id, vision_device, vision_device_id, dtype, hard_token_limit, force_text_only, baking_only, is_disk_swap, kv_root) 
@@ -137,7 +137,7 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        is_disk_swap: bool, // [NEW]
+        is_disk_swap: bool,
         kv_root: std::path::PathBuf,
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
@@ -210,7 +210,7 @@ impl Qwen3VLGenerateModel {
                 let mut mmproj_cursor = std::io::Cursor::new(&mmproj_mmap[..]);
                 let mmproj_content = gguf_file::Content::read(&mut mmproj_cursor)?;
 
-                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only, is_disk_swap)?;
+                let model = QuantizedQwen3VLModel::new_with_mmap(&cfg, &main_content, Some(Arc::new(main_mmap)), &mmproj_content, Some(Arc::new(mmproj_mmap)), &text_dev, text_device_id, &vision_dev, vision_device_id, dtype, kv_reserve, baking_only)?;
                 ModelVariant::QuantizedVL(model)
             } else {
                 let main = model_path.or_else(|| if !gguf_files.is_empty() { Some(gguf_files[0].clone()) } else { None }).ok_or(anyhow!("No GGUF file found"))?;
@@ -223,7 +223,7 @@ impl Qwen3VLGenerateModel {
                 let actual_baking_only = baking_only || is_06b;
                 let single_layer_mode = baking_only || is_06b;
                 
-                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode, is_disk_swap)?;
+                let model = crate::models::qwen3vl::quantized_model::QuantizedQwen3TextModel::new_with_mmap(&cfg, &content, Some(Arc::new(mmap)), &text_dev, text_device_id, dtype, kv_reserve, actual_baking_only, single_layer_mode)?;
                 ModelVariant::QuantizedText(model)
             }
         } else {
@@ -266,7 +266,6 @@ impl Qwen3VLGenerateModel {
             generation_config,
             model_name,
             hard_token_limit,
-            kv_root,
         })
     }
 
@@ -287,7 +286,7 @@ impl Qwen3VLGenerateModel {
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
 
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
 
             // [STREAMING] 주기적으로 디스크에 중간 결과 저장
             if let Some(path) = auto_save_path {
@@ -364,7 +363,7 @@ impl Qwen3VLGenerateModel {
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
 
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
 
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -420,72 +419,52 @@ impl Qwen3VLGenerateModel {
         Ok(current_pos)
     }
 
-    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
-        let full_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
-        let total_size = full_ids_vec.len();
-        let mut processed_so_far = 0;
+    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+        let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
+        let chunk_size = chunk_ids_vec.len();
+        let current_pos = self.get_kv_len();
+        let chunk_ids = Tensor::from_vec(chunk_ids_vec, (1, chunk_size), &self.text_device)?;
+        let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
+        if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+        self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos)?;
         
-        // Memory-safe prefill chunk size (Adjusted based on device)
-        let step_size = if self.text_device.is_cpu() { 4096 } else { 2048 };
-
-        while processed_so_far < total_size {
-            let current_pos = self.get_kv_len();
-            let remaining = total_size - processed_so_far;
-            let current_chunk_len = if remaining > step_size { step_size } else { remaining };
-            
-            let chunk_ids_slice = &full_ids_vec[processed_so_far..processed_so_far + current_chunk_len];
-            let chunk_ids = Tensor::from_vec(chunk_ids_slice.to_vec(), (1, current_chunk_len), &self.text_device)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + current_chunk_len) as u32, &self.text_device)?.unsqueeze(0)?;
-            
-            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-            
-            // Forward pass for current segment
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_size, None)?;
-            
-            // Optional: Relay KV cache segment to target
-            if let Some(ref mut target) = relay_target {
-                let (ks, vs) = self.get_current_kv();
+        if let Some(target) = relay_target {
+            let (ks, vs) = self.get_current_kv();
+            // [TURBO-RELAY] Parallelize layer compression
                 let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
-                     let s_len = k.dim(candle_core::D::Minus2)?;
-                     let k_new = k.narrow(candle_core::D::Minus2, s_len - current_chunk_len, current_chunk_len)?;
-                     let v_new = v.narrow(candle_core::D::Minus2, s_len - current_chunk_len, current_chunk_len)?;
-                     
-                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
-                        let res_k = m.language_model.compress_to_bitkv(&k_new)?;
-                        let res_v = m.language_model.compress_to_bitkv(&v_new)?;
-                        Ok((res_k, res_v))
-                    } else {
-                        Err(anyhow!("Unsupported variant"))
-                    }
-                }).collect();
-
-                let results = results?;
-                let mut k_anchors = Vec::with_capacity(results.len());
-                let mut k_packed = Vec::with_capacity(results.len());
-                let mut k_scales = Vec::with_capacity(results.len());
-                let mut v_anchors = Vec::with_capacity(results.len());
-                let mut v_packed = Vec::with_capacity(results.len());
-                let mut v_scales = Vec::with_capacity(results.len());
-                let mut original_shape = vec![];
-
-                for (res_k, res_v) in results {
-                    k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
-                    v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
-                    original_shape = res_k.3;
+                 let s_len = k.dim(candle_core::D::Minus2)?;
+                 let k_new = k.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
+                 let v_new = v.narrow(candle_core::D::Minus2, s_len - chunk_size, chunk_size)?;
+                 
+                 if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
+                    let res_k = m.language_model.compress_to_bitkv(&k_new)?;
+                    let res_v = m.language_model.compress_to_bitkv(&v_new)?;
+                    Ok((res_k, res_v))
+                } else {
+                    Err(anyhow!("Unsupported variant"))
                 }
-                
-                if !k_anchors.is_empty() {
-                    target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
-                }
+            }).collect();
+
+            let results = results?;
+            let mut k_anchors = Vec::with_capacity(results.len());
+            let mut k_packed = Vec::with_capacity(results.len());
+            let mut k_scales = Vec::with_capacity(results.len());
+            let mut v_anchors = Vec::with_capacity(results.len());
+            let mut v_packed = Vec::with_capacity(results.len());
+            let mut v_scales = Vec::with_capacity(results.len());
+            let mut original_shape = vec![];
+
+            for (res_k, res_v) in results {
+                k_anchors.push(res_k.0); k_packed.push(res_k.1); k_scales.push(res_k.2);
+                v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
+                original_shape = res_k.3;
             }
             
-            processed_so_far += current_chunk_len;
-            if total_size > step_size {
-                println!("[MODEL-PROGRESS] Chunked Prefill: {}/{} tokens ({:.1}%)", processed_so_far, total_size, (processed_so_far as f64 / total_size as f64) * 100.0);
+            if !k_anchors.is_empty() {
+                target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
             }
         }
-        
-        Ok(total_size)
+        Ok(chunk_size)
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
@@ -544,7 +523,7 @@ impl Qwen3VLGenerateModel {
                 if flag.load(Ordering::Relaxed) { return Err(anyhow!("Generation cancelled during prefill")); }
             }
 
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset)?;
             
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
@@ -581,7 +560,7 @@ impl Qwen3VLGenerateModel {
             
             // forward 호출 전 로그
             // println!("[DEBUG-GEN] Forwarding token {}...", _i);
-            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset)?;
             
             let logits = logits.squeeze(0)?;
             let mut logits = logits.i(logits.dim(0)? - 1)?.to_dtype(DType::F32)?;
@@ -598,7 +577,7 @@ impl Qwen3VLGenerateModel {
             
             // [REBALANCE] 512 토큰마다 VRAM 상태 체크하여 레이어 재배치 (CPU 모드가 아닐 때만)
             if _i > 0 && _i % 512 == 0 && !self.qwen3_vl.is_cpu() {
-                if let Err(e) = self.qwen3_vl.rebalance_layers(0, seqlen_offset + seq_len) {
+                if let Err(e) = self.qwen3_vl.rebalance_layers(0) {
                     println!("[REBALANCE] Failed: {}", e);
                 }
             }

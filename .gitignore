@@ -6,6 +6,7 @@
 *$py.class
 *.lance
 *.gguf
+*.gg
 *.safetensors
 
 # Virtual Environment
