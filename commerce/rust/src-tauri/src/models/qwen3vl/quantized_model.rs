@@ -1197,14 +1197,49 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [SWAP-LOGIC] Only save and unload if NOT pinned
-            if !is_pinned {
-                if let Some(sid) = &self.active_session_id {
-                    let checkpoint_path = crate::utils::paths::get_task_specific_dir(None, sid).join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    let _ = crate::utils::tensor_utils::save_tensor(&checkpoint_path, "hidden_states", &xs);
-                }
-                layer.to_device(&Device::Cpu)?;
-            } else {
+                        // [SWAP-LOGIC] Save results and purge if NOT pinned
+
+                        if !is_pinned {
+
+                            if let Some(sid) = &self.active_session_id {
+
+                                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+
+                                
+
+                                // 1. Save Hidden States (The signal)
+
+                                let hs_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+
+                                let _ = crate::utils::tensor_utils::save_tensor(&hs_path, "hidden_states", &xs);
+
+                                
+
+                                // 2. Save KV Cache (The memory)
+
+                                if let Some((k, v)) = &layer.self_attn.kv_cache {
+
+                                    let kv_path = task_dir.join(format!("inference_layer_{}_kv.safetensors", layer_idx));
+
+                                    let _ = crate::utils::tensor_utils::save_kv(&kv_path, k, v);
+
+                                }
+
+                                
+
+                                if layer_idx % 10 == 0 || layer_idx == num_layers - 1 {
+
+                                    println!("[SWAP-SAVE] Layer {} (Signal + Memory) at Offset {}.", layer_idx, seqlen_offset);
+
+                                }
+
+                            }
+
+                            layer.to_device(&Device::Cpu)?;
+
+                        }
+
+             else {
                 // If it's the last pinned layer, maybe log something
                 if layer_idx == self.pinned_layer_count - 1 {
                     // println!("[SPEED] Layer {} is the last GPU-resident layer.", layer_idx);
