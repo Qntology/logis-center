@@ -529,6 +529,16 @@ impl Qwen3VLGenerateModel {
             all_ids.push(next_id);
             generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
 
+            if i > 0 && i % 100 == 0 && !self.model_name.contains("0.6B") {
+                if let Some(sid) = &session_id {
+                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    self.save_kv_to_disk(&path, true)?;
+                    let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
+                    let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
+                    println!("[GEN-BAKING] Segment saved. Resetting memory at {}.", seqlen_offset);
+                }
+            }
+
             seqlen_offset += seq_len;
             pixel_values = None;
         }

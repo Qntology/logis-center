@@ -1051,7 +1051,7 @@ impl QuantizedQwen3VLTextModel {
                      if let Ok(mem) = dev.memory_info() {
                          simulated_free_vram = mem.free;
                          is_vram_checked = true;
-                         let os_reserve = 50_000_000; 
+                         let os_reserve = 30_000_000; 
                          safety_floor = os_reserve + kv_reserve + estimated_activation_buffer;
                      }
                  }
@@ -1065,7 +1065,7 @@ impl QuantizedQwen3VLTextModel {
         for layer_idx in 0..num_layers_to_load {
             let mut layer_device = current_device.clone();
             if current_device.is_cuda() && is_vram_checked {
-                 let buffer_factor = 1.05; 
+                 let buffer_factor = 1.02; 
                  if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                      pinned_layer_count += 1;
@@ -1219,17 +1219,23 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [SSD-BRIDGE] Atomic Save & Clear: In inference mode, always offload KV to disk immediately
-            if is_inference {
+            // [SSD-BRIDGE] Atomic Save & Clear:
+            // 1. Always offload if processing a chunk (Baking/Prefill: seq_len > 1) to prevent OOM.
+            // 2. Offload during inference ONLY if the layer is NOT pinned to GPU.
+            let should_offload = (seq_len > 1) || (is_inference && !is_pinned);
+
+            if should_offload {
                 if let Some(sid) = &self.active_session_id {
                     let task_dir = crate::utils::paths::get_kv_dir(None).join(sid);
                     
-                    // 1. Save KV to disk (inference_ prefix)
+                    // 1. Save KV to disk
                     let _ = layer.save_kv_cache(&task_dir, true, is_inference, 1024);
                     
-                    // 2. Save hidden state checkpoint for long-context resumption
-                    let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    let _ = crate::utils::tensor_utils::save_tensor(&checkpoint_path, "hidden_states", &xs);
+                    // 2. Save hidden state checkpoint (only for chunk processing)
+                    if seq_len > 1 {
+                        let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                        let _ = crate::utils::tensor_utils::save_tensor(&checkpoint_path, "hidden_states", &xs);
+                    }
                 }
                 
                 // If not pinned, also move weights back to CPU
@@ -1237,7 +1243,7 @@ impl QuantizedQwen3VLTextModel {
                     layer.to_device(&Device::Cpu)?;
                 }
             } else if !is_pinned {
-                // Baking mode: only save and unload if NOT pinned
+                // Fallback for non-inference baking (rare case)
                 if let Some(sid) = &self.active_session_id {
                     let task_dir = crate::utils::paths::get_kv_dir(None).join(sid);
                     let _ = layer.save_kv_cache(&task_dir, true, is_inference, 1024);

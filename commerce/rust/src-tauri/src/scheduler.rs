@@ -582,15 +582,15 @@ async fn process_task(
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         println!("[Scheduler] Starting DISK BRIDGE RELAY (0.6B -> Disk -> 2B)");
         
-        // [NEW] Log step A start for UI recovery
         log_task_progress(app_handle, &task.id, &json!({ "category": "Classification", "summary": "Determining page type...", "spinner": "⠋" }));
 
         let type_prompt = parsing::page_type_prompt();
         let pug_content = light_pug.clone();
+        
+        // [RESTORE] Unified prompt for perfect sequence matching
         let task_question = format!("[PUG CONTENT]\n{}\n\n[TASK] {}\n\n[ACTION] RETURN JSON ONLY", pug_content, type_prompt);
         let snapshot_id = format!("{}_step_a", task.id);
         
-        // [CHECKPOINT] Check if Step A snapshot already exists (Resume from OOM)
         let kv_dir = utils::paths::get_kv_dir(Some(app_handle)).join(&snapshot_id);
         let has_snapshot = kv_dir.exists() && fs::read_dir(&kv_dir).map(|mut d| d.next().is_some()).unwrap_or(false);
 
@@ -608,22 +608,14 @@ async fn process_task(
                 let mut gen_guard = model_clone.generator.blocking_lock();
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
-                    let params = crate::openai_types::ChatCompletionParameters {
-                        messages: vec![crate::openai_types::ChatCompletionRequestMessage::User(crate::openai_types::ChatCompletionRequestUserMessage {
-                            content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(question_clone),
-                            name: None,
-                        })],
-                        ..Default::default()
-                    };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    // Bake the actual full prompt
+                    worker.prefill_chunk(question_clone, Some(token_clone), None)?;
                 }
                 Ok(())
             }).await??;
-        } else {
-            println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
 
-        // 2. [2B] Load Snapshot & Bake Task
+        // 2. [2B] Load Snapshot & Execute Task
         {
             model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
 
@@ -636,17 +628,16 @@ async fn process_task(
                 ..Default::default()
             };
 
-                                    if let Some(gen) = model.generator.lock().await.as_mut() {
-                                        println!("[Scheduler] 2B Step A: Asking classification question...");
-                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
-                                        println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);                            
-                            // [DEBUG] AI 응답 저장
-                            let _ = data_manager.offload(&res, "step_a_res");
-            
-                            let type_info = parsing::parse_json_from_llm(&res); 
-                            page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+            if let Some(gen) = model.generator.lock().await.as_mut() {
+                println!("[Scheduler] 2B Step A: Asking classification question...");
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
+                println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                
+                let _ = data_manager.offload(&res, "step_a_res");
+                let type_info = parsing::parse_json_from_llm(&res); 
+                page_type = type_info.get("type").and_then(|s| s.as_str()).unwrap_or("").to_string();                
+                
                 if page_type.is_empty() {
-                    println!("[Scheduler] Warning: LLM returned empty type. Using task type fallback.");
                     page_type = match task.r#type.as_str() {
                         "image_extraction" => "tracking".to_string(),
                         _ => "unknown".to_string(),
@@ -655,6 +646,7 @@ async fn process_task(
                 println!("[Scheduler] Classified as: {}", page_type);
             }
         }
+    }
         
         if page_type.is_empty() || page_type == "unknown" { 
             model.unload_generator().await;
