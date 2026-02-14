@@ -35,11 +35,11 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
-    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, is_inference: bool) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id),
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id),
+            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id, is_inference),
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id, is_inference),
         }
     }
 
@@ -187,9 +187,10 @@ impl Qwen3VLGenerateModel {
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| f.contains("Qwen3-0.6B-Q4_K_M.gguf")).cloned(); }
             if model_path.is_none() { model_path = gguf_files.iter().find(|f| !f.contains("mmproj")).cloned(); }
 
-            let limit_tokens = hard_token_limit.unwrap_or(4096) as u64;  
-            let reserve_tokens = limit_tokens.min(8192);
-            let kv_reserve = reserve_tokens * 40000;
+            let limit_tokens = hard_token_limit.unwrap_or(8192) as u64;  
+            let reserve_tokens = limit_tokens.min(16384);
+            // 2B-VL: ~32KB per token for 28 layers. Using 35000 for safety margin.
+            let kv_reserve = reserve_tokens * 35000;
 
             if is_vision_model {
                 let mmproj = mmproj_path.ok_or(anyhow!("Missing mmproj GGUF"))?;
@@ -251,8 +252,8 @@ impl Qwen3VLGenerateModel {
             let chunk = &token_ids[current_pos..end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
-            if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path); }
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None, false)?;
+            if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path, false); }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
                 let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
@@ -294,7 +295,7 @@ impl Qwen3VLGenerateModel {
         if let Some(sid) = &session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if path.exists() && self.get_kv_len() == 0 {
-                let _ = self.load_kv_from_disk(&path);
+                let _ = self.load_kv_from_disk(&path, false);
             }
         }
 
@@ -316,7 +317,7 @@ impl Qwen3VLGenerateModel {
             let progress = (chunk_end as f64 / total_tokens as f64) * 100.0;
             println!("[BAKING] Step: {} to {} / Total: {} ({:.1}%)", current_pos, chunk_end, total_tokens, progress);
             
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone(), false)?;
 
             // [TURBO-RELAY] Parallelize layer compression before any potential purge
             if let Some(ref mut target) = relay_target {
@@ -350,7 +351,7 @@ impl Qwen3VLGenerateModel {
                 if !path.exists() { let _ = fs::create_dir_all(&path); }     
                 
                 // 1. Save to disk
-                self.save_kv_to_disk(&path)?;
+                self.save_kv_to_disk(&path, false)?;
                 let token_path = path.join("tokens.json");
                 if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
                 
@@ -374,7 +375,7 @@ impl Qwen3VLGenerateModel {
         if let Some(sid) = session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if !path.exists() { let _ = fs::create_dir_all(&path); }
-            self.save_kv_to_disk(&path)?;
+            self.save_kv_to_disk(&path, false)?;
             let token_path = path.join("tokens.json");
             if let Ok(file) = fs::File::create(&token_path) { 
                 let _ = serde_json::to_writer(file, &full_input_ids_vec); 
@@ -399,7 +400,7 @@ impl Qwen3VLGenerateModel {
             let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + current_chunk_len) as u32, &self.text_device)?.unsqueeze(0)?;
             
             println!("[MODEL-PROGRESS] Chunked Prefill: {}/{} tokens ({:.1}%)", processed_so_far + current_chunk_len, total_tokens, ((processed_so_far + current_chunk_len) as f64 / total_tokens as f64) * 100.0);
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None, false)?;
             
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -445,7 +446,7 @@ impl Qwen3VLGenerateModel {
                 if let Ok(data) = std::fs::read_to_string(&progress_path) {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
                         println!("[RESUME] Found progress. Loading...");
-                        let _ = self.load_kv_from_disk(&path);
+                        let _ = self.load_kv_from_disk(&path, true);
                         seqlen_offset = self.get_kv_len();
                         generated_text = json["text"].as_str().unwrap_or("").to_string();
                         if let Some(ids) = json["ids"].as_array() { all_ids = ids.iter().map(|v| v.as_u64().unwrap_or(0) as u32).collect(); }
@@ -464,7 +465,7 @@ impl Qwen3VLGenerateModel {
             if seqlen_offset == 0 {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    if path.exists() { self.load_kv_from_disk(&path)?; seqlen_offset = self.get_kv_len(); }
+                    if path.exists() { self.load_kv_from_disk(&path, true)?; seqlen_offset = self.get_kv_len(); }
                 }
             }
         }
@@ -484,7 +485,7 @@ impl Qwen3VLGenerateModel {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
             println!("[GEN-BAKING] Step: {} to {} / Total: {} ({:.1}%)", seqlen_offset, seqlen_offset + chunk_size, total_tokens, (seqlen_offset + chunk_size) as f64 / total_tokens as f64 * 100.0);
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone(), true)?;
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
 
@@ -492,7 +493,9 @@ impl Qwen3VLGenerateModel {
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
-                self.save_kv_to_disk(&path)?;
+                self.save_kv_to_disk(&path, true)?;
+                
+                println!("[GEN-BAKING] Segment saved. Resetting memory at {}.", seqlen_offset);
                 let _ = self.qwen3_vl.drop_kv_storage();
                 if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
                 #[cfg(target_os = "windows")]
@@ -501,7 +504,7 @@ impl Qwen3VLGenerateModel {
                     use windows_sys::Win32::System::Memory::*;
                     let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                 }
-                let _ = self.load_kv_from_disk(&path);
+                // let _ = self.load_kv_from_disk(&path, true);
             }
         }
 
@@ -518,7 +521,7 @@ impl Qwen3VLGenerateModel {
             
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
-            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone(), true)?;
             let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
             if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }
             let next_id = logit_processor.sample(&logits)?;
@@ -526,14 +529,6 @@ impl Qwen3VLGenerateModel {
             all_ids.push(next_id);
             generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
 
-            if i > 0 && i % 100 == 0 && !self.model_name.contains("0.6B") {
-                if let Some(sid) = &session_id {
-                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    self.save_kv_to_disk(&path)?;
-                    let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
-                    let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
-                }
-            }
             seqlen_offset += seq_len;
             pixel_values = None;
         }
@@ -567,18 +562,18 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-    pub fn save_kv_to_disk(&mut self, path: &Path) -> Result<()> {
+    pub fn save_kv_to_disk(&mut self, path: &Path, is_inference: bool) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 1024),
-            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, 1024),
+            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, is_inference, 1024),
+            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, is_inference, 1024),
             _ => Ok(()),
         }
     }
 
-    pub fn load_kv_from_disk(&mut self, path: &Path) -> Result<()> {
+    pub fn load_kv_from_disk(&mut self, path: &Path, is_inference: bool) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128),
-            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128),
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128, is_inference),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128, is_inference),
             _ => Ok(()),
         }
     }

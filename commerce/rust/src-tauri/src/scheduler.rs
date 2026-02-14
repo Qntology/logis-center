@@ -636,11 +636,10 @@ async fn process_task(
                 ..Default::default()
             };
 
-                        if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[Scheduler] 2B Step A: Asking classification question...");
-                            let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
-                            println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
-                            
+                                    if let Some(gen) = model.generator.lock().await.as_mut() {
+                                        println!("[Scheduler] 2B Step A: Asking classification question...");
+                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
+                                        println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);                            
                             // [DEBUG] AI 응답 저장
                             let _ = data_manager.offload(&res, "step_a_res");
             
@@ -729,7 +728,7 @@ async fn process_task(
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 2B Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -882,7 +881,7 @@ async fn process_task(
                     println!("[Scheduler] 2B Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), None)?;
+                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장

@@ -552,8 +552,9 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
-        let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, is_inference: bool, _block_size: usize) -> Result<()> {
+        let prefix = if is_inference { "inference_" } else { "" };
+        let file = path.join(format!("{}layer_{}_kv.safetensors", prefix, self.layer_idx));
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
@@ -577,9 +578,21 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
-        let file_path = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-        if !file_path.exists() { return Ok(()); }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, is_inference: bool) -> Result<()> {
+        let prefix = if is_inference { "inference_" } else { "" };
+        let mut file_path = path.join(format!("{}layer_{}_kv.safetensors", prefix, self.layer_idx));
+        
+        // [FALLBACK] If inference prefix not found, try loading base baking context
+        if is_inference && !file_path.exists() {
+            let fallback_path = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+            if fallback_path.exists() {
+                file_path = fallback_path;
+            } else {
+                return Ok(());
+            }
+        } else if !file_path.exists() {
+            return Ok(());
+        }
 
         let file = std::fs::File::open(&file_path)?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -666,8 +679,8 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-                    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-                        self.save_kv_cache(path, true, block_size)
+                    pub fn offload_kv_cache(&mut self, path: &Path, is_inference: bool, block_size: usize) -> Result<()> {
+                        self.save_kv_cache(path, true, is_inference, block_size)
                     }
 }
 
@@ -813,17 +826,17 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.input_layernorm.weight().device()
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-        self.self_attn.save_kv_cache(path, clear, block_size)
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, is_inference: bool, block_size: usize) -> Result<()> {
+        self.self_attn.save_kv_cache(path, clear, is_inference, block_size)
     }
 
-    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-        self.self_attn.offload_kv_cache(path, block_size)
+    pub fn offload_kv_cache(&mut self, path: &Path, is_inference: bool, block_size: usize) -> Result<()> {
+        self.self_attn.offload_kv_cache(path, is_inference, block_size)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize, is_inference: bool) -> Result<()> {
         let device = self.input_layernorm.weight().device();
-        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len)
+        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, is_inference)
     }
 }
 
@@ -1052,7 +1065,7 @@ impl QuantizedQwen3VLTextModel {
         for layer_idx in 0..num_layers_to_load {
             let mut layer_device = current_device.clone();
             if current_device.is_cuda() && is_vram_checked {
-                 let buffer_factor = 1.1; 
+                 let buffer_factor = 1.05; 
                  if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
                      pinned_layer_count += 1;
@@ -1105,6 +1118,7 @@ impl QuantizedQwen3VLTextModel {
         position_ids_in: Option<&Tensor>,
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
+        is_inference: bool,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
@@ -1179,7 +1193,15 @@ impl QuantizedQwen3VLTextModel {
 
             let is_pinned = layer_idx < self.pinned_layer_count;
             
-            // [ULTRA-SPEED] If pinned, skip loading/unloading (already on GPU)
+            // [SSD-BRIDGE] Atomic Load: If cache is empty and we have a session, load from disk
+            if let Some(sid) = &self.active_session_id {
+                if layer.get_kv_len() == 0 {
+                    let task_dir = crate::utils::paths::get_kv_dir(None).join(sid);
+                    let _ = layer.load_kv_cache(&task_dir, &target_device, 0, 0, is_inference);
+                }
+            }
+
+            // [VRAM-SYNC] Ensure layer is on target device
             if !is_pinned {
                 layer.to_device(&target_device)?;
             }
@@ -1197,18 +1219,30 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [SWAP-LOGIC] Only save and unload if NOT pinned
-            if !is_pinned {
+            // [SSD-BRIDGE] Atomic Save & Clear: In inference mode, always offload KV to disk immediately
+            if is_inference {
                 if let Some(sid) = &self.active_session_id {
-                    let checkpoint_path = crate::utils::paths::get_task_specific_dir(None, sid).join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                    let task_dir = crate::utils::paths::get_kv_dir(None).join(sid);
+                    
+                    // 1. Save KV to disk (inference_ prefix)
+                    let _ = layer.save_kv_cache(&task_dir, true, is_inference, 1024);
+                    
+                    // 2. Save hidden state checkpoint for long-context resumption
+                    let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
                     let _ = crate::utils::tensor_utils::save_tensor(&checkpoint_path, "hidden_states", &xs);
                 }
-                layer.to_device(&Device::Cpu)?;
-            } else {
-                // If it's the last pinned layer, maybe log something
-                if layer_idx == self.pinned_layer_count - 1 {
-                    // println!("[SPEED] Layer {} is the last GPU-resident layer.", layer_idx);
+                
+                // If not pinned, also move weights back to CPU
+                if !is_pinned {
+                    layer.to_device(&Device::Cpu)?;
                 }
+            } else if !is_pinned {
+                // Baking mode: only save and unload if NOT pinned
+                if let Some(sid) = &self.active_session_id {
+                    let task_dir = crate::utils::paths::get_kv_dir(None).join(sid);
+                    let _ = layer.save_kv_cache(&task_dir, true, is_inference, 1024);
+                }
+                layer.to_device(&Device::Cpu)?;
             }
         }
         
@@ -1356,25 +1390,25 @@ impl QuantizedQwen3VLTextModel {
         Ok(t.to_device(device)?)
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, is_inference: bool, block_size: usize) -> Result<()> {
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
 
         // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
         self.layers.iter_mut().try_for_each(|layer| {
-            layer.save_kv_cache(path, clear, block_size)
+            layer.save_kv_cache(path, clear, is_inference, block_size)
         })
     }
 
-    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-        self.save_kv_cache(path, true, block_size)
+    pub fn offload_kv_cache(&mut self, path: &Path, is_inference: bool, block_size: usize) -> Result<()> {
+        self.save_kv_cache(path, true, is_inference, block_size)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, is_inference: bool) -> Result<()> {
         if path.exists() {
             self.layers.iter_mut().try_for_each(|layer| {
-                layer.load_kv_cache(path, device, expected_len, upscale_refill_len)
+                layer.load_kv_cache(path, device, expected_len, upscale_refill_len, is_inference)
             })
         } else {
             Ok(())
@@ -1573,7 +1607,7 @@ impl QuantizedQwen3VLModel {
         Ok((position_ids, mrope))
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, is_inference: bool) -> Result<Tensor> {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
@@ -1593,7 +1627,7 @@ impl QuantizedQwen3VLModel {
         };
         
         self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, is_inference)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
@@ -1605,9 +1639,9 @@ impl QuantizedQwen3VLModel {
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
-    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, is_inference: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, is_inference, block_size) }
+    pub fn offload_kv_cache(&mut self, path: &Path, is_inference: bool, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, is_inference, block_size) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, is_inference: bool) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, is_inference) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
 }
@@ -1653,7 +1687,7 @@ impl QuantizedQwen3TextModel {
         Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
     }
 
-    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, is_inference: bool) -> Result<Tensor> {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
         
         let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
@@ -1672,7 +1706,7 @@ impl QuantizedQwen3TextModel {
         };
         
         self.language_model.active_session_id = session_id;
-        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
+        let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None, is_inference)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
@@ -1684,8 +1718,8 @@ impl QuantizedQwen3TextModel {
     pub fn get_kv_len(&self) -> usize { self.language_model.get_kv_len() }
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, is_inference: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, is_inference, block_size) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, is_inference: bool) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, is_inference) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
 }
