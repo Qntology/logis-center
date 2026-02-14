@@ -349,40 +349,56 @@ impl Qwen3VLGenerateModel {
     pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
-        // [STRICT-ALIGN] Never add BOS manually; ChatML handles starts.
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
+        
+        // [STRICT-CHUNK] 2048 tokens per bake step as requested
+        let prefill_chunk_size = 2048;
+        
+        // [RESUME-LOGIC] Start from existing KV length
         let mut current_pos = self.get_kv_len();
-        let prefill_chunk_size = 512;
+        if current_pos > 0 {
+            println!("[RESUME] Resuming baking from token {}.", current_pos);
+        }
 
         while current_pos < total_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Prefill cancelled")); } }
+            
             let end = (current_pos + prefill_chunk_size).min(total_tokens);
-            let end = if end == total_tokens { total_tokens - 1 } else { end };
-            if end <= current_pos { break; }
-            let chunk = &full_input_ids_vec[current_pos..end];
-            let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
+            // Don't process the very last token if we want to generate from it later
+            let chunk_end = if end == total_tokens { total_tokens - 1 } else { end };
+            if chunk_end <= current_pos { break; }
+            
+            let chunk_len = chunk_end - current_pos;
+            let chunk = &full_input_ids_vec[current_pos..chunk_end];
+            let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_len), &self.text_device)?;
+            let chunk_pos = Tensor::arange(current_pos as u32, chunk_end as u32, &self.text_device)?.unsqueeze(0)?;
 
+            println!("[BAKING] Step: {} to {} / Total: {}", current_pos, chunk_end, total_tokens);
+            
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
+
+            // [SAVE-EACH-CHUNK] Persistent save after every 2048 tokens
+            if let Some(sid) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                if !path.exists() { let _ = fs::create_dir_all(&path); }     
+                self.save_kv_to_disk(&path)?;
+                println!("[BAKING] Checkpoint saved for token {}.", chunk_end);
+            }
 
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
-                // [TURBO-RELAY] Parallelize layer compression
                     let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
                     let s_len = k.dim(candle_core::D::Minus2)?;
-                    let chunk_tokens = end - current_pos;
-                    let start = s_len.saturating_sub(chunk_tokens);
-                    
-                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk_tokens)?;
-                    
+                    let start = s_len.saturating_sub(chunk_len);
+                    let k_new = k.narrow(candle_core::D::Minus2, start, chunk_len)?;
+                    let v_new = v.narrow(candle_core::D::Minus2, start, chunk_len)?;
                     if let ModelVariant::QuantizedText(m) = &self.qwen3_vl {
                         let res_k = m.language_model.compress_to_bitkv(&k_new)?;
                         let res_v = m.language_model.compress_to_bitkv(&v_new)?;
                         Ok((res_k, res_v))
                     } else {
-                        Err(anyhow!("Unsupported model variant for BitKV relay"))
+                        Err(anyhow!("Unsupported model variant"))
                     }
                 }).collect();
 
@@ -400,12 +416,11 @@ impl Qwen3VLGenerateModel {
                     v_anchors.push(res_v.0); v_packed.push(res_v.1); v_scales.push(res_v.2);
                     original_shape = res_k.3;
                 }
-                
                 if !k_anchors.is_empty() {
                     target.inject_kv_bitkv(&k_anchors, &k_packed, &k_scales, &v_anchors, &v_packed, &v_scales, &original_shape)?;
                 }
             }
-            current_pos = end;
+            current_pos = chunk_end;
         }
 
         if let Some(sid) = session_id {
