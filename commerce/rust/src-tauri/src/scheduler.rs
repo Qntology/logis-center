@@ -600,19 +600,27 @@ async fn process_task(
             model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
             
             let model_clone = model.clone();
-            let question_clone = task_question.clone();
+            let params_clone = ChatCompletionParameters {
+                messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
+                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                    name: None,
+                })],
+                ..Default::default()
+            };
             let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
 
-            tokio::task::spawn_blocking(move || -> Result<()> {
+            let baked_len = tokio::task::spawn_blocking(move || -> Result<usize> {
                 let mut gen_guard = model_clone.generator.blocking_lock();
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
-                    // Bake the actual full prompt
-                    worker.prefill_chunk(question_clone, Some(token_clone), None)?;
+                    // [FIX] Apply template first so 0.6B bakes EXACTLY what 2B will see
+                    let templated_prompt = worker.chat_template.apply_chat_template(&params_clone)?;
+                    return worker.prefill_chunk(templated_prompt, Some(token_clone), None, session_clone);
                 }
-                Ok(())
+                Ok(0)
             }).await??;
+            println!("[Scheduler] 0.6B Baking Complete. Total Tokens: {}", baked_len);
         }
 
         // 2. [2B] Load Snapshot & Execute Task
@@ -630,6 +638,7 @@ async fn process_task(
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 2B Step A: Asking classification question...");
+                // Pass snapshot_id to allow context continuation from EXACTLY where 0.6B left off
                 let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
                 println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                 
@@ -646,7 +655,6 @@ async fn process_task(
                 println!("[Scheduler] Classified as: {}", page_type);
             }
         }
-    }
         
         if page_type.is_empty() || page_type == "unknown" { 
             model.unload_generator().await;

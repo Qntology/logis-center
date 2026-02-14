@@ -1126,7 +1126,8 @@ impl QuantizedQwen3VLTextModel {
         if let Ok(nvml) = Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() {
-                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{}", mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset + seq_len, total_len);
+                    let current_pos = (seqlen_offset + seq_len).min(total_len);
+                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{}", mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_pos, total_len);
                 }
             }
         }
@@ -1219,7 +1220,7 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [SSD-BRIDGE] Atomic Save & Clear:
+        // [SSD-BRIDGE] Atomic Save & Clear:
             // 1. Always offload if processing a chunk (Baking/Prefill: seq_len > 1) to prevent OOM.
             // 2. Offload during inference ONLY if the layer is NOT pinned to GPU.
             let should_offload = (seq_len > 1) || (is_inference && !is_pinned);
@@ -1228,17 +1229,20 @@ impl QuantizedQwen3VLTextModel {
                 if let Some(sid) = &self.active_session_id {
                     let task_dir = crate::utils::paths::get_kv_dir(None).join(sid);
                     
-                    // 1. Save KV to disk
+                    // [FORCE-CLEAR] Ensure VRAM recovery even if I/O is slow
                     let _ = layer.save_kv_cache(&task_dir, true, is_inference, 1024);
                     
-                    // 2. Save hidden state checkpoint (only for chunk processing)
                     if seq_len > 1 {
                         let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
                         let _ = crate::utils::tensor_utils::save_tensor(&checkpoint_path, "hidden_states", &xs);
+                        
+                        // [OOM-SAFETY] Brief pause after each heavy layer during baking to let driver catch up
+                        if layer_idx % 4 == 0 && target_device.is_cuda() {
+                            let _ = target_device.synchronize();
+                        }
                     }
                 }
                 
-                // If not pinned, also move weights back to CPU
                 if !is_pinned {
                     layer.to_device(&Device::Cpu)?;
                 }

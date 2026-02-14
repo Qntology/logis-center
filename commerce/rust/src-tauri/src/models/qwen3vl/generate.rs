@@ -384,7 +384,7 @@ impl Qwen3VLGenerateModel {
         Ok(current_pos)
     }
 
-    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+    pub fn prefill_chunk(&mut self, text: String, cancel_flag: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, session_id: Option<String>) -> Result<usize> {
         let full_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
         let total_tokens = full_ids_vec.len();
         let mut processed_so_far = 0;
@@ -400,7 +400,7 @@ impl Qwen3VLGenerateModel {
             let chunk_pos = Tensor::arange(current_pos as u32, (current_pos + current_chunk_len) as u32, &self.text_device)?.unsqueeze(0)?;
             
             println!("[MODEL-PROGRESS] Chunked Prefill: {}/{} tokens ({:.1}%)", processed_so_far + current_chunk_len, total_tokens, ((processed_so_far + current_chunk_len) as f64 / total_tokens as f64) * 100.0);
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None, false)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone(), false)?;
             
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -471,7 +471,7 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
-        let prefill_chunk_size = 2048; 
+        let prefill_chunk_size = 512; 
 
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
@@ -484,7 +484,9 @@ impl Qwen3VLGenerateModel {
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            println!("[GEN-BAKING] Step: {} to {} / Total: {} ({:.1}%)", seqlen_offset, seqlen_offset + chunk_size, total_tokens, (seqlen_offset + chunk_size) as f64 / total_tokens as f64 * 100.0);
+            // [PROGRESS-FIX] Correct denominator for baking
+            let current_progress = (seqlen_offset + chunk_size).min(total_tokens);
+            println!("[GEN-BAKING] Step: {} to {} / Total: {} ({:.1}%)", seqlen_offset, current_progress, total_tokens, (current_progress as f64 / total_tokens as f64) * 100.0);
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone(), true)?;
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
@@ -521,6 +523,11 @@ impl Qwen3VLGenerateModel {
             
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
+            
+            // [PROGRESS-FIX] Keep denominator fixed at total_tokens, cap numerator at 100%
+            let display_progress = (seqlen_offset + seq_len).min(total_tokens);
+            println!("[GEN-BAKING] Progress: {}/{} tokens ({:.1}%)", display_progress, total_tokens, (display_progress as f64 / total_tokens as f64) * 100.0);
+            
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone(), true)?;
             let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
             if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }

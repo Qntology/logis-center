@@ -428,11 +428,12 @@ impl LogisModel {
             // We use prefill_only via a manual chat construct or direct access if possible
             // Reusing chat_params_with_spinner for convenience but with empty generation
             
+            let sid_clone = base_session.clone();
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
                     // Just prefill, no generation needed for base context
-                    gen.prefill_chunk(prompt, token_clone, None)?;
+                    gen.prefill_chunk(prompt, token_clone, None, Some(sid_clone))?;
                 }
                 Ok(())
             }).await??;
