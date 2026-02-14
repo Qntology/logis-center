@@ -303,13 +303,26 @@ impl Qwen3VLGenerateModel {
             let chunk_pos = Tensor::arange(current_pos as u32, chunk_end as u32, &self.text_device)?.unsqueeze(0)?;
             println!("[BAKING] Step: {} to {} / Total: {}", current_pos, chunk_end, total_tokens);
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
+            // [SEGMENT-RESET] Persistent save and system-level memory purge after every chunk
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                if !path.exists() { let _ = fs::create_dir_all(&path); }     
+                
+                // 1. Save to disk
                 self.save_kv_to_disk(&path)?;
-                println!("[BAKING] Segment complete. Purging VRAM for token {}.", chunk_end);
-                let _ = self.qwen3_vl.drop_kv_storage();
+                
+                // 2. Purge from VRAM
+                println!("[BAKING] Segment saved. Resetting memory for token {}.", chunk_end);
+                let _ = self.qwen3_vl.drop_kv_storage(); 
+                
+                // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
                 if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
             }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -463,7 +476,8 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             all_ids.push(next_id);
             generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            if i > 0 && i % 50 == 0 {
+            // [INFERENCE-SAVE] Only checkpoint for Large models
+            if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     let _ = self.save_kv_to_disk(&path);

@@ -863,3 +863,19 @@ pub fn nonzero(input: &Tensor) -> Result<(Vec<u32>, Vec<u32>)> {
     }
     Ok((topk_ids, token_ids_all))
 }
+
+// [ULTRA-SWAP] Tensor Disk I/O Utilities
+pub fn save_tensor<P: AsRef<std::path::Path>>(path: P, name: &str, tensor: &Tensor) -> Result<()> {
+    let mut map = std::collections::HashMap::new();
+    let cpu_tensor = tensor.to_device(&Device::Cpu)?;
+    map.insert(name.to_string(), cpu_tensor);
+    candle_core::safetensors::save(&map, path.as_ref())?;
+    Ok(())
+}
+
+pub fn load_tensor<P: AsRef<std::path::Path>>(path: P, name: &str, device: &Device) -> Result<Tensor> {
+    let data = std::fs::read(path.as_ref())?;
+    let st = candle_core::safetensors::load_buffer(&data, device)?;
+    let tensor = st.get(name).ok_or_else(|| anyhow!("Tensor {} not found", name))?;
+    Ok(tensor.clone())
+}

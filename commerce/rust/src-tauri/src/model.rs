@@ -242,11 +242,7 @@ impl LogisModel {
             let dev = self.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
-                    // Repeat sync to force driver garbage collection
-                    for _ in 0..5 { // Increased to 5 for extra pressure
-                        let _ = dev.synchronize(); 
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
+                    let _ = dev.synchronize(); 
                 }
             }).await;
         }
@@ -257,9 +253,7 @@ impl LogisModel {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
-            // Call twice to ensure all pages (including CUDA mirrors) are paged out
-            let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Force return physical RAM back to OS once
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
         }
 

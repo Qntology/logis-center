@@ -838,6 +838,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub baking_only: bool, // [NEW] Skip MLP for KV baking
     pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
     pub active_session_id: Option<String>,
+    pub pinned_layer_count: usize, // [NEW] Keep N layers on GPU
     pub current_kv_len: usize,
 }
 
@@ -917,32 +918,25 @@ impl QuantizedQwen3VLTextModel {
         }
 
         let mut layer_devices = vec![];
+        let mut pinned_layer_count = 0;
         
-        // [FORCE-OPTIMIZATION] 4GB 내외의 VRAM 환경에서는 2B 모델이 충분히 들어갑니다.
-        let _force_gpu = if current_device.is_cuda() && is_vram_checked {
-            simulated_free_vram > 3_000_000_000 
-        } else {
-            false
-        };
-
-        for _ in 0..config.num_hidden_layers {
+        for layer_idx in 0..config.num_hidden_layers {
             let actual_cost = cost_per_layer;
             if current_device.is_cuda() && is_vram_checked {
-                 // [SAFE-ALLOC] 가용 VRAM에서 20% 여유를 두고 할당 (OOM 방지)
-                 // buffer_factor 1.2 = 레이어 크기의 1.2배 공간이 있어야 할당함
                  let buffer_factor = 1.2; 
                  if simulated_free_vram > ( (actual_cost as f64 * buffer_factor) as u64 + safety_floor ) {
                      simulated_free_vram = simulated_free_vram.saturating_sub(actual_cost);
                      layer_devices.push(current_device.clone());
+                     pinned_layer_count += 1;
                  } else {
-                     // 공간 부족 시 CPU로 할당 (속도는 조금 느려지지만 절대 죽지 않음)
                      layer_devices.push(Device::Cpu);
                  }
             } else {
-                // CPU 모드거나 VRAM 확인 불가 시 기본 장치 사용
                 layer_devices.push(current_device.clone());
             }
         }
+
+        println!("[MODEL] Configured with {} GPU-pinned layers out of {}.", pinned_layer_count, config.num_hidden_layers);
 
         // [ORGANIC] Dynamic Threading for Parallel Loading
         let thread_config = crate::utils::resources::get_optimal_thread_config(current_device.is_cpu());
@@ -981,7 +975,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, current_kv_len: 0 })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1052,25 +1046,28 @@ impl QuantizedQwen3VLTextModel {
         }
 
         let mut layers = vec![];
+        let mut pinned_layer_count = 0;
         let num_layers_to_load = if baking_only { 1 } else { config.num_hidden_layers };
 
         for layer_idx in 0..num_layers_to_load {
+            let mut layer_device = current_device.clone();
             if current_device.is_cuda() && is_vram_checked {
-                 let effective_cost = if cost_per_layer > 150_000_000 { 40_000_000 } else { cost_per_layer };
-                 if simulated_free_vram > ( (effective_cost as f64 * 1.02) as u64 + safety_floor ) {
-                     simulated_free_vram = simulated_free_vram.saturating_sub(effective_cost);
+                 let buffer_factor = 1.1; 
+                 if simulated_free_vram > ( (cost_per_layer as f64 * buffer_factor) as u64 + safety_floor ) {
+                     simulated_free_vram = simulated_free_vram.saturating_sub(cost_per_layer);
+                     pinned_layer_count += 1;
                  } else {
-                     current_device = Device::Cpu;
+                     layer_device = Device::Cpu;
                  }
             }
 
-            let layer_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
+            let layer_dtype = if layer_device.is_cpu() { DType::F32 } else { dtype };
             let standard = format!("{base_name}.layers.{layer_idx}");
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
 
             let layer = QuantizedQwen3VLTextDecoderLayer::new(
-                config, ct, reader, &prefix, &current_device, layer_dtype, layer_idx, baking_only
+                config, ct, reader, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
             )?;
             layers.push(layer)
         }
@@ -1078,8 +1075,9 @@ impl QuantizedQwen3VLTextModel {
         let norm_name = format!("{base_name}.norm");
         let alt_norm = "output_norm";
         let norm_prefix = if ct.tensor_infos.contains_key(&format!("{}.weight", alt_norm)) { alt_norm } else { &norm_name };
-        let norm_dtype = if current_device.is_cpu() { DType::F32 } else { dtype };
-        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, &current_device, norm_dtype)?;
+        let norm_device = layers.last().map(|l| l.device()).unwrap_or(&current_device);
+        let norm_dtype = if norm_device.is_cpu() { DType::F32 } else { dtype };
+        let norm = get_rms_norm(ct, reader, norm_prefix, config.rms_norm_eps, norm_device, norm_dtype)?;
         let head_dim = config.head_dim;
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
@@ -1094,6 +1092,7 @@ impl QuantizedQwen3VLTextModel {
             baking_only,
             is_forced_cpu,
             active_session_id: None,
+            pinned_layer_count,
             current_kv_len: 0,
         })
     }
@@ -1102,15 +1101,45 @@ impl QuantizedQwen3VLTextModel {
         &mut self,
         inputs_embeds: &Tensor,
         seqlen_offset: usize,
-        _total_len: usize,
-        position_ids: Option<&Tensor>,
+        total_len: usize,
+        position_ids_in: Option<&Tensor>,
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<Vec<Tensor>>,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
-        // println!("[TRACE-MODEL] Start forward. Input: {:?} {:?}, Target: BF16/F32", inputs_embeds.device(), inputs_embeds.dtype());
         
-        let position_ids = match position_ids {
+        use nvml_wrapper::Nvml;
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{}", mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset + seq_len, total_len);
+                }
+            }
+        }
+
+        let target_device = if self.layers[0].device().is_cuda() { Device::new_cuda(0)? } else { Device::Cpu };
+        let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
+
+        let mut start_layer = 0;
+        // [RESUME-LOGIC] Try to pick up from a saved layer checkpoint on disk
+        if let Some(sid) = &self.active_session_id {
+            let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+            for l_idx in (0..self.layers.len()).rev() {
+                let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", l_idx, seqlen_offset));
+                if checkpoint_path.exists() {
+                    if let Ok(recovered_xs) = crate::utils::tensor_utils::load_tensor(&checkpoint_path, "hidden_states", &target_device) {
+                        println!("[SWAP-RESUME] Jumping to Layer {} for Offset {}.", l_idx + 1, seqlen_offset);
+                        let r_xs: Tensor = recovered_xs; 
+                        xs = r_xs.to_dtype(target_dtype)?;
+                        start_layer = l_idx + 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let position_ids = match position_ids_in {
             Some(ids) => ids.clone(),
             None => Tensor::arange(
                 seqlen_offset as u32,
@@ -1128,10 +1157,6 @@ impl QuantizedQwen3VLTextModel {
             self.mrope_section.clone(),
         )?;
         
-        let xs = inputs_embeds.clone();
-        let target_dtype = if xs.device().is_cuda() { DType::BF16 } else { DType::F32 };
-        let mut xs = xs.to_dtype(target_dtype)?.contiguous()?;
-
         let attention_mask: Option<Tensor> = {
             if seq_len <= 1 {
                 None
@@ -1142,27 +1167,47 @@ impl QuantizedQwen3VLTextModel {
                     seqlen_offset,
                     xs.device(),
                 )?;
-                // [HARDENING] Mask DType Guard
                 Some(mask.to_dtype(DType::F32)?.contiguous()?)
             }
         };
 
-        let _total_layers = self.layers.len();
+        let num_layers = self.layers.len();
+
+        // [SMART-SEQUENTIAL-LOOP]
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            if layer_idx < start_layer { continue; }
+
+            let is_pinned = layer_idx < self.pinned_layer_count;
+            
+            // [ULTRA-SPEED] If pinned, skip loading/unloading (already on GPU)
+            if !is_pinned {
+                layer.to_device(&target_device)?;
+            }
+
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
                     let m_orig = visual_pos_masks.unwrap();
                     let e_orig = &deepstack_embeds[layer_idx];
-                    
                     let mask = if !m_orig.device().same_device(xs.device()) { m_orig.to_device(xs.device())? } else { m_orig.clone() };
                     let embed = if !e_orig.device().same_device(xs.device()) { e_orig.to_device(xs.device())? } else { e_orig.clone() };
-                    
-                    // [HARDENING] Visual Merge DType Guard
                     let embed = if embed.dtype() != xs.dtype() { embed.to_dtype(xs.dtype())? } else { embed };
-
                     xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
+                }
+            }
+
+            // [SWAP-LOGIC] Only save and unload if NOT pinned
+            if !is_pinned {
+                if let Some(sid) = &self.active_session_id {
+                    let checkpoint_path = crate::utils::paths::get_task_specific_dir(None, sid).join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                    let _ = crate::utils::tensor_utils::save_tensor(&checkpoint_path, "hidden_states", &xs);
+                }
+                layer.to_device(&Device::Cpu)?;
+            } else {
+                // If it's the last pinned layer, maybe log something
+                if layer_idx == self.pinned_layer_count - 1 {
+                    // println!("[SPEED] Layer {} is the last GPU-resident layer.", layer_idx);
                 }
             }
         }
