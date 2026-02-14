@@ -435,7 +435,6 @@ impl Qwen3VLGenerateModel {
 
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
         let prefill_chunk_size = 128;
-        let mut last_reset_pos = seqlen_offset;
 
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
@@ -448,32 +447,14 @@ impl Qwen3VLGenerateModel {
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
-            
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
-
-            // [GEN-PREFILL-RESET] Surgical reset every 2048 tokens
-            // [GUARD] Do not reset if we are near the end (< 512 tokens left) to keep context "warm"
-            let remaining_tokens = total_tokens.saturating_sub(seqlen_offset);
-            if seqlen_offset >= last_reset_pos + 2048 && remaining_tokens > 512 {
-                // 1. Save to disk ONLY if session exists
+            if seqlen_offset % 1024 == 0 {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    if !path.exists() { let _ = fs::create_dir_all(&path); }
-                    self.save_kv_to_disk(&path)?;
+                    let _ = self.save_kv_to_disk(&path);
+                    println!("[GEN-PREFILL] Checkpoint at {}", seqlen_offset);
                 }
-
-                // 2. ALWAYS purge memory to prevent OOM
-                println!("[GEN-PREFILL] Segment complete. Resetting memory at token {}. (Remaining: {})", seqlen_offset, remaining_tokens);
-                let _ = self.qwen3_vl.drop_kv_storage();
-                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                last_reset_pos = seqlen_offset;
             }
         }
 
@@ -481,15 +462,11 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
-        let mut last_gen_reset_i = 0;
-
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-            
             let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
                 Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
             } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
-            
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
@@ -499,28 +476,15 @@ impl Qwen3VLGenerateModel {
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             all_ids.push(next_id);
             generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-
-            // [INFERENCE-SAVE] Surgical reset every 50 tokens for Large models
-            if i >= last_gen_reset_i + 50 && !self.model_name.contains("0.6B") {
-                // 1. Save to disk ONLY if session exists
+            // [INFERENCE-SAVE] Only checkpoint for Large models
+            if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    self.save_kv_to_disk(&path)?;
+                    let _ = self.save_kv_to_disk(&path);
                     let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
                     let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
+                    println!("[GEN] Checkpoint at {}", i);
                 }
-
-                // 2. ALWAYS purge memory
-                println!("[GEN] Segment complete. Resetting memory at token {}.", i);
-                let _ = self.qwen3_vl.drop_kv_storage();
-                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                last_gen_reset_i = i;
             }
             seqlen_offset += seq_len;
             pixel_values = None;

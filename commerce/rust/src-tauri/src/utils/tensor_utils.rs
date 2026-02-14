@@ -873,22 +873,6 @@ pub fn save_tensor<P: AsRef<std::path::Path>>(path: P, name: &str, tensor: &Tens
     Ok(())
 }
 
-pub fn save_kv<P: AsRef<std::path::Path>>(path: P, k: &Tensor, v: &Tensor) -> Result<()> {
-    let mut map = std::collections::HashMap::new();
-    map.insert("k".to_string(), k.to_device(&Device::Cpu)?);
-    map.insert("v".to_string(), v.to_device(&Device::Cpu)?);
-    candle_core::safetensors::save(&map, path.as_ref())?;
-    Ok(())
-}
-
-pub fn load_kv<P: AsRef<std::path::Path>>(path: P, device: &Device) -> Result<(Tensor, Tensor)> {
-    let data = std::fs::read(path.as_ref())?;
-    let st = candle_core::safetensors::load_buffer(&data, device)?;
-    let k = st.get("k").ok_or_else(|| anyhow!("K not found"))?.clone();
-    let v = st.get("v").ok_or_else(|| anyhow!("V not found"))?.clone();
-    Ok((k, v))
-}
-
 pub fn load_tensor<P: AsRef<std::path::Path>>(path: P, name: &str, device: &Device) -> Result<Tensor> {
     let data = std::fs::read(path.as_ref())?;
     let st = candle_core::safetensors::load_buffer(&data, device)?;
