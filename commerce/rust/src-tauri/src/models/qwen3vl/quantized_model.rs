@@ -1173,17 +1173,28 @@ impl QuantizedQwen3VLTextModel {
 
         let num_layers = self.layers.len();
 
-        // [SMART-SEQUENTIAL-LOOP]
+        // [ULTRA-SEQUENTIAL-LOOP]
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
             let is_pinned = layer_idx < self.pinned_layer_count;
             
-            // [ULTRA-SPEED] If pinned, skip loading/unloading (already on GPU)
+            // 1. [SWAP-IN] Load weights and Memory (KV Cache)
             if !is_pinned {
                 layer.to_device(&target_device)?;
+                
+                if let Some(sid) = &self.active_session_id {
+                    let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+                    let kv_path = task_dir.join(format!("inference_layer_{}_kv.safetensors", layer_idx));
+                    if kv_path.exists() && layer.self_attn.kv_cache.is_none() {
+                        if let Ok((k, v)) = crate::utils::tensor_utils::load_kv(&kv_path, &target_device) {
+                            layer.self_attn.kv_cache = Some((k, v));
+                        }
+                    }
+                }
             }
 
+            // 2. Compute
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
@@ -1197,53 +1208,28 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-                        // [SWAP-LOGIC] Save results and purge if NOT pinned
-
-                        if !is_pinned {
-
-                            if let Some(sid) = &self.active_session_id {
-
-                                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
-
-                                
-
-                                // 1. Save Hidden States (The signal)
-
-                                let hs_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-
-                                let _ = crate::utils::tensor_utils::save_tensor(&hs_path, "hidden_states", &xs);
-
-                                
-
-                                // 2. Save KV Cache (The memory)
-
-                                if let Some((k, v)) = &layer.self_attn.kv_cache {
-
-                                    let kv_path = task_dir.join(format!("inference_layer_{}_kv.safetensors", layer_idx));
-
-                                    let _ = crate::utils::tensor_utils::save_kv(&kv_path, k, v);
-
-                                }
-
-                                
-
-                                if layer_idx % 10 == 0 || layer_idx == num_layers - 1 {
-
-                                    println!("[SWAP-SAVE] Layer {} (Signal + Memory) at Offset {}.", layer_idx, seqlen_offset);
-
-                                }
-
-                            }
-
-                            layer.to_device(&Device::Cpu)?;
-
-                        }
-
-             else {
-                // If it's the last pinned layer, maybe log something
-                if layer_idx == self.pinned_layer_count - 1 {
-                    // println!("[SPEED] Layer {} is the last GPU-resident layer.", layer_idx);
+            // 3. [SWAP-OUT] Save updated memory and purge
+            if !is_pinned {
+                if let Some(sid) = &self.active_session_id {
+                    let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+                    
+                    // Save Signal (Hidden States)
+                    let hs_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                    let _ = crate::utils::tensor_utils::save_tensor(&hs_path, "hidden_states", &xs);
+                    
+                    // Save & Drop Memory (KV Cache)
+                    if let Some((k, v)) = &layer.self_attn.kv_cache {
+                        let kv_path = task_dir.join(format!("inference_layer_{}_kv.safetensors", layer_idx));
+                        let _ = crate::utils::tensor_utils::save_kv(&kv_path, k, v);
+                    }
+                    layer.self_attn.kv_cache = None; // [CRITICAL] Free VRAM memory
+                    
+                    if layer_idx % 10 == 0 || layer_idx == num_layers - 1 {
+                        println!("[SWAP-KV] Layer {} memory swapped via disk.", layer_idx);
+                    }
                 }
+                layer.to_device(&Device::Cpu)?;
+                if target_device.is_cuda() { let _ = target_device.synchronize(); }
             }
         }
         

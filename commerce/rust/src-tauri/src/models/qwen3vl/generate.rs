@@ -452,8 +452,10 @@ impl Qwen3VLGenerateModel {
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
 
-            // [GEN-PREFILL-RESET] Surgical reset every 1024 tokens
-            if seqlen_offset >= last_reset_pos + 1024 {
+            // [GEN-PREFILL-RESET] Surgical reset every 2048 tokens
+            // [GUARD] Do not reset if we are near the end (< 512 tokens left) to keep context "warm"
+            let remaining_tokens = total_tokens.saturating_sub(seqlen_offset);
+            if seqlen_offset >= last_reset_pos + 2048 && remaining_tokens > 512 {
                 // 1. Save to disk ONLY if session exists
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
@@ -462,7 +464,7 @@ impl Qwen3VLGenerateModel {
                 }
 
                 // 2. ALWAYS purge memory to prevent OOM
-                println!("[GEN-PREFILL] Segment complete. Resetting memory at token {}.", seqlen_offset);
+                println!("[GEN-PREFILL] Segment complete. Resetting memory at token {}. (Remaining: {})", seqlen_offset, remaining_tokens);
                 let _ = self.qwen3_vl.drop_kv_storage();
                 if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
                 #[cfg(target_os = "windows")]
