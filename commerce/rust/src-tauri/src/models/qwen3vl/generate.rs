@@ -491,34 +491,52 @@ impl Qwen3VLGenerateModel {
         let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(top_k), seed);
         let repetition_penalty = 1.1;
 
+        let mut all_ids = vec![];
+        let mut generated_text = String::new();
         let mut seqlen_offset = self.get_kv_len();
 
-        let mes_render = self.chat_template.apply_chat_template(&mes)?;
-        let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
-        // [STRICT-ALIGN] Never add BOS manually; parity with prefill_only
-        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
-        let total_tokens = full_input_ids_vec.len();
-
-        if seqlen_offset == 0 {
-            if let Some(sid) = &session_id {
-                let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if path.exists() { self.load_kv_from_disk(&path)?; seqlen_offset = self.get_kv_len(); }
+        // [INFERENCE-RESUME] Detect existing progress
+        if let Some(sid) = &session_id {
+            let path = crate::utils::paths::get_kv_dir(None).join(sid);
+            let progress_path = path.join("generation_progress.json");
+            if progress_path.exists() {
+                if let Ok(data) = std::fs::read_to_string(&progress_path) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
+                        println!("[RESUME] Found existing generation progress. Loading...");
+                        let _ = self.load_kv_from_disk(&path);
+                        seqlen_offset = self.get_kv_len();
+                        generated_text = json["text"].as_str().unwrap_or("").to_string();
+                        if let Some(ids) = json["ids"].as_array() {
+                            all_ids = ids.iter().map(|v| v.as_u64().unwrap_or(0) as u32).collect();
+                        }
+                    }
+                }
             }
         }
 
-        // [CHUNKED PREFILL] - Memory-Safe Segmented Loading
-        // [STRICT-RELAY] Ensure 2B always reads at least the very last token to sync state.
-        let mut local_pos = if seqlen_offset > 0 { 
-            if seqlen_offset >= total_tokens {
-                total_tokens.saturating_sub(1)
-            } else {
-                seqlen_offset
+        let mes_render = self.chat_template.apply_chat_template(&mes)?;
+        let mut input = self.pre_processor.process_info(&mes, &mes_render)?;
+        let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
+        let total_tokens = full_input_ids_vec.len();
+
+        // If no progress found, start from prefill
+        if all_ids.is_empty() {
+            all_ids = full_input_ids_vec.clone();
+            
+            if seqlen_offset == 0 {
+                if let Some(sid) = &session_id {
+                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    if path.exists() { self.load_kv_from_disk(&path)?; seqlen_offset = self.get_kv_len(); }
+                }
             }
-        } else { 
-            0 
-        };
+        }
+
+        // [CHUNKED PREFILL] - Granular loading for stability
+        let mut local_pos = if seqlen_offset > 0 { 
+            if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset }
+        } else { 0 };
         
-        let prefill_chunk_size = if self.text_device.is_cpu() { 1024 } else { 256 };
+        let prefill_chunk_size = 128; // Use strict 128 chunks for 4GB VRAM
 
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
@@ -530,7 +548,6 @@ impl Qwen3VLGenerateModel {
             }
             if chunk_size == 0 { break; }
 
-            // [FIX] Slice relative to local_pos, but use seqlen_offset for the model
             let chunk = &full_input_ids_vec[local_pos..local_pos + chunk_size];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
@@ -543,27 +560,28 @@ impl Qwen3VLGenerateModel {
             
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
+
+            // [SAVE-PREFILL] Periodic checkpoint during prefill
+            if seqlen_offset % 1024 == 0 {
+                if let Some(sid) = &session_id {
+                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    let _ = self.save_kv_to_disk(&path);
+                    println!("[GEN-PREFILL] Checkpoint saved at token {}", seqlen_offset);
+                }
+            }
         }
-
-        let mut all_ids = full_input_ids_vec.clone();
-        let mut generated_text = String::new();
+        
+        // [TRUNCATED FOR CONCISE - Generation Loop Starts]
         let max_new_tokens = mes.max_tokens.unwrap_or(2048);
-
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
-        println!("[DEBUG-GEN] Starting token generation loop. Max tokens: {}", max_new_tokens);
-
-        for _i in 0..max_new_tokens {
+        for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { 
-                if flag.load(Ordering::Relaxed) { 
-                    println!("[DEBUG-GEN] Cancellation detected at token {}", _i);
-                    return Err(anyhow!("Task cancelled during generation")); 
-                } 
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Task cancelled")); } 
             }
             
-            let input_ids = if generated_text.is_empty() {
-                // Process remaining tokens from prefill
+            let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
                 let start = local_pos;
                 let end = total_tokens;
                 Tensor::new(&full_input_ids_vec[start..end], &self.text_device)?.unsqueeze(0)?
@@ -574,8 +592,6 @@ impl Qwen3VLGenerateModel {
             let seq_len = input_ids.dim(1)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
             
-            // forward 호출 전 로그
-            // println!("[DEBUG-GEN] Forwarding token {}...", _i);
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
             
             let logits = logits.squeeze(0)?;
@@ -589,17 +605,27 @@ impl Qwen3VLGenerateModel {
             let next_id = logit_processor.sample(&logits)?;
             if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
             all_ids.push(next_id);
-            generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
+            let new_token_text = self.tokenizer.token_decode(vec![next_id])?;
+            generated_text.push_str(&new_token_text);
             
-            // [REBALANCE] 512 토큰마다 VRAM 상태 체크하여 레이어 재배치 (CPU 모드가 아닐 때만)
-            if _i > 0 && _i % 512 == 0 && !self.qwen3_vl.is_cpu() {
-                if let Err(e) = self.qwen3_vl.rebalance_layers(0) {
-                    println!("[REBALANCE] Failed: {}", e);
+            // [INFERENCE-SAVE] Save checkpoint every 50 tokens
+            if i > 0 && i % 50 == 0 {
+                if let Some(sid) = &session_id {
+                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    let _ = self.save_kv_to_disk(&path);
+                    let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
+                    let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
+                    println!("[GEN] Checkpoint saved at token {}", i);
                 }
             }
 
             seqlen_offset += seq_len;
             pixel_values = None;
+        }
+
+        // [CLEANUP] Remove generation progress on success
+        if let Some(sid) = &session_id {
+            let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json"));
         }
 
         Ok(generated_text)
