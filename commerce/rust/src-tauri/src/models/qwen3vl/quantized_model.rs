@@ -1232,37 +1232,42 @@ impl QuantizedQwen3VLTextModel {
                 layer.to_device(&Device::Cpu)?;
             }
 
-            // 3. [A: Archived] Confirm Save and Drop Old Memory
-            // [OPTIMIZATION] Reduced window_size to 1 to minimize RAM/VRAM footprint
+            // 3. [A: Archived] Confirm Save and Drop Old Memory (HARD PURGE)
             let tight_window = 1; 
             while save_handles.len() > tight_window {
                 if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
                     // Wait for disk confirmation (Ack)
                     match futures::executor::block_on(handle) {
                         Ok(Ok(_)) => {
+                            // 1. Release reference
                             drop(old_xs);
+                            
+                            // 2. [GPU PURGE] Force GPU to clean up internal cache
+                            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+
+                            // 3. [OS PURGE] Force Windows to reclaim physical RAM immediately
+                            #[cfg(target_os = "windows")]
+                            unsafe {
+                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                                use windows_sys::Win32::System::Memory::*;
+                                let _ = SetProcessWorkingSetSizeEx(
+                                    GetCurrentProcess(), 
+                                    usize::MAX, 
+                                    usize::MAX, 
+                                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE
+                                );
+                            }
                         },
                         Ok(Err(e)) => {
-                            println!("[WINDOW-ERROR] Disk Write Failed for Layer {}: {}. OOM Risk Increasing.", old_idx, e);
-                            // Fallback: Drop anyway to prevent OOM, though consistency is now at risk
+                            println!("[WINDOW-ERROR] Disk Write Failed for Layer {}: {}. Emergency Purge.", old_idx, e);
                             drop(old_xs); 
                         },
                         _ => {
-                            println!("[WINDOW-ERROR] Join Error for Layer {}. Retaining memory.", old_idx);
+                            println!("[WINDOW-ERROR] Join Error for Layer {}. Skipping Purge.", old_idx);
                             save_handles.push_front((old_idx, tokio::task::spawn(async move { Ok(old_idx) }), old_xs)); 
                             break; 
                         }
                     }
-                }
-            }
-
-            // Windows-specific: Flush working set periodically when many layers are processed
-            if layer_idx % 5 == 0 {
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                 }
             }
         }
