@@ -1214,13 +1214,14 @@ impl QuantizedQwen3VLTextModel {
 
             // 2. [B: Backing Up] Start Save
             if let Some(sid) = &self.active_session_id {
+                println!("[TRACE-L{}] Mandatory save triggered for sid: {}", layer_idx, sid);
                 let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                 if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
                 let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
                 let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
                 
-                println!("[TRACE-L{}] Copying to CPU...", layer_idx);
+                println!("[TRACE-L{}] Copying tensor to CPU for saving...", layer_idx);
                 let xs_cpu = xs.to_device(&Device::Cpu)?;
                 
                 if num_layers == 1 {
