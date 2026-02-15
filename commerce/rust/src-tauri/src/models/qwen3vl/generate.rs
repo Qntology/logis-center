@@ -383,7 +383,9 @@ impl Qwen3VLGenerateModel {
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
-        let prefill_chunk_size = 2048;
+        
+        // [GRANULAR-BAKING] Use 512 blocks for consistent memory pressure
+        let prefill_chunk_size = 512;
         let mut current_pos = self.get_kv_len();
         if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
@@ -403,10 +405,10 @@ impl Qwen3VLGenerateModel {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }     
                 
-                // 1. Save to disk
+                // 1. Save to disk (Granular 512 block)
                 self.save_kv_to_disk(&path, kv_name.as_deref(), chunk_end)?;
                 
-                // 2. Purge from VRAM
+                // 2. Purge from VRAM (Keep memory lean during heavy prefill)
                 println!("[BAKING] Segment saved. Resetting memory for token {}.", chunk_end);
                 let _ = self.qwen3_vl.drop_kv_storage(); 
                 
@@ -566,19 +568,24 @@ impl Qwen3VLGenerateModel {
             std::path::PathBuf::new()
         };
 
+        // [SLIDING-WINDOW-CONFIG] 512 block size for more granular management
+        let window_keep_size = 5120; // 10 blocks of 512
+        let bake_block_size = 512;
+
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [WINDOW-BAKE] Trigger dump and truncate every 1024 tokens
-            if seqlen_offset > 0 && seqlen_offset % 1024 == 0 && !task_dir_base.as_os_str().is_empty() {
-                println!("[WINDOW-BAKE] 1024 boundary hit. Offloading past block to disk worker.");
+            // [WINDOW-BAKE] Trigger dump every 512 tokens
+            if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
+                println!("[WINDOW-BAKE] {} boundary hit. Offloading 512-token block to disk.", seqlen_offset);
                 let (ks, vs) = self.get_current_kv();
                 let mut layer_dumps = Vec::new();
+                
                 for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    // Capture only the 1024 block that just finished
-                    if k.dim(2)? >= 1024 {
-                        let k_slice = k.narrow(2, 0, 1024)?.contiguous()?;
-                        let v_slice = v.narrow(2, 0, 1024)?.contiguous()?;
+                    let current_mem_len = k.dim(2)?;
+                    if current_mem_len >= bake_block_size {
+                        let k_slice = k.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
+                        let v_slice = v.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
                         layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
                     }
                 }
@@ -586,16 +593,23 @@ impl Qwen3VLGenerateModel {
                 if !layer_dumps.is_empty() {
                     let task = BakeTask {
                         task_dir: task_dir_base.clone(),
-                        kv_name: kv_name.clone(),
-                        offset: seqlen_offset - 1024,
+                        kv_name: kv_name.clone().or_else(|| Some("default".to_string())),
+                        offset: seqlen_offset - bake_block_size,
                         layers: layer_dumps,
                     };
-                    // Use blocking_send since we are in a worker thread (spawn_blocking)
                     let _ = bake_tx.blocking_send(task);
                     
-                    // CRITICAL: Free VRAM immediately
-                    println!("[WINDOW-BAKE] Truncating 1024 tokens from VRAM memory.");
-                    let _ = self.truncate_kv_cache(1024);
+                    // [SLIDING-WINDOW-PURGE] Keep recent 10 blocks in RAM
+                    let current_kv_len = self.get_kv_len();
+                    if current_kv_len > window_keep_size {
+                        let purge_len = current_kv_len - window_keep_size;
+                        let aligned_purge = (purge_len / bake_block_size) * bake_block_size;
+                        if aligned_purge > 0 {
+                            println!("[WINDOW-BAKE] Purging {} old tokens. (RAM: {} / Disk: 0-{})", 
+                                aligned_purge, window_keep_size, seqlen_offset - window_keep_size);
+                            let _ = self.truncate_kv_cache(aligned_purge);
+                        }
+                    }
                 }
             }
 
