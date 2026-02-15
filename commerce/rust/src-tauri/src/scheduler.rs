@@ -632,7 +632,7 @@ async fn process_task(
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(0.1),
+                model: "qwen3vl".to_string(), max_tokens: Some(128), temperature: Some(1.0),
                 ..Default::default()
             };
 
@@ -723,7 +723,7 @@ async fn process_task(
                     content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                     name: None,
                 })],
-                model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(0.1),
+                model: "qwen3vl".to_string(), max_tokens: Some(512), temperature: Some(1.0),
                 ..Default::default()
             };
 
@@ -873,7 +873,7 @@ async fn process_task(
                         content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
                         name: None,
                     })],
-                    model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(0.1),
+                    model: "qwen3vl".to_string(), max_tokens: Some(2048), temperature: Some(1.0),
                     ..Default::default()
                 };
 
