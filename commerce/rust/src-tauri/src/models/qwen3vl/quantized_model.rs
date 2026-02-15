@@ -339,9 +339,8 @@ impl QuantizedQwen3VLTextAttention {
 
                 // --- [ULTRA-SPEED: KV CACHE FOLDING] ---
                 // 컨텍스트가 너무 길어지면 중요 정보(Sink)와 최신 정보(Window)만 남기고 접어버립니다.
-                // 4GB VRAM에서도 8k 토큰은 안정적으로 수용 가능합니다.
-                let max_capacity = 8192; // 2048에서 8192로 상향 (문서 유실 방지)
-                let sink_size = 512;     // 시스템 지시사항 및 PUG 헤더 보존 영역 확대
+                let max_capacity = 2048; // 고정된 메모리 버퍼 크기
+                let sink_size = 4;      // 초기 컨텍스트 유지 (Softmax 안정성)
                 let actual_len = k.dim(2)?;
 
                 if actual_len > max_capacity {
@@ -604,46 +603,24 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn truncate_kv_cache(&mut self, keep_len: usize) -> Result<()> {
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         if let Some((k, v)) = &self.kv_cache {
             let total_len = k.dim(2)?;
-            if keep_len == 0 {
+            if len >= total_len {
                 self.kv_cache = None;
-            } else if keep_len < total_len {
-                // [STANDARD-REJECTION] 첫 keep_len개의 토큰만 남기고 나머지는 버립니다.
-                let new_k = k.narrow(2, 0, keep_len)?.contiguous()?.clone();
-                let new_v = v.narrow(2, 0, keep_len)?.contiguous()?.clone();
+            } else {
+                // [HARD-RESET-STRATEGY] 
+                // Don't just slice (narrow). Slicing often keeps the parent storage alive.
+                // We create a FRESH tensor copy and let the old one be dropped.
+                let new_k = k.narrow(2, len, total_len - len)?.contiguous()?.clone();
+                let new_v = v.narrow(2, len, total_len - len)?.contiguous()?.clone();
+                
+                // Explicitly clear the old cache to trigger drop of the large tensors
+                self.kv_cache = None; 
+                
+                // Assign the fresh, small tensors
                 self.kv_cache = Some((new_k, new_v));
             }
-        }
-        Ok(())
-    }
-
-    pub fn truncate_prefix(&mut self, remove_len: usize) -> Result<()> {
-        if let Some((k, v)) = &self.kv_cache {
-            let total_len = k.dim(2)?;
-            let sink_size = 128; // 보호할 초기 문맥 크기
-
-            if remove_len == 0 || total_len <= sink_size {
-                return Ok(());
-            }
-
-            // [SINK-PROTECTION-FOLDING] 
-            // 0..sink_size (시스템 프롬프트)는 유지하고, 
-            // sink_size + remove_len 이후의 데이터를 앞으로 당깁니다.
-            let actual_remove = remove_len.min(total_len.saturating_sub(sink_size + 1));
-            if actual_remove == 0 { return Ok(()); }
-
-            let sink_k = k.narrow(2, 0, sink_size)?;
-            let window_k = k.narrow(2, sink_size + actual_remove, total_len - (sink_size + actual_remove))?;
-            let new_k = Tensor::cat(&[&sink_k, &window_k], 2)?.contiguous()?.clone();
-
-            let sink_v = v.narrow(2, 0, sink_size)?;
-            let window_v = v.narrow(2, sink_size + actual_remove, total_len - (sink_size + actual_remove))?;
-            let new_v = Tensor::cat(&[&sink_v, &window_v], 2)?.contiguous()?.clone();
-
-            self.kv_cache = Some((new_k, new_v));
-            // println!("[FOLDING] Protected Sink. Tokens: {} -> {}", total_len, self.get_kv_len());
         }
         Ok(())
     }
@@ -922,10 +899,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         self.self_attn.truncate_kv_cache(len)
-    }
-
-    pub fn truncate_prefix(&mut self, len: usize) -> Result<()> {
-        self.self_attn.truncate_prefix(len)
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -1526,12 +1499,6 @@ impl QuantizedQwen3VLTextModel {
         })
     }
 
-    pub fn truncate_prefix(&mut self, len: usize) -> Result<()> {
-        self.layers.iter_mut().try_for_each(|layer| {
-            layer.truncate_prefix(len)
-        })
-    }
-
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
         self.save_kv_cache(path, true, block_size, None)
     }
@@ -1759,15 +1726,7 @@ impl QuantizedQwen3VLModel {
         
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
-        
-        // [ULTRA-SPEED: MULTI-TOKEN LOGITS]
-        // 투기적 추론 검증을 위해 여러 토큰이 들어오면 모든 토큰의 결과를 반환합니다.
-        let hidden_state = if seq_len > 1 {
-            outputs 
-        } else {
-            outputs.narrow(1, outputs.dim(1)? - 1, 1)?
-        };
-
+        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
@@ -1780,7 +1739,6 @@ impl QuantizedQwen3VLModel {
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
-    pub fn truncate_prefix(&mut self, len: usize) -> Result<()> { self.language_model.truncate_prefix(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
@@ -1848,14 +1806,7 @@ impl QuantizedQwen3TextModel {
         
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
-        
-        // [ULTRA-SPEED: MULTI-TOKEN LOGITS]
-        let hidden_state = if seq_len > 1 {
-            outputs
-        } else {
-            outputs.narrow(1, outputs.dim(1)? - 1, 1)?
-        };
-
+        let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         if let Some(head) = &self.lm_head {
             let hidden_state = if !hidden_state.device().same_device(head.device()) { hidden_state.to_device(head.device())? } else { hidden_state };
             Ok(head.forward(&hidden_state)?)
@@ -1868,7 +1819,6 @@ impl QuantizedQwen3TextModel {
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
-    pub fn truncate_prefix(&mut self, len: usize) -> Result<()> { self.language_model.truncate_prefix(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }

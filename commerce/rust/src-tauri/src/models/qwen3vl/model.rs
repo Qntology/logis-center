@@ -1269,16 +1269,8 @@ impl Qwen3VLModel {
             visual_pos_mask.as_ref(),
             deepstack_visual_embeds,
         )?;
-        
         let seq_len = outputs.dim(1)?;
-        
-        // [ULTRA-SPEED: MULTI-TOKEN LOGITS]
-        let hidden_state = if seq_len > 1 {
-            outputs
-        } else {
-            outputs.narrow(1, seq_len - 1, 1)?
-        };
-
+        let hidden_state = outputs.narrow(1, seq_len - 1, 1)?;
         let logits = self.lm_head.forward(&hidden_state)?;
         Ok(logits)
     }

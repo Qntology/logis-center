@@ -662,16 +662,16 @@ async fn process_task(
         }
         
         if page_type.is_empty() || page_type == "unknown" { 
-            // model.deep_purge_resources().await; // 제거: 로딩 유지
+            model.deep_purge_resources().await;
             return Ok(()); 
         }
     }
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    // [OPTIMIZATION] 불필요한 리소스 정산 대기 제거
-    // model.deep_purge_resources().await;
-    // wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+    // [CRITICAL-CLEANUP] Clear the cache from Step A before Step B (git e8260c5 parity)
+    model.deep_purge_resources().await;
+    wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
 
     // --- STEP B: SELECTORS (Disk Bridge Relay) ---
     {
@@ -904,12 +904,14 @@ async fn process_task(
 
     // --- PHASE 3: HANDOVER (Unload 2B -> Load Embedding) ---
     {
-        println!("[Scheduler] PHASE 3: Handover - Preparing for Embedding...");
+        println!("[Scheduler] PHASE 3: Handover - Unloading 2B, Preparing for Embedding...");
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
-        // [OPTIMIZATION] 임베딩 단계로 넘어갈 때만 선별적으로 제거하거나 유지 시도
-        // model.deep_purge_resources().await;
-        // wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
+        // 1. Explicitly Unload 2B to free VRAM for Embedding Model
+        model.deep_purge_resources().await;
+        
+        // 2. Wait for VRAM to settle (Driver latency)
+        wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
     }
 
     // --- DB OPS & SIDE EFFECTS ---

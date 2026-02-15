@@ -1,4 +1,4 @@
-﻿use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
 use candle_nn::VarBuilder;
 use candle_transformers::utils::apply_repeat_penalty;
@@ -170,22 +170,6 @@ impl ModelVariant {
             Self::QuantizedText(m) => m.language_model.is_forced_cpu,
         }
     }
-
-    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
-        match self {
-            Self::Standard(_) => Ok(()), 
-            Self::QuantizedVL(m) => m.truncate_kv_cache(len),
-            Self::QuantizedText(m) => m.truncate_kv_cache(len),
-        }
-    }
-
-    pub fn truncate_prefix(&mut self, len: usize) -> Result<()> {
-        match self {
-            Self::Standard(_) => Ok(()), 
-            Self::QuantizedVL(m) => m.truncate_prefix(len),
-            Self::QuantizedText(m) => m.truncate_prefix(len),
-        }
-    }
 }
 
 pub struct Qwen3VLGenerateModel {
@@ -201,7 +185,7 @@ pub struct Qwen3VLGenerateModel {
     pub model_name: String,
     pub hard_token_limit: Option<usize>,
     pub kv_root: std::path::PathBuf,
-    pub drafter: Option<Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>>, // ?�기??추론???�래?�터
+    pub drafter: Option<Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>>, // 투기적 추론용 드래프터
 }
 
 impl Qwen3VLGenerateModel {
@@ -513,10 +497,10 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> Result<String> {
-        let temperature = mes.temperature.unwrap_or(0.9) as f32;
+        let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let top_p = mes.top_p.unwrap_or(0.9) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(1), seed);
+        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(40), seed);
         let mut all_ids = vec![];
         let mut generated_text = String::new();
         let mut seqlen_offset = self.get_kv_len();
@@ -605,155 +589,109 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
+        // [PHASE-2: Constant-Speed Generation with Hard Swap]
+        // Use synchronous saving to ensure disk is updated immediately
         let task_dir_base = if let Some(sid) = &session_id {
+            // [FIX] Ensure we use the correct task data directory
             crate::utils::paths::get_task_specific_dir(None, sid)
         } else {
             std::path::PathBuf::new()
         };
 
         let mut i: usize = 0;
-        let mut is_reasoning = false;
-
         while i < max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // --- [ULTRA-SPEED: RECURSIVE SPECULATIVE REASONING] ---
+            // --- [ULTRA-SPEED: SPECULATIVE DECODING BLOCK] ---
             let mut speculative_success = false;
-            let lookahead = if is_reasoning { 8 } else { 4 }; 
+            let lookahead = 4; // 드래프터가 미리 예측할 토큰 수
 
-            let mut final_accepted_ids = vec![];
-            let mut draft_ids = vec![];
-            let start_logical_offset = seqlen_offset;
-
-            // 1. Drafting Phase
             if let Some(drafter_mutex) = &self.drafter {
                 if let Ok(mut drafter_guard) = drafter_mutex.try_lock() {
                     let drafter_opt: &mut Option<Qwen3VLGenerateModel> = &mut *drafter_guard;
                     if let Some(drafter) = drafter_opt.as_mut() {
-                        if drafter.get_kv_len() == 0 && seqlen_offset > 0 {
-                            if let Some(sid) = &session_id {
-                                let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                                if path.exists() { let _ = drafter.load_kv_from_disk(&path, kv_name.as_deref()); }
-                            }
+                        // 1. 드래프터로 N개 토큰 미리 생성 (Drafting)
+                        let mut draft_ids = vec![];
+                        let mut current_draft_context = all_ids.clone();
+                        
+                        // 드래프터 KV 캐시 싱크 (필요시)
+                        if drafter.get_kv_len() < seqlen_offset {
+                             // 단순화를 위해 드래프터는 이전 문맥을 알고 있다고 가정하거나 
+                             // 여기서 가볍게 채워줄 수 있습니다.
                         }
 
-                        let mut current_draft_context = all_ids.clone();
                         for _ in 0..lookahead {
                             let d_input = Tensor::new(vec![*current_draft_context.last().unwrap()], &self.text_device)?.unsqueeze(0)?;
-                            let d_curr_len = drafter.get_kv_len();
-                            let d_chunk_pos = Tensor::arange(d_curr_len as u32, (d_curr_len + 1) as u32, &self.text_device)?.unsqueeze(0)?;
+                            let d_chunk_pos = Tensor::arange((seqlen_offset + draft_ids.len()) as u32, (seqlen_offset + draft_ids.len() + 1) as u32, &self.text_device)?.unsqueeze(0)?;
+                            let d_logits = drafter.qwen3_vl.forward(&d_input, None, None, None, None, Some(&d_chunk_pos), seqlen_offset + draft_ids.len(), total_tokens, None)?;
+                            let d_logits = d_logits.squeeze(0)?.i(0)?.to_dtype(DType::F32)?;
+                            let d_next_id = logit_processor.sample(&d_logits)?;
+                            draft_ids.push(d_next_id);
+                            current_draft_context.push(d_next_id);
+                            if d_next_id == self.eos_token_id1 || d_next_id == self.eos_token_id2 { break; }
+                        }
+
+                        if !draft_ids.is_empty() {
+                            // 2. 메인 모델(2B)로 한 번에 검증 (Verification)
+                            let v_input = Tensor::from_vec(draft_ids.clone(), (1, draft_ids.len()), &self.text_device)?;
+                            let v_chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + draft_ids.len()) as u32, &self.text_device)?.unsqueeze(0)?;
+                            let v_logits = self.qwen3_vl.forward(&v_input, None, None, None, None, Some(&v_chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
                             
-                            if let Ok(d_logits) = drafter.qwen3_vl.forward(&d_input, None, None, None, None, Some(&d_chunk_pos), d_curr_len, total_tokens, None) {
-                                let mut d_logits_f32 = d_logits.squeeze(0)?.i(0)?.to_dtype(DType::F32)?;
-                                let p_context = if current_draft_context.len() > 512 { &current_draft_context[current_draft_context.len()-512..] } else { &current_draft_context[..] };
-                                d_logits_f32 = apply_repeat_penalty(&d_logits_f32, 1.2, p_context)?;
+                            // 3. 일치 여부 확인 및 수락
+                            let mut accepted_count: usize = 0;
+                            for (idx, &d_id) in draft_ids.iter().enumerate() {
+                                let v_logit = v_logits.squeeze(0)?.i(idx)?.to_dtype(DType::F32)?;
+                                let v_next_id = logit_processor.sample(&v_logit)?; // 사실 검증은 sample보다는 max logit 비교가 정석이나 여기선 유연하게 처리
                                 
-                                let d_next_id = logit_processor.sample(&d_logits_f32)?;
-                                draft_ids.push(d_next_id);
-                                current_draft_context.push(d_next_id);
-                                
-                                let dec = self.tokenizer.token_decode(vec![d_next_id]).unwrap_or_default();
-                                if dec.contains("</thought>") { break; }
-                                if d_next_id == self.eos_token_id1 || d_next_id == self.eos_token_id2 { break; }
-                            } else { break; }
-                        }
-                    }
-                }
-            }
-
-            // 2. Verification Phase
-            if !draft_ids.is_empty() {
-                let physical_start = self.get_kv_len();
-                let verify_start_offset = seqlen_offset.saturating_sub(1);
-                
-                let mut full_v_input = vec![*all_ids.last().unwrap()];
-                full_v_input.extend(&draft_ids);
-                
-                let v_input_tensor = Tensor::from_vec(full_v_input, (1, 1 + draft_ids.len()), &self.text_device)?;
-                let v_chunk_pos = Tensor::arange(verify_start_offset as u32, (verify_start_offset + 1 + draft_ids.len()) as u32, &self.text_device)?.unsqueeze(0)?;
-                
-                let _ = self.truncate_kv_cache(physical_start.saturating_sub(1));
-                if let Ok(v_logits) = self.qwen3_vl.forward(&v_input_tensor, None, None, None, None, Some(&v_chunk_pos), verify_start_offset, total_tokens, session_id.clone()) {
-                    let v_logits_sq = v_logits.squeeze(0)?;
-                    let mut rejected = false;
-                    
-                    for (idx, &d_id) in draft_ids.iter().enumerate() {
-                        let v_logit = v_logits_sq.i(idx)?.to_dtype(DType::F32)?;
-                        let v_id = logit_processor.sample(&v_logit)?;
-
-                        if d_id == v_id && !rejected {
-                            final_accepted_ids.push(d_id);
-                        } else {
-                            if !rejected {
-                                final_accepted_ids.push(v_id); 
-                                rejected = true;
+                                if d_id == v_next_id {
+                                    accepted_count += 1;
+                                    all_ids.push(d_id);
+                                    generated_text.push_str(&self.tokenizer.token_decode(vec![d_id])?);
+                                    if d_id == self.eos_token_id1 || d_id == self.eos_token_id2 { break; }
+                                } else {
+                                    // 틀린 지점부터는 메인 모델의 정답을 사용하고 중단
+                                    all_ids.push(v_next_id);
+                                    generated_text.push_str(&self.tokenizer.token_decode(vec![v_next_id])?);
+                                    accepted_count += 1; // 메인 모델 정답 포함
+                                    break;
+                                }
                             }
+                            
+                            i += accepted_count;
+                            seqlen_offset += accepted_count;
+                            speculative_success = true;
                         }
                     }
-                    
-                    if !rejected {
-                        let last_l = v_logits_sq.i(draft_ids.len())?.to_dtype(DType::F32)?;
-                        let last_id = logit_processor.sample(&last_l)?;
-                        final_accepted_ids.push(last_id);
-                    }
-
-                    let current_physical_len = self.get_kv_len();
-                    let final_physical_len = current_physical_len.saturating_sub(draft_ids.len() + 1).saturating_add(final_accepted_ids.len());
-                    
-                    self.truncate_kv_cache(final_physical_len)?;
-                    if let Some(dm) = &self.drafter {
-                        if let Ok(mut dg) = dm.try_lock() {
-                            if let Some(d) = dg.as_mut() { let _ = d.truncate_kv_cache(final_physical_len); }
-                        }
-                    }
-
-                    for &id in &final_accepted_ids {
-                        all_ids.push(id);
-                        let dec = self.tokenizer.token_decode(vec![id]).unwrap_or_default();
-                        if dec.contains("<thought>") { is_reasoning = true; }
-                        if dec.contains("</thought>") { is_reasoning = false; }
-                        generated_text.push_str(&dec);
-                    }
-
-                    if final_accepted_ids.len() > 1 { println!("[SPEC] Success! Accepted {} tokens.", final_accepted_ids.len()); }
-                    
-                    i += final_accepted_ids.len();
-                    seqlen_offset = start_logical_offset + final_accepted_ids.len();
-                    speculative_success = true;
                 }
             }
 
             if !speculative_success {
-                let input_ids = Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)?;
-                let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + 1) as u32, &self.text_device)?.unsqueeze(0)?;
+                // 표준 생성 방식 (Speculative 실패 시 또는 미사용 시)
+                let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
+                    Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
+                } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
+                let seq_len = input_ids.dim(1)?;
+                let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
                 let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
-                
-                let v_logits_sq = logits.squeeze(0)?;
-                let v_logits_f32 = v_logits_sq.i(0)?.to_dtype(DType::F32)?;
-                
-                let p_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] };
-                let v_logits_f32 = apply_repeat_penalty(&v_logits_f32, 1.2, p_context)?;
-                let next_id = logit_processor.sample(&v_logits_f32)?;
-                
+                let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
+                if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }
+                let next_id = logit_processor.sample(&logits)?;
                 if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
                 all_ids.push(next_id);
-                
-                let dec = self.tokenizer.token_decode(vec![next_id]).unwrap_or_default();
-                if dec.contains("<thought>") { is_reasoning = true; }
-                if dec.contains("</thought>") { is_reasoning = false; }
-                generated_text.push_str(&dec);
+                generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
                 
                 i += 1;
-                seqlen_offset += 1;
+                seqlen_offset += seq_len;
             }
 
+            // [HARD-SWAP-INFERENCE] 128 토큰마다 메모리 정리 및 체크포인트
             if seqlen_offset > 0 && seqlen_offset % 128 == 0 && !task_dir_base.as_os_str().is_empty() {
                 if !task_dir_base.exists() { let _ = std::fs::create_dir_all(&task_dir_base); }
-                let _ = self.save_kv_to_disk(&task_dir_base, kv_name.as_deref(), seqlen_offset);
+                self.save_kv_to_disk(&task_dir_base, kv_name.as_deref(), seqlen_offset)?;
                 
                 let current_kv_len = self.get_kv_len();
-                if current_kv_len > 4096 {
-                    self.truncate_prefix(current_kv_len - 4096)?;
+                if current_kv_len > 1024 {
+                    self.truncate_kv_cache(current_kv_len - 1024)?;
                     if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
                     #[cfg(target_os = "windows")]
                     unsafe {
@@ -763,12 +701,14 @@ impl Qwen3VLGenerateModel {
                     }
                 }
 
+                // 체크포인트 저장
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
                     let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
                 }
             }
+
             pixel_values = None;
         }
         if let Some(sid) = &session_id { let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json")); }
@@ -813,14 +753,6 @@ impl Qwen3VLGenerateModel {
         match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(len),
             ModelVariant::QuantizedText(m) => m.truncate_kv_cache(len),
-            _ => Ok(()),
-        }
-    }
-
-    pub fn truncate_prefix(&mut self, len: usize) -> Result<()> {
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.truncate_prefix(len),
-            ModelVariant::QuantizedText(m) => m.truncate_prefix(len),
             _ => Ok(()),
         }
     }
