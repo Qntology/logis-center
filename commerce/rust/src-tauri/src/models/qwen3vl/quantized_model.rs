@@ -827,6 +827,9 @@ impl QuantizedQwen3VLTextDecoderLayer {
     }
 }
 
+use tokio::sync::Mutex as TokioMutex;
+use std::collections::VecDeque;
+
 #[derive(Clone)]
 pub struct QuantizedQwen3VLTextModel {
     pub embed_tokens: Embedding, 
@@ -840,6 +843,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub active_session_id: Option<String>,
     pub pinned_layer_count: usize, // [NEW] Keep N layers on GPU
     pub current_kv_len: usize,
+    pub save_queue: Arc<TokioMutex<VecDeque<(usize, tokio::task::JoinHandle<()>, Tensor)>>>,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -975,7 +979,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0, save_queue: Arc::new(TokioMutex::new(VecDeque::new())) })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1094,6 +1098,7 @@ impl QuantizedQwen3VLTextModel {
             active_session_id: None,
             pinned_layer_count,
             current_kv_len: 0,
+            save_queue: Arc::new(TokioMutex::new(VecDeque::new())),
         })
     }
 
@@ -1121,12 +1126,19 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
-        // --- [A-B-C WINDOW STRATEGY] ---
-        // c: Computing (Current Layer)
-        // b: Backing up (Save in progress, memory kept)
-        // a: Archived (Save confirmed, memory dropped)
-        let mut save_handles = std::collections::VecDeque::new(); 
-        let window_size = 2; // Keep at most 2 layers in RAM (Current + One being saved)
+        // --- [A-B-C WINDOW STRATEGY (GLOBAL QUEUE)] ---
+        let mut save_queue_guard = self.save_queue.blocking_lock();
+        let window_size = 10; // Global queue depth for 1024 token chunks
+
+        // 1. [CLEANUP] Remove already finished tasks from previous token computations
+        let mut i = 0;
+        while i < save_queue_guard.len() {
+            if save_queue_guard[i].1.is_finished() {
+                save_queue_guard.remove(i);
+            } else {
+                i += 1;
+            }
+        }
 
         let mut start_layer = 0;
         // [RESUME-LOGIC] Try to pick up from a saved layer checkpoint on disk
@@ -1218,10 +1230,13 @@ impl QuantizedQwen3VLTextModel {
                 let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                 if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
-                let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
+                // [PREFIX-SPLIT] Use 'base' prefix for content baking, 'inference' for token generation
+                let prefix = if sid.ends_with("_base") || sid.ends_with("_img") || sid.ends_with("_step_a") || sid.ends_with("_step_b") { "base" } else { "inference" };
+
+                let final_path = task_dir.join(format!("{}_layer_{}_at_{}.safetensors", prefix, layer_idx, seqlen_offset));
+                let tmp_path = task_dir.join(format!("{}_layer_{}_at_{}.tmp", prefix, layer_idx, seqlen_offset));
                 
-                println!("[TRACE-L{}] Copying tensor to CPU for saving...", layer_idx);
+                println!("[TRACE-L{}] Copying {} tensor to CPU for saving...", layer_idx, prefix);
                 let xs_cpu = xs.to_device(&Device::Cpu)?;
                 
                 if num_layers == 1 {
@@ -1230,44 +1245,31 @@ impl QuantizedQwen3VLTextModel {
                     let _ = candle_core::safetensors::save(&map, &tmp_path);
                     let _ = std::fs::rename(&tmp_path, &final_path);
                 } else {
+                    // [CONGESTION-CONTROL] If queue is over depth, wait for the oldest one briefly
+                    while save_queue_guard.len() >= window_size {
+                        if let Some((old_idx, handle, _)) = save_queue_guard.pop_front() {
+                            if !handle.is_finished() {
+                                // Just a tiny wait to let IO breathe
+                                println!("[QUEUE-FULL] Waiting for oldest layer {} save...", old_idx);
+                                let _ = futures::executor::block_on(handle);
+                            }
+                        }
+                    }
+
                     let h = tokio::task::spawn_blocking(move || {
                         let mut map = std::collections::HashMap::new();
                         map.insert("hidden_states".to_string(), xs_cpu);
                         let _ = candle_core::safetensors::save(&map, &tmp_path);
                         let _ = std::fs::rename(&tmp_path, &final_path);
                     });
-                    save_handles.push_back((layer_idx, h, xs.clone()));
+                    save_queue_guard.push_back((layer_idx, h, xs.clone()));
                 }
             }
             if !is_pinned { layer.to_device(&Device::Cpu)?; }
-
-            // 3. [A: Archived] Confirm Save and Drop Old Memory (HARD PURGE)
-            let tight_window = 1; 
-            while save_handles.len() > tight_window {
-                if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
-                    if handle.is_finished() {
-                        drop(old_xs);
-                        if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                            
-                        #[cfg(target_os = "windows")]
-                        unsafe {
-                            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                            use windows_sys::Win32::System::Memory::*;
-                            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                        }
-                    } else {
-                        save_handles.push_front((old_idx, handle, old_xs));
-                    }
-                }
-            }
         }
 
-        println!("[TRACE] All layers done. Finalizing saves...");
-        // Final Wait for all remaining saves before returning
-        for (idx, handle, _) in save_handles {
-            println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
-            let _ = futures::executor::block_on(handle);
-        }
+        println!("[TRACE] Computation complete. Save queue depth: {}", save_queue_guard.len());
+        drop(save_queue_guard); // Release lock immediately so next token can start
         
         self.current_kv_len = seqlen_offset + seq_len;
         println!("[TRACE] Final norm.forward starting...");
