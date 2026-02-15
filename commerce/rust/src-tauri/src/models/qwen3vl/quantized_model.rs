@@ -1179,7 +1179,8 @@ impl QuantizedQwen3VLTextModel {
         };
 
         // [SMART-SEQUENTIAL-LOOP]
-        println!("[TRACE] Entering layer loop. Total layers: {}", self.layers.len());
+        let num_layers = self.layers.len();
+        println!("[TRACE] Entering layer loop. Total layers: {}", num_layers);
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
@@ -1206,83 +1207,61 @@ impl QuantizedQwen3VLTextModel {
             }
 
             // GPU Sync to ensure computation is 100% done before save starts
-            if !is_pinned && target_device.is_cuda() { 
+            if target_device.is_cuda() { 
                 println!("[TRACE-L{}] Synchronizing GPU...", layer_idx);
-                target_device.synchronize()?; 
+                let _ = target_device.synchronize(); 
             }
 
-            // 2. [B: Backing Up] Start Async Save
-            if !is_pinned {
-                if let Some(sid) = &self.active_session_id {
-                    let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
-                    // [FIX] Ensure directory exists before attempting to save
-                    if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+            // 2. [B: Backing Up] Start Save
+            if let Some(sid) = &self.active_session_id {
+                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+                if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
-                    let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
-                    
-                    // Atomic move logic: Save to .tmp first, then rename
-                    let xs_to_save = xs.clone();
-                    println!("[TRACE-L{}] Spawning async save task...", layer_idx);
-                    let handle = tokio::task::spawn_blocking(move || -> Result<usize> {
-                        crate::utils::tensor_utils::save_tensor(&tmp_path, "hidden_states", &xs_to_save)?;
-                        std::fs::rename(&tmp_path, &final_path)?;
-                        Ok(layer_idx)
-                    });
-                    save_handles.push_back((layer_idx, handle, xs.clone())); // Keep xs in memory for now
-                } else {
-                    if layer_idx == 0 {
-                        println!("[WINDOW-WARN] No active_session_id found. Disk swapping disabled for this pass.");
-                    }
-                }
+                let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
                 
-                layer.to_device(&Device::Cpu)?;
+                println!("[TRACE-L{}] Copying to CPU...", layer_idx);
+                let xs_cpu = xs.to_device(&Device::Cpu)?;
+                
+                if num_layers == 1 {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("hidden_states".to_string(), xs_cpu.clone());
+                    let _ = candle_core::safetensors::save(&map, &tmp_path);
+                    let _ = std::fs::rename(&tmp_path, &final_path);
+                } else {
+                    let h = tokio::task::spawn_blocking(move || {
+                        let mut map = std::collections::HashMap::new();
+                        map.insert("hidden_states".to_string(), xs_cpu);
+                        let _ = candle_core::safetensors::save(&map, &tmp_path);
+                        let _ = std::fs::rename(&tmp_path, &final_path);
+                    });
+                    save_handles.push_back((layer_idx, h, xs.clone()));
+                }
             }
+            if !is_pinned { layer.to_device(&Device::Cpu)?; }
 
             // 3. [A: Archived] Confirm Save and Drop Old Memory (HARD PURGE)
             let tight_window = 1; 
             while save_handles.len() > tight_window {
                 if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
-                    // Wait for disk confirmation (Ack)
-                    println!("[TRACE-L{}] Waiting for background save to finish...", old_idx);
-                    match futures::executor::block_on(handle) {
-                        Ok(Ok(_)) => {
-                            println!("[TRACE-L{}] Save confirmed. Purging memory.", old_idx);
-                            // 1. Release reference
-                            drop(old_xs);
+                    if handle.is_finished() {
+                        drop(old_xs);
+                        if target_device.is_cuda() { let _ = target_device.synchronize(); }
                             
-                            // 2. [GPU PURGE] Force GPU to clean up internal cache
-                            if target_device.is_cuda() { let _ = target_device.synchronize(); }
-
-                            // 3. [OS PURGE] Force Windows to reclaim physical RAM immediately
-                            #[cfg(target_os = "windows")]
-                            unsafe {
-                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                                use windows_sys::Win32::System::Memory::*;
-                                let _ = SetProcessWorkingSetSizeEx(
-                                    GetCurrentProcess(), 
-                                    usize::MAX, 
-                                    usize::MAX, 
-                                    QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE
-                                );
-                            }
-                        },
-                        Ok(Err(e)) => {
-                            println!("[WINDOW-ERROR] Disk Write Failed for Layer {}: {}. Emergency Purge.", old_idx, e);
-                            drop(old_xs); 
-                        },
-                        _ => {
-                            println!("[WINDOW-ERROR] Join Error for Layer {}. Skipping Purge.", old_idx);
-                            save_handles.push_front((old_idx, tokio::task::spawn(async move { Ok(old_idx) }), old_xs)); 
-                            break; 
+                        #[cfg(target_os = "windows")]
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                            use windows_sys::Win32::System::Memory::*;
+                            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                         }
+                    } else {
+                        save_handles.push_front((old_idx, handle, old_xs));
                     }
                 }
             }
-            println!("[TRACE-L{}] Loop iteration finished.", layer_idx);
         }
 
-        println!("[TRACE] All layers done. Waiting for remaining saves...");
+        println!("[TRACE] All layers done. Finalizing saves...");
         // Final Wait for all remaining saves before returning
         for (idx, handle, _) in save_handles {
             println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
