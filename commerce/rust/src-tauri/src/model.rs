@@ -417,6 +417,20 @@ impl LogisModel {
     pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
+        {
+            let current_size = *self.current_size.lock().await;
+            let gen_guard = self.generator.lock().await;
+            if current_size == Some(target_size) && gen_guard.is_some() && !is_baking {
+                println!("[RELAY] Model {:?} already loaded. Skipping purge/reload.", target_size);
+                
+                // 디스크 스냅샷만 로드 (필요시)
+                if let Some(tid) = task_id {
+                    self.load_kv_snapshot(tid, kv_name).await?;
+                }
+                return Ok(());
+            }
+        }
+
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
         println!("[RELAY] Performing Deep Purge before loading {:?} (Baking: {})...", target_size, is_baking);
         self.deep_purge_resources().await;
@@ -634,16 +648,41 @@ impl LogisModel {
         *gen_guard = Some(gen);
         *current_size_guard = Some(size);
 
-        // --- [ULTRA-SPEED: CONNECT DRAFTER] ---
-        // Large 모델이 활성화되면 Small 모델을 투기적 추론용 드래프터로 연결합니다.
+        // --- [ULTRA-SPEED: KEEP DRAFTER ON CPU] ---
         if size == ModelSize::Large {
+            let small_path = self.small_model_path.clone();
+            let large_path = self.large_model_path.clone();
+            let handle = self.app_handle.clone();
+            let is_swap = self.is_disk_swap;
             let small_slot = self.small_hibernation.clone();
+
+            tauri::async_runtime::spawn(async move {
+                let mut slot = small_slot.lock().await;
+                if slot.is_none() {
+                    println!("[MODEL] Warm-up: Pinning Drafter (0.6B) to CPU RAM...");
+                    let kv_root = crate::utils::paths::get_kv_dir(Some(&handle));
+                    // 드래프터는 연산량이 적으므로 CPU에서 돌려도 충분히 빠르며, VRAM 경쟁을 피합니다.
+                    let cpu_device = candle_core::Device::Cpu;
+                    if let Ok(m) = tokio::task::spawn_blocking(move || {
+                        crate::models::qwen3vl::generate::Qwen3VLGenerateModel::init_with_config(
+                            &small_path, Some(&large_path), Some(&large_path),
+                            Some(&cpu_device), 0, Some(&cpu_device), 0, Some(candle_core::DType::F32), Some(4096),
+                            true, true, is_swap, kv_root
+                        )
+                    }).await {
+                        if let Ok(model) = m {
+                            *slot = Some(model);
+                            println!("[MODEL] Speculative Drafter (0.6B) is now PINNED to CPU.");
+                        }
+                    }
+                }
+            });
+
             if let Some(large_gen) = gen_guard.as_mut() {
-                large_gen.set_drafter(small_slot);
-                println!("[MODEL] Speculative Drafter (0.6B) connected to Large engine.");
+                large_gen.set_drafter(self.small_hibernation.clone());
             }
         }
-        // --------------------------------------
+        // ------------------------------------------
         
         Ok(())
     }
