@@ -552,8 +552,14 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _block_size: usize) -> Result<()> {
-        let file = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
+        let filename = match (kv_name, offset) {
+            (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
+            (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
+            (None, 0) => format!("layer_{}_kv.safetensors", self.layer_idx),
+            (None, off) => format!("layer_{}_kv_{}.safetensors", self.layer_idx, off),
+        };
+        let file = path.join(filename);
         let mut map = HashMap::new();
 
         if let Some((k, v)) = &self.kv_cache {
@@ -577,57 +583,99 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
-        let file_path = path.join(format!("layer_{}_kv.safetensors", self.layer_idx));
-        if !file_path.exists() { return Ok(()); }
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        if let Some((k, v)) = &self.kv_cache {
+            let total_len = k.dim(2)?;
+            if len >= total_len {
+                self.kv_cache = None;
+            } else {
+                let new_k = k.narrow(2, len, total_len - len)?.contiguous()?;
+                let new_v = v.narrow(2, len, total_len - len)?.contiguous()?;
+                self.kv_cache = Some((new_k, new_v));
+            }
+        }
+        Ok(())
+    }
 
-        let file = std::fs::File::open(&file_path)?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        let st = safetensors::SafeTensors::deserialize(&mmap)?;
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+        let base_filename = match kv_name {
+            Some(name) => format!("layer_{}_kv", name),
+            None => format!("layer_{}_kv", self.layer_idx),
+        };
+
+        // 1. Try to find all fragments (e.g., base_0.safetensors, base_1024.safetensors)
+        let mut fragments = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.starts_with(&base_filename) && fname.ends_with(".safetensors") {
+                    // Extract offset from filename: "layer_pug_kv_1024.safetensors" -> 1024
+                    let offset = if fname == format!("{}.safetensors", base_filename) {
+                        0
+                    } else {
+                        fname.strip_prefix(&format!("{}_", base_filename))
+                             .and_then(|s| s.strip_suffix(".safetensors"))
+                             .and_then(|s| s.parse::<usize>().ok())
+                             .unwrap_or(0)
+                    };
+                    fragments.push((offset, entry.path()));
+                }
+            }
+        }
         
-        let mode = if let Ok(view) = st.tensor("mode") {
-            u32::from_le_bytes(view.data()[0..4].try_into().unwrap())
-        } else { 1 };
-        
+        if fragments.is_empty() { return Ok(()); }
+        fragments.sort_by_key(|f| f.0); // Ensure correct order
+
+        let mut all_k = Vec::new();
+        let mut all_v = Vec::new();
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
 
-        let (mut k, mut v) = if mode == 3 {
-            // BitKV Loading
-            let dequantize_bitkv = |prefix: &str| -> Result<Tensor> {
-                let anchors_view = st.tensor(&format!("{}_anchors", prefix))?;
-                let anchors = Tensor::from_slice(unsafe { std::slice::from_raw_parts(anchors_view.data().as_ptr() as *const f32, anchors_view.data().len() / 4) }, anchors_view.shape(), device)?;
-                
-                let packed_view = st.tensor(&format!("{}_packed", prefix))?;
-                let packed = Tensor::from_slice(packed_view.data(), packed_view.shape(), device)?;
-                
-                let scales_view = st.tensor(&format!("{}_scales", prefix))?;
-                let scales = Tensor::from_slice(unsafe { std::slice::from_raw_parts(scales_view.data().as_ptr() as *const f32, scales_view.data().len() / 4) }, scales_view.shape(), device)?;
-                
-                let shape_view = st.tensor("k_shape")?;
-                let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(shape_view.data().as_ptr() as *const u32, shape_view.data().len() / 4) };
-                let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
+        for (_, file_path) in fragments {
+            let file = std::fs::File::open(&file_path)?;
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            let st = safetensors::SafeTensors::deserialize(&mmap)?;
+            
+            let mode = if let Ok(view) = st.tensor("mode") {
+                u32::from_le_bytes(view.data()[0..4].try_into().unwrap())
+            } else { 1 };
 
-                let t = self.decompress_from_bitkv(&anchors, &packed, &scales, &shape)?;
-                Ok(t.to_dtype(target_dtype)?)
+            let (k, v) = if mode == 3 {
+                let dequantize_bitkv = |prefix: &str| -> Result<Tensor> {
+                    let anchors_view = st.tensor(&format!("{}_anchors", prefix))?;
+                    let anchors = Tensor::from_slice(unsafe { std::slice::from_raw_parts(anchors_view.data().as_ptr() as *const f32, anchors_view.data().len() / 4) }, anchors_view.shape(), device)?;
+                    let packed_view = st.tensor(&format!("{}_packed", prefix))?;
+                    let packed = Tensor::from_slice(packed_view.data(), packed_view.shape(), device)?;
+                    let scales_view = st.tensor(&format!("{}_scales", prefix))?;
+                    let scales = Tensor::from_slice(unsafe { std::slice::from_raw_parts(scales_view.data().as_ptr() as *const f32, scales_view.data().len() / 4) }, scales_view.shape(), device)?;
+                    let shape_view = st.tensor("k_shape")?;
+                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(shape_view.data().as_ptr() as *const u32, shape_view.data().len() / 4) };
+                    let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
+                    let t = self.decompress_from_bitkv(&anchors, &packed, &scales, &shape)?;
+                    Ok(t.to_dtype(target_dtype)?)
+                };
+                (dequantize_bitkv("k")?, dequantize_bitkv("v")?)
+            } else {
+                let dequantize_legacy = |prefix: &str| -> Result<Tensor> {
+                    let packed_view = st.tensor(&format!("{}_packed", prefix))?;
+                    let packed = Tensor::from_slice(packed_view.data(), packed_view.shape(), device)?;
+                    let scales_view = st.tensor(&format!("{}_scales", prefix))?;
+                    let scales = Tensor::from_slice(unsafe { std::slice::from_raw_parts(scales_view.data().as_ptr() as *const f32, scales_view.data().len() / 4) }, scales_view.shape(), device)?;
+                    let shape_view = st.tensor("k_shape")?;
+                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(shape_view.data().as_ptr() as *const u32, shape_view.data().len() / 4) };
+                    let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
+                    let t = if mode == 2 { self.decompress_from_1bit(&packed, &scales, &shape)? } 
+                            else { self.decompress_from_8bit(&packed, &scales, &shape)? };
+                    Ok(t.to_dtype(target_dtype)?)
+                };
+                (dequantize_legacy("k")?, dequantize_legacy("v")?)
             };
-            (dequantize_bitkv("k")?, dequantize_bitkv("v")?)
-        } else {
-            // Fallback to old 1-bit or 8-bit
-            let dequantize_legacy = |prefix: &str| -> Result<Tensor> {
-                let packed_view = st.tensor(&format!("{}_packed", prefix))?;
-                let packed = Tensor::from_slice(packed_view.data(), packed_view.shape(), device)?;
-                let scales_view = st.tensor(&format!("{}_scales", prefix))?;
-                let scales = Tensor::from_slice(unsafe { std::slice::from_raw_parts(scales_view.data().as_ptr() as *const f32, scales_view.data().len() / 4) }, scales_view.shape(), device)?;
-                let shape_view = st.tensor("k_shape")?;
-                let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(shape_view.data().as_ptr() as *const u32, shape_view.data().len() / 4) };
-                let shape: Vec<usize> = shape_u32.iter().map(|&x| x as usize).collect();
-                
-                let t = if mode == 2 { self.decompress_from_1bit(&packed, &scales, &shape)? } 
-                        else { self.decompress_from_8bit(&packed, &scales, &shape)? };
-                Ok(t.to_dtype(target_dtype)?)
-            };
-            (dequantize_legacy("k")?, dequantize_legacy("v")?)
-        };
+            all_k.push(k);
+            all_v.push(v);
+        }
+
+        // Stitch all blocks back together
+        let mut k = Tensor::cat(&all_k, 2)?;
+        let mut v = Tensor::cat(&all_v, 2)?;
 
         // [LINEAR-BRIDGE] Convert 0.6B (512) cache to 2B (2048) cache
         let (_b, h, _s, d) = k.dims4()?;
@@ -666,9 +714,13 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-                    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-                        self.save_kv_cache(path, true, block_size)
-                    }
+                        pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
+
+                            self.save_kv_cache(path, true, block_size, None)
+
+                        }
+
+                    
 }
 
 #[derive(Clone)]
@@ -813,22 +865,23 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.input_layernorm.weight().device()
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
-        self.self_attn.save_kv_cache(path, clear, block_size)
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
+        self.self_attn.save_kv_cache(path, clear, offset, kv_name)
+    }
+
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        self.self_attn.truncate_kv_cache(len)
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-        self.self_attn.offload_kv_cache(path, block_size)
+        self.self_attn.save_kv_cache(path, true, block_size, None)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         let device = self.input_layernorm.weight().device();
-        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len)
+        self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name)
     }
 }
-
-use tokio::sync::Mutex as TokioMutex;
-use std::collections::VecDeque;
 
 #[derive(Clone)]
 pub struct QuantizedQwen3VLTextModel {
@@ -843,7 +896,6 @@ pub struct QuantizedQwen3VLTextModel {
     pub active_session_id: Option<String>,
     pub pinned_layer_count: usize, // [NEW] Keep N layers on GPU
     pub current_kv_len: usize,
-    pub save_queue: Arc<TokioMutex<VecDeque<(usize, tokio::task::JoinHandle<()>, Tensor)>>>,
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -979,7 +1031,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0, save_queue: Arc::new(TokioMutex::new(VecDeque::new())) })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1098,7 +1150,6 @@ impl QuantizedQwen3VLTextModel {
             active_session_id: None,
             pinned_layer_count,
             current_kv_len: 0,
-            save_queue: Arc::new(TokioMutex::new(VecDeque::new())),
         })
     }
 
@@ -1126,19 +1177,12 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
-        // --- [A-B-C WINDOW STRATEGY (GLOBAL QUEUE)] ---
-        let mut save_queue_guard = self.save_queue.blocking_lock();
-        let window_size = 10; // Global queue depth for 1024 token chunks
-
-        // 1. [CLEANUP] Remove already finished tasks from previous token computations
-        let mut i = 0;
-        while i < save_queue_guard.len() {
-            if save_queue_guard[i].1.is_finished() {
-                save_queue_guard.remove(i);
-            } else {
-                i += 1;
-            }
-        }
+        // --- [A-B-C WINDOW STRATEGY] ---
+        // c: Computing (Current Layer)
+        // b: Backing up (Save in progress, memory kept)
+        // a: Archived (Save confirmed, memory dropped)
+        let mut save_handles = std::collections::VecDeque::new(); 
+        let window_size = 2; // Keep at most 2 layers in RAM (Current + One being saved)
 
         let mut start_layer = 0;
         // [RESUME-LOGIC] Try to pick up from a saved layer checkpoint on disk
@@ -1230,13 +1274,10 @@ impl QuantizedQwen3VLTextModel {
                 let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                 if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
-                // [PREFIX-SPLIT] Use 'base' prefix for content baking, 'inference' for token generation
-                let prefix = if sid.ends_with("_base") || sid.ends_with("_img") || sid.ends_with("_step_a") || sid.ends_with("_step_b") { "base" } else { "inference" };
-
-                let final_path = task_dir.join(format!("{}_layer_{}_at_{}.safetensors", prefix, layer_idx, seqlen_offset));
-                let tmp_path = task_dir.join(format!("{}_layer_{}_at_{}.tmp", prefix, layer_idx, seqlen_offset));
+                let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
                 
-                println!("[TRACE-L{}] Copying {} tensor to CPU for saving...", layer_idx, prefix);
+                println!("[TRACE-L{}] Copying tensor to CPU for saving...", layer_idx);
                 let xs_cpu = xs.to_device(&Device::Cpu)?;
                 
                 if num_layers == 1 {
@@ -1245,31 +1286,44 @@ impl QuantizedQwen3VLTextModel {
                     let _ = candle_core::safetensors::save(&map, &tmp_path);
                     let _ = std::fs::rename(&tmp_path, &final_path);
                 } else {
-                    // [CONGESTION-CONTROL] If queue is over depth, wait for the oldest one briefly
-                    while save_queue_guard.len() >= window_size {
-                        if let Some((old_idx, handle, _)) = save_queue_guard.pop_front() {
-                            if !handle.is_finished() {
-                                // Just a tiny wait to let IO breathe
-                                println!("[QUEUE-FULL] Waiting for oldest layer {} save...", old_idx);
-                                let _ = futures::executor::block_on(handle);
-                            }
-                        }
-                    }
-
                     let h = tokio::task::spawn_blocking(move || {
                         let mut map = std::collections::HashMap::new();
                         map.insert("hidden_states".to_string(), xs_cpu);
                         let _ = candle_core::safetensors::save(&map, &tmp_path);
                         let _ = std::fs::rename(&tmp_path, &final_path);
                     });
-                    save_queue_guard.push_back((layer_idx, h, xs.clone()));
+                    save_handles.push_back((layer_idx, h, xs.clone()));
                 }
             }
             if !is_pinned { layer.to_device(&Device::Cpu)?; }
+
+            // 3. [A: Archived] Confirm Save and Drop Old Memory (HARD PURGE)
+            let tight_window = 1; 
+            while save_handles.len() > tight_window {
+                if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
+                    if handle.is_finished() {
+                        drop(old_xs);
+                        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                            
+                        #[cfg(target_os = "windows")]
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                            use windows_sys::Win32::System::Memory::*;
+                            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                        }
+                    } else {
+                        save_handles.push_front((old_idx, handle, old_xs));
+                    }
+                }
+            }
         }
 
-        println!("[TRACE] Computation complete. Save queue depth: {}", save_queue_guard.len());
-        drop(save_queue_guard); // Release lock immediately so next token can start
+        println!("[TRACE] All layers done. Finalizing saves...");
+        // Final Wait for all remaining saves before returning
+        for (idx, handle, _) in save_handles {
+            println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
+            let _ = futures::executor::block_on(handle);
+        }
         
         self.current_kv_len = seqlen_offset + seq_len;
         println!("[TRACE] Final norm.forward starting...");
@@ -1417,25 +1471,31 @@ impl QuantizedQwen3VLTextModel {
         Ok(t.to_device(device)?)
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> {
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
         if !path.exists() {
             fs::create_dir_all(path)?;
         }
 
         // [STABILITY] Use sequential saving to avoid CUDA_ERROR_INVALID_CONTEXT in rayon threads
         self.layers.iter_mut().try_for_each(|layer| {
-            layer.save_kv_cache(path, clear, block_size)
+            layer.save_kv_cache(path, clear, offset, kv_name)
+        })
+    }
+
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        self.layers.iter_mut().try_for_each(|layer| {
+            layer.truncate_kv_cache(len)
         })
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
-        self.save_kv_cache(path, true, block_size)
+        self.save_kv_cache(path, true, block_size, None)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         if path.exists() {
             self.layers.iter_mut().try_for_each(|layer| {
-                layer.load_kv_cache(path, device, expected_len, upscale_refill_len)
+                layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name)
             })
         } else {
             Ok(())
@@ -1666,9 +1726,10 @@ impl QuantizedQwen3VLModel {
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
 }
@@ -1745,8 +1806,10 @@ impl QuantizedQwen3TextModel {
     pub fn get_kv_len(&self) -> usize { self.language_model.get_kv_len() }
     pub fn inject_live_kv(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scale: f32, v_scale: f32) -> Result<()> { self.language_model.inject_live_kv(k_list, v_list, k_scale, v_scale) }
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, block_size: usize) -> Result<()> { self.language_model.save_kv_cache(path, clear, block_size) }
-    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len) }
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
+    pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
+    pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
     pub fn rebalance_layers(&mut self, device_id: usize) -> Result<()> { self.language_model.rebalance_layers(device_id) }
 }

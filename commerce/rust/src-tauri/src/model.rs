@@ -345,7 +345,7 @@ impl LogisModel {
     }
 
     // --- [NEW] SSD Bridge Operations ---
-    pub async fn save_kv_snapshot(&self, task_id: &str) -> anyhow::Result<String> {
+    pub async fn save_kv_snapshot(&self, task_id: &str, kv_name: Option<String>, offset: usize) -> anyhow::Result<String> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
         
@@ -354,7 +354,7 @@ impl LogisModel {
             if let Some(gen) = gen_guard.as_mut() {
                 let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
-                gen.save_kv_to_disk(&path)?;
+                gen.save_kv_to_disk(&path, kv_name.as_deref(), offset)?;
                 Ok(path.to_string_lossy().to_string())
             } else {
                 Err(anyhow::anyhow!("No active generator to save snapshot from"))
@@ -362,7 +362,19 @@ impl LogisModel {
         }).await?
     }
 
-    pub async fn load_kv_snapshot(&self, task_id: &str) -> anyhow::Result<()> {
+    pub async fn truncate_kv_cache(&self, len: usize) -> anyhow::Result<()> {
+        let generator_arc = self.generator.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut gen_guard = generator_arc.blocking_lock();
+            if let Some(gen) = gen_guard.as_mut() {
+                gen.truncate_kv_cache(len).map_err(|e| anyhow::anyhow!("Truncate failed: {}", e))
+            } else {
+                Ok(())
+            }
+        }).await?
+    }
+
+    pub async fn load_kv_snapshot(&self, task_id: &str, kv_name: Option<String>) -> anyhow::Result<()> {
         let generator_arc = self.generator.clone();
         let task_id_str = task_id.to_string();
 
@@ -372,7 +384,7 @@ impl LogisModel {
                 let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
-                    gen.load_kv_from_disk(&path)?;
+                    gen.load_kv_from_disk(&path, kv_name.as_deref())?;
                     Ok(())
                 } else {
                     println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
@@ -385,7 +397,7 @@ impl LogisModel {
     }
 
     /// [NEW] Secure VRAM/RAM Transition Logic (Isolation Protocol)
-    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool) -> anyhow::Result<()> {
+    pub async fn secure_vram_relay(&self, target_size: ModelSize, task_id: Option<&str>, cancel_token: Option<Arc<AtomicBool>>, is_baking: bool, kv_name: Option<String>) -> anyhow::Result<()> {
         let start_time = Instant::now();
         
         // 1. [CLEANUP] 강력한 리소스 해제 및 OS 반환
@@ -405,7 +417,7 @@ impl LogisModel {
 
         // 4. [RESTORE] 디스크 스냅샷 로드
         if let Some(tid) = task_id {
-            self.load_kv_snapshot(tid).await?;
+            self.load_kv_snapshot(tid, kv_name).await?;
         }
 
         println!("[RELAY] Transition to {:?} complete in {:.2}s", target_size, start_time.elapsed().as_secs_f32());
@@ -413,11 +425,11 @@ impl LogisModel {
     }
 
     // --- [NEW] Base Context Baking (One-time Heavy Lifting) ---
-    pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
+    pub async fn ingest_pug_to_ssd(&self, task_id: &str, pug_content: &str, cancel_token: Option<Arc<AtomicBool>>, kv_name: Option<String>) -> anyhow::Result<()> {
         let base_session = format!("{}_base", task_id);
         
         // 1. Load Small Model Isolated
-        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true).await?;
+        self.secure_vram_relay(ModelSize::Small, None, cancel_token.clone(), true, None).await?;
 
         // 2. Ingest PUG content
         {
@@ -439,7 +451,7 @@ impl LogisModel {
         }
 
         // 3. Save Base Snapshot
-        self.save_kv_snapshot(&base_session).await?;
+        self.save_kv_snapshot(&base_session, kv_name, 0).await?;
         
         // 4. Unload immediately to free VRAM for 2B
         self.unload_generator().await;
@@ -466,7 +478,7 @@ impl LogisModel {
             }
         }
 
-        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false).await
+        self.secure_vram_relay(ModelSize::Large, Some(&base_session), cancel_token, false, None).await
     }
 
     async fn load_generator_internal(&self, path: &str, shared_config_path: Option<&str>, force_text_only: bool) -> anyhow::Result<Qwen3VLGenerateModel> {
@@ -743,7 +755,8 @@ impl LogisModel {
                 json!({ "category": "Vision Analysis", "summary": "Analyzing image with baked context..." }), 
                 1024, 
                 cancel_token.clone(), 
-                Some(task_id.clone()) 
+                Some(task_id.clone()),
+                None
             ).await?;
 
             let extracted_data = crate::parsing::parse_json_from_llm(&result_str);
@@ -808,7 +821,7 @@ impl LogisModel {
         self.is_cpu_mode
     }
 
-    pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
+    pub async fn chat(&self, system: &str, user_input: &str, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
         // [FIX] Use current generator if available, else default to Large
         {
             let gen_guard = self.generator.lock().await;
@@ -854,7 +867,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
         }).await?
@@ -869,7 +882,8 @@ impl LogisModel {
         base_payload: Value,
         max_tokens: usize,
         cancel_token: Option<Arc<AtomicBool>>,
-        session_id: Option<String>
+        session_id: Option<String>,
+        kv_name: Option<String>
     ) -> anyhow::Result<String> {
         let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
             content: system.to_string(),
@@ -896,7 +910,7 @@ impl LogisModel {
             ..Default::default()
         };
 
-        self.chat_params_with_spinner(params, app_handle, event_name, base_payload, cancel_token, session_id).await
+        self.chat_params_with_spinner(params, app_handle, event_name, base_payload, cancel_token, session_id, kv_name).await
     }
 
     pub async fn chat_params_with_spinner(
@@ -906,7 +920,8 @@ impl LogisModel {
         _event_name: &str,
         mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
-        session_id: Option<String>
+        session_id: Option<String>,
+        kv_name: Option<String>
     ) -> anyhow::Result<String> {
         // [FIX] Do not force reload Large. Use current if available, else default to Large.
         {
@@ -940,7 +955,7 @@ impl LogisModel {
         let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = self_clone.blocking_lock();
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         task.await.map_err(|e| anyhow!("Task join error: {}", e))?
@@ -955,7 +970,8 @@ impl LogisModel {
         _base_payload: Value,
         max_tokens: usize,
         cancel_token: Option<Arc<AtomicBool>>,
-        session_id: Option<String>
+        session_id: Option<String>,
+        kv_name: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator(ModelSize::Large).await?;
@@ -1002,13 +1018,13 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
         });
 
         task.await.map_err(|e| anyhow!("Task join error: {}", e))?
     }
 
-    async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>) -> anyhow::Result<String> {
+    async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
         self.ensure_generator(ModelSize::Large).await?;
         
         let mut gen_guard = self.generator.lock().await;
@@ -1047,7 +1063,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
@@ -1058,7 +1074,8 @@ impl LogisModel {
         _event_name: &str,
         mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
-        session_id: Option<String>
+        session_id: Option<String>,
+        kv_name: Option<String>
     ) -> anyhow::Result<String> {
         // Ensure generator is loaded
         self.ensure_generator(ModelSize::Large).await?;
@@ -1115,7 +1132,7 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            gen.generate(params, cancel_token, session_id).map_err(|e| anyhow!("Inference failed: {}", e))
+            gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
         });
         
         task.await.map_err(|e| anyhow!("Task join error: {}", e))?
@@ -1139,6 +1156,7 @@ impl LogisModel {
             "extraction-progress", 
             json!({ "category": "Processing", "summary": "Analyzing document content..." }),
             cancel_token,
+            None,
             None
         ).await?;
 
@@ -1170,7 +1188,7 @@ impl LogisModel {
         
         // Stage 1: Segment query (para2graph) - Using persistent session for schema caching
         let prompt1 = crate::parsing::para2graph(language);
-        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, Some("system_search_p2g".to_string())).await?;
+        let res1 = self.chat("", &format!("{}\n\nQuery: {}", prompt1, query), None, Some("system_search_p2g".to_string()), None).await?;
         let segments = crate::parsing::parse_json_from_llm(&res1);
         
         // Stage 2: Extract conditions for each segment (graph2contexts) in ONE BATCH
@@ -1186,7 +1204,7 @@ impl LogisModel {
             if !combined_segments.is_empty() {
                 let prompt2 = crate::parsing::graph2contexts(&current_time);
                 // Using persistent session for schema caching
-                let res2 = self.chat("", &format!("{}\n\nInput Segments:\n{}", prompt2, combined_segments), None, Some("system_search_g2c".to_string())).await?;
+                let res2 = self.chat("", &format!("{}\n\nInput Segments:\n{}", prompt2, combined_segments), None, Some("system_search_g2c".to_string()), None).await?;
                 let mut batch_info = crate::parsing::parse_json_from_llm(&res2);
                 
                 // Process results and ensure type parity
@@ -1234,7 +1252,7 @@ impl LogisModel {
             let prompt = format!("Given this context: {}\n\nTask: {}\nQuery: {}\n\nProvide deep insight for this specific step.", context_data, step, query);
             
             // In a real implementation, we might want to stream this too, but for now we wait for the step result
-            let step_result = self.run_inference_text(prompt, None, cancel_token.clone(), None).await?;
+            let step_result = self.run_inference_text(prompt, None, cancel_token.clone(), None, None).await?;
             
             let short_res = if step_result.len() > 200 { &step_result[..200] } else { &step_result };
             status_history.push_str(&format!("> {}...\n\n", short_res.replace("\n", " ")));
@@ -1246,7 +1264,7 @@ impl LogisModel {
         status_history.push_str("### 📊 Final Research Report\n\n");
         let final_prompt = format!("CONTEXT: {}\nQUERY: {}\n\nBased on the above steps, generate a comprehensive final trade intelligence report.", context_data, query);
         
-        let report = self.run_inference_text(final_prompt, None, cancel_token, None).await?;
+        let report = self.run_inference_text(final_prompt, None, cancel_token, None, None).await?;
         status_history.push_str(&report);
         
         // [LOG-ONLY]

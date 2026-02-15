@@ -6,10 +6,6 @@ use crate::logic;
 use crate::utils;
 use crate::parsing::{self, PugMode};
 use crate::model::LogisModel;
-use crate::openai_types::{
-    ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent,
-};
 use serde_json::{Value, json};
 use anyhow::Result;
 use tauri::Emitter;
@@ -376,6 +372,12 @@ async fn process_task(
     let mut data_manager = TaskDataManager::new(&task.id, Some(app_handle.clone()));
 
     let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    // [FIX] 작업 유형에 따라 파일명을 자동으로 결정합니다.
+    let kv_name = if task.r#type == "image_extraction" {
+        Some("img".to_string())
+    } else {
+        Some("pug".to_string())
+    };
     
     // [FIX] Robust device preference parsing (supports both "cpu" string and true/false boolean)
     let task_device_pref = if let Some(v) = task_data.get("device_preference") {
@@ -431,7 +433,7 @@ async fn process_task(
             log_task_progress(app_handle, &task.id, &json!({ "category": "Baking", "summary": "Baking visual context (1-Layer 2B)...", "spinner": "⠋" }));
             
             // Activate 2B in Baking mode (1 layer, no MLP)
-            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, None, Some(cancellation_token.clone()), true, None).await?;
             
             // Perform prefill with image to create visual KV cache
             let model_clone = model.clone();
@@ -439,6 +441,7 @@ async fn process_task(
             let prompt_clone = prompt.clone();
             let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
+            let kv_name_clone = kv_name.clone();
 
             use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestMessageContentPartImage, ImageURL};
 
@@ -465,18 +468,18 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
                 }
                 Ok(())
             }).await??;
 
-            model.save_kv_snapshot(&snapshot_id).await?;
+            model.save_kv_snapshot(&snapshot_id, kv_name.clone(), 0).await?;
 
             // 2. [Full Vision] Reload full 2B model and inject baked cache
             log_task_progress(app_handle, &task.id, &json!({ "category": "Vision", "summary": "Finalizing analysis with full 2B-VL...", "spinner": "⠋" }));
             
             // Transition to full Large model with the baked snapshot
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             model.extract_from_image(
                 task.id.clone(),
@@ -597,12 +600,13 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake FULL Templated Prompt
             println!("[Scheduler] Phase 1: Baking Full Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
             
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
+            let kv_name_clone = kv_name.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut gen_guard = model_clone.generator.blocking_lock();
@@ -615,7 +619,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
                 }
                 Ok(())
             }).await??;
@@ -625,7 +629,7 @@ async fn process_task(
 
         // 2. [2B] Load Snapshot & Bake Task
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -636,10 +640,11 @@ async fn process_task(
                 ..Default::default()
             };
 
-                                    if let Some(gen) = model.generator.lock().await.as_mut() {
-                                        println!("[Scheduler] 2B Step A: Asking classification question...");
-                                        let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
-                                        println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);                            
+                        if let Some(gen) = model.generator.lock().await.as_mut() {
+                            println!("[Scheduler] 2B Step A: Asking classification question...");
+                            let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone())?;
+                            println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
+                            
                             // [DEBUG] AI 응답 저장
                             let _ = data_manager.offload(&res, "step_a_res");
             
@@ -688,11 +693,12 @@ async fn process_task(
         if !has_snapshot {
             // 1. [0.6B] Bake Full Context
             println!("[Scheduler] Phase 1: Baking Selector Context with 0.6B...");
-            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
             let model_clone = model.clone();
             let question_clone = task_question.clone();
             let token_clone = cancellation_token.clone();
             let session_clone = Some(snapshot_id.clone());
+            let kv_name_clone = kv_name.clone();
 
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut gen_guard = model_clone.generator.blocking_lock();
@@ -705,7 +711,7 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
                 }
                 Ok(())
             }).await??;
@@ -715,7 +721,7 @@ async fn process_task(
 
         // 2. [2B] Load & Generate
         {
-            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+            model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
             let params = ChatCompletionParameters {
                 messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -728,7 +734,7 @@ async fn process_task(
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 2B Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
+                let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone())?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -838,11 +844,12 @@ async fn process_task(
                 println!("[Scheduler] Phase 1: Baking Detail Context with 0.6B...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Context Baking", "summary": "Baking content with 0.6B model..." }));
                 
-                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Small, None, Some(cancellation_token.clone()), true, None).await?;
                 let model_clone = model.clone();
                 let question_clone = task_question.clone();
                 let token_clone = cancellation_token.clone();
                 let session_clone = Some(snapshot_id.clone());
+                let kv_name_clone = kv_name.clone();
 
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut gen_guard = model_clone.generator.blocking_lock();
@@ -855,7 +862,7 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
-                        worker.prefill_only(params, Some(token_clone), session_clone, None)?;
+                        worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
                     }
                     Ok(())
                 }).await??;
@@ -865,7 +872,7 @@ async fn process_task(
 
             // 2. [2B] Load & Generate
             {
-                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false).await?;
+                model.secure_vram_relay(crate::model::ModelSize::Large, Some(&snapshot_id), Some(cancellation_token.clone()), false, kv_name.clone()).await?;
 
                 let params = ChatCompletionParameters {
                     messages: vec![ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
@@ -881,7 +888,7 @@ async fn process_task(
                     println!("[Scheduler] 2B Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()))?;
+                    let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone())?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장

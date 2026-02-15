@@ -27,6 +27,101 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::fs;
 use std::path::Path;
 
+use std::path::PathBuf;
+use tokio::sync::mpsc;
+
+struct LayerKVDump {
+    layer_idx: usize,
+    k: Tensor,
+    v: Tensor,
+}
+
+struct BakeTask {
+    task_dir: PathBuf,
+    kv_name: Option<String>,
+    offset: usize,
+    layers: Vec<LayerKVDump>,
+}
+
+fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
+    tokio::spawn(async move {
+        println!("[BAKE-WORKER] Background KV storage worker started.");
+        while let Some(task) = rx.recv().await {
+            let task_dir = task.task_dir;
+            let kv_name = task.kv_name;
+            let offset = task.offset;
+            
+            println!("[BAKE-WORKER] Saving block at offset {}...", offset);
+            
+            for layer in task.layers {
+                let filename = match (&kv_name, offset) {
+                    (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
+                    (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
+                    (None, 0) => format!("layer_{}_kv.safetensors", layer.layer_idx),
+                    (None, off) => format!("layer_{}_kv_{}.safetensors", layer.layer_idx, off),
+                };
+                let path = task_dir.join(filename);
+                
+                // --- Manual BitKV Compression (Worker Thread) ---
+                let mut map = std::collections::HashMap::new();
+                
+                let process_tensor = |t: Tensor, prefix: &str, target_map: &mut std::collections::HashMap<String, Tensor>| {
+                    if let Ok(dims) = t.dims4() {
+                        let (b, h, s, d) = dims;
+                        if let Ok(t_f32) = t.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
+                            if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                                let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                                let mut anchors = vec![0.0f32; b * h * anchor_count * d];
+                                let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
+                                let mut scales = vec![0.0f32; b * h * s];
+
+                                // Bit Packing & Anchors/Scales (Simplified loop for worker)
+                                let head_token_size = s * d;
+                                for bh_idx in 0..(b * h) {
+                                    let bh_offset = bh_idx * head_token_size;
+                                    for i in 0..head_token_size {
+                                        if t_data[bh_offset + i] >= 0.0 {
+                                            packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8);
+                                        }
+                                    }
+                                    
+                                    for token_idx in 0..s {
+                                        let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+                                        if token_idx < 4 || token_idx % 8 == 0 {
+                                            let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                                            anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
+                                        }
+                                        let mut max_abs = 0.0f32;
+                                        for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                        scales[bh_idx * s + token_idx] = max_abs;
+                                    }
+                                }
+
+                                if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { target_map.insert(format!("{}_anchors", prefix), at); }
+                                let packed_len = packed_residuals.len();
+                                if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { target_map.insert(format!("{}_packed", prefix), pt); }
+                                if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { target_map.insert(format!("{}_scales", prefix), st); }
+                                if prefix == "k" {
+                                    if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { target_map.insert("k_shape".to_string(), sh); }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let _ = process_tensor(layer.k, "k", &mut map);
+                let _ = process_tensor(layer.v, "v", &mut map);
+                if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
+                    map.insert("mode".to_string(), mode_tensor);
+                }
+
+                let _ = candle_core::safetensors::save(&map, &path); 
+            }
+        }
+        println!("[BAKE-WORKER] Worker finished.");
+    });
+}
+
 #[derive(Clone)]
 pub enum ModelVariant {
     Standard(crate::models::qwen3vl::model::Qwen3VLModel),
@@ -252,7 +347,7 @@ impl Qwen3VLGenerateModel {
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
-            if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path); }
+            if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path, None, end); }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
                 let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
@@ -283,7 +378,7 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
-    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>) -> Result<usize> {
+    pub fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, kv_name: Option<String>) -> Result<usize> {
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
@@ -309,7 +404,7 @@ impl Qwen3VLGenerateModel {
                 if !path.exists() { let _ = fs::create_dir_all(&path); }     
                 
                 // 1. Save to disk
-                self.save_kv_to_disk(&path)?;
+                self.save_kv_to_disk(&path, kv_name.as_deref(), chunk_end)?;
                 
                 // 2. Purge from VRAM
                 println!("[BAKING] Segment saved. Resetting memory for token {}.", chunk_end);
@@ -353,7 +448,7 @@ impl Qwen3VLGenerateModel {
         if let Some(sid) = session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if !path.exists() { let _ = fs::create_dir_all(&path); }
-            self.save_kv_to_disk(&path)?;
+            self.save_kv_to_disk(&path, kv_name.as_deref(), current_pos)?;
             let token_path = path.join("tokens.json");
             if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
         }
@@ -393,7 +488,7 @@ impl Qwen3VLGenerateModel {
         Ok(chunk_size)
     }
 
-    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
+    pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> Result<String> {
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let top_p = mes.top_p.unwrap_or(0.9) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
@@ -409,7 +504,7 @@ impl Qwen3VLGenerateModel {
                 if let Ok(data) = std::fs::read_to_string(&progress_path) {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
                         println!("[RESUME] Found progress. Loading...");
-                        let _ = self.load_kv_from_disk(&path);
+                        let _ = self.load_kv_from_disk(&path, kv_name.as_deref());
                         seqlen_offset = self.get_kv_len();
                         generated_text = json["text"].as_str().unwrap_or("").to_string();
                         if let Some(ids) = json["ids"].as_array() { all_ids = ids.iter().map(|v| v.as_u64().unwrap_or(0) as u32).collect(); }
@@ -428,7 +523,7 @@ impl Qwen3VLGenerateModel {
             if seqlen_offset == 0 {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    if path.exists() { self.load_kv_from_disk(&path)?; seqlen_offset = self.get_kv_len(); }
+                    if path.exists() { self.load_kv_from_disk(&path, kv_name.as_deref())?; seqlen_offset = self.get_kv_len(); }
                 }
             }
         }
@@ -452,7 +547,7 @@ impl Qwen3VLGenerateModel {
             if seqlen_offset % 1024 == 0 {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    let _ = self.save_kv_to_disk(&path);
+                    let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
                     println!("[GEN-PREFILL] Checkpoint at {}", seqlen_offset);
                 }
             }
@@ -462,8 +557,48 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
+        // [WINDOW-BAKE] Setup async channel for background saving (Queue size: 10)
+        let (bake_tx, bake_rx) = mpsc::channel(10);
+        spawn_bake_worker(bake_rx);
+        let task_dir_base = if let Some(sid) = &session_id {
+            crate::utils::paths::get_kv_dir(None).join(sid)
+        } else {
+            std::path::PathBuf::new()
+        };
+
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
+            // [WINDOW-BAKE] Trigger dump and truncate every 1024 tokens
+            if seqlen_offset > 0 && seqlen_offset % 1024 == 0 && !task_dir_base.as_os_str().is_empty() {
+                println!("[WINDOW-BAKE] 1024 boundary hit. Offloading past block to disk worker.");
+                let (ks, vs) = self.get_current_kv();
+                let mut layer_dumps = Vec::new();
+                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                    // Capture only the 1024 block that just finished
+                    if k.dim(2)? >= 1024 {
+                        let k_slice = k.narrow(2, 0, 1024)?.contiguous()?;
+                        let v_slice = v.narrow(2, 0, 1024)?.contiguous()?;
+                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
+                    }
+                }
+                
+                if !layer_dumps.is_empty() {
+                    let task = BakeTask {
+                        task_dir: task_dir_base.clone(),
+                        kv_name: kv_name.clone(),
+                        offset: seqlen_offset - 1024,
+                        layers: layer_dumps,
+                    };
+                    // Use blocking_send since we are in a worker thread (spawn_blocking)
+                    let _ = bake_tx.blocking_send(task);
+                    
+                    // CRITICAL: Free VRAM immediately
+                    println!("[WINDOW-BAKE] Truncating 1024 tokens from VRAM memory.");
+                    let _ = self.truncate_kv_cache(1024);
+                }
+            }
+
             let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
                 Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
             } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
@@ -480,7 +615,7 @@ impl Qwen3VLGenerateModel {
             if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    let _ = self.save_kv_to_disk(&path);
+                    let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
                     let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
                     let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
                     println!("[GEN] Checkpoint at {}", i);
@@ -519,18 +654,26 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-    pub fn save_kv_to_disk(&mut self, path: &Path) -> Result<()> {
+    pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, 1024),
-            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, 1024),
+            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, offset, kv_name),
+            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, offset, kv_name),
             _ => Ok(()),
         }
     }
 
-    pub fn load_kv_from_disk(&mut self, path: &Path) -> Result<()> {
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128),
-            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128),
+            ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(len),
+            ModelVariant::QuantizedText(m) => m.truncate_kv_cache(len),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
             _ => Ok(()),
         }
     }
