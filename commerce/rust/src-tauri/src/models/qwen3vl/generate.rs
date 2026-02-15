@@ -531,26 +531,50 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
-        let prefill_chunk_size = 128;
+        
+        // [HARD-SWAP-CONFIG] Constant memory usage strategy
+        let window_keep_size = 1024; 
+        let bake_block_size = 128;
 
+        // [PHASE-1: Granular Prefill] Offload prompt chunks immediately to SSD
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
             if remaining == 1 { break; }
-            let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
+            let mut chunk_size = if remaining > bake_block_size { bake_block_size } else { remaining };
             if local_pos + chunk_size >= total_tokens { chunk_size = (total_tokens - local_pos).saturating_sub(1); }
             if chunk_size == 0 { break; }
+            
             let chunk = &full_input_ids_vec[local_pos..local_pos + chunk_size];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
+            
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+            
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
-            if seqlen_offset % 1024 == 0 {
-                if let Some(sid) = &session_id {
-                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
-                    println!("[GEN-PREFILL] Checkpoint at {}", seqlen_offset);
+
+            // Immediate Offload & Purge during prefill
+            if let Some(sid) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
+                
+                // Keep only the window, purge the rest using HARD RESET
+                let current_kv_len = self.get_kv_len();
+                if current_kv_len > window_keep_size {
+                    let purge_len = current_kv_len - window_keep_size;
+                    // Trigger the newly upgraded Hard Reset truncate
+                    let _ = self.truncate_kv_cache(purge_len);
+                    
+                    // Force GPU and OS sync to see immediate capacity change
+                    if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                        use windows_sys::Win32::System::Memory::*;
+                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                    }
                 }
             }
         }
@@ -559,56 +583,37 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
-        // [WINDOW-BAKE] Setup async channel for background saving (Queue size: 10)
-        let (bake_tx, bake_rx) = mpsc::channel(10);
-        spawn_bake_worker(bake_rx);
+        // [PHASE-2: Constant-Speed Generation with Hard Swap]
+        // Use synchronous saving to ensure disk is updated immediately
         let task_dir_base = if let Some(sid) = &session_id {
-            crate::utils::paths::get_kv_dir(None).join(sid)
+            // [FIX] Ensure we use the correct task data directory
+            crate::utils::paths::get_task_specific_dir(None, sid)
         } else {
             std::path::PathBuf::new()
         };
 
-        // [SLIDING-WINDOW-CONFIG] 512 block size for more granular management
-        let window_keep_size = 1024; // 2 blocks of 512 (Keep very lean)
-        let bake_block_size = 512;
-
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [WINDOW-BAKE] Trigger dump every 512 tokens
+            // [HARD-SWAP-INFERENCE] Trigger every 128 tokens
             if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
-                println!("[WINDOW-BAKE] {} boundary hit. Offloading 512-token block to disk.", seqlen_offset);
-                let (ks, vs) = self.get_current_kv();
-                let mut layer_dumps = Vec::new();
+                // Synchronous Save to Disk
+                if !task_dir_base.exists() { let _ = std::fs::create_dir_all(&task_dir_base); }
+                self.save_kv_to_disk(&task_dir_base, kv_name.as_deref(), seqlen_offset)?;
                 
-                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    let current_mem_len = k.dim(2)?;
-                    if current_mem_len >= bake_block_size {
-                        let k_slice = k.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
-                        let v_slice = v.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
-                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
-                    }
-                }
-                
-                if !layer_dumps.is_empty() {
-                    let task = BakeTask {
-                        task_dir: task_dir_base.clone(),
-                        kv_name: kv_name.clone().or_else(|| Some("default".to_string())),
-                        offset: seqlen_offset - bake_block_size,
-                        layers: layer_dumps,
-                    };
-                    let _ = bake_tx.blocking_send(task);
+                // Hard Reset Memory
+                let current_kv_len = self.get_kv_len();
+                if current_kv_len > window_keep_size {
+                    let purge_len = current_kv_len - window_keep_size;
+                    let _ = self.truncate_kv_cache(purge_len);
                     
-                    // [SLIDING-WINDOW-PURGE] Keep recent 10 blocks in RAM
-                    let current_kv_len = self.get_kv_len();
-                    if current_kv_len > window_keep_size {
-                        let purge_len = current_kv_len - window_keep_size;
-                        let aligned_purge = (purge_len / bake_block_size) * bake_block_size;
-                        if aligned_purge > 0 {
-                            println!("[WINDOW-BAKE] Purging {} old tokens. (RAM: {} / Disk: 0-{})", 
-                                aligned_purge, window_keep_size, seqlen_offset - window_keep_size);
-                            let _ = self.truncate_kv_cache(aligned_purge);
-                        }
+                    // Force Release to OS
+                    if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                        use windows_sys::Win32::System::Memory::*;
+                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                     }
                 }
             }

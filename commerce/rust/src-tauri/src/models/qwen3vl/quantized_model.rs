@@ -589,8 +589,16 @@ impl QuantizedQwen3VLTextAttention {
             if len >= total_len {
                 self.kv_cache = None;
             } else {
-                let new_k = k.narrow(2, len, total_len - len)?.contiguous()?;
-                let new_v = v.narrow(2, len, total_len - len)?.contiguous()?;
+                // [HARD-RESET-STRATEGY] 
+                // Don't just slice (narrow). Slicing often keeps the parent storage alive.
+                // We create a FRESH tensor copy and let the old one be dropped.
+                let new_k = k.narrow(2, len, total_len - len)?.contiguous()?.clone();
+                let new_v = v.narrow(2, len, total_len - len)?.contiguous()?.clone();
+                
+                // Explicitly clear the old cache to trigger drop of the large tensors
+                self.kv_cache = None; 
+                
+                // Assign the fresh, small tensors
                 self.kv_cache = Some((new_k, new_v));
             }
         }
