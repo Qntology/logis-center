@@ -20,9 +20,9 @@ impl Default for Qwen3VLGenerationConfig {
             bos_token_id: 151643,
             eos_token_id: serde_json::json!([151643, 151645]),
             pad_token_id: 151643,
-            repetition_penalty: 1.0,
-            temperature: 0.9,
-            top_k: 20,
+            repetition_penalty: 0.0,
+            temperature: 0.0,
+            top_k: 1,
             top_p: 0.9,
             transformers_version: "4.45.0".to_string(),
         }
