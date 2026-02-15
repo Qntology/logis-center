@@ -1247,9 +1247,9 @@ impl QuantizedQwen3VLTextModel {
                 layer.to_device(&target_device)?;
             }
 
-            println!("[TRACE-L{}] Calling layer.forward...", layer_idx);
+            // println!("[TRACE-L{}] Calling layer.forward...", layer_idx);
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
-            println!("[TRACE-L{}] layer.forward finished.", layer_idx);
+            // println!("[TRACE-L{}] layer.forward finished.", layer_idx);
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -1264,20 +1264,20 @@ impl QuantizedQwen3VLTextModel {
 
             // GPU Sync to ensure computation is 100% done before save starts
             if target_device.is_cuda() { 
-                println!("[TRACE-L{}] Synchronizing GPU...", layer_idx);
+                // println!("[TRACE-L{}] Synchronizing GPU...", layer_idx);
                 let _ = target_device.synchronize(); 
             }
 
             // 2. [B: Backing Up] Start Save
             if let Some(sid) = &self.active_session_id {
-                println!("[TRACE-L{}] Mandatory save triggered for sid: {}", layer_idx, sid);
+                // println!("[TRACE-L{}] Mandatory save triggered for sid: {}", layer_idx, sid);
                 let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                 if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
                 let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
                 let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
                 
-                println!("[TRACE-L{}] Copying tensor to CPU for saving...", layer_idx);
+                // println!("[TRACE-L{}] Copying tensor to CPU for saving...", layer_idx);
                 let xs_cpu = xs.to_device(&Device::Cpu)?;
                 
                 if num_layers == 1 {
@@ -1321,7 +1321,7 @@ impl QuantizedQwen3VLTextModel {
         println!("[TRACE] All layers done. Finalizing saves...");
         // Final Wait for all remaining saves before returning
         for (idx, handle, _) in save_handles {
-            println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
+            // println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
             let _ = futures::executor::block_on(handle);
         }
         

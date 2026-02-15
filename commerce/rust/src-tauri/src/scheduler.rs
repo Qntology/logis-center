@@ -263,7 +263,7 @@ pub async fn start_background_worker(
                                 {
                                     let mut model_lock = model.lock().await;
                                     if let Some(m) = model_lock.as_ref() {
-                                        m.unload_generator().await;
+                                        m.deep_purge_resources().await;
                                     }
                                     *model_lock = None;
                                     println!("[Scheduler] Error detected. Emergency memory release performed: {}", err_msg);
@@ -293,7 +293,7 @@ pub async fn start_background_worker(
                                         {
                                             let mut model_lock = model.lock().await;
                                             if let Some(m) = model_lock.as_ref() {
-                                                let _ = m.unload_generator().await;
+                                                let _ = m.deep_purge_resources().await;
                                             }
                                             *model_lock = None; 
                                         }
@@ -403,7 +403,7 @@ async fn process_task(
             let wants_cpu = effective_device_pref == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
                 println!("[Scheduler] Device preference mismatch (Current CPU: {}, Wants CPU: {}). Reloading model...", m.is_cpu_mode, wants_cpu);
-                m.unload_generator().await;
+                m.deep_purge_resources().await;
                 *model_lock = None;
             }
         }
@@ -662,7 +662,7 @@ async fn process_task(
         }
         
         if page_type.is_empty() || page_type == "unknown" { 
-            model.unload_generator().await;
+            model.deep_purge_resources().await;
             return Ok(()); 
         }
     }
@@ -908,7 +908,7 @@ async fn process_task(
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model..." }));
         
         // 1. Explicitly Unload 2B to free VRAM for Embedding Model
-        model.unload_generator().await;
+        model.deep_purge_resources().await;
         
         // 2. Wait for VRAM to settle (Driver latency)
         wait_for_resources_settled(1200, 800, Some(cancellation_token)).await?;
@@ -1127,30 +1127,31 @@ async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, can
             break; // Perfect state reached
         }
 
-        // [STABILITY-LOGIC] Even if below target, if memory release has STstopped changing,
+        // [STABILITY-LOGIC] Even if below target, if memory release has stopped changing,
         // it means we've recovered all we can. Don't wait forever.
         let delta = if current_vram > last_vram { current_vram - last_vram } else { last_vram - current_vram };
-        if delta < 5_000_000 { // Change < 5MB
+        if delta < 10_000_000 { // Change < 10MB (more lenient)
             stable_ticks += 1;
         } else {
             stable_ticks = 0;
         }
 
-        // If stable for 3 seconds AND we have at least 1.2GB free (enough for Large model weights)
-        if stable_ticks >= 6 && current_vram > 1_200_000_000 {
-            println!("[RESOURCE-WATCH] Memory stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
+        // [FAST-EXIT] If stable for 1.5 seconds OR we have at least 600MB free (enough for Embedding/0.6B)
+        // This prevents being stuck at 0.7GB when target is 1.1GB.
+        if (stable_ticks >= 3 && current_vram > 600_000_000) || current_vram > target_vram_bytes {
+            println!("[RESOURCE-WATCH] Memory sufficient or stabilized. Proceeding with {:.2} GB free VRAM.", current_vram as f64 / 1e9);
             break;
         }
 
-        if last_report.elapsed().as_secs() >= 5 {
+        if last_report.elapsed().as_secs() >= 2 { // Faster reporting
             println!("[RESOURCE-DIAG] Waiting... VRAM: {:.2} GB free (Target: {:.2} GB)", 
                 current_vram as f64 / 1e9, target_vram_mb as f64 / 1024.0);
             last_report = std::time::Instant::now();
         }
 
-        // Absolute maximum wait 20s
-        if start_time.elapsed().as_secs() > 20 {
-            println!("[RESOURCE-WATCH] Max wait reached. Proceeding anyway.");
+        // Absolute maximum wait 10s (reduced from 20s)
+        if start_time.elapsed().as_secs() > 10 {
+            println!("[RESOURCE-WATCH] Timeout or sufficient VRAM reached. Proceeding.");
             break;
         }
 

@@ -207,7 +207,7 @@ impl LogisModel {
         }
     }
 
-    /// [CLEANUP] Aggressive Factory Reset Purge
+    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced)
     pub async fn deep_purge_resources(&self) {
         println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
         
@@ -215,22 +215,36 @@ impl LogisModel {
         {
             let mut gen = self.generator.lock().await;
             if let Some(mut g) = gen.take() {
+                println!("[MEMORY] Purging Active Generator...");
                 let _ = g.clear_kv_cache();
-                let _ = g.qwen3_vl.drop_kv_storage(); // Force drop heavy tensors
+                let _ = g.qwen3_vl.drop_kv_storage(); 
                 drop(g); 
             }
         }
         {
             let mut s_hib = self.small_hibernation.lock().await;
-            if let Some(g) = s_hib.take() { drop(g); }
+            if let Some(mut g) = s_hib.take() { 
+                println!("[MEMORY] Purging Small Hibernation...");
+                let _ = g.clear_kv_cache();
+                let _ = g.qwen3_vl.drop_kv_storage();
+                drop(g); 
+            }
         }
         {
             let mut l_hib = self.large_hibernation.lock().await;
-            if let Some(g) = l_hib.take() { drop(g); }
+            if let Some(mut g) = l_hib.take() { 
+                println!("[MEMORY] Purging Large Hibernation...");
+                let _ = g.clear_kv_cache();
+                let _ = g.qwen3_vl.drop_kv_storage();
+                drop(g); 
+            }
         }
         {
             let mut emb = self.embedding_model.lock().await;
-            if let Some(e) = emb.take() { drop(e); }
+            if let Some(e) = emb.take() { 
+                println!("[MEMORY] Purging Embedding Model...");
+                drop(e); 
+            }
         }
         {
             let mut size = self.current_size.lock().await;
@@ -242,6 +256,7 @@ impl LogisModel {
             let dev = self.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if dev.is_cuda() { 
+                    println!("[MEMORY] Synchronizing CUDA for purge...");
                     let _ = dev.synchronize(); 
                 }
             }).await;
@@ -253,12 +268,14 @@ impl LogisModel {
             use windows_sys::Win32::System::Threading::*;
             use windows_sys::Win32::System::Memory::*;
             let current_process = GetCurrentProcess();
-            // Force return physical RAM back to OS once
+            println!("[MEMORY] Flushing OS Working Set (Aggressive)...");
+            // Force return physical RAM back to OS
             let _ = SetProcessWorkingSetSizeEx(current_process, usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            std::thread::yield_now(); // Give OS time to react
         }
 
         println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
