@@ -258,7 +258,7 @@ impl LogisModel {
         }
 
         println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
@@ -352,9 +352,9 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 println!("[SSD-BRIDGE] Saving KV snapshot to {:?}", path);
-                gen.save_kv_to_disk(&path, true)?;
+                gen.save_kv_to_disk(&path)?;
                 Ok(path.to_string_lossy().to_string())
             } else {
                 Err(anyhow::anyhow!("No active generator to save snapshot from"))
@@ -369,10 +369,10 @@ impl LogisModel {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let mut gen_guard = generator_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
-                let path = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+                let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
                 if path.exists() {
                     println!("[SSD-BRIDGE] Loading KV snapshot from {:?}", path);
-                    gen.load_kv_from_disk(&path, true)?;
+                    gen.load_kv_from_disk(&path)?;
                     Ok(())
                 } else {
                     println!("[SSD-BRIDGE] No snapshot found for {}", task_id_str);
@@ -428,12 +428,11 @@ impl LogisModel {
             // We use prefill_only via a manual chat construct or direct access if possible
             // Reusing chat_params_with_spinner for convenience but with empty generation
             
-            let sid_clone = base_session.clone();
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let mut gen_guard = gen_clone.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
                     // Just prefill, no generation needed for base context
-                    gen.prefill_chunk(prompt, token_clone, None, Some(sid_clone))?;
+                    gen.prefill_chunk(prompt, token_clone, None)?;
                 }
                 Ok(())
             }).await??;
