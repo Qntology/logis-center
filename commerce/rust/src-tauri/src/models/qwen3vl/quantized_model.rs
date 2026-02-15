@@ -1179,6 +1179,7 @@ impl QuantizedQwen3VLTextModel {
         };
 
         // [SMART-SEQUENTIAL-LOOP]
+        println!("[TRACE] Entering layer loop. Total layers: {}", self.layers.len());
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
@@ -1189,7 +1190,9 @@ impl QuantizedQwen3VLTextModel {
                 layer.to_device(&target_device)?;
             }
 
+            println!("[TRACE-L{}] Calling layer.forward...", layer_idx);
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
+            println!("[TRACE-L{}] layer.forward finished.", layer_idx);
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -1203,7 +1206,10 @@ impl QuantizedQwen3VLTextModel {
             }
 
             // GPU Sync to ensure computation is 100% done before save starts
-            if !is_pinned && target_device.is_cuda() { target_device.synchronize()?; }
+            if !is_pinned && target_device.is_cuda() { 
+                println!("[TRACE-L{}] Synchronizing GPU...", layer_idx);
+                target_device.synchronize()?; 
+            }
 
             // 2. [B: Backing Up] Start Async Save
             if !is_pinned {
@@ -1217,6 +1223,7 @@ impl QuantizedQwen3VLTextModel {
                     
                     // Atomic move logic: Save to .tmp first, then rename
                     let xs_to_save = xs.clone();
+                    println!("[TRACE-L{}] Spawning async save task...", layer_idx);
                     let handle = tokio::task::spawn_blocking(move || -> Result<usize> {
                         crate::utils::tensor_utils::save_tensor(&tmp_path, "hidden_states", &xs_to_save)?;
                         std::fs::rename(&tmp_path, &final_path)?;
@@ -1237,8 +1244,10 @@ impl QuantizedQwen3VLTextModel {
             while save_handles.len() > tight_window {
                 if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
                     // Wait for disk confirmation (Ack)
+                    println!("[TRACE-L{}] Waiting for background save to finish...", old_idx);
                     match futures::executor::block_on(handle) {
                         Ok(Ok(_)) => {
+                            println!("[TRACE-L{}] Save confirmed. Purging memory.", old_idx);
                             // 1. Release reference
                             drop(old_xs);
                             
@@ -1270,19 +1279,24 @@ impl QuantizedQwen3VLTextModel {
                     }
                 }
             }
+            println!("[TRACE-L{}] Loop iteration finished.", layer_idx);
         }
 
+        println!("[TRACE] All layers done. Waiting for remaining saves...");
         // Final Wait for all remaining saves before returning
-        for (_idx, handle, _) in save_handles {
+        for (idx, handle, _) in save_handles {
+            println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
             let _ = futures::executor::block_on(handle);
         }
         
         self.current_kv_len = seqlen_offset + seq_len;
+        println!("[TRACE] Final norm.forward starting...");
         let norm_dev = self.norm.weight().device();
         if !xs.device().same_device(norm_dev) {
             xs = xs.to_device(norm_dev)?;
         }
         let xs = xs.apply(&self.norm)?;
+        println!("[TRACE] All forward pass steps complete.");
         Ok(xs)
     }
 
