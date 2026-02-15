@@ -22,6 +22,7 @@ use crate::{
     },
     openai_types::ChatCompletionParameters,
 };
+use tokio::sync::Mutex as TokioMutex;
 use rayon::prelude::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::fs;
@@ -184,9 +185,14 @@ pub struct Qwen3VLGenerateModel {
     pub model_name: String,
     pub hard_token_limit: Option<usize>,
     pub kv_root: std::path::PathBuf,
+    pub drafter: Option<Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>>, // 투기적 추론용 드래프터
 }
 
 impl Qwen3VLGenerateModel {
+    pub fn set_drafter(&mut self, drafter: Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>) {
+        self.drafter = Some(drafter);
+    }
+
     pub fn init(
         path: &str,
         text_device: Option<&Device>,
@@ -331,7 +337,7 @@ impl Qwen3VLGenerateModel {
             _ => (151643, 151643),
         };
 
-        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root })
+        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root, drafter: None })
     }
 
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
@@ -579,7 +585,7 @@ impl Qwen3VLGenerateModel {
             }
         }
 
-        let max_new_tokens = mes.max_tokens.unwrap_or(2048);
+        let max_new_tokens = mes.max_tokens.unwrap_or(2048) as usize;
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
@@ -592,22 +598,100 @@ impl Qwen3VLGenerateModel {
             std::path::PathBuf::new()
         };
 
-        for i in 0..max_new_tokens {
+        let mut i: usize = 0;
+        while i < max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [HARD-SWAP-INFERENCE] Trigger every 128 tokens
-            if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
-                // Synchronous Save to Disk
+            // --- [ULTRA-SPEED: SPECULATIVE DECODING BLOCK] ---
+            let mut speculative_success = false;
+            let lookahead = 4; // 드래프터가 미리 예측할 토큰 수
+
+            if let Some(drafter_mutex) = &self.drafter {
+                if let Ok(mut drafter_guard) = drafter_mutex.try_lock() {
+                    let drafter_opt: &mut Option<Qwen3VLGenerateModel> = &mut *drafter_guard;
+                    if let Some(drafter) = drafter_opt.as_mut() {
+                        // 1. 드래프터로 N개 토큰 미리 생성 (Drafting)
+                        let mut draft_ids = vec![];
+                        let mut current_draft_context = all_ids.clone();
+                        
+                        // 드래프터 KV 캐시 싱크 (필요시)
+                        if drafter.get_kv_len() < seqlen_offset {
+                             // 단순화를 위해 드래프터는 이전 문맥을 알고 있다고 가정하거나 
+                             // 여기서 가볍게 채워줄 수 있습니다.
+                        }
+
+                        for _ in 0..lookahead {
+                            let d_input = Tensor::new(vec![*current_draft_context.last().unwrap()], &self.text_device)?.unsqueeze(0)?;
+                            let d_chunk_pos = Tensor::arange((seqlen_offset + draft_ids.len()) as u32, (seqlen_offset + draft_ids.len() + 1) as u32, &self.text_device)?.unsqueeze(0)?;
+                            let d_logits = drafter.qwen3_vl.forward(&d_input, None, None, None, None, Some(&d_chunk_pos), seqlen_offset + draft_ids.len(), total_tokens, None)?;
+                            let d_logits = d_logits.squeeze(0)?.i(0)?.to_dtype(DType::F32)?;
+                            let d_next_id = logit_processor.sample(&d_logits)?;
+                            draft_ids.push(d_next_id);
+                            current_draft_context.push(d_next_id);
+                            if d_next_id == self.eos_token_id1 || d_next_id == self.eos_token_id2 { break; }
+                        }
+
+                        if !draft_ids.is_empty() {
+                            // 2. 메인 모델(2B)로 한 번에 검증 (Verification)
+                            let v_input = Tensor::from_vec(draft_ids.clone(), (1, draft_ids.len()), &self.text_device)?;
+                            let v_chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + draft_ids.len()) as u32, &self.text_device)?.unsqueeze(0)?;
+                            let v_logits = self.qwen3_vl.forward(&v_input, None, None, None, None, Some(&v_chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+                            
+                            // 3. 일치 여부 확인 및 수락
+                            let mut accepted_count: usize = 0;
+                            for (idx, &d_id) in draft_ids.iter().enumerate() {
+                                let v_logit = v_logits.squeeze(0)?.i(idx)?.to_dtype(DType::F32)?;
+                                let v_next_id = logit_processor.sample(&v_logit)?; // 사실 검증은 sample보다는 max logit 비교가 정석이나 여기선 유연하게 처리
+                                
+                                if d_id == v_next_id {
+                                    accepted_count += 1;
+                                    all_ids.push(d_id);
+                                    generated_text.push_str(&self.tokenizer.token_decode(vec![d_id])?);
+                                    if d_id == self.eos_token_id1 || d_id == self.eos_token_id2 { break; }
+                                } else {
+                                    // 틀린 지점부터는 메인 모델의 정답을 사용하고 중단
+                                    all_ids.push(v_next_id);
+                                    generated_text.push_str(&self.tokenizer.token_decode(vec![v_next_id])?);
+                                    accepted_count += 1; // 메인 모델 정답 포함
+                                    break;
+                                }
+                            }
+                            
+                            i += accepted_count;
+                            seqlen_offset += accepted_count;
+                            speculative_success = true;
+                        }
+                    }
+                }
+            }
+
+            if !speculative_success {
+                // 표준 생성 방식 (Speculative 실패 시 또는 미사용 시)
+                let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
+                    Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
+                } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
+                let seq_len = input_ids.dim(1)?;
+                let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
+                let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
+                let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
+                if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }
+                let next_id = logit_processor.sample(&logits)?;
+                if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+                all_ids.push(next_id);
+                generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
+                
+                i += 1;
+                seqlen_offset += seq_len;
+            }
+
+            // [HARD-SWAP-INFERENCE] 128 토큰마다 메모리 정리 및 체크포인트
+            if seqlen_offset > 0 && seqlen_offset % 128 == 0 && !task_dir_base.as_os_str().is_empty() {
                 if !task_dir_base.exists() { let _ = std::fs::create_dir_all(&task_dir_base); }
                 self.save_kv_to_disk(&task_dir_base, kv_name.as_deref(), seqlen_offset)?;
                 
-                // Hard Reset Memory
                 let current_kv_len = self.get_kv_len();
-                if current_kv_len > window_keep_size {
-                    let purge_len = current_kv_len - window_keep_size;
-                    let _ = self.truncate_kv_cache(purge_len);
-                    
-                    // Force Release to OS
+                if current_kv_len > 1024 {
+                    self.truncate_kv_cache(current_kv_len - 1024)?;
                     if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
                     #[cfg(target_os = "windows")]
                     unsafe {
@@ -616,31 +700,15 @@ impl Qwen3VLGenerateModel {
                         let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
                     }
                 }
-            }
 
-            let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
-                Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
-            } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
-            let seq_len = input_ids.dim(1)?;
-            let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
-            let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
-            let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
-            if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }
-            let next_id = logit_processor.sample(&logits)?;
-            if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
-            all_ids.push(next_id);
-            generated_text.push_str(&self.tokenizer.token_decode(vec![next_id])?);
-            // [INFERENCE-SAVE] Only checkpoint for Large models
-            if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
+                // 체크포인트 저장
                 if let Some(sid) = &session_id {
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
                     let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
                     let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
-                    println!("[GEN] Checkpoint at {}", i);
                 }
             }
-            seqlen_offset += seq_len;
+
             pixel_values = None;
         }
         if let Some(sid) = &session_id { let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json")); }

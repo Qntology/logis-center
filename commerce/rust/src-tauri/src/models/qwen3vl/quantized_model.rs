@@ -334,8 +334,28 @@ impl QuantizedQwen3VLTextAttention {
                 let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v.clone() };
                 let pv = if pv.dtype() != target_dtype { pv.to_dtype(target_dtype)? } else { pv }.contiguous()?;
                 
-                let k = Tensor::cat(&[&pk, &key_states.contiguous()?], 2)?.contiguous()?;
-                let v = Tensor::cat(&[&pv, &value_states.contiguous()?], 2)?.contiguous()?;
+                let mut k = Tensor::cat(&[&pk, &key_states.contiguous()?], 2)?.contiguous()?;
+                let mut v = Tensor::cat(&[&pv, &value_states.contiguous()?], 2)?.contiguous()?;
+
+                // --- [ULTRA-SPEED: KV CACHE FOLDING] ---
+                // 컨텍스트가 너무 길어지면 중요 정보(Sink)와 최신 정보(Window)만 남기고 접어버립니다.
+                let max_capacity = 2048; // 고정된 메모리 버퍼 크기
+                let sink_size = 4;      // 초기 컨텍스트 유지 (Softmax 안정성)
+                let actual_len = k.dim(2)?;
+
+                if actual_len > max_capacity {
+                    let sink_k = k.narrow(2, 0, sink_size)?;
+                    let window_k = k.narrow(2, actual_len - (max_capacity - sink_size), max_capacity - sink_size)?;
+                    k = Tensor::cat(&[&sink_k, &window_k], 2)?.contiguous()?;
+
+                    let sink_v = v.narrow(2, 0, sink_size)?;
+                    let window_v = v.narrow(2, actual_len - (max_capacity - sink_size), max_capacity - sink_size)?;
+                    v = Tensor::cat(&[&sink_v, &window_v], 2)?.contiguous()?;
+                    
+                    // println!("[FOLDING] KV Cache folded: {} -> {}", actual_len, k.dim(2)?);
+                }
+                // ----------------------------------------
+
                 (k, v)
             }
         };
