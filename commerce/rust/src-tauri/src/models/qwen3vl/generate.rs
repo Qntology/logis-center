@@ -569,7 +569,7 @@ impl Qwen3VLGenerateModel {
         };
 
         // [SLIDING-WINDOW-CONFIG] 512 block size for more granular management
-        let window_keep_size = 5120; // 10 blocks of 512
+        let window_keep_size = 1024; // 2 blocks of 512 (Keep very lean)
         let bake_block_size = 512;
 
         for i in 0..max_new_tokens {
