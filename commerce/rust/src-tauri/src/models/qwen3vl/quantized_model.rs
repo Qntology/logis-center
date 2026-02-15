@@ -1121,6 +1121,13 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
+        // --- [A-B-C WINDOW STRATEGY] ---
+        // c: Computing (Current Layer)
+        // b: Backing up (Save in progress, memory kept)
+        // a: Archived (Save confirmed, memory dropped)
+        let mut save_handles = std::collections::VecDeque::new(); 
+        let window_size = 2; // Keep at most 2 layers in RAM (Current + One being saved)
+
         let mut start_layer = 0;
         // [RESUME-LOGIC] Try to pick up from a saved layer checkpoint on disk
         if let Some(sid) = &self.active_session_id {
@@ -1171,15 +1178,13 @@ impl QuantizedQwen3VLTextModel {
             }
         };
 
-        let num_layers = self.layers.len();
-
         // [SMART-SEQUENTIAL-LOOP]
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
             let is_pinned = layer_idx < self.pinned_layer_count;
             
-            // [ULTRA-SPEED] If pinned, skip loading/unloading (already on GPU)
+            // 1. [C: Computing] Prepare and Run Layer
             if !is_pinned {
                 layer.to_device(&target_device)?;
             }
@@ -1197,19 +1202,74 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [SWAP-LOGIC] Only save and unload if NOT pinned
+            // GPU Sync to ensure computation is 100% done before save starts
+            if !is_pinned && target_device.is_cuda() { target_device.synchronize()?; }
+
+            // 2. [B: Backing Up] Start Async Save
             if !is_pinned {
                 if let Some(sid) = &self.active_session_id {
-                    let checkpoint_path = crate::utils::paths::get_task_specific_dir(None, sid).join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    let _ = crate::utils::tensor_utils::save_tensor(&checkpoint_path, "hidden_states", &xs);
+                    let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+                    // [FIX] Ensure directory exists before attempting to save
+                    if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+
+                    let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                    let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
+                    
+                    // Atomic move logic: Save to .tmp first, then rename
+                    let xs_to_save = xs.clone();
+                    let handle = tokio::task::spawn_blocking(move || -> Result<usize> {
+                        crate::utils::tensor_utils::save_tensor(&tmp_path, "hidden_states", &xs_to_save)?;
+                        std::fs::rename(&tmp_path, &final_path)?;
+                        Ok(layer_idx)
+                    });
+                    save_handles.push_back((layer_idx, handle, xs.clone())); // Keep xs in memory for now
+                } else {
+                    if layer_idx == 0 {
+                        println!("[WINDOW-WARN] No active_session_id found. Disk swapping disabled for this pass.");
+                    }
                 }
+                
                 layer.to_device(&Device::Cpu)?;
-            } else {
-                // If it's the last pinned layer, maybe log something
-                if layer_idx == self.pinned_layer_count - 1 {
-                    // println!("[SPEED] Layer {} is the last GPU-resident layer.", layer_idx);
+            }
+
+            // 3. [A: Archived] Confirm Save and Drop Old Memory
+            // [OPTIMIZATION] Reduced window_size to 1 to minimize RAM/VRAM footprint
+            let tight_window = 1; 
+            while save_handles.len() > tight_window {
+                if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
+                    // Wait for disk confirmation (Ack)
+                    match futures::executor::block_on(handle) {
+                        Ok(Ok(_)) => {
+                            drop(old_xs);
+                        },
+                        Ok(Err(e)) => {
+                            println!("[WINDOW-ERROR] Disk Write Failed for Layer {}: {}. OOM Risk Increasing.", old_idx, e);
+                            // Fallback: Drop anyway to prevent OOM, though consistency is now at risk
+                            drop(old_xs); 
+                        },
+                        _ => {
+                            println!("[WINDOW-ERROR] Join Error for Layer {}. Retaining memory.", old_idx);
+                            save_handles.push_front((old_idx, tokio::task::spawn(async move { Ok(old_idx) }), old_xs)); 
+                            break; 
+                        }
+                    }
                 }
             }
+
+            // Windows-specific: Flush working set periodically when many layers are processed
+            if layer_idx % 5 == 0 {
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+            }
+        }
+
+        // Final Wait for all remaining saves before returning
+        for (_idx, handle, _) in save_handles {
+            let _ = futures::executor::block_on(handle);
         }
         
         self.current_kv_len = seqlen_offset + seq_len;
