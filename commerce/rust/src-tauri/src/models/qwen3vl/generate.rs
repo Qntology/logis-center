@@ -426,10 +426,10 @@ impl Qwen3VLGenerateModel {
         while current_pos < total_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (상한선을 10개로 완화하여 성능 향상)
+            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (상한선을 20개로 완화하여 성능 향상)
             let mut wait_count = 0;
-            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 10 {
-                if wait_count == 0 { println!("[MEMORY] 68. 대기열 포화 (10개 초과). 일시 정지."); }
+            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 20 {
+                if wait_count == 0 { println!("[MEMORY] 68. 대기열 포화 (20개 초과). 일시 정지."); }
                 println!("[MEMORY] {}. 메모리 제거 대기 (Queue: {})...", 69 + wait_count.min(3), self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst));
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 wait_count += 1;
