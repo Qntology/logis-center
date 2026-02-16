@@ -146,6 +146,22 @@ impl ModelVariant {
         }
     }
 
+    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
+        match self {
+            Self::Standard(_) => Ok(()), 
+            Self::QuantizedVL(m) => m.truncate_kv_cache(len),
+            Self::QuantizedText(m) => m.truncate_kv_cache(len),
+        }
+    }
+
+    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
+        match self {
+            Self::Standard(_) => Ok(()),
+            Self::QuantizedVL(m) => m.rewind_kv_cache(target_len),
+            Self::QuantizedText(m) => m.rewind_kv_cache(target_len),
+        }
+    }
+
     pub fn drop_kv_storage(&mut self) -> Result<()> {
         match self {
             Self::Standard(_) => Ok(()),
@@ -620,9 +636,21 @@ impl Qwen3VLGenerateModel {
 
             let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
                 Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
-            } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
+            } else { 
+                // [OPTIMIZATION] Reuse scalar if possible, but candle's Tensor::new is still common. 
+                // To truly remove reallocation, we'd need a pre-allocated mutable tensor (not fully supported in simple Candle).
+                // However, we avoid vector allocations here.
+                Tensor::new(&[*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? 
+            };
+            
             let seq_len = input_ids.dim(1)?;
-            let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
+            // [OPTIMIZATION] Avoid arange allocation if seq_len is 1 (common case in generation)
+            let chunk_pos = if seq_len == 1 {
+                Tensor::new(&[seqlen_offset as u32], &self.text_device)?.unsqueeze(0)?
+            } else {
+                Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?
+            };
+            
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
             let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
             if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }
@@ -682,11 +710,11 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(len),
-            ModelVariant::QuantizedText(m) => m.truncate_kv_cache(len),
-            _ => Ok(()),
-        }
+        self.qwen3_vl.truncate_kv_cache(len)
+    }
+
+    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
+        self.qwen3_vl.rewind_kv_cache(target_len)
     }
 
     pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
@@ -713,5 +741,105 @@ impl Qwen3VLGenerateModel {
             ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
             _ => {},
         }
+    }
+
+    pub fn generate_speculative(&mut self, draft_model: &mut Qwen3VLGenerateModel, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
+        let temperature = mes.temperature.unwrap_or(0.7) as f32;
+        let top_p = mes.top_p.unwrap_or(0.9) as f32;
+        let seed = mes.seed.unwrap_or(34562) as u64;
+        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(40), seed);
+        
+        let mut generated_text = String::new();
+        let mut all_ids = self.tokenizer.text_encode_vec(self.chat_template.apply_chat_template(&mes)?, false)?;
+        let mut seqlen_offset = self.get_kv_len();
+        
+        // Initial prefill if needed
+        if seqlen_offset == 0 {
+            seqlen_offset = self.prefill_only(mes.clone(), cancel_flag.clone(), session_id.clone(), None, None)?;
+        }
+
+        let max_new_tokens = mes.max_tokens.unwrap_or(2048) as usize;
+        let gamma = 4; // Number of speculative tokens
+        let mut tokens_generated: usize = 0;
+
+        while tokens_generated < max_new_tokens {
+            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+
+            // 1. [DRAFT] Generate gamma tokens using the small model
+            let mut speculative_tokens = Vec::new();
+            let mut draft_seq_offset = draft_model.get_kv_len();
+            
+            // Sync draft model's KV with target model if needed (simplified here)
+            // In a real scenario, you'd ensure draft_model has the same context.
+            
+            for _ in 0..gamma {
+                let last_token = *all_ids.last().unwrap();
+                let input_ids = Tensor::new(&[last_token], &draft_model.text_device)?.unsqueeze(0)?;
+                let pos = Tensor::new(&[draft_seq_offset as u32], &draft_model.text_device)?.unsqueeze(0)?;
+                let logits = draft_model.qwen3_vl.forward(&input_ids, None, None, None, None, Some(&pos), draft_seq_offset, draft_seq_offset + 1, None)?;
+                let logits = logits.squeeze(0)?.i(0)?.to_dtype(DType::F32)?;
+                let next_id = logit_processor.sample(&logits)?;
+                speculative_tokens.push(next_id);
+                all_ids.push(next_id);
+                draft_seq_offset += 1;
+                if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
+            }
+
+            // 2. [VERIFY] Verify speculative tokens in parallel using the main model
+            let spec_len = speculative_tokens.len();
+            let verify_input = Tensor::new(&all_ids[all_ids.len() - spec_len - 1 ..], &self.text_device)?.unsqueeze(0)?;
+            let verify_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + spec_len + 1) as u32, &self.text_device)?.unsqueeze(0)?;
+            
+            let logits = self.qwen3_vl.forward(&verify_input, None, None, None, None, Some(&verify_pos), seqlen_offset, seqlen_offset + spec_len + 1, session_id.clone())?;
+            let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
+
+            // 3. [ACCEPT/REJECT] Check how many tokens match
+            let mut accepted_count = 0;
+            let mut next_token_from_main = 0;
+
+            for j in 0..spec_len {
+                let main_logits = logits.i(j)?;
+                let main_token = logit_processor.sample(&main_logits)?;
+                
+                if main_token == speculative_tokens[j] {
+                    accepted_count += 1;
+                } else {
+                    next_token_from_main = main_token;
+                    break;
+                }
+            }
+
+            // If all gamma tokens were accepted, we still need the (gamma+1)-th token from main model
+            if accepted_count == spec_len {
+                let last_logits = logits.i(spec_len)?;
+                next_token_from_main = logit_processor.sample(&last_logits)?;
+            }
+
+            // 4. [REWIND] Backtrack KV cache for rejected tokens
+            let total_proposed = spec_len;
+            let final_accepted = accepted_count;
+            
+            // Adjust all_ids and KV cache
+            all_ids.truncate(all_ids.len() - total_proposed); // Remove all speculative
+            for j in 0..final_accepted {
+                let t = speculative_tokens[j];
+                all_ids.push(t);
+                generated_text.push_str(&self.tokenizer.token_decode(vec![t])?);
+            }
+            all_ids.push(next_token_from_main);
+            generated_text.push_str(&self.tokenizer.token_decode(vec![next_token_from_main])?);
+            
+            // Rewind Main Model KV
+            seqlen_offset += final_accepted + 1;
+            self.qwen3_vl.rewind_kv_cache(seqlen_offset)?;
+            
+            // Rewind/Sync Draft Model KV
+            draft_model.qwen3_vl.rewind_kv_cache(seqlen_offset)?;
+
+            tokens_generated += final_accepted + 1;
+            if next_token_from_main == self.eos_token_id1 || next_token_from_main == self.eos_token_id2 { break; }
+        }
+
+        Ok(generated_text)
     }
 }

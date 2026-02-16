@@ -605,6 +605,20 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
+    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
+        if let Some((k, v)) = &self.kv_cache {
+            let current_len = k.dim(2)?;
+            if target_len < current_len {
+                let new_k = k.narrow(2, 0, target_len)?.contiguous()?.clone();
+                let new_v = v.narrow(2, 0, target_len)?.contiguous()?.clone();
+                self.kv_cache = Some((new_k, new_v));
+            } else if target_len == 0 {
+                self.kv_cache = None;
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         let base_filename = match kv_name {
             Some(name) => format!("layer_{}_kv", name),
@@ -879,6 +893,10 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         self.self_attn.truncate_kv_cache(len)
+    }
+
+    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
+        self.self_attn.rewind_kv_cache(target_len)
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -1479,6 +1497,12 @@ impl QuantizedQwen3VLTextModel {
         })
     }
 
+    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
+        self.layers.iter_mut().try_for_each(|layer| {
+            layer.rewind_kv_cache(target_len)
+        })
+    }
+
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
         self.save_kv_cache(path, true, block_size, None)
     }
@@ -1719,6 +1743,7 @@ impl QuantizedQwen3VLModel {
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
+    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> { self.language_model.rewind_kv_cache(target_len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
@@ -1799,6 +1824,7 @@ impl QuantizedQwen3TextModel {
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
+    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> { self.language_model.rewind_kv_cache(target_len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
