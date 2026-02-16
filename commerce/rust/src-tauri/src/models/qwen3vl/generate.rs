@@ -44,15 +44,15 @@ struct BakeTask {
     layers: Vec<LayerKVDump>,
 }
 
-fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
+fn spawn_bake_worker() -> mpsc::UnboundedSender<BakeTask> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<BakeTask>();
+    
     tokio::spawn(async move {
-        println!("[BAKE-WORKER] Background KV storage worker started.");
+        println!("[BAKE-WORKER] Background BitKV storage worker started.");
         while let Some(task) = rx.recv().await {
             let task_dir = task.task_dir;
             let kv_name = task.kv_name;
             let offset = task.offset;
-            
-            println!("[BAKE-WORKER] Saving block at offset {}...", offset);
             
             for layer in task.layers {
                 let filename = match (&kv_name, offset) {
@@ -63,64 +63,64 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
                 };
                 let path = task_dir.join(filename);
                 
-                // --- Manual BitKV Compression (Worker Thread) ---
                 let mut map = std::collections::HashMap::new();
-                
-                let process_tensor = |t: Tensor, prefix: &str, target_map: &mut std::collections::HashMap<String, Tensor>| {
-                    if let Ok(dims) = t.dims4() {
-                        let (b, h, s, d) = dims;
-                        if let Ok(t_f32) = t.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                            if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-                                let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                                let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-                                let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
-                                let mut scales = vec![0.0f32; b * h * s];
 
-                                // Bit Packing & Anchors/Scales (Simplified loop for worker)
-                                let head_token_size = s * d;
-                                for bh_idx in 0..(b * h) {
-                                    let bh_offset = bh_idx * head_token_size;
-                                    for i in 0..head_token_size {
-                                        if t_data[bh_offset + i] >= 0.0 {
-                                            packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8);
-                                        }
-                                    }
-                                    
-                                    for token_idx in 0..s {
-                                        let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                                        if token_idx < 4 || token_idx % 8 == 0 {
-                                            let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
-                                            anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
-                                        }
-                                        let mut max_abs = 0.0f32;
-                                        for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
-                                        scales[bh_idx * s + token_idx] = max_abs;
-                                    }
-                                }
+                // --- [Pure 1-bit Compression Logic] ---
+                let mut process_kv = |t: Tensor, prefix: &str| -> Result<()> {
+                    let dims = t.dims4()?;
+                    let (b, h, s, d) = dims;
+                    let t_f32 = t.to_dtype(DType::F32)?;
+                    let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
+                    
+                    let mut packed_bits = vec![0u8; (b * h * s * d + 7) / 8];
+                    let mut scales = vec![0.0f32; b * h * s];
 
-                                if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { target_map.insert(format!("{}_anchors", prefix), at); }
-                                let packed_len = packed_residuals.len();
-                                if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { target_map.insert(format!("{}_packed", prefix), pt); }
-                                if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { target_map.insert(format!("{}_scales", prefix), st); }
-                                if prefix == "k" {
-                                    if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { target_map.insert("k_shape".to_string(), sh); }
-                                }
+                    let head_token_size = s * d;
+                    for bh_idx in 0..(b * h) {
+                        let bh_offset = bh_idx * head_token_size;
+                        for i in 0..head_token_size {
+                            if t_data[bh_offset + i] >= 0.0 {
+                                let global_bit_idx = bh_offset + i;
+                                packed_bits[global_bit_idx / 8] |= 1 << (global_bit_idx % 8);
                             }
                         }
+                        
+                        for token_idx in 0..s {
+                            let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+                            
+                            // Calculate Mean Absolute Scale for 1-bit
+                            let mut abs_sum = 0.0f32;
+                            for &v in token_data { abs_sum += v.abs(); }
+                            scales[bh_idx * s + token_idx] = abs_sum / (d as f32);
+                        }
                     }
+
+                    let p_len = packed_bits.len();
+                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(packed_bits, vec![p_len], &Device::Cpu)?);
+                    map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?);
+                    
+                    if prefix == "k" {
+                        map.insert("k_shape".to_string(), Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu)?);
+                    }
+                    Ok(())
                 };
 
-                let _ = process_tensor(layer.k, "k", &mut map);
-                let _ = process_tensor(layer.v, "v", &mut map);
-                if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
+                let _ = process_kv(layer.k, "k");
+                let _ = process_kv(layer.v, "v");
+                
+                // Mode 2: Pure 1-bit (Scale + Bits)
+                if let Ok(mode_tensor) = Tensor::from_vec(vec![2u32], (1,), &Device::Cpu) {
                     map.insert("mode".to_string(), mode_tensor);
                 }
 
-                let _ = candle_core::safetensors::save(&map, &path); 
+                if let Err(e) = candle_core::safetensors::save(&map, &path) {
+                    eprintln!("[BAKE-WORKER] Failed to save layer {}: {:?}", layer.layer_idx, e);
+                }
             }
         }
         println!("[BAKE-WORKER] Worker finished.");
     });
+    tx
 }
 
 #[derive(Clone)]
@@ -186,6 +186,7 @@ pub struct Qwen3VLGenerateModel {
     pub hard_token_limit: Option<usize>,
     pub kv_root: std::path::PathBuf,
     pub drafter: Option<Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>>, // 투기적 추론용 드래프터
+    pub bake_tx: mpsc::UnboundedSender<BakeTask>, // [NEW] Asynchronous baking queue
 }
 
 impl Qwen3VLGenerateModel {
@@ -238,7 +239,7 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        is_disk_swap: bool,
+        _is_disk_swap: bool,
         kv_root: std::path::PathBuf,
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
@@ -336,14 +337,16 @@ impl Qwen3VLGenerateModel {
             serde_json::Value::Array(arr) => { let id1 = arr.get(0).and_then(|v| v.as_u64()).unwrap_or(151643) as u32; let id2 = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(id1 as u64) as u32; (id1, id2) },
             _ => (151643, 151643),
         };
+        
+        let bake_tx = spawn_bake_worker();
 
-        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root, drafter: None })
+        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root, drafter: None, bake_tx })
     }
 
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
         let token_ids = self.tokenizer.text_encode_vec(text.to_string(), false)?;
         let total_tokens = token_ids.len();
-        let chunk_size = 512;
+        let chunk_size = 2048;
         let mut current_pos = 0;
 
         while current_pos < total_tokens {
@@ -390,8 +393,8 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
         
-        // [GRANULAR-BAKING] Use 512 blocks for consistent memory pressure
-        let prefill_chunk_size = 512;
+        // [GRANULAR-BAKING] Use 2048 blocks for consistent memory pressure
+        let prefill_chunk_size = 2048;
         let mut current_pos = self.get_kv_len();
         if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
@@ -411,11 +414,23 @@ impl Qwen3VLGenerateModel {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }     
                 
-                // 1. Save to disk (Granular 512 block)
-                self.save_kv_to_disk(&path, kv_name.as_deref(), chunk_end)?;
+                // 1. Save to disk (Granular 512 block) via Async Queue
+                let (ks, vs) = self.get_current_kv();
+                let mut layer_dumps = Vec::with_capacity(ks.len());
+                for (idx, (k, v)) in ks.into_iter().zip(vs).enumerate() {
+                    if let (Ok(k_cpu), Ok(v_cpu)) = (k.to_device(&Device::Cpu), v.to_device(&Device::Cpu)) {
+                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_cpu, v: v_cpu });
+                    }
+                }
+                let _ = self.bake_tx.send(BakeTask {
+                    task_dir: path,
+                    kv_name: kv_name.clone(),
+                    offset: chunk_end,
+                    layers: layer_dumps,
+                });
                 
                 // 2. Purge from VRAM (Keep memory lean during heavy prefill)
-                println!("[BAKING] Segment saved. Resetting memory for token {}.", chunk_end);
+                println!("[BAKING] Segment queued. Resetting memory for token {}.", chunk_end);
                 let _ = self.qwen3_vl.drop_kv_storage(); 
                 
                 // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
@@ -539,8 +554,8 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
         
         // [HARD-SWAP-CONFIG] Constant memory usage strategy
-        let window_keep_size = 1024; 
-        let bake_block_size = 128;
+        let window_keep_size = 2048; 
+        let bake_block_size = 2048;
 
         // [PHASE-1: Granular Prefill] Offload prompt chunks immediately to SSD
         while local_pos < total_tokens {
@@ -687,7 +702,22 @@ impl Qwen3VLGenerateModel {
             // [HARD-SWAP-INFERENCE] 128 토큰마다 메모리 정리 및 체크포인트
             if seqlen_offset > 0 && seqlen_offset % 128 == 0 && !task_dir_base.as_os_str().is_empty() {
                 if !task_dir_base.exists() { let _ = std::fs::create_dir_all(&task_dir_base); }
-                self.save_kv_to_disk(&task_dir_base, kv_name.as_deref(), seqlen_offset)?;
+                
+                // [ASYNC-BAKING-UPGRADE]
+                let (ks, vs) = self.get_current_kv();
+                let mut layer_dumps = Vec::with_capacity(ks.len());
+                for (idx, (k, v)) in ks.into_iter().zip(vs).enumerate() {
+                    if let (Ok(k_cpu), Ok(v_cpu)) = (k.to_device(&Device::Cpu), v.to_device(&Device::Cpu)) {
+                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_cpu, v: v_cpu });
+                    }
+                }
+                
+                let _ = self.bake_tx.send(BakeTask {
+                    task_dir: task_dir_base.clone(),
+                    kv_name: kv_name.clone(),
+                    offset: seqlen_offset,
+                    layers: layer_dumps,
+                });
                 
                 let current_kv_len = self.get_kv_len();
                 if current_kv_len > 1024 {
