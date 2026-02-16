@@ -48,6 +48,20 @@ pub enum BakeTask {
         k: Tensor, // F32 CPU Tensor
         v: Tensor, // F32 CPU Tensor
         path: PathBuf,
+    },
+    GpuPrecomputedKvChunk {
+        kv_name: Option<String>,
+        offset: usize,
+        layer_idx: usize,
+        // These are effectively "CPU-side" now (transferred immediately after GPU compute)
+        k_anchors: Tensor, 
+        k_scales: Tensor,
+        k_signs: Tensor, // U8
+        v_anchors: Tensor, 
+        v_scales: Tensor,
+        v_signs: Tensor, // U8
+        k_shape: Vec<usize>,
+        path: PathBuf,
     }
 }
 
@@ -58,6 +72,32 @@ static WORKER_STARTED: std::sync::Once = std::sync::Once::new();
 
 fn get_bake_queue() -> &'static (Mutex<VecDeque<BakeTask>>, Condvar) {
     BAKE_QUEUE_PAIR.get_or_init(|| (Mutex::new(VecDeque::new()), Condvar::new()))
+}
+
+// Helper to pack U8 (0/1) signs into bits on CPU
+fn worker_pack_signs(signs: &Tensor) -> Result<Tensor> {
+    let signs_vec = signs.flatten_all()?.to_vec1::<u8>()?;
+    let len = signs_vec.len();
+    let packed_len = (len + 7) / 8;
+    let mut packed = vec![0u8; packed_len];
+    
+    // Parallel bit packing
+    packed.par_chunks_mut(1024).enumerate().for_each(|(chunk_idx, byte_chunk)| {
+        let start_byte = chunk_idx * 1024;
+        for (i, byte) in byte_chunk.iter_mut().enumerate() {
+            let global_byte_idx = start_byte + i;
+            let start_bit = global_byte_idx * 8;
+            for bit in 0..8 {
+                if start_bit + bit < len {
+                    if signs_vec[start_bit + bit] == 1 {
+                        *byte |= 1 << bit;
+                    }
+                }
+            }
+        }
+    });
+    
+    Ok(Tensor::from_vec(packed, vec![packed_len], &Device::Cpu)?)
 }
 
 // Standalone compression helper for the worker
@@ -125,20 +165,13 @@ pub fn start_baking_worker() {
                 if let Some(task) = task {
                     match task {
                         BakeTask::LayerSnapshot { layer_idx: _, offset: _, data, path } => {
-                            if let Ok(_) = candle_core::safetensors::save(&data, &path) {
-                                // Success
-                            }
+                            if let Ok(_) = candle_core::safetensors::save(&data, &path) { }
                         },
                         BakeTask::KvChunk { kv_name: _, offset: _, data, path } => {
-                             if let Ok(_) = candle_core::safetensors::save(&data, &path) {
-                                // Success
-                            }
+                             if let Ok(_) = candle_core::safetensors::save(&data, &path) { }
                         },
-                        BakeTask::RawKvChunk { kv_name, offset, layer_idx, k, v, path } => {
-                            // [STRONG ASYNC] Worker performs compression
-                            // 1. Compress K
+                        BakeTask::RawKvChunk { kv_name: _, offset: _, layer_idx: _, k, v, path } => {
                             if let Ok((k_anchors, k_packed, k_scales, k_shape)) = worker_compress_bitkv(&k) {
-                                // 2. Compress V
                                 if let Ok((v_anchors, v_packed, v_scales, _)) = worker_compress_bitkv(&v) {
                                     let mut map = std::collections::HashMap::new();
                                     map.insert("k_anchors".to_string(), k_anchors);
@@ -153,21 +186,41 @@ pub fn start_baking_worker() {
                                     if let Ok(mode) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
                                         map.insert("mode".to_string(), mode);
                                     }
-                                    
-                                    // 3. Save
+                                    let _ = candle_core::safetensors::save(&map, &path);
+                                }
+                            }
+                        },
+                        BakeTask::GpuPrecomputedKvChunk { kv_name: _, offset: _, layer_idx: _, k_anchors, k_scales, k_signs, v_anchors, v_scales, v_signs, k_shape, path } => {
+                            // [GPU-ACCELERATED PATH]
+                            // The "Hard Math" (Scales/Anchors) is done. We just pack bits (Signs -> Packed).
+                            if let Ok(k_packed) = worker_pack_signs(&k_signs) {
+                                if let Ok(v_packed) = worker_pack_signs(&v_signs) {
+                                    let mut map = std::collections::HashMap::new();
+                                    map.insert("k_anchors".to_string(), k_anchors);
+                                    map.insert("k_packed".to_string(), k_packed);
+                                    map.insert("k_scales".to_string(), k_scales);
+                                    map.insert("v_anchors".to_string(), v_anchors);
+                                    map.insert("v_packed".to_string(), v_packed);
+                                    map.insert("v_scales".to_string(), v_scales);
+                                    if let Ok(s) = Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu) {
+                                        map.insert("k_shape".to_string(), s);
+                                    }
+                                    if let Ok(mode) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
+                                        map.insert("mode".to_string(), mode);
+                                    }
                                     let _ = candle_core::safetensors::save(&map, &path);
                                 }
                             }
                         }
                     }
                     
-                    // [LOG-REQ] 1. Memory Freed
                     println!("[MEMORY] 1. 메모리 삭제됨");
                 }
             }
         });
     });
 }
+
 
 pub fn submit_bake_task(task: BakeTask) {
     // Ensure worker is running
@@ -596,6 +649,33 @@ impl QuantizedQwen3VLTextAttention {
         let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
         let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?;
         Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
+    }
+
+    // [GPU-ACCELERATION] Perform heavy quantization math on the GPU
+    pub fn gpu_compress_bitkv(&self, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+        let (b, h, s, d) = t.dims4()?;
+        let original_shape = vec![b, h, s, d];
+        let device = t.device();
+
+        // 1. Anchors: Select indices (0, 1, 2, 3, 4, 12, 20...)
+        // Creating index tensor on CPU then moving is easiest/fast enough for indices
+        let mut indices = vec![0u32, 1, 2, 3];
+        for i in (4..s).step_by(8) {
+            indices.push(i as u32);
+        }
+        let idx_len = indices.len();
+        let idx_tensor = Tensor::from_vec(indices, (idx_len,), device)?;
+        let anchors = t.index_select(&idx_tensor, 2)?; 
+
+        // 2. Scales: Max Abs over last dim (D)
+        // [B, H, S, 1]
+        let scales = t.abs()?.max_keepdim(D::Minus1)?; 
+
+        // 3. Signs: t >= 0 -> 1, else 0
+        // [B, H, S, D] -> [U8]
+        let signs = t.ge(0.0)?.to_dtype(DType::U8)?;
+
+        Ok((anchors, scales, signs, original_shape))
     }
 
     pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {

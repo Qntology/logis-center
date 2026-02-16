@@ -608,17 +608,28 @@ impl Qwen3VLGenerateModel {
                         let target_path = path.join(filename);
 
                         if is_gpu_mode {
-                            // [STRONG ASYNC] Move raw F32 CPU tensors to worker
-                            if let Ok(k_cpu) = k.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                                if let Ok(v_cpu) = v.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                                    submit_bake_task(BakeTask::RawKvChunk {
-                                        kv_name: kv_name_owned.clone(),
-                                        offset,
-                                        layer_idx: layer.self_attn.layer_idx,
-                                        k: k_cpu,
-                                        v: v_cpu,
-                                        path: target_path,
-                                    });
+                            // [GPU-ACCELERATED] Perform math on GPU, transfer small components, pack on worker
+                            if let Ok((k_anc, k_scl, k_sgn, k_shp)) = layer.self_attn.gpu_compress_bitkv(k) {
+                                if let Ok((v_anc, v_scl, v_sgn, _)) = layer.self_attn.gpu_compress_bitkv(v) {
+                                    // Move components to CPU for transfer
+                                    if let (Ok(k_a), Ok(k_sc), Ok(k_sn), Ok(v_a), Ok(v_sc), Ok(v_sn)) = (
+                                        k_anc.to_device(&Device::Cpu), k_scl.to_device(&Device::Cpu), k_sgn.to_device(&Device::Cpu),
+                                        v_anc.to_device(&Device::Cpu), v_scl.to_device(&Device::Cpu), v_sgn.to_device(&Device::Cpu)
+                                    ) {
+                                        submit_bake_task(BakeTask::GpuPrecomputedKvChunk {
+                                            kv_name: kv_name_owned.clone(),
+                                            offset,
+                                            layer_idx: layer.self_attn.layer_idx,
+                                            k_anchors: k_a,
+                                            k_scales: k_sc,
+                                            k_signs: k_sn,
+                                            v_anchors: v_a,
+                                            v_scales: v_sc,
+                                            v_signs: v_sn,
+                                            k_shape: k_shp,
+                                            path: target_path,
+                                        });
+                                    }
                                 }
                             }
                         } else {
@@ -665,16 +676,28 @@ impl Qwen3VLGenerateModel {
                         let target_path = path.join(filename);
 
                         if is_gpu_mode {
-                             if let Ok(k_cpu) = k.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                                if let Ok(v_cpu) = v.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                                    submit_bake_task(BakeTask::RawKvChunk {
-                                        kv_name: kv_name_owned.clone(),
-                                        offset,
-                                        layer_idx: layer.self_attn.layer_idx,
-                                        k: k_cpu,
-                                        v: v_cpu,
-                                        path: target_path,
-                                    });
+                            // [GPU-ACCELERATED] Perform math on GPU, transfer small components, pack on worker
+                            if let Ok((k_anc, k_scl, k_sgn, k_shp)) = layer.self_attn.gpu_compress_bitkv(k) {
+                                if let Ok((v_anc, v_scl, v_sgn, _)) = layer.self_attn.gpu_compress_bitkv(v) {
+                                    // Move components to CPU for transfer
+                                    if let (Ok(k_a), Ok(k_sc), Ok(k_sn), Ok(v_a), Ok(v_sc), Ok(v_sn)) = (
+                                        k_anc.to_device(&Device::Cpu), k_scl.to_device(&Device::Cpu), k_sgn.to_device(&Device::Cpu),
+                                        v_anc.to_device(&Device::Cpu), v_scl.to_device(&Device::Cpu), v_sgn.to_device(&Device::Cpu)
+                                    ) {
+                                        submit_bake_task(BakeTask::GpuPrecomputedKvChunk {
+                                            kv_name: kv_name_owned.clone(),
+                                            offset,
+                                            layer_idx: layer.self_attn.layer_idx,
+                                            k_anchors: k_a,
+                                            k_scales: k_sc,
+                                            k_signs: k_sn,
+                                            v_anchors: v_a,
+                                            v_scales: v_sc,
+                                            v_signs: v_sn,
+                                            k_shape: k_shp,
+                                            path: target_path,
+                                        });
+                                    }
                                 }
                             }
                         } else {
