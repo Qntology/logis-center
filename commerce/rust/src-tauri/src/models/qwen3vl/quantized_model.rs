@@ -1331,8 +1331,9 @@ impl QuantizedQwen3VLTextModel {
                         let h = tokio::task::spawn_blocking(move || {
                             let mut map = std::collections::HashMap::new();
                             map.insert("hidden_states".to_string(), xs_cpu);
-                            let _ = candle_core::safetensors::save(&map, &tmp_path);
-                            let _ = std::fs::rename(&tmp_path, &final_path);
+                            if let Ok(_) = candle_core::safetensors::save(&map, &tmp_path) {
+                                let _ = std::fs::rename(&tmp_path, &final_path);
+                            }
                             counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         });
                         save_handles.push_back((layer_idx, h, xs.clone()));

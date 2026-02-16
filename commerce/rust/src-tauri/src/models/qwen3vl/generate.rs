@@ -438,21 +438,42 @@ impl Qwen3VLGenerateModel {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }     
                 
-                // 1. Save to disk (Granular 512 block) via Async Queue
+                // 1. Save to disk (Incremental Chunk) via Async Queue
                 let (ks, vs) = self.get_current_kv();
                 let mut layer_dumps = Vec::with_capacity(ks.len());
                 for (idx, (k, v)) in ks.into_iter().zip(vs).enumerate() {
-                    if let (Ok(k_cpu), Ok(v_cpu)) = (k.to_device(&Device::Cpu), v.to_device(&Device::Cpu)) {
-                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_cpu, v: v_cpu });
+                    // [INCREMENTAL-FIX] 전체가 아닌 현재 조각(chunk_len)만 추출하여 중복 방지
+                    let s_len = k.dim(candle_core::D::Minus2)?;
+                    let take_len = chunk_len.min(s_len);
+                    if let (Ok(k_chunk), Ok(v_chunk)) = (
+                        k.narrow(candle_core::D::Minus2, s_len - take_len, take_len),
+                        v.narrow(candle_core::D::Minus2, s_len - take_len, take_len)
+                    ) {
+                        if let (Ok(k_cpu), Ok(v_cpu)) = (k_chunk.to_device(&Device::Cpu), v_chunk.to_device(&Device::Cpu)) {
+                            layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_cpu, v: v_cpu });
+                        }
                     }
                 }
+                self.active_bake_tasks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let _ = self.bake_tx.send(BakeTask {
                     task_dir: path,
                     kv_name: kv_name.clone(),
                     offset: end,
                     layers: layer_dumps,
                 });
-                self.active_bake_tasks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                
+                // 2. Purge from VRAM (Keep memory lean)
+                println!("[BAKING] Segment queued. Resetting memory for token {}.", end);
+                let _ = self.qwen3_vl.drop_kv_storage(); 
+                
+                // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
+                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
             }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -526,10 +547,10 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> Result<String> {
-        let temperature = mes.temperature.unwrap_or(0.7) as f32;
+        let temperature = mes.temperature.unwrap_or(0.9) as f32;
         let top_p = mes.top_p.unwrap_or(0.9) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(10), seed);
+        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(1), seed);
         let mut all_ids = vec![];
         let mut generated_text = String::new();
         let mut seqlen_offset = self.get_kv_len();
@@ -593,7 +614,40 @@ impl Qwen3VLGenerateModel {
             // Immediate Offload & Purge during prefill
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
+                
+                // [INCREMENTAL-SAVE-GENERATION]
+                let (ks, vs) = self.get_current_kv();
+                let mut layer_dumps = Vec::with_capacity(ks.len());
+                for (idx, (k, v)) in ks.into_iter().zip(vs).enumerate() {
+                    let s_len = k.dim(candle_core::D::Minus2)?;
+                    let take_len = chunk_size.min(s_len);
+                    if let (Ok(k_chunk), Ok(v_chunk)) = (
+                        k.narrow(candle_core::D::Minus2, s_len - take_len, take_len),
+                        v.narrow(candle_core::D::Minus2, s_len - take_len, take_len)
+                    ) {
+                        if let (Ok(k_cpu), Ok(v_cpu)) = (k_chunk.to_device(&Device::Cpu), v_chunk.to_device(&Device::Cpu)) {
+                            layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_cpu, v: v_cpu });
+                        }
+                    }
+                }
+                
+                self.active_bake_tasks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = self.bake_tx.send(BakeTask {
+                    task_dir: path,
+                    kv_name: kv_name.clone(),
+                    offset: seqlen_offset,
+                    layers: layer_dumps,
+                });
+
+                // Purge only AFTER queuing to background
+                let _ = self.qwen3_vl.drop_kv_storage();
+                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
             }
         }
 
