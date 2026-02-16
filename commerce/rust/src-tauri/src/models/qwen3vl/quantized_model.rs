@@ -339,21 +339,28 @@ impl QuantizedQwen3VLTextAttention {
             }
         };
 
-        // [DYNAMIC PAGING] 윈도우 관리 (2048 토큰 초과 시 SSD 스와핑)
+        // [DYNAMIC PAGING] Anchor Paging (지시사항 보존형 슬라이딩 윈도우)
         let current_kv_len = key_states.dim(2)?;
-        let sliding_window = 2048;
-        let eviction_block = 512;
+        let sliding_window = 4096; // 전체 VRAM 캐시 유지 크기 (10k+ 처리를 위해 확장)
+        let anchor_size = 1024;    // 절대 삭제하지 않을 전면 지시사항(System Prompt) 영역
 
         if current_kv_len > sliding_window {
-            // 오래된 블록을 디스크로 추방 (Eviction)
-            // Note: 실제 저장은 전역 워커나 save_kv_cache를 통해 별도로 관리될 수 있으나,
-            // 여기서는 VRAM 즉시 해제를 위해 슬라이싱을 수행함.
-            key_states = key_states.narrow(2, eviction_block, current_kv_len - eviction_block)?.contiguous()?;
-            value_states = value_states.narrow(2, eviction_block, current_kv_len - eviction_block)?.contiguous()?;
+            // 1. 전면 지시사항(Anchor) 추출
+            let anchor_k = key_states.narrow(2, 0, anchor_size)?;
+            let anchor_v = value_states.narrow(2, 0, anchor_size)?;
+            
+            // 2. 최신 문맥(Recent Window) 추출
+            let recent_len = sliding_window - anchor_size;
+            let recent_k = key_states.narrow(2, current_kv_len - recent_len, recent_len)?;
+            let recent_v = value_states.narrow(2, current_kv_len - recent_len, recent_len)?;
+            
+            // 3. 결합 (중간의 데이터만 비우고 지시사항+최신데이터로 재구성)
+            key_states = Tensor::cat(&[&anchor_k, &recent_k], 2)?.contiguous()?;
+            value_states = Tensor::cat(&[&anchor_v, &recent_v], 2)?.contiguous()?;
             
             if self.layer_idx == 0 {
-                println!("[PAGING] VRAM Limit Reached. Evicted {} tokens to SSD. (New VRAM Size: {})", 
-                    eviction_block, key_states.dim(2)?);
+                println!("[PAGING] Anchor Paging Active. System instructions preserved. (VRAM: {}/{} tokens)", 
+                    key_states.dim(2)?, current_kv_len);
             }
         }
 
@@ -1341,7 +1348,9 @@ impl QuantizedQwen3VLTextModel {
     }
 
     pub fn get_kv_len(&self) -> usize {
-        self.layers.get(0).map(|l| l.get_kv_len()).unwrap_or(0)
+        // [ROPE-FIX] 물리적 캐시 크기가 아닌 논리적 진행 위치를 반환하여 
+        // 페이징 후에도 다음 토큰의 RoPE Offset이 어긋나지 않게 함
+        self.current_kv_len
     }
 
     pub fn compress_to_bitkv(&self, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
@@ -1686,34 +1695,120 @@ impl QuantizedQwen3VLModel {
         Ok(special_mask)
     }
     
-    fn get_rope_index(&self, input_ids: &Tensor, _image_grid_thw: Option<&Tensor>, _video_grid_thw: Option<&Tensor>, _mask: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
-        let position_ids = Tensor::arange(0u32, input_ids.dim(1)? as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, input_ids.dim(0)?, input_ids.dim(1)?))?;
-        let mrope = Tensor::zeros((input_ids.dim(0)?, 1), input_ids.dtype(), input_ids.device())?;
-        Ok((position_ids, mrope))
+    fn get_rope_index(
+        &self,
+        input_ids: &Tensor,
+        image_grid_thw: Option<&Tensor>,
+        _video_grid_thw: Option<&Tensor>,
+        _mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        // [ROPE-FIX] 이미지 격자 구조를 반영한 실제 3D mRoPE 인덱스 계산 로직
+        let spatial_merge_size = self.config.vision_config.as_ref().map(|c| c.spatial_merge_size).unwrap_or(2);
+        let image_token_id = self.config.image_token_id.unwrap_or(0);
+        let vision_start_token_id = self.config.vision_start_token_id.unwrap_or(0);
+        
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        let mut position_ids = Tensor::zeros((3, b_sz, seq_len), DType::U32, input_ids.device())?;
+        let mut mrope_position_deltas = Vec::new();
+
+        let input_ids_vec = input_ids.to_vec2::<u32>()?;
+        let mut image_idx = 0;
+
+        for b in 0..b_sz {
+            let ids = &input_ids_vec[b];
+            let mut curr_pos = 0u32;
+            let mut llm_pos_ids = vec![vec![0u32; seq_len]; 3];
+
+            let mut i = 0;
+            while i < seq_len {
+                if ids[i] == vision_start_token_id as u32 && i + 1 < seq_len && ids[i+1] == image_token_id as u32 {
+                    // 이미지 영역 발견
+                    if let Some(thw_tensor) = image_grid_thw {
+                        let thw = thw_tensor.i(image_idx)?.to_vec1::<u32>()?;
+                        image_idx += 1;
+                        
+                        let (t, h, w) = (thw[0], thw[1] / spatial_merge_size as u32, thw[2] / spatial_merge_size as u32);
+                        
+                        // vision_start 토큰 위치
+                        for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                        i += 1;
+                        curr_pos += 1;
+
+                        // image_pad 토큰들 위치 (3D Grid)
+                        let img_len = (t * h * w) as usize;
+                        for tt in 0..t {
+                            for hh in 0..h {
+                                for ww in 0..w {
+                                    let idx = i + (tt * h * w + hh * w + ww) as usize;
+                                    if idx < seq_len {
+                                        llm_pos_ids[0][idx] = curr_pos + tt;
+                                        llm_pos_ids[1][idx] = curr_pos + hh;
+                                        llm_pos_ids[2][idx] = curr_pos + ww;
+                                    }
+                                }
+                            }
+                        }
+                        i += img_len;
+                        curr_pos += t.max(h).max(w); // 이미지 점유 폭만큼 위치 점프
+                    } else {
+                        for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                        i += 1; curr_pos += 1;
+                    }
+                } else {
+                    // 일반 텍스트 토큰
+                    for d in 0..3 { llm_pos_ids[d][i] = curr_pos; }
+                    i += 1;
+                    curr_pos += 1;
+                }
+            }
+            
+            // Tensor로 변환 및 삽입
+            for d in 0..3 {
+                let d_tensor = Tensor::from_vec(llm_pos_ids[d].clone(), (1, seq_len), input_ids.device())?;
+                position_ids = position_ids.slice_assign(&[(d..d+1), (b..b+1), (0..seq_len)], &d_tensor)?;
+            }
+            mrope_position_deltas.push(curr_pos as i64 - seq_len as i64);
+        }
+
+        let deltas = Tensor::from_vec(mrope_position_deltas, (b_sz, 1), input_ids.device())?.to_dtype(input_ids.dtype())?;
+        Ok((position_ids, deltas))
     }
 
     pub fn forward(&mut self, input_ids_in: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, _pixel_values_video: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
-        
-        let cache_position = if let Some(cp) = cache_position_in { if !cp.device().same_device(&self.text_device) { Some(cp.to_device(&self.text_device)?) } else { Some(cp.clone()) } } else { None };
         let (b_sz, seq_len) = input_ids.dims2()?;
+
+        // 1. Embedding & Vision Integration
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         let mut inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?;
-        if let Some(pixel_values) = pixel_values { if let Some(image_grid_thw) = image_grid_thw { let (image_embeds, _) = self.get_vision_features(pixel_values, image_grid_thw)?; let image_embeds = Tensor::cat(&image_embeds, 0)?; let vision_mask = self.get_placeholder_mask(&input_ids, true)?; inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; } }
         
-        let position_ids = if let Some(cache_pos) = cache_position { 
-            let start = cache_pos.flatten_all()?.i(0)?.to_scalar::<u32>()?; 
-            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))? 
+        if let Some(pv) = pixel_values { 
+            if let Some(thw) = image_grid_thw { 
+                let (image_embeds, _) = self.get_vision_features(pv, thw)?; 
+                let image_embeds = Tensor::cat(&image_embeds, 0)?; 
+                let vision_mask = self.get_placeholder_mask(&input_ids, true)?; 
+                inputs_embeds = masked_scatter_dim0(&inputs_embeds, &image_embeds, &vision_mask)?; 
+            } 
+        }
+        
+        // 2. Position IDs calculation (Corrected for Long Context & Vision)
+        let (position_ids, rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
+            let (p_ids, deltas) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
+            self.rope_deltas = Some(deltas);
+            (p_ids, self.rope_deltas.as_ref().unwrap().clone())
         } else {
-            // [ROPE-CORRECTION] Use the updated seqlen_offset for position IDs
+            // Decoding/Incremental Step
             let start = seqlen_offset as u32;
-            Tensor::arange(start, start + seq_len as u32, input_ids.device())?.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?
+            let p_ids = Tensor::arange(start, start + seq_len as u32, input_ids.device())?
+                .unsqueeze(0)?.unsqueeze(0)?.broadcast_as((3, b_sz, seq_len))?;
+            (p_ids, self.rope_deltas.as_ref().unwrap().clone())
         };
         
         self.language_model.active_session_id = session_id;
         let outputs = self.language_model.forward(&inputs_embeds, seqlen_offset, total_len, Some(&position_ids), None, None)?;
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
