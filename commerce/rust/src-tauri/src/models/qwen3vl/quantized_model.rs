@@ -53,13 +53,10 @@ pub enum BakeTask {
         kv_name: Option<String>,
         offset: usize,
         layer_idx: usize,
-        // These are effectively "CPU-side" now (transferred immediately after GPU compute)
-        k_anchors: Tensor, 
-        k_scales: Tensor,
-        k_signs: Tensor, // U8
-        v_anchors: Tensor, 
-        v_scales: Tensor,
-        v_signs: Tensor, // U8
+        // Combined K and V components to reduce transfer calls
+        anchors_kv: Tensor, 
+        scales_kv: Tensor,
+        signs_kv: Tensor, // U8
         k_shape: Vec<usize>,
         path: PathBuf,
     }
@@ -74,23 +71,37 @@ fn get_bake_queue() -> &'static (Mutex<VecDeque<BakeTask>>, Condvar) {
     BAKE_QUEUE_PAIR.get_or_init(|| (Mutex::new(VecDeque::new()), Condvar::new()))
 }
 
-// Helper to pack U8 (0/1) signs into bits on CPU
+// [OPTIMIZED] Fast bit-packing using bitwise shifts instead of per-bit loops
 fn worker_pack_signs(signs: &Tensor) -> Result<Tensor> {
     let signs_vec = signs.flatten_all()?.to_vec1::<u8>()?;
     let len = signs_vec.len();
     let packed_len = (len + 7) / 8;
     let mut packed = vec![0u8; packed_len];
     
-    // Parallel bit packing
+    // Process 8 elements at once for maximum speed
     packed.par_chunks_mut(1024).enumerate().for_each(|(chunk_idx, byte_chunk)| {
         let start_byte = chunk_idx * 1024;
+        let start_element = start_byte * 8;
+        
         for (i, byte) in byte_chunk.iter_mut().enumerate() {
-            let global_byte_idx = start_byte + i;
-            let start_bit = global_byte_idx * 8;
-            for bit in 0..8 {
-                if start_bit + bit < len {
-                    if signs_vec[start_bit + bit] == 1 {
-                        *byte |= 1 << bit;
+            let elem_pos = start_element + i * 8;
+            if elem_pos + 8 <= len {
+                let slice = &signs_vec[elem_pos..elem_pos + 8];
+                *byte = (slice[0] & 1) 
+                      | ((slice[1] & 1) << 1)
+                      | ((slice[2] & 1) << 2)
+                      | ((slice[3] & 1) << 3)
+                      | ((slice[4] & 1) << 4)
+                      | ((slice[5] & 1) << 5)
+                      | ((slice[6] & 1) << 6)
+                      | ((slice[7] & 1) << 7);
+            } else {
+                // Handle remainder
+                for bit in 0..8 {
+                    if elem_pos + bit < len {
+                        if signs_vec[elem_pos + bit] == 1 {
+                            *byte |= 1 << bit;
+                        }
                     }
                 }
             }
@@ -165,10 +176,10 @@ pub fn start_baking_worker() {
                 if let Some(task) = task {
                     match task {
                         BakeTask::LayerSnapshot { layer_idx: _, offset: _, data, path } => {
-                            if let Ok(_) = candle_core::safetensors::save(&data, &path) { }
+                            let _ = candle_core::safetensors::save(&data, &path);
                         },
                         BakeTask::KvChunk { kv_name: _, offset: _, data, path } => {
-                             if let Ok(_) = candle_core::safetensors::save(&data, &path) { }
+                             let _ = candle_core::safetensors::save(&data, &path);
                         },
                         BakeTask::RawKvChunk { kv_name: _, offset: _, layer_idx: _, k, v, path } => {
                             if let Ok((k_anchors, k_packed, k_scales, k_shape)) = worker_compress_bitkv(&k) {
@@ -190,18 +201,18 @@ pub fn start_baking_worker() {
                                 }
                             }
                         },
-                        BakeTask::GpuPrecomputedKvChunk { kv_name: _, offset: _, layer_idx: _, k_anchors, k_scales, k_signs, v_anchors, v_scales, v_signs, k_shape, path } => {
-                            // [GPU-ACCELERATED PATH]
-                            // The "Hard Math" (Scales/Anchors) is done. We just pack bits (Signs -> Packed).
-                            if let Ok(k_packed) = worker_pack_signs(&k_signs) {
-                                if let Ok(v_packed) = worker_pack_signs(&v_signs) {
+                        BakeTask::GpuPrecomputedKvChunk { kv_name: _, offset: _, layer_idx: _, anchors_kv, scales_kv, signs_kv, k_shape, path } => {
+                            // [OPTIMIZED PATH]
+                            // Split K and V components from the combined tensors
+                            if let (Ok(anchors), Ok(scales), Ok(signs)) = (anchors_kv.chunk(2, 0), scales_kv.chunk(2, 0), signs_kv.chunk(2, 0)) {
+                                if let (Ok(k_packed), Ok(v_packed)) = (worker_pack_signs(&signs[0]), worker_pack_signs(&signs[1])) {
                                     let mut map = std::collections::HashMap::new();
-                                    map.insert("k_anchors".to_string(), k_anchors);
+                                    map.insert("k_anchors".to_string(), anchors[0].clone());
                                     map.insert("k_packed".to_string(), k_packed);
-                                    map.insert("k_scales".to_string(), k_scales);
-                                    map.insert("v_anchors".to_string(), v_anchors);
+                                    map.insert("k_scales".to_string(), scales[0].clone());
+                                    map.insert("v_anchors".to_string(), anchors[1].clone());
                                     map.insert("v_packed".to_string(), v_packed);
-                                    map.insert("v_scales".to_string(), v_scales);
+                                    map.insert("v_scales".to_string(), scales[1].clone());
                                     if let Ok(s) = Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu) {
                                         map.insert("k_shape".to_string(), s);
                                     }
@@ -214,7 +225,7 @@ pub fn start_baking_worker() {
                         }
                     }
                     
-                    println!("[MEMORY] 1. 메모리 삭제됨");
+                    println!("[MEMORY] KV Cache Persisted to Disk.");
                 }
             }
         });
@@ -229,13 +240,12 @@ pub fn submit_bake_task(task: BakeTask) {
     let (lock, cvar) = get_bake_queue();
     let mut queue = lock.lock().unwrap();
 
-    // [FLOW-CONTROL] Limit to 20
-    if queue.len() >= 20 {
-        println!("[MEMORY] 69. 메모리 제거 대기...");
-        while queue.len() >= 20 {
+    // [FLOW-CONTROL] Increased capacity to 40 to avoid stalling inference as often
+    if queue.len() >= 40 {
+        println!("[MEMORY] Bake queue full (40). Waiting for worker...");
+        while queue.len() >= 40 {
             queue = cvar.wait(queue).unwrap();
         }
-        println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
     }
 
     queue.push_back(task);

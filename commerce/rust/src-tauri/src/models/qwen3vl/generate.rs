@@ -608,25 +608,26 @@ impl Qwen3VLGenerateModel {
                         let target_path = path.join(filename);
 
                         if is_gpu_mode {
-                            // [GPU-ACCELERATED] Perform math on GPU, transfer small components, pack on worker
-                            if let Ok((k_anc, k_scl, k_sgn, k_shp)) = layer.self_attn.gpu_compress_bitkv(k) {
-                                if let Ok((v_anc, v_scl, v_sgn, _)) = layer.self_attn.gpu_compress_bitkv(v) {
-                                    // Move components to CPU for transfer
-                                    if let (Ok(k_a), Ok(k_sc), Ok(k_sn), Ok(v_a), Ok(v_sc), Ok(v_sn)) = (
-                                        k_anc.to_device(&Device::Cpu), k_scl.to_device(&Device::Cpu), k_sgn.to_device(&Device::Cpu),
-                                        v_anc.to_device(&Device::Cpu), v_scl.to_device(&Device::Cpu), v_sgn.to_device(&Device::Cpu)
+                            // [GPU-ACCELERATED] Perform math on GPU, batch transfers
+                            if let (Ok(k_comp), Ok(v_comp)) = (layer.self_attn.gpu_compress_bitkv(k), layer.self_attn.gpu_compress_bitkv(v)) {
+                                // Batch: Concatenate K and V components on GPU to reduce transfer calls (6 -> 3)
+                                let anchors_kv = Tensor::cat(&[k_comp.0, v_comp.0], 0);
+                                let scales_kv = Tensor::cat(&[k_comp.1, v_comp.1], 0);
+                                let signs_kv = Tensor::cat(&[k_comp.2, v_comp.2], 0);
+
+                                if let (Ok(anc_kv), Ok(scl_kv), Ok(sgn_kv)) = (anchors_kv, scales_kv, signs_kv) {
+                                    // Move combined components to CPU in only 3 transfers
+                                    if let (Ok(a_kv), Ok(s_kv), Ok(sn_kv)) = (
+                                        anc_kv.to_device(&Device::Cpu), scl_kv.to_device(&Device::Cpu), sgn_kv.to_device(&Device::Cpu)
                                     ) {
                                         submit_bake_task(BakeTask::GpuPrecomputedKvChunk {
                                             kv_name: kv_name_owned.clone(),
                                             offset,
                                             layer_idx: layer.self_attn.layer_idx,
-                                            k_anchors: k_a,
-                                            k_scales: k_sc,
-                                            k_signs: k_sn,
-                                            v_anchors: v_a,
-                                            v_scales: v_sc,
-                                            v_signs: v_sn,
-                                            k_shape: k_shp,
+                                            anchors_kv: a_kv,
+                                            scales_kv: s_kv,
+                                            signs_kv: sn_kv,
+                                            k_shape: k_comp.3,
                                             path: target_path,
                                         });
                                     }
@@ -676,25 +677,26 @@ impl Qwen3VLGenerateModel {
                         let target_path = path.join(filename);
 
                         if is_gpu_mode {
-                            // [GPU-ACCELERATED] Perform math on GPU, transfer small components, pack on worker
-                            if let Ok((k_anc, k_scl, k_sgn, k_shp)) = layer.self_attn.gpu_compress_bitkv(k) {
-                                if let Ok((v_anc, v_scl, v_sgn, _)) = layer.self_attn.gpu_compress_bitkv(v) {
-                                    // Move components to CPU for transfer
-                                    if let (Ok(k_a), Ok(k_sc), Ok(k_sn), Ok(v_a), Ok(v_sc), Ok(v_sn)) = (
-                                        k_anc.to_device(&Device::Cpu), k_scl.to_device(&Device::Cpu), k_sgn.to_device(&Device::Cpu),
-                                        v_anc.to_device(&Device::Cpu), v_scl.to_device(&Device::Cpu), v_sgn.to_device(&Device::Cpu)
+                            // [GPU-ACCELERATED] Perform math on GPU, batch transfers
+                            if let (Ok(k_comp), Ok(v_comp)) = (layer.self_attn.gpu_compress_bitkv(k), layer.self_attn.gpu_compress_bitkv(v)) {
+                                // Batch: Concatenate K and V components on GPU to reduce transfer calls (6 -> 3)
+                                let anchors_kv = Tensor::cat(&[k_comp.0, v_comp.0], 0);
+                                let scales_kv = Tensor::cat(&[k_comp.1, v_comp.1], 0);
+                                let signs_kv = Tensor::cat(&[k_comp.2, v_comp.2], 0);
+
+                                if let (Ok(anc_kv), Ok(scl_kv), Ok(sgn_kv)) = (anchors_kv, scales_kv, signs_kv) {
+                                    // Move combined components to CPU in only 3 transfers
+                                    if let (Ok(a_kv), Ok(s_kv), Ok(sn_kv)) = (
+                                        anc_kv.to_device(&Device::Cpu), scl_kv.to_device(&Device::Cpu), sgn_kv.to_device(&Device::Cpu)
                                     ) {
                                         submit_bake_task(BakeTask::GpuPrecomputedKvChunk {
                                             kv_name: kv_name_owned.clone(),
                                             offset,
                                             layer_idx: layer.self_attn.layer_idx,
-                                            k_anchors: k_a,
-                                            k_scales: k_sc,
-                                            k_signs: k_sn,
-                                            v_anchors: v_a,
-                                            v_scales: v_sc,
-                                            v_signs: v_sn,
-                                            k_shape: k_shp,
+                                            anchors_kv: a_kv,
+                                            scales_kv: s_kv,
+                                            signs_kv: sn_kv,
+                                            k_shape: k_comp.3,
                                             path: target_path,
                                         });
                                     }
