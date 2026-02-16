@@ -4,11 +4,10 @@ use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use rayon::prelude::*;
 use nvml_wrapper::Nvml;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs;
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Arc;
 use memmap2::Mmap;
 
 use crate::{
@@ -25,234 +24,6 @@ use crate::{
         prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
     },
 };
-
-// --- [BAKING QUEUE SYSTEM] ---
-
-pub enum BakeTask {
-    LayerSnapshot {
-        layer_idx: usize,
-        offset: usize,
-        data: HashMap<String, Tensor>, // CPU Tensors
-        path: PathBuf,
-    },
-    KvChunk {
-        kv_name: Option<String>,
-        offset: usize,
-        data: HashMap<String, Tensor>, // CPU Tensors (k, v)
-        path: PathBuf,
-    },
-    RawKvChunk {
-        kv_name: Option<String>,
-        offset: usize,
-        layer_idx: usize,
-        k: Tensor, // F32 CPU Tensor
-        v: Tensor, // F32 CPU Tensor
-        path: PathBuf,
-    },
-    GpuPrecomputedKvChunk {
-        kv_name: Option<String>,
-        offset: usize,
-        layer_idx: usize,
-        // Combined K and V components to reduce transfer calls
-        anchors_kv: Tensor, 
-        scales_kv: Tensor,
-        signs_kv: Tensor, // U8
-        k_shape: Vec<usize>,
-        path: PathBuf,
-    }
-}
-
-// Global Queue: (Queue, Capacity Condition)
-// We use a manual Mutex/Condvar to strictly enforce the log flow and thread blocking.
-static BAKE_QUEUE_PAIR: std::sync::OnceLock<(Mutex<VecDeque<BakeTask>>, Condvar)> = std::sync::OnceLock::new();
-static WORKER_STARTED: std::sync::Once = std::sync::Once::new();
-
-fn get_bake_queue() -> &'static (Mutex<VecDeque<BakeTask>>, Condvar) {
-    BAKE_QUEUE_PAIR.get_or_init(|| (Mutex::new(VecDeque::new()), Condvar::new()))
-}
-
-// [OPTIMIZED] Fast bit-packing using bitwise shifts instead of per-bit loops
-fn worker_pack_signs(signs: &Tensor) -> Result<Tensor> {
-    let signs_vec = signs.flatten_all()?.to_vec1::<u8>()?;
-    let len = signs_vec.len();
-    let packed_len = (len + 7) / 8;
-    let mut packed = vec![0u8; packed_len];
-    
-    // Process 8 elements at once for maximum speed
-    packed.par_chunks_mut(1024).enumerate().for_each(|(chunk_idx, byte_chunk)| {
-        let start_byte = chunk_idx * 1024;
-        let start_element = start_byte * 8;
-        
-        for (i, byte) in byte_chunk.iter_mut().enumerate() {
-            let elem_pos = start_element + i * 8;
-            if elem_pos + 8 <= len {
-                let slice = &signs_vec[elem_pos..elem_pos + 8];
-                *byte = (slice[0] & 1) 
-                      | ((slice[1] & 1) << 1)
-                      | ((slice[2] & 1) << 2)
-                      | ((slice[3] & 1) << 3)
-                      | ((slice[4] & 1) << 4)
-                      | ((slice[5] & 1) << 5)
-                      | ((slice[6] & 1) << 6)
-                      | ((slice[7] & 1) << 7);
-            } else {
-                // Handle remainder
-                for bit in 0..8 {
-                    if elem_pos + bit < len {
-                        if signs_vec[elem_pos + bit] == 1 {
-                            *byte |= 1 << bit;
-                        }
-                    }
-                }
-            }
-        }
-    });
-    
-    Ok(Tensor::from_vec(packed, vec![packed_len], &Device::Cpu)?)
-}
-
-// Standalone compression helper for the worker
-fn worker_compress_bitkv(t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
-    let original_shape = t.shape().dims().to_vec();
-    let (b, h, s, d) = t.dims4()?;
-    // Assume t is already F32 on CPU
-    let t_data = t.flatten_all()?.to_vec1::<f32>()?;
-    
-    let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-    let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-    let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
-    let mut scales = vec![0.0f32; b * h * s];
-
-    let head_token_size = s * d;
-    // Parallelize by head (using rayon in worker)
-    packed_residuals.par_chunks_mut(head_token_size / 8).enumerate().for_each(|(bh_idx, head_packed)| {
-        let bh_offset = bh_idx * head_token_size;
-        for i in 0..head_token_size {
-            if t_data[bh_offset + i] >= 0.0 {
-                head_packed[i / 8] |= 1 << (i % 8);
-            }
-        }
-    });
-    
-    let anchor_head_size = anchor_count * d;
-    let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
-    let mut scales_heads: Vec<&mut [f32]> = scales.chunks_mut(s).collect();
-
-    anchors_heads.par_iter_mut().zip(scales_heads.par_iter_mut()).enumerate().for_each(|(bh_idx, (anchor_head, head_scales))| {
-        let bh_offset = bh_idx * head_token_size;
-        for token_idx in 0..s {
-            let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-            if token_idx < 4 || token_idx % 8 == 0 {
-                let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
-                anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
-            }
-            let mut max_abs = 0.0f32;
-            for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
-            head_scales[token_idx] = max_abs;
-        }
-    });
-
-    let packed_len = packed_residuals.len();
-    let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?;
-    let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
-    let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?;
-    Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
-}
-
-pub fn start_baking_worker() {
-    WORKER_STARTED.call_once(|| {
-        std::thread::spawn(move || {
-            let (lock, cvar) = get_bake_queue();
-            loop {
-                let mut queue = lock.lock().unwrap();
-                while queue.is_empty() {
-                    queue = cvar.wait(queue).unwrap();
-                }
-                
-                let task = queue.pop_front();
-                cvar.notify_all(); 
-                drop(queue); 
-
-                if let Some(task) = task {
-                    match task {
-                        BakeTask::LayerSnapshot { layer_idx: _, offset: _, data, path } => {
-                            let _ = candle_core::safetensors::save(&data, &path);
-                        },
-                        BakeTask::KvChunk { kv_name: _, offset: _, data, path } => {
-                             let _ = candle_core::safetensors::save(&data, &path);
-                        },
-                        BakeTask::RawKvChunk { kv_name: _, offset: _, layer_idx: _, k, v, path } => {
-                            if let Ok((k_anchors, k_packed, k_scales, k_shape)) = worker_compress_bitkv(&k) {
-                                if let Ok((v_anchors, v_packed, v_scales, _)) = worker_compress_bitkv(&v) {
-                                    let mut map = std::collections::HashMap::new();
-                                    map.insert("k_anchors".to_string(), k_anchors);
-                                    map.insert("k_packed".to_string(), k_packed);
-                                    map.insert("k_scales".to_string(), k_scales);
-                                    map.insert("v_anchors".to_string(), v_anchors);
-                                    map.insert("v_packed".to_string(), v_packed);
-                                    map.insert("v_scales".to_string(), v_scales);
-                                    if let Ok(s) = Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu) {
-                                        map.insert("k_shape".to_string(), s);
-                                    }
-                                    if let Ok(mode) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
-                                        map.insert("mode".to_string(), mode);
-                                    }
-                                    let _ = candle_core::safetensors::save(&map, &path);
-                                }
-                            }
-                        },
-                        BakeTask::GpuPrecomputedKvChunk { kv_name: _, offset: _, layer_idx: _, anchors_kv, scales_kv, signs_kv, k_shape, path } => {
-                            // [OPTIMIZED PATH]
-                            // Split K and V components from the combined tensors
-                            if let (Ok(anchors), Ok(scales), Ok(signs)) = (anchors_kv.chunk(2, 0), scales_kv.chunk(2, 0), signs_kv.chunk(2, 0)) {
-                                if let (Ok(k_packed), Ok(v_packed)) = (worker_pack_signs(&signs[0]), worker_pack_signs(&signs[1])) {
-                                    let mut map = std::collections::HashMap::new();
-                                    map.insert("k_anchors".to_string(), anchors[0].clone());
-                                    map.insert("k_packed".to_string(), k_packed);
-                                    map.insert("k_scales".to_string(), scales[0].clone());
-                                    map.insert("v_anchors".to_string(), anchors[1].clone());
-                                    map.insert("v_packed".to_string(), v_packed);
-                                    map.insert("v_scales".to_string(), scales[1].clone());
-                                    if let Ok(s) = Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu) {
-                                        map.insert("k_shape".to_string(), s);
-                                    }
-                                    if let Ok(mode) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
-                                        map.insert("mode".to_string(), mode);
-                                    }
-                                    let _ = candle_core::safetensors::save(&map, &path);
-                                }
-                            }
-                        }
-                    }
-                    
-                    println!("[MEMORY] KV Cache Persisted to Disk.");
-                }
-            }
-        });
-    });
-}
-
-
-pub fn submit_bake_task(task: BakeTask) {
-    // Ensure worker is running
-    start_baking_worker();
-
-    let (lock, cvar) = get_bake_queue();
-    let mut queue = lock.lock().unwrap();
-
-    // [FLOW-CONTROL] Increased capacity to 40 to avoid stalling inference as often
-    if queue.len() >= 40 {
-        println!("[MEMORY] Bake queue full (40). Waiting for worker...");
-        while queue.len() >= 40 {
-            queue = cvar.wait(queue).unwrap();
-        }
-    }
-
-    queue.push_back(task);
-    cvar.notify_all(); // Wake up worker
-}
-
-// -----------------------------
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -659,33 +430,6 @@ impl QuantizedQwen3VLTextAttention {
         let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
         let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?;
         Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
-    }
-
-    // [GPU-ACCELERATION] Perform heavy quantization math on the GPU
-    pub fn gpu_compress_bitkv(&self, t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
-        let (b, h, s, d) = t.dims4()?;
-        let original_shape = vec![b, h, s, d];
-        let device = t.device();
-
-        // 1. Anchors: Select indices (0, 1, 2, 3, 4, 12, 20...)
-        // Creating index tensor on CPU then moving is easiest/fast enough for indices
-        let mut indices = vec![0u32, 1, 2, 3];
-        for i in (4..s).step_by(8) {
-            indices.push(i as u32);
-        }
-        let idx_len = indices.len();
-        let idx_tensor = Tensor::from_vec(indices, (idx_len,), device)?;
-        let anchors = t.index_select(&idx_tensor, 2)?; 
-
-        // 2. Scales: Max Abs over last dim (D)
-        // [B, H, S, 1]
-        let scales = t.abs()?.max_keepdim(D::Minus1)?; 
-
-        // 3. Signs: t >= 0 -> 1, else 0
-        // [B, H, S, D] -> [U8]
-        let signs = t.ge(0.0)?.to_dtype(DType::U8)?;
-
-        Ok((anchors, scales, signs, original_shape))
     }
 
     pub fn decompress_from_bitkv(&self, anchors: &Tensor, packed: &Tensor, scales: &Tensor, original_shape: &[usize]) -> Result<Tensor> {
@@ -1432,6 +1176,8 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
+        let mut save_handles = std::collections::VecDeque::new(); 
+
         let mut start_layer = 0;
         // [RESUME-LOGIC] Only active for multi-token chunks (Ingestion)
         if seq_len > 1 {
@@ -1516,32 +1262,61 @@ impl QuantizedQwen3VLTextModel {
                     let _ = target_device.synchronize(); 
                 }
 
-                // 2. [B: Backing] Submit to Queue
+                // 2. [B: Backing Up] Start Save
                 if let Some(sid) = &self.active_session_id {
                     let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                     if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
                     let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                    let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
                     
-                    // Copy to CPU immediately to free GPU, then submit
-                    if let Ok(xs_cpu) = xs.to_device(&Device::Cpu) {
-                         let mut map = std::collections::HashMap::new();
-                         map.insert("hidden_states".to_string(), xs_cpu);
-                         
-                         let task = BakeTask::LayerSnapshot {
-                             layer_idx,
-                             offset: seqlen_offset,
-                             data: map,
-                             path: final_path,
-                         };
-                         
-                         submit_bake_task(task);
+                    let xs_cpu = xs.to_device(&Device::Cpu)?;
+                    
+                    if num_layers == 1 {
+                        let mut map = std::collections::HashMap::new();
+                        map.insert("hidden_states".to_string(), xs_cpu.clone());
+                        let _ = candle_core::safetensors::save(&map, &tmp_path);
+                        let _ = std::fs::rename(&tmp_path, &final_path);
+                    } else {
+                        let h = tokio::task::spawn_blocking(move || {
+                            let mut map = std::collections::HashMap::new();
+                            map.insert("hidden_states".to_string(), xs_cpu);
+                            let _ = candle_core::safetensors::save(&map, &tmp_path);
+                            let _ = std::fs::rename(&tmp_path, &final_path);
+                        });
+                        save_handles.push_back((layer_idx, h, xs.clone()));
+                    }
+                }
+
+                // 3. [A: Archived] Confirm Save and Drop Old Memory
+                let tight_window = 1; 
+                while save_handles.len() > tight_window {
+                    if let Some((_, handle, old_xs)) = save_handles.pop_front() {
+                        if handle.is_finished() {
+                            drop(old_xs);
+                            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                                
+                            #[cfg(target_os = "windows")]
+                            unsafe {
+                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                                use windows_sys::Win32::System::Memory::*;
+                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                            }
+                        } else {
+                            save_handles.push_front((0, handle, old_xs));
+                        }
                     }
                 }
             }
             if !is_pinned { layer.to_device(&Device::Cpu)?; }
         }
 
+        // Final Wait for all remaining saves before returning (Only for Ingestion)
+        if seq_len > 1 {
+            for (_, handle, _) in save_handles {
+                let _ = futures::executor::block_on(handle);
+            }
+        }
         
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
