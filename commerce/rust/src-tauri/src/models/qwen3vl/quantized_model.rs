@@ -174,6 +174,7 @@ pub struct MemorySlot {
     pub block_idx: usize,
 }
 
+#[derive(Clone)]
 pub struct KVBlock {
     pub location: KVLocation,
     pub k_cache: Option<Tensor>, // Present if in VRAM
@@ -632,17 +633,29 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> {
-        let filename = match (kv_name, offset) {
-            (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
-            (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
-            (None, 0) => format!("layer_{}_kv.safetensors", self.layer_idx),
-            (None, off) => format!("layer_{}_kv_{}.safetensors", self.layer_idx, off),
+    pub fn save_kv_cache(&mut self, path: &Path, clear: bool, _offset: usize, kv_name: Option<&str>) -> Result<()> {
+        let filename = match kv_name {
+            Some(name) => format!("layer_{}_kv.safetensors", name),
+            None => format!("layer_{}_kv.safetensors", self.layer_idx),
         };
         let file = path.join(filename);
         let mut map = HashMap::new();
 
-        if let Some((k, v)) = &self.kv_cache {
+        // [BLOCK-SAVE]
+        let mut ks = Vec::new();
+        let mut vs = Vec::new();
+        for block in &self.kv_blocks {
+            if block.location == KVLocation::VRAM {
+                if let (Some(k), Some(v)) = (&block.k_cache, &block.v_cache) {
+                    ks.push(k.clone());
+                    vs.push(v.clone());
+                }
+            }
+        }
+
+        if !ks.is_empty() {
+            let k = Tensor::cat(&ks, 2)?;
+            let v = Tensor::cat(&vs, 2)?;
             let (k_anchors, k_packed, k_scales, k_shape) = self.compress_to_bitkv(&k)?;
             let (v_anchors, v_packed, v_scales, _) = self.compress_to_bitkv(&v)?;
             
@@ -653,27 +666,42 @@ impl QuantizedQwen3VLTextAttention {
             map.insert("v_packed".to_string(), v_packed);
             map.insert("v_scales".to_string(), v_scales);
             map.insert("k_shape".to_string(), Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu)?);
-            map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu)?); // Mode 3: BitKV
-        } else {
-            return Ok(());
+            map.insert("mode".to_string(), Tensor::from_vec(vec![3u32], (1,), &Device::Cpu)?);
+            candle_core::safetensors::save(&map, &file)?;
         }
 
-        candle_core::safetensors::save(&map, &file)?;
-        if clear { self.kv_cache = None; }
+        if clear { self.kv_blocks.clear(); }
         Ok(())
     }
 
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
-        if let Some((k, v)) = &self.kv_cache {
-            let total_len = k.dim(2)?;
-            if len >= total_len {
-                self.kv_cache = None;
+        let mut current_total = 0;
+        let mut to_remove = Vec::new();
+        
+        for (i, block) in self.kv_blocks.iter_mut().enumerate() {
+            if current_total + block.len <= len {
+                current_total += block.len;
             } else {
-                let new_k = k.narrow(2, len, total_len - len)?.contiguous()?;
-                let new_v = v.narrow(2, len, total_len - len)?.contiguous()?;
-                self.kv_cache = Some((new_k, new_v));
+                let keep_in_this_block = len - current_total;
+                if keep_in_this_block > 0 {
+                    if block.location == KVLocation::VRAM {
+                        if let (Some(k), Some(v)) = (&block.k_cache, &block.v_cache) {
+                            block.k_cache = Some(k.narrow(2, 0, keep_in_this_block)?);
+                            block.v_cache = Some(v.narrow(2, 0, keep_in_this_block)?);
+                        }
+                    }
+                    block.len = keep_in_this_block;
+                    current_total += keep_in_this_block;
+                    for j in (i + 1)..self.kv_blocks.len() { to_remove.push(j); }
+                } else {
+                    for j in i..self.kv_blocks.len() { to_remove.push(j); }
+                }
+                break;
             }
         }
+        
+        to_remove.sort_by(|a, b| b.cmp(a));
+        for idx in to_remove { self.kv_blocks.remove(idx); }
         Ok(())
     }
 
@@ -789,7 +817,19 @@ impl QuantizedQwen3VLTextAttention {
 
         if final_len > 0 {
             let safe_len = final_len.min(actual_k_len);
-            self.kv_cache = Some((k.narrow(2, 0, safe_len)?, v.narrow(2, 0, safe_len)?));
+            let k_final = k.narrow(2, 0, safe_len)?.contiguous()?;
+            let v_final = v.narrow(2, 0, safe_len)?.contiguous()?;
+            
+            self.kv_blocks.clear();
+            self.kv_blocks.push(KVBlock {
+                location: KVLocation::VRAM,
+                k_cache: Some(k_final),
+                v_cache: Some(v_final),
+                ssd_path: None,
+                start_token: 0,
+                len: safe_len,
+                bitkv_metadata: None,
+            });
         }
         Ok(())
     }

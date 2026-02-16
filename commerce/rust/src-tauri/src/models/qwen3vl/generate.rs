@@ -764,8 +764,40 @@ impl Qwen3VLGenerateModel {
     pub fn get_current_kv(&self) -> (Vec<Tensor>, Vec<Tensor>) {
         let mut ks = vec![]; let mut vs = vec![];
         match &self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => { for l in &m.language_model.layers { if let Some((k, v)) = &l.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
-            ModelVariant::QuantizedText(m) => { for l in &m.language_model.layers { if let Some((k, v)) = &l.self_attn.kv_cache { ks.push(k.clone()); vs.push(v.clone()); } } },
+            ModelVariant::QuantizedVL(m) => { 
+                for l in &m.language_model.layers { 
+                    let mut layer_k = Vec::new();
+                    let mut layer_v = Vec::new();
+                    for b in &l.self_attn.kv_blocks {
+                        if let (Some(k), Some(v)) = (&b.k_cache, &b.v_cache) {
+                            layer_k.push(k.clone());
+                            layer_v.push(v.clone());
+                        }
+                    }
+                    if !layer_k.is_empty() {
+                        if let (Ok(k), Ok(v)) = (Tensor::cat(&layer_k, 2), Tensor::cat(&layer_v, 2)) {
+                            ks.push(k); vs.push(v);
+                        }
+                    }
+                } 
+            },
+            ModelVariant::QuantizedText(m) => { 
+                for l in &m.language_model.layers { 
+                    let mut layer_k = Vec::new();
+                    let mut layer_v = Vec::new();
+                    for b in &l.self_attn.kv_blocks {
+                        if let (Some(k), Some(v)) = (&b.k_cache, &b.v_cache) {
+                            layer_k.push(k.clone());
+                            layer_v.push(v.clone());
+                        }
+                    }
+                    if !layer_k.is_empty() {
+                        if let (Ok(k), Ok(v)) = (Tensor::cat(&layer_k, 2), Tensor::cat(&layer_v, 2)) {
+                            ks.push(k); vs.push(v);
+                        }
+                    }
+                } 
+            },
             _ => {} 
         }
         (ks, vs)

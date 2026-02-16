@@ -1059,7 +1059,7 @@ impl LogisModel {
             ..Default::default()
         };
         
-        gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn run_inference_with_spinner(
