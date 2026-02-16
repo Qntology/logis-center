@@ -55,14 +55,15 @@ fn spawn_bake_worker(active_tasks: Arc<std::sync::atomic::AtomicUsize>) -> mpsc:
             let offset = task.offset;
             
             for layer in task.layers {
-                let filename = match (&kv_name, offset) {
+                let filename = match (&kv_name, task.offset) {
                     (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
                     (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
                     (None, 0) => format!("layer_{}_kv.safetensors", layer.layer_idx),
                     (None, off) => format!("layer_{}_kv_{}.safetensors", layer.layer_idx, off),
                 };
-                let path = task_dir.join(filename);
-                
+                let final_path = task_dir.join(&filename);
+                let tmp_path = task_dir.join(format!("{}.tmp", filename));
+
                 let mut map = std::collections::HashMap::new();
 
                 // --- [BitKV Compression Logic] ---
@@ -89,12 +90,10 @@ fn spawn_bake_worker(active_tasks: Arc<std::sync::atomic::AtomicUsize>) -> mpsc:
                         
                         for token_idx in 0..s {
                             let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                            
                             if token_idx < 4 || token_idx % 8 == 0 {
                                 let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
                                 anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
                             }
-                            
                             let mut max_abs = 0.0f32;
                             for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
                             scales[bh_idx * s + token_idx] = max_abs;
@@ -115,16 +114,16 @@ fn spawn_bake_worker(active_tasks: Arc<std::sync::atomic::AtomicUsize>) -> mpsc:
                 let _ = process_kv(layer.k, "k");
                 let _ = process_kv(layer.v, "v");
                 
-                // Mode 3: BitKV (Compressed)
                 if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
                     map.insert("mode".to_string(), mode_tensor);
                 }
 
-                if let Err(e) = candle_core::safetensors::save(&map, &path) {
-                    eprintln!("[BAKE-WORKER] Failed to save layer {}: {:?}", layer.layer_idx, e);
+                // Atomic Write: Write to .tmp then rename
+                if let Ok(_) = candle_core::safetensors::save(&map, &tmp_path) {
+                    let _ = std::fs::rename(&tmp_path, &final_path);
                 }
             }
-            // 작업 완료 후 카운터 감소 및 명시적 메모리 해제 암시
+            // 작업 완료 후 카운터 감소
             active_tasks.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     });
@@ -426,17 +425,6 @@ impl Qwen3VLGenerateModel {
         while current_pos < total_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (상한선을 20개로 완화하여 성능 향상)
-            let mut wait_count = 0;
-            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 20 {
-                if wait_count == 0 { println!("[MEMORY] 68. 대기열 포화 (20개 초과). 일시 정지."); }
-                println!("[MEMORY] {}. 메모리 제거 대기 (Queue: {})...", 69 + wait_count.min(3), self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst));
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                wait_count += 1;
-                if wait_count > 200 { break; } 
-            }
-            if wait_count > 0 { println!("[MEMORY] 73. 추론 진행 메모리 (Ready)"); }
-
             let end = (current_pos + prefill_chunk_size).min(total_tokens);
             let chunk_len = end - current_pos;
             if chunk_len == 0 { break; }
@@ -465,19 +453,6 @@ impl Qwen3VLGenerateModel {
                     layers: layer_dumps,
                 });
                 self.active_bake_tasks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                
-                // 2. Purge from VRAM (Keep memory lean during heavy prefill)
-                println!("[BAKING] Segment queued. Resetting memory for token {}.", end);
-                let _ = self.qwen3_vl.drop_kv_storage(); 
-                
-                // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
-                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
             }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -506,24 +481,13 @@ impl Qwen3VLGenerateModel {
             current_pos = end;
         }
         
-        // [CRITICAL-SYNC] 73. 최종 대기: 마지막 조각이 디스크에 쓰여질 때까지 반드시 대기
-        let mut final_wait = 0;
-        while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-            if final_wait == 0 { println!("[BAKING] Finishing last background tasks..."); }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            final_wait += 1;
-            if final_wait > 100 { break; }
-        }
-        if final_wait > 0 { println!("[BAKING] All segments committed to disk. 73. 추론 진행 메모리 (Ready)"); }
-
         if let Some(sid) = session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if !path.exists() { let _ = fs::create_dir_all(&path); }
             let token_path = path.join("tokens.json");
             if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
             
-            println!("[BAKING] Full context baked. Purging Small engine memory.");
-            let _ = self.qwen3_vl.drop_kv_storage(); 
+            println!("[BAKING] Prefill complete. Small engine transitioning...");
         }
         Ok(current_pos)
     }
@@ -565,7 +529,7 @@ impl Qwen3VLGenerateModel {
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let top_p = mes.top_p.unwrap_or(0.9) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(40), seed);
+        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(10), seed);
         let mut all_ids = vec![];
         let mut generated_text = String::new();
         let mut seqlen_offset = self.get_kv_len();
@@ -630,23 +594,6 @@ impl Qwen3VLGenerateModel {
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
-                
-                // Keep only the window, purge the rest using HARD RESET
-                let current_kv_len = self.get_kv_len();
-                if current_kv_len > window_keep_size {
-                    let purge_len = current_kv_len - window_keep_size;
-                    // Trigger the newly upgraded Hard Reset truncate
-                    let _ = self.truncate_kv_cache(purge_len);
-                    
-                    // Force GPU and OS sync to see immediate capacity change
-                    if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                    #[cfg(target_os = "windows")]
-                    unsafe {
-                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                        use windows_sys::Win32::System::Memory::*;
-                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                    }
-                }
             }
         }
 
@@ -837,14 +784,23 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-        pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
-            match &mut self.qwen3_vl {
-                ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 0, kv_name),    
-                ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 0, kv_name),  
-                _ => Ok(()),
-            }
-        }
-    pub fn to_device(&mut self, d: &Device) -> Result<()> {
+            pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
+                // [SYNC-ON-DEMAND] 파일을 읽기 직전에만 대기열이 비었는지 확인 (겸사겸사)
+                let mut wait_count = 0;
+                while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    if wait_count == 0 { println!("[LOADER] Waiting for background bake tasks to commit to disk..."); }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    wait_count += 1;
+                    if wait_count > 100 { break; } // 5초 타임아웃
+                }
+                if wait_count > 0 { println!("[LOADER] All files ready. Proceeding with load."); }
+        
+                match &mut self.qwen3_vl {
+                    ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 0, kv_name),    
+                    ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 0, kv_name),  
+                    _ => Ok(()),
+                }
+            }    pub fn to_device(&mut self, d: &Device) -> Result<()> {
         match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => m.to_device(d)?,
             ModelVariant::QuantizedText(m) => m.to_device(d)?,

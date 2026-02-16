@@ -1280,14 +1280,6 @@ impl QuantizedQwen3VLTextModel {
             }
             if wait_count > 0 { 
                 println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
-                
-                // [AGGRESSIVE-OS-TRIM] OS에게 사용하지 않는 메모리를 즉시 반환하도록 요청
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
             }
 
             let is_pinned = layer_idx < self.pinned_layer_count;
@@ -1351,17 +1343,7 @@ impl QuantizedQwen3VLTextModel {
                 let tight_window = 1; 
                 while save_handles.len() > tight_window {
                     if let Some((_, handle, old_xs)) = save_handles.pop_front() {
-                        if handle.is_finished() {
-                            drop(old_xs);
-                            if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                                
-                            #[cfg(target_os = "windows")]
-                            unsafe {
-                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                                use windows_sys::Win32::System::Memory::*;
-                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                            }
-                        } else {
+                        if !handle.is_finished() {
                             save_handles.push_front((0, handle, old_xs));
                         }
                     }
