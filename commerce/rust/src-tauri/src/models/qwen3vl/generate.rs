@@ -80,6 +80,7 @@ impl SlotManager {
 }
 
 pub static ACTIVE_BAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(8));
 
 // [MEMORY] 강제 메모리 해제 및 초기화 함수 (Async)
 async fn purge_vram_position(device: &Device) {
@@ -99,6 +100,7 @@ struct LayerKVDump {
 }
 
 struct BakeTask {
+    slot_id: usize,
     task_dir: PathBuf,
     kv_name: Option<String>,
     offset: usize,
@@ -106,8 +108,18 @@ struct BakeTask {
 }
 
 struct SaveTask {
+    slot_id: usize,
     path: PathBuf,
     tensors: std::collections::HashMap<String, Tensor>,
+}
+
+pub static BAKE_TX: once_cell::sync::Lazy<tokio::sync::Mutex<Option<mpsc::Sender<BakeTask>>>> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+
+pub fn init_bake_worker() {
+    let (tx, rx) = mpsc::channel(100);
+    spawn_bake_worker(rx);
+    let mut lock = BAKE_TX.blocking_lock();
+    *lock = Some(tx);
 }
 
 fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
@@ -118,7 +130,9 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
         println!("[IO-WORKER] Disk writer started.");
         while let Some(task) = io_rx.recv().await {
             let _ = candle_core::safetensors::save(&task.tensors, &task.path);
-            // I/O가 끝나는 시점에 최종적으로 대기열 카운트 감소 (필요시)
+            // SSD 저장 완료 후 슬롯 반납 (Handoff 완료)
+            SLOT_MANAGER.release_slot(task.slot_id);
+            println!("[IO-WORKER] Slot {} released.", task.slot_id);
         }
     });
 
@@ -126,6 +140,7 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
     tokio::spawn(async move {
         println!("[BAKE-WORKER] Compression worker started.");
         while let Some(task) = rx.recv().await {
+            let slot_id = task.slot_id;
             let task_dir = task.task_dir;
             let kv_name = task.kv_name;
             let offset = task.offset;
@@ -190,10 +205,9 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
                 }
 
                 // 압축 완료된 맵을 IO 워커로 전송 (논블로킹)
-                let _ = io_tx.blocking_send(SaveTask { path, tensors: map });
+                let _ = io_tx.blocking_send(SaveTask { slot_id, path, tensors: map });
             }
         }
-        println!("[BAKE-WORKER] Compression worker finished.");
     });
 }
 
