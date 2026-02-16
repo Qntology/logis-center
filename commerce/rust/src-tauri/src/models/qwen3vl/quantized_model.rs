@@ -40,6 +40,14 @@ pub enum BakeTask {
         offset: usize,
         data: HashMap<String, Tensor>, // CPU Tensors (k, v)
         path: PathBuf,
+    },
+    RawKvChunk {
+        kv_name: Option<String>,
+        offset: usize,
+        layer_idx: usize,
+        k: Tensor, // F32 CPU Tensor
+        v: Tensor, // F32 CPU Tensor
+        path: PathBuf,
     }
 }
 
@@ -50,6 +58,54 @@ static WORKER_STARTED: std::sync::Once = std::sync::Once::new();
 
 fn get_bake_queue() -> &'static (Mutex<VecDeque<BakeTask>>, Condvar) {
     BAKE_QUEUE_PAIR.get_or_init(|| (Mutex::new(VecDeque::new()), Condvar::new()))
+}
+
+// Standalone compression helper for the worker
+fn worker_compress_bitkv(t: &Tensor) -> Result<(Tensor, Tensor, Tensor, Vec<usize>)> {
+    let original_shape = t.shape().dims().to_vec();
+    let (b, h, s, d) = t.dims4()?;
+    // Assume t is already F32 on CPU
+    let t_data = t.flatten_all()?.to_vec1::<f32>()?;
+    
+    let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+    let mut anchors = vec![0.0f32; b * h * anchor_count * d];
+    let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
+    let mut scales = vec![0.0f32; b * h * s];
+
+    let head_token_size = s * d;
+    // Parallelize by head (using rayon in worker)
+    packed_residuals.par_chunks_mut(head_token_size / 8).enumerate().for_each(|(bh_idx, head_packed)| {
+        let bh_offset = bh_idx * head_token_size;
+        for i in 0..head_token_size {
+            if t_data[bh_offset + i] >= 0.0 {
+                head_packed[i / 8] |= 1 << (i % 8);
+            }
+        }
+    });
+    
+    let anchor_head_size = anchor_count * d;
+    let mut anchors_heads: Vec<&mut [f32]> = anchors.chunks_mut(anchor_head_size).collect();
+    let mut scales_heads: Vec<&mut [f32]> = scales.chunks_mut(s).collect();
+
+    anchors_heads.par_iter_mut().zip(scales_heads.par_iter_mut()).enumerate().for_each(|(bh_idx, (anchor_head, head_scales))| {
+        let bh_offset = bh_idx * head_token_size;
+        for token_idx in 0..s {
+            let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+            if token_idx < 4 || token_idx % 8 == 0 {
+                let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                anchor_head[anchor_pos * d .. (anchor_pos + 1) * d].copy_from_slice(token_data);
+            }
+            let mut max_abs = 0.0f32;
+            for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
+            head_scales[token_idx] = max_abs;
+        }
+    });
+
+    let packed_len = packed_residuals.len();
+    let anchors_tensor = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?;
+    let packed_tensor = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu)?;
+    let scales_tensor = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?;
+    Ok((anchors_tensor, packed_tensor, scales_tensor, original_shape))
 }
 
 pub fn start_baking_worker() {
@@ -63,17 +119,12 @@ pub fn start_baking_worker() {
                 }
                 
                 let task = queue.pop_front();
-                // Notify producers that space might be available (though we usually notify after processing to ensure flow)
                 cvar.notify_all(); 
-                drop(queue); // Release lock while processing
+                drop(queue); 
 
                 if let Some(task) = task {
                     match task {
                         BakeTask::LayerSnapshot { layer_idx: _, offset: _, data, path } => {
-                            // BitKV Compression or standard save could happen here.
-                            // For now, we assume data is already prepared or we save directly.
-                            // In a real scenario, we would move the `compress_to_bitkv` logic here.
-                            // But per request, we just save what we got.
                             if let Ok(_) = candle_core::safetensors::save(&data, &path) {
                                 // Success
                             }
@@ -81,6 +132,31 @@ pub fn start_baking_worker() {
                         BakeTask::KvChunk { kv_name: _, offset: _, data, path } => {
                              if let Ok(_) = candle_core::safetensors::save(&data, &path) {
                                 // Success
+                            }
+                        },
+                        BakeTask::RawKvChunk { kv_name, offset, layer_idx, k, v, path } => {
+                            // [STRONG ASYNC] Worker performs compression
+                            // 1. Compress K
+                            if let Ok((k_anchors, k_packed, k_scales, k_shape)) = worker_compress_bitkv(&k) {
+                                // 2. Compress V
+                                if let Ok((v_anchors, v_packed, v_scales, _)) = worker_compress_bitkv(&v) {
+                                    let mut map = std::collections::HashMap::new();
+                                    map.insert("k_anchors".to_string(), k_anchors);
+                                    map.insert("k_packed".to_string(), k_packed);
+                                    map.insert("k_scales".to_string(), k_scales);
+                                    map.insert("v_anchors".to_string(), v_anchors);
+                                    map.insert("v_packed".to_string(), v_packed);
+                                    map.insert("v_scales".to_string(), v_scales);
+                                    if let Ok(s) = Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu) {
+                                        map.insert("k_shape".to_string(), s);
+                                    }
+                                    if let Ok(mode) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
+                                        map.insert("mode".to_string(), mode);
+                                    }
+                                    
+                                    // 3. Save
+                                    let _ = candle_core::safetensors::save(&map, &path);
+                                }
                             }
                         }
                     }
