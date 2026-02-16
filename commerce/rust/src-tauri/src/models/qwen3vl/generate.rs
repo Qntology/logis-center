@@ -86,7 +86,8 @@ impl SlotManager {
     }
 
     pub fn release_slot(&self, id: usize) {
-        if id < 4 {
+        let count = self.slots.len();
+        if id < count / 2 {
             self.free_write_slots.lock().unwrap().push(id);
         } else {
             self.free_read_slots.lock().unwrap().push(id);
@@ -600,8 +601,30 @@ impl Qwen3VLGenerateModel {
                     layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
                 }
 
-                // [즉시 해제] VRAM 점유권 박탈 (Purge)
-                self.qwen3_vl.drop_kv_storage()?; 
+                // [HANDOFF] VRAM -> SSD Transition
+                // Instead of clearing all, mark these blocks as SSD and set paths
+                if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
+                    for block in &m.language_model.layers[0].self_attn.kv_blocks {
+                        let mut inner = block.inner.write().unwrap();
+                        if inner.location == KVLocation::VRAM {
+                            inner.location = KVLocation::SSD;
+                            inner.ssd_path = Some(path.clone());
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                        }
+                    }
+                } else if let ModelVariant::QuantizedVL(ref mut m) = self.qwen3_vl {
+                    for block in &m.language_model.layers[0].self_attn.kv_blocks {
+                        let mut inner = block.inner.write().unwrap();
+                        if inner.location == KVLocation::VRAM {
+                            inner.location = KVLocation::SSD;
+                            inner.ssd_path = Some(path.clone());
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                        }
+                    }
+                }
+
                 let dev = self.text_device.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let _ = dev.synchronize();
@@ -613,17 +636,12 @@ impl Qwen3VLGenerateModel {
                         slot_id,
                         task_dir: path,
                         kv_name: kv_name.clone(),
-                        offset: end, // 끝 지점을 오프셋으로 사용
+                        offset: end,
                         layers: layer_dumps,
                     })).await;
                 }
             }
 
-            if let Some(ref mut target) = relay_target {
-                // [NOTE] Relay Target also needs careful management in step 4
-                // For now, we keep the simple relay but note that VRAM was purged above.
-                // We might need to keep a copy for relay or use the CPU slots.
-            }
             current_pos = end;
             println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
         }

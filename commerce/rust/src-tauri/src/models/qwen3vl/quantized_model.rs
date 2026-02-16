@@ -460,19 +460,10 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         for block in &self.kv_blocks {
-            let (mut k, mut v, b_len, loc) = {
+            let (mut k, mut v, b_len, mut loc) = {
                 let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.location.clone())
             };
-
-            // [WAIT-IF-LOADING]
-            if loc == KVLocation::Loading {
-                loop {
-                    let l = block.inner.read().unwrap().location.clone();
-                    if l != KVLocation::Loading { break; }
-                    std::thread::yield_now();
-                }
-            }
 
             match loc {
                 KVLocation::VRAM => {
@@ -482,14 +473,56 @@ impl QuantizedQwen3VLTextAttention {
                     global_start_idx += b_len;
                     continue;
                 }
-                KVLocation::RAM | KVLocation::SSD => {
-                    let inner = block.inner.read().unwrap();
+                KVLocation::RAM | KVLocation::SSD | KVLocation::Loading => {
+                    // [FALLBACK-LOAD] If not in RAM, load synchronously to avoid skips or hangs
+                    let mut inner = block.inner.write().unwrap();
+                    if inner.location != KVLocation::VRAM && inner.bitkv_metadata.is_none() {
+                        // Attempt synchronous load if prefetch is lagging or not triggered
+                        if let Some(path) = &inner.ssd_path {
+                            let filename = format!("layer_{}_kv.safetensors", self.layer_idx);
+                            let full_path = path.join(filename);
+                            if full_path.exists() {
+                                if let Ok(content) = std::fs::read(&full_path) {
+                                    if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                        let extract_vec = |name: &str| -> Option<Vec<f32>> {
+                                            st.tensor(name).ok().map(|v| unsafe {
+                                                std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
+                                            })
+                                        };
+                                        if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
+                                            if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
+                                                let original_shape = if let Ok(view) = st.tensor("k_shape") {
+                                                    let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
+                                                    shape_u32.iter().map(|&x| x as usize).collect()
+                                                } else { vec![1, 8, b_len, 128] };
+
+                                                inner.bitkv_metadata = Some(BitKVMetadata {
+                                                    k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
+                                                    k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], b_len, 1), &Device::Cpu).unwrap(),
+                                                    v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
+                                                    v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], b_len, 1), &Device::Cpu).unwrap(),
+                                                    original_shape,
+                                                });
+                                                inner.location = KVLocation::RAM;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
                     if let Some(meta) = &inner.bitkv_metadata {
                         let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
                         let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
                         k = Some(k_raw);
                         v = Some(v_raw);
-                    } else { global_start_idx += b_len; continue; }
+                    } else { 
+                        println!("[WARNING] Block {} could not be loaded. Skipping context!", inner.index);
+                        global_start_idx += b_len; continue; 
+                    }
                 }
                 _ => { global_start_idx += b_len; continue; }
             }
@@ -580,7 +613,21 @@ impl QuantizedQwen3VLTextAttention {
         let attn_output = attn_output.transpose(1, 2)?
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
-        let attn_output = self.o_proj.forward(&attn_output)?;
+
+        // [OFFLOAD-WATCH] Manage VRAM residency
+        let current_kv_total = self.get_kv_len();
+        if current_kv_total > 8192 {
+            // [FIX] Pre-calculate take amount to avoid simultaneous borrow
+            let num_to_offload = self.kv_blocks.len().saturating_sub(2);
+            for block in self.kv_blocks.iter_mut().take(num_to_offload) {
+                let mut inner = block.inner.write().unwrap();
+                if inner.location == KVLocation::VRAM {
+                    inner.location = KVLocation::SSD;
+                    inner.k_cache = None;
+                    inner.v_cache = None;
+                }
+            }
+        }
 
         Ok(attn_output)
     }
