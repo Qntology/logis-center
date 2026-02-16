@@ -146,22 +146,6 @@ impl ModelVariant {
         }
     }
 
-    pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
-        match self {
-            Self::Standard(_) => Ok(()), 
-            Self::QuantizedVL(m) => m.truncate_kv_cache(len),
-            Self::QuantizedText(m) => m.truncate_kv_cache(len),
-        }
-    }
-
-    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
-        match self {
-            Self::Standard(_) => Ok(()),
-            Self::QuantizedVL(m) => m.rewind_kv_cache(target_len),
-            Self::QuantizedText(m) => m.rewind_kv_cache(target_len),
-        }
-    }
-
     pub fn drop_kv_storage(&mut self) -> Result<()> {
         match self {
             Self::Standard(_) => Ok(()),
@@ -547,50 +531,26 @@ impl Qwen3VLGenerateModel {
         }
 
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
-        
-        // [HARD-SWAP-CONFIG] Constant memory usage strategy
-        let window_keep_size = 1024; 
-        let bake_block_size = 128;
+        let prefill_chunk_size = 128;
 
-        // [PHASE-1: Granular Prefill] Offload prompt chunks immediately to SSD
         while local_pos < total_tokens {
             let remaining = total_tokens - local_pos;
             if remaining == 1 { break; }
-            let mut chunk_size = if remaining > bake_block_size { bake_block_size } else { remaining };
+            let mut chunk_size = if remaining > prefill_chunk_size { prefill_chunk_size } else { remaining };
             if local_pos + chunk_size >= total_tokens { chunk_size = (total_tokens - local_pos).saturating_sub(1); }
             if chunk_size == 0 { break; }
-            
             let chunk = &full_input_ids_vec[local_pos..local_pos + chunk_size];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_size), &self.text_device)?;
             let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + chunk_size) as u32, &self.text_device)?.unsqueeze(0)?;
-            
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-            
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
-            
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
-
-            // Immediate Offload & Purge during prefill
-            if let Some(sid) = &session_id {
-                let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
-                
-                // Keep only the window, purge the rest using HARD RESET
-                let current_kv_len = self.get_kv_len();
-                if current_kv_len > window_keep_size {
-                    let purge_len = current_kv_len - window_keep_size;
-                    // Trigger the newly upgraded Hard Reset truncate
-                    let _ = self.truncate_kv_cache(purge_len);
-                    
-                    // Force GPU and OS sync to see immediate capacity change
-                    if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                    #[cfg(target_os = "windows")]
-                    unsafe {
-                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                        use windows_sys::Win32::System::Memory::*;
-                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                    }
+            if seqlen_offset % 1024 == 0 {
+                if let Some(sid) = &session_id {
+                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    let _ = self.save_kv_to_disk(&path, kv_name.as_deref(), seqlen_offset);
+                    println!("[GEN-PREFILL] Checkpoint at {}", seqlen_offset);
                 }
             }
         }
@@ -599,58 +559,65 @@ impl Qwen3VLGenerateModel {
         let mut pixel_values = input.pixel_values.take();
         let image_grid_thw = input.image_grid_thw.take();
 
-        // [PHASE-2: Constant-Speed Generation with Hard Swap]
-        // Use synchronous saving to ensure disk is updated immediately
+        // [WINDOW-BAKE] Setup async channel for background saving (Queue size: 10)
+        let (bake_tx, bake_rx) = mpsc::channel(10);
+        spawn_bake_worker(bake_rx);
         let task_dir_base = if let Some(sid) = &session_id {
-            // [FIX] Ensure we use the correct task data directory
-            crate::utils::paths::get_task_specific_dir(None, sid)
+            crate::utils::paths::get_kv_dir(None).join(sid)
         } else {
             std::path::PathBuf::new()
         };
 
+        // [SLIDING-WINDOW-CONFIG] 512 block size for more granular management
+        let window_keep_size = 1024; // 2 blocks of 512 (Keep very lean)
+        let bake_block_size = 512;
+
         for i in 0..max_new_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [HARD-SWAP-INFERENCE] Trigger every 128 tokens
+            // [WINDOW-BAKE] Trigger dump every 512 tokens
             if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
-                // Synchronous Save to Disk
-                if !task_dir_base.exists() { let _ = std::fs::create_dir_all(&task_dir_base); }
-                self.save_kv_to_disk(&task_dir_base, kv_name.as_deref(), seqlen_offset)?;
+                println!("[WINDOW-BAKE] {} boundary hit. Offloading 512-token block to disk.", seqlen_offset);
+                let (ks, vs) = self.get_current_kv();
+                let mut layer_dumps = Vec::new();
                 
-                // Hard Reset Memory
-                let current_kv_len = self.get_kv_len();
-                if current_kv_len > window_keep_size {
-                    let purge_len = current_kv_len - window_keep_size;
-                    let _ = self.truncate_kv_cache(purge_len);
+                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                    let current_mem_len = k.dim(2)?;
+                    if current_mem_len >= bake_block_size {
+                        let k_slice = k.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
+                        let v_slice = v.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
+                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
+                    }
+                }
+                
+                if !layer_dumps.is_empty() {
+                    let task = BakeTask {
+                        task_dir: task_dir_base.clone(),
+                        kv_name: kv_name.clone().or_else(|| Some("default".to_string())),
+                        offset: seqlen_offset - bake_block_size,
+                        layers: layer_dumps,
+                    };
+                    let _ = bake_tx.blocking_send(task);
                     
-                    // Force Release to OS
-                    if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                    #[cfg(target_os = "windows")]
-                    unsafe {
-                        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                        use windows_sys::Win32::System::Memory::*;
-                        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                    // [SLIDING-WINDOW-PURGE] Keep recent 10 blocks in RAM
+                    let current_kv_len = self.get_kv_len();
+                    if current_kv_len > window_keep_size {
+                        let purge_len = current_kv_len - window_keep_size;
+                        let aligned_purge = (purge_len / bake_block_size) * bake_block_size;
+                        if aligned_purge > 0 {
+                            println!("[WINDOW-BAKE] Purging {} old tokens. (RAM: {} / Disk: 0-{})", 
+                                aligned_purge, window_keep_size, seqlen_offset - window_keep_size);
+                            let _ = self.truncate_kv_cache(aligned_purge);
+                        }
                     }
                 }
             }
 
             let input_ids = if generated_text.is_empty() && seqlen_offset < total_tokens {
                 Tensor::new(&full_input_ids_vec[local_pos..total_tokens], &self.text_device)?.unsqueeze(0)?
-            } else { 
-                // [OPTIMIZATION] Reuse scalar if possible, but candle's Tensor::new is still common. 
-                // To truly remove reallocation, we'd need a pre-allocated mutable tensor (not fully supported in simple Candle).
-                // However, we avoid vector allocations here.
-                Tensor::new(&[*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? 
-            };
-            
+            } else { Tensor::new(vec![*all_ids.last().unwrap()], &self.text_device)?.unsqueeze(0)? };
             let seq_len = input_ids.dim(1)?;
-            // [OPTIMIZATION] Avoid arange allocation if seq_len is 1 (common case in generation)
-            let chunk_pos = if seq_len == 1 {
-                Tensor::new(&[seqlen_offset as u32], &self.text_device)?.unsqueeze(0)?
-            } else {
-                Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?
-            };
-            
+            let chunk_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + seq_len) as u32, &self.text_device)?.unsqueeze(0)?;
             let logits = self.qwen3_vl.forward(&input_ids, pixel_values.as_ref(), image_grid_thw.as_ref(), None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
             let mut logits = logits.squeeze(0)?.i(logits.dim(1)? - 1)?.to_dtype(DType::F32)?;
             if 1.1 != 1.0 { let penalty_context = if all_ids.len() > 512 { &all_ids[all_ids.len()-512..] } else { &all_ids[..] }; logits = apply_repeat_penalty(&logits, 1.1, penalty_context)?; }
@@ -710,11 +677,11 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
-        self.qwen3_vl.truncate_kv_cache(len)
-    }
-
-    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
-        self.qwen3_vl.rewind_kv_cache(target_len)
+        match &mut self.qwen3_vl {
+            ModelVariant::QuantizedVL(m) => m.truncate_kv_cache(len),
+            ModelVariant::QuantizedText(m) => m.truncate_kv_cache(len),
+            _ => Ok(()),
+        }
     }
 
     pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
@@ -741,105 +708,5 @@ impl Qwen3VLGenerateModel {
             ModelVariant::QuantizedText(m) => m.clear_kv_cache(),
             _ => {},
         }
-    }
-
-    pub fn generate_speculative(&mut self, draft_model: &mut Qwen3VLGenerateModel, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>) -> Result<String> {
-        let temperature = mes.temperature.unwrap_or(0.7) as f32;
-        let top_p = mes.top_p.unwrap_or(0.9) as f32;
-        let seed = mes.seed.unwrap_or(34562) as u64;
-        let mut logit_processor = get_logit_processor(Some(temperature), Some(top_p), Some(40), seed);
-        
-        let mut generated_text = String::new();
-        let mut all_ids = self.tokenizer.text_encode_vec(self.chat_template.apply_chat_template(&mes)?, false)?;
-        let mut seqlen_offset = self.get_kv_len();
-        
-        // Initial prefill if needed
-        if seqlen_offset == 0 {
-            seqlen_offset = self.prefill_only(mes.clone(), cancel_flag.clone(), session_id.clone(), None, None)?;
-        }
-
-        let max_new_tokens = mes.max_tokens.unwrap_or(2048) as usize;
-        let gamma = 4; // Number of speculative tokens
-        let mut tokens_generated: usize = 0;
-
-        while tokens_generated < max_new_tokens {
-            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
-
-            // 1. [DRAFT] Generate gamma tokens using the small model
-            let mut speculative_tokens = Vec::new();
-            let mut draft_seq_offset = draft_model.get_kv_len();
-            
-            // Sync draft model's KV with target model if needed (simplified here)
-            // In a real scenario, you'd ensure draft_model has the same context.
-            
-            for _ in 0..gamma {
-                let last_token = *all_ids.last().unwrap();
-                let input_ids = Tensor::new(&[last_token], &draft_model.text_device)?.unsqueeze(0)?;
-                let pos = Tensor::new(&[draft_seq_offset as u32], &draft_model.text_device)?.unsqueeze(0)?;
-                let logits = draft_model.qwen3_vl.forward(&input_ids, None, None, None, None, Some(&pos), draft_seq_offset, draft_seq_offset + 1, None)?;
-                let logits = logits.squeeze(0)?.i(0)?.to_dtype(DType::F32)?;
-                let next_id = logit_processor.sample(&logits)?;
-                speculative_tokens.push(next_id);
-                all_ids.push(next_id);
-                draft_seq_offset += 1;
-                if next_id == self.eos_token_id1 || next_id == self.eos_token_id2 { break; }
-            }
-
-            // 2. [VERIFY] Verify speculative tokens in parallel using the main model
-            let spec_len = speculative_tokens.len();
-            let verify_input = Tensor::new(&all_ids[all_ids.len() - spec_len - 1 ..], &self.text_device)?.unsqueeze(0)?;
-            let verify_pos = Tensor::arange(seqlen_offset as u32, (seqlen_offset + spec_len + 1) as u32, &self.text_device)?.unsqueeze(0)?;
-            
-            let logits = self.qwen3_vl.forward(&verify_input, None, None, None, None, Some(&verify_pos), seqlen_offset, seqlen_offset + spec_len + 1, session_id.clone())?;
-            let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
-
-            // 3. [ACCEPT/REJECT] Check how many tokens match
-            let mut accepted_count = 0;
-            let mut next_token_from_main = 0;
-
-            for j in 0..spec_len {
-                let main_logits = logits.i(j)?;
-                let main_token = logit_processor.sample(&main_logits)?;
-                
-                if main_token == speculative_tokens[j] {
-                    accepted_count += 1;
-                } else {
-                    next_token_from_main = main_token;
-                    break;
-                }
-            }
-
-            // If all gamma tokens were accepted, we still need the (gamma+1)-th token from main model
-            if accepted_count == spec_len {
-                let last_logits = logits.i(spec_len)?;
-                next_token_from_main = logit_processor.sample(&last_logits)?;
-            }
-
-            // 4. [REWIND] Backtrack KV cache for rejected tokens
-            let total_proposed = spec_len;
-            let final_accepted = accepted_count;
-            
-            // Adjust all_ids and KV cache
-            all_ids.truncate(all_ids.len() - total_proposed); // Remove all speculative
-            for j in 0..final_accepted {
-                let t = speculative_tokens[j];
-                all_ids.push(t);
-                generated_text.push_str(&self.tokenizer.token_decode(vec![t])?);
-            }
-            all_ids.push(next_token_from_main);
-            generated_text.push_str(&self.tokenizer.token_decode(vec![next_token_from_main])?);
-            
-            // Rewind Main Model KV
-            seqlen_offset += final_accepted + 1;
-            self.qwen3_vl.rewind_kv_cache(seqlen_offset)?;
-            
-            // Rewind/Sync Draft Model KV
-            draft_model.qwen3_vl.rewind_kv_cache(seqlen_offset)?;
-
-            tokens_generated += final_accepted + 1;
-            if next_token_from_main == self.eos_token_id1 || next_token_from_main == self.eos_token_id2 { break; }
-        }
-
-        Ok(generated_text)
     }
 }

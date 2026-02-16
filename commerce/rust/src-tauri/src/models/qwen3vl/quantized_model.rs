@@ -589,31 +589,9 @@ impl QuantizedQwen3VLTextAttention {
             if len >= total_len {
                 self.kv_cache = None;
             } else {
-                // [HARD-RESET-STRATEGY] 
-                // Don't just slice (narrow). Slicing often keeps the parent storage alive.
-                // We create a FRESH tensor copy and let the old one be dropped.
-                let new_k = k.narrow(2, len, total_len - len)?.contiguous()?.clone();
-                let new_v = v.narrow(2, len, total_len - len)?.contiguous()?.clone();
-                
-                // Explicitly clear the old cache to trigger drop of the large tensors
-                self.kv_cache = None; 
-                
-                // Assign the fresh, small tensors
+                let new_k = k.narrow(2, len, total_len - len)?.contiguous()?;
+                let new_v = v.narrow(2, len, total_len - len)?.contiguous()?;
                 self.kv_cache = Some((new_k, new_v));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
-        if let Some((k, v)) = &self.kv_cache {
-            let current_len = k.dim(2)?;
-            if target_len < current_len {
-                let new_k = k.narrow(2, 0, target_len)?.contiguous()?.clone();
-                let new_v = v.narrow(2, 0, target_len)?.contiguous()?.clone();
-                self.kv_cache = Some((new_k, new_v));
-            } else if target_len == 0 {
-                self.kv_cache = None;
             }
         }
         Ok(())
@@ -893,10 +871,6 @@ impl QuantizedQwen3VLTextDecoderLayer {
 
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         self.self_attn.truncate_kv_cache(len)
-    }
-
-    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
-        self.self_attn.rewind_kv_cache(target_len)
     }
 
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -1190,26 +1164,39 @@ impl QuantizedQwen3VLTextModel {
     ) -> Result<Tensor> {
         let (b_size, seq_len, _) = inputs_embeds.dims3()?;
         
+        use nvml_wrapper::Nvml;
+        if let Ok(nvml) = Nvml::init() {
+            if let Ok(dev) = nvml.device_by_index(0) {
+                if let Ok(mem) = dev.memory_info() {
+                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{}", mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset + seq_len, total_len);
+                }
+            }
+        }
+
         let target_device = if self.layers[0].device().is_cuda() { Device::new_cuda(0)? } else { Device::Cpu };
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
+        // --- [A-B-C WINDOW STRATEGY] ---
+        // c: Computing (Current Layer)
+        // b: Backing up (Save in progress, memory kept)
+        // a: Archived (Save confirmed, memory dropped)
         let mut save_handles = std::collections::VecDeque::new(); 
+        let window_size = 2; // Keep at most 2 layers in RAM (Current + One being saved)
 
         let mut start_layer = 0;
-        // [RESUME-LOGIC] Only active for multi-token chunks (Ingestion)
-        if seq_len > 1 {
-            if let Some(sid) = &self.active_session_id {
-                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
-                for l_idx in (0..self.layers.len()).rev() {
-                    let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", l_idx, seqlen_offset));
-                    if checkpoint_path.exists() {
-                        if let Ok(recovered_xs) = crate::utils::tensor_utils::load_tensor(&checkpoint_path, "hidden_states", &target_device) {
-                            let r_xs: Tensor = recovered_xs; 
-                            xs = r_xs.to_dtype(target_dtype)?;
-                            start_layer = l_idx + 1;
-                            break;
-                        }
+        // [RESUME-LOGIC] Try to pick up from a saved layer checkpoint on disk
+        if let Some(sid) = &self.active_session_id {
+            let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+            for l_idx in (0..self.layers.len()).rev() {
+                let checkpoint_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", l_idx, seqlen_offset));
+                if checkpoint_path.exists() {
+                    if let Ok(recovered_xs) = crate::utils::tensor_utils::load_tensor(&checkpoint_path, "hidden_states", &target_device) {
+                        println!("[SWAP-RESUME] Jumping to Layer {} for Offset {}.", l_idx + 1, seqlen_offset);
+                        let r_xs: Tensor = recovered_xs; 
+                        xs = r_xs.to_dtype(target_dtype)?;
+                        start_layer = l_idx + 1;
+                        break;
                     }
                 }
             }
@@ -1249,6 +1236,7 @@ impl QuantizedQwen3VLTextModel {
 
         // [SMART-SEQUENTIAL-LOOP]
         let num_layers = self.layers.len();
+        println!("[TRACE] Entering layer loop. Total layers: {}", num_layers);
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
@@ -1274,74 +1262,77 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // [OPTIMIZATION] Sync and save ONLY during ingestion (seq_len > 1)
-            if seq_len > 1 {
-                if target_device.is_cuda() { 
-                    let _ = target_device.synchronize(); 
-                }
+            // GPU Sync to ensure computation is 100% done before save starts
+            if target_device.is_cuda() { 
+                // println!("[TRACE-L{}] Synchronizing GPU...", layer_idx);
+                let _ = target_device.synchronize(); 
+            }
 
-                // 2. [B: Backing Up] Start Save
-                if let Some(sid) = &self.active_session_id {
-                    let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
-                    if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
+            // 2. [B: Backing Up] Start Save
+            if let Some(sid) = &self.active_session_id {
+                // println!("[TRACE-L{}] Mandatory save triggered for sid: {}", layer_idx, sid);
+                let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
+                if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
-                    let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
-                    
-                    let xs_cpu = xs.to_device(&Device::Cpu)?;
-                    
-                    if num_layers == 1 {
+                let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
+                
+                // println!("[TRACE-L{}] Copying tensor to CPU for saving...", layer_idx);
+                let xs_cpu = xs.to_device(&Device::Cpu)?;
+                
+                if num_layers == 1 {
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("hidden_states".to_string(), xs_cpu.clone());
+                    let _ = candle_core::safetensors::save(&map, &tmp_path);
+                    let _ = std::fs::rename(&tmp_path, &final_path);
+                } else {
+                    let h = tokio::task::spawn_blocking(move || {
                         let mut map = std::collections::HashMap::new();
-                        map.insert("hidden_states".to_string(), xs_cpu.clone());
+                        map.insert("hidden_states".to_string(), xs_cpu);
                         let _ = candle_core::safetensors::save(&map, &tmp_path);
                         let _ = std::fs::rename(&tmp_path, &final_path);
-                    } else {
-                        let h = tokio::task::spawn_blocking(move || {
-                            let mut map = std::collections::HashMap::new();
-                            map.insert("hidden_states".to_string(), xs_cpu);
-                            let _ = candle_core::safetensors::save(&map, &tmp_path);
-                            let _ = std::fs::rename(&tmp_path, &final_path);
-                        });
-                        save_handles.push_back((layer_idx, h, xs.clone()));
-                    }
-                }
-
-                // 3. [A: Archived] Confirm Save and Drop Old Memory
-                let tight_window = 1; 
-                while save_handles.len() > tight_window {
-                    if let Some((_, handle, old_xs)) = save_handles.pop_front() {
-                        if handle.is_finished() {
-                            drop(old_xs);
-                            if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                                
-                            #[cfg(target_os = "windows")]
-                            unsafe {
-                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                                use windows_sys::Win32::System::Memory::*;
-                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                            }
-                        } else {
-                            save_handles.push_front((0, handle, old_xs));
-                        }
-                    }
+                    });
+                    save_handles.push_back((layer_idx, h, xs.clone()));
                 }
             }
             if !is_pinned { layer.to_device(&Device::Cpu)?; }
+
+            // 3. [A: Archived] Confirm Save and Drop Old Memory (HARD PURGE)
+            let tight_window = 1; 
+            while save_handles.len() > tight_window {
+                if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
+                    if handle.is_finished() {
+                        drop(old_xs);
+                        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                            
+                        #[cfg(target_os = "windows")]
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                            use windows_sys::Win32::System::Memory::*;
+                            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                        }
+                    } else {
+                        save_handles.push_front((old_idx, handle, old_xs));
+                    }
+                }
+            }
         }
 
-        // Final Wait for all remaining saves before returning (Only for Ingestion)
-        if seq_len > 1 {
-            for (_, handle, _) in save_handles {
-                let _ = futures::executor::block_on(handle);
-            }
+        println!("[TRACE] All layers done. Finalizing saves...");
+        // Final Wait for all remaining saves before returning
+        for (idx, handle, _) in save_handles {
+            // println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
+            let _ = futures::executor::block_on(handle);
         }
         
         self.current_kv_len = seqlen_offset + seq_len;
+        println!("[TRACE] Final norm.forward starting...");
         let norm_dev = self.norm.weight().device();
         if !xs.device().same_device(norm_dev) {
             xs = xs.to_device(norm_dev)?;
         }
         let xs = xs.apply(&self.norm)?;
+        println!("[TRACE] All forward pass steps complete.");
         Ok(xs)
     }
 
@@ -1494,12 +1485,6 @@ impl QuantizedQwen3VLTextModel {
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         self.layers.iter_mut().try_for_each(|layer| {
             layer.truncate_kv_cache(len)
-        })
-    }
-
-    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> {
-        self.layers.iter_mut().try_for_each(|layer| {
-            layer.rewind_kv_cache(target_len)
         })
     }
 
@@ -1743,7 +1728,6 @@ impl QuantizedQwen3VLModel {
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
-    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> { self.language_model.rewind_kv_cache(target_len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.visual.to_device(device)?; self.language_model.to_device(device)?; self.lm_head.to_device(device)?; self.text_device = device.clone(); self.vision_device = device.clone(); Ok(()) }
@@ -1824,7 +1808,6 @@ impl QuantizedQwen3TextModel {
     pub fn inject_live_kv_quantized(&mut self, k_list: &[Tensor], v_list: &[Tensor], k_scales: &[f32], v_scales: &[f32]) -> Result<()> { self.language_model.inject_live_kv_quantized(k_list, v_list, k_scales, v_scales) }
     pub fn save_kv_cache(&mut self, path: &Path, clear: bool, offset: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.save_kv_cache(path, clear, offset, kv_name) }
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> { self.language_model.truncate_kv_cache(len) }
-    pub fn rewind_kv_cache(&mut self, target_len: usize) -> Result<()> { self.language_model.rewind_kv_cache(target_len) }
     pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> { self.language_model.offload_kv_cache(path, block_size) }
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> { self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) }
     pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device(device)?; } self.text_device = device.clone(); Ok(()) }
