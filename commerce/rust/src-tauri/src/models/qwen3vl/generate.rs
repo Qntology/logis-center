@@ -117,7 +117,10 @@ pub static BAKE_TX: once_cell::sync::Lazy<tokio::sync::Mutex<Option<mpsc::Sender
 
 pub fn init_bake_worker() {
     let (tx, rx) = mpsc::channel(100);
-    spawn_bake_worker(rx);
+    // [FIX] Ensure spawn happens within a runtime context
+    tauri::async_runtime::spawn(async move {
+        spawn_bake_worker(rx);
+    });
     let mut lock = BAKE_TX.blocking_lock();
     *lock = Some(tx);
 }
@@ -519,7 +522,7 @@ impl Qwen3VLGenerateModel {
                 }).await;
 
                 // 워커에게 전달
-                if let Some(tx) = BAKE_TX.blocking_lock().as_ref() {
+                if let Some(tx) = BAKE_TX.lock().await.as_ref() {
                     let _ = tx.send(BakeTask {
                         slot_id,
                         task_dir: path,
@@ -649,7 +652,7 @@ impl Qwen3VLGenerateModel {
                         layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
                     }
                     
-                    if let Some(tx) = BAKE_TX.blocking_lock().as_ref() {
+                    if let Some(tx) = BAKE_TX.lock().await.as_ref() {
                         let _ = tx.send(BakeTask {
                             slot_id, task_dir: path, kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
                         }).await;
@@ -737,7 +740,7 @@ impl Qwen3VLGenerateModel {
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
                         layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
                     }
-                    if let Some(tx) = BAKE_TX.blocking_lock().as_ref() {
+                    if let Some(tx) = BAKE_TX.lock().await.as_ref() {
                         let _ = tx.send(BakeTask {
                             slot_id, task_dir: path.clone(), kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
                         }).await;

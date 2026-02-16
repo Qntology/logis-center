@@ -177,12 +177,12 @@ pub struct MemorySlot {
 #[derive(Clone)]
 pub struct KVBlock {
     pub location: KVLocation,
-    pub k_cache: Option<Tensor>, // Present if in VRAM
-    pub v_cache: Option<Tensor>, // Present if in VRAM
+    pub index: usize, // 0, 1, 2, ...
+    pub k_cache: Option<Tensor>,
+    pub v_cache: Option<Tensor>,
     pub ssd_path: Option<std::path::PathBuf>,
-    pub start_token: usize,
     pub len: usize,
-    pub bitkv_metadata: Option<BitKVMetadata>, // Metadata for compressed RAM/SSD blocks
+    pub bitkv_metadata: Option<BitKVMetadata>,
 }
 
 #[derive(Clone)]
@@ -368,16 +368,11 @@ impl QuantizedQwen3VLTextAttention {
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         
-        // 3. [FLASH-DECODING] Block-wise Attention & LSE Merging
-        let mut running_m = None; // Running max logit
-        let mut running_s = None; // Running sum of exps
-        let mut running_o = None; // Running weighted output
-
-        // [CURRENT-BLOCK] Efficient Allocation
+        // 3. [BLOCK-ALLOCATION] Append new QKV to the existing VRAM block or create new
         let current_chunk_len = key_states.dim(2)?;
         let mut appended = false;
         if let Some(last_block) = self.kv_blocks.last_mut() {
-            if last_block.location == KVLocation::VRAM {
+            if last_block.location == KVLocation::VRAM && last_block.len + current_chunk_len <= 1024 {
                 if let (Some(prev_k), Some(prev_v)) = (last_block.k_cache.take(), last_block.v_cache.take()) {
                     last_block.k_cache = Some(Tensor::cat(&[prev_k, key_states.clone()], 2)?.contiguous()?);
                     last_block.v_cache = Some(Tensor::cat(&[prev_v, value_states.clone()], 2)?.contiguous()?);
@@ -390,47 +385,64 @@ impl QuantizedQwen3VLTextAttention {
         if !appended {
             self.kv_blocks.push(KVBlock {
                 location: KVLocation::VRAM,
+                index: self.kv_blocks.len(),
                 k_cache: Some(key_states),
                 v_cache: Some(value_states),
                 ssd_path: None,
-                start_token: self.get_kv_len(),
                 len: current_chunk_len,
                 bitkv_metadata: None,
             });
         }
 
+        // 4. [FLASH-DECODING] LSE Merging Loop
+        let mut running_m = None; 
+        let mut running_s = None; 
+        let mut running_o = None; 
+        
+        let mut start_idx = 0;
+
         for block in &self.kv_blocks {
-            let (k, v) = match block.location {
+            let (mut k, mut v) = match block.location {
                 KVLocation::VRAM => {
                     (block.k_cache.as_ref().unwrap().clone(), block.v_cache.as_ref().unwrap().clone())
                 }
                 KVLocation::RAM | KVLocation::SSD => {
-                    // [ON-DEMAND-DECOMPRESS] 
                     if let Some(meta) = &block.bitkv_metadata {
-                        let k = self.decompress_from_bitkv(
-                            &meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev
-                        )?;
-                        let v = self.decompress_from_bitkv(
-                            &meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev
-                        )?;
-                        (k, v)
+                        let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
+                        let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
+                        (k_raw, v_raw)
                     } else { continue; }
                 }
                 _ => continue,
             };
 
-            // Compute partial attention for this block
+            // [GQA-SUPPORT] Repeat KV heads to match Query heads
+            if self.num_kv_groups > 1 {
+                let (b, h, s, d) = k.dims4()?;
+                k = k.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+                v = v.unsqueeze(2)?.expand((b, h, self.num_kv_groups, s, d))?.reshape((b, h * self.num_kv_groups, s, d))?;
+            }
+
             // P = Q * K^T / sqrt(d)
             let mut attn_weights = query_states.matmul(&k.transpose(2, 3)?)?
                 .broadcast_mul(&Tensor::new(&[self.scaling as f32], dev)?.to_dtype(target_dtype)?)?;
 
-            // Apply causal mask if it's the last (current) block
-            // (Simplified: block-based masking logic)
-            
-            let m_i = attn_weights.max_keepdim(D::Minus1)?; // [B, H, Q, 1]
-            let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?; // exp(P - m)
-            let s_i = p_i.sum_keepdim(D::Minus1)?; // [B, H, Q, 1]
-            let o_i = p_i.matmul(&v)?; // [B, H, Q, D]
+            // [MASK-SLICING] Slice mask for this specific block to avoid shape mismatch
+            if let Some(mask) = attention_mask {
+                let mask_len = mask.dim(D::Minus1)?;
+                let block_len = block.len;
+                if start_idx + block_len <= mask_len {
+                    let sub_mask = mask.narrow(D::Minus1, start_idx, block_len)?;
+                    // [FIX] Ensure sub_mask matches attn_weights dtype (usually BF16)
+                    let sub_mask = sub_mask.to_dtype(target_dtype)?;
+                    attn_weights = attn_weights.broadcast_add(&sub_mask)?;
+                }
+            }
+
+            let m_i = attn_weights.max_keepdim(D::Minus1)?;
+            let p_i = attn_weights.broadcast_sub(&m_i)?.exp()?;
+            let s_i = p_i.sum_keepdim(D::Minus1)?;
+            let o_i = p_i.matmul(&v)?;
 
             match (running_m, running_s, running_o) {
                 (None, None, None) => {
@@ -439,17 +451,19 @@ impl QuantizedQwen3VLTextAttention {
                     running_o = Some(o_i);
                 }
                 (Some(m_prev), Some(s_prev), Some(o_prev)) => {
-                    // Merge logic: LSE style
                     let m_new = m_prev.maximum(&m_i)?;
                     
-                    let alpha_prev = m_prev.sub(&m_new)?.exp()?;
-                    let alpha_i = m_i.sub(&m_new)?.exp()?;
+                    // [FIX] Ensure exponents and multiplications stay in target_dtype (BF16)
+                    let alpha_prev = m_prev.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
+                    let alpha_i = m_i.sub(&m_new)?.exp()?.to_dtype(target_dtype)?;
                     
                     let s_new = s_prev.broadcast_mul(&alpha_prev)?
-                        .add(&s_i.broadcast_mul(&alpha_i)?)?;
-                    
+                        .add(&s_i.broadcast_mul(&alpha_i)?)?
+                        .to_dtype(target_dtype)?;
+                        
                     let o_new = o_prev.broadcast_mul(&alpha_prev)?
-                        .add(&o_i.broadcast_mul(&alpha_i)?)?;
+                        .add(&o_i.broadcast_mul(&alpha_i)?)?
+                        .to_dtype(target_dtype)?;
                     
                     running_m = Some(m_new);
                     running_s = Some(s_new);
@@ -457,18 +471,13 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 _ => unreachable!(),
             }
+            start_idx += block.len;
         }
 
         let attn_output = running_o.unwrap().broadcast_div(&running_s.unwrap())?;
         let attn_output = attn_output.transpose(1, 2)?
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
-
-        // [CLEANUP] Keep VRAM blocks under control
-        let current_kv_total = self.get_kv_len();
-        if current_kv_total > 4096 {
-            // Anchor Paging logic would go here in Step 5
-        }
 
         Ok(attn_output)
     }
@@ -649,15 +658,15 @@ impl QuantizedQwen3VLTextAttention {
         let k_final = if !k_final.device().same_device(dev) { k_final.to_device(dev)? } else { k_final.clone() };
         let v_final = if !v_final.device().same_device(dev) { v_final.to_device(dev)? } else { v_final.clone() };
         
-        let start_token = self.get_kv_len();
+        let index = self.kv_blocks.len();
         let len = k_final.dim(2)?;
         
         self.kv_blocks.push(KVBlock {
             location: KVLocation::VRAM,
+            index,
             k_cache: Some(k_final),
             v_cache: Some(v_final),
             ssd_path: None,
-            start_token,
             len,
             bitkv_metadata: None,
         });
@@ -854,10 +863,10 @@ impl QuantizedQwen3VLTextAttention {
             self.kv_blocks.clear();
             self.kv_blocks.push(KVBlock {
                 location: KVLocation::VRAM,
+                index: 0,
                 k_cache: Some(k_final),
                 v_cache: Some(v_final),
                 ssd_path: None,
-                start_token: 0,
                 len: safe_len,
                 bitkv_metadata: None,
             });
