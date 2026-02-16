@@ -346,7 +346,7 @@ impl Qwen3VLGenerateModel {
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
         let token_ids = self.tokenizer.text_encode_vec(text.to_string(), false)?;
         let total_tokens = token_ids.len();
-        let chunk_size = 2048;
+        let chunk_size = 512;
         let mut current_pos = 0;
 
         while current_pos < total_tokens {
@@ -393,8 +393,8 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
         
-        // [GRANULAR-BAKING] Use 2048 blocks for consistent memory pressure
-        let prefill_chunk_size = 2048;
+        // [GRANULAR-BAKING] Use 512 blocks for consistent memory pressure
+        let prefill_chunk_size = 512;
         let mut current_pos = self.get_kv_len();
         if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
@@ -554,8 +554,8 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
         
         // [HARD-SWAP-CONFIG] Constant memory usage strategy
-        let window_keep_size = 2048; 
-        let bake_block_size = 2048;
+        let window_keep_size = 1024; 
+        let bake_block_size = 256;
 
         // [PHASE-1: Granular Prefill] Offload prompt chunks immediately to SSD
         while local_pos < total_tokens {
