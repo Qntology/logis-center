@@ -147,13 +147,52 @@ impl QLinear {
 }
 
 // [QUANTIZED-KV] Storage for 4-bit compressed KV cache in VRAM
-struct QuantizedKV {
-    k_packed: Tensor, // [B, H, S, D/2]
-    v_packed: Tensor, // [B, H, S, D/2]
-    k_scales: Tensor, // [B, H, S, 1]
-    v_scales: Tensor,
-    original_shape: Vec<usize>,
-    block_size: usize,
+#[derive(Clone, Debug, PartialEq)]
+pub enum KVLocation {
+    VRAM,
+    RAM,
+    SSD,
+    Streaming, // Currently being transferred or processed
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlotState {
+    Free,
+    Computing,    // Reserved for GPU computation
+    Transferring, // Moving from VRAM to CPU RAM
+    Compressing,  // BitKV compression in progress
+    Saving,       // SSD I/O in progress
+    Ready,        // Stored in RAM and ready for use or SSD offload
+}
+
+pub struct MemorySlot {
+    pub id: usize,
+    pub state: Arc<std::sync::atomic::AtomicU8>, // Mapping SlotState to u8
+    pub k_data: Arc<tokio::sync::Mutex<Option<Tensor>>>,
+    pub v_data: Arc<tokio::sync::Mutex<Option<Tensor>>>,
+    pub layer_idx: usize,
+    pub block_idx: usize,
+}
+
+pub struct KVBlock {
+    pub location: KVLocation,
+    pub k_cache: Option<Tensor>, // Present if in VRAM
+    pub v_cache: Option<Tensor>, // Present if in VRAM
+    pub ssd_path: Option<std::path::PathBuf>,
+    pub start_token: usize,
+    pub len: usize,
+    pub bitkv_metadata: Option<BitKVMetadata>, // Metadata for compressed RAM/SSD blocks
+}
+
+#[derive(Clone)]
+pub struct BitKVMetadata {
+    pub k_anchors: Tensor,
+    pub k_packed: Tensor,
+    pub k_scales: Tensor,
+    pub v_anchors: Tensor,
+    pub v_packed: Tensor,
+    pub v_scales: Tensor,
+    pub original_shape: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -169,7 +208,7 @@ pub struct QuantizedQwen3VLTextAttention {
     pub head_dim: usize,
     pub num_kv_groups: usize,
     pub scaling: f64,
-    pub kv_cache: Option<(Tensor, Tensor)>,
+    pub kv_blocks: Vec<KVBlock>, // Changed from Option<(Tensor, Tensor)>
     pub layer_idx: usize,
 }
 
@@ -182,12 +221,16 @@ impl QuantizedQwen3VLTextAttention {
         self.q_norm.to_device(device)?;
         self.k_norm.to_device(device)?;
         
-        if let Some((k, v)) = &self.kv_cache {
-            let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-            self.kv_cache = Some((
-                k.to_device(device)?.to_dtype(target_dtype)?, 
-                v.to_device(device)?.to_dtype(target_dtype)?
-            ));
+        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        for block in &mut self.kv_blocks {
+            if block.location == KVLocation::VRAM {
+                if let Some(k) = &block.k_cache {
+                    block.k_cache = Some(k.to_device(device)?.to_dtype(target_dtype)?);
+                }
+                if let Some(v) = &block.v_cache {
+                    block.v_cache = Some(v.to_device(device)?.to_dtype(target_dtype)?);
+                }
+            }
         }
         Ok(())
     }
@@ -263,7 +306,7 @@ impl QuantizedQwen3VLTextAttention {
             num_kv_groups,
             head_dim,
             scaling,
-            kv_cache: None,
+            kv_blocks: Vec::new(),
             layer_idx,
         })
     }
