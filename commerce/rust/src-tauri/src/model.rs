@@ -633,17 +633,6 @@ impl LogisModel {
 
         *gen_guard = Some(gen);
         *current_size_guard = Some(size);
-
-        // --- [ULTRA-SPEED: CONNECT DRAFTER] ---
-        // Large 모델이 활성화되면 Small 모델을 투기적 추론용 드래프터로 연결합니다.
-        if size == ModelSize::Large {
-            let small_slot = self.small_hibernation.clone();
-            if let Some(large_gen) = gen_guard.as_mut() {
-                large_gen.set_drafter(small_slot);
-                println!("[MODEL] Speculative Drafter (0.6B) connected to Large engine.");
-            }
-        }
-        // --------------------------------------
         
         Ok(())
     }

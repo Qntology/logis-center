@@ -334,28 +334,8 @@ impl QuantizedQwen3VLTextAttention {
                 let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v.clone() };
                 let pv = if pv.dtype() != target_dtype { pv.to_dtype(target_dtype)? } else { pv }.contiguous()?;
                 
-                let mut k = Tensor::cat(&[&pk, &key_states.contiguous()?], 2)?.contiguous()?;
-                let mut v = Tensor::cat(&[&pv, &value_states.contiguous()?], 2)?.contiguous()?;
-
-                // --- [ULTRA-SPEED: KV CACHE FOLDING] ---
-                // 컨텍스트가 너무 길어지면 중요 정보(Sink)와 최신 정보(Window)만 남기고 접어버립니다.
-                let max_capacity = 2048; // 고정된 메모리 버퍼 크기
-                let sink_size = 4;      // 초기 컨텍스트 유지 (Softmax 안정성)
-                let actual_len = k.dim(2)?;
-
-                if actual_len > max_capacity {
-                    let sink_k = k.narrow(2, 0, sink_size)?;
-                    let window_k = k.narrow(2, actual_len - (max_capacity - sink_size), max_capacity - sink_size)?;
-                    k = Tensor::cat(&[&sink_k, &window_k], 2)?.contiguous()?;
-
-                    let sink_v = v.narrow(2, 0, sink_size)?;
-                    let window_v = v.narrow(2, actual_len - (max_capacity - sink_size), max_capacity - sink_size)?;
-                    v = Tensor::cat(&[&sink_v, &window_v], 2)?.contiguous()?;
-                    
-                    // println!("[FOLDING] KV Cache folded: {} -> {}", actual_len, k.dim(2)?);
-                }
-                // ----------------------------------------
-
+                let k = Tensor::cat(&[&pk, &key_states.contiguous()?], 2)?.contiguous()?;
+                let v = Tensor::cat(&[&pv, &value_states.contiguous()?], 2)?.contiguous()?;
                 (k, v)
             }
         };
@@ -924,7 +904,6 @@ pub struct QuantizedQwen3VLTextModel {
     pub active_session_id: Option<String>,
     pub pinned_layer_count: usize, // [NEW] Keep N layers on GPU
     pub current_kv_len: usize,
-    pub active_bake_tasks: std::sync::Arc<std::sync::atomic::AtomicUsize>, // [NEW] Track layer saves
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -1060,20 +1039,7 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { 
-            embed_tokens, 
-            layers, 
-            norm, 
-            rotary_emb, 
-            mrope_section, 
-            mmap: mmap_handle, 
-            baking_only, 
-            is_forced_cpu, 
-            active_session_id: None, 
-            pinned_layer_count, 
-            current_kv_len: 0,
-            active_bake_tasks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        })
+        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1192,7 +1158,6 @@ impl QuantizedQwen3VLTextModel {
             active_session_id: None,
             pinned_layer_count,
             current_kv_len: 0,
-            active_bake_tasks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -1269,19 +1234,6 @@ impl QuantizedQwen3VLTextModel {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
-            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (20개 레이어까지 대기열 허용)
-            let mut wait_count = 0;
-            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 20 {
-                if wait_count == 0 { println!("[MEMORY] 68. 레이어 대기열 포화 (20개). 일시 정지."); }
-                println!("[MEMORY] {}. 메모리 제거 대기 (L{}, Queue: {})...", 69 + wait_count.min(3), layer_idx, self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst));
-                std::thread::sleep(std::time::Duration::from_millis(30));
-                wait_count += 1;
-                if wait_count > 200 { break; } 
-            }
-            if wait_count > 0 { 
-                println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
-            }
-
             let is_pinned = layer_idx < self.pinned_layer_count;
             
             // 1. [C: Computing] Prepare and Run Layer
@@ -1326,15 +1278,11 @@ impl QuantizedQwen3VLTextModel {
                         let _ = candle_core::safetensors::save(&map, &tmp_path);
                         let _ = std::fs::rename(&tmp_path, &final_path);
                     } else {
-                        let counter = self.active_bake_tasks.clone();
-                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let h = tokio::task::spawn_blocking(move || {
                             let mut map = std::collections::HashMap::new();
                             map.insert("hidden_states".to_string(), xs_cpu);
-                            if let Ok(_) = candle_core::safetensors::save(&map, &tmp_path) {
-                                let _ = std::fs::rename(&tmp_path, &final_path);
-                            }
-                            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            let _ = candle_core::safetensors::save(&map, &tmp_path);
+                            let _ = std::fs::rename(&tmp_path, &final_path);
                         });
                         save_handles.push_back((layer_idx, h, xs.clone()));
                     }
@@ -1344,7 +1292,17 @@ impl QuantizedQwen3VLTextModel {
                 let tight_window = 1; 
                 while save_handles.len() > tight_window {
                     if let Some((_, handle, old_xs)) = save_handles.pop_front() {
-                        if !handle.is_finished() {
+                        if handle.is_finished() {
+                            drop(old_xs);
+                            if target_device.is_cuda() { let _ = target_device.synchronize(); }
+                                
+                            #[cfg(target_os = "windows")]
+                            unsafe {
+                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                                use windows_sys::Win32::System::Memory::*;
+                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                            }
+                        } else {
                             save_handles.push_front((0, handle, old_xs));
                         }
                     }
