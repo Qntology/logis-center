@@ -4,10 +4,11 @@ use candle_nn::{Embedding, Module, VarBuilder}; // Removed RmsNorm
 use candle_core::quantized::{gguf_file, QMatMul};
 use rayon::prelude::*;
 use nvml_wrapper::Nvml;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::fs;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, Condvar, atomic::{AtomicBool, Ordering}};
+use std::time::Duration;
 use memmap2::Mmap;
 
 use crate::{
@@ -24,6 +25,95 @@ use crate::{
         prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
     },
 };
+
+// --- [BAKING QUEUE SYSTEM] ---
+
+pub enum BakeTask {
+    LayerSnapshot {
+        layer_idx: usize,
+        offset: usize,
+        data: HashMap<String, Tensor>, // CPU Tensors
+        path: PathBuf,
+    },
+    KvChunk {
+        kv_name: Option<String>,
+        offset: usize,
+        data: HashMap<String, Tensor>, // CPU Tensors (k, v)
+        path: PathBuf,
+    }
+}
+
+// Global Queue: (Queue, Capacity Condition)
+// We use a manual Mutex/Condvar to strictly enforce the log flow and thread blocking.
+static BAKE_QUEUE_PAIR: std::sync::OnceLock<(Mutex<VecDeque<BakeTask>>, Condvar)> = std::sync::OnceLock::new();
+static WORKER_STARTED: std::sync::Once = std::sync::Once::new();
+
+fn get_bake_queue() -> &'static (Mutex<VecDeque<BakeTask>>, Condvar) {
+    BAKE_QUEUE_PAIR.get_or_init(|| (Mutex::new(VecDeque::new()), Condvar::new()))
+}
+
+pub fn start_baking_worker() {
+    WORKER_STARTED.call_once(|| {
+        std::thread::spawn(move || {
+            let (lock, cvar) = get_bake_queue();
+            loop {
+                let mut queue = lock.lock().unwrap();
+                while queue.is_empty() {
+                    queue = cvar.wait(queue).unwrap();
+                }
+                
+                let task = queue.pop_front();
+                // Notify producers that space might be available (though we usually notify after processing to ensure flow)
+                cvar.notify_all(); 
+                drop(queue); // Release lock while processing
+
+                if let Some(task) = task {
+                    match task {
+                        BakeTask::LayerSnapshot { layer_idx: _, offset: _, data, path } => {
+                            // BitKV Compression or standard save could happen here.
+                            // For now, we assume data is already prepared or we save directly.
+                            // In a real scenario, we would move the `compress_to_bitkv` logic here.
+                            // But per request, we just save what we got.
+                            if let Ok(_) = candle_core::safetensors::save(&data, &path) {
+                                // Success
+                            }
+                        },
+                        BakeTask::KvChunk { kv_name: _, offset: _, data, path } => {
+                             if let Ok(_) = candle_core::safetensors::save(&data, &path) {
+                                // Success
+                            }
+                        }
+                    }
+                    
+                    // [LOG-REQ] 1. Memory Freed
+                    println!("[MEMORY] 1. 메모리 삭제됨");
+                }
+            }
+        });
+    });
+}
+
+pub fn submit_bake_task(task: BakeTask) {
+    // Ensure worker is running
+    start_baking_worker();
+
+    let (lock, cvar) = get_bake_queue();
+    let mut queue = lock.lock().unwrap();
+
+    // [FLOW-CONTROL] Limit to 20
+    if queue.len() >= 20 {
+        println!("[MEMORY] 69. 메모리 제거 대기...");
+        while queue.len() >= 20 {
+            queue = cvar.wait(queue).unwrap();
+        }
+        println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
+    }
+
+    queue.push_back(task);
+    cvar.notify_all(); // Wake up worker
+}
+
+// -----------------------------
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -1176,8 +1266,6 @@ impl QuantizedQwen3VLTextModel {
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?.contiguous()?;
 
-        let mut save_handles = std::collections::VecDeque::new(); 
-
         let mut start_layer = 0;
         // [RESUME-LOGIC] Only active for multi-token chunks (Ingestion)
         if seq_len > 1 {
@@ -1262,61 +1350,32 @@ impl QuantizedQwen3VLTextModel {
                     let _ = target_device.synchronize(); 
                 }
 
-                // 2. [B: Backing Up] Start Save
+                // 2. [B: Backing] Submit to Queue
                 if let Some(sid) = &self.active_session_id {
                     let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                     if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
 
                     let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                    let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
                     
-                    let xs_cpu = xs.to_device(&Device::Cpu)?;
-                    
-                    if num_layers == 1 {
-                        let mut map = std::collections::HashMap::new();
-                        map.insert("hidden_states".to_string(), xs_cpu.clone());
-                        let _ = candle_core::safetensors::save(&map, &tmp_path);
-                        let _ = std::fs::rename(&tmp_path, &final_path);
-                    } else {
-                        let h = tokio::task::spawn_blocking(move || {
-                            let mut map = std::collections::HashMap::new();
-                            map.insert("hidden_states".to_string(), xs_cpu);
-                            let _ = candle_core::safetensors::save(&map, &tmp_path);
-                            let _ = std::fs::rename(&tmp_path, &final_path);
-                        });
-                        save_handles.push_back((layer_idx, h, xs.clone()));
-                    }
-                }
-
-                // 3. [A: Archived] Confirm Save and Drop Old Memory
-                let tight_window = 1; 
-                while save_handles.len() > tight_window {
-                    if let Some((_, handle, old_xs)) = save_handles.pop_front() {
-                        if handle.is_finished() {
-                            drop(old_xs);
-                            if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                                
-                            #[cfg(target_os = "windows")]
-                            unsafe {
-                                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                                use windows_sys::Win32::System::Memory::*;
-                                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                            }
-                        } else {
-                            save_handles.push_front((0, handle, old_xs));
-                        }
+                    // Copy to CPU immediately to free GPU, then submit
+                    if let Ok(xs_cpu) = xs.to_device(&Device::Cpu) {
+                         let mut map = std::collections::HashMap::new();
+                         map.insert("hidden_states".to_string(), xs_cpu);
+                         
+                         let task = BakeTask::LayerSnapshot {
+                             layer_idx,
+                             offset: seqlen_offset,
+                             data: map,
+                             path: final_path,
+                         };
+                         
+                         submit_bake_task(task);
                     }
                 }
             }
             if !is_pinned { layer.to_device(&Device::Cpu)?; }
         }
 
-        // Final Wait for all remaining saves before returning (Only for Ingestion)
-        if seq_len > 1 {
-            for (_, handle, _) in save_handles {
-                let _ = futures::executor::block_on(handle);
-            }
-        }
         
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();

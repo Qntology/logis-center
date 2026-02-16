@@ -9,7 +9,7 @@ use crate::{
         qwen3vl::{
             config::{Qwen3VLConfig, Qwen3VLGenerationConfig},
             model::Qwen3VLModel,
-            quantized_model::QuantizedQwen3VLModel,
+            quantized_model::{QuantizedQwen3VLModel, BakeTask, submit_bake_task}, // Imported global queue
             processor::Qwen3VLProcessor,
         },
     },
@@ -36,91 +36,7 @@ struct LayerKVDump {
     v: Tensor,
 }
 
-struct BakeTask {
-    task_dir: PathBuf,
-    kv_name: Option<String>,
-    offset: usize,
-    layers: Vec<LayerKVDump>,
-}
-
-fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
-    tokio::spawn(async move {
-        println!("[BAKE-WORKER] Background KV storage worker started.");
-        while let Some(task) = rx.recv().await {
-            let task_dir = task.task_dir;
-            let kv_name = task.kv_name;
-            let offset = task.offset;
-            
-            println!("[BAKE-WORKER] Saving block at offset {}...", offset);
-            
-            for layer in task.layers {
-                let filename = match (&kv_name, offset) {
-                    (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
-                    (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
-                    (None, 0) => format!("layer_{}_kv.safetensors", layer.layer_idx),
-                    (None, off) => format!("layer_{}_kv_{}.safetensors", layer.layer_idx, off),
-                };
-                let path = task_dir.join(filename);
-                
-                // --- Manual BitKV Compression (Worker Thread) ---
-                let mut map = std::collections::HashMap::new();
-                
-                let process_tensor = |t: Tensor, prefix: &str, target_map: &mut std::collections::HashMap<String, Tensor>| {
-                    if let Ok(dims) = t.dims4() {
-                        let (b, h, s, d) = dims;
-                        if let Ok(t_f32) = t.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                            if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-                                let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                                let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-                                let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
-                                let mut scales = vec![0.0f32; b * h * s];
-
-                                // Bit Packing & Anchors/Scales (Simplified loop for worker)
-                                let head_token_size = s * d;
-                                for bh_idx in 0..(b * h) {
-                                    let bh_offset = bh_idx * head_token_size;
-                                    for i in 0..head_token_size {
-                                        if t_data[bh_offset + i] >= 0.0 {
-                                            packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8);
-                                        }
-                                    }
-                                    
-                                    for token_idx in 0..s {
-                                        let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                                        if token_idx < 4 || token_idx % 8 == 0 {
-                                            let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
-                                            anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
-                                        }
-                                        let mut max_abs = 0.0f32;
-                                        for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
-                                        scales[bh_idx * s + token_idx] = max_abs;
-                                    }
-                                }
-
-                                if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { target_map.insert(format!("{}_anchors", prefix), at); }
-                                let packed_len = packed_residuals.len();
-                                if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { target_map.insert(format!("{}_packed", prefix), pt); }
-                                if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { target_map.insert(format!("{}_scales", prefix), st); }
-                                if prefix == "k" {
-                                    if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { target_map.insert("k_shape".to_string(), sh); }
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let _ = process_tensor(layer.k, "k", &mut map);
-                let _ = process_tensor(layer.v, "v", &mut map);
-                if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
-                    map.insert("mode".to_string(), mode_tensor);
-                }
-
-                let _ = candle_core::safetensors::save(&map, &path); 
-            }
-        }
-        println!("[BAKE-WORKER] Worker finished.");
-    });
-}
+// [REMOVED] Local BakeTask and worker. Using global system in quantized_model.rs
 
 #[derive(Clone)]
 pub enum ModelVariant {
@@ -674,9 +590,88 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn save_kv_to_disk(&mut self, path: &Path, kv_name: Option<&str>, offset: usize) -> Result<()> {
+        let kv_name_owned = kv_name.map(|s| s.to_string());
+        
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.save_kv_cache(path, false, offset, kv_name),
-            ModelVariant::QuantizedText(m) => m.save_kv_cache(path, false, offset, kv_name),
+            ModelVariant::QuantizedVL(m) => {
+                let layers = &m.language_model.layers;
+                // [BAKING] Parallel compression + Async Save
+                layers.par_iter().for_each(|layer| {
+                    if let Some((k, v)) = &layer.self_attn.kv_cache {
+                        if let Ok((k_anchors, k_packed, k_scales, k_shape)) = layer.self_attn.compress_to_bitkv(k) {
+                            if let Ok((v_anchors, v_packed, v_scales, _)) = layer.self_attn.compress_to_bitkv(v) {
+                                let mut map = std::collections::HashMap::new();
+                                map.insert("k_anchors".to_string(), k_anchors);
+                                map.insert("k_packed".to_string(), k_packed);
+                                map.insert("k_scales".to_string(), k_scales);
+                                map.insert("v_anchors".to_string(), v_anchors);
+                                map.insert("v_packed".to_string(), v_packed);
+                                map.insert("v_scales".to_string(), v_scales);
+                                if let Ok(s) = Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu) {
+                                    map.insert("k_shape".to_string(), s);
+                                }
+                                if let Ok(mode) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
+                                    map.insert("mode".to_string(), mode);
+                                }
+
+                                let filename = match (&kv_name_owned, offset) {
+                                    (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
+                                    (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
+                                    (None, 0) => format!("layer_{}_kv.safetensors", layer.self_attn.layer_idx),
+                                    (None, off) => format!("layer_{}_kv_{}.safetensors", layer.self_attn.layer_idx, off),
+                                };
+                                
+                                let task = submit_bake_task(BakeTask::KvChunk {
+                                    kv_name: kv_name_owned.clone(),
+                                    offset,
+                                    data: map,
+                                    path: path.join(filename),
+                                });
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            },
+            ModelVariant::QuantizedText(m) => {
+                 let layers = &m.language_model.layers;
+                 layers.par_iter().for_each(|layer| {
+                    if let Some((k, v)) = &layer.self_attn.kv_cache {
+                        if let Ok((k_anchors, k_packed, k_scales, k_shape)) = layer.self_attn.compress_to_bitkv(k) {
+                            if let Ok((v_anchors, v_packed, v_scales, _)) = layer.self_attn.compress_to_bitkv(v) {
+                                let mut map = std::collections::HashMap::new();
+                                map.insert("k_anchors".to_string(), k_anchors);
+                                map.insert("k_packed".to_string(), k_packed);
+                                map.insert("k_scales".to_string(), k_scales);
+                                map.insert("v_anchors".to_string(), v_anchors);
+                                map.insert("v_packed".to_string(), v_packed);
+                                map.insert("v_scales".to_string(), v_scales);
+                                if let Ok(s) = Tensor::from_vec(k_shape.iter().map(|&x| x as u32).collect(), (k_shape.len(),), &Device::Cpu) {
+                                    map.insert("k_shape".to_string(), s);
+                                }
+                                if let Ok(mode) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
+                                    map.insert("mode".to_string(), mode);
+                                }
+
+                                let filename = match (&kv_name_owned, offset) {
+                                    (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
+                                    (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
+                                    (None, 0) => format!("layer_{}_kv.safetensors", layer.self_attn.layer_idx),
+                                    (None, off) => format!("layer_{}_kv_{}.safetensors", layer.self_attn.layer_idx, off),
+                                };
+                                
+                                let task = submit_bake_task(BakeTask::KvChunk {
+                                    kv_name: kv_name_owned.clone(),
+                                    offset,
+                                    data: map,
+                                    path: path.join(filename),
+                                });
+                            }
+                        }
+                    }
+                });
+                Ok(())
+            },
             _ => Ok(()),
         }
     }
