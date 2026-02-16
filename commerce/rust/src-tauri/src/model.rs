@@ -450,21 +450,12 @@ impl LogisModel {
 
         // 2. Ingest PUG content
         {
-            let gen_clone = self.generator.clone();
             let prompt = format!("{}\n\n[SYSTEM] Analyze the document structure.", pug_content);
-            let token_clone = cancel_token.clone();
-            
-            // We use prefill_only via a manual chat construct or direct access if possible
-            // Reusing chat_params_with_spinner for convenience but with empty generation
-            
-            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut gen_guard = gen_clone.blocking_lock();
-                if let Some(gen) = gen_guard.as_mut() {
-                    // Just prefill, no generation needed for base context
-                    gen.prefill_chunk(prompt, token_clone, None)?;
-                }
-                Ok(())
-            }).await??;
+            let mut gen_guard = self.generator.lock().await;
+            if let Some(gen) = gen_guard.as_mut() {
+                // Just prefill, no generation needed for base context
+                gen.prefill_chunk(prompt, cancel_token.clone(), None).await?;
+            }
         }
 
         // 3. Save Base Snapshot
@@ -855,8 +846,8 @@ impl LogisModel {
         
         println!("[MODEL-CHAT] Sending Chat Request...");
         
-        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = self_clone.blocking_lock();
+        {
+            let mut gen_guard = self.generator.lock().await;
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
             
             let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
@@ -884,10 +875,10 @@ impl LogisModel {
                 ..Default::default()
             };
             
-            let response = gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))?;
+            let response = gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))?;
             println!("[MODEL-CHAT] Raw Response: {}", response);
             Ok(response)
-        }).await?
+        }
     }
 
     pub async fn chat_with_spinner(
@@ -967,15 +958,9 @@ impl LogisModel {
             crate::scheduler::log_task_progress(app_handle, task_id, &base_payload);
         }
 
-        let self_clone = self.generator.clone();
-        
-        let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = self_clone.blocking_lock();
-            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-            gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
-        });
-
-        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
+        let mut gen_guard = self.generator.lock().await;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn chat_with_image_spinner(
@@ -996,49 +981,43 @@ impl LogisModel {
         // [FIX] Removed redundant emit. Only log the progress if needed.
         // let _ = app_handle.emit(event_name, base_payload);
 
-        let self_clone = self.generator.clone();
+        let mut gen_guard = self.generator.lock().await;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
         
-        let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = self_clone.blocking_lock();
-            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
+        let mut content_parts = Vec::new();
+        
+        if let Some(img) = image {
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png)?;
+            let b64 = BASE64_STANDARD.encode(buf.into_inner());
+            let url = format!("data:image/png;base64,{}", b64);
             
-            let mut content_parts = Vec::new();
-            
-            if let Some(img) = image {
-                let mut buf = Cursor::new(Vec::new());
-                img.write_to(&mut buf, image::ImageFormat::Png)?;
-                let b64 = BASE64_STANDARD.encode(buf.into_inner());
-                let url = format!("data:image/png;base64,{}", b64);
-                
-                content_parts.push(ChatCompletionRequestMessageContentPart::ImageURL(
-                    ChatCompletionRequestMessageContentPartImage {
-                        image_url: ImageURL { url, detail: None }
-                    }
-                ));
-            }
-
-            content_parts.push(ChatCompletionRequestMessageContentPart::Text(
-                ChatCompletionRequestMessageContentPartText { text: prompt }
+            content_parts.push(ChatCompletionRequestMessageContentPart::ImageURL(
+                ChatCompletionRequestMessageContentPartImage {
+                    image_url: ImageURL { url, detail: None }
+                }
             ));
+        }
 
-            let message = ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(content_parts),
-                name: None,
-            };
+        content_parts.push(ChatCompletionRequestMessageContentPart::Text(
+            ChatCompletionRequestMessageContentPartText { text: prompt }
+        ));
 
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(message)],
-                model: "qwen3vl".to_string(),
-                max_tokens: Some(max_tokens as u32),
-                temperature: Some(0.1),
-                top_p: Some(0.9),
-                ..Default::default()
-            };
-            
-            gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
-        });
+        let message = ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(content_parts),
+            name: None,
+        };
 
-        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(message)],
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(max_tokens as u32),
+            temperature: Some(0.1),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+        
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     async fn run_inference_text(&self, prompt: String, image: Option<DynamicImage>, cancel_token: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> anyhow::Result<String> {
@@ -1109,50 +1088,44 @@ impl LogisModel {
         // [FIX] Removed redundant emit. Only log the progress.
         // let _ = app_handle.emit(event_name, base_payload);
 
-        let generator_arc = self.generator.clone();
         let max_tok = self.max_tokens_limit;
         
-        // Spawn the heavy task using Tokio directly for standard behavior
-        let task = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let mut gen_guard = generator_arc.blocking_lock();
-            let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
-            
-            let mut content_parts = Vec::new();
-            if let Some(img) = image {
-                let mut buf = Cursor::new(Vec::new());
-                img.write_to(&mut buf, image::ImageFormat::Png)?;
-                let b64 = BASE64_STANDARD.encode(buf.into_inner());
-                let url = format!("data:image/png;base64,{}", b64);
-                
-                content_parts.push(ChatCompletionRequestMessageContentPart::ImageURL(
-                    ChatCompletionRequestMessageContentPartImage {
-                        image_url: ImageURL { url, detail: None }
-                    }
-                ));
-            }
-    
-            content_parts.push(ChatCompletionRequestMessageContentPart::Text(
-                ChatCompletionRequestMessageContentPartText { text: prompt }
-            ));
-    
-            let message = ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Array(content_parts),
-                name: None,
-            };
-    
-            let params = ChatCompletionParameters {
-                messages: vec![ChatCompletionRequestMessage::User(message)],
-                model: "qwen3vl".to_string(),
-                max_tokens: Some(max_tok),
-                temperature: Some(0.1),
-                top_p: Some(0.9),
-                ..Default::default()
-            };
-            
-            gen.generate(params, cancel_token, session_id, kv_name).map_err(|e| anyhow!("Inference failed: {}", e))
-        });
+        let mut gen_guard = self.generator.lock().await;
+        let gen = gen_guard.as_mut().ok_or_else(|| anyhow!("Generator is unloaded"))?;
         
-        task.await.map_err(|e| anyhow!("Task join error: {}", e))?
+        let mut content_parts = Vec::new();
+        if let Some(img) = image {
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png)?;
+            let b64 = BASE64_STANDARD.encode(buf.into_inner());
+            let url = format!("data:image/png;base64,{}", b64);
+            
+            content_parts.push(ChatCompletionRequestMessageContentPart::ImageURL(
+                ChatCompletionRequestMessageContentPartImage {
+                    image_url: ImageURL { url, detail: None }
+                }
+            ));
+        }
+
+        content_parts.push(ChatCompletionRequestMessageContentPart::Text(
+            ChatCompletionRequestMessageContentPartText { text: prompt }
+        ));
+
+        let message = ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Array(content_parts),
+            name: None,
+        };
+
+        let params = ChatCompletionParameters {
+            messages: vec![ChatCompletionRequestMessage::User(message)],
+            model: "qwen3vl".to_string(),
+            max_tokens: Some(max_tok),
+            temperature: Some(0.1),
+            top_p: Some(0.9),
+            ..Default::default()
+        };
+        
+        gen.generate(params, cancel_token, session_id, kv_name).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
     pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
