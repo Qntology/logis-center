@@ -23,12 +23,26 @@ use crate::{
     openai_types::ChatCompletionParameters,
 };
 use rayon::prelude::*;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use std::fs;
 use std::path::Path;
 
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+
+// [GLOBAL] 전역 대기열 카운터: 20개 상한선 체크용
+pub static ACTIVE_BAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+// [MEMORY] 강제 메모리 해제 및 초기화 함수 (Async)
+async fn purge_vram_position(device: &Device) {
+    if device.is_cuda() {
+        let dev_clone = device.clone();
+        // 비동기 방식으로 GPU 동기화를 호출하여 현재 포지션의 연산 잔재를 완전히 소거
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = dev_clone.synchronize();
+        }).await;
+    }
+}
 
 struct LayerKVDump {
     layer_idx: usize,
@@ -384,43 +398,54 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
         
-        // [GRANULAR-BAKING] Use 512 blocks for consistent memory pressure
-        let prefill_chunk_size = 512;
+        // [증분 저장] 2048 토큰 단위로 기억 조각을 생성
+        let prefill_chunk_size = 2048;
         let mut current_pos = self.get_kv_len();
         if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
         while current_pos < total_tokens {
-            if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            // [대기열 제어] 20개 초과 시 일시 정지 (신호등 역할)
+            while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= 20 {
+                println!("[MEMORY] 69. 메모리 제거 대기... (Queue: {})", ACTIVE_BAKE_TASKS.load(Ordering::SeqCst));
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            if let Some(flag) = &cancel_flag { 
+                if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } 
+            }
+
             let end = (current_pos + prefill_chunk_size).min(total_tokens);
-            let chunk_end = if end == total_tokens { total_tokens - 1 } else { end };
-            if chunk_end <= current_pos { break; }
-            let chunk_len = chunk_end - current_pos;
-            let chunk = &full_input_ids_vec[current_pos..chunk_end];
+            let chunk_len = end - current_pos;
+            let chunk = &full_input_ids_vec[current_pos..end];
+            
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_len), &self.text_device)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, chunk_end as u32, &self.text_device)?.unsqueeze(0)?;
-            println!("[BAKING] Step: {} to {} / Total: {}", current_pos, chunk_end, total_tokens);
+            let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
+
+            // 1. GPU 추론 진행
+            println!("[BAKING] {} to {} / Total: {}", current_pos, end, total_tokens);
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
-            // [SEGMENT-RESET] Persistent save and system-level memory purge after every chunk
+
+            // 2. 비동기 워커에게 기억 조각(KV) 전달
             if let Some(sid) = &session_id {
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if !path.exists() { let _ = fs::create_dir_all(&path); }     
+                if !path.exists() { let _ = fs::create_dir_all(&path); }
                 
-                // 1. Save to disk (Granular 512 block)
-                self.save_kv_to_disk(&path, kv_name.as_deref(), chunk_end)?;
+                // 대기열 카운트 증가
+                ACTIVE_BAKE_TASKS.fetch_add(1, Ordering::SeqCst);
                 
-                // 2. Purge from VRAM (Keep memory lean during heavy prefill)
-                println!("[BAKING] Segment saved. Resetting memory for token {}.", chunk_end);
-                let _ = self.qwen3_vl.drop_kv_storage(); 
+                // 디스크 저장 명령 (Incremental Save)
+                self.save_kv_to_disk(&path, kv_name.as_deref(), end)?;
                 
-                // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
-                if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
+                // [MEMORY] 1. 메모리 삭제됨 (VRAM 즉시 초기화)
+                let dev = self.text_device.clone();
+                tauri::async_runtime::spawn(async move {
+                    // GPU 메모리 포지션을 강하게 비움
+                    purge_vram_position(&dev).await;
+                    // 저장이 완료된 것으로 간주하고 카운트 감소
+                    ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
+                });
             }
+
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
                 let results: Result<Vec<_>> = ks.par_iter().zip(vs.par_iter()).map(|(k, v): (&Tensor, &Tensor)| {
@@ -445,12 +470,18 @@ impl Qwen3VLGenerateModel {
                 }
                 if !ka.is_empty() { target.inject_kv_bitkv(&ka, &kp, &ks_, &va, &vp, &vs_, &os)?; }
             }
-            current_pos = chunk_end;
+            current_pos = end;
+            println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
         }
+
+        // 최종 동기화: 모든 대기열이 비워질 때까지 대기
+        while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) > 0 {
+            println!("[MEMORY] 69. 최종 메모리 제거 대기... (Remaining: {})", ACTIVE_BAKE_TASKS.load(Ordering::SeqCst));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
         if let Some(sid) = session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
-            if !path.exists() { let _ = fs::create_dir_all(&path); }
-            self.save_kv_to_disk(&path, kv_name.as_deref(), current_pos)?;
             let token_path = path.join("tokens.json");
             if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
         }

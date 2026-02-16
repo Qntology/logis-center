@@ -8,6 +8,7 @@ use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use memmap2::Mmap;
 
 use crate::{
@@ -24,6 +25,7 @@ use crate::{
         prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
     },
 };
+use crate::models::qwen3vl::generate::ACTIVE_BAKE_TASKS;
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -1181,8 +1183,6 @@ impl QuantizedQwen3VLTextModel {
         // c: Computing (Current Layer)
         // b: Backing up (Save in progress, memory kept)
         // a: Archived (Save confirmed, memory dropped)
-        let mut save_handles = std::collections::VecDeque::new(); 
-        let window_size = 2; // Keep at most 2 layers in RAM (Current + One being saved)
 
         let mut start_layer = 0;
         // [RESUME-LOGIC] Try to pick up from a saved layer checkpoint on disk
@@ -1240,6 +1240,11 @@ impl QuantizedQwen3VLTextModel {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
+            // [FLOW-CONTROL] 대기열이 가득 차면 레이어 연산 전 일시 정지
+            while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= 20 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
             let is_pinned = layer_idx < self.pinned_layer_count;
             
             // 1. [C: Computing] Prepare and Run Layer
@@ -1247,9 +1252,7 @@ impl QuantizedQwen3VLTextModel {
                 layer.to_device(&target_device)?;
             }
 
-            // println!("[TRACE-L{}] Calling layer.forward...", layer_idx);
             xs = layer.forward(&xs, &cos, &sin, attention_mask.as_ref())?;
-            // println!("[TRACE-L{}] layer.forward finished.", layer_idx);
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
@@ -1262,68 +1265,46 @@ impl QuantizedQwen3VLTextModel {
                 }
             }
 
-            // GPU Sync to ensure computation is 100% done before save starts
-            if target_device.is_cuda() { 
-                // println!("[TRACE-L{}] Synchronizing GPU...", layer_idx);
-                let _ = target_device.synchronize(); 
-            }
-
-            // 2. [B: Backing Up] Start Save
+            // 2. 레이어 연산 직후 스냅샷 생성 및 비동기 워커로 오프로드
             if let Some(sid) = &self.active_session_id {
-                // println!("[TRACE-L{}] Mandatory save triggered for sid: {}", layer_idx, sid);
                 let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                 if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
-
+                
+                let xs_cpu = xs.to_device(&Device::Cpu)?; // GPU 메모리 포인터 해제 준비
+                
+                ACTIVE_BAKE_TASKS.fetch_add(1, Ordering::SeqCst);
+                
                 let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                let tmp_path = task_dir.join(format!("inference_layer_{}_at_{}.tmp", layer_idx, seqlen_offset));
                 
-                // println!("[TRACE-L{}] Copying tensor to CPU for saving...", layer_idx);
-                let xs_cpu = xs.to_device(&Device::Cpu)?;
-                
-                if num_layers == 1 {
+                // [WORKER] 비동기 저장 워커 기동
+                tokio::task::spawn_blocking(move || {
                     let mut map = std::collections::HashMap::new();
-                    map.insert("hidden_states".to_string(), xs_cpu.clone());
-                    let _ = candle_core::safetensors::save(&map, &tmp_path);
-                    let _ = std::fs::rename(&tmp_path, &final_path);
-                } else {
-                    let h = tokio::task::spawn_blocking(move || {
-                        let mut map = std::collections::HashMap::new();
-                        map.insert("hidden_states".to_string(), xs_cpu);
-                        let _ = candle_core::safetensors::save(&map, &tmp_path);
-                        let _ = std::fs::rename(&tmp_path, &final_path);
-                    });
-                    save_handles.push_back((layer_idx, h, xs.clone()));
-                }
-            }
-            if !is_pinned { layer.to_device(&Device::Cpu)?; }
-
-            // 3. [A: Archived] Confirm Save and Drop Old Memory (HARD PURGE)
-            let tight_window = 1; 
-            while save_handles.len() > tight_window {
-                if let Some((old_idx, handle, old_xs)) = save_handles.pop_front() {
-                    if handle.is_finished() {
-                        drop(old_xs);
-                        if target_device.is_cuda() { let _ = target_device.synchronize(); }
-                            
-                        #[cfg(target_os = "windows")]
-                        unsafe {
-                            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                            use windows_sys::Win32::System::Memory::*;
-                            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                        }
+                    map.insert("hidden_states".to_string(), xs_cpu);
+                    if let Ok(_) = candle_core::safetensors::save(&map, &final_path) {
+                        ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
                     } else {
-                        save_handles.push_front((old_idx, handle, old_xs));
+                        ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
                     }
-                }
+                });
+            }
+
+            // [CRITICAL] 3. 레이어 메모리 포지션 강제 초기화 (Async Await)
+            let dev_clone = target_device.clone();
+            
+            if !is_pinned {
+                layer.to_device(&Device::Cpu)?; 
+                
+                let _ = tauri::async_runtime::spawn(async move {
+                    if dev_clone.is_cuda() {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = dev_clone.synchronize();
+                        }).await;
+                    }
+                });
             }
         }
 
-        println!("[TRACE] All layers done. Finalizing saves...");
-        // Final Wait for all remaining saves before returning
-        for (idx, handle, _) in save_handles {
-            // println!("[TRACE-L{}] Final block_on for remaining handle.", idx);
-            let _ = futures::executor::block_on(handle);
-        }
+        println!("[TRACE] All layers done.");
         
         self.current_kv_len = seqlen_offset + seq_len;
         println!("[TRACE] Final norm.forward starting...");
