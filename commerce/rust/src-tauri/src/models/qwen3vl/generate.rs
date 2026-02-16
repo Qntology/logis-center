@@ -44,7 +44,7 @@ struct BakeTask {
     layers: Vec<LayerKVDump>,
 }
 
-fn spawn_bake_worker() -> mpsc::UnboundedSender<BakeTask> {
+fn spawn_bake_worker(active_tasks: Arc<std::sync::atomic::AtomicUsize>) -> mpsc::UnboundedSender<BakeTask> {
     let (tx, mut rx) = mpsc::unbounded_channel::<BakeTask>();
     
     tokio::spawn(async move {
@@ -87,8 +87,6 @@ fn spawn_bake_worker() -> mpsc::UnboundedSender<BakeTask> {
                         
                         for token_idx in 0..s {
                             let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                            
-                            // Calculate Mean Absolute Scale for 1-bit
                             let mut abs_sum = 0.0f32;
                             for &v in token_data { abs_sum += v.abs(); }
                             scales[bh_idx * s + token_idx] = abs_sum / (d as f32);
@@ -108,7 +106,6 @@ fn spawn_bake_worker() -> mpsc::UnboundedSender<BakeTask> {
                 let _ = process_kv(layer.k, "k");
                 let _ = process_kv(layer.v, "v");
                 
-                // Mode 2: Pure 1-bit (Scale + Bits)
                 if let Ok(mode_tensor) = Tensor::from_vec(vec![2u32], (1,), &Device::Cpu) {
                     map.insert("mode".to_string(), mode_tensor);
                 }
@@ -117,8 +114,9 @@ fn spawn_bake_worker() -> mpsc::UnboundedSender<BakeTask> {
                     eprintln!("[BAKE-WORKER] Failed to save layer {}: {:?}", layer.layer_idx, e);
                 }
             }
+            // 작업 완료 후 카운터 감소 및 명시적 메모리 해제 암시
+            active_tasks.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
-        println!("[BAKE-WORKER] Worker finished.");
     });
     tx
 }
@@ -187,6 +185,7 @@ pub struct Qwen3VLGenerateModel {
     pub kv_root: std::path::PathBuf,
     pub drafter: Option<Arc<TokioMutex<Option<Qwen3VLGenerateModel>>>>, // 투기적 추론용 드래프터
     pub bake_tx: mpsc::UnboundedSender<BakeTask>, // [NEW] Asynchronous baking queue
+    pub active_bake_tasks: Arc<std::sync::atomic::AtomicUsize>, // [NEW] Track background saves
 }
 
 impl Qwen3VLGenerateModel {
@@ -338,9 +337,10 @@ impl Qwen3VLGenerateModel {
             _ => (151643, 151643),
         };
         
-        let bake_tx = spawn_bake_worker();
+        let active_bake_tasks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bake_tx = spawn_bake_worker(active_bake_tasks.clone());
 
-        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root, drafter: None, bake_tx })
+        Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root, drafter: None, bake_tx, active_bake_tasks })
     }
 
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
@@ -400,6 +400,28 @@ impl Qwen3VLGenerateModel {
 
         while current_pos < total_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
+            
+            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (Strongest Purge: Threshold 1)
+            let mut wait_count = 0;
+            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                if wait_count == 0 { println!("[MEMORY] 68. 메모리 비워짐 (Strongest Purge Active)"); }
+                println!("[MEMORY] {}. 메모리 제거 대기...", 69 + wait_count.min(3));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                wait_count += 1;
+                if wait_count > 200 { break; } 
+            }
+            if wait_count > 0 { 
+                println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
+                
+                // [AGGRESSIVE-OS-TRIM] 
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+            }
+
             let end = (current_pos + prefill_chunk_size).min(total_tokens);
             let chunk_end = if end == total_tokens { total_tokens - 1 } else { end };
             if chunk_end <= current_pos { break; }
@@ -428,6 +450,7 @@ impl Qwen3VLGenerateModel {
                     offset: chunk_end,
                     layers: layer_dumps,
                 });
+                self.active_bake_tasks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 
                 // 2. Purge from VRAM (Keep memory lean during heavy prefill)
                 println!("[BAKING] Segment queued. Resetting memory for token {}.", chunk_end);

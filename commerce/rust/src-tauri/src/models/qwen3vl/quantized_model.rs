@@ -924,6 +924,7 @@ pub struct QuantizedQwen3VLTextModel {
     pub active_session_id: Option<String>,
     pub pinned_layer_count: usize, // [NEW] Keep N layers on GPU
     pub current_kv_len: usize,
+    pub active_bake_tasks: std::sync::Arc<std::sync::atomic::AtomicUsize>, // [NEW] Track layer saves
 }
 
 impl QuantizedQwen3VLTextModel {
@@ -1059,7 +1060,20 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { 
+            embed_tokens, 
+            layers, 
+            norm, 
+            rotary_emb, 
+            mrope_section, 
+            mmap: mmap_handle, 
+            baking_only, 
+            is_forced_cpu, 
+            active_session_id: None, 
+            pinned_layer_count, 
+            current_kv_len: 0,
+            active_bake_tasks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,
@@ -1178,6 +1192,7 @@ impl QuantizedQwen3VLTextModel {
             active_session_id: None,
             pinned_layer_count,
             current_kv_len: 0,
+            active_bake_tasks: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -1254,6 +1269,27 @@ impl QuantizedQwen3VLTextModel {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
+            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (가장 강력한 1개 제한 정책)
+            let mut wait_count = 0;
+            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                if wait_count == 0 { println!("[MEMORY] 68. 메모리 비워짐 (Strong Purge Active)"); }
+                println!("[MEMORY] {}. 메모리 제거 대기 (L{})...", 69 + wait_count.min(3), layer_idx);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                wait_count += 1;
+                if wait_count > 200 { break; } 
+            }
+            if wait_count > 0 { 
+                println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
+                
+                // [AGGRESSIVE-OS-TRIM] OS에게 사용하지 않는 메모리를 즉시 반환하도록 요청
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    use windows_sys::Win32::System::Memory::*;
+                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+                }
+            }
+
             let is_pinned = layer_idx < self.pinned_layer_count;
             
             // 1. [C: Computing] Prepare and Run Layer
@@ -1298,11 +1334,14 @@ impl QuantizedQwen3VLTextModel {
                         let _ = candle_core::safetensors::save(&map, &tmp_path);
                         let _ = std::fs::rename(&tmp_path, &final_path);
                     } else {
+                        let counter = self.active_bake_tasks.clone();
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let h = tokio::task::spawn_blocking(move || {
                             let mut map = std::collections::HashMap::new();
                             map.insert("hidden_states".to_string(), xs_cpu);
                             let _ = candle_core::safetensors::save(&map, &tmp_path);
                             let _ = std::fs::rename(&tmp_path, &final_path);
+                            counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         });
                         save_handles.push_back((layer_idx, h, xs.clone()));
                     }
