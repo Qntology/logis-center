@@ -368,47 +368,58 @@ impl QuantizedQwen3VLTextAttention {
             apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         
         // 3. [HARDENING] KV Cache Concatenation Guard & [DYNAMIC PAGING]
-        let (mut key_states, mut value_states): (Tensor, Tensor) = match &self.kv_cache {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
-                let pk = if pk.dtype() != target_dtype { pk.to_dtype(target_dtype)? } else { pk }.contiguous()?;
-                let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v.clone() };
-                let pv = if pv.dtype() != target_dtype { pv.to_dtype(target_dtype)? } else { pv }.contiguous()?;
-                
-                let k = Tensor::cat(&[&pk, &key_states.contiguous()?], 2)?.contiguous()?;
-                let v = Tensor::cat(&[&pv, &value_states.contiguous()?], 2)?.contiguous()?;
-                (k, v)
+        let mut key_list = Vec::new();
+        let mut value_list = Vec::new();
+        
+        for block in &self.kv_blocks {
+            if block.location == KVLocation::VRAM {
+                if let (Some(k), Some(v)) = (&block.k_cache, &block.v_cache) {
+                    key_list.push(k.clone());
+                    value_list.push(v.clone());
+                }
+            } else if block.location == KVLocation::RAM {
+                // [TEMPORARY] For now, if it's in RAM, we must move it back to VRAM to concatenate
+                // In step 4, we will handle this without full concatenation
+                if let Some(meta) = &block.bitkv_metadata {
+                    // This is a simplified fallback
+                    key_list.push(meta.k_anchors.to_device(dev)?);
+                    value_list.push(meta.v_anchors.to_device(dev)?);
+                }
             }
-        };
+        }
+        
+        key_list.push(key_states);
+        value_list.push(value_states);
+        
+        let mut key_states = Tensor::cat(&key_list, 2)?.contiguous()?;
+        let mut value_states = Tensor::cat(&value_list, 2)?.contiguous()?;
 
         // [DYNAMIC PAGING] Anchor Paging (지시사항 보존형 슬라이딩 윈도우)
         let current_kv_len = key_states.dim(2)?;
-        let sliding_window = 4096; // 전체 VRAM 캐시 유지 크기 (10k+ 처리를 위해 확장)
-        let anchor_size = 1024;    // 절대 삭제하지 않을 전면 지시사항(System Prompt) 영역
+        let sliding_window = 4096; 
+        let anchor_size = 1024;   
 
         if current_kv_len > sliding_window {
-            // 1. 전면 지시사항(Anchor) 추출
             let anchor_k = key_states.narrow(2, 0, anchor_size)?;
             let anchor_v = value_states.narrow(2, 0, anchor_size)?;
-            
-            // 2. 최신 문맥(Recent Window) 추출
             let recent_len = sliding_window - anchor_size;
             let recent_k = key_states.narrow(2, current_kv_len - recent_len, recent_len)?;
             let recent_v = value_states.narrow(2, current_kv_len - recent_len, recent_len)?;
-            
-            // 3. 결합 (중간의 데이터만 비우고 지시사항+최신데이터로 재구성)
             key_states = Tensor::cat(&[&anchor_k, &recent_k], 2)?.contiguous()?;
             value_states = Tensor::cat(&[&anchor_v, &recent_v], 2)?.contiguous()?;
-            
-            if self.layer_idx == 0 {
-                println!("[PAGING] Anchor Paging Active. System instructions preserved. (VRAM: {}/{} tokens)", 
-                    key_states.dim(2)?, current_kv_len);
-            }
         }
 
-        // Update working cache
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        // Update working blocks (Simplified for now: keep as one large VRAM block if we are not offloading yet)
+        self.kv_blocks.clear();
+        self.kv_blocks.push(KVBlock {
+            location: KVLocation::VRAM,
+            k_cache: Some(key_states.clone()),
+            v_cache: Some(value_states.clone()),
+            ssd_path: None,
+            start_token: 0,
+            len: key_states.dim(2)?,
+            bitkv_metadata: None,
+        });
 
         // 4. [HARDENING] Adjusted Mask Logic
         let actual_seq_len = key_states.dim(2)?;
@@ -579,18 +590,15 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
+        self.kv_blocks.clear();
     }
 
     pub fn get_kv_len(&self) -> usize {
-        match &self.kv_cache {
-            None => 0,
-            Some((k, _)) => k.dim(2).unwrap_or(0),
-        }
+        self.kv_blocks.iter().map(|b| b.len).sum()
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
-        self.kv_cache = None;
+        self.kv_blocks.clear();
         Ok(())
     }
 
@@ -608,14 +616,19 @@ impl QuantizedQwen3VLTextAttention {
         let dev = self.q_proj.device();
         let k_final = if !k_final.device().same_device(dev) { k_final.to_device(dev)? } else { k_final.clone() };
         let v_final = if !v_final.device().same_device(dev) { v_final.to_device(dev)? } else { v_final.clone() };
-        self.kv_cache = match &self.kv_cache {
-            None => Some((k_final, v_final)),
-            Some((prev_k, prev_v)) => {
-                let k = Tensor::cat(&[prev_k, &k_final], 2)?;
-                let v = Tensor::cat(&[prev_v, &v_final], 2)?;
-                Some((k, v))
-            }
-        };
+        
+        let start_token = self.get_kv_len();
+        let len = k_final.dim(2)?;
+        
+        self.kv_blocks.push(KVBlock {
+            location: KVLocation::VRAM,
+            k_cache: Some(k_final),
+            v_cache: Some(v_final),
+            ssd_path: None,
+            start_token,
+            len,
+            bitkv_metadata: None,
+        });
         Ok(())
     }
 

@@ -30,7 +30,55 @@ use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-// [GLOBAL] 전역 대기열 카운터: 20개 상한선 체크용
+// [GLOBAL] 슬롯 관리자: CPU RAM 상주 데이터 및 대기열 제어
+pub struct SlotManager {
+    pub slots: Vec<crate::models::qwen3vl::quantized_model::MemorySlot>,
+    pub handoff_notifier: Arc<tokio::sync::Notify>,
+    pub free_slots: Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl SlotManager {
+    pub fn new(count: usize) -> Self {
+        let mut slots = Vec::new();
+        let mut free_indices = Vec::new();
+        for i in 0..count {
+            slots.push(crate::models::qwen3vl::quantized_model::MemorySlot {
+                id: i,
+                state: Arc::new(std::sync::atomic::AtomicU8::new(0)), // 0: Free
+                k_data: Arc::new(tokio::sync::Mutex::new(None)),
+                v_data: Arc::new(tokio::sync::Mutex::new(None)),
+                layer_idx: 0,
+                block_idx: 0,
+            });
+            free_indices.push(i);
+        }
+        Self {
+            slots,
+            handoff_notifier: Arc::new(tokio::sync::Notify::new()),
+            free_slots: Arc::new(std::sync::Mutex::new(free_indices)),
+        }
+    }
+
+    pub async fn acquire_slot(&self) -> usize {
+        loop {
+            {
+                let mut free = self.free_slots.lock().unwrap();
+                if let Some(idx) = free.pop() {
+                    return idx;
+                }
+            }
+            // 슬롯이 없으면 SSD 저장 완료 신호를 기다림
+            self.handoff_notifier.notified().await;
+        }
+    }
+
+    pub fn release_slot(&self, id: usize) {
+        let mut free = self.free_slots.lock().unwrap();
+        free.push(id);
+        self.handoff_notifier.notify_waiters();
+    }
+}
+
 pub static ACTIVE_BAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
 
 // [MEMORY] 강제 메모리 해제 및 초기화 함수 (Async)
