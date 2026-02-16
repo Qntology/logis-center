@@ -839,7 +839,7 @@ impl LogisModel {
             }
         }
         
-        let self_clone = self.generator.clone();
+        let _self_clone = self.generator.clone();
         let system_text = system.to_string();
         let user_text = user_input.to_string();
         let max_tok = self.max_tokens_limit;

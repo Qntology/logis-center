@@ -1,3 +1,4 @@
+use crate::models::qwen3vl::quantized_model::KVLocation;
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor, IndexOp};
 use candle_nn::VarBuilder;
@@ -30,57 +31,72 @@ use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-// [GLOBAL] 슬롯 관리자: CPU RAM 상주 데이터 및 대기열 제어
+// [GLOBAL] 슬롯 관리자: 읽기/쓰기 통로 분리 및 대기열 제어
 pub struct SlotManager {
     pub slots: Vec<crate::models::qwen3vl::quantized_model::MemorySlot>,
     pub handoff_notifier: Arc<tokio::sync::Notify>,
-    pub free_slots: Arc<std::sync::Mutex<Vec<usize>>>,
+    pub free_write_slots: Arc<std::sync::Mutex<Vec<usize>>>, // 0~3
+    pub free_read_slots: Arc<std::sync::Mutex<Vec<usize>>>,  // 4~7
 }
 
 impl SlotManager {
     pub fn new(count: usize) -> Self {
         let mut slots = Vec::new();
-        let mut free_indices = Vec::new();
+        let mut free_write = Vec::new();
+        let mut free_read = Vec::new();
         for i in 0..count {
             slots.push(crate::models::qwen3vl::quantized_model::MemorySlot {
                 id: i,
                 state: Arc::new(std::sync::atomic::AtomicU8::new(0)), // 0: Free
                 k_data: Arc::new(tokio::sync::Mutex::new(None)),
                 v_data: Arc::new(tokio::sync::Mutex::new(None)),
+                remaining_layers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 layer_idx: 0,
                 block_idx: 0,
             });
-            free_indices.push(i);
+            if i < count / 2 { free_write.push(i); }
+            else { free_read.push(i); }
         }
         Self {
             slots,
             handoff_notifier: Arc::new(tokio::sync::Notify::new()),
-            free_slots: Arc::new(std::sync::Mutex::new(free_indices)),
+            free_write_slots: Arc::new(std::sync::Mutex::new(free_write)),
+            free_read_slots: Arc::new(std::sync::Mutex::new(free_read)),
         }
     }
 
-    pub async fn acquire_slot(&self) -> usize {
+    pub async fn acquire_write_slot(&self) -> usize {
         loop {
             {
-                let mut free = self.free_slots.lock().unwrap();
-                if let Some(idx) = free.pop() {
-                    return idx;
-                }
+                let mut free = self.free_write_slots.lock().unwrap();
+                if let Some(idx) = free.pop() { return idx; }
             }
-            // 슬롯이 없으면 SSD 저장 완료 신호를 기다림
+            self.handoff_notifier.notified().await;
+        }
+    }
+
+    pub async fn acquire_read_slot(&self) -> usize {
+        loop {
+            {
+                let mut free = self.free_read_slots.lock().unwrap();
+                if let Some(idx) = free.pop() { return idx; }
+            }
             self.handoff_notifier.notified().await;
         }
     }
 
     pub fn release_slot(&self, id: usize) {
-        let mut free = self.free_slots.lock().unwrap();
-        free.push(id);
+        if id < 4 {
+            self.free_write_slots.lock().unwrap().push(id);
+        } else {
+            self.free_read_slots.lock().unwrap().push(id);
+        }
         self.handoff_notifier.notify_waiters();
     }
 }
 
 pub static ACTIVE_BAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
-pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(8));
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(16));
 
 // [MEMORY] 강제 메모리 해제 및 초기화 함수 (Async)
 async fn purge_vram_position(device: &Device) {
@@ -113,102 +129,172 @@ struct SaveTask {
     tensors: std::collections::HashMap<String, Tensor>,
 }
 
-pub static BAKE_TX: once_cell::sync::Lazy<tokio::sync::Mutex<Option<mpsc::Sender<BakeTask>>>> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+// [GLOBAL] 통합 슬롯 작업 채널
+pub enum SlotTask {
+    Bake(BakeTask),
+    Load(LoadTask),
+}
+
+pub struct LoadTask {
+    pub slot_id: usize,
+    pub path: PathBuf,
+    pub layer_idx: usize,
+    pub kv_name: Option<String>,
+    pub shared_block: crate::models::qwen3vl::quantized_model::KVBlock,
+}
+
+pub static SLOT_TX: once_cell::sync::Lazy<tokio::sync::Mutex<Option<mpsc::Sender<SlotTask>>>> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
 
 pub fn init_bake_worker() {
     let (tx, rx) = mpsc::channel(100);
-    // [FIX] Ensure spawn happens within a runtime context
     tauri::async_runtime::spawn(async move {
-        spawn_bake_worker(rx);
+        spawn_slot_worker(rx);
     });
-    let mut lock = BAKE_TX.blocking_lock();
+    let mut lock = SLOT_TX.blocking_lock();
     *lock = Some(tx);
 }
 
-fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
-    // Phase B: 디스크 I/O 전담 워커 (IO 채널)
-    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(50);
+fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(500); // Increased capacity for multi-layer tasks
     
+    // Phase B: 디스크 I/O 전담 워커 (IO 채널)
     tokio::spawn(async move {
         println!("[IO-WORKER] Disk writer started.");
         while let Some(task) = io_rx.recv().await {
             let _ = candle_core::safetensors::save(&task.tensors, &task.path);
-            // SSD 저장 완료 후 슬롯 반납 (Handoff 완료)
-            SLOT_MANAGER.release_slot(task.slot_id);
-            println!("[IO-WORKER] Slot {} released.", task.slot_id);
+            
+            // [FIX] Decrement remaining layers and release only when 0
+            let slot = &SLOT_MANAGER.slots[task.slot_id];
+            let remaining = slot.remaining_layers.fetch_sub(1, Ordering::SeqCst);
+            if remaining == 1 {
+                SLOT_MANAGER.release_slot(task.slot_id);
+                println!("[IO-WORKER] Slot {} fully released after all layers saved.", task.slot_id);
+            }
         }
     });
 
-    // Phase A: CPU 압축 전담 워커
+    // Phase A: CPU 작업 전담 워커 (압축 및 로드)
     tokio::spawn(async move {
-        println!("[BAKE-WORKER] Compression worker started.");
+        println!("[SLOT-WORKER] Started.");
         while let Some(task) = rx.recv().await {
-            let slot_id = task.slot_id;
-            let task_dir = task.task_dir;
-            let kv_name = task.kv_name;
-            let offset = task.offset;
-            
-            for layer in task.layers {
-                let filename = match (&kv_name, offset) {
-                    (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
-                    (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
-                    (None, 0) => format!("layer_{}_kv.safetensors", layer.layer_idx),
-                    (None, off) => format!("layer_{}_kv_{}.safetensors", layer.layer_idx, off),
-                };
-                let path = task_dir.join(filename);
-                
-                let mut map = std::collections::HashMap::new();
-                let process_tensor = |t: Tensor, prefix: &str, target_map: &mut std::collections::HashMap<String, Tensor>| {
-                    if let Ok(dims) = t.dims4() {
-                        let (b, h, s, d) = dims;
-                        // CPU 멀티코어를 활용하여 빠르게 압축 (BitKV Mode 3)
-                        if let Ok(t_f32) = t.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                            if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-                                let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                                let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-                                let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
-                                let mut scales = vec![0.0f32; b * h * s];
+            match task {
+                SlotTask::Bake(bake) => {
+                    let slot_id = bake.slot_id;
+                    let task_dir = bake.task_dir;
+                    let kv_name = bake.kv_name;
+                    let offset = bake.offset;
+                    
+                    // [FIX] Initialize layer counter before starting Phase B tasks
+                    SLOT_MANAGER.slots[slot_id].remaining_layers.store(bake.layers.len(), Ordering::SeqCst);
+                    
+                    for layer in bake.layers {
+                        let filename = match (&kv_name, offset) {
+                            (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
+                            (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
+                            (None, 0) => format!("layer_{}_kv.safetensors", layer.layer_idx),
+                            (None, off) => format!("layer_{}_kv_{}.safetensors", layer.layer_idx, off),
+                        };
+                        let path = task_dir.join(filename);
+                        
+                        let mut map = std::collections::HashMap::new();
+                        let process_tensor = |t: Tensor, prefix: &str, target_map: &mut std::collections::HashMap<String, Tensor>| {
+                            if let Ok(dims) = t.dims4() {
+                                let (b, h, s, d) = dims;
+                                if let Ok(t_f32) = t.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
+                                    if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                                        let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                                        let mut anchors = vec![0.0f32; b * h * anchor_count * d];
+                                        let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
+                                        let mut scales = vec![0.0f32; b * h * s];
 
-                                let head_token_size = s * d;
-                                for bh_idx in 0..(b * h) {
-                                    let bh_offset = bh_idx * head_token_size;
-                                    for i in 0..head_token_size {
-                                        if t_data[bh_offset + i] >= 0.0 {
-                                            packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8);
+                                        let head_token_size = s * d;
+                                        for bh_idx in 0..(b * h) {
+                                            let bh_offset = bh_idx * head_token_size;
+                                            for i in 0..head_token_size {
+                                                if t_data[bh_offset + i] >= 0.0 {
+                                                    packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8);
+                                                }
+                                            }
+                                            for token_idx in 0..s {
+                                                let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+                                                if token_idx < 4 || token_idx % 8 == 0 {
+                                                    let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                                                    anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
+                                                }
+                                                let mut max_abs = 0.0f32;
+                                                for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                                scales[bh_idx * s + token_idx] = max_abs;
+                                            }
                                         }
-                                    }
-                                    for token_idx in 0..s {
-                                        let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                                        if token_idx < 4 || token_idx % 8 == 0 {
-                                            let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
-                                            anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
+
+                                        if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { target_map.insert(format!("{}_anchors", prefix), at); }
+                                        let packed_len = packed_residuals.len();
+                                        if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { target_map.insert(format!("{}_packed", prefix), pt); }
+                                        if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { target_map.insert(format!("{}_scales", prefix), st); }
+                                        if prefix == "k" {
+                                            if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { target_map.insert("k_shape".to_string(), sh); }
                                         }
-                                        let mut max_abs = 0.0f32;
-                                        for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
-                                        scales[bh_idx * s + token_idx] = max_abs;
                                     }
                                 }
+                            }
+                        };
 
-                                if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { target_map.insert(format!("{}_anchors", prefix), at); }
-                                let packed_len = packed_residuals.len();
-                                if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { target_map.insert(format!("{}_packed", prefix), pt); }
-                                if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { target_map.insert(format!("{}_scales", prefix), st); }
-                                if prefix == "k" {
-                                    if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { target_map.insert("k_shape".to_string(), sh); }
+                        let _ = process_tensor(layer.k, "k", &mut map);
+                        let _ = process_tensor(layer.v, "v", &mut map);
+                        if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
+                            map.insert("mode".to_string(), mode_tensor);
+                        }
+
+                        let _ = io_tx.blocking_send(SaveTask { slot_id, path, tensors: map });
+                    }
+                }
+                SlotTask::Load(load) => {
+                    // [STEP-5] SSD -> Shared Block Loading
+                    let filename = match &load.kv_name {
+                        Some(name) => format!("layer_{}_kv.safetensors", name),
+                        None => format!("layer_{}_kv.safetensors", load.layer_idx),
+                    };
+                    let path = load.path.join(filename);
+                    if path.exists() {
+                        if let Ok(content) = std::fs::read(&path) {
+                            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                let mut inner = load.shared_block.inner.write().unwrap();
+                                
+                                let extract_vec = |name: &str| -> Option<Vec<f32>> {
+                                    st.tensor(name).ok().map(|v| unsafe {
+                                        std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
+                                    })
+                                };
+
+                                if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
+                                    if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
+                                        
+                                        let original_shape = if let Ok(view) = st.tensor("k_shape") {
+                                            let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
+                                            shape_u32.iter().map(|&x| x as usize).collect()
+                                        } else { vec![1, 8, inner.len, 128] };
+
+                                        inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata {
+                                            k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (inner.len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
+                                            k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], inner.len, 1), &Device::Cpu).unwrap(),
+                                            v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (inner.len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
+                                            v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], inner.len, 1), &Device::Cpu).unwrap(),
+                                            original_shape,
+                                        });
+                                        inner.location = KVLocation::RAM; 
+                                        println!("[SLOT-WORKER] Block {} loaded into RAM.", inner.index);
+                                    }
                                 }
                             }
                         }
                     }
-                };
-
-                let _ = process_tensor(layer.k, "k", &mut map);
-                let _ = process_tensor(layer.v, "v", &mut map);
-                if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
-                    map.insert("mode".to_string(), mode_tensor);
+                    if load.shared_block.inner.read().unwrap().location == KVLocation::Loading {
+                        load.shared_block.inner.write().unwrap().location = KVLocation::SSD;
+                    }
+                    SLOT_MANAGER.release_slot(load.slot_id); 
                 }
-
-                // 압축 완료된 맵을 IO 워커로 전송 (논블로킹)
-                let _ = io_tx.blocking_send(SaveTask { slot_id, path, tensors: map });
             }
         }
     });
@@ -324,7 +410,7 @@ impl Qwen3VLGenerateModel {
         hard_token_limit: Option<usize>,
         force_text_only: bool,
         baking_only: bool,
-        is_disk_swap: bool,
+        _is_disk_swap: bool,
         kv_root: std::path::PathBuf,
     ) -> Result<Self> {
         let path = if let Some(stripped) = path.strip_prefix(r"\\?\") { stripped } else { path };
@@ -499,7 +585,7 @@ impl Qwen3VLGenerateModel {
 
             // 2. [HANDOFF] 슬롯 확보 및 VRAM -> RAM 전송
             if let Some(sid) = &session_id {
-                let slot_id = SLOT_MANAGER.acquire_slot().await;
+                let slot_id = SLOT_MANAGER.acquire_write_slot().await;
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
 
@@ -522,14 +608,14 @@ impl Qwen3VLGenerateModel {
                 }).await;
 
                 // 워커에게 전달
-                if let Some(tx) = BAKE_TX.lock().await.as_ref() {
-                    let _ = tx.send(BakeTask {
+                if let Some(tx) = SLOT_TX.lock().await.as_ref() {
+                    let _ = tx.send(SlotTask::Bake(BakeTask {
                         slot_id,
                         task_dir: path,
                         kv_name: kv_name.clone(),
                         offset: end, // 끝 지점을 오프셋으로 사용
                         layers: layer_dumps,
-                    }).await;
+                    })).await;
                 }
             }
 
@@ -642,7 +728,7 @@ impl Qwen3VLGenerateModel {
             if seqlen_offset % 1024 == 0 {
                 if let Some(sid) = &session_id {
                     // [HANDOFF] Use slot manager for checkpointing
-                    let slot_id = SLOT_MANAGER.acquire_slot().await;
+                    let slot_id = SLOT_MANAGER.acquire_write_slot().await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     if !path.exists() { let _ = fs::create_dir_all(&path); }
 
@@ -652,10 +738,10 @@ impl Qwen3VLGenerateModel {
                         layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
                     }
                     
-                    if let Some(tx) = BAKE_TX.lock().await.as_ref() {
-                        let _ = tx.send(BakeTask {
+                    if let Some(tx) = SLOT_TX.lock().await.as_ref() {
+                        let _ = tx.send(SlotTask::Bake(BakeTask {
                             slot_id, task_dir: path, kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
-                        }).await;
+                        })).await;
                     }
                     println!("[GEN-PREFILL] Checkpoint Slot {} at {}", slot_id, seqlen_offset);
                 }
@@ -681,7 +767,7 @@ impl Qwen3VLGenerateModel {
             
             // [WINDOW-BAKE] Trigger dump every 512 tokens
             if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
-                let slot_id = SLOT_MANAGER.acquire_slot().await;
+                let slot_id = SLOT_MANAGER.acquire_write_slot().await;
                 println!("[WINDOW-BAKE] {} boundary hit. Offloading block to Slot {}.", seqlen_offset, slot_id);
                 
                 let (ks, vs) = self.get_current_kv();
@@ -696,14 +782,14 @@ impl Qwen3VLGenerateModel {
                 }
                 
                 if !layer_dumps.is_empty() {
-                    if let Some(tx) = BAKE_TX.blocking_lock().as_ref() {
-                        let _ = tx.send(BakeTask {
+                    if let Some(tx) = SLOT_TX.lock().await.as_ref() {
+                        let _ = tx.send(SlotTask::Bake(BakeTask {
                             slot_id,
                             task_dir: task_dir_base.clone(),
                             kv_name: kv_name.clone().or_else(|| Some("default".to_string())),
                             offset: seqlen_offset - bake_block_size,
                             layers: layer_dumps,
-                        }).await;
+                        })).await;
                     }
                     
                     // [SLIDING-WINDOW-PURGE] 
@@ -733,17 +819,17 @@ impl Qwen3VLGenerateModel {
             // [INFERENCE-SAVE] Periodic Checkpointing
             if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
                 if let Some(sid) = &session_id {
-                    let slot_id = SLOT_MANAGER.acquire_slot().await;
+                    let slot_id = SLOT_MANAGER.acquire_write_slot().await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     let (ks, vs) = self.get_current_kv();
                     let mut layer_dumps = Vec::new();
                     for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
                         layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
                     }
-                    if let Some(tx) = BAKE_TX.lock().await.as_ref() {
-                        let _ = tx.send(BakeTask {
+                    if let Some(tx) = SLOT_TX.lock().await.as_ref() {
+                        let _ = tx.send(SlotTask::Bake(BakeTask {
                             slot_id, task_dir: path.clone(), kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
-                        }).await;
+                        })).await;
                     }
                     let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
                     let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
@@ -772,7 +858,8 @@ impl Qwen3VLGenerateModel {
                     let mut layer_k = Vec::new();
                     let mut layer_v = Vec::new();
                     for b in &l.self_attn.kv_blocks {
-                        if let (Some(k), Some(v)) = (&b.k_cache, &b.v_cache) {
+                        let inner = b.inner.read().unwrap();
+                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                             layer_k.push(k.clone());
                             layer_v.push(v.clone());
                         }
@@ -789,7 +876,8 @@ impl Qwen3VLGenerateModel {
                     let mut layer_k = Vec::new();
                     let mut layer_v = Vec::new();
                     for b in &l.self_attn.kv_blocks {
-                        if let (Some(k), Some(v)) = (&b.k_cache, &b.v_cache) {
+                        let inner = b.inner.read().unwrap();
+                        if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                             layer_k.push(k.clone());
                             layer_v.push(v.clone());
                         }

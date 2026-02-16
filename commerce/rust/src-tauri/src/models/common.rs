@@ -558,7 +558,7 @@ pub fn eager_attention_forward(
     scaling: f64,
 ) -> Result<Tensor> {
     // [FLASH-DECODING] 5만 토큰 이상의 초장문 문맥을 위한 블록 단위 어텐션 최적화
-    let (b_sz, n_heads, q_len, _d_head) = query_states.dims4()?;
+    let (_b_sz, _n_heads, _q_len, _d_head) = query_states.dims4()?;
     let kv_seq_len = key_states.dim(2)?;
     
     // GQA/MQA 그룹 반복
