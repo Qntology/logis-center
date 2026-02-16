@@ -445,8 +445,8 @@ async fn process_task(
 
             use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart, ChatCompletionRequestMessageContentPartText, ChatCompletionRequestMessageContentPartImage, ImageURL};
 
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let mut gen_guard = model_clone.generator.blocking_lock();
+            {
+                let mut gen_guard = model_clone.generator.lock().await;
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
                     
@@ -468,10 +468,9 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
                 }
-                Ok(())
-            }).await??;
+            }
 
             model.save_kv_snapshot(&snapshot_id, kv_name.clone(), 0).await?;
 
@@ -608,8 +607,8 @@ async fn process_task(
             let session_clone = Some(snapshot_id.clone());
             let kv_name_clone = kv_name.clone();
 
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut gen_guard = model_clone.generator.blocking_lock();
+            {
+                let mut gen_guard = model_clone.generator.lock().await;
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
                     let params = crate::openai_types::ChatCompletionParameters {
@@ -619,10 +618,9 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
                 }
-                Ok(())
-            }).await??;
+            }
         } else {
             println!("[Scheduler] Found existing snapshot for Step A. Skipping 0.6B baking.");
         }
@@ -642,7 +640,7 @@ async fn process_task(
 
                         if let Some(gen) = model.generator.lock().await.as_mut() {
                             println!("[Scheduler] 2B Step A: Asking classification question...");
-                            let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone())?;
+                            let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
                             println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                             
                             // [DEBUG] AI 응답 저장
@@ -700,8 +698,8 @@ async fn process_task(
             let session_clone = Some(snapshot_id.clone());
             let kv_name_clone = kv_name.clone();
 
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut gen_guard = model_clone.generator.blocking_lock();
+            {
+                let mut gen_guard = model_clone.generator.lock().await;
                 if let Some(worker) = gen_guard.as_mut() {
                     worker.clear_kv_cache();
                     let params = crate::openai_types::ChatCompletionParameters {
@@ -711,10 +709,9 @@ async fn process_task(
                         })],
                         ..Default::default()
                     };
-                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
+                    worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
                 }
-                Ok(())
-            }).await??;
+            }
         } else {
             println!("[Scheduler] Found existing snapshot for Step B. Skipping 0.6B baking.");
         }
@@ -734,7 +731,7 @@ async fn process_task(
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 2B Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone())?;
+                let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
@@ -851,8 +848,8 @@ async fn process_task(
                 let session_clone = Some(snapshot_id.clone());
                 let kv_name_clone = kv_name.clone();
 
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut gen_guard = model_clone.generator.blocking_lock();
+                {
+                    let mut gen_guard = model_clone.generator.lock().await;
                     if let Some(worker) = gen_guard.as_mut() {
                         worker.clear_kv_cache();
                         let params = crate::openai_types::ChatCompletionParameters {
@@ -862,10 +859,9 @@ async fn process_task(
                             })],
                             ..Default::default()
                         };
-                        worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone)?;
+                        worker.prefill_only(params, Some(token_clone), session_clone, None, kv_name_clone).await?;
                     }
-                    Ok(())
-                }).await??;
+                }
             } else {
                 println!("[Scheduler] Found existing snapshot for Detail Extraction. Skipping 0.6B baking.");
             }
@@ -888,7 +884,7 @@ async fn process_task(
                     println!("[Scheduler] 2B Step C: Asking extraction question...");
                     log_task_progress(app_handle, &task.id, &json!({ "category": "Extraction", "summary": "Running 2B Inference..." }));
                     
-                    let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone())?;
+                    let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
                     println!("[DEBUG-SCHED] Step C Raw Response: '{}'", res);
 
                     // [DEBUG] AI 응답 저장
