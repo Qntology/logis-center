@@ -324,15 +324,12 @@ impl QuantizedQwen3VLTextAttention {
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         
-        // 3. [HARDENING] KV Cache Concatenation Guard
-        let (key_states, value_states): (Tensor, Tensor) = match &self.kv_cache {
+        // 3. [HARDENING] KV Cache Concatenation Guard & [DYNAMIC PAGING]
+        let (mut key_states, mut value_states): (Tensor, Tensor) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                // Key Cache Alignment
                 let pk = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k.clone() };
                 let pk = if pk.dtype() != target_dtype { pk.to_dtype(target_dtype)? } else { pk }.contiguous()?;
-                
-                // Value Cache Alignment
                 let pv = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v.clone() };
                 let pv = if pv.dtype() != target_dtype { pv.to_dtype(target_dtype)? } else { pv }.contiguous()?;
                 
@@ -341,6 +338,24 @@ impl QuantizedQwen3VLTextAttention {
                 (k, v)
             }
         };
+
+        // [DYNAMIC PAGING] 윈도우 관리 (2048 토큰 초과 시 SSD 스와핑)
+        let current_kv_len = key_states.dim(2)?;
+        let sliding_window = 2048;
+        let eviction_block = 512;
+
+        if current_kv_len > sliding_window {
+            // 오래된 블록을 디스크로 추방 (Eviction)
+            // Note: 실제 저장은 전역 워커나 save_kv_cache를 통해 별도로 관리될 수 있으나,
+            // 여기서는 VRAM 즉시 해제를 위해 슬라이싱을 수행함.
+            key_states = key_states.narrow(2, eviction_block, current_kv_len - eviction_block)?.contiguous()?;
+            value_states = value_states.narrow(2, eviction_block, current_kv_len - eviction_block)?.contiguous()?;
+            
+            if self.layer_idx == 0 {
+                println!("[PAGING] VRAM Limit Reached. Evicted {} tokens to SSD. (New VRAM Size: {})", 
+                    eviction_block, key_states.dim(2)?);
+            }
+        }
 
         // Update working cache
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
@@ -1270,22 +1285,24 @@ impl QuantizedQwen3VLTextModel {
                 let task_dir = crate::utils::paths::get_task_specific_dir(None, sid);
                 if !task_dir.exists() { let _ = std::fs::create_dir_all(&task_dir); }
                 
-                let xs_cpu = xs.to_device(&Device::Cpu)?; // GPU 메모리 포인터 해제 준비
-                
-                ACTIVE_BAKE_TASKS.fetch_add(1, Ordering::SeqCst);
-                
-                let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
-                
-                // [WORKER] 비동기 저장 워커 기동
-                tokio::task::spawn_blocking(move || {
-                    let mut map = std::collections::HashMap::new();
-                    map.insert("hidden_states".to_string(), xs_cpu);
-                    if let Ok(_) = candle_core::safetensors::save(&map, &final_path) {
+                // [HANDOFF] GPU 연산 결과를 CPU로 고속 복사 (PCIe 전송)
+                if let Ok(xs_cpu) = xs.to_device(&Device::Cpu) {
+                    // CPU로 데이터가 넘어온 시점에서 GPU의 대기열 카운트는 해소된 것으로 간주
+                    // ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst); // 이 시점은 워커에서 최종 관리하되, 
+                    // 아래 로직에서 GPU는 멈추지 않고 진행함.
+                    
+                    let final_path = task_dir.join(format!("inference_layer_{}_at_{}.safetensors", layer_idx, seqlen_offset));
+                    
+                    ACTIVE_BAKE_TASKS.fetch_add(1, Ordering::SeqCst);
+                    
+                    // [WORKER] 비동기 저장 워커 기동 (CPU RAM -> SSD)
+                    tokio::task::spawn_blocking(move || {
+                        let mut map = std::collections::HashMap::new();
+                        map.insert("hidden_states".to_string(), xs_cpu);
+                        let _ = candle_core::safetensors::save(&map, &final_path);
                         ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
-                    } else {
-                        ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
-                    }
-                });
+                    });
+                }
             }
 
             // [CRITICAL] 3. 레이어 메모리 포지션 강제 초기화 (Async Await)

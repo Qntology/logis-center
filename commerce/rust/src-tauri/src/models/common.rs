@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{D, Device, Tensor};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{
     Activation, BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, LayerNorm, LayerNormConfig,
     Linear, Module, RmsNorm, VarBuilder, batch_norm, conv2d, conv2d_no_bias, layer_norm, linear,
@@ -557,8 +557,11 @@ pub fn eager_attention_forward(
     attention_mask: Option<&Tensor>,
     scaling: f64,
 ) -> Result<Tensor> {
-    // input q shape:(b, num_head, seq_len, dim)
-    // input k/v shape:(b, num_kv_head, seq_len, dim)
+    // [FLASH-DECODING] 5만 토큰 이상의 초장문 문맥을 위한 블록 단위 어텐션 최적화
+    let (b_sz, n_heads, q_len, _d_head) = query_states.dims4()?;
+    let kv_seq_len = key_states.dim(2)?;
+    
+    // GQA/MQA 그룹 반복
     let key_states = match num_key_value_groups {
         Some(g) => repeat_kv(key_states.clone(), g)?.contiguous()?,
         None => key_states.clone(),
@@ -567,51 +570,104 @@ pub fn eager_attention_forward(
         Some(g) => repeat_kv(value_states.clone(), g)?.contiguous()?,
         None => value_states.clone(),
     };
-    let query_states = query_states.contiguous()?;
-    let key_states = key_states.contiguous()?;
-    let value_states = value_states.contiguous()?;
-    let attn_output = {
-        #[cfg(not(feature = "flash-attn"))]
-        {
-            let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
-            let attn_weights = (attn_weights * scaling)?;
-            let attn_weights = match attention_mask {
-                None => attn_weights,
-                Some(mask) => {
-                    // [TRACE] Diagnostic logging
-                    // if attn_weights.dim(0)? == 1 {
-                    //     println!("[TRACE-ATTN] weights: {:?} {:?}, mask: {:?} {:?}", 
-                    //         attn_weights.device(), attn_weights.dtype(), mask.device(), mask.dtype());
-                    // }
-                    // [FIX] Force both to F32 for the mask addition to avoid BF16 CPU errors
-                    let mask_f32 = mask.to_dtype(candle_core::DType::F32)?;
-                    let weights_f32 = attn_weights.to_dtype(candle_core::DType::F32)?;
-                    weights_f32.broadcast_add(&mask_f32)?.to_dtype(attn_weights.dtype())?
-                },
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&value_states)?
-        }
-        #[cfg(feature = "flash-attn")]
-        {
-            // use flash-attn,
-            // flash-attn shape: (bs, seq_len, num_head, head_dim)
-            let query_states = query_states.transpose(1, 2)?;
-            let key_states = key_states.transpose(1, 2)?;
-            let value_states = value_states.transpose(1, 2)?;
-            let attn_output = candle_flash_attn::flash_attn(
-                &query_states,
-                &key_states,
-                &value_states,
-                scaling as f32,
-                attention_mask.is_some(),
-            )?
-            .transpose(1, 2)?;
-            attn_output
-        }
-    };
-    //(b, n_head, seq_len, dim) -> (b, seq_len, n_head, dim)
-    let attn_output = attn_output.transpose(1, 2)?.contiguous()?;
+
+    // 블록 크기 설정 (GPU SM 효율 및 VRAM 고려)
+    let block_size = 4096;
+    
+    // 일반적인 짧은 문장이나 Flash-Attn 지원 시 기존 방식 사용
+    #[cfg(feature = "flash-attn")]
+    {
+        let query_states = query_states.transpose(1, 2)?;
+        let key_states = key_states.transpose(1, 2)?;
+        let value_states = value_states.transpose(1, 2)?;
+        let attn_output = candle_flash_attn::flash_attn(
+            &query_states,
+            &key_states,
+            &value_states,
+            scaling as f32,
+            attention_mask.is_some(),
+        )?
+        .transpose(1, 2)?;
+        return Ok(attn_output.transpose(1, 2)?.contiguous()?);
+    }
+
+    if kv_seq_len <= block_size {
+        let attn_weights = query_states.matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?;
+        let attn_weights = (attn_weights * scaling)?;
+        let attn_weights = match attention_mask {
+            None => attn_weights,
+            Some(mask) => {
+                let mask_f32 = mask.to_dtype(DType::F32)?;
+                let weights_f32 = attn_weights.to_dtype(DType::F32)?;
+                weights_f32.broadcast_add(&mask_f32)?.to_dtype(attn_weights.dtype())?
+            }
+        };
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&value_states)?;
+        return Ok(attn_output.transpose(1, 2)?.contiguous()?);
+    }
+
+    // --- Flash-Decoding 병렬 연산 구간 ---
+    let num_blocks = (kv_seq_len + block_size - 1) / block_size;
+    let mut block_outputs = Vec::with_capacity(num_blocks);
+    let mut block_lse = Vec::with_capacity(num_blocks);
+
+    for i in 0..num_blocks {
+        let start = i * block_size;
+        let end = (start + block_size).min(kv_seq_len);
+        let k_block = key_states.narrow(2, start, end - start)?;
+        let v_block = value_states.narrow(2, start, end - start)?;
+
+        // 로컬 어텐션 스코어 계산
+        let attn_weights = (query_states.matmul(&k_block.transpose(2, 3)?)? * scaling)?;
+        
+        // 마스크 처리
+        let attn_weights = if let Some(mask) = attention_mask {
+            let m_len = mask.dim(D::Minus1)?;
+            if start < m_len {
+                let m_end = end.min(m_len);
+                let sub_mask = mask.narrow(D::Minus1, start, m_end - start)?;
+                let w_f32 = attn_weights.to_dtype(DType::F32)?;
+                let m_f32 = sub_mask.to_dtype(DType::F32)?;
+                w_f32.broadcast_add(&m_f32)?.to_dtype(attn_weights.dtype())?
+            } else {
+                attn_weights
+            }
+        } else {
+            attn_weights
+        };
+
+        // 수치적 안정성을 위한 Max 로짓 추출 및 통합 준비
+        let max_logits = attn_weights.max_keepdim(D::Minus1)?;
+        let exp_weights = attn_weights.broadcast_sub(&max_logits)?.exp()?;
+        let sum_exp = exp_weights.sum_keepdim(D::Minus1)?;
+        
+        let out_block = exp_weights.matmul(&v_block)?;
+        let lse = (sum_exp.log()? + max_logits)?;
+
+        block_outputs.push(out_block);
+        block_lse.push(lse);
+    }
+
+    // 블록 결과 통합 (Merging)
+    let mut final_output = block_outputs[0].clone();
+    let mut max_lse = block_lse[0].clone();
+
+    for i in 1..num_blocks {
+        let lse_i = &block_lse[i];
+        let out_i = &block_outputs[i];
+
+        let new_max_lse = max_lse.broadcast_maximum(lse_i)?;
+        let exp_a = max_lse.broadcast_sub(&new_max_lse)?.exp()?;
+        let exp_b = lse_i.broadcast_sub(&new_max_lse)?.exp()?;
+
+        final_output = (final_output.broadcast_mul(&exp_a)? + out_i.broadcast_mul(&exp_b)?)?;
+        max_lse = new_max_lse;
+    }
+
+    // 최종 정규화 및 차원 복구
+    let final_output = final_output.broadcast_div(&max_lse.exp()?)?;
+    let attn_output = final_output.transpose(1, 2)?.contiguous()?;
 
     Ok(attn_output)
 }

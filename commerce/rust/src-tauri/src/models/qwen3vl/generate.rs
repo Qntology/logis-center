@@ -57,15 +57,30 @@ struct BakeTask {
     layers: Vec<LayerKVDump>,
 }
 
+struct SaveTask {
+    path: PathBuf,
+    tensors: std::collections::HashMap<String, Tensor>,
+}
+
 fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
+    // Phase B: 디스크 I/O 전담 워커 (IO 채널)
+    let (io_tx, mut io_rx) = mpsc::channel::<SaveTask>(50);
+    
     tokio::spawn(async move {
-        println!("[BAKE-WORKER] Background KV storage worker started.");
+        println!("[IO-WORKER] Disk writer started.");
+        while let Some(task) = io_rx.recv().await {
+            let _ = candle_core::safetensors::save(&task.tensors, &task.path);
+            // I/O가 끝나는 시점에 최종적으로 대기열 카운트 감소 (필요시)
+        }
+    });
+
+    // Phase A: CPU 압축 전담 워커
+    tokio::spawn(async move {
+        println!("[BAKE-WORKER] Compression worker started.");
         while let Some(task) = rx.recv().await {
             let task_dir = task.task_dir;
             let kv_name = task.kv_name;
             let offset = task.offset;
-            
-            println!("[BAKE-WORKER] Saving block at offset {}...", offset);
             
             for layer in task.layers {
                 let filename = match (&kv_name, offset) {
@@ -76,12 +91,11 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
                 };
                 let path = task_dir.join(filename);
                 
-                // --- Manual BitKV Compression (Worker Thread) ---
                 let mut map = std::collections::HashMap::new();
-                
                 let process_tensor = |t: Tensor, prefix: &str, target_map: &mut std::collections::HashMap<String, Tensor>| {
                     if let Ok(dims) = t.dims4() {
                         let (b, h, s, d) = dims;
+                        // CPU 멀티코어를 활용하여 빠르게 압축 (BitKV Mode 3)
                         if let Ok(t_f32) = t.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
                             if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
                                 let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
@@ -89,7 +103,6 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
                                 let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
                                 let mut scales = vec![0.0f32; b * h * s];
 
-                                // Bit Packing & Anchors/Scales (Simplified loop for worker)
                                 let head_token_size = s * d;
                                 for bh_idx in 0..(b * h) {
                                     let bh_offset = bh_idx * head_token_size;
@@ -98,7 +111,6 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
                                             packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8);
                                         }
                                     }
-                                    
                                     for token_idx in 0..s {
                                         let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
                                         if token_idx < 4 || token_idx % 8 == 0 {
@@ -129,10 +141,11 @@ fn spawn_bake_worker(mut rx: mpsc::Receiver<BakeTask>) {
                     map.insert("mode".to_string(), mode_tensor);
                 }
 
-                let _ = candle_core::safetensors::save(&map, &path); 
+                // 압축 완료된 맵을 IO 워커로 전송 (논블로킹)
+                let _ = io_tx.blocking_send(SaveTask { path, tensors: map });
             }
         }
-        println!("[BAKE-WORKER] Worker finished.");
+        println!("[BAKE-WORKER] Compression worker finished.");
     });
 }
 
