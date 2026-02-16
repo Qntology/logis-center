@@ -1269,11 +1269,11 @@ impl QuantizedQwen3VLTextModel {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             if layer_idx < start_layer { continue; }
 
-            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (가장 강력한 1개 제한 정책)
+            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (10개 레이어까지 대기열 허용)
             let mut wait_count = 0;
-            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
-                if wait_count == 0 { println!("[MEMORY] 68. 메모리 비워짐 (Strong Purge Active)"); }
-                println!("[MEMORY] {}. 메모리 제거 대기 (L{})...", 69 + wait_count.min(3), layer_idx);
+            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 10 {
+                if wait_count == 0 { println!("[MEMORY] 68. 레이어 대기열 포화 (10개). 일시 정지."); }
+                println!("[MEMORY] {}. 메모리 제거 대기 (L{}, Queue: {})...", 69 + wait_count.min(3), layer_idx, self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst));
                 std::thread::sleep(std::time::Duration::from_millis(30));
                 wait_count += 1;
                 if wait_count > 200 { break; } 

@@ -65,14 +65,16 @@ fn spawn_bake_worker(active_tasks: Arc<std::sync::atomic::AtomicUsize>) -> mpsc:
                 
                 let mut map = std::collections::HashMap::new();
 
-                // --- [Pure 1-bit Compression Logic] ---
+                // --- [BitKV Compression Logic] ---
                 let mut process_kv = |t: Tensor, prefix: &str| -> Result<()> {
                     let dims = t.dims4()?;
                     let (b, h, s, d) = dims;
                     let t_f32 = t.to_dtype(DType::F32)?;
                     let t_data = t_f32.flatten_all()?.to_vec1::<f32>()?;
                     
-                    let mut packed_bits = vec![0u8; (b * h * s * d + 7) / 8];
+                    let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                    let mut anchors = vec![0.0f32; b * h * anchor_count * d];
+                    let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
                     let mut scales = vec![0.0f32; b * h * s];
 
                     let head_token_size = s * d;
@@ -81,20 +83,27 @@ fn spawn_bake_worker(active_tasks: Arc<std::sync::atomic::AtomicUsize>) -> mpsc:
                         for i in 0..head_token_size {
                             if t_data[bh_offset + i] >= 0.0 {
                                 let global_bit_idx = bh_offset + i;
-                                packed_bits[global_bit_idx / 8] |= 1 << (global_bit_idx % 8);
+                                packed_residuals[global_bit_idx / 8] |= 1 << (global_bit_idx % 8);
                             }
                         }
                         
                         for token_idx in 0..s {
                             let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                            let mut abs_sum = 0.0f32;
-                            for &v in token_data { abs_sum += v.abs(); }
-                            scales[bh_idx * s + token_idx] = abs_sum / (d as f32);
+                            
+                            if token_idx < 4 || token_idx % 8 == 0 {
+                                let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                                anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
+                            }
+                            
+                            let mut max_abs = 0.0f32;
+                            for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                            scales[bh_idx * s + token_idx] = max_abs;
                         }
                     }
 
-                    let p_len = packed_bits.len();
-                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(packed_bits, vec![p_len], &Device::Cpu)?);
+                    map.insert(format!("{}_anchors", prefix), Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu)?);
+                    let p_len = packed_residuals.len();
+                    map.insert(format!("{}_packed", prefix), Tensor::from_vec(packed_residuals, vec![p_len], &Device::Cpu)?);
                     map.insert(format!("{}_scales", prefix), Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu)?);
                     
                     if prefix == "k" {
@@ -106,7 +115,8 @@ fn spawn_bake_worker(active_tasks: Arc<std::sync::atomic::AtomicUsize>) -> mpsc:
                 let _ = process_kv(layer.k, "k");
                 let _ = process_kv(layer.v, "v");
                 
-                if let Ok(mode_tensor) = Tensor::from_vec(vec![2u32], (1,), &Device::Cpu) {
+                // Mode 3: BitKV (Compressed)
+                if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
                     map.insert("mode".to_string(), mode_tensor);
                 }
 
@@ -346,7 +356,7 @@ impl Qwen3VLGenerateModel {
     pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
         let token_ids = self.tokenizer.text_encode_vec(text.to_string(), false)?;
         let total_tokens = token_ids.len();
-        let chunk_size = 512;
+        let chunk_size = 2048;
         let mut current_pos = 0;
 
         while current_pos < total_tokens {
@@ -393,43 +403,47 @@ impl Qwen3VLGenerateModel {
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
         let total_tokens = full_input_ids_vec.len();
         
-        // [GRANULAR-BAKING] Use 512 blocks for consistent memory pressure
-        let prefill_chunk_size = 512;
+        // [GRANULAR-BAKING] Use 2048 blocks for consistent memory pressure
+        let prefill_chunk_size = 2048;
         let mut current_pos = self.get_kv_len();
+        
+        // [CLEAN-START] 최초 작업 시작 시 기존 찌꺼기 제거 (강력한 초기화)
+        if current_pos == 0 {
+            if let Some(sid) = &session_id {
+                let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                if path.exists() {
+                    println!("[BAKING] Strong cleaning session directory: {:?}", path);
+                    let _ = std::fs::remove_dir_all(&path);
+                    // Windows에서 파일 삭제 후 핸들이 해제될 때까지 약간의 여유를 줍니다.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let _ = std::fs::create_dir_all(&path);
+            }
+        }
+
         if current_pos > 0 { println!("[RESUME] Resuming from token {}.", current_pos); }
 
         while current_pos < total_tokens {
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { return Err(anyhow!("Cancelled")); } }
             
-            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (Strongest Purge: Threshold 1)
+            // [WAIT-LOGIC] 68-72: 메모리 제거 대기 (상한선을 10개로 완화하여 성능 향상)
             let mut wait_count = 0;
-            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-                if wait_count == 0 { println!("[MEMORY] 68. 메모리 비워짐 (Strongest Purge Active)"); }
-                println!("[MEMORY] {}. 메모리 제거 대기...", 69 + wait_count.min(3));
+            while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) >= 10 {
+                if wait_count == 0 { println!("[MEMORY] 68. 대기열 포화 (10개 초과). 일시 정지."); }
+                println!("[MEMORY] {}. 메모리 제거 대기 (Queue: {})...", 69 + wait_count.min(3), self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst));
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 wait_count += 1;
                 if wait_count > 200 { break; } 
             }
-            if wait_count > 0 { 
-                println!("[MEMORY] 73. 추론 진행 메모리 (Ready)");
-                
-                // [AGGRESSIVE-OS-TRIM] 
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::*;
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-            }
+            if wait_count > 0 { println!("[MEMORY] 73. 추론 진행 메모리 (Ready)"); }
 
             let end = (current_pos + prefill_chunk_size).min(total_tokens);
-            let chunk_end = if end == total_tokens { total_tokens - 1 } else { end };
-            if chunk_end <= current_pos { break; }
-            let chunk_len = chunk_end - current_pos;
-            let chunk = &full_input_ids_vec[current_pos..chunk_end];
+            let chunk_len = end - current_pos;
+            if chunk_len == 0 { break; }
+            let chunk = &full_input_ids_vec[current_pos..end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, chunk_len), &self.text_device)?;
-            let chunk_pos = Tensor::arange(current_pos as u32, chunk_end as u32, &self.text_device)?.unsqueeze(0)?;
-            println!("[BAKING] Step: {} to {} / Total: {}", current_pos, chunk_end, total_tokens);
+            let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
+            println!("[BAKING] Step: {} to {} / Total: {}", current_pos, end, total_tokens);
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
             // [SEGMENT-RESET] Persistent save and system-level memory purge after every chunk
             if let Some(sid) = &session_id {
@@ -447,13 +461,13 @@ impl Qwen3VLGenerateModel {
                 let _ = self.bake_tx.send(BakeTask {
                     task_dir: path,
                     kv_name: kv_name.clone(),
-                    offset: chunk_end,
+                    offset: end,
                     layers: layer_dumps,
                 });
                 self.active_bake_tasks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 
                 // 2. Purge from VRAM (Keep memory lean during heavy prefill)
-                println!("[BAKING] Segment queued. Resetting memory for token {}.", chunk_end);
+                println!("[BAKING] Segment queued. Resetting memory for token {}.", end);
                 let _ = self.qwen3_vl.drop_kv_storage(); 
                 
                 // 3. [CRITICAL-RESET] Force OS to reclaim RAM immediately
@@ -489,14 +503,27 @@ impl Qwen3VLGenerateModel {
                 }
                 if !ka.is_empty() { target.inject_kv_bitkv(&ka, &kp, &ks_, &va, &vp, &vs_, &os)?; }
             }
-            current_pos = chunk_end;
+            current_pos = end;
         }
+        
+        // [CRITICAL-SYNC] 73. 최종 대기: 마지막 조각이 디스크에 쓰여질 때까지 반드시 대기
+        let mut final_wait = 0;
+        while self.active_bake_tasks.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            if final_wait == 0 { println!("[BAKING] Finishing last background tasks..."); }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            final_wait += 1;
+            if final_wait > 100 { break; }
+        }
+        if final_wait > 0 { println!("[BAKING] All segments committed to disk. 73. 추론 진행 메모리 (Ready)"); }
+
         if let Some(sid) = session_id {
             let path = crate::utils::paths::get_kv_dir(None).join(sid);
             if !path.exists() { let _ = fs::create_dir_all(&path); }
-            self.save_kv_to_disk(&path, kv_name.as_deref(), current_pos)?;
             let token_path = path.join("tokens.json");
             if let Ok(file) = fs::File::create(&token_path) { let _ = serde_json::to_writer(file, &full_input_ids_vec); }
+            
+            println!("[BAKING] Full context baked. Purging Small engine memory.");
+            let _ = self.qwen3_vl.drop_kv_storage(); 
         }
         Ok(current_pos)
     }
@@ -577,8 +604,8 @@ impl Qwen3VLGenerateModel {
         let mut local_pos = if seqlen_offset > 0 { if seqlen_offset >= total_tokens { total_tokens.saturating_sub(1) } else { seqlen_offset } } else { 0 };
         
         // [HARD-SWAP-CONFIG] Constant memory usage strategy
-        let window_keep_size = 1024; 
-        let bake_block_size = 256;
+        let window_keep_size = 2048; 
+        let bake_block_size = 2048;
 
         // [PHASE-1: Granular Prefill] Offload prompt chunks immediately to SSD
         while local_pos < total_tokens {
@@ -810,14 +837,13 @@ impl Qwen3VLGenerateModel {
         }
     }
 
-    pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
-        match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
-            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
-            _ => Ok(()),
+        pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
+            match &mut self.qwen3_vl {
+                ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 0, kv_name),    
+                ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 0, kv_name),  
+                _ => Ok(()),
+            }
         }
-    }
-
     pub fn to_device(&mut self, d: &Device) -> Result<()> {
         match &mut self.qwen3_vl {
             ModelVariant::QuantizedVL(m) => m.to_device(d)?,
