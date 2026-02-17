@@ -172,6 +172,9 @@ pub struct MemorySlot {
     pub k_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, // Slave K tensors
     pub v_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, // Slave V tensors
     pub remaining_layers: Arc<std::sync::atomic::AtomicUsize>,
+    pub ready_signal: Arc<tokio::sync::Notify>, // [NEW] Added for async/await synchronization
+    pub lock: Arc<std::sync::Mutex<()>>, // [NEW] Added for Condvar blocking wait
+    pub condvar: Arc<std::sync::Condvar>, // [NEW] Added for signaling
 }
 
 impl MemorySlot {
@@ -188,6 +191,9 @@ impl MemorySlot {
             k_layers,
             v_layers,
             remaining_layers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            ready_signal: Arc::new(tokio::sync::Notify::new()),
+            lock: Arc::new(std::sync::Mutex::new(())),
+            condvar: Arc::new(std::sync::Condvar::new()),
         }
     }
 }
@@ -573,7 +579,7 @@ impl QuantizedQwen3VLTextAttention {
                         
                         tauri::async_runtime::spawn(async move {
                             use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
-                            let slot_id = SLOT_MANAGER.acquire_read_slot().await;
+                            let slot_id = SLOT_MANAGER.acquire_sub_slot().await;
                             if let Ok(tx) = get_worker_channel().await {
                                 let _ = tx.send(SlotTask::Load(LoadTask {
                                     slot_id,
@@ -623,7 +629,7 @@ impl QuantizedQwen3VLTextAttention {
                 }
             };
 
-            // [WAIT-IF-LOADING] Safer wait with async sleep
+            // [WAIT-IF-LOADING] Safer wait with synchronous sleep
             if loc == KVLocation::Loading {
                 let mut attempts = 0;
                 while attempts < 1000 { 
@@ -636,7 +642,7 @@ impl QuantizedQwen3VLTextAttention {
                         }
                     };
                     if l != KVLocation::Loading { break; }
-                    tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    std::thread::sleep(std::time::Duration::from_micros(100));
                     attempts += 1;
                 }
             }
@@ -691,6 +697,7 @@ impl QuantizedQwen3VLTextAttention {
 
                     // [SLOT-POLLING] 워커가 데이터를 채워줄 때까지 대기
                     let mut attempts = 0;
+                    let mut last_loc = KVLocation::SSD;
                     while attempts < 2000 && k.is_none() {
                         // [2D-LOOKUP] Registry와 Block 상태를 동시에 확인
                         let (current_loc, sid) = {
@@ -699,37 +706,45 @@ impl QuantizedQwen3VLTextAttention {
                                 (reg[index].location[self.layer_idx], reg[index].slot_ids[self.layer_idx])
                             } else { (KVLocation::SSD, None) }
                         };
+                        last_loc = current_loc;
 
                         if current_loc == KVLocation::RAM {
                             if let Some(id) = sid {
-                                let slot = &crate::models::qwen3vl::generate::SLOT_MANAGER.slots[id];
-                                if let Ok(k_guard) = slot.k_layers[self.layer_idx].try_lock() {
-                                    if let Some(tk) = k_guard.as_ref() {
-                                        if let Ok(v_guard) = slot.v_layers[self.layer_idx].try_lock() {
-                                            if let Some(tv) = v_guard.as_ref() {
-                                                let tk_dev = tk.to_device(dev)?.to_dtype(target_dtype)?;
-                                                let tv_dev = tv.to_device(dev)?.to_dtype(target_dtype)?;
-                                                
-                                                let mut inner = block.inner.write().unwrap();
-                                                inner.k_cache = Some(tk_dev.clone());
-                                                inner.v_cache = Some(tv_dev.clone());
-                                                inner.location = KVLocation::RAM;
-                                                k = Some(tk_dev);
-                                                v = Some(tv_dev);
-                                                break;
+                                if let Some(slot) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_slot(id) {
+                                    if let Ok(k_guard) = slot.k_layers[self.layer_idx].try_lock() {
+                                        if let Some(tk) = k_guard.as_ref() {
+                                            if let Ok(v_guard) = slot.v_layers[self.layer_idx].try_lock() {
+                                                if let Some(tv) = v_guard.as_ref() {
+                                                    let tk_dev = tk.to_device(dev)?.to_dtype(target_dtype)?;
+                                                    let tv_dev = tv.to_device(dev)?.to_dtype(target_dtype)?;
+                                                    
+                                                    let mut inner = block.inner.write().unwrap();
+                                                    inner.k_cache = Some(tk_dev.clone());
+                                                    inner.v_cache = Some(tv_dev.clone());
+                                                    inner.location = KVLocation::RAM;
+                                                    k = Some(tk_dev);
+                                                    v = Some(tv_dev);
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
+
+                                    // [FIX] Condvar를 사용한 명시적 대기
+                                    let lock_guard = slot.lock.lock().unwrap();
+                                    let _unused = slot.condvar.wait_timeout(lock_guard, std::time::Duration::from_millis(10)).unwrap();
                                 }
                             }
+                        } else {
+                            // SSD/Loading 상태일 때도 잠시 대기
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        
-                        tokio::time::sleep(std::time::Duration::from_micros(200)).await;
                         attempts += 1;
                     }
 
                     if k.is_none() {
-                        println!("[WARNING] Block {} could not be loaded at Layer {}. Using fallback.", index, self.layer_idx);
+                        println!("[ERROR] Block {} at Layer {} failed to load after {}ms. Location: {:?}", 
+                            index, self.layer_idx, attempts, last_loc);
                     }
 
                     let tk = k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
@@ -1110,7 +1125,7 @@ impl QuantizedQwen3VLTextAttention {
         Ok(())
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, _upscale_refill_len: usize, kv_name: Option<&str>) -> Result<usize> {
         // [FIX] 이름표 동기화
         if let Some(name) = kv_name {
             *self.kv_name.write().unwrap() = Some(name.to_string());
@@ -1140,7 +1155,30 @@ impl QuantizedQwen3VLTextAttention {
             }
         }
         
-        if fragments.is_empty() { return Ok(()); }
+        if fragments.is_empty() { 
+            // [RELAY-FALLBACK] If no files found for this layer, but registry exists (from Layer 0),
+            // we must mirror the block structure of Layer 0 to ensure index alignment.
+            if self.layer_idx > 0 {
+                let reg = self.registry.entries.read().unwrap();
+                if !reg.is_empty() {
+                    self.kv_blocks.clear();
+                    for (i, entry) in reg.iter().enumerate() {
+                        let new_block = KVBlock::new(KVLocation::SSD, i, entry.token_len, entry.token_start);
+                        {
+                            let mut inner = new_block.inner.write().unwrap();
+                            // Fallback to the path stored in registry (likely Layer 0's path directory)
+                            inner.ssd_path = entry.ssd_path.clone();
+                        }
+                        self.kv_blocks.push(new_block);
+                    }
+                    // println!("[RELAY-MIRROR] Layer {} mirrored {} blocks from Registry.", self.layer_idx, reg.len());
+                    // Return the mirrored total length
+                    let total_len = reg.last().map(|e| e.token_start + e.token_len).unwrap_or(0);
+                    return Ok(total_len);
+                }
+            }
+            return Ok(0); 
+        }
         fragments.sort_by_key(|f| f.0);
 
         // [CRITICAL] VRAM에 직접 로드하지 않고 SSD 상태의 가상 블록 생성
@@ -1183,8 +1221,8 @@ impl QuantizedQwen3VLTextAttention {
             println!("[VIRTUAL-LOAD] Registered {} SSD blocks (Total: {} tokens). Ready for Round-Robin Relay.", 
                 self.kv_blocks.len(), current_total);
         }
-
-        Ok(())
+        
+        Ok(current_total)
     }
 
                         pub fn offload_kv_cache(&mut self, path: &Path, block_size: usize) -> Result<()> {
@@ -1345,7 +1383,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
         self.self_attn.save_kv_cache(path, true, block_size, None)
     }
 
-    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
+    pub fn load_kv_cache(&mut self, path: &Path, _device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<usize> {
         let device = self.input_layernorm.weight().device();
         self.self_attn.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name)
     }
@@ -1661,10 +1699,14 @@ impl QuantizedQwen3VLTextModel {
         if let Ok(nvml) = Nvml::init() {
             if let Ok(dev) = nvml.device_by_index(0) {
                 if let Ok(mem) = dev.memory_info() {
-                    let current_progress = (seqlen_offset + seq_len).min(total_len);
-                    let (reads, writes, cached, free) = SLOT_MANAGER.get_counts();
-                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, C={}, F={}", 
-                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, cached, free);
+                    let (active_sub, free_sub) = SLOT_MANAGER.get_counts();
+                    let mut active_base = 0;
+                    for s in &SLOT_MANAGER.base_slots {
+                        if s.state.load(std::sync::atomic::Ordering::Relaxed) != 0 { active_base += 1; }
+                    }
+                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Base: {}/28 | Sub: Active={}, Free={}", 
+                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, (seqlen_offset + seq_len).min(total_len), total_len, 
+                        active_base, active_sub, free_sub);
                 }
             }
         }
@@ -1722,12 +1764,13 @@ impl QuantizedQwen3VLTextModel {
             
             if let Some(deepstack_embeds) = deepstack_visual_embeds.as_ref() {
                 if layer_idx < deepstack_embeds.len() {
-                    let m_orig = visual_pos_masks.unwrap();
-                    let e_orig = &deepstack_embeds[layer_idx];
-                    let mask = if !m_orig.device().same_device(xs.device()) { m_orig.to_device(xs.device())? } else { m_orig.clone() };
-                    let embed = if !e_orig.device().same_device(xs.device()) { e_orig.to_device(xs.device())? } else { e_orig.clone() };
-                    let embed = if embed.dtype() != xs.dtype() { embed.to_dtype(xs.dtype())? } else { embed };
-                    xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
+                    if let Some(m_orig) = visual_pos_masks {
+                        let e_orig = &deepstack_embeds[layer_idx];
+                        let mask = if !m_orig.device().same_device(xs.device()) { m_orig.to_device(xs.device())? } else { m_orig.clone() };
+                        let embed = if !e_orig.device().same_device(xs.device()) { e_orig.to_device(xs.device())? } else { e_orig.clone() };
+                        let embed = if embed.dtype() != xs.dtype() { embed.to_dtype(xs.dtype())? } else { embed };
+                        xs = mask_index_add(&xs.squeeze(0)?, &mask.squeeze(0)?, &embed)?.unsqueeze(0)?;
+                    }
                 }
             }
 
@@ -1904,12 +1947,14 @@ impl QuantizedQwen3VLTextModel {
 
     pub fn load_kv_cache(&mut self, path: &Path, device: &Device, expected_len: usize, upscale_refill_len: usize, kv_name: Option<&str>) -> Result<()> {
         if path.exists() {
-            self.layers.iter_mut().try_for_each(|layer| {
-                layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name)
-            })
-        } else {
-            Ok(())
+            let mut loaded_len = 0;
+            for (i, layer) in self.layers.iter_mut().enumerate() {
+                let len = layer.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name)?;
+                if i == 0 { loaded_len = len; }
+            }
+            self.current_kv_len = loaded_len;
         }
+        Ok(())
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
@@ -2199,7 +2244,7 @@ impl QuantizedQwen3VLModel {
         }
         
         // 2. Position IDs calculation (Corrected for Long Context & Vision)
-        let (position_ids, rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
+        let (position_ids, _rope_deltas) = if (cache_position_in.is_some() && cache_position_in.unwrap().i(0)?.to_scalar::<u32>()? == 0) || self.rope_deltas.is_none() {
             let (p_ids, deltas) = self.get_rope_index(&input_ids, image_grid_thw, video_grid_thw, None)?;
             self.rope_deltas = Some(deltas);
             (p_ids, self.rope_deltas.as_ref().unwrap().clone())
