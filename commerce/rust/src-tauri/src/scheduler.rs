@@ -54,12 +54,11 @@ impl TaskDataManager {
 
 impl Drop for TaskDataManager {
     fn drop(&mut self) {
-        println!("[Cleanup] TaskDataManager dropping. Keeping files for debugging: {}", self.task_id);
+        println!("[Cleanup] TaskDataManager dropping. Cleaning up temporary files for: {}", self.task_id);
         for path in &self.created_files {
-            println!("[DEBUG] Persisted file: {:?}", path);
-            // if path.exists() {
-            //     let _ = fs::remove_file(path);
-            // }
+            if path.exists() {
+                let _ = fs::remove_file(path);
+            }
         }
         // KV 캐시는 재사용을 위해 디스크에 유지합니다.
     }
@@ -248,11 +247,21 @@ pub async fn start_background_worker(
                         match process_task(task.clone(), &store, &model, &cancellation_token, &app_handle, current_device_pref.clone()).await {
                             Ok(_) => {
                                 println!("[Scheduler] Task completed: {}", task.id);
+                                
+                                // [NEW] 성공 후에도 메모리를 즉시 해제하여 다음 작업을 위해 초기 상태로 복구
+                                {
+                                    let mut model_lock = model.lock().await;
+                                    if let Some(m) = model_lock.as_ref() {
+                                        m.deep_purge_resources().await;
+                                    }
+                                    // 모델 인스턴스 자체를 None으로 만들어 완전히 초기화 (다음 작업 시 필요하면 다시 로드)
+                                    *model_lock = None;
+                                }
+
                                 let store_guard = store.lock().await;
                                 if let Some(db) = store_guard.as_ref() {
                                     let _ = db.update_task_status(&task.id, crate::logic::parse_status("complete")).await;
                                 }
-                                // [NEW] 성공 시에만 리소스 정리 및 모드 리셋
                                 cleanup_task_resources(&task.id, Some(&app_handle));
                                 current_device_pref = None; 
                             },
