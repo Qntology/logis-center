@@ -24,7 +24,7 @@ use crate::{
         prepare_causal_attention_mask, prod_tensor_last_dim, split_tensor,
     },
 };
-use crate::models::qwen3vl::generate::ACTIVE_BAKE_TASKS;
+use crate::models::qwen3vl::generate::{ACTIVE_BAKE_TASKS, SLOT_MANAGER};
 
 // Local RmsNorm implementation exposing weight and device
 #[derive(Clone, Debug)]
@@ -1673,12 +1673,14 @@ impl QuantizedQwen3VLTextModel {
         
         use nvml_wrapper::Nvml;
         if let Ok(nvml) = Nvml::init() {
-                            if let Ok(dev) = nvml.device_by_index(0) {
-                                if let Ok(mem) = dev.memory_info() {
-                                    let current_progress = (seqlen_offset + seq_len).min(total_len);
-                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{}", mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len);
-                                }
-                            }        }
+                                                            if let Ok(dev) = nvml.device_by_index(0) {
+                                                                if let Ok(mem) = dev.memory_info() {
+                                                                    let current_progress = (seqlen_offset + seq_len).min(total_len);
+                                                                    let (reads, writes, cached, free) = SLOT_MANAGER.get_counts();
+                                                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Slots: R={}, W={}, C={}, F={}", 
+                                                                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len, reads, writes, cached, free);
+                                                                }
+                                                            }        }
 
         let target_device = if self.layers[0].device().is_cuda() { Device::new_cuda(0)? } else { Device::Cpu };
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };

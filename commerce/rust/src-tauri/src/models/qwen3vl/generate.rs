@@ -72,6 +72,7 @@ impl SlotManager {
                     if slot.state.load(Ordering::SeqCst) == 0 { // 0: Free
                         slot.state.store(1, Ordering::SeqCst); // 1: Baking
                         self.active_write_count.fetch_add(1, Ordering::SeqCst);
+                        println!("[SLOT-ACQUIRE] Occupied Write Slot {} for baking.", i);
                         return i;
                     }
                 }
@@ -141,6 +142,23 @@ impl SlotManager {
             self.active_write_count.fetch_sub(1, Ordering::SeqCst);
         }
         self.handoff_notifier.notify_waiters();
+    }
+
+    pub fn get_counts(&self) -> (usize, usize, usize, usize) {
+        let mut writes = 0;
+        let mut reads = 0;
+        let mut cached = 0;
+        let mut free = 0;
+        for slot in &self.slots {
+            match slot.state.load(Ordering::SeqCst) {
+                0 => free += 1,    // Free
+                1 => writes += 1,  // Baking (VRAM -> SSD)
+                2 => cached += 1,  // Ready (RAM Cache)
+                3 => reads += 1,   // Loading (SSD -> VRAM)
+                _ => {}
+            }
+        }
+        (reads, writes, cached, free)
     }
 }
 
