@@ -180,26 +180,48 @@ pub struct KVBlock {
     pub inner: Arc<std::sync::RwLock<KVBlockInner>>,
 }
 
-pub struct KVBlockInner {
+// [NEW] 중앙 집중식 KV 목차의 각 항목 (별도 고정 슬롯 관리용)
+#[derive(Clone)]
+pub struct RegistryEntry {
     pub location: KVLocation,
-    pub index: usize,
+    pub token_start: usize,
+    pub token_len: usize,
+    pub slot_id: Option<usize>, 
+    pub ssd_path: Option<std::path::PathBuf>,
+}
+
+// [NEW] 모델 전체가 공유하는 KV 목차 (Table of Contents)
+#[derive(Clone)]
+pub struct KVRegistry {
+    pub entries: Arc<std::sync::RwLock<Vec<RegistryEntry>>>,
+}
+
+impl KVRegistry {
+    pub fn new() -> Self {
+        Self {
+            entries: Arc::new(std::sync::RwLock::new(Vec::new())),
+        }
+    }
+}
+
+pub struct KVBlockInner {
+    pub index: usize, // RegistryEntry의 인덱스와 매칭 (목차 번호)
     pub k_cache: Option<Tensor>,
     pub v_cache: Option<Tensor>,
-    pub ssd_path: Option<std::path::PathBuf>,
     pub len: usize,
+    pub offset: usize,
     pub bitkv_metadata: Option<BitKVMetadata>,
 }
 
 impl KVBlock {
-    pub fn new(location: KVLocation, index: usize, len: usize) -> Self {
+    pub fn new(index: usize, len: usize, offset: usize) -> Self {
         Self {
             inner: Arc::new(std::sync::RwLock::new(KVBlockInner {
-                location,
                 index,
                 k_cache: None,
                 v_cache: None,
-                ssd_path: None,
                 len,
+                offset,
                 bitkv_metadata: None,
             })),
         }
@@ -230,7 +252,8 @@ pub struct QuantizedQwen3VLTextAttention {
     pub head_dim: usize,
     pub num_kv_groups: usize,
     pub scaling: f64,
-    pub kv_blocks: Vec<KVBlock>, // Changed from Option<(Tensor, Tensor)>
+    pub kv_blocks: Vec<KVBlock>,
+    pub registry: KVRegistry, // [NEW] 중앙 목차 참조
     pub layer_idx: usize,
 }
 
@@ -267,6 +290,7 @@ impl QuantizedQwen3VLTextAttention {
         device: &Device,
         dtype: DType,
         layer_idx: usize,
+        registry: KVRegistry, // [NEW]
     ) -> Result<Self> {
         let _hidden_size = config.hidden_size;
         let head_dim = config.head_dim;
@@ -330,6 +354,7 @@ impl QuantizedQwen3VLTextAttention {
             head_dim,
             scaling,
             kv_blocks: Vec::new(),
+            registry,
             layer_idx,
         })
     }
@@ -407,7 +432,8 @@ impl QuantizedQwen3VLTextAttention {
 
         if !appended {
             let index = self.kv_blocks.len();
-            let new_block = KVBlock::new(KVLocation::VRAM, index, current_chunk_len);
+            let current_total = self.get_kv_len();
+            let new_block = KVBlock::new(KVLocation::VRAM, index, current_chunk_len, current_total);
             {
                 let mut inner = new_block.inner.write().unwrap();
                 inner.k_cache = Some(key_states);
@@ -460,10 +486,25 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         for block in &self.kv_blocks {
-            let (mut k, mut v, b_len, mut loc) = {
+            let (mut k, mut v, b_len, loc) = {
                 let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.location.clone())
             };
+
+            // [WAIT-IF-LOADING] Safer wait with backoff and timeout
+            if loc == KVLocation::Loading {
+                let mut attempts = 0;
+                while attempts < 100 { // Max 100ms wait
+                    let l = block.inner.read().unwrap().location.clone();
+                    if l != KVLocation::Loading { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    attempts += 1;
+                }
+                // If still loading after 100ms, force fallback by treating as SSD
+                if block.inner.read().unwrap().location == KVLocation::Loading {
+                    println!("[TIMEOUT] Block {} loading too slow at Layer {}. Forcing fallback.", block.inner.read().unwrap().index, self.layer_idx);
+                }
+            }
 
             match loc {
                 KVLocation::VRAM => {
@@ -473,13 +514,25 @@ impl QuantizedQwen3VLTextAttention {
                     global_start_idx += b_len;
                     continue;
                 }
-                KVLocation::RAM | KVLocation::SSD | KVLocation::Loading => {
-                    // [FALLBACK-LOAD] If not in RAM, load synchronously to avoid skips or hangs
+                KVLocation::RAM | KVLocation::SSD => {
                     let mut inner = block.inner.write().unwrap();
-                    if inner.location != KVLocation::VRAM && inner.bitkv_metadata.is_none() {
-                        // Attempt synchronous load if prefetch is lagging or not triggered
+                    // [TEMPORAL-REUSE] If already decompressed by a previous layer (e.g. layer 0), use it immediately
+                    if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
+                        k = Some(kc.clone());
+                        v = Some(vc.clone());
+                    } else if let Some(meta) = &inner.bitkv_metadata {
+                        let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
+                        let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
+                        // [PIN] Store for subsequent layers to reuse
+                        inner.k_cache = Some(k_raw.clone());
+                        inner.v_cache = Some(v_raw.clone());
+                        k = Some(k_raw);
+                        v = Some(v_raw);
+                    } else { 
+                        // Fallback load if metadata is missing but path exists
                         if let Some(path) = &inner.ssd_path {
-                            let filename = format!("layer_{}_kv.safetensors", self.layer_idx);
+                            let filename = if inner.offset == 0 { format!("layer_{}_kv.safetensors", self.layer_idx) } 
+                                           else { format!("layer_{}_kv_{}.safetensors", self.layer_idx, inner.offset) };
                             let full_path = path.join(filename);
                             if full_path.exists() {
                                 if let Ok(content) = std::fs::read(&full_path) {
@@ -495,7 +548,6 @@ impl QuantizedQwen3VLTextAttention {
                                                     let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
                                                     shape_u32.iter().map(|&x| x as usize).collect()
                                                 } else { vec![1, 8, b_len, 128] };
-
                                                 inner.bitkv_metadata = Some(BitKVMetadata {
                                                     k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
                                                     k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
@@ -506,6 +558,10 @@ impl QuantizedQwen3VLTextAttention {
                                                     original_shape,
                                                 });
                                                 inner.location = KVLocation::RAM;
+                                                let kr = self.decompress_from_bitkv(&inner.bitkv_metadata.as_ref().unwrap().k_anchors, &inner.bitkv_metadata.as_ref().unwrap().k_packed, &inner.bitkv_metadata.as_ref().unwrap().k_scales, &inner.bitkv_metadata.as_ref().unwrap().original_shape, dev)?;
+                                                let vr = self.decompress_from_bitkv(&inner.bitkv_metadata.as_ref().unwrap().v_anchors, &inner.bitkv_metadata.as_ref().unwrap().v_packed, &inner.bitkv_metadata.as_ref().unwrap().v_scales, &inner.bitkv_metadata.as_ref().unwrap().original_shape, dev)?;
+                                                inner.k_cache = Some(kr.clone()); inner.v_cache = Some(vr.clone());
+                                                k = Some(kr); v = Some(vr);
                                             }
                                         }
                                     }
@@ -513,15 +569,9 @@ impl QuantizedQwen3VLTextAttention {
                             }
                         }
                     }
-                    
-                    if let Some(meta) = &inner.bitkv_metadata {
-                        let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
-                        let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
-                        k = Some(k_raw);
-                        v = Some(v_raw);
-                    } else { 
-                        println!("[WARNING] Block {} could not be loaded. Skipping context!", inner.index);
-                        global_start_idx += b_len; continue; 
+                    if k.is_none() {
+                        println!("[WARNING] Block {} could not be loaded at Layer {}", inner.index, self.layer_idx);
+                        global_start_idx += b_len; continue;
                     }
                 }
                 _ => { global_start_idx += b_len; continue; }
@@ -810,8 +860,9 @@ impl QuantizedQwen3VLTextAttention {
         
         let index = self.kv_blocks.len();
         let len = k_final.dim(2)?;
+        let current_total = self.get_kv_len();
         
-        let new_block = KVBlock::new(KVLocation::VRAM, index, len);
+        let new_block = KVBlock::new(KVLocation::VRAM, index, len, current_total);
         {
             let mut inner = new_block.inner.write().unwrap();
             inner.k_cache = Some(k_final);
@@ -1016,7 +1067,7 @@ impl QuantizedQwen3VLTextAttention {
             let v_final = v.narrow(2, 0, safe_len)?.contiguous()?;
             
             self.kv_blocks.clear();
-            let new_block = KVBlock::new(KVLocation::VRAM, 0, safe_len);
+            let new_block = KVBlock::new(KVLocation::VRAM, 0, safe_len, 0);
             {
                 let mut inner = new_block.inner.write().unwrap();
                 inner.k_cache = Some(k_final);
@@ -1065,7 +1116,8 @@ impl QuantizedQwen3VLTextDecoderLayer {
         device: &Device,
         dtype: DType,
         layer_idx: usize,
-        baking_only: bool, // Use this flag now
+        baking_only: bool,
+        registry: KVRegistry, // [NEW]
     ) -> Result<Self> {
         // Detect GGUF naming convention
         let is_gguf_naming = base_name.starts_with("blk.");
@@ -1076,7 +1128,7 @@ impl QuantizedQwen3VLTextDecoderLayer {
             (format!("{}.self_attn", base_name), "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "input_layernorm", "post_attention_layernorm")
         };
 
-        let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx)?;
+        let self_attn = QuantizedQwen3VLTextAttention::new(config, ct, reader, &attn_base, is_gguf_naming, device, dtype, layer_idx, registry)?;
         
         // [OPTIMIZATION] Skip MLP loading if we only need to bake KV cache (MLP 0% Mode)
         let (mlp_gate, mlp_up, mlp_down, post_attention_layernorm) = if !baking_only {
@@ -1203,11 +1255,12 @@ pub struct QuantizedQwen3VLTextModel {
     pub norm: RmsNorm,
     pub rotary_emb: Qwen3VLTextRotaryEmbedding,
     pub mrope_section: Vec<usize>,
-    pub mmap: Option<Arc<Mmap>>, // Keep mmap alive for tensors
-    pub baking_only: bool, // [NEW] Skip MLP for KV baking
-    pub is_forced_cpu: bool, // [FIX] Prevents rebalancer from uploading back to GPU
+    pub mmap: Option<Arc<Mmap>>, 
+    pub registry: KVRegistry, // [NEW] 모델 전체 공유 목차
+    pub baking_only: bool,
+    pub is_forced_cpu: bool,
     pub active_session_id: Option<String>,
-    pub pinned_layer_count: usize, // [NEW] Keep N layers on GPU
+    pub pinned_layer_count: usize,
     pub current_kv_len: usize,
 }
 
@@ -1318,6 +1371,9 @@ impl QuantizedQwen3VLTextModel {
 
         let num_layers_to_load = if baking_only { 1 } else { final_config.num_hidden_layers };
 
+        // [NEW] 중앙 목차 생성
+        let registry = KVRegistry::new();
+
         let layers: Result<Vec<_>> = pool.install(|| {
             (0..num_layers_to_load).into_par_iter().zip(layer_devices).map(|(layer_idx, layer_device)| {
                 let mut local_cursor = std::io::Cursor::new(mmap);
@@ -1326,7 +1382,7 @@ impl QuantizedQwen3VLTextModel {
                 let gguf_blk = format!("blk.{layer_idx}");
                 let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
                 QuantizedQwen3VLTextDecoderLayer::new(
-                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
+                    final_config, ct, &mut local_cursor, &prefix, &layer_device, layer_dtype, layer_idx, baking_only, registry.clone()
                 )
             }).collect()
         });
@@ -1344,7 +1400,20 @@ impl QuantizedQwen3VLTextModel {
         let rotary_emb = Qwen3VLTextRotaryEmbedding::new(head_dim, config.rope_theta);
         let mrope_section = config.rope_scaling.as_ref().map(|r| r.mrope_section.clone()).unwrap_or_default();
         
-        Ok(Self { embed_tokens, layers, norm, rotary_emb, mrope_section, mmap: mmap_handle, baking_only, is_forced_cpu, active_session_id: None, pinned_layer_count, current_kv_len: 0 })
+        Ok(Self { 
+            embed_tokens, 
+            layers, 
+            norm, 
+            rotary_emb, 
+            mrope_section, 
+            mmap: mmap_handle, 
+            registry, // [NEW]
+            baking_only, 
+            is_forced_cpu, 
+            active_session_id: None, 
+            pinned_layer_count, 
+            current_kv_len: 0 
+        })
     }
     pub fn new<R: std::io::Seek + std::io::Read>(
         config: &Qwen3VLTextConfig,

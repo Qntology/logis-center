@@ -250,11 +250,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 }
                 SlotTask::Load(load) => {
-                    // [STEP-5] SSD -> Shared Block Loading
-                    let filename = match &load.kv_name {
-                        Some(name) => format!("layer_{}_kv.safetensors", name),
-                        None => format!("layer_{}_kv.safetensors", load.layer_idx),
+                    // [STEP-5] SSD -> Shared Block Loading with correct fragment offset
+                    let (offset, index) = {
+                        let inner = load.shared_block.inner.read().unwrap();
+                        (inner.offset, inner.index)
                     };
+                    
+                    let filename = if offset == 0 { 
+                        format!("layer_{}_kv.safetensors", load.layer_idx) 
+                    } else { 
+                        format!("layer_{}_kv_{}.safetensors", load.layer_idx, offset) 
+                    };
+                    
                     let path = load.path.join(filename);
                     if path.exists() {
                         if let Ok(content) = std::fs::read(&path) {
@@ -285,14 +292,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             original_shape,
                                         });
                                         inner.location = KVLocation::RAM; 
-                                        println!("[SLOT-WORKER] Block {} loaded into RAM.", inner.index);
+                                        println!("[SLOT-WORKER] Block {} (Offset {}) loaded into RAM.", index, offset);
                                     }
                                 }
                             }
                         }
                     }
-                    if load.shared_block.inner.read().unwrap().location == KVLocation::Loading {
-                        load.shared_block.inner.write().unwrap().location = KVLocation::SSD;
+                    
+                    // Always transition out of Loading state, even on failure
+                    {
+                        let mut inner = load.shared_block.inner.write().unwrap();
+                        if inner.location == KVLocation::Loading {
+                            inner.location = KVLocation::SSD;
+                        }
                     }
                     SLOT_MANAGER.release_slot(load.slot_id); 
                 }
@@ -602,25 +614,29 @@ impl Qwen3VLGenerateModel {
                 }
 
                 // [HANDOFF] VRAM -> SSD Transition
-                // Instead of clearing all, mark these blocks as SSD and set paths
+                // Sync ALL layers so every layer knows where its context is stored
                 if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
-                    for block in &m.language_model.layers[0].self_attn.kv_blocks {
-                        let mut inner = block.inner.write().unwrap();
-                        if inner.location == KVLocation::VRAM {
-                            inner.location = KVLocation::SSD;
-                            inner.ssd_path = Some(path.clone());
-                            inner.k_cache = None;
-                            inner.v_cache = None;
+                    for layer in &mut m.language_model.layers {
+                        for block in &mut layer.self_attn.kv_blocks {
+                            let mut inner = block.inner.write().unwrap();
+                            if inner.location == KVLocation::VRAM {
+                                inner.location = KVLocation::SSD;
+                                inner.ssd_path = Some(path.clone());
+                                inner.k_cache = None;
+                                inner.v_cache = None;
+                            }
                         }
                     }
                 } else if let ModelVariant::QuantizedVL(ref mut m) = self.qwen3_vl {
-                    for block in &m.language_model.layers[0].self_attn.kv_blocks {
-                        let mut inner = block.inner.write().unwrap();
-                        if inner.location == KVLocation::VRAM {
-                            inner.location = KVLocation::SSD;
-                            inner.ssd_path = Some(path.clone());
-                            inner.k_cache = None;
-                            inner.v_cache = None;
+                    for layer in &mut m.language_model.layers {
+                        for block in &mut layer.self_attn.kv_blocks {
+                            let mut inner = block.inner.write().unwrap();
+                            if inner.location == KVLocation::VRAM {
+                                inner.location = KVLocation::SSD;
+                                inner.ssd_path = Some(path.clone());
+                                inner.k_cache = None;
+                                inner.v_cache = None;
+                            }
                         }
                     }
                 }
@@ -639,6 +655,29 @@ impl Qwen3VLGenerateModel {
                         offset: end,
                         layers: layer_dumps,
                     })).await;
+                }
+
+                // [CLEANUP] Clear temporal VRAM caches used for layer-to-layer reuse
+                if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
+                    for layer in &mut m.language_model.layers {
+                        for block in &mut layer.self_attn.kv_blocks {
+                            let mut inner = block.inner.write().unwrap();
+                            if inner.location == KVLocation::SSD || inner.location == KVLocation::RAM {
+                                inner.k_cache = None;
+                                inner.v_cache = None;
+                            }
+                        }
+                    }
+                } else if let ModelVariant::QuantizedVL(ref mut m) = self.qwen3_vl {
+                    for layer in &mut m.language_model.layers {
+                        for block in &mut layer.self_attn.kv_blocks {
+                            let mut inner = block.inner.write().unwrap();
+                            if inner.location == KVLocation::SSD || inner.location == KVLocation::RAM {
+                                inner.k_cache = None;
+                                inner.v_cache = None;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -855,6 +894,29 @@ impl Qwen3VLGenerateModel {
             }
             seqlen_offset += seq_len;
             pixel_values = None;
+
+            // [CLEANUP] Clear temporal VRAM caches used for layer-to-layer reuse
+            if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
+                for layer in &mut m.language_model.layers {
+                    for block in &mut layer.self_attn.kv_blocks {
+                        let mut inner = block.inner.write().unwrap();
+                        if inner.location == KVLocation::SSD || inner.location == KVLocation::RAM {
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                        }
+                    }
+                }
+            } else if let ModelVariant::QuantizedVL(ref mut m) = self.qwen3_vl {
+                for layer in &mut m.language_model.layers {
+                    for block in &mut layer.self_attn.kv_blocks {
+                        let mut inner = block.inner.write().unwrap();
+                        if inner.location == KVLocation::SSD || inner.location == KVLocation::RAM {
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                        }
+                    }
+                }
+            }
         }
         if let Some(sid) = &session_id { let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json")); }
         Ok(generated_text)
