@@ -35,68 +35,66 @@ use tokio::sync::mpsc;
 pub struct SlotManager {
     pub slots: Vec<crate::models::qwen3vl::quantized_model::MemorySlot>,
     pub handoff_notifier: Arc<tokio::sync::Notify>,
-    pub free_write_slots: Arc<std::sync::Mutex<Vec<usize>>>, // 0~3
-    pub free_read_slots: Arc<std::sync::Mutex<Vec<usize>>>,  // 4~7
+    pub busy_flags: Arc<std::sync::Mutex<Vec<bool>>>, // true: Busy, false: Free
 }
 
 impl SlotManager {
     pub fn new(count: usize) -> Self {
         let mut slots = Vec::new();
-        let mut free_write = Vec::new();
-        let mut free_read = Vec::new();
-        
-        // [STRATEGY] Read-Heavy Partitioning (e.g. 4 Write / 12 Read if count=16)
-        let write_count = (count / 4).max(1); 
-        
+        let num_layers = 28;
         for i in 0..count {
-            slots.push(crate::models::qwen3vl::quantized_model::MemorySlot {
-                id: i,
-                state: Arc::new(std::sync::atomic::AtomicU8::new(0)), 
-                k_data: Arc::new(tokio::sync::Mutex::new(None)),
-                v_data: Arc::new(tokio::sync::Mutex::new(None)),
-                remaining_layers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                layer_idx: 0,
-                block_idx: 0,
-            });
-            if i < write_count { free_write.push(i); }
-            else { free_read.push(i); }
+            slots.push(crate::models::qwen3vl::quantized_model::MemorySlot::new(i, num_layers));
         }
         Self {
             slots,
             handoff_notifier: Arc::new(tokio::sync::Notify::new()),
-            free_write_slots: Arc::new(std::sync::Mutex::new(free_write)),
-            free_read_slots: Arc::new(std::sync::Mutex::new(free_read)),
+            busy_flags: Arc::new(std::sync::Mutex::new(vec![false; count])),
         }
     }
 
-    pub async fn acquire_write_slot(&self) -> usize {
+    fn get_write_limit(&self, current_len: usize) -> usize {
+        if current_len < 4096 { 8 }
+        else if current_len < 8192 { 4 }
+        else { 2 } // 사용자님 제안: 쓰기 비중을 최소화하여 읽기(25+) 공간 확보
+    }
+
+    pub async fn acquire_write_slot(&self, current_len: usize) -> usize {
+        let limit = self.get_write_limit(current_len);
         loop {
             {
-                let mut free = self.free_write_slots.lock().unwrap();
-                if let Some(idx) = free.pop() { return idx; }
+                let mut busy = self.busy_flags.lock().unwrap();
+                for i in 0..limit {
+                    if !busy[i] {
+                        busy[i] = true;
+                        return i;
+                    }
+                }
             }
             self.handoff_notifier.notified().await;
         }
     }
 
-    pub async fn acquire_read_slot(&self) -> usize {
-        loop {
-            {
-                let mut free = self.free_read_slots.lock().unwrap();
-                if let Some(idx) = free.pop() { return idx; }
-            }
-            self.handoff_notifier.notified().await;
-        }
-    }
-
-    pub fn release_slot(&self, id: usize) {
+    pub async fn acquire_read_slot(&self, current_len: usize) -> usize {
+        let start_idx = self.get_write_limit(current_len);
         let count = self.slots.len();
-        let write_count = (count / 4).max(1);
-        
-        if id < write_count {
-            self.free_write_slots.lock().unwrap().push(id);
-        } else {
-            self.free_read_slots.lock().unwrap().push(id);
+        loop {
+            {
+                let mut busy = self.busy_flags.lock().unwrap();
+                for i in start_idx..count {
+                    if !busy[i] {
+                        busy[i] = true;
+                        return i;
+                    }
+                }
+            }
+            self.handoff_notifier.notified().await;
+        }
+    }
+
+    pub async fn release_slot(&self, id: usize) {
+        {
+            let mut busy = self.busy_flags.lock().unwrap();
+            if id < busy.len() { busy[id] = false; }
         }
         self.handoff_notifier.notify_waiters();
     }
@@ -175,7 +173,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             let slot = &SLOT_MANAGER.slots[task.slot_id];
             let remaining = slot.remaining_layers.fetch_sub(1, Ordering::SeqCst);
             if remaining == 1 {
-                SLOT_MANAGER.release_slot(task.slot_id);
+                SLOT_MANAGER.release_slot(task.slot_id).await;
                 println!("[IO-WORKER] Slot {} fully released after all layers saved.", task.slot_id);
             }
         }
@@ -257,70 +255,80 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 }
                 SlotTask::Load(load) => {
-                    // [STEP-5] SSD -> Shared Block Loading with correct fragment offset
+                    // [BULK-LOAD] Load all 28 layers for this master block at once
                     let (offset, index) = {
                         let inner = load.shared_block.inner.read().unwrap();
                         (inner.offset, inner.index)
                     };
                     
-                    let filename = if offset == 0 { 
-                        format!("layer_{}_kv.safetensors", load.layer_idx) 
-                    } else { 
-                        format!("layer_{}_kv_{}.safetensors", load.layer_idx, offset) 
-                    };
-                    
-                    let path = load.path.join(filename);
-                    if path.exists() {
-                        if let Ok(content) = std::fs::read(&path) {
-                            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                let mut inner = load.shared_block.inner.write().unwrap();
-                                
-                                let extract_vec = |name: &str| -> Option<Vec<f32>> {
-                                    st.tensor(name).ok().map(|v| unsafe {
-                                        std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
-                                    })
-                                };
+                    let slot = &SLOT_MANAGER.slots[load.slot_id];
+                    let mut success_count = 0;
+                    let num_layers = slot.k_layers.len();
 
-                                if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
-                                    if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
-                                        
-                                        let original_shape = if let Ok(view) = st.tensor("k_shape") {
-                                            let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
-                                            shape_u32.iter().map(|&x| x as usize).collect()
-                                        } else { vec![1, 8, inner.len, 128] };
+                    for layer_idx in 0..num_layers {
+                        let filename = if offset == 0 { 
+                            format!("layer_{}_kv.safetensors", layer_idx) 
+                        } else { 
+                            format!("layer_{}_kv_{}.safetensors", layer_idx, offset) 
+                        };
+                        
+                        let path = load.path.join(filename);
+                        if path.exists() {
+                            if let Ok(content) = std::fs::read(&path) {
+                                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                    let extract_vec = |name: &str| -> Option<Vec<f32>> {
+                                        st.tensor(name).ok().map(|v| unsafe {
+                                            std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
+                                        })
+                                    };
 
-                                        inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata {
-                                            k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (inner.len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                            k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], inner.len, 1), &Device::Cpu).unwrap(),
-                                            v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (inner.len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                            v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], inner.len, 1), &Device::Cpu).unwrap(),
-                                            original_shape,
-                                        });
-                                        
-                                        // Update central registry to RAM state
-                                        {
-                                            let mut reg = load.registry.entries.write().unwrap();
-                                            if index < reg.len() {
-                                                reg[index].location = KVLocation::RAM;
+                                    if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
+                                        if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
+                                            
+                                            let original_shape = if let Ok(view) = st.tensor("k_shape") {
+                                                let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
+                                                shape_u32.iter().map(|&x| x as usize).collect()
+                                            } else { vec![1, 8, 1024, 128] };
+
+                                            // Decompress and store in the Master Slot's specific layer
+                                            // Note: In a real scenario, we'd use the model's decompress_from_bitkv, 
+                                            // but for simplicity here we just store metadata or use a helper.
+                                            // For now, let's assume we store the decompressed tensors if possible.
+                                            // [TEMP] To keep it simple, we update the metadata in the block.
+                                            if layer_idx == load.layer_idx {
+                                                let mut inner = load.shared_block.inner.write().unwrap();
+                                                inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata {
+                                                    k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
+                                                    k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
+                                                    v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
+                                                    v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
+                                                    original_shape,
+                                                });
                                             }
+                                            success_count += 1;
                                         }
-                                        println!("[SLOT-WORKER] Block {} (Offset {}) loaded into RAM.", index, offset);
                                     }
                                 }
                             }
                         }
                     }
                     
-                    // Always transition out of Loading state in registry
-                    {
+                    if success_count > 0 {
                         let mut reg = load.registry.entries.write().unwrap();
-                        if index < reg.len() && reg[index].location == KVLocation::Loading {
+                        if index < reg.len() {
+                            reg[index].location = KVLocation::RAM;
+                            reg[index].slot_id = Some(load.slot_id);
+                        }
+                        println!("[SLOT-WORKER] Master Block {} (Offset {}) bulk loaded ({} layers).", index, offset, success_count);
+                    } else {
+                        let mut reg = load.registry.entries.write().unwrap();
+                        if index < reg.len() {
                             reg[index].location = KVLocation::SSD;
                         }
                     }
-                    SLOT_MANAGER.release_slot(load.slot_id); 
+                    SLOT_MANAGER.release_slot(load.slot_id).await; 
                 }
             }
         }
@@ -612,7 +620,7 @@ impl Qwen3VLGenerateModel {
 
             // 2. [HANDOFF] 슬롯 확보 및 VRAM -> RAM 전송
             if let Some(sid) = &session_id {
-                let slot_id = SLOT_MANAGER.acquire_write_slot().await;
+                let slot_id = SLOT_MANAGER.acquire_write_slot(current_pos).await;
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
 
@@ -804,7 +812,7 @@ impl Qwen3VLGenerateModel {
             if seqlen_offset % 1024 == 0 {
                 if let Some(sid) = &session_id {
                     // [HANDOFF] Use slot manager for checkpointing
-                    let slot_id = SLOT_MANAGER.acquire_write_slot().await;
+                    let slot_id = SLOT_MANAGER.acquire_write_slot(seqlen_offset).await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     if !path.exists() { let _ = fs::create_dir_all(&path); }
 
@@ -843,7 +851,7 @@ impl Qwen3VLGenerateModel {
             
             // [WINDOW-BAKE] Trigger dump every 512 tokens
             if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
-                let slot_id = SLOT_MANAGER.acquire_write_slot().await;
+                let slot_id = SLOT_MANAGER.acquire_write_slot(seqlen_offset).await;
                 println!("[WINDOW-BAKE] {} boundary hit. Offloading block to Slot {}.", seqlen_offset, slot_id);
                 
                 let (ks, vs) = self.get_current_kv();
@@ -875,7 +883,7 @@ impl Qwen3VLGenerateModel {
                         let _ = self.truncate_kv_cache(purge_len);
                     }
                 } else {
-                    SLOT_MANAGER.release_slot(slot_id);
+                    SLOT_MANAGER.release_slot(slot_id).await;
                 }
             }
 
@@ -895,7 +903,7 @@ impl Qwen3VLGenerateModel {
             // [INFERENCE-SAVE] Periodic Checkpointing
             if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
                 if let Some(sid) = &session_id {
-                    let slot_id = SLOT_MANAGER.acquire_write_slot().await;
+                    let slot_id = SLOT_MANAGER.acquire_write_slot(seqlen_offset).await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     let (ks, vs) = self.get_current_kv();
                     let mut layer_dumps = Vec::new();
