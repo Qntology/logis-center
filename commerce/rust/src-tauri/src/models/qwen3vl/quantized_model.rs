@@ -146,7 +146,7 @@ impl QLinear {
 }
 
 // [QUANTIZED-KV] Storage for 4-bit compressed KV cache in VRAM
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KVLocation {
     VRAM,
     RAM,
@@ -205,21 +205,25 @@ impl KVRegistry {
 }
 
 pub struct KVBlockInner {
-    pub index: usize, // RegistryEntry의 인덱스와 매칭 (목차 번호)
+    pub location: KVLocation,
+    pub index: usize,
     pub k_cache: Option<Tensor>,
     pub v_cache: Option<Tensor>,
+    pub ssd_path: Option<std::path::PathBuf>,
     pub len: usize,
-    pub offset: usize,
+    pub offset: usize, 
     pub bitkv_metadata: Option<BitKVMetadata>,
 }
 
 impl KVBlock {
-    pub fn new(index: usize, len: usize, offset: usize) -> Self {
+    pub fn new(location: KVLocation, index: usize, len: usize, offset: usize) -> Self {
         Self {
             inner: Arc::new(std::sync::RwLock::new(KVBlockInner {
+                location,
                 index,
                 k_cache: None,
                 v_cache: None,
+                ssd_path: None,
                 len,
                 offset,
                 bitkv_metadata: None,
@@ -268,8 +272,15 @@ impl QuantizedQwen3VLTextAttention {
         
         let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         for block in &mut self.kv_blocks {
-            let mut inner = block.inner.write().unwrap();
-            if inner.location == KVLocation::VRAM {
+            let (index, mut inner) = {
+                let inner = block.inner.write().unwrap();
+                (inner.index, inner)
+            };
+            let loc = {
+                let reg = self.registry.entries.read().unwrap();
+                reg[index].location
+            };
+            if loc == KVLocation::VRAM {
                 if let Some(k) = &inner.k_cache {
                     inner.k_cache = Some(k.to_device(device)?.to_dtype(target_dtype)?);
                 }
@@ -439,40 +450,65 @@ impl QuantizedQwen3VLTextAttention {
                 inner.k_cache = Some(key_states);
                 inner.v_cache = Some(value_states);
             }
+            
+            // [REGISTRY-REGISTER] Immediately register this block in the central TOC
+            // This ensures Layer 1-27 will find the entry even if Layer 0 just created it.
+            {
+                let mut reg = self.registry.entries.write().unwrap();
+                if reg.len() <= index {
+                    reg.push(RegistryEntry {
+                        location: KVLocation::VRAM,
+                        token_start: current_total,
+                        token_len: current_chunk_len,
+                        slot_id: None,
+                        ssd_path: None,
+                    });
+                }
+            }
             self.kv_blocks.push(new_block);
         }
 
-        // [PREFETCH-TRIGGER]
-        let blocks_to_prefetch: Vec<_> = self.kv_blocks.iter()
-            .filter(|b| b.inner.read().unwrap().location == KVLocation::SSD)
-            .cloned()
-            .collect();
+        // [PREFETCH-TRIGGER] Only trigger on Layer 0 to avoid 28x redundant SSD requests
+        if self.layer_idx == 0 {
+            let blocks_to_prefetch: Vec<_> = self.kv_blocks.iter()
+                .filter(|b| {
+                    let index = b.inner.read().unwrap().index;
+                    let reg = self.registry.entries.read().unwrap();
+                    reg[index].location == KVLocation::SSD
+                })
+                .cloned()
+                .collect();
 
-        for block in blocks_to_prefetch {
-            let layer_idx = self.layer_idx;
-            // [FIX] Extract path outside the async block to avoid holding Guard across await
-            let path = block.inner.read().unwrap().ssd_path.clone().unwrap_or_default();
-            
-            // Mark as loading
-            {
-                let mut inner = block.inner.write().unwrap();
-                inner.location = KVLocation::Loading;
-            }
-            
-            let shared_block = block.clone();
-            tauri::async_runtime::spawn(async move {
-                use crate::models::qwen3vl::generate::{SLOT_MANAGER, SLOT_TX, SlotTask, LoadTask};
-                let slot_id = SLOT_MANAGER.acquire_read_slot().await;
-                if let Some(tx_lock) = SLOT_TX.lock().await.as_ref() {
-                    let _ = tx_lock.send(SlotTask::Load(LoadTask {
-                        slot_id,
-                        path, // Use the extracted path
-                        layer_idx,
-                        kv_name: None,
-                        shared_block,
-                    })).await;
+            for block in blocks_to_prefetch {
+                let index = block.inner.read().unwrap().index;
+                let path = {
+                    let reg = self.registry.entries.read().unwrap();
+                    reg[index].ssd_path.clone().unwrap_or_default()
+                };
+                
+                // Mark as loading in central registry
+                {
+                    let mut reg = self.registry.entries.write().unwrap();
+                    reg[index].location = KVLocation::Loading;
                 }
-            });
+                
+                let shared_block = block.clone();
+                let registry_clone = self.registry.clone();
+                tauri::async_runtime::spawn(async move {
+                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SLOT_TX, SlotTask, LoadTask};
+                    let slot_id = SLOT_MANAGER.acquire_read_slot().await;
+                    if let Some(tx_lock) = SLOT_TX.lock().await.as_ref() {
+                        let _ = tx_lock.send(SlotTask::Load(LoadTask {
+                            slot_id,
+                            path,
+                            layer_idx: 0,
+                            kv_name: None,
+                            shared_block,
+                            registry: registry_clone,
+                        })).await;
+                    }
+                });
+            }
         }
 
         // 4. [LIGHTWEIGHT-HYBRID-ENGINE]
@@ -486,30 +522,42 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         for block in &self.kv_blocks {
-            let (mut k, mut v, b_len, loc) = {
+            let (mut k, mut v, b_len, index) = {
                 let inner = block.inner.read().unwrap();
-                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.location.clone())
+                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
+            };
+
+            // [REGISTRY-LOOKUP] Get location and path from the central table
+            let (loc, ssd_path) = {
+                let reg = self.registry.entries.read().unwrap();
+                let entry = &reg[index];
+                (entry.location, entry.ssd_path.clone())
             };
 
             // [WAIT-IF-LOADING] Safer wait with backoff and timeout
             if loc == KVLocation::Loading {
                 let mut attempts = 0;
-                while attempts < 100 { // Max 100ms wait
-                    let l = block.inner.read().unwrap().location.clone();
+                while attempts < 100 { 
+                    let l = {
+                        let reg = self.registry.entries.read().unwrap();
+                        reg[index].location
+                    };
                     if l != KVLocation::Loading { break; }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     attempts += 1;
                 }
-                // If still loading after 100ms, force fallback by treating as SSD
-                if block.inner.read().unwrap().location == KVLocation::Loading {
-                    println!("[TIMEOUT] Block {} loading too slow at Layer {}. Forcing fallback.", block.inner.read().unwrap().index, self.layer_idx);
-                }
             }
+
+            // Re-read location after possible wait
+            let loc = {
+                let reg = self.registry.entries.read().unwrap();
+                reg[index].location
+            };
 
             match loc {
                 KVLocation::VRAM => {
-                    vram_ks.push(k.unwrap());
-                    vram_vs.push(v.unwrap());
+                    vram_ks.push(k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
+                    vram_vs.push(v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap()));
                     vram_total_len += b_len;
                     global_start_idx += b_len;
                     continue;
@@ -529,8 +577,11 @@ impl QuantizedQwen3VLTextAttention {
                         k = Some(k_raw);
                         v = Some(v_raw);
                     } else { 
-                        // Fallback load if metadata is missing but path exists
-                        if let Some(path) = &inner.ssd_path {
+                        let spath = {
+                            let reg = self.registry.entries.read().unwrap();
+                            reg[index].ssd_path.clone()
+                        };
+                        if let Some(path) = &spath {
                             let filename = if inner.offset == 0 { format!("layer_{}_kv.safetensors", self.layer_idx) } 
                                            else { format!("layer_{}_kv_{}.safetensors", self.layer_idx, inner.offset) };
                             let full_path = path.join(filename);
@@ -557,7 +608,13 @@ impl QuantizedQwen3VLTextAttention {
                                                     v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], b_len, 1), &Device::Cpu).unwrap(),
                                                     original_shape,
                                                 });
-                                                inner.location = KVLocation::RAM;
+                                                
+                                                // Update registry to RAM state
+                                                {
+                                                    let mut reg = self.registry.entries.write().unwrap();
+                                                    reg[index].location = KVLocation::RAM;
+                                                }
+
                                                 let kr = self.decompress_from_bitkv(&inner.bitkv_metadata.as_ref().unwrap().k_anchors, &inner.bitkv_metadata.as_ref().unwrap().k_packed, &inner.bitkv_metadata.as_ref().unwrap().k_scales, &inner.bitkv_metadata.as_ref().unwrap().original_shape, dev)?;
                                                 let vr = self.decompress_from_bitkv(&inner.bitkv_metadata.as_ref().unwrap().v_anchors, &inner.bitkv_metadata.as_ref().unwrap().v_packed, &inner.bitkv_metadata.as_ref().unwrap().v_scales, &inner.bitkv_metadata.as_ref().unwrap().original_shape, dev)?;
                                                 inner.k_cache = Some(kr.clone()); inner.v_cache = Some(vr.clone());
@@ -570,7 +627,7 @@ impl QuantizedQwen3VLTextAttention {
                         }
                     }
                     if k.is_none() {
-                        println!("[WARNING] Block {} could not be loaded at Layer {}", inner.index, self.layer_idx);
+                        println!("[WARNING] Block {} could not be loaded at Layer {}", index, self.layer_idx);
                         global_start_idx += b_len; continue;
                     }
                 }
@@ -1447,6 +1504,8 @@ impl QuantizedQwen3VLTextModel {
         patched_config.hidden_size = actual_hidden_size;
         let config = &patched_config;
 
+        let registry = KVRegistry::new();
+
         let nvml = Nvml::init().ok();
         let mut current_device = device.clone();
         
@@ -1505,7 +1564,7 @@ impl QuantizedQwen3VLTextModel {
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { standard };
 
             let layer = QuantizedQwen3VLTextDecoderLayer::new(
-                config, ct, reader, &prefix, &layer_device, layer_dtype, layer_idx, baking_only
+                config, ct, reader, &prefix, &layer_device, layer_dtype, layer_idx, baking_only, registry.clone()
             )?;
             layers.push(layer)
         }
@@ -1527,6 +1586,7 @@ impl QuantizedQwen3VLTextModel {
             rotary_emb,
             mrope_section,
             mmap: None,
+            registry,
             baking_only,
             is_forced_cpu,
             active_session_id: None,
