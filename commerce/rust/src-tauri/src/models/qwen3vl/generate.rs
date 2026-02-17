@@ -31,13 +31,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-// [GLOBAL] 슬롯 관리자: 읽기/쓰기 통로 분리 및 대기열 제어
 // [GLOBAL] 슬롯 관리자: 풀(Pool) 기반 유기적 관리
 pub struct SlotManager {
     pub slots: Vec<crate::models::qwen3vl::quantized_model::MemorySlot>,
     pub handoff_notifier: Arc<tokio::sync::Notify>,
     pub active_write_count: Arc<AtomicUsize>,
-    // [NEW] Lock-free status counters
+    pub last_picked_idx: Arc<AtomicUsize>, // [NEW] 로테이션을 위한 인덱스
     pub count_reads: Arc<AtomicUsize>,
     pub count_writes: Arc<AtomicUsize>,
     pub count_cached: Arc<AtomicUsize>,
@@ -55,22 +54,23 @@ impl SlotManager {
             slots,
             handoff_notifier: Arc::new(tokio::sync::Notify::new()),
             active_write_count: Arc::new(AtomicUsize::new(0)),
+            last_picked_idx: Arc::new(AtomicUsize::new(0)),
             count_reads: Arc::new(AtomicUsize::new(0)),
             count_writes: Arc::new(AtomicUsize::new(0)),
             count_cached: Arc::new(AtomicUsize::new(0)),
-            count_free: Arc::new(AtomicUsize::new(count)), // 초기에는 모두 Free
+            count_free: Arc::new(AtomicUsize::new(count)),
         }
     }
 
     // 상태 변경 시 카운터 업데이트 유틸리티
     fn update_counters(&self, old_state: u8, new_state: u8) {
         if old_state == new_state { return; }
-        
+        let dec = |c: &Arc<AtomicUsize>| { c.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1))).ok(); };
         match old_state {
-            0 => { self.count_free.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
-            1 => { self.count_writes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
-            2 => { self.count_cached.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
-            3 => { self.count_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
+            0 => dec(&self.count_free),
+            1 => dec(&self.count_writes),
+            2 => dec(&self.count_cached),
+            3 => dec(&self.count_reads),
             _ => {},
         };
         match new_state {
@@ -82,43 +82,59 @@ impl SlotManager {
         };
     }
 
-    pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
-        let max_writes = self.get_max_concurrent_writes(total_tokens);
-        loop {
-            if self.active_write_count.load(Ordering::SeqCst) < max_writes {
-                for (i, slot) in self.slots.iter().enumerate() {
-                    // 0(Free) -> 1(Baking) 원자적 전환
-                    if slot.state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                        self.update_counters(0, 1);
-                        self.active_write_count.fetch_add(1, Ordering::SeqCst);
-                        println!("[SLOT-ACQUIRE] Occupied Write Slot {} for baking.", i);
-                        return i;
-                    }
-                }
-                // Evict logic: 2(Ready) -> 1(Baking)
-                for (i, slot) in self.slots.iter().enumerate() {
-                    if slot.state.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                        self.prepare_for_reuse(i).await;
-                        self.update_counters(2, 1);
-                        self.active_write_count.fetch_add(1, Ordering::SeqCst);
-                        println!("[SLOT-EVICT] Evicted Slot {} for baking.", i);
-                        return i;
-                    }
-                }
-            }
-            tokio::time::timeout(std::time::Duration::from_millis(50), self.handoff_notifier.notified()).await.ok();
+    pub async fn reset_all_slots(&self) {
+        println!("[SLOT-MANAGER] Force resetting all slots for new stage...");
+        for i in 0..self.slots.len() {
+            self.release_slot(i).await;
         }
     }
 
     pub async fn acquire_read_slot(&self) -> usize {
+        let count = self.slots.len();
         loop {
-            for (i, slot) in self.slots.iter().enumerate() {
-                let current = slot.state.load(Ordering::SeqCst);
-                if current == 0 || current == 2 {
-                    if slot.state.compare_exchange(current, 3, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                        if current == 2 { self.prepare_for_reuse(i).await; }
-                        self.update_counters(current, 3);
-                        return i;
+            let start_idx = self.last_picked_idx.load(Ordering::Relaxed);
+            
+            // 1순위: 로테이션하며 완전히 비어있는(Free) 슬롯 찾기
+            for i in 0..count {
+                let idx = (start_idx + i) % count;
+                let slot = &self.slots[idx];
+                if slot.state.compare_exchange(0, 3, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    self.update_counters(0, 3);
+                    self.last_picked_idx.store((idx + 1) % count, Ordering::Relaxed);
+                    return idx;
+                }
+            }
+
+            // 2순위: 비어있는 게 없다면 이미 캐시된(Ready) 슬롯 중 로테이션하며 찾기
+            for i in 0..count {
+                let idx = (start_idx + i) % count;
+                let slot = &self.slots[idx];
+                if slot.state.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    self.prepare_for_reuse(idx).await;
+                    self.update_counters(2, 3);
+                    self.last_picked_idx.store((idx + 1) % count, Ordering::Relaxed);
+                    return idx;
+                }
+            }
+
+            tokio::time::timeout(std::time::Duration::from_millis(50), self.handoff_notifier.notified()).await.ok();
+        }
+    }
+
+    pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
+        let max_writes = self.get_max_concurrent_writes(total_tokens);
+        let count = self.slots.len();
+        loop {
+            if self.active_write_count.load(Ordering::SeqCst) < max_writes {
+                let start_idx = self.last_picked_idx.load(Ordering::Relaxed);
+                for i in 0..count {
+                    let idx = (start_idx + i) % count;
+                    if self.slots[idx].state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                        self.update_counters(0, 1);
+                        self.active_write_count.fetch_add(1, Ordering::SeqCst);
+                        self.last_picked_idx.store((idx + 1) % count, Ordering::Relaxed);
+                        println!("[SLOT-ACQUIRE] Write Slot {} (Rotation)", idx);
+                        return idx;
                     }
                 }
             }
@@ -128,13 +144,12 @@ impl SlotManager {
 
     pub async fn release_slot(&self, id: usize) {
         if id < self.slots.len() {
-            let slot = &self.slots[id];
-            let prev_state = slot.state.swap(0, Ordering::SeqCst);
-            if prev_state != 0 {
-                self.update_counters(prev_state, 0);
-                if prev_state == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
-                for layer_k in &slot.k_layers { *layer_k.lock().await = None; }
-                for layer_v in &slot.v_layers { *layer_v.lock().await = None; }
+            let prev = self.slots[id].state.swap(0, Ordering::SeqCst);
+            if prev != 0 {
+                self.update_counters(prev, 0);
+                if prev == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
+                for layer_k in &self.slots[id].k_layers { *layer_k.lock().await = None; }
+                for layer_v in &self.slots[id].v_layers { *layer_v.lock().await = None; }
             }
         }
         self.handoff_notifier.notify_waiters();
@@ -149,16 +164,14 @@ impl SlotManager {
 
     // 슬롯 재사용 전 초기화 (내부용)
     async fn prepare_for_reuse(&self, id: usize) {
-        let slot = &self.slots[id];
-        for layer_k in &slot.k_layers { *layer_k.lock().await = None; }
-        for layer_v in &slot.v_layers { *layer_v.lock().await = None; }
+        for layer_k in &self.slots[id].k_layers { *layer_k.lock().await = None; }
+        for layer_v in &self.slots[id].v_layers { *layer_v.lock().await = None; }
     }
 
     pub async fn mark_ready(&self, id: usize) {
         if id < self.slots.len() {
-            let slot = &self.slots[id];
-            let current = slot.state.load(Ordering::SeqCst);
-            if (current == 1 || current == 3) && slot.state.compare_exchange(current, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            let current = self.slots[id].state.load(Ordering::SeqCst);
+            if (current == 1 || current == 3) && self.slots[id].state.compare_exchange(current, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                 self.update_counters(current, 2);
                 if current == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
             }
@@ -167,12 +180,7 @@ impl SlotManager {
     }
 
     pub fn get_counts(&self) -> (usize, usize, usize, usize) {
-        (
-            self.count_reads.load(Ordering::Relaxed),
-            self.count_writes.load(Ordering::Relaxed),
-            self.count_cached.load(Ordering::Relaxed),
-            self.count_free.load(Ordering::Relaxed),
-        )
+        (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_cached.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed))
     }
 }
 
@@ -465,8 +473,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         {
                             let mut reg = load.registry.entries.write().unwrap();
                             if index < reg.len() {
-                                reg[index].location = KVLocation::RAM;
-                                reg[index].slot_id = Some(load.slot_id);
+                                // [2D-UPDATE] 해당 블록의 특정 레이어만 RAM 상태로 변경
+                                reg[index].location[layer_idx] = KVLocation::RAM;
+                                reg[index].slot_ids[layer_idx] = Some(load.slot_id);
                             }
                         }
                         // Note: For layer-wise distribution, we don't hold the slot globally for all layers.
@@ -476,7 +485,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         {
                             let mut reg = load.registry.entries.write().unwrap();
                             if index < reg.len() {
-                                reg[index].location = KVLocation::SSD;
+                                reg[index].location[layer_idx] = KVLocation::SSD;
                             }
                         }
                         SLOT_MANAGER.release_slot(load.slot_id).await;
@@ -744,6 +753,9 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, kv_name: Option<String>) -> Result<usize> {
+        // [STAGE-RESET] 작업 시작 전 슬롯 초기화
+        SLOT_MANAGER.reset_all_slots().await;
+
         let mes_render = self.chat_template.apply_chat_template(&mes)?;
         let input = self.pre_processor.process_info(&mes, &mes_render)?;
         let full_input_ids_vec = self.tokenizer.text_encode_vec(input.replace_text.clone(), false)?;
@@ -796,24 +808,26 @@ impl Qwen3VLGenerateModel {
                         layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
                     }
 
-                    // [HANDOFF] VRAM -> SSD Transition
-                    // Sync ALL layers via central registry so every layer knows where its context is stored
-                    let registry = match self.qwen3_vl {
-                        ModelVariant::QuantizedText(ref m) => Some(m.language_model.registry.clone()),
-                        ModelVariant::QuantizedVL(ref m) => Some(m.language_model.registry.clone()),
-                        _ => None,
-                    };
-
-                    if let Some(reg_obj) = registry {
-                        let mut reg = reg_obj.entries.write().unwrap();
-                        for entry in reg.iter_mut() {
-                            if entry.location == KVLocation::VRAM {
-                                entry.location = KVLocation::SSD;
-                                entry.ssd_path = Some(path.clone());
-                            }
-                        }
-                    }
-
+                                    // [HANDOFF] VRAM -> SSD Transition
+                                    // Sync ALL layers via central registry so every layer knows where its context is stored
+                                    let registry = match self.qwen3_vl {
+                                        ModelVariant::QuantizedText(ref m) => Some(m.language_model.registry.clone()),
+                                        ModelVariant::QuantizedVL(ref m) => Some(m.language_model.registry.clone()),
+                                        _ => None,
+                                    };
+                    
+                                    if let Some(reg_obj) = registry {
+                                        let mut reg = reg_obj.entries.write().unwrap();
+                                        let block_index = self.get_kv_len() / 1024; // Approximate
+                                        if block_index < reg.len() {
+                                            for l_idx in 0..28 {
+                                                if reg[block_index].location[l_idx] == KVLocation::VRAM {
+                                                    reg[block_index].location[l_idx] = KVLocation::SSD;
+                                                    reg[block_index].ssd_path = Some(path.clone());
+                                                }
+                                            }
+                                        }
+                                    }
                     // Also clear physical caches in the blocks
                     self.clear_temporal_kv_caches();
 
@@ -899,6 +913,9 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> Result<String> {
+        // [STAGE-RESET] 작업 시작 전 슬롯 초기화
+        SLOT_MANAGER.reset_all_slots().await;
+
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let top_p = mes.top_p.unwrap_or(0.9) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
@@ -1120,16 +1137,19 @@ impl Qwen3VLGenerateModel {
     pub fn clear_temporal_kv_caches(&mut self) {
         match self.qwen3_vl {
             ModelVariant::QuantizedText(ref mut m) => {
-                for layer in &mut m.language_model.layers {
+                let reg_obj = m.language_model.registry.clone();
+                let reg = reg_obj.entries.read().unwrap();
+                for (layer_idx, layer) in m.language_model.layers.iter_mut().enumerate() {
                     for block in &mut layer.self_attn.kv_blocks {
                         let mut inner = block.inner.write().unwrap();
                         // [OPTIMIZATION] VRAM만 비우고 RAM(Slot)에 있는 데이터는 유지
                         // 이를 통해 'C' 숫자가 쌓이고 SSD 재읽기가 방지됨
                         if inner.location == KVLocation::VRAM {
                             // 이미 SSD나 RAM에 백업된 정보가 있을 때만 VRAM을 비움
-                            let reg_loc = {
-                                let reg = m.language_model.registry.entries.read().unwrap();
-                                if inner.index < reg.len() { reg[inner.index].location } else { KVLocation::VRAM }
+                            let reg_loc = if inner.index < reg.len() { 
+                                reg[inner.index].location[layer_idx] 
+                            } else { 
+                                KVLocation::VRAM 
                             };
                             
                             if reg_loc != KVLocation::VRAM {
@@ -1142,13 +1162,16 @@ impl Qwen3VLGenerateModel {
                 }
             },
             ModelVariant::QuantizedVL(ref mut m) => {
-                for layer in &mut m.language_model.layers {
+                let reg_obj = m.language_model.registry.clone();
+                let reg = reg_obj.entries.read().unwrap();
+                for (layer_idx, layer) in m.language_model.layers.iter_mut().enumerate() {
                     for block in &mut layer.self_attn.kv_blocks {
                         let mut inner = block.inner.write().unwrap();
                         if inner.location == KVLocation::VRAM {
-                            let reg_loc = {
-                                let reg = m.language_model.registry.entries.read().unwrap();
-                                if inner.index < reg.len() { reg[inner.index].location } else { KVLocation::VRAM }
+                            let reg_loc = if inner.index < reg.len() { 
+                                reg[inner.index].location[layer_idx] 
+                            } else { 
+                                KVLocation::VRAM 
                             };
                             
                             if reg_loc != KVLocation::VRAM {
