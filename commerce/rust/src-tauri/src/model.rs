@@ -275,6 +275,10 @@ impl LogisModel {
         }
 
         println!("[MEMORY] Factory Reset Complete. All AI resources released to OS.");
+        
+        // [SIGNAL] 명시적으로 초기화 완료를 알림
+        crate::models::qwen3vl::generate::SLOT_MANAGER.purge_signal.notify_waiters();
+        
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
@@ -298,9 +302,28 @@ impl LogisModel {
                 }
             }
 
-            // 2. Measure VRAM
+            // [NEW] 만약 VRAM이 부족하면, Purge 신호가 올 때까지 대기
             let mut current_free = 0;
             use nvml_wrapper::Nvml;
+            if let Ok(nvml) = Nvml::init() {
+                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
+                    if let Ok(mem) = dev.memory_info() {
+                        current_free = mem.free;
+                    }
+                }
+            }
+
+            if current_free < target_bytes {
+                println!("[VRAM-WATCH] Insufficient VRAM ({:.2} GB). Waiting for Purge signal...", current_free as f64 / 1e9);
+                // 최대 2초간 신호를 기다림
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2), 
+                    crate::models::qwen3vl::generate::SLOT_MANAGER.purge_signal.notified()
+                ).await;
+            }
+
+            // 2. Measure VRAM Again after signal/wait
+            let mut current_free = 0;
             if let Ok(nvml) = Nvml::init() {
                 if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
                     if let Ok(mem) = dev.memory_info() {

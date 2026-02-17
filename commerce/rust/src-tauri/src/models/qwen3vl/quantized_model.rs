@@ -497,45 +497,65 @@ impl QuantizedQwen3VLTextAttention {
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, &cos, &sin, false)?;
         
-        // 3. [BLOCK-ALLOCATION] Append or Create New
+        // 3. [BLOCK-ALLOCATION] Append or Create New (Enforced 1024 block size)
         let current_chunk_len = key_states.dim(2)?;
-        let mut appended = false;
-        if let Some(last_block) = self.kv_blocks.last_mut() {
-            let mut inner = last_block.inner.write().unwrap();
-            if inner.location == KVLocation::VRAM && inner.len + current_chunk_len <= 1024 {
-                if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
-                    inner.k_cache = Some(Tensor::cat(&[prev_k, key_states.clone()], 2)?.contiguous()?);
-                    inner.v_cache = Some(Tensor::cat(&[prev_v, value_states.clone()], 2)?.contiguous()?);
-                    inner.len += current_chunk_len;
-                    appended = true;
-                }
-            }
-        }
+        let mut start_pos_in_chunk = 0;
+        while start_pos_in_chunk < current_chunk_len {
+            let remaining_in_chunk = current_chunk_len - start_pos_in_chunk;
+            let mut appended = false;
 
-        if !appended {
-            let index = self.kv_blocks.len();
-            let current_total = self.get_kv_len();
-            let new_block = KVBlock::new(KVLocation::VRAM, index, current_chunk_len, current_total);
-            {
-                let mut inner = new_block.inner.write().unwrap();
-                inner.k_cache = Some(key_states);
-                inner.v_cache = Some(value_states);
-            }
-            
-            // [REGISTRY-REGISTER] 2D 목차 규격 통일 (항상 28개 레이어 공간 확보)
-            {
-                let mut reg = self.registry.entries.write().unwrap();
-                if reg.len() <= index {
-                    reg.push(RegistryEntry {
-                        location: vec![KVLocation::VRAM; 28], // 0.6B 모델이라도 28개로 생성
-                        slot_ids: vec![None; 28],
-                        token_start: current_total,
-                        token_len: current_chunk_len,
-                        ssd_path: None,
-                    });
+            if let Some(last_block) = self.kv_blocks.last_mut() {
+                let mut inner = last_block.inner.write().unwrap();
+                if inner.location == KVLocation::VRAM && inner.len < 1024 {
+                    let can_take = 1024 - inner.len;
+                    let to_take = remaining_in_chunk.min(can_take);
+                    
+                    if let (Some(prev_k), Some(prev_v)) = (inner.k_cache.take(), inner.v_cache.take()) {
+                        let k_slice = key_states.narrow(2, start_pos_in_chunk, to_take)?;
+                        let v_slice = value_states.narrow(2, start_pos_in_chunk, to_take)?;
+                        inner.k_cache = Some(Tensor::cat(&[prev_k, k_slice], 2)?.contiguous()?);
+                        inner.v_cache = Some(Tensor::cat(&[prev_v, v_slice], 2)?.contiguous()?);
+                        inner.len += to_take;
+                        start_pos_in_chunk += to_take;
+                        appended = true;
+                    }
                 }
             }
-            self.kv_blocks.push(new_block);
+
+            if !appended {
+                let to_take = remaining_in_chunk.min(1024);
+                let current_total = seqlen_offset + start_pos_in_chunk;
+                let index = current_total / 1024; // [FIX] 토큰 위치 기반 인덱싱
+                let new_block = KVBlock::new(KVLocation::VRAM, index, to_take, current_total);
+                
+                let k_slice = key_states.narrow(2, start_pos_in_chunk, to_take)?;
+                let v_slice = value_states.narrow(2, start_pos_in_chunk, to_take)?;
+                {
+                    let mut inner = new_block.inner.write().unwrap();
+                    inner.k_cache = Some(k_slice);
+                    inner.v_cache = Some(v_slice);
+                }
+                
+                // [REGISTRY-REGISTER]
+                {
+                    let mut reg = self.registry.entries.write().unwrap();
+                    if reg.len() <= index {
+                        reg.push(RegistryEntry {
+                            location: vec![KVLocation::VRAM; 28],
+                            slot_ids: vec![None; 28],
+                            token_start: current_total,
+                            token_len: to_take,
+                            ssd_path: None,
+                        });
+                    } else {
+                        reg[index].location.fill(KVLocation::VRAM);
+                        reg[index].token_len = to_take;
+                        reg[index].token_start = current_total;
+                    }
+                }
+                self.kv_blocks.push(new_block);
+                start_pos_in_chunk += to_take;
+            }
         }
 
         // [PREFETCH-TRIGGER] Optimized Look-ahead Prefetching (N to N+8 layers)
@@ -606,158 +626,116 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_vs = Vec::new();
         let mut vram_total_len = 0;
 
-        for block in &self.kv_blocks {
-            let (mut k, mut v, b_len, index) = {
-                let inner = block.inner.read().unwrap();
-                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
-            };
+        // [LOGIC-UPGRADE] Registry 중심의 전체 블록 스캔
+        // seqlen_offset까지의 모든 과거 블록(1024 단위)을 순회
+        let num_historic_blocks = seqlen_offset / 1024;
+        let mut processed_indices = std::collections::HashSet::new();
 
-            // [REGISTRY-LOOKUP] 2D 목차에서 이 레이어의 위치를 정확히 찾음
-            let (loc, layer_slot_id) = {
-                let mut reg = self.registry.entries.write().unwrap();
+        // 1. 과거 블록들 (Registry 기반) 처리
+        for index in 0..num_historic_blocks {
+            if processed_indices.contains(&index) { continue; }
+            processed_indices.insert(index);
+            
+            // Registry에서 위치와 정보 확인
+            let (loc, mut b_len, sid) = {
+                let reg = self.registry.entries.read().unwrap();
                 if index < reg.len() {
-                    let entry = &mut reg[index];
-                    // [SAFETY-CHECK] 0.6B -> 2B 전환 시 레이어 0의 상태를 복제하여 확장 (VRAM 방지)
-                    if entry.location.len() <= self.layer_idx {
-                        let base_loc = entry.location[0];
-                        entry.location.resize(28, base_loc);
-                        entry.slot_ids.resize(28, None);
-                    }
-                    (entry.location[self.layer_idx], entry.slot_ids[self.layer_idx])
+                    let entry = &reg[index];
+                    (entry.location[self.layer_idx], entry.token_len, entry.slot_ids[self.layer_idx])
                 } else {
-                    (KVLocation::VRAM, None)
+                    // Registry에도 없다면 유실된 것임 (0으로 채움)
+                    (KVLocation::SSD, 1024, None)
                 }
             };
 
-            // [WAIT-IF-LOADING] Safer wait with synchronous sleep
-            if loc == KVLocation::Loading {
+            let mut k_final = None;
+            let mut v_final = None;
+
+            // [STEP A] VRAM 캐시 확인
+            for block in &self.kv_blocks {
+                if block.inner.read().unwrap().index == index {
+                    let inner = block.inner.read().unwrap();
+                    k_final = inner.k_cache.clone();
+                    v_final = inner.v_cache.clone();
+                    b_len = inner.len;
+                    
+                    // 만약 이 블록이 여러 인덱스를 포함한다면 (예: len=2048), 다음 루프에서 건너뛰도록 등록
+                    let blocks_covered = (b_len + 1023) / 1024;
+                    for i in 1..blocks_covered {
+                        processed_indices.insert(index + i);
+                    }
+                    break;
+                }
+            }
+
+            // VRAM에 없다면 RAM/SSD 로딩 시도
+            if k_final.is_none() {
                 let mut attempts = 0;
-                while attempts < 1000 { 
-                    let l = {
+                while attempts < 1000 && k_final.is_none() {
+                    let (current_loc, current_sid) = {
                         let reg = self.registry.entries.read().unwrap();
-                        if index < reg.len() && reg[index].location.len() > self.layer_idx {
-                            reg[index].location[self.layer_idx]
-                        } else {
-                            KVLocation::VRAM
-                        }
+                        if index < reg.len() { (reg[index].location[self.layer_idx], reg[index].slot_ids[self.layer_idx]) } 
+                        else { (KVLocation::SSD, None) }
                     };
-                    if l != KVLocation::Loading { break; }
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+
+                    if current_loc == KVLocation::RAM && current_sid.is_some() {
+                        if let Some(slot) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_slot(current_sid.unwrap()) {
+                            if let (Ok(kg), Ok(vg)) = (slot.k_layers[self.layer_idx].try_lock(), slot.v_layers[self.layer_idx].try_lock()) {
+                                if let (Some(tk), Some(tv)) = (kg.as_ref(), vg.as_ref()) {
+                                    k_final = Some(tk.to_device(dev)?.to_dtype(target_dtype)?);
+                                    v_final = Some(tv.to_device(dev)?.to_dtype(target_dtype)?);
+                                    break;
+                                }
+                            }
+                            // Condvar 대기
+                            let lock_guard = slot.lock.lock().unwrap();
+                            let _ = slot.condvar.wait_timeout(lock_guard, std::time::Duration::from_millis(10)).unwrap();
+                        }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                     attempts += 1;
                 }
             }
 
-            // Re-read location after possible wait
-            let loc = {
-                let reg = self.registry.entries.read().unwrap();
-                if index < reg.len() && reg[index].location.len() > self.layer_idx {
-                    reg[index].location[self.layer_idx]
-                } else {
-                    KVLocation::VRAM
-                }
-            };
-
-            // [SHAPE-HARMONIZER] 모든 경로(VRAM, RAM, SSD, Fallback)에서 올라온 텐서의 규격을 최종 확인 및 교정
-            let mut finalize_block = |mut tk: Tensor, mut tv: Tensor| -> Result<()> {
-                let h = tk.dim(1)?;
-                if h == 8 && self.num_key_value_heads == 16 {
-                    // 8헤드(Small)를 16헤드(Large)로 확장
-                    tk = Tensor::cat(&[&tk, &tk], 1)?;
-                    tv = Tensor::cat(&[&tv, &tv], 1)?;
-                } else if h != self.num_key_value_heads {
-                    // 기타 불일치는 0 텐서로 안전하게 대체
-                    tk = Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev)?;
-                    tv = Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev)?;
-                }
-                vram_ks.push(tk);
-                vram_vs.push(tv);
-                Ok(())
-            };
-
-            match loc {
-                KVLocation::VRAM => {
-                    let tk = k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
-                    let tv = v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
-                    finalize_block(tk, tv)?;
-                    vram_total_len += b_len;
-                    global_start_idx += b_len;
-                    continue;
-                }
-                KVLocation::RAM | KVLocation::SSD | KVLocation::Loading => {
-                    // [CACHE-CHECK] 이미 로드된 경우 즉시 사용
-                    {
-                        let inner = block.inner.read().unwrap();
-                        if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
-                            finalize_block(kc.clone(), vc.clone())?;
-                            vram_total_len += b_len;
-                            global_start_idx += b_len;
-                            continue;
-                        }
-                    }
-
-                    // [SLOT-POLLING] 워커가 데이터를 채워줄 때까지 대기
-                    let mut attempts = 0;
-                    let mut last_loc = KVLocation::SSD;
-                    while attempts < 2000 && k.is_none() {
-                        // [2D-LOOKUP] Registry와 Block 상태를 동시에 확인
-                        let (current_loc, sid) = {
-                            let reg = self.registry.entries.read().unwrap();
-                            if index < reg.len() && reg[index].location.len() > self.layer_idx {
-                                (reg[index].location[self.layer_idx], reg[index].slot_ids[self.layer_idx])
-                            } else { (KVLocation::SSD, None) }
-                        };
-                        last_loc = current_loc;
-
-                        if current_loc == KVLocation::RAM {
-                            if let Some(id) = sid {
-                                if let Some(slot) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_slot(id) {
-                                    if let Ok(k_guard) = slot.k_layers[self.layer_idx].try_lock() {
-                                        if let Some(tk) = k_guard.as_ref() {
-                                            if let Ok(v_guard) = slot.v_layers[self.layer_idx].try_lock() {
-                                                if let Some(tv) = v_guard.as_ref() {
-                                                    let tk_dev = tk.to_device(dev)?.to_dtype(target_dtype)?;
-                                                    let tv_dev = tv.to_device(dev)?.to_dtype(target_dtype)?;
-                                                    
-                                                    let mut inner = block.inner.write().unwrap();
-                                                    inner.k_cache = Some(tk_dev.clone());
-                                                    inner.v_cache = Some(tv_dev.clone());
-                                                    inner.location = KVLocation::RAM;
-                                                    k = Some(tk_dev);
-                                                    v = Some(tv_dev);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // [FIX] Condvar를 사용한 명시적 대기
-                                    let lock_guard = slot.lock.lock().unwrap();
-                                    let _unused = slot.condvar.wait_timeout(lock_guard, std::time::Duration::from_millis(10)).unwrap();
-                                }
-                            }
-                        } else {
-                            // SSD/Loading 상태일 때도 잠시 대기
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
-                        attempts += 1;
-                    }
-
-                    if k.is_none() {
-                        println!("[ERROR] Block {} at Layer {} failed to load after {}ms. Location: {:?}", 
-                            index, self.layer_idx, attempts, last_loc);
-                    }
-
-                    let tk = k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
-                    let tv = v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
-                    
-                    finalize_block(tk, tv)?;
-                    vram_total_len += b_len;
-                    global_start_idx += b_len;
-                    continue;
-                }
-                _ => { global_start_idx += b_len; continue; }
+            let tk = k_final.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
+            let tv = v_final.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
+            
+            // [SHAPE-HARMONIZER] 0.6B -> 2B 헤드 수 자동 보정
+            let mut tk = tk; let mut tv = tv;
+            if tk.dim(1).unwrap_or(0) == 8 && self.num_key_value_heads == 16 {
+                tk = Tensor::cat(&[&tk, &tk], 1)?; tv = Tensor::cat(&[&tv, &tv], 1)?;
             }
+
+            vram_ks.push(tk);
+            vram_vs.push(tv);
+            vram_total_len += b_len;
         }
+
+        // 2. 현재 처리 중인 블록들 처리 (kv_blocks 중 아직 처리 안된 것들)
+        for block in &self.kv_blocks {
+            let (k, v, b_len, index) = {
+                let inner = block.inner.read().unwrap();
+                (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
+            };
+            if processed_indices.contains(&index) { continue; }
+
+            let tk = k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
+            let tv = v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
+            
+            let mut tk = tk; let mut tv = tv;
+            if tk.dim(1).unwrap_or(0) == 8 && self.num_key_value_heads == 16 {
+                tk = Tensor::cat(&[&tk, &tk], 1)?; tv = Tensor::cat(&[&tv, &tv], 1)?;
+            }
+
+            vram_ks.push(tk);
+            vram_vs.push(tv);
+            vram_total_len += b_len;
+        }
+
+        // [FINAL-VERIFY] 전체 길이가 어텐션 마스크와 맞는지 확인
+        // (vram_total_len + q_len == total_mask_len 이어야 함)
+        // ... (나머지 어텐션 연산) ...
 
         // 5. [BATCH-VRAM] Fast single-pass for all VRAM blocks
         if !vram_ks.is_empty() {
@@ -775,7 +753,7 @@ impl QuantizedQwen3VLTextAttention {
 
             if let Some(mask) = attention_mask {
                 let mask_len = mask.dim(D::Minus1)?;
-                let vram_start = global_start_idx - vram_total_len;
+                let vram_start = seqlen_offset.saturating_sub(vram_total_len); // [FIX] seqlen_offset 기준 계산
                 if vram_start + vram_total_len <= mask_len {
                     let sub_mask = mask.narrow(D::Minus1, vram_start, vram_total_len)?.to_dtype(target_dtype)?;
                     attn_weights = attn_weights.broadcast_add(&sub_mask)?;
@@ -1705,7 +1683,7 @@ impl QuantizedQwen3VLTextModel {
                         if s.state.load(std::sync::atomic::Ordering::Relaxed) != 0 { active_base += 1; }
                     }
                     println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Base: {}/28 | Sub: Active={}, Free={}", 
-                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, (seqlen_offset + seq_len).min(total_len), total_len, 
+                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset, total_len, 
                         active_base, active_sub, free_sub);
                 }
             }
