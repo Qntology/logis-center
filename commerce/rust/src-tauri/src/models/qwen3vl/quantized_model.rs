@@ -627,29 +627,57 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_total_len = 0;
 
         // [LOGIC-UPGRADE] Registry 중심의 전체 블록 스캔
-        // seqlen_offset까지의 모든 과거 블록(1024 단위)을 순회
         let num_historic_blocks = seqlen_offset / 1024;
         let mut processed_indices = std::collections::HashSet::new();
 
-        // 1. 과거 블록들 (Registry 기반) 처리
+        // 1. [BULK-TRIGGER] 필요한 모든 SSD 블록에 대해 로드 요청을 미리 병렬로 던짐
+        for index in 0..num_historic_blocks {
+            let (loc, sid) = {
+                let reg = self.registry.entries.read().unwrap();
+                if index < reg.len() { (reg[index].location[self.layer_idx], reg[index].slot_ids[self.layer_idx]) }
+                else { (KVLocation::SSD, None) }
+            };
+
+            if loc == KVLocation::SSD {
+                let path = {
+                    let reg = self.registry.entries.read().unwrap();
+                    reg[index].ssd_path.clone().unwrap_or_default()
+                };
+                if !path.as_os_str().is_empty() {
+                    {
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if index < reg.len() { reg[index].location[self.layer_idx] = KVLocation::Loading; }
+                    }
+                    // 해당 인덱스의 실제 블록 객체 찾기
+                    let target_block = self.kv_blocks.iter().find(|b| b.inner.read().unwrap().index == index).cloned()
+                        .unwrap_or_else(|| self.kv_blocks[0].clone());
+                    
+                    let registry_clone = self.registry.clone();
+                    let layer_to_load = self.layer_idx;
+                    let current_kv_name = self.kv_name.read().unwrap().clone();
+                    
+                    tauri::async_runtime::spawn(async move {
+                        use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
+                        let slot_id = SLOT_MANAGER.acquire_sub_slot().await;
+                        if let Ok(tx) = get_worker_channel().await {
+                            let _ = tx.send(SlotTask::Load(LoadTask {
+                                slot_id, path, layer_idx: layer_to_load,
+                                kv_name: current_kv_name, shared_block: target_block, registry: registry_clone,
+                            })).await;
+                        }
+                    });
+                }
+            }
+        }
+
+        // 2. 과거 블록들 (Registry 기반) 처리 및 수집
         for index in 0..num_historic_blocks {
             if processed_indices.contains(&index) { continue; }
             processed_indices.insert(index);
             
-            // Registry에서 위치와 정보 확인
-            let (loc, mut b_len, sid) = {
-                let reg = self.registry.entries.read().unwrap();
-                if index < reg.len() {
-                    let entry = &reg[index];
-                    (entry.location[self.layer_idx], entry.token_len, entry.slot_ids[self.layer_idx])
-                } else {
-                    // Registry에도 없다면 유실된 것임 (0으로 채움)
-                    (KVLocation::SSD, 1024, None)
-                }
-            };
-
             let mut k_final = None;
             let mut v_final = None;
+            let mut b_len = 1024;
 
             // [STEP A] VRAM 캐시 확인
             for block in &self.kv_blocks {
@@ -658,17 +686,13 @@ impl QuantizedQwen3VLTextAttention {
                     k_final = inner.k_cache.clone();
                     v_final = inner.v_cache.clone();
                     b_len = inner.len;
-                    
-                    // 만약 이 블록이 여러 인덱스를 포함한다면 (예: len=2048), 다음 루프에서 건너뛰도록 등록
                     let blocks_covered = (b_len + 1023) / 1024;
-                    for i in 1..blocks_covered {
-                        processed_indices.insert(index + i);
-                    }
+                    for i in 1..blocks_covered { processed_indices.insert(index + i); }
                     break;
                 }
             }
 
-            // VRAM에 없다면 RAM/SSD 로딩 시도
+            // [STEP B] VRAM에 없으면 대기 (이미 위에서 Trigger됨)
             if k_final.is_none() {
                 let mut attempts = 0;
                 while attempts < 1000 && k_final.is_none() {
@@ -679,17 +703,20 @@ impl QuantizedQwen3VLTextAttention {
                     };
 
                     if current_loc == KVLocation::RAM && current_sid.is_some() {
-                        if let Some(slot) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_slot(current_sid.unwrap()) {
-                            if let (Ok(kg), Ok(vg)) = (slot.k_layers[self.layer_idx].try_lock(), slot.v_layers[self.layer_idx].try_lock()) {
+                        let sid = current_sid.unwrap();
+                        if let Some(slot) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_slot(sid) {
+                            // [FIX] 슬롯 용량이 1이므로 0번 인덱스 잠금
+                            if let (Ok(kg), Ok(vg)) = (slot.k_layers[0].try_lock(), slot.v_layers[0].try_lock()) {
                                 if let (Some(tk), Some(tv)) = (kg.as_ref(), vg.as_ref()) {
                                     k_final = Some(tk.to_device(dev)?.to_dtype(target_dtype)?);
                                     v_final = Some(tv.to_device(dev)?.to_dtype(target_dtype)?);
+                                    
+                                    if sid >= 28 { crate::models::qwen3vl::generate::SLOT_MANAGER.sync_release_sub_slot(sid); }
                                     break;
                                 }
                             }
-                            // Condvar 대기
                             let lock_guard = slot.lock.lock().unwrap();
-                            let _ = slot.condvar.wait_timeout(lock_guard, std::time::Duration::from_millis(10)).unwrap();
+                            let _ = slot.condvar.wait_timeout(lock_guard, std::time::Duration::from_millis(5)).unwrap();
                         }
                     } else {
                         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -701,9 +728,9 @@ impl QuantizedQwen3VLTextAttention {
             let tk = k_final.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
             let tv = v_final.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
             
-            // [SHAPE-HARMONIZER] 0.6B -> 2B 헤드 수 자동 보정
+            // [SHAPE-HARMONIZER-1] 0.6B -> 2B 헤드 수 자동 보정
             let mut tk = tk; let mut tv = tv;
-            if tk.dim(1).unwrap_or(0) == 8 && self.num_key_value_heads == 16 {
+            if tk.dim(1)? == 8 && self.num_key_value_heads == 16 {
                 tk = Tensor::cat(&[&tk, &tk], 1)?; tv = Tensor::cat(&[&tv, &tv], 1)?;
             }
 

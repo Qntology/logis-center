@@ -45,15 +45,14 @@ pub struct SlotManager {
 
 impl SlotManager {
     pub fn new() -> Self {
-        // ... (existing initialization)
         let mut base_slots = Vec::new();
         for i in 0..28 {
             base_slots.push(crate::models::qwen3vl::quantized_model::MemorySlot::new(i, 1));
         }
 
         let mut sub_slots = Vec::new();
-        for i in 0..14 {
-            sub_slots.push(crate::models::qwen3vl::quantized_model::MemorySlot::new(28 + i, 28));
+        for i in 0..56 {
+            sub_slots.push(crate::models::qwen3vl::quantized_model::MemorySlot::new(28 + i, 1));
         }
 
         Self {
@@ -104,7 +103,7 @@ impl SlotManager {
         }
     }
 
-    pub async fn release_sub_slot(&self, global_id: usize) {
+    pub fn sync_release_sub_slot(&self, global_id: usize) {
         if global_id >= 28 {
             let idx = global_id - 28;
             if idx < self.sub_slots.len() {
@@ -112,18 +111,20 @@ impl SlotManager {
                 let prev = slot.state.swap(0, Ordering::SeqCst);
                 if prev != 0 {
                     self.sub_active_count.fetch_sub(1, Ordering::SeqCst);
-                    // Clear data
-                    for k in &slot.k_layers { *k.lock().await = None; }
-                    for v in &slot.v_layers { *v.lock().await = None; }
+                    // Clear data pointers efficiently
+                    if let Ok(mut k0) = slot.k_layers[0].try_lock() { *k0 = None; }
+                    if let Ok(mut v0) = slot.v_layers[0].try_lock() { *v0 = None; }
                     slot.ready_signal.notify_waiters();
-                    
-                    // Signal for sync blocking wait
                     let _guard = slot.lock.lock().unwrap();
                     slot.condvar.notify_all();
                 }
             }
             self.handoff_notifier.notify_waiters();
         }
+    }
+
+    pub async fn release_sub_slot(&self, global_id: usize) {
+        self.sync_release_sub_slot(global_id);
     }
     
     pub async fn release_slot(&self, id: usize) {
@@ -214,7 +215,7 @@ impl SlotManager {
 
     pub fn get_counts(&self) -> (usize, usize) {
         let active = self.sub_active_count.load(Ordering::Relaxed);
-        (active, 14 - active)
+        (active, 56 - active)
     }
 }
 
@@ -476,15 +477,43 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     
                     
                     
-                                                                                                    let mut path = load.path.clone();
+                                                                                                                        let mut path = load.path.clone();
                     
                     
                     
-                                                                                                    let mut found = false;
+                                                                                                                        let mut found = false;
                     
                     
                     
-                                                                                                    let mut target_name = String::new();
+                                                                                                                        let mut target_name = String::new();
+                    
+                    
+                    
+                                                                                                                        
+                    
+                    
+                    
+                                                                                                                        // [SLOT-COUNT-LOG] 실시간 슬롯 점유 상태 계산
+                    
+                    
+                    
+                                                                                                                        let (sub_active, _) = SLOT_MANAGER.get_counts();
+                    
+                    
+                    
+                                                                                                                        let mut base_active = 0;
+                    
+                    
+                    
+                                                                                                                        for s in &SLOT_MANAGER.base_slots {
+                    
+                    
+                    
+                                                                                                                            if s.state.load(Ordering::Relaxed) != 0 { base_active += 1; }
+                    
+                    
+                    
+                                                                                                                        }
                     
                     
                     
@@ -492,11 +521,19 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     
                     
                     
-                                                                                                    println!("[IO-READ-DEBUG] Slot {} Layer {} Offset {} checking candidates in {:?}", load.slot_id, layer_idx, offset, load.path);
+                                                                                                                        println!("[IO-READ-DEBUG] Slot {} Layer {} Offset {} | Base: {}/28, Sub: {}/14 | Checking in {:?}", 
                     
                     
                     
-                                                                                                    for (i, cand) in candidates.iter().enumerate() {
+                                                                                                                            load.slot_id, layer_idx, offset, base_active, sub_active, load.path);
+                    
+                    
+                    
+                                                                                                                        
+                    
+                    
+                    
+                                                                                                                        for (i, cand) in candidates.iter().enumerate() {
                     
                     
                     
@@ -581,11 +618,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     if let Ok((k, v)) = dequant_res {
                                         let slot = SLOT_MANAGER.get_slot(load.slot_id).unwrap();
                                         {
-                                            let mut k_guard = slot.k_layers[layer_idx].lock().await;
+                                            // [FIX] 슬롯 용량이 1이므로 무조건 0번 인덱스 사용
+                                            let mut k_guard = slot.k_layers[0].lock().await;
                                             *k_guard = Some(k);
                                         }
                                         {
-                                            let mut v_guard = slot.v_layers[layer_idx].lock().await;
+                                            let mut v_guard = slot.v_layers[0].lock().await;
                                             *v_guard = Some(v);
                                         }
                                         success = true;
@@ -946,41 +984,45 @@ impl Qwen3VLGenerateModel {
                         let current_block_len = (chunk_len - block_offset_in_chunk).min(1024);
                         let global_block_index = (current_pos + block_offset_in_chunk) / 1024;
 
-                        // [BASE-SLOT-UPDATE] 해당 블록의 데이터를 Base Slot에 저장
-                        // (현재 설계상 Base Slot은 레이어당 1개이므로 가장 최신 블록만 RAM 상주)
+                        // [BASE-SLOT-APPEND] 데이터를 Base Slot(4096)에 누적
                         for (l_idx, (k, v)) in ks.iter().zip(vs.iter()).enumerate() {
                             if l_idx < 28 {
                                 let s_len = k.dim(2)?;
-                                // 청크 내에서 해당 블록의 위치를 정확히 잘라냄
                                 let k_slice = k.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
                                 let v_slice = v.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
                                 
                                 let base_slot = SLOT_MANAGER.get_base_slot(l_idx);
-                                *base_slot.k_layers[0].lock().await = Some(k_slice.clone());
-                                *base_slot.v_layers[0].lock().await = Some(v_slice.clone());
+                                let mut k_guard = base_slot.k_layers[0].lock().await;
+                                let mut v_guard = base_slot.v_layers[0].lock().await;
+                                
+                                // 기존 데이터가 있으면 이어 붙임 (최대 4096까지)
+                                let new_k = match k_guard.take() {
+                                    Some(prev) => {
+                                        let combined = Tensor::cat(&[prev, k_slice], 2)?;
+                                        // 4096 넘어가면 앞부분은 SSD에 이미 있을테니 잘라냄 (Rolling Window)
+                                        let c_len = combined.dim(2)?;
+                                        if c_len > 4096 { combined.narrow(2, c_len - 4096, 4096)?.contiguous()? } else { combined }
+                                    },
+                                    None => k_slice
+                                };
+                                let new_v = match v_guard.take() {
+                                    Some(prev) => {
+                                        let combined = Tensor::cat(&[prev, v_slice], 2)?;
+                                        let c_len = combined.dim(2)?;
+                                        if c_len > 4096 { combined.narrow(2, c_len - 4096, 4096)?.contiguous()? } else { combined }
+                                    },
+                                    None => v_slice
+                                };
+                                
+                                *k_guard = Some(new_k);
+                                *v_guard = Some(new_v);
                                 base_slot.state.store(2, Ordering::SeqCst);
                                 base_slot.ready_signal.notify_waiters();
                             }
                         }
 
-                        if let Some(reg_obj) = registry.as_ref() {
-                            let mut reg = reg_obj.entries.write().unwrap();
-                            let entry = RegistryEntry {
-                                location: vec![KVLocation::RAM; 28],
-                                slot_ids: (0..28).map(|i| Some(i)).collect(),
-                                token_start: current_pos + block_offset_in_chunk,
-                                token_len: current_block_len,
-                                ssd_path: Some(path.clone()),
-                            };
-
-                            if reg.len() <= global_block_index {
-                                reg.push(entry);
-                            } else {
-                                reg[global_block_index] = entry;
-                            }
-                        }
-
-                        // [SHUTTLE-START] Sub Slot을 확보하여 SSD로 전송 (각 블록별로 개별 전송)
+                        // [SSD-OFFLOAD-TRIGGER] 1024 단위 블록이 완성될 때마다 Sub Slot을 통해 SSD로 전송
+                        // (이미 Base Slot에 안전하게 복사되었으므로 연산과 병렬 진행 가능)
                         let sub_slot_id = SLOT_MANAGER.acquire_sub_slot().await;
                         let mut layer_dumps = Vec::new();
                         for (l_idx, (k, v)) in ks.iter().zip(vs.iter()).enumerate() {
@@ -1064,9 +1106,8 @@ impl Qwen3VLGenerateModel {
     }
 
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, kv_name: Option<String>) -> Result<String> {
-        // [STAGE-RESET] 작업 시작 전 슬롯 초기화
-        SLOT_MANAGER.reset_all_slots().await;
-
+        // [STAGE-RESET] Removed to preserve baked context from previous steps
+        
         let temperature = mes.temperature.unwrap_or(0.7) as f32;
         let top_p = mes.top_p.unwrap_or(0.9) as f32;
         let seed = mes.seed.unwrap_or(34562) as u64;
