@@ -408,9 +408,11 @@ impl QuantizedQwen3VLTextAttention {
 
         if num_attention_heads != config.num_attention_heads || num_key_value_heads != config.num_key_value_heads {
             if layer_idx == 0 {
-                println!("[MODEL-FIX] Architecture Mismatch Detected. GGUF: {} heads / {} KV heads. Config: {} heads / {} KV heads. Overriding config.",
+                println!("[MODEL-ARCH] GGUF: {}/{} heads. Config: {}/{} heads.",
                     num_attention_heads, num_key_value_heads, config.num_attention_heads, config.num_key_value_heads);
             }
+        } else if layer_idx == 0 {
+            println!("[MODEL-ARCH] Config confirmed: {}/{} heads.", num_attention_heads, num_key_value_heads);
         }
 
         let q_proj = get_qlinear(ct, reader, &format!("{base_name}.{q}"), device, dtype)?;
@@ -767,14 +769,19 @@ impl QuantizedQwen3VLTextAttention {
 
         // 5. [BATCH-VRAM] Fast single-pass for all collected blocks
         if !vram_ks.is_empty() {
-            // [FINAL-SAFETY-GUARD] 모든 텐서의 헤드 수가 일치하는지 최종 확인
+            // [FINAL-SAFETY-GUARD-ENHANCED] 어떤 경로로 왔든 무조건 16헤드로 강제 통일
             let mut finalized_ks = Vec::with_capacity(vram_ks.len());
             let mut finalized_vs = Vec::with_capacity(vram_vs.len());
+            
             for (mut tk, mut tv) in vram_ks.into_iter().zip(vram_vs.into_iter()) {
-                if tk.dim(1)? == 8 && self.num_key_value_heads == 16 {
-                    tk = Tensor::cat(&[&tk, &tk], 1)?; tv = Tensor::cat(&[&tv, &tv], 1)?;
+                let h = tk.dim(1)?;
+                if h == 8 && self.num_key_value_heads == 16 {
+                    // 0.6B(8 heads) -> 2B(16 heads)
+                    tk = Tensor::cat(&[&tk, &tk], 1)?;
+                    tv = Tensor::cat(&[&tv, &tv], 1)?;
                 }
-                finalized_ks.push(tk); finalized_vs.push(tv);
+                finalized_ks.push(tk);
+                finalized_vs.push(tv);
             }
 
             let mut k = Tensor::cat(&finalized_ks, 2)?;

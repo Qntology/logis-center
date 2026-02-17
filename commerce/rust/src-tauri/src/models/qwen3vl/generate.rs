@@ -493,39 +493,71 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     
                     
                     
-                                                                                                                        // [SLOT-COUNT-LOG] 실시간 슬롯 점유 상태 계산
+                                                                                                                                            // [SLOT-COUNT-LOG] 실시간 슬롯 점유 상태 계산
                     
                     
                     
-                                                                                                                        let (sub_active, _) = SLOT_MANAGER.get_counts();
+                                                                                                                        
                     
                     
                     
-                                                                                                                        let mut base_active = 0;
+                                                                                                                                            let (sub_active, _) = SLOT_MANAGER.get_counts();
                     
                     
                     
-                                                                                                                        for s in &SLOT_MANAGER.base_slots {
+                                                                                                                        
                     
                     
                     
-                                                                                                                            if s.state.load(Ordering::Relaxed) != 0 { base_active += 1; }
+                                                                                                                                            let mut base_active = 0;
                     
                     
                     
-                                                                                                                        }
+                                                                                                                        
                     
                     
                     
-                                                                                                    
+                                                                                                                                            for s in &SLOT_MANAGER.base_slots {
                     
                     
                     
-                                                                                                                        println!("[IO-READ-DEBUG] Slot {} Layer {} Offset {} | Base: {}/28, Sub: {}/14 | Checking in {:?}", 
+                                                                                                                        
                     
                     
                     
-                                                                                                                            load.slot_id, layer_idx, offset, base_active, sub_active, load.path);
+                                                                                                                                                if s.state.load(Ordering::Relaxed) != 0 { base_active += 1; }
+                    
+                    
+                    
+                                                                                                                        
+                    
+                    
+                    
+                                                                                                                                            }
+                    
+                    
+                    
+                                                                                                                        
+                    
+                    
+                    
+                                                                                                                        
+                    
+                    
+                    
+                                                                                                                        
+                    
+                    
+                    
+                                                                                                                                            println!("[IO-READ-DEBUG] Slot {} Layer {} Offset {} | Base: {}/28, Sub: {}/56 | Checking in {:?}", 
+                    
+                    
+                    
+                                                                                                                        
+                    
+                    
+                    
+                                                                                                                                                load.slot_id, layer_idx, offset, base_active, sub_active, load.path);
                     
                     
                     
@@ -1458,9 +1490,14 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn load_kv_from_disk(&mut self, path: &Path, kv_name: Option<&str>) -> Result<()> {
+        let expected_len = if let Ok(data) = std::fs::read(path.join("tokens.json")) {
+            let ids: Vec<u32> = serde_json::from_slice(&data).unwrap_or_default();
+            ids.len()
+        } else { 0 };
+
         match &mut self.qwen3_vl {
-            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
-            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, 0, 128, kv_name),
+            ModelVariant::QuantizedVL(m) => m.load_kv_cache(path, &self.text_device, expected_len, 128, kv_name),
+            ModelVariant::QuantizedText(m) => m.load_kv_cache(path, &self.text_device, expected_len, 128, kv_name),
             _ => Ok(()),
         }
     }
