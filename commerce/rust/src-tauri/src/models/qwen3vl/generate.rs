@@ -87,6 +87,8 @@ impl SlotManager {
         for i in 0..self.slots.len() {
             self.release_slot(i).await;
         }
+        // [CRITICAL] 모든 쓰기 카운터 강제 0 초기화 (안전 장치)
+        self.active_write_count.store(0, Ordering::SeqCst);
     }
 
     pub async fn acquire_read_slot(&self) -> usize {
@@ -122,8 +124,9 @@ impl SlotManager {
     }
 
     pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
-        let max_writes = self.get_max_concurrent_writes(total_tokens);
+        let max_writes = self.get_max_concurrent_writes(total_tokens).max(1);
         let count = self.slots.len();
+        println!("[SLOT-DEBUG] acquire_write_slot: active={}, max={}", self.active_write_count.load(Ordering::Relaxed), max_writes);
         loop {
             if self.active_write_count.load(Ordering::SeqCst) < max_writes {
                 let start_idx = self.last_picked_idx.load(Ordering::Relaxed);
@@ -180,7 +183,17 @@ impl SlotManager {
     }
 
     pub fn get_counts(&self) -> (usize, usize, usize, usize) {
-        (self.count_reads.load(Ordering::Relaxed), self.count_writes.load(Ordering::Relaxed), self.count_cached.load(Ordering::Relaxed), self.count_free.load(Ordering::Relaxed))
+        let mut r = 0; let mut w = 0; let mut c = 0; let mut f = 0;
+        for slot in &self.slots {
+            match slot.state.load(Ordering::Relaxed) {
+                0 => f += 1,
+                1 => w += 1,
+                2 => c += 1,
+                3 => r += 1,
+                _ => {},
+            }
+        }
+        (r, w, c, f)
     }
 }
 
@@ -417,53 +430,78 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 }
                 SlotTask::Load(load) => {
-                    // [LAYER-LOAD] Load specific layer for this master block
                     let (offset, index) = {
                         let inner = load.shared_block.inner.read().unwrap();
                         (inner.offset, inner.index)
                     };
-                    
                     let layer_idx = load.layer_idx;
-
-                    let filename = if offset == 0 { 
-                        format!("layer_{}_kv.safetensors", layer_idx) 
-                    } else { 
-                        format!("layer_{}_kv_{}.safetensors", layer_idx, offset) 
-                    };
                     
-                    let path = load.path.join(filename);
-                    let mut success = false;
+                    // [RELAY-COMPAT] 2B 모델은 28개 레이어지만 0.6B 캐시는 layer_0만 존재함
+                    let filename = if offset == 0 { format!("layer_{}_kv.safetensors", layer_idx) } 
+                                   else { format!("layer_{}_kv_{}.safetensors", layer_idx, offset) };
+                    let mut path = load.path.join(&filename);
+                    
+                    if !path.exists() && layer_idx > 0 {
+                        let fallback_name = if offset == 0 { "layer_0_kv.safetensors".to_string() }
+                                            else { format!("layer_0_kv_{}.safetensors", offset) };
+                        let fallback_path = load.path.join(fallback_name);
+                        if fallback_path.exists() {
+                            path = fallback_path;
+                        }
+                    }
 
+                    let mut success = false;
                     if path.exists() {
                         if let Ok(content) = std::fs::read(&path) {
                             if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                let extract_vec = |name: &str| -> Option<Vec<f32>> {
-                                    st.tensor(name).ok().map(|v| unsafe {
-                                        std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
-                                    })
-                                };
+                                let mode = if let Ok(view) = st.tensor("mode") { u32::from_le_bytes(view.data()[0..4].try_into().unwrap()) } else { 1 };
 
-                                if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
-                                    if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
+                                let dequant_res: Result<(Tensor, Tensor)> = (|| {
+                                    if mode == 3 {
+                                        let k_raw = crate::models::qwen3vl::quantized_model::decompress_bitkv_cpu(
+                                            st.tensor("k_anchors")?, st.tensor("k_packed")?, st.tensor("k_scales")?, 
+                                            &if let Ok(v) = st.tensor("k_shape") {
+                                                let s: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
+                                                s.iter().map(|&x| x as usize).collect()
+                                            } else { vec![1, 8, 1024, 128] }
+                                        )?;
                                         
-                                        let original_shape = if let Ok(view) = st.tensor("k_shape") {
-                                            let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
-                                            shape_u32.iter().map(|&x| x as usize).collect()
-                                        } else { vec![1, 8, 1024, 128] };
+                                        let v_raw = crate::models::qwen3vl::quantized_model::decompress_bitkv_cpu(
+                                            st.tensor("v_anchors")?, st.tensor("v_packed")?, st.tensor("v_scales")?, 
+                                            &if let Ok(v) = st.tensor("k_shape") {
+                                                let s: &[u32] = unsafe { std::slice::from_raw_parts(v.data().as_ptr() as *const u32, v.data().len() / 4) };
+                                                s.iter().map(|&x| x as usize).collect()
+                                            } else { vec![1, 8, 1024, 128] }
+                                        )?;
 
-                                        // Store metadata only for the requested layer
-                                        let mut inner = load.shared_block.inner.write().unwrap();
-                                        inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata {
-                                            k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                            k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
-                                            v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                            v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
-                                            original_shape,
-                                        });
-                                        success = true;
+                                        // [LINEAR-BRIDGE] 0.6B(8 heads) -> 2B(16 heads) 자동 변환
+                                        let (mut k, mut v) = (k_raw, v_raw);
+                                        let h = k.dim(1)?;
+                                        if h == 8 {
+                                            // 2B 모델을 위해 헤드를 8 -> 16으로 확장 (단순 복제 방식)
+                                            k = Tensor::cat(&[&k, &k], 1)?;
+                                            v = Tensor::cat(&[&v, &v], 1)?;
+                                        }
+                                        
+                                        Ok((k, v))
+                                    } else {
+                                        Err(anyhow!("Legacy mode not supported in worker"))
                                     }
+                                })();
+
+                                if let Ok((k, v)) = dequant_res {
+                                    let slot = &SLOT_MANAGER.slots[load.slot_id];
+                                    {
+                                        let mut k_guard = slot.k_layers[layer_idx].lock().await;
+                                        *k_guard = Some(k);
+                                    }
+                                    {
+                                        let mut v_guard = slot.v_layers[layer_idx].lock().await;
+                                        *v_guard = Some(v);
+                                    }
+                                    success = true;
+                                } else if let Err(e) = dequant_res {
+                                    println!("[SLOT-WORKER-ERROR] Dequant failed: {}", e);
                                 }
                             }
                         }
@@ -473,20 +511,15 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         {
                             let mut reg = load.registry.entries.write().unwrap();
                             if index < reg.len() {
-                                // [2D-UPDATE] 해당 블록의 특정 레이어만 RAM 상태로 변경
                                 reg[index].location[layer_idx] = KVLocation::RAM;
                                 reg[index].slot_ids[layer_idx] = Some(load.slot_id);
                             }
                         }
-                        // Note: For layer-wise distribution, we don't hold the slot globally for all layers.
-                        // However, to satisfy SLOT_MANAGER stats, we mark it Ready.
                         SLOT_MANAGER.mark_ready(load.slot_id).await;
                     } else {
                         {
                             let mut reg = load.registry.entries.write().unwrap();
-                            if index < reg.len() {
-                                reg[index].location[layer_idx] = KVLocation::SSD;
-                            }
+                            if index < reg.len() { reg[index].location[layer_idx] = KVLocation::SSD; }
                         }
                         SLOT_MANAGER.release_slot(load.slot_id).await;
                     }
@@ -752,7 +785,7 @@ impl Qwen3VLGenerateModel {
         Ok(())
     }
 
-    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, kv_name: Option<String>) -> Result<usize> {
+    pub async fn prefill_only(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, relay_target: Option<&mut Qwen3VLGenerateModel>, kv_name: Option<String>) -> Result<usize> {
         // [STAGE-RESET] 작업 시작 전 슬롯 초기화
         SLOT_MANAGER.reset_all_slots().await;
 
@@ -972,6 +1005,7 @@ impl Qwen3VLGenerateModel {
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
             if seqlen_offset % 1024 == 0 && seqlen_offset > 0 {
+                println!("[DEBUG-BAKE] Prefill Trigger at {}", seqlen_offset);
                 if let Some(sid) = &session_id {
                     let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);

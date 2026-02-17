@@ -649,7 +649,7 @@ async fn process_task(
 
                         if let Some(gen) = model.generator.lock().await.as_mut() {
                             println!("[Scheduler] 2B Step A: Asking classification question...");
-                            let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
+                            let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                             println!("[DEBUG-SCHED] Step A Raw Response: '{}'", res);
                             
                             // [DEBUG] AI 응답 저장
@@ -740,7 +740,7 @@ async fn process_task(
 
             if let Some(gen) = model.generator.lock().await.as_mut() {
                 println!("[Scheduler] 2B Step B: Asking selector question...");
-                let res = gen.generate(params, Some(cancellation_token.clone()), None, kv_name.clone()).await?;
+                let res = gen.generate(params, Some(cancellation_token.clone()), Some(snapshot_id.clone()), kv_name.clone()).await?;
                 println!("[DEBUG-SCHED] Step B Raw Response: '{}'", res);
 
                 // [DEBUG] AI 응답 저장
