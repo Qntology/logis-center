@@ -486,39 +486,43 @@ impl QuantizedQwen3VLTextAttention {
             self.kv_blocks.push(new_block);
         }
 
-        // [PREFETCH-TRIGGER] Look-ahead Prefetching (N+1, N+2 layers)
-        // Only trigger for blocks currently residing on SSD
+        // [PREFETCH-TRIGGER] Look-ahead Prefetching (N+1 to N+4 layers)
         for block in &self.kv_blocks {
             let (index, offset) = {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset)
             };
             
-            // Check if next layers for this block need to be prefetched
-            let look_ahead = 2;
+            let look_ahead = 8; // 더 공격적으로 예독 (14개 슬롯 활용)
             for i in 1..=look_ahead {
                 let target_layer = self.layer_idx + i;
                 if target_layer >= 28 { break; }
 
-                let reg_loc = {
+                let should_trigger = {
                     let reg = self.registry.entries.read().unwrap();
-                    if index < reg.len() { reg[index].location } else { KVLocation::VRAM }
+                    if index < reg.len() { reg[index].location == KVLocation::SSD } else { false }
                 };
 
-                if reg_loc == KVLocation::SSD {
+                if should_trigger {
                     let path = {
                         let reg = self.registry.entries.read().unwrap();
                         reg[index].ssd_path.clone().unwrap_or_default()
                     };
                     
                     if !path.as_os_str().is_empty() {
+                        // [PRE-EMPTIVE] 스레드를 띄우기 전에 미리 Loading으로 마크하여 
+                        // 다음 레이어 루프에서 중복 요청이 발생하는 것을 원천 차단
+                        {
+                            let mut reg = self.registry.entries.write().unwrap();
+                            if index < reg.len() { reg[index].location = KVLocation::Loading; }
+                        }
+
                         let shared_block = block.clone();
                         let registry_clone = self.registry.clone();
                         let layer_to_load = target_layer;
                         
                         tauri::async_runtime::spawn(async move {
                             use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
-                            // Request a slot for this specific layer prefetch
                             let slot_id = SLOT_MANAGER.acquire_read_slot().await;
                             if let Ok(tx) = get_worker_channel().await {
                                 let _ = tx.send(SlotTask::Load(LoadTask {
