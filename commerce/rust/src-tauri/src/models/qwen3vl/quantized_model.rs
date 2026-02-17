@@ -750,8 +750,9 @@ impl QuantizedQwen3VLTextAttention {
             let tk = k.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
             let tv = v.unwrap_or_else(|| Tensor::zeros((1, self.num_key_value_heads, b_len, self.head_dim), target_dtype, dev).unwrap());
             
+            // [SHAPE-HARMONIZER-2] 0.6B -> 2B 헤드 수 자동 보정
             let mut tk = tk; let mut tv = tv;
-            if tk.dim(1).unwrap_or(0) == 8 && self.num_key_value_heads == 16 {
+            if tk.dim(1)? == 8 && self.num_key_value_heads == 16 {
                 tk = Tensor::cat(&[&tk, &tk], 1)?; tv = Tensor::cat(&[&tv, &tv], 1)?;
             }
 
@@ -764,10 +765,20 @@ impl QuantizedQwen3VLTextAttention {
         // (vram_total_len + q_len == total_mask_len 이어야 함)
         // ... (나머지 어텐션 연산) ...
 
-        // 5. [BATCH-VRAM] Fast single-pass for all VRAM blocks
+        // 5. [BATCH-VRAM] Fast single-pass for all collected blocks
         if !vram_ks.is_empty() {
-            let mut k = Tensor::cat(&vram_ks, 2)?;
-            let mut v = Tensor::cat(&vram_vs, 2)?;
+            // [FINAL-SAFETY-GUARD] 모든 텐서의 헤드 수가 일치하는지 최종 확인
+            let mut finalized_ks = Vec::with_capacity(vram_ks.len());
+            let mut finalized_vs = Vec::with_capacity(vram_vs.len());
+            for (mut tk, mut tv) in vram_ks.into_iter().zip(vram_vs.into_iter()) {
+                if tk.dim(1)? == 8 && self.num_key_value_heads == 16 {
+                    tk = Tensor::cat(&[&tk, &tk], 1)?; tv = Tensor::cat(&[&tv, &tv], 1)?;
+                }
+                finalized_ks.push(tk); finalized_vs.push(tv);
+            }
+
+            let mut k = Tensor::cat(&finalized_ks, 2)?;
+            let mut v = Tensor::cat(&finalized_vs, 2)?;
             
             if self.num_kv_groups > 1 {
                 let (b, h, s, d) = k.dims4()?;
@@ -1195,7 +1206,7 @@ impl QuantizedQwen3VLTextAttention {
             let block_len = if i + 1 < fragments.len() {
                 fragments[i+1].0 - offset
             } else {
-                expected_len.saturating_sub(*offset).max(1024)
+                expected_len.saturating_sub(*offset) // [FIX] 패딩 제거
             };
             
             let new_block = KVBlock::new(KVLocation::SSD, i, block_len, *offset);
