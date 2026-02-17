@@ -250,7 +250,7 @@ impl VectorStore {
 
     pub async fn get_pending_tasks(&self, limit: usize) -> Result<Vec<Task>> {
         let table = self.conn.open_table("tasks").execute().await?;
-        let filter = "status = 10 OR status = 1";
+        let filter = "status = 10"; // 오직 '대기 중'인 작업만 가져옵니다. (1: 진행 중 제외)
         let results = table.query().only_if(filter).limit(limit).execute().await?.try_collect::<Vec<_>>().await?;
         let mut tasks = Vec::new();
         for batch in results {

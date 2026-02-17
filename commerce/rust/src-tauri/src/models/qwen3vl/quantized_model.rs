@@ -1673,12 +1673,12 @@ impl QuantizedQwen3VLTextModel {
         
         use nvml_wrapper::Nvml;
         if let Ok(nvml) = Nvml::init() {
-            if let Ok(dev) = nvml.device_by_index(0) {
-                if let Ok(mem) = dev.memory_info() {
-                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{}", mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset + seq_len, total_len);
-                }
-            }
-        }
+                            if let Ok(dev) = nvml.device_by_index(0) {
+                                if let Ok(mem) = dev.memory_info() {
+                                    let current_progress = (seqlen_offset + seq_len).min(total_len);
+                                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{}", mem.used / 1024 / 1024, mem.free / 1024 / 1024, current_progress, total_len);
+                                }
+                            }        }
 
         let target_device = if self.layers[0].device().is_cuda() { Device::new_cuda(0)? } else { Device::Cpu };
         let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };

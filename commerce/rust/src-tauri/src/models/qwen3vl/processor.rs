@@ -201,7 +201,6 @@ impl Qwen3VLProcessor {
 
         for img in imgs {
             let img_tensor = self.process_img(&img, img_mean, img_std)?;
-            let img_tensor = Tensor::cat(&[&img_tensor, &img_tensor], 0)?.contiguous()?;
             let (img_tensor, grid_thw) = self.process_vision_tensor(&img_tensor)?;
             pixel_values_vec.push(img_tensor);
             vision_grid_thws_vec.push(grid_thw);
