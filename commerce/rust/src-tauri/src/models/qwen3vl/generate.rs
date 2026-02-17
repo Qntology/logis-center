@@ -212,20 +212,30 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
         println!("[IO-WORKER] Disk writer started.");
         while let Some(task) = io_rx.recv().await {
             let start = std::time::Instant::now();
-            let _ = candle_core::safetensors::save(&task.tensors, &task.path);
             
-            // [FIX] Decrement remaining layers and release only when 0
+            // [FIX] 경로 확인 및 생성 (tmp 폴더 실패 방지)
+            if let Some(parent) = task.path.parent() {
+                if !parent.exists() { let _ = std::fs::create_dir_all(parent); }
+            }
+
+            // [CRITICAL] 쓰기 시도 및 에러 로깅
+            let save_result = candle_core::safetensors::save(&task.tensors, &task.path);
+            if let Err(e) = save_result {
+                println!("[IO-ERROR] Failed to save SSD chunk to {:?}: {}", task.path, e);
+            }
+            
+            // [FIX] Decrement remaining layers and release ONLY when 0
             let slot = &SLOT_MANAGER.slots[task.slot_id];
             let remaining = slot.remaining_layers.fetch_sub(1, Ordering::SeqCst);
             
             if remaining % 10 == 0 || remaining <= 1 {
-                println!("[IO-WORKER] Saved to {:?}. Remaining layers for slot {}: {}. (Time: {:.2?})", 
-                    task.path.file_name().unwrap_or_default(), task.slot_id, remaining - 1, start.elapsed());
+                println!("[IO-WORKER] Processed {:?}. Remaining: {}. (Time: {:.2?})", 
+                    task.path.file_name().unwrap_or_default(), remaining - 1, start.elapsed());
             }
 
             if remaining == 1 {
                 SLOT_MANAGER.mark_ready(task.slot_id).await;
-                println!("[IO-WORKER] Slot {} marked as READY (RAM Cache).", task.slot_id);
+                println!("[IO-WORKER] Slot {} marked as READY. (WriteCount decreased)", task.slot_id);
             }
         }
     });
@@ -243,7 +253,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     
                     // [FIX] Initialize layer counter before starting Phase B tasks
                     let slot = &SLOT_MANAGER.slots[slot_id];
-                    slot.remaining_layers.store(bake.layers.len(), Ordering::SeqCst);
+                    let total_layers = bake.layers.len();
+                    slot.remaining_layers.store(total_layers, Ordering::SeqCst);
                     
                     for layer in bake.layers {
                         // [RAM-STORAGE] Direct Access를 위해 RAM 슬롯에 텐서 저장
@@ -311,7 +322,11 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             map.insert("mode".to_string(), mode_tensor);
                         }
 
-                        let _ = io_tx.blocking_send(SaveTask { slot_id, path, tensors: map });
+                        // [CRITICAL] 텐서 처리가 실패하여 map이 비었더라도, 반드시 io_tx로 작업을 보내 카운트를 감소시켜야 합니다.
+                        if let Err(e) = io_tx.blocking_send(SaveTask { slot_id, path, tensors: map }) {
+                            println!("[SLOT-WORKER] Fatal error: io_tx channel closed: {}", e);
+                            // 채널이 닫혔다면 슬롯을 여기서 강제로라도 마크해야 할 수도 있습니다.
+                        }
                     }
                 }
                 SlotTask::Load(load) => {
