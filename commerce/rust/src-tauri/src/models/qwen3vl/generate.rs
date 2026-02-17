@@ -342,8 +342,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         }
 
                         let filename = match (&kv_name, offset) {
-                            (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
-                            (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
+                            (Some(name), 0) => format!("layer_{}_{}_kv.safetensors", name, layer.layer_idx),
+                            (Some(name), off) => format!("layer_{}_{}_kv_{}.safetensors", name, layer.layer_idx, off),
                             (None, 0) => format!("layer_{}_kv.safetensors", layer.layer_idx),
                             (None, off) => format!("layer_{}_kv_{}.safetensors", layer.layer_idx, off),
                         };
@@ -437,16 +437,45 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let layer_idx = load.layer_idx;
                     
                     // [RELAY-COMPAT] 2B 모델은 28개 레이어지만 0.6B 캐시는 layer_0만 존재함
-                    let filename = if offset == 0 { format!("layer_{}_kv.safetensors", layer_idx) } 
-                                   else { format!("layer_{}_kv_{}.safetensors", layer_idx, offset) };
+                    // [NAME-COMPAT] kv_name(예: "pug")이 있으면 최우선으로 찾음
+                    let mut filename = match (&load.kv_name, offset) {
+                        (Some(name), 0) => format!("layer_{}_{}_kv.safetensors", name, layer_idx),
+                        (Some(name), off) => format!("layer_{}_{}_kv_{}.safetensors", name, layer_idx, off),
+                        (None, 0) => format!("layer_{}_kv.safetensors", layer_idx),
+                        (None, off) => format!("layer_{}_kv_{}.safetensors", layer_idx, off),
+                    };
+                    
                     let mut path = load.path.join(&filename);
                     
-                    if !path.exists() && layer_idx > 0 {
-                        let fallback_name = if offset == 0 { "layer_0_kv.safetensors".to_string() }
-                                            else { format!("layer_0_kv_{}.safetensors", offset) };
+                    // 만약 이름표+인덱스 조합으로 못 찾았다면, 인덱스 없는 이름표로 폴백 (0.6B 릴레이 호환성)
+                    if !path.exists() && load.kv_name.is_some() {
+                        let name = load.kv_name.as_ref().unwrap();
+                        let fallback_name = if offset == 0 { format!("layer_{}_kv.safetensors", name) }
+                                            else { format!("layer_{}_kv_{}.safetensors", name, offset) };
                         let fallback_path = load.path.join(fallback_name);
                         if fallback_path.exists() {
                             path = fallback_path;
+                        }
+                    }
+
+                    // 여전히 못 찾았다면 레이어 0 파일로 폴백 (0.6B -> 2B 릴레이 핵심)
+                    if !path.exists() && layer_idx > 0 {
+                        let l0_name = match (&load.kv_name, offset) {
+                            (Some(name), 0) => format!("layer_{}_0_kv.safetensors", name),
+                            (Some(name), off) => format!("layer_{}_0_kv_{}.safetensors", name, off),
+                            (None, 0) => "layer_0_kv.safetensors".to_string(),
+                            (None, off) => format!("layer_0_kv_{}.safetensors", off),
+                        };
+                        let l0_path = load.path.join(&l0_name);
+                        if l0_path.exists() {
+                            path = l0_path;
+                        } else if load.kv_name.is_some() {
+                            // 이름표만 있는 layer_0 폴백 (최종 수단)
+                            let name = load.kv_name.as_ref().unwrap();
+                            let last_resort = if offset == 0 { format!("layer_{}_kv.safetensors", name) }
+                                              else { format!("layer_{}_kv_{}.safetensors", name, offset) };
+                            let last_path = load.path.join(last_resort);
+                            if last_path.exists() { path = last_path; }
                         }
                     }
 
@@ -515,8 +544,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                 reg[index].slot_ids[layer_idx] = Some(load.slot_id);
                             }
                         }
+                        // [FIX] 블록 자체의 상태도 업데이트하여 Polling 루프 즉시 탈출 지원
+                        {
+                            let mut inner = load.shared_block.inner.write().unwrap();
+                            inner.location = KVLocation::RAM;
+                        }
                         SLOT_MANAGER.mark_ready(load.slot_id).await;
                     } else {
+                        println!("[SLOT-WORKER-FAIL] Could not find file for Layer {} at {:?}", layer_idx, path);
                         {
                             let mut reg = load.registry.entries.write().unwrap();
                             if index < reg.len() { reg[index].location[layer_idx] = KVLocation::SSD; }
@@ -537,11 +572,11 @@ pub enum ModelVariant {
 }
 
 impl ModelVariant {
-    pub fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
+    pub async fn forward(&mut self, input_ids: &Tensor, pixel_values: Option<&Tensor>, image_grid_thw: Option<&Tensor>, video_pixel_values: Option<&Tensor>, video_grid_thw: Option<&Tensor>, cache_position: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>) -> Result<Tensor> {
         match self {
             Self::Standard(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset),
-            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id),
-            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id),
+            Self::QuantizedVL(m) => m.forward(input_ids, pixel_values, image_grid_thw, video_pixel_values, video_grid_thw, cache_position, seqlen_offset, total_len, session_id).await,
+            Self::QuantizedText(m) => m.forward(input_ids, cache_position, seqlen_offset, total_len, session_id).await,
         }
     }
 
@@ -741,7 +776,7 @@ impl Qwen3VLGenerateModel {
         Ok(Self { chat_template, tokenizer, pre_processor, qwen3_vl, text_device: text_dev, vision_device: vision_dev, eos_token_id1, eos_token_id2, generation_config, model_name, hard_token_limit, kv_root })
     }
 
-    pub fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
+    pub async fn prefill_text_only(&mut self, text: &str, cancel_token: Option<Arc<AtomicBool>>, mut relay_target: Option<&mut Qwen3VLGenerateModel>, auto_save_path: Option<&std::path::Path>) -> Result<()> {
         let token_ids = self.tokenizer.text_encode_vec(text.to_string(), false)?;
         let total_tokens = token_ids.len();
         let chunk_size = 512;
@@ -753,7 +788,7 @@ impl Qwen3VLGenerateModel {
             let chunk = &token_ids[current_pos..end];
             let chunk_ids = Tensor::from_vec(chunk.to_vec(), (1, end - current_pos), &self.text_device)?;
             let chunk_pos = Tensor::arange(current_pos as u32, end as u32, &self.text_device)?.unsqueeze(0)?;
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None)?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, None).await?;
             if let Some(path) = auto_save_path { let _ = self.save_kv_to_disk(path, None, end); }
             if let Some(ref mut target) = relay_target {
                 let (ks, vs) = self.get_current_kv();
@@ -813,7 +848,7 @@ impl Qwen3VLGenerateModel {
 
             // 1. GPU 추론 진행
             println!("[BAKING] {} to {} / Total: {}", current_pos, end, total_tokens);
-            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone())?;
+            self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), current_pos, total_tokens, session_id.clone()).await?;
 
             // 2. [HANDOFF] 슬롯 확보 및 VRAM -> RAM 전송
             if let Some(sid) = &session_id {
