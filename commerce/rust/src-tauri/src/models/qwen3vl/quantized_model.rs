@@ -514,7 +514,7 @@ impl QuantizedQwen3VLTextAttention {
                 let registry_clone = self.registry.clone();
                 tauri::async_runtime::spawn(async move {
                     use crate::models::qwen3vl::generate::{SLOT_MANAGER, SLOT_TX, SlotTask, LoadTask};
-                    let slot_id = SLOT_MANAGER.acquire_read_slot(seqlen_offset).await;
+                    let slot_id = SLOT_MANAGER.acquire_read_slot().await;
                     if let Some(tx_lock) = SLOT_TX.lock().await.as_ref() {
                         let _ = tx_lock.send(SlotTask::Load(LoadTask {
                             slot_id,

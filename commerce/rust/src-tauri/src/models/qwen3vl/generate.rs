@@ -32,10 +32,11 @@ use std::path::PathBuf;
 use tokio::sync::mpsc;
 
 // [GLOBAL] 슬롯 관리자: 읽기/쓰기 통로 분리 및 대기열 제어
+// [GLOBAL] 슬롯 관리자: 풀(Pool) 기반 유기적 관리
 pub struct SlotManager {
     pub slots: Vec<crate::models::qwen3vl::quantized_model::MemorySlot>,
     pub handoff_notifier: Arc<tokio::sync::Notify>,
-    pub busy_flags: Arc<std::sync::Mutex<Vec<bool>>>, // true: Busy, false: Free
+    pub active_write_count: Arc<AtomicUsize>, // 현재 SSD 저장 중인 작업 수
 }
 
 impl SlotManager {
@@ -48,43 +49,63 @@ impl SlotManager {
         Self {
             slots,
             handoff_notifier: Arc::new(tokio::sync::Notify::new()),
-            busy_flags: Arc::new(std::sync::Mutex::new(vec![false; count])),
+            active_write_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    fn get_write_limit(&self, current_len: usize) -> usize {
-        if current_len < 4096 { 8 }
-        else if current_len < 8192 { 4 }
-        else { 2 } // 사용자님 제안: 쓰기 비중을 최소화하여 읽기(25+) 공간 확보
+    // 컨텍스트 크기에 따른 "동시 쓰기 작업 허용 수" 제한
+    fn get_max_concurrent_writes(&self, total_tokens: usize) -> usize {
+        if total_tokens < 4096 { 12 }
+        else if total_tokens < 8192 { 8 }
+        else { 4 } // 거대 컨텍스트일수록 읽기 대역폭 확보를 위해 쓰기 병렬도를 낮춤
     }
 
-    pub async fn acquire_write_slot(&self, current_len: usize) -> usize {
-        let limit = self.get_write_limit(current_len);
+    pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
+        let max_writes = self.get_max_concurrent_writes(total_tokens);
+        let mut retry_count = 0;
+
         loop {
-            {
-                let mut busy = self.busy_flags.lock().unwrap();
-                for i in 0..limit {
-                    if !busy[i] {
-                        busy[i] = true;
+            // 1. 현재 SSD 저장 중인 작업이 너무 많으면 대기 (Throttle)
+            if self.active_write_count.load(Ordering::SeqCst) < max_writes {
+                // 2. 완전히 비어있는(Free) 슬롯 찾기 (0~15번 전체 대상)
+                for (i, slot) in self.slots.iter().enumerate() {
+                    if slot.state.load(Ordering::SeqCst) == 0 { // 0: Free
+                        slot.state.store(1, Ordering::SeqCst); // 1: Baking
+                        self.active_write_count.fetch_add(1, Ordering::SeqCst);
+                        return i;
+                    }
+                }
+
+                // 3. 비어있는 슬롯이 없다면, Ready(RAM 캐시) 상태인 슬롯 중 하나를 희생(Evict)
+                for (i, slot) in self.slots.iter().enumerate() {
+                    if slot.state.load(Ordering::SeqCst) == 2 { // 2: Ready (RAM Cache)
+                        // [CLEANUP] 이전 RAM 캐시 데이터를 비우고 재사용 준비
+                        self.prepare_for_reuse(i).await;
+                        slot.state.store(1, Ordering::SeqCst); 
+                        self.active_write_count.fetch_add(1, Ordering::SeqCst);
+                        println!("[SLOT-REUSE] Evicted RAM Cache in slot {} for new write.", i);
                         return i;
                     }
                 }
             }
-            self.handoff_notifier.notified().await;
+
+            if retry_count % 10 == 0 {
+                println!("[SLOT-WAIT] All slots busy or write limit ({}) reached. WriteCount: {}. Retrying...", 
+                    max_writes, self.active_write_count.load(Ordering::SeqCst));
+            }
+            retry_count += 1;
+            tokio::time::timeout(std::time::Duration::from_millis(200), self.handoff_notifier.notified()).await.ok();
         }
     }
 
-    pub async fn acquire_read_slot(&self, current_len: usize) -> usize {
-        let start_idx = self.get_write_limit(current_len);
-        let count = self.slots.len();
+    pub async fn acquire_read_slot(&self) -> usize {
         loop {
-            {
-                let mut busy = self.busy_flags.lock().unwrap();
-                for i in start_idx..count {
-                    if !busy[i] {
-                        busy[i] = true;
-                        return i;
-                    }
+            // 읽기는 쓰기 제한과 상관없이 비어있거나 Ready인 슬롯을 찾습니다.
+            for (i, slot) in self.slots.iter().enumerate() {
+                let state = slot.state.load(Ordering::SeqCst);
+                if state == 0 || state == 2 { // Free or Ready
+                    slot.state.store(3, Ordering::SeqCst); // 3: Loading
+                    return i;
                 }
             }
             self.handoff_notifier.notified().await;
@@ -92,9 +113,32 @@ impl SlotManager {
     }
 
     pub async fn release_slot(&self, id: usize) {
-        {
-            let mut busy = self.busy_flags.lock().unwrap();
-            if id < busy.len() { busy[id] = false; }
+        if id < self.slots.len() {
+            let slot = &self.slots[id];
+            let prev_state = slot.state.swap(0, Ordering::SeqCst);
+            if prev_state == 1 { // 쓰기 작업 중이었다면 카운트 감소
+                self.active_write_count.fetch_sub(1, Ordering::SeqCst);
+            }
+            // [CLEANUP] 물리적 메모리(텐서)를 명시적으로 해제하여 RAM 반납
+            for layer_k in &slot.k_layers { *layer_k.lock().await = None; }
+            for layer_v in &slot.v_layers { *layer_v.lock().await = None; }
+            println!("[SLOT-CLEANUP] Slot {} memory fully cleared.", id);
+        }
+        self.handoff_notifier.notify_waiters();
+    }
+
+    // 슬롯 재사용 전 초기화 (내부용)
+    async fn prepare_for_reuse(&self, id: usize) {
+        let slot = &self.slots[id];
+        for layer_k in &slot.k_layers { *layer_k.lock().await = None; }
+        for layer_v in &slot.v_layers { *layer_v.lock().await = None; }
+    }
+
+    // SSD 저장이 완료되었을 때 호출 (Free로 만들지 않고 Ready로 유지)
+    pub async fn mark_ready(&self, id: usize) {
+        if id < self.slots.len() {
+            self.slots[id].state.store(2, Ordering::SeqCst); // 2: Ready (RAM Cache)
+            self.active_write_count.fetch_sub(1, Ordering::SeqCst);
         }
         self.handoff_notifier.notify_waiters();
     }
@@ -167,14 +211,21 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     tokio::spawn(async move {
         println!("[IO-WORKER] Disk writer started.");
         while let Some(task) = io_rx.recv().await {
+            let start = std::time::Instant::now();
             let _ = candle_core::safetensors::save(&task.tensors, &task.path);
             
             // [FIX] Decrement remaining layers and release only when 0
             let slot = &SLOT_MANAGER.slots[task.slot_id];
             let remaining = slot.remaining_layers.fetch_sub(1, Ordering::SeqCst);
+            
+            if remaining % 10 == 0 || remaining <= 1 {
+                println!("[IO-WORKER] Saved to {:?}. Remaining layers for slot {}: {}. (Time: {:.2?})", 
+                    task.path.file_name().unwrap_or_default(), task.slot_id, remaining - 1, start.elapsed());
+            }
+
             if remaining == 1 {
-                SLOT_MANAGER.release_slot(task.slot_id).await;
-                println!("[IO-WORKER] Slot {} fully released after all layers saved.", task.slot_id);
+                SLOT_MANAGER.mark_ready(task.slot_id).await;
+                println!("[IO-WORKER] Slot {} marked as READY (RAM Cache).", task.slot_id);
             }
         }
     });
@@ -191,9 +242,18 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let offset = bake.offset;
                     
                     // [FIX] Initialize layer counter before starting Phase B tasks
-                    SLOT_MANAGER.slots[slot_id].remaining_layers.store(bake.layers.len(), Ordering::SeqCst);
+                    let slot = &SLOT_MANAGER.slots[slot_id];
+                    slot.remaining_layers.store(bake.layers.len(), Ordering::SeqCst);
                     
                     for layer in bake.layers {
+                        // [RAM-STORAGE] Direct Access를 위해 RAM 슬롯에 텐서 저장
+                        if let Ok(mut k_guard) = slot.k_layers[layer.layer_idx].try_lock() {
+                            *k_guard = Some(layer.k.clone());
+                        }
+                        if let Ok(mut v_guard) = slot.v_layers[layer.layer_idx].try_lock() {
+                            *v_guard = Some(layer.v.clone());
+                        }
+
                         let filename = match (&kv_name, offset) {
                             (Some(name), 0) => format!("layer_{}_kv.safetensors", name),
                             (Some(name), off) => format!("layer_{}_kv_{}.safetensors", name, off),
@@ -620,7 +680,9 @@ impl Qwen3VLGenerateModel {
 
             // 2. [HANDOFF] 슬롯 확보 및 VRAM -> RAM 전송
             if let Some(sid) = &session_id {
-                let slot_id = SLOT_MANAGER.acquire_write_slot(current_pos).await;
+                // [FIX] 현재 위치가 아닌 전체 토큰 양을 기준으로 슬롯 범위를 결정하여 
+                // 작업 도중 Limit이 줄어들어 발생하는 Hang 현상을 방지합니다.
+                let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
                 let path = crate::utils::paths::get_kv_dir(None).join(sid);
                 if !path.exists() { let _ = fs::create_dir_all(&path); }
 
@@ -812,7 +874,7 @@ impl Qwen3VLGenerateModel {
             if seqlen_offset % 1024 == 0 {
                 if let Some(sid) = &session_id {
                     // [HANDOFF] Use slot manager for checkpointing
-                    let slot_id = SLOT_MANAGER.acquire_write_slot(seqlen_offset).await;
+                    let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     if !path.exists() { let _ = fs::create_dir_all(&path); }
 
@@ -851,7 +913,7 @@ impl Qwen3VLGenerateModel {
             
             // [WINDOW-BAKE] Trigger dump every 512 tokens
             if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
-                let slot_id = SLOT_MANAGER.acquire_write_slot(seqlen_offset).await;
+                let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
                 println!("[WINDOW-BAKE] {} boundary hit. Offloading block to Slot {}.", seqlen_offset, slot_id);
                 
                 let (ks, vs) = self.get_current_kv();
@@ -903,7 +965,7 @@ impl Qwen3VLGenerateModel {
             // [INFERENCE-SAVE] Periodic Checkpointing
             if i > 0 && i % 50 == 0 && !self.model_name.contains("0.6B") {
                 if let Some(sid) = &session_id {
-                    let slot_id = SLOT_MANAGER.acquire_write_slot(seqlen_offset).await;
+                    let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
                     let (ks, vs) = self.get_current_kv();
                     let mut layer_dumps = Vec::new();
