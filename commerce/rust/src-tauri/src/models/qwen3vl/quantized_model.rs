@@ -486,46 +486,53 @@ impl QuantizedQwen3VLTextAttention {
             self.kv_blocks.push(new_block);
         }
 
-        // [PREFETCH-TRIGGER] Only trigger on Layer 0 to avoid 28x redundant SSD requests
-        if self.layer_idx == 0 {
-            let blocks_to_prefetch: Vec<_> = self.kv_blocks.iter()
-                .filter(|b| {
-                    let index = b.inner.read().unwrap().index;
-                    let reg = self.registry.entries.read().unwrap();
-                    reg[index].location == KVLocation::SSD
-                })
-                .cloned()
-                .collect();
+        // [PREFETCH-TRIGGER] Look-ahead Prefetching (N+1, N+2 layers)
+        // Only trigger for blocks currently residing on SSD
+        for block in &self.kv_blocks {
+            let (index, offset) = {
+                let inner = block.inner.read().unwrap();
+                (inner.index, inner.offset)
+            };
+            
+            // Check if next layers for this block need to be prefetched
+            let look_ahead = 2;
+            for i in 1..=look_ahead {
+                let target_layer = self.layer_idx + i;
+                if target_layer >= 28 { break; }
 
-            for block in blocks_to_prefetch {
-                let index = block.inner.read().unwrap().index;
-                let path = {
+                let reg_loc = {
                     let reg = self.registry.entries.read().unwrap();
-                    reg[index].ssd_path.clone().unwrap_or_default()
+                    if index < reg.len() { reg[index].location } else { KVLocation::VRAM }
                 };
-                
-                // Mark as loading in central registry
-                {
-                    let mut reg = self.registry.entries.write().unwrap();
-                    reg[index].location = KVLocation::Loading;
-                }
-                
-                let shared_block = block.clone();
-                let registry_clone = self.registry.clone();
-                tauri::async_runtime::spawn(async move {
-                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
-                    let slot_id = SLOT_MANAGER.acquire_read_slot().await;
-                    if let Ok(tx) = get_worker_channel().await {
-                        let _ = tx.send(SlotTask::Load(LoadTask {
-                            slot_id,
-                            path,
-                            layer_idx: 0,
-                            kv_name: None,
-                            shared_block,
-                            registry: registry_clone,
-                        })).await;
+
+                if reg_loc == KVLocation::SSD {
+                    let path = {
+                        let reg = self.registry.entries.read().unwrap();
+                        reg[index].ssd_path.clone().unwrap_or_default()
+                    };
+                    
+                    if !path.as_os_str().is_empty() {
+                        let shared_block = block.clone();
+                        let registry_clone = self.registry.clone();
+                        let layer_to_load = target_layer;
+                        
+                        tauri::async_runtime::spawn(async move {
+                            use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
+                            // Request a slot for this specific layer prefetch
+                            let slot_id = SLOT_MANAGER.acquire_read_slot().await;
+                            if let Ok(tx) = get_worker_channel().await {
+                                let _ = tx.send(SlotTask::Load(LoadTask {
+                                    slot_id,
+                                    path,
+                                    layer_idx: layer_to_load,
+                                    kv_name: None,
+                                    shared_block,
+                                    registry: registry_clone,
+                                })).await;
+                            }
+                        });
                     }
-                });
+                }
             }
         }
 
@@ -952,6 +959,20 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn clear_kv_cache(&mut self) {
+        // [CLEANUP] 슬롯 자원 명시적 반납
+        for block in &self.kv_blocks {
+            let slot_id = {
+                let reg = self.registry.entries.read().unwrap();
+                let inner = block.inner.read().unwrap();
+                if inner.index < reg.len() { reg[inner.index].slot_id } else { None }
+            };
+            if let Some(id) = slot_id {
+                // 비동기 호출을 위해 spawn 사용 (clear_kv_cache는 동기 함수)
+                tauri::async_runtime::spawn(async move {
+                    SLOT_MANAGER.release_slot(id).await;
+                });
+            }
+        }
         self.kv_blocks.clear();
     }
 
@@ -960,7 +981,7 @@ impl QuantizedQwen3VLTextAttention {
     }
 
     pub fn drop_kv_storage(&mut self) -> Result<()> {
-        self.kv_blocks.clear();
+        self.clear_kv_cache();
         Ok(())
     }
 

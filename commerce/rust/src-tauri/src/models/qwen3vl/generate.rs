@@ -36,7 +36,12 @@ use tokio::sync::mpsc;
 pub struct SlotManager {
     pub slots: Vec<crate::models::qwen3vl::quantized_model::MemorySlot>,
     pub handoff_notifier: Arc<tokio::sync::Notify>,
-    pub active_write_count: Arc<AtomicUsize>, // 현재 SSD 저장 중인 작업 수
+    pub active_write_count: Arc<AtomicUsize>,
+    // [NEW] Lock-free status counters
+    pub count_reads: Arc<AtomicUsize>,
+    pub count_writes: Arc<AtomicUsize>,
+    pub count_cached: Arc<AtomicUsize>,
+    pub count_free: Arc<AtomicUsize>,
 }
 
 impl SlotManager {
@@ -50,62 +55,69 @@ impl SlotManager {
             slots,
             handoff_notifier: Arc::new(tokio::sync::Notify::new()),
             active_write_count: Arc::new(AtomicUsize::new(0)),
+            count_reads: Arc::new(AtomicUsize::new(0)),
+            count_writes: Arc::new(AtomicUsize::new(0)),
+            count_cached: Arc::new(AtomicUsize::new(0)),
+            count_free: Arc::new(AtomicUsize::new(count)), // 초기에는 모두 Free
         }
     }
 
-    // 컨텍스트 크기에 따른 "동시 쓰기 작업 허용 수" 제한
-    fn get_max_concurrent_writes(&self, total_tokens: usize) -> usize {
-        if total_tokens < 4096 { 12 }
-        else if total_tokens < 8192 { 8 }
-        else { 4 } // 거대 컨텍스트일수록 읽기 대역폭 확보를 위해 쓰기 병렬도를 낮춤
+    // 상태 변경 시 카운터 업데이트 유틸리티
+    fn update_counters(&self, old_state: u8, new_state: u8) {
+        if old_state == new_state { return; }
+        
+        match old_state {
+            0 => { self.count_free.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
+            1 => { self.count_writes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
+            2 => { self.count_cached.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
+            3 => { self.count_reads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |val| Some(val.saturating_sub(1))).ok(); },
+            _ => {},
+        };
+        match new_state {
+            0 => { self.count_free.fetch_add(1, Ordering::SeqCst); },
+            1 => { self.count_writes.fetch_add(1, Ordering::SeqCst); },
+            2 => { self.count_cached.fetch_add(1, Ordering::SeqCst); },
+            3 => { self.count_reads.fetch_add(1, Ordering::SeqCst); },
+            _ => {},
+        };
     }
 
     pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
         let max_writes = self.get_max_concurrent_writes(total_tokens);
-        let mut retry_count = 0;
-
         loop {
-            // 1. 현재 SSD 저장 중인 작업이 너무 많으면 대기 (Throttle)
             if self.active_write_count.load(Ordering::SeqCst) < max_writes {
-                // 2. 완전히 비어있는(Free) 슬롯 찾기 (0~15번 전체 대상)
                 for (i, slot) in self.slots.iter().enumerate() {
                     if slot.state.load(Ordering::SeqCst) == 0 { // 0: Free
-                        slot.state.store(1, Ordering::SeqCst); // 1: Baking
+                        slot.state.store(1, Ordering::SeqCst);
+                        self.update_counters(0, 1);
                         self.active_write_count.fetch_add(1, Ordering::SeqCst);
                         println!("[SLOT-ACQUIRE] Occupied Write Slot {} for baking.", i);
                         return i;
                     }
                 }
-
-                // 3. 비어있는 슬롯이 없다면, Ready(RAM 캐시) 상태인 슬롯 중 하나를 희생(Evict)
+                // Evict logic
                 for (i, slot) in self.slots.iter().enumerate() {
-                    if slot.state.load(Ordering::SeqCst) == 2 { // 2: Ready (RAM Cache)
-                        // [CLEANUP] 이전 RAM 캐시 데이터를 비우고 재사용 준비
+                    if slot.state.load(Ordering::SeqCst) == 2 { // 2: Ready
                         self.prepare_for_reuse(i).await;
-                        slot.state.store(1, Ordering::SeqCst); 
+                        slot.state.store(1, Ordering::SeqCst);
+                        self.update_counters(2, 1);
                         self.active_write_count.fetch_add(1, Ordering::SeqCst);
-                        println!("[SLOT-REUSE] Evicted RAM Cache in slot {} for new write.", i);
                         return i;
                     }
                 }
             }
-
-            if retry_count % 10 == 0 {
-                println!("[SLOT-WAIT] All slots busy or write limit ({}) reached. WriteCount: {}. Retrying...", 
-                    max_writes, self.active_write_count.load(Ordering::SeqCst));
-            }
-            retry_count += 1;
-            tokio::time::timeout(std::time::Duration::from_millis(200), self.handoff_notifier.notified()).await.ok();
+            tokio::time::timeout(std::time::Duration::from_millis(100), self.handoff_notifier.notified()).await.ok();
         }
     }
 
     pub async fn acquire_read_slot(&self) -> usize {
         loop {
-            // 읽기는 쓰기 제한과 상관없이 비어있거나 Ready인 슬롯을 찾습니다.
             for (i, slot) in self.slots.iter().enumerate() {
                 let state = slot.state.load(Ordering::SeqCst);
-                if state == 0 || state == 2 { // Free or Ready
-                    slot.state.store(3, Ordering::SeqCst); // 3: Loading
+                if state == 0 || state == 2 {
+                    if state == 2 { self.prepare_for_reuse(i).await; }
+                    slot.state.store(3, Ordering::SeqCst);
+                    self.update_counters(state, 3);
                     return i;
                 }
             }
@@ -117,15 +129,19 @@ impl SlotManager {
         if id < self.slots.len() {
             let slot = &self.slots[id];
             let prev_state = slot.state.swap(0, Ordering::SeqCst);
-            if prev_state == 1 { // 쓰기 작업 중이었다면 카운트 감소
-                self.active_write_count.fetch_sub(1, Ordering::SeqCst);
-            }
-            // [CLEANUP] 물리적 메모리(텐서)를 명시적으로 해제하여 RAM 반납
+            self.update_counters(prev_state, 0);
+            if prev_state == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
             for layer_k in &slot.k_layers { *layer_k.lock().await = None; }
             for layer_v in &slot.v_layers { *layer_v.lock().await = None; }
-            println!("[SLOT-CLEANUP] Slot {} memory fully cleared.", id);
         }
         self.handoff_notifier.notify_waiters();
+    }
+
+    // 컨텍스트 크기에 따른 "동시 쓰기 작업 허용 수" 제한
+    fn get_max_concurrent_writes(&self, total_tokens: usize) -> usize {
+        if total_tokens < 4096 { 12 }
+        else if total_tokens < 8192 { 8 }
+        else { 4 }
     }
 
     // 슬롯 재사용 전 초기화 (내부용)
@@ -135,35 +151,28 @@ impl SlotManager {
         for layer_v in &slot.v_layers { *layer_v.lock().await = None; }
     }
 
-    // SSD 저장이 완료되었을 때 호출 (Free로 만들지 않고 Ready로 유지)
     pub async fn mark_ready(&self, id: usize) {
         if id < self.slots.len() {
-            self.slots[id].state.store(2, Ordering::SeqCst); // 2: Ready (RAM Cache)
-            self.active_write_count.fetch_sub(1, Ordering::SeqCst);
+            let slot = &self.slots[id];
+            let prev_state = slot.state.swap(2, Ordering::SeqCst);
+            self.update_counters(prev_state, 2);
+            if prev_state == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
         }
         self.handoff_notifier.notify_waiters();
     }
 
     pub fn get_counts(&self) -> (usize, usize, usize, usize) {
-        let mut writes = 0;
-        let mut reads = 0;
-        let mut cached = 0;
-        let mut free = 0;
-        for slot in &self.slots {
-            match slot.state.load(Ordering::SeqCst) {
-                0 => free += 1,    // Free
-                1 => writes += 1,  // Baking (VRAM -> SSD)
-                2 => cached += 1,  // Ready (RAM Cache)
-                3 => reads += 1,   // Loading (SSD -> VRAM)
-                _ => {}
-            }
-        }
-        (reads, writes, cached, free)
+        (
+            self.count_reads.load(Ordering::Relaxed),
+            self.count_writes.load(Ordering::Relaxed),
+            self.count_cached.load(Ordering::Relaxed),
+            self.count_free.load(Ordering::Relaxed),
+        )
     }
 }
 
 pub static ACTIVE_BAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
-pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(16));
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(15)); // 1 Central + 14 Workers
 
 // [MEMORY] 강제 메모리 해제 및 초기화 함수 (Async)
 async fn purge_vram_position(device: &Device) {
@@ -297,11 +306,13 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     
                     for layer in bake.layers {
                         // [RAM-STORAGE] Direct Access를 위해 RAM 슬롯에 텐서 저장
-                        if let Ok(mut k_guard) = slot.k_layers[layer.layer_idx].try_lock() {
-                            *k_guard = Some(layer.k.clone());
-                        }
-                        if let Ok(mut v_guard) = slot.v_layers[layer.layer_idx].try_lock() {
-                            *v_guard = Some(layer.v.clone());
+                        {
+                            if let Ok(mut k_guard) = slot.k_layers[layer.layer_idx].try_lock() {
+                                *k_guard = Some(layer.k.clone());
+                            }
+                            if let Ok(mut v_guard) = slot.v_layers[layer.layer_idx].try_lock() {
+                                *v_guard = Some(layer.v.clone());
+                            }
                         }
 
                         let filename = match (&kv_name, offset) {
@@ -313,50 +324,75 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let path = task_dir.join(filename);
                         
                         let mut map = std::collections::HashMap::new();
-                        let process_tensor = |t: Tensor, prefix: &str, target_map: &mut std::collections::HashMap<String, Tensor>| {
-                            if let Ok(dims) = t.dims4() {
-                                let (b, h, s, d) = dims;
-                                if let Ok(t_f32) = t.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
-                                    if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
-                                        let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
-                                        let mut anchors = vec![0.0f32; b * h * anchor_count * d];
-                                        let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
-                                        let mut scales = vec![0.0f32; b * h * s];
-
-                                        let head_token_size = s * d;
-                                        for bh_idx in 0..(b * h) {
-                                            let bh_offset = bh_idx * head_token_size;
-                                            for i in 0..head_token_size {
-                                                if t_data[bh_offset + i] >= 0.0 {
-                                                    packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8);
-                                                }
-                                            }
-                                            for token_idx in 0..s {
-                                                let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
-                                                if token_idx < 4 || token_idx % 8 == 0 {
-                                                    let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
-                                                    anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
-                                                }
-                                                let mut max_abs = 0.0f32;
-                                                for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
-                                                scales[bh_idx * s + token_idx] = max_abs;
-                                            }
+                        
+                        // [REFACTORED] Move process_tensor logic into a standalone non-capturing way
+                        if let Ok(dims) = layer.k.dims4() {
+                            let (b, h, s, d) = dims;
+                            if let Ok(t_f32) = layer.k.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
+                                if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                                    let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                                    let mut anchors = vec![0.0f32; b * h * anchor_count * d];
+                                    let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
+                                    let mut scales = vec![0.0f32; b * h * s];
+                                    let head_token_size = s * d;
+                                    for bh_idx in 0..(b * h) {
+                                        let bh_offset = bh_idx * head_token_size;
+                                        for i in 0..head_token_size {
+                                            if t_data[bh_offset + i] >= 0.0 { packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8); }
                                         }
-
-                                        if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { target_map.insert(format!("{}_anchors", prefix), at); }
-                                        let packed_len = packed_residuals.len();
-                                        if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { target_map.insert(format!("{}_packed", prefix), pt); }
-                                        if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { target_map.insert(format!("{}_scales", prefix), st); }
-                                        if prefix == "k" {
-                                            if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { target_map.insert("k_shape".to_string(), sh); }
+                                        for token_idx in 0..s {
+                                            let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+                                            if token_idx < 4 || token_idx % 8 == 0 {
+                                                let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                                                anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
+                                            }
+                                            let mut max_abs = 0.0f32;
+                                            for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                            scales[bh_idx * s + token_idx] = max_abs;
                                         }
                                     }
+                                    if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { map.insert("k_anchors".to_string(), at); }
+                                    let packed_len = packed_residuals.len();
+                                    if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { map.insert("k_packed".to_string(), pt); }
+                                    if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { map.insert("k_scales".to_string(), st); }
+                                    if let Ok(sh) = Tensor::from_vec(vec![b as u32, h as u32, s as u32, d as u32], (4,), &Device::Cpu) { map.insert("k_shape".to_string(), sh); }
                                 }
                             }
-                        };
+                        }
 
-                        let _ = process_tensor(layer.k, "k", &mut map);
-                        let _ = process_tensor(layer.v, "v", &mut map);
+                        if let Ok(dims) = layer.v.dims4() {
+                            let (b, h, s, d) = dims;
+                            if let Ok(t_f32) = layer.v.to_device(&Device::Cpu).and_then(|t| t.to_dtype(DType::F32)) {
+                                if let Ok(t_data) = t_f32.flatten_all().and_then(|t| t.to_vec1::<f32>()) {
+                                    let anchor_count = (0..s).filter(|&i| i < 4 || i % 8 == 0).count();
+                                    let mut anchors = vec![0.0f32; b * h * anchor_count * d];
+                                    let mut packed_residuals = vec![0u8; (b * h * s * d + 7) / 8];
+                                    let mut scales = vec![0.0f32; b * h * s];
+                                    let head_token_size = s * d;
+                                    for bh_idx in 0..(b * h) {
+                                        let bh_offset = bh_idx * head_token_size;
+                                        for i in 0..head_token_size {
+                                            if t_data[bh_offset + i] >= 0.0 { packed_residuals[(bh_offset + i) / 8] |= 1 << ((bh_offset + i) % 8); }
+                                        }
+                                        for token_idx in 0..s {
+                                            let token_data = &t_data[bh_offset + token_idx * d .. bh_offset + (token_idx + 1) * d];
+                                            if token_idx < 4 || token_idx % 8 == 0 {
+                                                let anchor_pos = if token_idx < 4 { token_idx } else { 4 + (token_idx - 4) / 8 };
+                                                anchors[(bh_idx * anchor_count + anchor_pos) * d .. (bh_idx * anchor_count + anchor_pos + 1) * d].copy_from_slice(token_data);
+                                            }
+                                            let mut max_abs = 0.0f32;
+                                            for &v in token_data { let a = v.abs(); if a > max_abs { max_abs = a; } }
+                                            scales[bh_idx * s + token_idx] = max_abs;
+                                        }
+                                    }
+                                    if let Ok(at) = Tensor::from_vec(anchors, vec![b, h, anchor_count, d], &Device::Cpu) { map.insert("v_anchors".to_string(), at); }
+                                    let packed_len = packed_residuals.len();
+                                    if let Ok(pt) = Tensor::from_vec(packed_residuals, vec![packed_len], &Device::Cpu) { map.insert("v_packed".to_string(), pt); }
+                                    if let Ok(st) = Tensor::from_vec(scales, vec![b, h, s, 1], &Device::Cpu) { map.insert("v_scales".to_string(), st); }
+                                }
+                            }
+                        }
+
                         if let Ok(mode_tensor) = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu) {
                             map.insert("mode".to_string(), mode_tensor);
                         }
@@ -368,80 +404,78 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     }
                 }
                 SlotTask::Load(load) => {
-                    // [BULK-LOAD] Load all 28 layers for this master block at once
+                    // [LAYER-LOAD] Load specific layer for this master block
                     let (offset, index) = {
                         let inner = load.shared_block.inner.read().unwrap();
                         (inner.offset, inner.index)
                     };
                     
-                    let slot = &SLOT_MANAGER.slots[load.slot_id];
-                    let mut success_count = 0;
-                    let num_layers = slot.k_layers.len();
+                    let layer_idx = load.layer_idx;
 
-                    for layer_idx in 0..num_layers {
-                        let filename = if offset == 0 { 
-                            format!("layer_{}_kv.safetensors", layer_idx) 
-                        } else { 
-                            format!("layer_{}_kv_{}.safetensors", layer_idx, offset) 
-                        };
-                        
-                        let path = load.path.join(filename);
-                        if path.exists() {
-                            if let Ok(content) = std::fs::read(&path) {
-                                if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
-                                    let extract_vec = |name: &str| -> Option<Vec<f32>> {
-                                        st.tensor(name).ok().map(|v| unsafe {
-                                            std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
-                                        })
-                                    };
+                    let filename = if offset == 0 { 
+                        format!("layer_{}_kv.safetensors", layer_idx) 
+                    } else { 
+                        format!("layer_{}_kv_{}.safetensors", layer_idx, offset) 
+                    };
+                    
+                    let path = load.path.join(filename);
+                    let mut success = false;
 
-                                    if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
-                                        if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
-                                            
-                                            let original_shape = if let Ok(view) = st.tensor("k_shape") {
-                                                let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
-                                                shape_u32.iter().map(|&x| x as usize).collect()
-                                            } else { vec![1, 8, 1024, 128] };
+                    if path.exists() {
+                        if let Ok(content) = std::fs::read(&path) {
+                            if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
+                                let extract_vec = |name: &str| -> Option<Vec<f32>> {
+                                    st.tensor(name).ok().map(|v| unsafe {
+                                        std::slice::from_raw_parts(v.data().as_ptr() as *const f32, v.data().len() / 4).to_vec()
+                                    })
+                                };
 
-                                            // Decompress and store in the Master Slot's specific layer
-                                            // Note: In a real scenario, we'd use the model's decompress_from_bitkv, 
-                                            // but for simplicity here we just store metadata or use a helper.
-                                            // For now, let's assume we store the decompressed tensors if possible.
-                                            // [TEMP] To keep it simple, we update the metadata in the block.
-                                            if layer_idx == load.layer_idx {
-                                                let mut inner = load.shared_block.inner.write().unwrap();
-                                                inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata {
-                                                    k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                                    k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                                    k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
-                                                    v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                                    v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                                    v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
-                                                    original_shape,
-                                                });
-                                            }
-                                            success_count += 1;
-                                        }
+                                if let (Some(ka), Some(kp), Some(ks)) = (extract_vec("k_anchors"), st.tensor("k_packed").ok(), extract_vec("k_scales")) {
+                                    if let (Some(va), Some(vp), Some(vs)) = (extract_vec("v_anchors"), st.tensor("v_packed").ok(), extract_vec("v_scales")) {
+                                        
+                                        let original_shape = if let Ok(view) = st.tensor("k_shape") {
+                                            let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
+                                            shape_u32.iter().map(|&x| x as usize).collect()
+                                        } else { vec![1, 8, 1024, 128] };
+
+                                        // Store metadata only for the requested layer
+                                        let mut inner = load.shared_block.inner.write().unwrap();
+                                        inner.bitkv_metadata = Some(crate::models::qwen3vl::quantized_model::BitKVMetadata {
+                                            k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                            k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
+                                            k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
+                                            v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (original_shape[2] + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
+                                            v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
+                                            v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], original_shape[2], 1), &Device::Cpu).unwrap(),
+                                            original_shape,
+                                        });
+                                        success = true;
                                     }
                                 }
                             }
                         }
                     }
                     
-                    if success_count > 0 {
-                        let mut reg = load.registry.entries.write().unwrap();
-                        if index < reg.len() {
-                            reg[index].location = KVLocation::RAM;
-                            reg[index].slot_id = Some(load.slot_id);
+                    if success {
+                        {
+                            let mut reg = load.registry.entries.write().unwrap();
+                            if index < reg.len() {
+                                reg[index].location = KVLocation::RAM;
+                                reg[index].slot_id = Some(load.slot_id);
+                            }
                         }
-                        println!("[SLOT-WORKER] Master Block {} (Offset {}) bulk loaded ({} layers).", index, offset, success_count);
+                        // Note: For layer-wise distribution, we don't hold the slot globally for all layers.
+                        // However, to satisfy SLOT_MANAGER stats, we mark it Ready.
+                        SLOT_MANAGER.mark_ready(load.slot_id).await;
                     } else {
-                        let mut reg = load.registry.entries.write().unwrap();
-                        if index < reg.len() {
-                            reg[index].location = KVLocation::SSD;
+                        {
+                            let mut reg = load.registry.entries.write().unwrap();
+                            if index < reg.len() {
+                                reg[index].location = KVLocation::SSD;
+                            }
                         }
+                        SLOT_MANAGER.release_slot(load.slot_id).await;
                     }
-                    SLOT_MANAGER.release_slot(load.slot_id).await; 
                 }
             }
         }
@@ -1086,11 +1120,14 @@ impl Qwen3VLGenerateModel {
                 for layer in &mut m.language_model.layers {
                     for block in &mut layer.self_attn.kv_blocks {
                         let index = block.inner.read().unwrap().index;
-                        if index < reg.len() && reg[index].location != KVLocation::VRAM {
-                            let mut inner = block.inner.write().unwrap();
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                            inner.location = reg[index].location;
+                        if index < reg.len() {
+                            let loc = reg[index].location;
+                            if loc != KVLocation::VRAM && loc != KVLocation::Loading {
+                                let mut inner = block.inner.write().unwrap();
+                                inner.k_cache = None;
+                                inner.v_cache = None;
+                                inner.location = loc;
+                            }
                         }
                     }
                 }
@@ -1101,11 +1138,14 @@ impl Qwen3VLGenerateModel {
                 for layer in &mut m.language_model.layers {
                     for block in &mut layer.self_attn.kv_blocks {
                         let index = block.inner.read().unwrap().index;
-                        if index < reg.len() && reg[index].location != KVLocation::VRAM {
-                            let mut inner = block.inner.write().unwrap();
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                            inner.location = reg[index].location;
+                        if index < reg.len() {
+                            let loc = reg[index].location;
+                            if loc != KVLocation::VRAM && loc != KVLocation::Loading {
+                                let mut inner = block.inner.write().unwrap();
+                                inner.k_cache = None;
+                                inner.v_cache = None;
+                                inner.location = loc;
+                            }
                         }
                     }
                 }
