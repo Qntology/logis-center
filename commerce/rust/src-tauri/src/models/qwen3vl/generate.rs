@@ -193,15 +193,30 @@ pub struct LoadTask {
     pub registry: crate::models::qwen3vl::quantized_model::KVRegistry, // [NEW]
 }
 
-pub static SLOT_TX: once_cell::sync::Lazy<tokio::sync::Mutex<Option<mpsc::Sender<SlotTask>>>> = once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+use tokio::sync::OnceCell;
+
+pub static SLOT_TX: OnceCell<mpsc::Sender<SlotTask>> = OnceCell::const_new();
+
+/// 워커 채널을 안전하게 가져오며, 준비될 때까지 비동기적으로 대기합니다.
+pub async fn get_worker_channel() -> Result<mpsc::Sender<SlotTask>> {
+    // 준비될 때까지 최대 5초간 대기 (폴링 대신 yield 활용)
+    for _ in 0..50 {
+        if let Some(tx) = SLOT_TX.get() {
+            return Ok(tx.clone());
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(anyhow!("Slot worker channel initialization timed out"))
+}
 
 pub fn init_bake_worker() {
     let (tx, rx) = mpsc::channel(100);
     tauri::async_runtime::spawn(async move {
         spawn_slot_worker(rx);
     });
-    let mut lock = SLOT_TX.blocking_lock();
-    *lock = Some(tx);
+    let _ = SLOT_TX.set(tx);
+    println!("[INIT] Slot worker channel initialized and registered.");
 }
 
 fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
@@ -251,6 +266,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     let kv_name = bake.kv_name;
                     let offset = bake.offset;
                     
+                    if bake.layers.is_empty() {
+                        println!("[SLOT-WORKER] BakeTask has no layers. Releasing slot {}.", slot_id);
+                        SLOT_MANAGER.release_slot(slot_id).await;
+                        continue;
+                    }
+
                     // [FIX] Initialize layer counter before starting Phase B tasks
                     let slot = &SLOT_MANAGER.slots[slot_id];
                     let total_layers = bake.layers.len();
@@ -323,9 +344,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         }
 
                         // [CRITICAL] 텐서 처리가 실패하여 map이 비었더라도, 반드시 io_tx로 작업을 보내 카운트를 감소시켜야 합니다.
-                        if let Err(e) = io_tx.blocking_send(SaveTask { slot_id, path, tensors: map }) {
+                        if let Err(e) = io_tx.send(SaveTask { slot_id, path, tensors: map }).await {
                             println!("[SLOT-WORKER] Fatal error: io_tx channel closed: {}", e);
-                            // 채널이 닫혔다면 슬롯을 여기서 강제로라도 마크해야 할 수도 있습니다.
                         }
                     }
                 }
@@ -695,94 +715,85 @@ impl Qwen3VLGenerateModel {
 
             // 2. [HANDOFF] 슬롯 확보 및 VRAM -> RAM 전송
             if let Some(sid) = &session_id {
-                // [FIX] 현재 위치가 아닌 전체 토큰 양을 기준으로 슬롯 범위를 결정하여 
-                // 작업 도중 Limit이 줄어들어 발생하는 Hang 현상을 방지합니다.
                 let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
-                let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                if !path.exists() { let _ = fs::create_dir_all(&path); }
+                
+                let result = async {
+                    let path = crate::utils::paths::get_kv_dir(None).join(sid);
+                    if !path.exists() { let _ = fs::create_dir_all(&path); }
 
-                // KV 캐시 추출
-                let (ks, vs) = self.get_current_kv();
-                let mut layer_dumps = Vec::new();
-                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    let s_len = k.dim(2)?;
-                    // 현재 청크에 해당하는 부분만 추출
-                    let k_slice = k.narrow(2, s_len - chunk_len, chunk_len)?.contiguous()?;
-                    let v_slice = v.narrow(2, s_len - chunk_len, chunk_len)?.contiguous()?;
-                    layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
-                }
+                    // KV 캐시 추출
+                    let (ks, vs) = self.get_current_kv();
+                    if ks.is_empty() {
+                        return Err(anyhow!("No KV data to offload. Possibly auto-purged by forward pass."));
+                    }
 
-                // [HANDOFF] VRAM -> SSD Transition
-                // Sync ALL layers via central registry so every layer knows where its context is stored
-                let registry = match self.qwen3_vl {
-                    ModelVariant::QuantizedText(ref m) => Some(m.language_model.registry.clone()),
-                    ModelVariant::QuantizedVL(ref m) => Some(m.language_model.registry.clone()),
-                    _ => None,
-                };
-
-                if let Some(reg_obj) = registry {
-                    let mut reg = reg_obj.entries.write().unwrap();
-                    for entry in reg.iter_mut() {
-                        if entry.location == KVLocation::VRAM {
-                            entry.location = KVLocation::SSD;
-                            entry.ssd_path = Some(path.clone());
+                    let mut layer_dumps = Vec::new();
+                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                        let s_len = k.dim(2)?;
+                        if s_len < chunk_len {
+                            return Err(anyhow!("KV length mismatch: {} vs chunk {}", s_len, chunk_len));
                         }
+                        // 현재 청크에 해당하는 부분만 추출
+                        let k_slice = k.narrow(2, s_len - chunk_len, chunk_len)?.contiguous()?;
+                        let v_slice = v.narrow(2, s_len - chunk_len, chunk_len)?.contiguous()?;
+                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
+                    }
+
+                    // [HANDOFF] VRAM -> SSD Transition
+                    // Sync ALL layers via central registry so every layer knows where its context is stored
+                    let registry = match self.qwen3_vl {
+                        ModelVariant::QuantizedText(ref m) => Some(m.language_model.registry.clone()),
+                        ModelVariant::QuantizedVL(ref m) => Some(m.language_model.registry.clone()),
+                        _ => None,
+                    };
+
+                    if let Some(reg_obj) = registry {
+                        let mut reg = reg_obj.entries.write().unwrap();
+                        for entry in reg.iter_mut() {
+                            if entry.location == KVLocation::VRAM {
+                                entry.location = KVLocation::SSD;
+                                entry.ssd_path = Some(path.clone());
+                            }
+                        }
+                    }
+
+                    // Also clear physical caches in the blocks
+                    self.clear_temporal_kv_caches();
+
+                    let dev = self.text_device.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = dev.synchronize();
+                    }).await;
+
+                    // 워커가 준비될 때까지 명시적으로 대기 (헬퍼 함수 활용)
+                    match get_worker_channel().await {
+                        Ok(tx) => {
+                            tx.send(SlotTask::Bake(BakeTask {
+                                slot_id,
+                                task_dir: path,
+                                kv_name: kv_name.clone(),
+                                offset: end,
+                                layers: layer_dumps,
+                            })).await.map_err(|e| anyhow!("Failed to send to slot worker: {}", e))?;
+                            Ok(())
+                        },
+                        Err(e) => Err(e)
+                    }
+                }.await;
+
+                if let Err(e) = result {
+                    println!("[SLOT-ERROR] Failed to prepare offload: {}. Releasing slot {}.", e, slot_id);
+                    SLOT_MANAGER.release_slot(slot_id).await;
+                    // Auto-purged data is not a fatal error for the prefill loop, it just means we don't save this chunk.
+                    if e.to_string().contains("No KV data") {
+                        // Continue
+                    } else {
+                        return Err(e);
                     }
                 }
 
-                // Also clear physical caches in the blocks
-                if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
-                    for layer in &mut m.language_model.layers {
-                        for block in &mut layer.self_attn.kv_blocks {
-                            let mut inner = block.inner.write().unwrap();
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                        }
-                    }
-                } else if let ModelVariant::QuantizedVL(ref mut m) = self.qwen3_vl {
-                    for layer in &mut m.language_model.layers {
-                        for block in &mut layer.self_attn.kv_blocks {
-                            let mut inner = block.inner.write().unwrap();
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                        }
-                    }
-                }
-
-                let dev = self.text_device.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = dev.synchronize();
-                }).await;
-
-                // 워커에게 전달
-                if let Some(tx) = SLOT_TX.lock().await.as_ref() {
-                    let _ = tx.send(SlotTask::Bake(BakeTask {
-                        slot_id,
-                        task_dir: path,
-                        kv_name: kv_name.clone(),
-                        offset: end,
-                        layers: layer_dumps,
-                    })).await;
-                }
-
-                // [CLEANUP] Clear temporal VRAM caches used for layer-to-layer reuse
-                if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
-                    for layer in &mut m.language_model.layers {
-                        for block in &mut layer.self_attn.kv_blocks {
-                            let mut inner = block.inner.write().unwrap();
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                        }
-                    }
-                } else if let ModelVariant::QuantizedVL(ref mut m) = self.qwen3_vl {
-                    for layer in &mut m.language_model.layers {
-                        for block in &mut layer.self_attn.kv_blocks {
-                            let mut inner = block.inner.write().unwrap();
-                            inner.k_cache = None;
-                            inner.v_cache = None;
-                        }
-                    }
-                }
+                // [CLEANUP] Ensure caches are clear for the next chunk
+                self.clear_temporal_kv_caches();
             }
 
             current_pos = end;
@@ -886,25 +897,41 @@ impl Qwen3VLGenerateModel {
             self.qwen3_vl.forward(&chunk_ids, None, None, None, None, Some(&chunk_pos), seqlen_offset, total_tokens, session_id.clone())?;
             local_pos += chunk_size;
             seqlen_offset += chunk_size;
-            if seqlen_offset % 1024 == 0 {
+            if seqlen_offset % 1024 == 0 && seqlen_offset > 0 {
                 if let Some(sid) = &session_id {
-                    // [HANDOFF] Use slot manager for checkpointing
                     let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    if !path.exists() { let _ = fs::create_dir_all(&path); }
-
-                    let (ks, vs) = self.get_current_kv();
-                    let mut layer_dumps = Vec::new();
-                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
-                    }
                     
-                    if let Some(tx) = SLOT_TX.lock().await.as_ref() {
-                        let _ = tx.send(SlotTask::Bake(BakeTask {
-                            slot_id, task_dir: path, kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
-                        })).await;
+                    let result = async {
+                        if !path.exists() { let _ = fs::create_dir_all(&path); }
+
+                        let (ks, vs) = self.get_current_kv();
+                        if ks.is_empty() {
+                            return Err(anyhow!("No KV data to checkpoint."));
+                        }
+
+                        let mut layer_dumps = Vec::new();
+                        for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                            layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
+                        }
+                        
+                        match get_worker_channel().await {
+                            Ok(tx) => {
+                                tx.send(SlotTask::Bake(BakeTask {
+                                    slot_id, task_dir: path, kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
+                                })).await.map_err(|e| anyhow!("Send failed: {}", e))?;
+                                Ok(())
+                            },
+                            Err(e) => Err(e)
+                        }
+                    }.await;
+
+                    if let Err(e) = result {
+                        println!("[GEN-PREFILL] Checkpoint skipped: {}. Releasing slot {}.", e, slot_id);
+                        SLOT_MANAGER.release_slot(slot_id).await;
+                    } else {
+                        println!("[GEN-PREFILL] Checkpoint Slot {} at {}", slot_id, seqlen_offset);
                     }
-                    println!("[GEN-PREFILL] Checkpoint Slot {} at {}", slot_id, seqlen_offset);
                 }
             }
         }
@@ -929,38 +956,49 @@ impl Qwen3VLGenerateModel {
             // [WINDOW-BAKE] Trigger dump every 512 tokens
             if seqlen_offset > 0 && seqlen_offset % bake_block_size == 0 && !task_dir_base.as_os_str().is_empty() {
                 let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
-                println!("[WINDOW-BAKE] {} boundary hit. Offloading block to Slot {}.", seqlen_offset, slot_id);
                 
-                let (ks, vs) = self.get_current_kv();
-                let mut layer_dumps = Vec::new();
-                for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                    let current_mem_len = k.dim(2)?;
-                    if current_mem_len >= bake_block_size {
-                        let k_slice = k.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
-                        let v_slice = v.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
-                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
-                    }
-                }
-                
-                if !layer_dumps.is_empty() {
-                    if let Some(tx) = SLOT_TX.lock().await.as_ref() {
-                        let _ = tx.send(SlotTask::Bake(BakeTask {
-                            slot_id,
-                            task_dir: task_dir_base.clone(),
-                            kv_name: kv_name.clone().or_else(|| Some("default".to_string())),
-                            offset: seqlen_offset - bake_block_size,
-                            layers: layer_dumps,
-                        })).await;
+                let result = async {
+                    let (ks, vs) = self.get_current_kv();
+                    if ks.is_empty() { return Err(anyhow!("No KV data for window bake.")); }
+
+                    let mut layer_dumps = Vec::new();
+                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                        let current_mem_len = k.dim(2)?;
+                        if current_mem_len >= bake_block_size {
+                            let k_slice = k.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
+                            let v_slice = v.narrow(2, current_mem_len - bake_block_size, bake_block_size)?.contiguous()?;
+                            layer_dumps.push(LayerKVDump { layer_idx: idx, k: k_slice, v: v_slice });
+                        }
                     }
                     
+                    if layer_dumps.is_empty() { return Err(anyhow!("Layer dumps empty for window bake.")); }
+
+                    match get_worker_channel().await {
+                        Ok(tx) => {
+                            tx.send(SlotTask::Bake(BakeTask {
+                                slot_id,
+                                task_dir: task_dir_base.clone(),
+                                kv_name: kv_name.clone().or_else(|| Some("default".to_string())),
+                                offset: seqlen_offset - bake_block_size,
+                                layers: layer_dumps,
+                            })).await.map_err(|e| anyhow!("Send failed: {}", e))?;
+                            Ok(())
+                        },
+                        Err(e) => Err(e)
+                    }
+                }.await;
+
+                if let Err(e) = result {
+                    println!("[WINDOW-BAKE] Skipped: {}. Releasing slot {}.", e, slot_id);
+                    SLOT_MANAGER.release_slot(slot_id).await;
+                } else {
+                    println!("[WINDOW-BAKE] {} boundary hit. Offloaded to Slot {}.", seqlen_offset, slot_id);
                     // [SLIDING-WINDOW-PURGE] 
                     let current_kv_len = self.get_kv_len();
                     if current_kv_len > window_keep_size {
                         let purge_len = current_kv_len - window_keep_size;
                         let _ = self.truncate_kv_cache(purge_len);
                     }
-                } else {
-                    SLOT_MANAGER.release_slot(slot_id).await;
                 }
             }
 
@@ -982,44 +1020,80 @@ impl Qwen3VLGenerateModel {
                 if let Some(sid) = &session_id {
                     let slot_id = SLOT_MANAGER.acquire_write_slot(total_tokens).await;
                     let path = crate::utils::paths::get_kv_dir(None).join(sid);
-                    let (ks, vs) = self.get_current_kv();
-                    let mut layer_dumps = Vec::new();
-                    for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
-                        layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
+                    
+                    let result = async {
+                        let (ks, vs) = self.get_current_kv();
+                        if ks.is_empty() { return Err(anyhow!("No KV data for inference checkpoint.")); }
+
+                        let mut layer_dumps = Vec::new();
+                        for (idx, (k, v)) in ks.into_iter().zip(vs.into_iter()).enumerate() {
+                            layer_dumps.push(LayerKVDump { layer_idx: idx, k: k.clone(), v: v.clone() });
+                        }
+                        
+                        match get_worker_channel().await {
+                            Ok(tx) => {
+                                tx.send(SlotTask::Bake(BakeTask {
+                                    slot_id, task_dir: path.clone(), kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
+                                })).await.map_err(|e| anyhow!("Send failed: {}", e))?;
+                                Ok(())
+                            },
+                            Err(e) => Err(e)
+                        }
+                    }.await;
+
+                    if let Err(e) = result {
+                        println!("[INFERENCE-SAVE] Checkpoint skipped: {}. Releasing slot {}.", e, slot_id);
+                        SLOT_MANAGER.release_slot(slot_id).await;
+                    } else {
+                        let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
+                        let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
                     }
-                    if let Some(tx) = SLOT_TX.lock().await.as_ref() {
-                        let _ = tx.send(SlotTask::Bake(BakeTask {
-                            slot_id, task_dir: path.clone(), kv_name: kv_name.clone(), offset: seqlen_offset, layers: layer_dumps
-                        })).await;
-                    }
-                    let progress = serde_json::json!({ "text": generated_text, "ids": all_ids });
-                    let _ = std::fs::write(path.join("generation_progress.json"), progress.to_string());
                 }
             }
             seqlen_offset += seq_len;
             pixel_values = None;
 
-            // [CLEANUP] Clear temporal VRAM caches used for layer-to-layer reuse
-            if let ModelVariant::QuantizedText(ref mut m) = self.qwen3_vl {
-                for layer in &mut m.language_model.layers {
-                    for block in &mut layer.self_attn.kv_blocks {
-                        let mut inner = block.inner.write().unwrap();
-                        inner.k_cache = None;
-                        inner.v_cache = None;
-                    }
-                }
-            } else if let ModelVariant::QuantizedVL(ref mut m) = self.qwen3_vl {
-                for layer in &mut m.language_model.layers {
-                    for block in &mut layer.self_attn.kv_blocks {
-                        let mut inner = block.inner.write().unwrap();
-                        inner.k_cache = None;
-                        inner.v_cache = None;
-                    }
-                }
-            }
+            // [CLEANUP] Clear temporal VRAM caches for blocks that are already backed up
+            self.clear_temporal_kv_caches();
         }
         if let Some(sid) = &session_id { let _ = std::fs::remove_file(crate::utils::paths::get_kv_dir(None).join(sid).join("generation_progress.json")); }
         Ok(generated_text)
+    }
+
+    pub fn clear_temporal_kv_caches(&mut self) {
+        match self.qwen3_vl {
+            ModelVariant::QuantizedText(ref mut m) => {
+                let reg_obj = m.language_model.registry.clone();
+                let reg = reg_obj.entries.read().unwrap();
+                for layer in &mut m.language_model.layers {
+                    for block in &mut layer.self_attn.kv_blocks {
+                        let index = block.inner.read().unwrap().index;
+                        if index < reg.len() && reg[index].location != KVLocation::VRAM {
+                            let mut inner = block.inner.write().unwrap();
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                            inner.location = reg[index].location;
+                        }
+                    }
+                }
+            },
+            ModelVariant::QuantizedVL(ref mut m) => {
+                let reg_obj = m.language_model.registry.clone();
+                let reg = reg_obj.entries.read().unwrap();
+                for layer in &mut m.language_model.layers {
+                    for block in &mut layer.self_attn.kv_blocks {
+                        let index = block.inner.read().unwrap().index;
+                        if index < reg.len() && reg[index].location != KVLocation::VRAM {
+                            let mut inner = block.inner.write().unwrap();
+                            inner.k_cache = None;
+                            inner.v_cache = None;
+                            inner.location = reg[index].location;
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
     }
 
     pub fn get_kv_len(&self) -> usize {

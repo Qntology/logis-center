@@ -513,10 +513,10 @@ impl QuantizedQwen3VLTextAttention {
                 let shared_block = block.clone();
                 let registry_clone = self.registry.clone();
                 tauri::async_runtime::spawn(async move {
-                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SLOT_TX, SlotTask, LoadTask};
+                    use crate::models::qwen3vl::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_worker_channel};
                     let slot_id = SLOT_MANAGER.acquire_read_slot().await;
-                    if let Some(tx_lock) = SLOT_TX.lock().await.as_ref() {
-                        let _ = tx_lock.send(SlotTask::Load(LoadTask {
+                    if let Ok(tx) = get_worker_channel().await {
+                        let _ = tx.send(SlotTask::Load(LoadTask {
                             slot_id,
                             path,
                             layer_idx: 0,
@@ -776,11 +776,26 @@ impl QuantizedQwen3VLTextAttention {
             // [FIX] Pre-calculate take amount to avoid simultaneous borrow
             let num_to_offload = self.kv_blocks.len().saturating_sub(2);
             for block in self.kv_blocks.iter_mut().take(num_to_offload) {
-                let mut inner = block.inner.write().unwrap();
-                if inner.location == KVLocation::VRAM {
-                    inner.location = KVLocation::SSD;
-                    inner.k_cache = None;
-                    inner.v_cache = None;
+                let (index, current_inner_loc) = {
+                    let inner = block.inner.read().unwrap();
+                    (inner.index, inner.location)
+                };
+
+                // [CRITICAL] Only purge if the registry confirms it's backed up to SSD or RAM.
+                // If registry still says VRAM, this block is "dirty" and must stay in VRAM until prefill_only saves it.
+                let reg_loc = {
+                    let reg = self.registry.entries.read().unwrap();
+                    if index < reg.len() { reg[index].location } else { KVLocation::VRAM }
+                };
+
+                if reg_loc != KVLocation::VRAM {
+                    let mut inner = block.inner.write().unwrap();
+                    if inner.location == KVLocation::VRAM {
+                        println!("[OFFLOAD] Purging backed-up block {} from VRAM to save space.", index);
+                        inner.location = reg_loc; // Sync with registry (usually SSD)
+                        inner.k_cache = None;
+                        inner.v_cache = None;
+                    }
                 }
             }
         }
