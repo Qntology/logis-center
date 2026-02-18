@@ -331,6 +331,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             
             if remaining == 1 {
                 SLOT_MANAGER.release_slot(task.slot_id).await;
+                // [FIX] 작업 완료 시 카운트 감소
+                ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
             }
         }
     });
@@ -1050,6 +1052,16 @@ impl Qwen3VLGenerateModel {
                                 *v_guard = Some(new_v);
                                 base_slot.state.store(2, Ordering::SeqCst);
                                 base_slot.ready_signal.notify_waiters();
+
+                                // [FIX] RAM에 적재되었으므로 즉시 장부(Registry) 업데이트
+                                // 이제 clear_temporal_kv_caches가 이 블록을 VRAM에서 즉시 지울 수 있음
+                                if let Some(reg_obj) = &registry {
+                                    let mut reg = reg_obj.entries.write().unwrap();
+                                    if global_block_index < reg.len() {
+                                        reg[global_block_index].location[l_idx] = KVLocation::RAM;
+                                        reg[global_block_index].slot_ids[l_idx] = Some(base_slot.id);
+                                    }
+                                }
                             }
                         }
 
@@ -1066,6 +1078,8 @@ impl Qwen3VLGenerateModel {
 
                         match get_worker_channel().await {
                             Ok(tx) => {
+                                // [FIX] 작업 시작 시 카운트 증가
+                                ACTIVE_BAKE_TASKS.fetch_add(1, Ordering::SeqCst);
                                 tx.send(SlotTask::Bake(BakeTask {
                                     slot_id: sub_slot_id,
                                     task_dir: path.clone(),

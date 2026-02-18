@@ -1727,8 +1727,8 @@ impl QuantizedQwen3VLTextModel {
                     for s in &SLOT_MANAGER.base_slots {
                         if s.state.load(std::sync::atomic::Ordering::Relaxed) != 0 { active_base += 1; }
                     }
-                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Progress: {}/{} | Base: {}/28 | Sub: Active={}, Free={}", 
-                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset, total_len, 
+                    println!("[STAT] VRAM: {}MB Used / {}MB Free | Context Baked: {} tokens | Base: {}/28 | Sub: Active={}, Free={}", 
+                        mem.used / 1024 / 1024, mem.free / 1024 / 1024, seqlen_offset, 
                         active_base, active_sub, free_sub);
                 }
             }
