@@ -30,13 +30,20 @@ use std::path::Path;
 
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+use std::collections::VecDeque;
+use tokio::sync::oneshot;
 
-// [GLOBAL] 슬롯 관리자: 풀(Pool) 기반 유기적 관리
+pub enum SlotRequest {
+    AcquireRead { response: oneshot::Sender<usize> },
+    AcquireWrite { response: oneshot::Sender<usize>, total_tokens: usize },
+    Release { idx: usize },
+    MarkReady { idx: usize },
+}
+
+// [GLOBAL] 슬롯 관리자: 중앙 디스패처 기반 관리
 pub struct SlotManager {
     pub slots: Vec<crate::models::qwen3vl::quantized_model::MemorySlot>,
-    pub handoff_notifier: Arc<tokio::sync::Notify>,
-    pub active_write_count: Arc<AtomicUsize>,
-    pub last_picked_idx: Arc<AtomicUsize>, // [NEW] 로테이션을 위한 인덱스
+    pub request_tx: mpsc::Sender<SlotRequest>,
     pub count_reads: Arc<AtomicUsize>,
     pub count_writes: Arc<AtomicUsize>,
     pub count_cached: Arc<AtomicUsize>,
@@ -50,133 +57,215 @@ impl SlotManager {
         for i in 0..count {
             slots.push(crate::models::qwen3vl::quantized_model::MemorySlot::new(i, num_layers));
         }
+
+        let (tx, rx) = mpsc::channel(200); // 큐 크기 확장
+        let count_reads = Arc::new(AtomicUsize::new(0));
+        let count_writes = Arc::new(AtomicUsize::new(0));
+        let count_cached = Arc::new(AtomicUsize::new(0));
+        let count_free = Arc::new(AtomicUsize::new(count));
+
+        // 디스패처 태스크 실행
+        let count_r = count_reads.clone();
+        let count_w = count_writes.clone();
+        let count_c = count_cached.clone();
+        let count_f = count_free.clone();
+        
+        let mut free_pool: VecDeque<usize> = (0..count).collect();
+        let ready_pool: VecDeque<usize> = VecDeque::new();
+        let max_pool_size = count;
+        
+        tauri::async_runtime::spawn(async move {
+            Self::slot_dispatcher(rx, free_pool, ready_pool, count_r, count_w, count_c, count_f, max_pool_size).await;
+        });
+
         Self {
             slots,
-            handoff_notifier: Arc::new(tokio::sync::Notify::new()),
-            active_write_count: Arc::new(AtomicUsize::new(0)),
-            last_picked_idx: Arc::new(AtomicUsize::new(0)),
-            count_reads: Arc::new(AtomicUsize::new(0)),
-            count_writes: Arc::new(AtomicUsize::new(0)),
-            count_cached: Arc::new(AtomicUsize::new(0)),
-            count_free: Arc::new(AtomicUsize::new(count)),
+            request_tx: tx,
+            count_reads,
+            count_writes,
+            count_cached,
+            count_free,
         }
     }
 
-    // 상태 변경 시 카운터 업데이트 유틸리티
-    fn update_counters(&self, old_state: u8, new_state: u8) {
-        if old_state == new_state { return; }
-        let dec = |c: &Arc<AtomicUsize>| { c.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1))).ok(); };
-        match old_state {
-            0 => dec(&self.count_free),
-            1 => dec(&self.count_writes),
-            2 => dec(&self.count_cached),
-            3 => dec(&self.count_reads),
-            _ => {},
-        };
-        match new_state {
-            0 => { self.count_free.fetch_add(1, Ordering::SeqCst); },
-            1 => { self.count_writes.fetch_add(1, Ordering::SeqCst); },
-            2 => { self.count_cached.fetch_add(1, Ordering::SeqCst); },
-            3 => { self.count_reads.fetch_add(1, Ordering::SeqCst); },
-            _ => {},
-        };
+    async fn slot_dispatcher(
+        mut rx: mpsc::Receiver<SlotRequest>,
+        mut free_pool: VecDeque<usize>,
+        mut ready_pool: VecDeque<usize>,
+        count_r: Arc<AtomicUsize>,
+        count_w: Arc<AtomicUsize>,
+        count_c: Arc<AtomicUsize>,
+        count_f: Arc<AtomicUsize>,
+        max_pool_size: usize,
+    ) {
+        let mut pending_writes: VecDeque<(oneshot::Sender<usize>, usize)> = VecDeque::new();
+        let mut pending_reads: VecDeque<oneshot::Sender<usize>> = VecDeque::new();
+        let mut active_write_count = 0;
+        let mut sys = sysinfo::System::new_all();
+
+        println!("[SLOT-DISPATCHER] Adaptive Dispatcher Started.");
+
+        while let Some(request) = rx.recv().await {
+            match request {
+                SlotRequest::AcquireWrite { response, total_tokens } => {
+                    sys.refresh_memory();
+                    let max_concurrent = Self::calculate_dynamic_budget(&sys, total_tokens, max_pool_size);
+                    
+                    if active_write_count < max_concurrent {
+                        if let Some(idx) = free_pool.pop_front() {
+                            let _ = response.send(idx);
+                            active_write_count += 1;
+                            count_f.fetch_sub(1, Ordering::SeqCst);
+                            count_w.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        } else if let Some(idx) = ready_pool.pop_front() {
+                            let _ = response.send(idx);
+                            active_write_count += 1;
+                            count_c.fetch_sub(1, Ordering::SeqCst);
+                            count_w.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                    }
+                    pending_writes.push_back((response, total_tokens));
+                }
+                SlotRequest::AcquireRead { response } => {
+                    if let Some(idx) = free_pool.pop_front() {
+                        let _ = response.send(idx);
+                        count_f.fetch_sub(1, Ordering::SeqCst);
+                        count_r.fetch_add(1, Ordering::SeqCst);
+                    } else if let Some(idx) = ready_pool.pop_front() {
+                        let _ = response.send(idx);
+                        count_c.fetch_sub(1, Ordering::SeqCst);
+                        count_r.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        pending_reads.push_back(response);
+                    }
+                }
+                SlotRequest::Release { idx } => {
+                    free_pool.push_back(idx);
+                    count_f.fetch_add(1, Ordering::SeqCst);
+                    sys.refresh_memory();
+                    Self::process_queues(&sys, &mut free_pool, &mut ready_pool, &mut pending_writes, &mut pending_reads, &mut active_write_count, &count_f, &count_c, &count_w, &count_r, max_pool_size);
+                }
+                SlotRequest::MarkReady { idx } => {
+                    ready_pool.push_back(idx);
+                    count_c.fetch_add(1, Ordering::SeqCst);
+                    active_write_count = active_write_count.saturating_sub(1);
+                    count_w.fetch_sub(1, Ordering::SeqCst);
+                    sys.refresh_memory();
+                    Self::process_queues(&sys, &mut free_pool, &mut ready_pool, &mut pending_writes, &mut pending_reads, &mut active_write_count, &count_f, &count_c, &count_w, &count_r, max_pool_size);
+                }
+            }
+        }
+    }
+
+    // [ADAPTIVE] 시스템 상태와 태스크 규모에 따른 동적 워커 수 계산
+    fn calculate_dynamic_budget(sys: &sysinfo::System, total_tokens: usize, max_pool_size: usize) -> usize {
+        let available_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+        let safety_buffer = 1.5; // 1.5GB OS 여유분 확보
+        let usable_ram = (available_ram_gb - safety_buffer).max(0.0);
+        
+        // 0.6B 모델의 1024 토큰당 RAM 점유율 추정치 (BitKV 기준 약 15~20MB)
+        let mem_per_slot_gb = 0.02; 
+        
+        let ram_budget = (usable_ram / mem_per_slot_gb) as usize;
+        let token_budget = (total_tokens / 1024).saturating_add(2); // 컨텍스트 크기에 맞춤
+        
+        // 가용 RAM, 토큰 필요량, 물리적 슬롯 풀 크기 중 최소값 선택
+        let budget = ram_budget.min(token_budget).min(max_pool_size);
+        
+        // 최소 1개는 보장하되, 너무 적으면 4개까지는 시도
+        budget.max(4).min(max_pool_size)
+    }
+
+    fn process_queues(
+        sys: &sysinfo::System,
+        free_pool: &mut VecDeque<usize>,
+        ready_pool: &mut VecDeque<usize>,
+        pending_writes: &mut VecDeque<(oneshot::Sender<usize>, usize)>,
+        pending_reads: &mut VecDeque<oneshot::Sender<usize>>,
+        active_write_count: &mut usize,
+        count_f: &Arc<AtomicUsize>,
+        count_c: &Arc<AtomicUsize>,
+        count_w: &Arc<AtomicUsize>,
+        count_r: &Arc<AtomicUsize>,
+        max_pool_size: usize,
+    ) {
+        // 1. Write 대기열 처리 (동적 예산 적용)
+        while !pending_writes.is_empty() {
+            let (_, total_tokens) = pending_writes.front().unwrap();
+            let max_concurrent = Self::calculate_dynamic_budget(sys, *total_tokens, max_pool_size);
+            
+            if *active_write_count < max_concurrent {
+                if let Some(idx) = free_pool.pop_front() {
+                    let (res, _) = pending_writes.pop_front().unwrap();
+                    let _ = res.send(idx);
+                    *active_write_count += 1;
+                    count_f.fetch_sub(1, Ordering::SeqCst);
+                    count_w.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                } else if let Some(idx) = ready_pool.pop_front() {
+                    let (res, _) = pending_writes.pop_front().unwrap();
+                    let _ = res.send(idx);
+                    *active_write_count += 1;
+                    count_c.fetch_sub(1, Ordering::SeqCst);
+                    count_w.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+            }
+            break;
+        }
+
+        // 2. Read 대기열 처리
+        while !pending_reads.is_empty() {
+            if let Some(idx) = free_pool.pop_front() {
+                let res = pending_reads.pop_front().unwrap();
+                let _ = res.send(idx);
+                count_f.fetch_sub(1, Ordering::SeqCst);
+                count_r.fetch_add(1, Ordering::SeqCst);
+            } else if let Some(idx) = ready_pool.pop_front() {
+                let res = pending_reads.pop_front().unwrap();
+                let _ = res.send(idx);
+                count_c.fetch_sub(1, Ordering::SeqCst);
+                count_r.fetch_add(1, Ordering::SeqCst);
+            } else {
+                break;
+            }
+        }
     }
 
     pub async fn reset_all_slots(&self) {
-        println!("[SLOT-MANAGER] Force resetting all slots for new stage...");
-        for i in 0..self.slots.len() {
-            self.release_slot(i).await;
-        }
+        println!("[SLOT-MANAGER] Reset is now handled via Dispatcher lifecycle.");
     }
 
     pub async fn acquire_read_slot(&self) -> usize {
-        let count = self.slots.len();
-        loop {
-            let start_idx = self.last_picked_idx.load(Ordering::Relaxed);
-            
-            // 1순위: 로테이션하며 완전히 비어있는(Free) 슬롯 찾기
-            for i in 0..count {
-                let idx = (start_idx + i) % count;
-                let slot = &self.slots[idx];
-                if slot.state.compare_exchange(0, 3, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    self.update_counters(0, 3);
-                    self.last_picked_idx.store((idx + 1) % count, Ordering::Relaxed);
-                    return idx;
-                }
-            }
-
-            // 2순위: 비어있는 게 없다면 이미 캐시된(Ready) 슬롯 중 로테이션하며 찾기
-            for i in 0..count {
-                let idx = (start_idx + i) % count;
-                let slot = &self.slots[idx];
-                if slot.state.compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    self.prepare_for_reuse(idx).await;
-                    self.update_counters(2, 3);
-                    self.last_picked_idx.store((idx + 1) % count, Ordering::Relaxed);
-                    return idx;
-                }
-            }
-
-            tokio::time::timeout(std::time::Duration::from_millis(50), self.handoff_notifier.notified()).await.ok();
-        }
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_tx.send(SlotRequest::AcquireRead { response: tx }).await;
+        rx.await.unwrap_or(0)
     }
 
     pub async fn acquire_write_slot(&self, total_tokens: usize) -> usize {
-        let max_writes = self.get_max_concurrent_writes(total_tokens);
-        let count = self.slots.len();
-        loop {
-            if self.active_write_count.load(Ordering::SeqCst) < max_writes {
-                let start_idx = self.last_picked_idx.load(Ordering::Relaxed);
-                for i in 0..count {
-                    let idx = (start_idx + i) % count;
-                    if self.slots[idx].state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                        self.update_counters(0, 1);
-                        self.active_write_count.fetch_add(1, Ordering::SeqCst);
-                        self.last_picked_idx.store((idx + 1) % count, Ordering::Relaxed);
-                        println!("[SLOT-ACQUIRE] Write Slot {} (Rotation)", idx);
-                        return idx;
-                    }
-                }
-            }
-            tokio::time::timeout(std::time::Duration::from_millis(50), self.handoff_notifier.notified()).await.ok();
-        }
+        let (tx, rx) = oneshot::channel();
+        let _ = self.request_tx.send(SlotRequest::AcquireWrite { response: tx, total_tokens }).await;
+        rx.await.unwrap_or(0)
     }
 
     pub async fn release_slot(&self, id: usize) {
         if id < self.slots.len() {
-            let prev = self.slots[id].state.swap(0, Ordering::SeqCst);
-            if prev != 0 {
-                self.update_counters(prev, 0);
-                if prev == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
-                for layer_k in &self.slots[id].k_layers { *layer_k.lock().await = None; }
-                for layer_v in &self.slots[id].v_layers { *layer_v.lock().await = None; }
-            }
+            // 물리적 리소스 해제
+            for layer_k in &self.slots[id].k_layers { *layer_k.lock().await = None; }
+            for layer_v in &self.slots[id].v_layers { *layer_v.lock().await = None; }
+            self.slots[id].state.store(0, Ordering::SeqCst);
+            // 디스패처에 반납 알림
+            let _ = self.request_tx.send(SlotRequest::Release { idx: id }).await;
         }
-        self.handoff_notifier.notify_waiters();
-    }
-
-    // 컨텍스트 크기에 따른 "동시 쓰기 작업 허용 수" 제한
-    fn get_max_concurrent_writes(&self, total_tokens: usize) -> usize {
-        if total_tokens < 4096 { 12 }
-        else if total_tokens < 8192 { 8 }
-        else { 4 }
-    }
-
-    // 슬롯 재사용 전 초기화 (내부용)
-    async fn prepare_for_reuse(&self, id: usize) {
-        for layer_k in &self.slots[id].k_layers { *layer_k.lock().await = None; }
-        for layer_v in &self.slots[id].v_layers { *layer_v.lock().await = None; }
     }
 
     pub async fn mark_ready(&self, id: usize) {
         if id < self.slots.len() {
-            let current = self.slots[id].state.load(Ordering::SeqCst);
-            if (current == 1 || current == 3) && self.slots[id].state.compare_exchange(current, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                self.update_counters(current, 2);
-                if current == 1 { self.active_write_count.fetch_sub(1, Ordering::SeqCst); }
-            }
+            self.slots[id].state.store(2, Ordering::SeqCst);
+            let _ = self.request_tx.send(SlotRequest::MarkReady { idx: id }).await;
         }
-        self.handoff_notifier.notify_waiters();
     }
 
     pub fn get_counts(&self) -> (usize, usize, usize, usize) {
@@ -185,7 +274,7 @@ impl SlotManager {
 }
 
 pub static ACTIVE_BAKE_TASKS: AtomicUsize = AtomicUsize::new(0);
-pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(15)); // 1 Central + 14 Workers
+pub static SLOT_MANAGER: once_cell::sync::Lazy<SlotManager> = once_cell::sync::Lazy::new(|| SlotManager::new(64)); // 최대 64개까지 확장 가능한 풀
 
 // [MEMORY] 강제 메모리 해제 및 초기화 함수 (Async)
 async fn purge_vram_position(device: &Device) {
@@ -818,12 +907,12 @@ impl Qwen3VLGenerateModel {
                     
                                     if let Some(reg_obj) = registry {
                                         let mut reg = reg_obj.entries.write().unwrap();
-                                        let block_index = self.get_kv_len() / 1024; // Approximate
-                                        if block_index < reg.len() {
+                                        // [FIX] 모든 VRAM 상태인 블록을 SSD로 전환 (Baking 중에는 순차적으로 쌓이므로)
+                                        for entry in reg.iter_mut() {
                                             for l_idx in 0..28 {
-                                                if reg[block_index].location[l_idx] == KVLocation::VRAM {
-                                                    reg[block_index].location[l_idx] = KVLocation::SSD;
-                                                    reg[block_index].ssd_path = Some(path.clone());
+                                                if entry.location[l_idx] == KVLocation::VRAM {
+                                                    entry.location[l_idx] = KVLocation::SSD;
+                                                    entry.ssd_path = Some(path.clone());
                                                 }
                                             }
                                         }
