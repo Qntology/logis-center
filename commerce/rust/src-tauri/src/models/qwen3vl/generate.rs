@@ -305,7 +305,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
     tokio::spawn(async move {
         println!("[IO-WORKER] Disk writer started.");
         while let Some(task) = io_rx.recv().await {
-            let _start = std::time::Instant::now();
+            let pending_in_queue = ACTIVE_BAKE_TASKS.load(Ordering::Relaxed);
             
             if let Some(parent) = task.path.parent() {
                 if !parent.exists() { let _ = std::fs::create_dir_all(parent); }
@@ -315,7 +315,6 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             if let Err(e) = save_result {
                 println!("[IO-ERROR] Failed to save SSD chunk to {:?}: {}", task.path, e);
             } else {
-                // [REGISTRY-UPDATE] 명시적인 layer_idx를 사용하여 정확하게 업데이트
                 if let Some(reg_obj) = &task.registry {
                     let mut reg = reg_obj.entries.write().unwrap();
                     let block_index = task.offset / 1024;
@@ -331,8 +330,8 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             
             if remaining == 1 {
                 SLOT_MANAGER.release_slot(task.slot_id).await;
-                // [FIX] 작업 완료 시 카운트 감소
                 ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
+                println!("[IO-DONE] Slot {} finished. Remaining Tasks in Queue: {}", task.slot_id, ACTIVE_BAKE_TASKS.load(Ordering::Relaxed));
             }
         }
     });
@@ -344,6 +343,9 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
             match task {
                 SlotTask::Bake(bake) => {
                     let slot_id = bake.slot_id;
+                    println!("[SLOT-BAKE-START] Processing Slot {} at Offset {}. Queue Depth: {}", 
+                        slot_id, bake.offset, ACTIVE_BAKE_TASKS.load(Ordering::Relaxed));
+                    
                     let task_dir = bake.task_dir;
                     let kv_name = bake.kv_name;
                     let offset = bake.offset;
@@ -351,6 +353,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                     
                     if bake.layers.is_empty() {
                         SLOT_MANAGER.release_slot(slot_id).await;
+                        ACTIVE_BAKE_TASKS.fetch_sub(1, Ordering::SeqCst);
                         continue;
                     }
 
@@ -1067,13 +1070,13 @@ impl Qwen3VLGenerateModel {
                         }
 
                         // [SSD-OFFLOAD-TRIGGER] 1024 단위 블록이 완성될 때마다 Sub Slot을 통해 SSD로 전송
-                        // (이미 Base Slot에 안전하게 복사되었으므로 연산과 병렬 진행 가능)
                         let sub_slot_id = SLOT_MANAGER.acquire_sub_slot().await;
                         let mut layer_dumps = Vec::new();
                         for (l_idx, (k, v)) in ks.iter().zip(vs.iter()).enumerate() {
                             let s_len = k.dim(2)?;
                             let k_slice = k.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
                             let v_slice = v.narrow(2, s_len - chunk_len + block_offset_in_chunk, current_block_len)?.contiguous()?;
+                            
                             layer_dumps.push(LayerKVDump { layer_idx: l_idx, k: k_slice, v: v_slice });
                         }
 
@@ -1376,6 +1379,9 @@ impl Qwen3VLGenerateModel {
     }
 
     pub fn clear_temporal_kv_caches(&mut self) {
+        let mut cleared_count = 0;
+        let mut skipped_count = 0;
+        
         match self.qwen3_vl {
             ModelVariant::QuantizedText(ref mut m) => {
                 let reg_obj = m.language_model.registry.clone();
@@ -1383,10 +1389,7 @@ impl Qwen3VLGenerateModel {
                 for (layer_idx, layer) in m.language_model.layers.iter_mut().enumerate() {
                     for block in &mut layer.self_attn.kv_blocks {
                         let mut inner = block.inner.write().unwrap();
-                        // [OPTIMIZATION] VRAM만 비우고 RAM(Slot)에 있는 데이터는 유지
-                        // 이를 통해 'C' 숫자가 쌓이고 SSD 재읽기가 방지됨
                         if inner.location == KVLocation::VRAM {
-                            // 이미 SSD나 RAM에 백업된 정보가 있을 때만 VRAM을 비움
                             let reg_loc = if inner.index < reg.len() { 
                                 reg[inner.index].location[layer_idx] 
                             } else { 
@@ -1397,6 +1400,9 @@ impl Qwen3VLGenerateModel {
                                 inner.k_cache = None;
                                 inner.v_cache = None;
                                 inner.location = reg_loc;
+                                cleared_count += 1;
+                            } else {
+                                skipped_count += 1;
                             }
                         }
                     }
@@ -1419,12 +1425,18 @@ impl Qwen3VLGenerateModel {
                                 inner.k_cache = None;
                                 inner.v_cache = None;
                                 inner.location = reg_loc;
+                                cleared_count += 1;
+                            } else {
+                                skipped_count += 1;
                             }
                         }
                     }
                 }
             },
             _ => {}
+        }
+        if cleared_count > 0 || skipped_count > 0 {
+            println!("[VRAM-CLEAN] Evicted: {} blocks, Still in VRAM: {} blocks.", cleared_count, skipped_count);
         }
     }
 

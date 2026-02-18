@@ -1781,8 +1781,8 @@ impl QuantizedQwen3VLTextModel {
 
         // [SMART-SEQUENTIAL-LOOP]
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // [FLOW-CONTROL] Synchronous wait
-            while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= 20 {
+            // [FLOW-CONTROL] 임계값을 4개로 낮춰 VRAM 압박 최소화
+            while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= 4 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
