@@ -211,6 +211,9 @@ impl LogisModel {
     pub async fn deep_purge_resources(&self) {
         println!("[MEMORY] Initiating AGGRESSIVE Factory Reset Purge...");
         
+        // [SYNC-WAIT] 모든 백그라운드 슬롯 작업이 끝날 때까지 대기 (CUDA Context 보호)
+        crate::models::qwen3vl::generate::SLOT_MANAGER.wait_for_all_tasks().await;
+
         // 1. Clear ALL Slots (Explicitly take and drop everything)
         {
             let mut gen = self.generator.lock().await;

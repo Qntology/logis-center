@@ -552,20 +552,19 @@ impl QuantizedQwen3VLTextAttention {
         let mut vram_vs = Vec::new();
         let mut vram_total_len = 0;
 
+        // [STRICT-STREAMING] 현재 레이어 연산을 위한 조각 모음
         for block in &self.kv_blocks {
             let (mut k, mut v, b_len, index) = {
                 let inner = block.inner.read().unwrap();
                 (inner.k_cache.clone(), inner.v_cache.clone(), inner.len, inner.index)
             };
 
-            // [REGISTRY-LOOKUP] 2D 목차에서 이 레이어의 위치를 정확히 찾음
-            let (loc, ssd_path, layer_slot_id) = {
+            let (loc, layer_slot_id) = {
                 let reg = self.registry.entries.read().unwrap();
                 let entry = &reg[index];
-                (entry.location[self.layer_idx], entry.ssd_path.clone(), entry.slot_ids[self.layer_idx])
+                (entry.location[self.layer_idx], entry.slot_ids[self.layer_idx])
             };
 
-            // [WAIT-IF-LOADING] Safer wait with backoff and timeout
             if loc == KVLocation::Loading {
                 let mut attempts = 0;
                 while attempts < 100 { 
@@ -579,7 +578,6 @@ impl QuantizedQwen3VLTextAttention {
                 }
             }
 
-            // Re-read location after possible wait
             let loc = {
                 let reg = self.registry.entries.read().unwrap();
                 reg[index].location[self.layer_idx]
@@ -595,24 +593,16 @@ impl QuantizedQwen3VLTextAttention {
                 }
                 KVLocation::RAM | KVLocation::SSD => {
                     let mut inner = block.inner.write().unwrap();
-                    // [TEMPORAL-REUSE] If already decompressed by a previous layer (e.g. layer 0), use it immediately
-                    if let (Some(kc), Some(vc)) = (&inner.k_cache, &inner.v_cache) {
-                        k = Some(kc.clone());
-                        v = Some(vc.clone());
-                    } 
                     
-                    // [SLOT-DIRECT-ACCESS] Try to get raw tensors from RAM slots if available
                     if k.is_none() && loc == KVLocation::RAM {
                         if let Some(sid) = layer_slot_id {
                             let slot = &crate::models::qwen3vl::generate::SLOT_MANAGER.slots[sid];
-                            // [SMART-LOCK] Try to acquire tensors from the master slot
                             if let Ok(k_guard) = slot.k_layers[self.layer_idx].try_lock() {
                                 if let Some(tk) = k_guard.as_ref() {
                                     if let Ok(v_guard) = slot.v_layers[self.layer_idx].try_lock() {
                                         if let Some(tv) = v_guard.as_ref() {
                                             let tk_dev = tk.to_device(dev)?.to_dtype(target_dtype)?;
                                             let tv_dev = tv.to_device(dev)?.to_dtype(target_dtype)?;
-                                            // Pin to VRAM for subsequent layers in this pass
                                             inner.k_cache = Some(tk_dev.clone());
                                             inner.v_cache = Some(tv_dev.clone());
                                             k = Some(tk_dev);
@@ -626,14 +616,26 @@ impl QuantizedQwen3VLTextAttention {
 
                     if k.is_none() {
                         if let Some(meta) = &inner.bitkv_metadata {
-                            let k_raw = self.decompress_from_bitkv(&meta.k_anchors, &meta.k_packed, &meta.k_scales, &meta.original_shape, dev)?;
-                            let v_raw = self.decompress_from_bitkv(&meta.v_anchors, &meta.v_packed, &meta.v_scales, &meta.original_shape, dev)?;
-                            // [PIN] Store for subsequent layers to reuse
+                            // [FIX] 메타데이터 자체를 VRAM에 상주시키기 (이미 VRAM이면 그대로, 아니면 이동)
+                            let k_anchors = if !meta.k_anchors.device().same_device(dev) { meta.k_anchors.to_device(dev)? } else { meta.k_anchors.clone() };
+                            let k_packed = if !meta.k_packed.device().same_device(dev) { meta.k_packed.to_device(dev)? } else { meta.k_packed.clone() };
+                            let k_scales = if !meta.k_scales.device().same_device(dev) { meta.k_scales.to_device(dev)? } else { meta.k_scales.clone() };
+                            
+                            let v_anchors = if !meta.v_anchors.device().same_device(dev) { meta.v_anchors.to_device(dev)? } else { meta.v_anchors.clone() };
+                            let v_packed = if !meta.v_packed.device().same_device(dev) { meta.v_packed.to_device(dev)? } else { meta.v_packed.clone() };
+                            let v_scales = if !meta.v_scales.device().same_device(dev) { meta.v_scales.to_device(dev)? } else { meta.v_scales.clone() };
+
+                            // 현재 레이어 연산을 위해 잠깐 해제 (BF16)
+                            let k_raw = self.decompress_from_bitkv(&k_anchors, &k_packed, &k_scales, &meta.original_shape, dev)?;
+                            let v_raw = self.decompress_from_bitkv(&v_anchors, &v_packed, &v_scales, &meta.original_shape, dev)?;
+                            
+                            // [ACTIVE-PIN] 현재 레이어 연산 동안만 VRAM 캐시에 유지
                             inner.k_cache = Some(k_raw.clone());
                             inner.v_cache = Some(v_raw.clone());
                             k = Some(k_raw);
                             v = Some(v_raw);
                         } else { 
+                            // ... (SSD 로드 로직 동일)
                             let spath = {
                                 let reg = self.registry.entries.read().unwrap();
                                 reg[index].ssd_path.clone()
@@ -656,17 +658,18 @@ impl QuantizedQwen3VLTextAttention {
                                                         let shape_u32: &[u32] = unsafe { std::slice::from_raw_parts(view.data().as_ptr() as *const u32, view.data().len() / 4) };
                                                         shape_u32.iter().map(|&x| x as usize).collect()
                                                     } else { vec![1, 8, b_len, 128] };
+                                                    
+                                                    // 로드 시점에 즉시 VRAM 메타데이터로 생성
                                                     inner.bitkv_metadata = Some(BitKVMetadata {
-                                                        k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), &Device::Cpu).unwrap(),
-                                                        k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], b_len, 1), &Device::Cpu).unwrap(),
-                                                        v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), &Device::Cpu).unwrap(),
-                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), &Device::Cpu).unwrap(),
-                                                        v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], b_len, 1), &Device::Cpu).unwrap(),
+                                                        k_anchors: Tensor::from_vec(ka, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), dev)?.to_dtype(target_dtype)?,
+                                                        k_packed: Tensor::from_slice(kp.data(), kp.shape(), dev)?,
+                                                        k_scales: Tensor::from_vec(ks, (original_shape[0], original_shape[1], b_len, 1), dev)?.to_dtype(target_dtype)?,
+                                                        v_anchors: Tensor::from_vec(va, (original_shape[0], original_shape[1], (b_len + 7) / 8 + 4, original_shape[3]), dev)?.to_dtype(target_dtype)?,
+                                                        v_packed: Tensor::from_slice(vp.data(), vp.shape(), dev)?,
+                                                        v_scales: Tensor::from_vec(vs, (original_shape[0], original_shape[1], b_len, 1), dev)?.to_dtype(target_dtype)?,
                                                         original_shape,
                                                     });
                                                     
-                                                    // Update registry to RAM state for THIS layer
                                                     {
                                                         let mut reg = self.registry.entries.write().unwrap();
                                                         if index < reg.len() { reg[index].location[self.layer_idx] = KVLocation::RAM; }
@@ -685,7 +688,6 @@ impl QuantizedQwen3VLTextAttention {
                         }
                     }
                     if k.is_none() {
-                        println!("[WARNING] Block {} could not be loaded at Layer {}", index, self.layer_idx);
                         global_start_idx += b_len; continue;
                     }
                 }
@@ -779,32 +781,26 @@ impl QuantizedQwen3VLTextAttention {
             .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
         let attn_output = self.o_proj.forward(&attn_output)?;
 
-        // [OFFLOAD-WATCH] Manage VRAM residency
-        let current_kv_total = self.get_kv_len();
-        if current_kv_total > 8192 {
-            // [FIX] Pre-calculate take amount to avoid simultaneous borrow
-            let num_to_offload = self.kv_blocks.len().saturating_sub(2);
-            for block in self.kv_blocks.iter_mut().take(num_to_offload) {
-                let (index, current_inner_loc) = {
-                    let inner = block.inner.read().unwrap();
-                    (inner.index, inner.location)
-                };
+        // [STRICT-PURGE] 레이어 연산 직후 모든 VRAM 조각 해제
+        for block in &mut self.kv_blocks {
+            let (index, current_inner_loc) = {
+                let inner = block.inner.read().unwrap();
+                (inner.index, inner.location)
+            };
 
-                // [CRITICAL] Only purge if the registry confirms it's backed up to SSD or RAM.
-                // If registry still says VRAM, this block is "dirty" and must stay in VRAM until prefill_only saves it.
-                let reg_loc = {
-                    let reg = self.registry.entries.read().unwrap();
-                    if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
-                };
+            let reg_loc = {
+                let reg = self.registry.entries.read().unwrap();
+                if index < reg.len() { reg[index].location[self.layer_idx] } else { KVLocation::VRAM }
+            };
 
-                if reg_loc != KVLocation::VRAM {
-                    let mut inner = block.inner.write().unwrap();
-                    if inner.location == KVLocation::VRAM {
-                        println!("[OFFLOAD] Purging backed-up block {} from VRAM to save space.", index);
-                        inner.location = reg_loc; // Sync with registry (usually SSD)
-                        inner.k_cache = None;
-                        inner.v_cache = None;
-                    }
+            // VRAM에만 있거나 새로 로드된 데이터를 연산 직후 비움
+            if reg_loc != KVLocation::VRAM || current_inner_loc != KVLocation::VRAM {
+                let mut inner = block.inner.write().unwrap();
+                inner.k_cache = None;
+                inner.v_cache = None;
+                // 상태 동기화 (SSD나 RAM 상태로 되돌림)
+                if inner.location == KVLocation::VRAM {
+                    inner.location = reg_loc;
                 }
             }
         }
