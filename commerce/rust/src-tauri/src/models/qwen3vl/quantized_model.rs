@@ -168,13 +168,15 @@ pub enum SlotState {
 // [NEW] 마스터 슬롯: 1024 토큰에 대한 28개 레이어 전체 데이터를 담는 방
 pub struct MemorySlot {
     pub id: usize,
-    pub state: Arc<std::sync::atomic::AtomicU8>, // 0:Free, 1:Baking, 2:Ready, 3:Loading
-    pub k_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, // Slave K tensors
-    pub v_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, // Slave V tensors
+    pub state: Arc<std::sync::atomic::AtomicU8>, // 0:Free, 1:Baking, 2:Ready, 3:Persistent-Cache
+    pub k_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, 
+    pub v_layers: Vec<Arc<tokio::sync::Mutex<Option<Tensor>>>>, 
     pub remaining_layers: Arc<std::sync::atomic::AtomicUsize>,
-    pub ready_signal: Arc<tokio::sync::Notify>, // [NEW] Added for async/await synchronization
-    pub lock: Arc<std::sync::Mutex<()>>, // [NEW] Added for Condvar blocking wait
-    pub condvar: Arc<std::sync::Condvar>, // [NEW] Added for signaling
+    pub ready_signal: Arc<tokio::sync::Notify>, 
+    pub lock: Arc<std::sync::Mutex<()>>, 
+    pub condvar: Arc<std::sync::Condvar>, 
+    pub tenant_registry: Arc<std::sync::RwLock<Option<KVRegistry>>>, // [NEW] Current tenant's registry
+    pub tenant_index: std::sync::atomic::AtomicUsize, // [NEW] Current tenant's block index
 }
 
 impl MemorySlot {
@@ -194,6 +196,8 @@ impl MemorySlot {
             ready_signal: Arc::new(tokio::sync::Notify::new()),
             lock: Arc::new(std::sync::Mutex::new(())),
             condvar: Arc::new(std::sync::Condvar::new()),
+            tenant_registry: Arc::new(std::sync::RwLock::new(None)),
+            tenant_index: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -716,19 +720,20 @@ impl QuantizedQwen3VLTextAttention {
 
                     if let Some(sid) = sid_opt {
                         if let Some(slot) = crate::models::qwen3vl::generate::SLOT_MANAGER.get_slot(sid) {
-                            // 데이터가 준비될 때까지(State=2) 대기
-                            // 이미 준비되었으면 루프 탈출
-                            if slot.state.load(Ordering::SeqCst) == 2 {
+                            // [CACHE-AWARE-LOAD] 2(Ready) 또는 3(Persistent-Cache) 상태면 즉시 RAM에서 읽어옵니다.
+                            let state = slot.state.load(Ordering::SeqCst);
+                            if state == 2 || state == 3 {
                                 if let (Ok(kg), Ok(vg)) = (slot.k_layers[0].try_lock(), slot.v_layers[0].try_lock()) {
                                     if let (Some(tk), Some(tv)) = (kg.as_ref(), vg.as_ref()) {
                                         k_final = Some(tk.to_device(dev)?.to_dtype(target_dtype)?);
                                         v_final = Some(tv.to_device(dev)?.to_dtype(target_dtype)?);
+                                        // Sub Slot(ID >= 28)인 경우에만 로드 후 해제 (Base Slot은 영구 캐시로 유지)
                                         if sid >= 28 { crate::models::qwen3vl::generate::SLOT_MANAGER.sync_release_sub_slot(sid); }
                                         break; 
                                     }
                                 }
                             }
-                            // 아직 준비 안 됐으면 신호 대기
+                            // 아직 준비 안 됐으면(상태 1 등) 신호 대기
                             slot.ready_signal.notified().await;
                         } else {
                             break; // Invalid slot
@@ -1800,9 +1805,9 @@ impl QuantizedQwen3VLTextModel {
         // [SMART-SEQUENTIAL-LOOP]
         let layer_count = self.layers.len();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // [DYNAMIC-FLOW-CONTROL] 모드별 최적화된 흐름 제어
-            // 0.6B(1개 레이어)는 2개 제한, 2B(28개 레이어)는 28개까지 개방하여 병렬성 확보
-            let max_active = if layer_count <= 1 { 2 } else { 28 };
+            // [UNIFIED-PIPELINE] 모델 크기와 상관없이 28개 슬롯 인프라를 기준으로 최대 병렬성 허용
+            // 0.6B도 2B와 동일한 "고속도로" 정책을 따릅니다.
+            let max_active = 28;
             while ACTIVE_BAKE_TASKS.load(Ordering::SeqCst) >= max_active {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
